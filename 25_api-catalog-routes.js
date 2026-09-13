@@ -29,6 +29,7 @@ function isAllowedPosterUrl(raw) {
     return false;
   }
   if (u.protocol !== "https:") return false;
+  if (u.pathname.startsWith("/api/safe-poster")) return true;
   return POSTER_IMAGE_HOSTS.has(u.hostname.toLowerCase());
 }
 
@@ -218,6 +219,22 @@ async function handleFetch(request, env, ctx) {
       });
     }
 
+    // /api/safe-poster -> Dynamic age-appropriate vector SVG poster for Adult Content Filter
+    if (path === "/api/safe-poster") {
+      const title = url.searchParams.get("title") || "Untitled";
+      const year = url.searchParams.get("year") || "";
+      const type = url.searchParams.get("type") || "movie";
+      const cert = url.searchParams.get("cert") || "AGE-FILTERED";
+      const svg = generateSafePosterSvg({ title, year, type, certification: cert });
+      return new Response(svg, {
+        headers: {
+          "Content-Type": "image/svg+xml; charset=utf-8",
+          "Cache-Control": "public, max-age=86400",
+          ...corsHeaders(),
+        },
+      });
+    }
+
     // /api/poster-badge -> Dynamic badged SVG poster for Stremio / Nuvio
     if (path === "/api/poster-badge") {
       const posterUrl = url.searchParams.get("poster") || "";
@@ -229,6 +246,7 @@ async function handleFetch(request, env, ctx) {
       const rawFinaleDate = url.searchParams.get("finaleDate") || "";
       const isFinaleAired = rawFinaleDate && typeof isEpisodeAired === "function" && isEpisodeAired(rawFinaleDate);
       const finaleDate = !isFinaleAired ? rawFinaleDate : "";
+      const companion = url.searchParams.get("companion") || "";
 
       if (!posterUrl || !isAllowedPosterUrl(posterUrl)) {
         // Missing entirely, or not one of the image hosts this add-on
@@ -244,7 +262,7 @@ async function handleFetch(request, env, ctx) {
       }
 
       // If no badges are requested or all dates have aired, redirect straight to the original poster
-      if (!airDate && !isPremiere && !isFinale && !finaleDate) {
+      if (!airDate && !isPremiere && !isFinale && !finaleDate && !companion) {
         return Response.redirect(posterUrl, 302);
       }
 
@@ -294,7 +312,12 @@ async function handleFetch(request, env, ctx) {
       let bottomBorder = "rgba(48, 209, 88, 0.4)";
       let bottomColor = "#ffffff";
 
-      if (isPremiere) {
+      if (companion) {
+        bottomText = companion;
+        bottomBg = "rgba(37, 99, 235, 0.95)";
+        bottomBorder = "rgba(37, 99, 235, 0.8)";
+        bottomColor = "#ffffff";
+      } else if (isPremiere) {
         bottomText = "Season Premiere";
         bottomBg = "#28a745";
         bottomBorder = "rgba(40, 167, 69, 0.6)";
@@ -347,7 +370,7 @@ async function handleFetch(request, env, ctx) {
     let m = path.match(/^\/([^/]+)\/configure$/);
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases } = await resolveConfig(m[1], env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter } = await resolveConfig(m[1], env);
       // The one page that still sends no-store (it renders the person's own
       // API keys -- see the note on the headers below), but it should not
       // also be re-sending the 1.3MB client bundle every time. The split
@@ -357,7 +380,7 @@ async function handleFetch(request, env, ctx) {
       return new Response(
         await pageWithExternalBundle(renderBuilder(url.origin, {
           initialEntries: entries,
-          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases },
+          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter },
           isConfigureMode: true,
         })),
         // The one builder page that deliberately keeps no-store rather than
@@ -752,7 +775,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, adultContentFilter, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
@@ -770,7 +793,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const staleKey = env && env.CONFIGS && !isAutoTrack && !isUserPersonal ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
@@ -877,7 +900,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // callers with a normal-sized url (a plain mdblist/trakt/tmdb list
     // link is never going to hit that limit).
     if (path === "/api/preview") {
-      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName, hideNonDigitalReleases;
+      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName, hideNonDigitalReleases, adultContentFilter, region;
       if (request.method === "POST") {
         let reqBody;
         try {
@@ -895,7 +918,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
         simklKey = reqBody.simklKey || "";
         simklAccessToken = reqBody.simklAccessToken || "";
         creatorName = reqBody.creatorName || "";
+        region = reqBody.region || "";
         hideNonDigitalReleases = !!reqBody.hideNonDigitalReleases;
+        adultContentFilter = !!reqBody.adultContentFilter;
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(reqBody.sample, 10) || 5));
         skip = Math.max(0, parseInt(reqBody.skip, 10) || 0);
       } else {
@@ -910,21 +935,23 @@ Sitemap: ${url.origin}/sitemap.xml`;
         simklKey = url.searchParams.get("simklKey") || "";
         simklAccessToken = url.searchParams.get("simklAccessToken") || "";
         creatorName = url.searchParams.get("creatorName") || "";
+        region = url.searchParams.get("region") || "";
         hideNonDigitalReleases = url.searchParams.get("hideNonDigitalReleases") === "1";
+        adultContentFilter = url.searchParams.get("adultContentFilter") === "1";
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(url.searchParams.get("sample"), 10) || 5));
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
 
       // Unauthenticated and heavyweight: each call can fan out to TMDB /
       // Trakt / MDBList. Same IP-keyed KV slot as create/restore/feedback
-      // -- 80/minute is enough for Live Preview paging a shelf, not enough
-      // to use this as a free outbound scanner.
+      // -- 240/minute provides sufficient budget for browsing multi-card
+      // Discover shelves while protecting against automated scraping.
       const ip = clientIpKey(request);
       if (!ip) return json({ ok: false, error: "Couldn't load that list." }, 400, { "Cache-Control": "no-store" });
       if (env && env.CONFIGS) {
         const rateKey = `ratelimit:preview:${ip}`;
         const n = parseInt((await env.CONFIGS.get(rateKey)) || "0", 10) || 0;
-        if (n >= 80) {
+        if (n >= 240) {
           return json({ ok: false, error: "Couldn't load that list." }, 429, { "Cache-Control": "no-store" });
         }
         ctx.waitUntil(env.CONFIGS.put(rateKey, String(n + 1), { expirationTtl: 60 }));
@@ -937,7 +964,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       let body;
       try {
-        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, adultContentFilter, region, env, ctx, origin: url.origin });
         const totalItems = (typeof metas.totalItems === "number") ? metas.totalItems : (metas.length < PAGE_SIZE && skip === 0 ? metas.length : null);
         body = {
           ok: true,
@@ -946,6 +973,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
           maybeMore: totalItems != null ? (skip + metas.length < totalItems) : (metas.length >= PAGE_SIZE),
           sample: metas.slice(0, sampleSize).map((m) => ({
             id: m.id,
+            showId: m.showId || undefined,
             type: m.type || (m.mediatype === "show" || m.mediatype === "series" || m.mediatype === "tv" ? "series" : (m.mediatype === "episode" ? "episode" : (type === "series" ? "series" : "movie"))),
             name: m.name,
             poster: m.poster,
@@ -954,6 +982,16 @@ Sitemap: ${url.origin}/sitemap.xml`;
             posterShape: m.posterShape,
             season: m.season,
             episode: m.episode,
+            seasonNum: m.seasonNum != null ? m.seasonNum : (m.season != null ? m.season : undefined),
+            episodeNum: m.episodeNum != null ? m.episodeNum : (m.episode != null ? m.episode : undefined),
+            airDate: m.airDate || undefined,
+            isUnaired: m.isUnaired || undefined,
+            isSeasonPremiere: m.isSeasonPremiere || undefined,
+            isSeasonFinale: m.isSeasonFinale || undefined,
+            seasonFinaleAirDate: m.seasonFinaleAirDate || undefined,
+            seasonFinaleEpisodeNumber: m.seasonFinaleEpisodeNumber != null ? m.seasonFinaleEpisodeNumber : undefined,
+            isAdult: isAdultOrNsfw(m),
+            isAdultPosterFiltered: !!m.isAdultPosterFiltered,
           })),
         };
       } catch (err) {
@@ -1225,6 +1263,56 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: true, season: seasonData }, 200, { "Cache-Control": "max-age=60" });
       }
 
+function generateSearchVariations(query) {
+  if (!query || typeof query !== "string") return [];
+  const variations = new Set();
+  const trimmed = query.trim();
+
+  // 1. Common missing-space words / compound nouns
+  const compounds = [
+    [/\bpickup\b/gi, "pick up"],
+    [/\bpick up\b/gi, "pickup"],
+    [/\bstandby\b/gi, "stand by"],
+    [/\bspiderman\b/gi, "spider-man"],
+    [/\bironman\b/gi, "iron man"],
+    [/\bstarwars\b/gi, "star wars"],
+    [/\bstartrek\b/gi, "star trek"],
+    [/\bbreakingbad\b/gi, "breaking bad"],
+    [/\bgameofthrones\b/gi, "game of thrones"],
+    [/\blordoftherings\b/gi, "lord of the rings"],
+    [/\bxmen\b/gi, "x-men"],
+    [/\bantman\b/gi, "ant-man"],
+    [/\btopgun\b/gi, "top gun"],
+    [/\bdeadpool\b/gi, "dead pool"],
+    [/\bfallout\b/gi, "fall out"],
+    [/\bpayback\b/gi, "pay back"],
+    [/\bstepup\b/gi, "step up"],
+    [/\bhangover\b/gi, "hang over"],
+    [/\bknockout\b/gi, "knock out"],
+    [/\bstrangerthings\b/gi, "stranger things"],
+  ];
+  for (const [re, replacement] of compounds) {
+    if (re.test(trimmed)) {
+      variations.add(trimmed.replace(re, replacement));
+    }
+  }
+
+  // 2. Glued numbers and words (e.g. "matrix4" -> "matrix 4", "ironman2" -> "ironman 2")
+  const withSpacedNumbers = trimmed.replace(/([a-zA-Z])(\d+)/g, "$1 $2").replace(/(\d+)([a-zA-Z])/g, "$1 $2");
+  if (withSpacedNumbers !== trimmed) variations.add(withSpacedNumbers);
+
+  // 3. CamelCase transitions (e.g. "SpiderMan" -> "Spider Man")
+  const withSpacedCamel = trimmed.replace(/([a-z])([A-Z])/g, "$1 $2");
+  if (withSpacedCamel !== trimmed) variations.add(withSpacedCamel);
+
+  // 4. Hyphen/colon variants
+  if (trimmed.includes("-")) variations.add(trimmed.replace(/-/g, " "));
+  if (trimmed.includes(":")) variations.add(trimmed.replace(/:/g, " "));
+
+  variations.delete(trimmed);
+  return Array.from(variations);
+}
+
     // /api/title-search?q=...&type=movie|tv
     // -> powers the "Search a show/movie" box in the Channel builder and the Search tab.
     // When no query is provided, returns the top 20 trending/popular titles for that category.
@@ -1232,6 +1320,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
     if (path === "/api/title-search") {
       const q = (url.searchParams.get("q") || "").trim();
       const kind = url.searchParams.get("type") === "movie" ? "movie" : "tv";
+      const adultFilterParam = url.searchParams.get("adultContentFilter");
+      const isAdultFilterActive = adultFilterParam === "1" || adultFilterParam === "true";
       try {
         // Always the shared key -- no per-user override for this endpoint.
         ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
@@ -1244,16 +1334,31 @@ Sitemap: ${url.origin}/sitemap.xml`;
           });
           if (!res.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${res.status}).` });
           const data = await res.json();
-          const results = (data.results || []).slice(0, 20).map((it) => ({
-            tmdbId: it.id,
-            title: it.title || it.name,
-            year: (it.release_date || it.first_air_date || "").slice(0, 4),
-            poster: it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : null,
-            backdrop: it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null,
-            rating: typeof it.vote_average === "number" ? Math.round(it.vote_average * 10) / 10 : null,
-            genreIds: Array.isArray(it.genre_ids) ? it.genre_ids : [],
-            type: kind,
-          }));
+          const results = (data.results || []).slice(0, 20).map((it) => {
+            const isAdultItem = it.adult === true || it.is_adult === true || isAdultOrNsfw(it);
+            let poster = it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : null;
+            if (isAdultFilterActive && isAdultItem) {
+              poster = getSafePosterUrl(url.origin, {
+                title: it.title || it.name,
+                year: (it.release_date || it.first_air_date || "").slice(0, 4),
+                type: kind === "tv" ? "series" : "movie",
+                certification: "ADULT",
+              });
+            }
+            return {
+              tmdbId: it.id,
+              title: it.title || it.name,
+              year: (it.release_date || it.first_air_date || "").slice(0, 4),
+              poster,
+              backdrop: it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null,
+              rating: typeof it.vote_average === "number" ? Math.round(it.vote_average * 10) / 10 : null,
+              genreIds: Array.isArray(it.genre_ids) ? it.genre_ids : [],
+              type: kind,
+              adult: isAdultItem,
+              isAdult: isAdultItem,
+              isAdultPosterFiltered: isAdultFilterActive && isAdultItem,
+            };
+          });
           return json({ ok: true, results });
         }
 
@@ -1264,7 +1369,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
         const page1Src = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
           TMDB_API_KEY
-        )}&query=${encodeURIComponent(q)}&include_adult=false&page=1`;
+        )}&query=${encodeURIComponent(q)}&include_adult=true&page=1`;
         const page1Res = await fetch(page1Src, {
           headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
           cf: { cacheTtl: 3600, cacheEverything: true },
@@ -1285,7 +1390,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
               try {
                 const pSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
                   TMDB_API_KEY
-                )}&query=${encodeURIComponent(q)}&include_adult=false&page=${p}`;
+                )}&query=${encodeURIComponent(q)}&include_adult=true&page=${p}`;
                 const pRes = await fetch(pSrc, {
                   headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                   cf: { cacheTtl: 3600, cacheEverything: true },
@@ -1303,7 +1408,117 @@ Sitemap: ${url.origin}/sitemap.xml`;
           }
         }
 
-        // Deduplicate by TMDB ID
+        // Fallback 1: Query Variations (missing spaces, glued numbers, compounds)
+        if (allRawItems.length === 0) {
+          const variations = generateSearchVariations(q);
+          for (const altQ of variations) {
+            try {
+              const altSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
+                TMDB_API_KEY
+              )}&query=${encodeURIComponent(altQ)}&include_adult=true&page=1`;
+              const altRes = await fetch(altSrc, {
+                headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+                cf: { cacheTtl: 3600, cacheEverything: true },
+              });
+              if (altRes.ok) {
+                const altData = await altRes.json();
+                if (Array.isArray(altData.results) && altData.results.length > 0) {
+                  allRawItems = altData.results;
+                  break;
+                }
+              }
+            } catch {}
+          }
+        }
+
+        // Fallback 2: Cinemeta Fuzzy Search (handles misspellings, typos, phonetic matches, missing words)
+        if (allRawItems.length === 0) {
+          try {
+            const cinemetaType = kind === "tv" ? "series" : "movie";
+            const cUrl = `https://v3-cinemeta.strem.io/catalog/${cinemetaType}/top/search=${encodeURIComponent(q)}.json`;
+            const cRes = await fetch(cUrl, {
+              headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+              cf: { cacheTtl: 86400, cacheEverything: true },
+            });
+            if (cRes.ok) {
+              const cData = await cRes.json();
+              const metas = Array.isArray(cData.metas) ? cData.metas.slice(0, 10) : [];
+              if (metas.length > 0) {
+                // A. Resolve top IMDB IDs to TMDB items via /3/find/
+                if (TMDB_API_KEY) {
+                  const foundItems = await Promise.all(
+                    metas.slice(0, 6).map(async (m) => {
+                      const imdbId = m.imdb_id || (typeof m.id === "string" && m.id.startsWith("tt") ? m.id : null);
+                      if (!imdbId) return null;
+                      try {
+                        const findUrl = `https://api.themoviedb.org/3/find/${encodeURIComponent(imdbId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&external_source=imdb_id`;
+                        const fRes = await fetch(findUrl, {
+                          headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+                          cf: { cacheTtl: 604800, cacheEverything: true },
+                        });
+                        if (!fRes.ok) return null;
+                        const fData = await fRes.json();
+                        const match = kind === "tv"
+                          ? ((fData.tv_results || [])[0] || (fData.tv_episode_results || [])[0])
+                          : ((fData.movie_results || [])[0]);
+                        return match || null;
+                      } catch {
+                        return null;
+                      }
+                    })
+                  );
+                  for (const it of foundItems) {
+                    if (it && it.id) allRawItems.push(it);
+                  }
+                }
+
+                // B. If still needed, search TMDB using Cinemeta's top match title
+                if (allRawItems.length === 0 && metas[0] && metas[0].name && TMDB_API_KEY) {
+                  const cleanTopTitle = metas[0].name.replace(/[-–—].*$/, "").trim() || metas[0].name.trim();
+                  if (cleanTopTitle && cleanTopTitle.toLowerCase() !== q.toLowerCase()) {
+                    try {
+                      const tSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
+                        TMDB_API_KEY
+                      )}&query=${encodeURIComponent(cleanTopTitle)}&include_adult=true&page=1`;
+                      const tRes = await fetch(tSrc, {
+                        headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+                        cf: { cacheTtl: 3600, cacheEverything: true },
+                      });
+                      if (tRes.ok) {
+                        const tData = await tRes.json();
+                        if (Array.isArray(tData.results) && tData.results.length > 0) {
+                          allRawItems.push(...tData.results);
+                        }
+                      }
+                    } catch {}
+                  }
+                }
+
+                // C. Fallback: map Cinemeta metas directly if TMDB didn't match
+                if (allRawItems.length === 0) {
+                  for (const m of metas) {
+                    allRawItems.push({
+                      id: m.id || m.imdb_id,
+                      title: m.name,
+                      name: m.name,
+                      release_date: m.releaseInfo || m.year || "",
+                      first_air_date: m.releaseInfo || m.year || "",
+                      poster_path: null,
+                      direct_poster: m.poster || null,
+                      backdrop_path: null,
+                      direct_backdrop: m.background || m.poster || null,
+                      vote_average: m.imdbRating ? parseFloat(m.imdbRating) : null,
+                      genre_ids: [],
+                      adult: false,
+                    });
+                  }
+                }
+              }
+            }
+          } catch {}
+        }
+
+        // Deduplicate by TMDB ID (or IMDB ID if Cinemeta fallback)
         const seenIds = new Set();
         const rawResults = [];
         for (const it of allRawItems) {
@@ -1314,8 +1529,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
         const results = await Promise.all(
           rawResults.map(async (it) => {
-            let poster = it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : null;
-            const backdrop = it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null;
+            let poster = it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : (it.direct_poster || null);
+            const backdrop = it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : (it.direct_backdrop || poster || null);
+            const isAdultItem = it.adult === true || it.is_adult === true || isAdultOrNsfw(it);
 
             // If TMDB poster is missing, try backdrop or Cinemeta fallback
             if (!poster) {
@@ -1341,6 +1557,15 @@ Sitemap: ${url.origin}/sitemap.xml`;
               }
             }
 
+            if (isAdultFilterActive && isAdultItem) {
+              poster = getSafePosterUrl(url.origin, {
+                title: it.title || it.name,
+                year: (it.release_date || it.first_air_date || "").slice(0, 4),
+                type: kind === "tv" ? "series" : "movie",
+                certification: "ADULT",
+              });
+            }
+
             return {
               tmdbId: it.id,
               title: it.title || it.name,
@@ -1350,6 +1575,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
               rating: typeof it.vote_average === "number" ? Math.round(it.vote_average * 10) / 10 : null,
               genreIds: Array.isArray(it.genre_ids) ? it.genre_ids : [],
               type: kind,
+              adult: isAdultItem,
+              isAdult: isAdultItem,
+              isAdultPosterFiltered: isAdultFilterActive && isAdultItem,
             };
           })
         );
@@ -1478,8 +1706,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // Always the shared key -- 2 outbound TMDB calls per request.
         ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
         const [details, showRes] = await Promise.all([
-          fetchTmdbDetails(tmdbId, "tv", TMDB_API_KEY),
-          fetch(`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${encodeURIComponent(TMDB_API_KEY)}`, {
+          fetchTmdbDetails(tmdbId, "tv", TMDB_API_KEY, env),
+          fetch(`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=episode_groups`, {
             headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
             cf: { cacheTtl: 3600, cacheEverything: true },
           }),
@@ -1489,9 +1717,21 @@ Sitemap: ${url.origin}/sitemap.xml`;
         }
         if (!showRes.ok) return json({ ok: false, error: `TMDB show lookup failed (HTTP ${showRes.status}).` });
         const data = await showRes.json();
-        const seasons = (data.seasons || [])
+        let seasons = (data.seasons || [])
           .filter((s) => s.season_number > 0) // skip "Specials" (season 0)
           .map((s) => ({ season: s.season_number, name: s.name, episodeCount: s.episode_count }));
+        const standardEpisodeCount = seasons.reduce((sum, s) => sum + (s.episodeCount || 0), 0);
+        if (seasons.length === 1 && standardEpisodeCount > 1) {
+          const groups = (data.episode_groups && Array.isArray(data.episode_groups.results)) ? data.episode_groups.results : [];
+          const unpacked = await resolveUnpackedShowData(tmdbId, details.imdbId, data.seasons, TMDB_API_KEY, env, ctx, groups);
+          if (unpacked && Array.isArray(unpacked.seasons) && unpacked.seasons.length > 1) {
+            seasons = unpacked.seasons.map((s) => ({
+              season: s.season_number || s.season,
+              name: s.name || `Season ${s.season_number || s.season}`,
+              episodeCount: s.episode_count || s.episodeCount,
+            }));
+          }
+        }
         return json({
           ok: true,
           imdbId: details.imdbId,
@@ -1513,6 +1753,19 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const season = url.searchParams.get("season") || "";
       if (!tmdbId || !season) return json({ ok: false, error: "Missing tmdbId or season." }, 400);
       try {
+        const numericSeason = parseInt(season, 10);
+        // Check if show is unpacked
+        const unpacked = await resolveUnpackedShowData(tmdbId, null, null, TMDB_API_KEY, env, ctx);
+        if (unpacked && unpacked.episodesBySeason && unpacked.episodesBySeason[numericSeason]) {
+          const episodes = unpacked.episodesBySeason[numericSeason].map((e) => ({
+            episode: e.episode_number,
+            name: e.name,
+            released: e.air_date || null,
+            thumbnail: e.still_path || null,
+          }));
+          return json({ ok: true, episodes });
+        }
+
         // Always the shared key.
         ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const src = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${encodeURIComponent(
@@ -1522,7 +1775,19 @@ Sitemap: ${url.origin}/sitemap.xml`;
           headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
           cf: { cacheTtl: 3600, cacheEverything: true },
         });
-        if (!res.ok) return json({ ok: false, error: `TMDB season lookup failed (HTTP ${res.status}).` });
+        if (!res.ok) {
+          const fallbackUnpacked = await resolveUnpackedShowData(tmdbId, null, null, TMDB_API_KEY, env, ctx);
+          if (fallbackUnpacked && fallbackUnpacked.episodesBySeason && fallbackUnpacked.episodesBySeason[numericSeason]) {
+            const episodes = fallbackUnpacked.episodesBySeason[numericSeason].map((e) => ({
+              episode: e.episode_number,
+              name: e.name,
+              released: e.air_date || null,
+              thumbnail: e.still_path || null,
+            }));
+            return json({ ok: true, episodes });
+          }
+          return json({ ok: false, error: `TMDB season lookup failed (HTTP ${res.status}).` });
+        }
         const data = await res.json();
         const episodes = (data.episodes || []).map((e) => ({
           episode: e.episode_number,
@@ -2059,6 +2324,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const q = (url.searchParams.get("q") || "").trim();
       const tmdbKeyParam = url.searchParams.get("tmdbKey") || "";
       const tmdbKey = tmdbKeyParam || TMDB_API_KEY;
+      const isAdultFilterActive = url.searchParams.get("adultContentFilter") === "1";
       if (!q || !tmdbKey) {
         return json({ ok: true, lists: [] });
       }
@@ -2070,7 +2336,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
         // 1. Search TMDB Collections
         const collRes = await fetch(
-          `https://api.themoviedb.org/3/search/collection?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(q)}`,
+          `https://api.themoviedb.org/3/search/collection?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(q)}&include_adult=true`,
           {
             headers: { "User-Agent": "my-list-addon/1.14" },
             cf: { cacheTtl: 86400, cacheEverything: true },
@@ -2082,15 +2348,22 @@ Sitemap: ${url.origin}/sitemap.xml`;
           const collections = Array.isArray(collData.results) ? collData.results : [];
           for (const c of collections.slice(0, 15)) {
             if (!c || !c.id) continue;
+            const isCollAdult = c.adult === true || (typeof isAdultOrNsfw === "function" && isAdultOrNsfw({ name: c.name, title: c.name, franchise: c.name }));
+            const poster = isAdultFilterActive && isCollAdult
+              ? getSafePosterUrl(url.origin, { title: c.name || "Collection", type: "movie", certification: "ADULT" })
+              : (c.poster_path ? `https://image.tmdb.org/t/p/w500${c.poster_path}` : undefined);
             results.push({
               name: c.name || "Unnamed Collection",
               user: "TMDB Franchise",
               url: `https://www.themoviedb.org/collection/${c.id}`,
               type: "movie",
               items: "Franchise",
-              poster: c.poster_path ? `https://image.tmdb.org/t/p/w500${c.poster_path}` : undefined,
+              poster,
               likes: 0,
               isCollection: true,
+              adult: isCollAdult,
+              isAdult: isCollAdult,
+              isAdultPosterFiltered: isAdultFilterActive && isCollAdult,
             });
           }
         }
@@ -5826,6 +6099,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (body.shuffleItems) payload.shuffleItems = true;
       if (body.region && body.region !== "US") payload.region = body.region;
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
+      if (body.adultContentFilter) payload.adultContentFilter = true;
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a

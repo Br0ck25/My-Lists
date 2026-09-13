@@ -11,7 +11,14 @@ blocks.sort(key=len)
 biggest = blocks[-1]
 fn = f'inner_{tag}.js'
 open(fn,'w',encoding='utf-8').write(biggest)
-r = subprocess.run(['node','--check',fn], capture_output=True, text=True)
+import shutil
+node_cmd = 'node'
+if not shutil.which('node'):
+    for cand in [r'C:\Users\James\AppData\Local\nvm\v24.11.0\node.exe', r'C:\Users\James\AppData\Local\nvm\v20.20.0\node.exe']:
+        if os.path.exists(cand):
+            node_cmd = cand
+            break
+r = subprocess.run([node_cmd,'--check',fn], capture_output=True, text=True)
 if r.returncode != 0:
     print("FAIL: largest <script> block syntax error:\n", r.stderr[:3000]); sys.exit(1)
 print(f"  inner script OK ({len(blocks)} blocks, largest {len(biggest)} chars)")

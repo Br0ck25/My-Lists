@@ -37,6 +37,17 @@
     </div>
 
     <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Adult Content &amp; Poster Safety</h2>
+      <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.92rem; user-select:none;">
+        <input type="checkbox" id="adultContentFilterCheckbox" ${initialAdultContentFilter ? 'checked' : ''} onchange="localStorage.setItem('myListAddon:adultContentFilter', this.checked ? '1' : '0'); if (window._listPreviewCache) window._listPreviewCache.clear(); saveState()" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+        <div>
+          <span style="font-weight:600;">Adult Content Filter</span>
+          <p style="margin:4px 0 0; color:var(--muted); font-size:0.82rem;">Filter NSFW posters and replace default unfiltered posters with safe, age-appropriate ones across your catalogs, search, continue watching, and Stremio/Nuvio.</p>
+        </div>
+      </label>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Poster Badges &amp; Labels</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Customize which badges and indicators are displayed on posters across your website dashboard, catalogs, and Stremio/Nuvio.</p>
       <div style="display:flex; flex-direction:column; gap:12px;">
@@ -138,6 +149,15 @@
 
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Watch History &amp; Continue Watching</h2>
+      <div style="border-bottom:1px solid var(--border); padding-bottom:12px; margin-bottom:12px;">
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="autoRecommendCompanionsCheckbox" checked onchange="toggleCompanionRecommendationSetting(this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Storyline &amp; Companion Recommendations</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Automatically recommend canon bridge movies between seasons (e.g. <em>Demon Slayer: Mugen Train</em>) and sequel films or spin-off series when a show concludes (e.g. <em>Breaking Bad &rarr; El Camino &rarr; Better Call Saul</em>).</p>
+          </div>
+        </label>
+      </div>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Reset or clear all recorded movies and episodes from your personal Watch History or in-progress Continue Watching.</p>
       <div id="watchHistorySettingsSection" style="display:flex; gap:10px; flex-wrap:wrap;">
         <button type="button" class="secondary lc-btn" onclick="clearWatchHistoryAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.3); font-weight:600; padding:8px 16px;">Clear Watch History</button>

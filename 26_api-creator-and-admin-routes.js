@@ -79,7 +79,7 @@
       // Fire-and-forget, not awaited -- see touchCreatorLastSeen's own
       // comment for why this is throttled and safe to never wait on.
       touchCreatorLastSeen(env, v.normalized);
-      return { ok: true, username: v.normalized, displayName: profile.displayName };
+      return { ok: true, username: profile.username || v.normalized, displayName: profile.displayName };
     }
 
     // Every failure path above returns the exact same generic message
@@ -1628,14 +1628,30 @@
           console.error("D1 order read error (/api/creator/lists):", e);
         }
       }
-      if (!d1Ordered && env.CONFIGS) {
-        const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+      if (env.CONFIGS) {
         try {
-          order = orderRaw ? JSON.parse(orderRaw).order || [] : [];
+          const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+          const kvOrder = orderRaw ? JSON.parse(orderRaw).order || [] : [];
+          if (Array.isArray(kvOrder) && kvOrder.length > 0) {
+            if (d1Ordered && order.length > 0) {
+              const d1Slugs = new Set(order);
+              const merged = [];
+              kvOrder.forEach((s) => {
+                if (typeof s === "string" && (d1Slugs.has(s) || s === "continue-watching" || s === "watch-history" || s === "watchlist" || s === "airing-next")) {
+                  merged.push(s);
+                }
+              });
+              order.forEach((s) => {
+                if (!merged.includes(s)) merged.push(s);
+              });
+              order = merged;
+            } else if (!d1Ordered) {
+              order = kvOrder.filter((s) => typeof s === "string" && s);
+            }
+          }
         } catch {
-          order = [];
+          if (!d1Ordered) order = [];
         }
-        order = order.filter((s) => typeof s === "string" && s);
       }
 
       // Anything the account owns that creatorlistorder: has lost.
@@ -1758,6 +1774,10 @@
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
                 visibility: effectiveListVisibility(data.visibility),
+                sourceUrl: data.sourceUrl || undefined,
+                synced: !!data.synced || undefined,
+                lastSyncedAt: Number.isFinite(data.lastSyncedAt) ? data.lastSyncedAt : undefined,
+                baseItemIds: Array.isArray(data.baseItemIds) ? data.baseItemIds : undefined,
                 // The version these items are, so an editor can send it back
                 // as expectedUpdatedAt and have lists/save refuse a write
                 // built on a copy another device has since replaced.
@@ -1892,6 +1912,7 @@
                   slug,
                   items,
                   itemCount: items.length,
+                  baseItemIds: Array.isArray(data.baseItemIds) ? data.baseItemIds : undefined,
                   updatedAt: Number.isFinite(data.updatedAt) ? data.updatedAt : undefined,
                 };
               } catch {
@@ -2069,17 +2090,32 @@
         return json({ ok: false, error: "expectedUpdatedAt must be a number." }, 400);
       }
 
+      const sourceUrl = typeof body.sourceUrl === "string" ? body.sourceUrl.trim() : (body.sourceUrl === "" ? "" : null);
+      const synced = body.synced != null ? !!body.synced : (sourceUrl ? true : null);
+      const lastSyncedAt = Number.isFinite(Number(body.lastSyncedAt)) ? Number(body.lastSyncedAt) : null;
+      const baseItemIds = Array.isArray(body.baseItemIds)
+        ? body.baseItemIds.filter((id) => typeof id === "string" || typeof id === "number").map(String)
+        : null;
+
       const existingRaw = editingSlug ? await getCreatorList(env, auth.username, slug) : null;
       let createdAt = now;
       let likes = 0;
       let storedUpdatedAt = 0;
       let existingReadable = false;
+      let existingSourceUrl = "";
+      let existingSynced = false;
+      let existingLastSyncedAt = null;
+      let existingBaseItemIds = null;
       if (existingRaw) {
         try {
           const existing = JSON.parse(existingRaw);
           createdAt = existing.createdAt || now;
           likes = existing.likes || 0;
           storedUpdatedAt = Number(existing.updatedAt) || 0;
+          existingSourceUrl = existing.sourceUrl || "";
+          existingSynced = !!existing.synced;
+          existingLastSyncedAt = Number.isFinite(existing.lastSyncedAt) ? existing.lastSyncedAt : null;
+          existingBaseItemIds = Array.isArray(existing.baseItemIds) ? existing.baseItemIds : null;
           existingReadable = true;
         } catch {
           // Unreadable stored record -- nothing coherent to protect against,
@@ -2130,12 +2166,23 @@
         }
       }
       
+      const finalSourceUrl = (sourceUrl !== null) ? sourceUrl : existingSourceUrl;
+      const finalSynced = (synced !== null) ? synced : (finalSourceUrl ? existingSynced : false);
+      const finalLastSyncedAt = (lastSyncedAt !== null) ? lastSyncedAt : existingLastSyncedAt;
+      const finalBaseItemIds = (baseItemIds !== null) ? baseItemIds : existingBaseItemIds;
+
       // Unconditional -- KV must not be allowed to hold a stale copy of a
       // list that D1 has since updated, because the public read paths
       // (/lists/:user/:slug, the directory, search) all read KV.
+      const kvPayload = { name, slug, type, items, visibility, likes, createdAt, updatedAt };
+      if (finalSourceUrl) kvPayload.sourceUrl = finalSourceUrl;
+      if (finalSynced) kvPayload.synced = true;
+      if (finalLastSyncedAt) kvPayload.lastSyncedAt = finalLastSyncedAt;
+      if (finalBaseItemIds) kvPayload.baseItemIds = finalBaseItemIds;
+
       await env.CONFIGS.put(
         `creatorlist:${auth.username}:${slug}`,
-        JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt })
+        JSON.stringify(kvPayload)
       );
       if (!order.includes(slug)) {
         // Re-read and MERGE rather than writing back the array this handler
@@ -2214,9 +2261,16 @@
           console.error("D1 write error (lists_fts save):", dbErr);
         }
       }
-      // updatedAt comes back so the client can advance its own baseline
-      // without a separate read, exactly as /api/creator/sync/save does.
-      return json({ ok: true, slug, updatedAt, url: `${url.origin}/lists/${auth.username}/${slug}` });
+      return json({
+        ok: true,
+        slug,
+        updatedAt,
+        sourceUrl: finalSourceUrl || undefined,
+        synced: finalSynced || undefined,
+        lastSyncedAt: finalLastSyncedAt || undefined,
+        baseItemIds: finalBaseItemIds || undefined,
+        url: `${url.origin}/lists/${auth.username}/${slug}`,
+      });
     }
 
     // /api/creator/lists/delete  (POST)  { creatorName, creatorKey, slug }
@@ -2680,22 +2734,33 @@
               const incomingCwList = Array.isArray(body.continueWatching) ? body.continueWatching : [];
               const mergedCw = [];
               const handledShows = new Set();
+              const fullyWatchedSet = new Set([
+                ...(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []),
+                ...(Array.isArray(existingBlob.fullyWatchedShowIds) ? existingBlob.fullyWatchedShowIds.map(String) : [])
+              ]);
               
-              // Server's updated Continue Watching items come first
+              // Server's updated Continue Watching items come first, but NEVER resurrect fully watched shows!
               for (const sItem of serverCwList) {
                 if (sItem && (sItem.showId || sItem.id)) {
                   const sKey = String(sItem.showId || sItem.id);
+                  const baseKey = sKey.split(':')[0];
+                  if (!sItem.isCompanion && (fullyWatchedSet.has(sKey) || fullyWatchedSet.has(baseKey) || (sItem.showId && fullyWatchedSet.has(String(sItem.showId))))) {
+                    continue;
+                  }
                   mergedCw.push(sItem);
                   handledShows.add(sKey);
+                  if (baseKey) handledShows.add(baseKey);
                 }
               }
               // Add any client-only Continue Watching shows that aren't on the server
               for (const cItem of incomingCwList) {
                 if (cItem && (cItem.showId || cItem.id)) {
                   const cKey = String(cItem.showId || cItem.id);
-                  if (!handledShows.has(cKey)) {
+                  const baseKey = cKey.split(':')[0];
+                  if (!handledShows.has(cKey) && !handledShows.has(baseKey)) {
                     mergedCw.push(cItem);
                     handledShows.add(cKey);
+                    if (baseKey) handledShows.add(baseKey);
                   }
                 }
               }
@@ -2803,20 +2868,32 @@
               }
             }
             if (queueCw.length) {
+              const fullyWatchedSet = new Set([
+                ...(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []),
+                ...(Array.isArray(existingBlob.fullyWatchedShowIds) ? existingBlob.fullyWatchedShowIds.map(String) : [])
+              ]);
               const mergedCw = [];
               const handledShows = new Set();
               for (const qItem of queueCw) {
                 if (qItem && (qItem.showId || qItem.id)) {
+                  const qKey = String(qItem.showId || qItem.id);
+                  const baseKey = qKey.split(':')[0];
+                  if (!qItem.isCompanion && (fullyWatchedSet.has(qKey) || fullyWatchedSet.has(baseKey) || (qItem.showId && fullyWatchedSet.has(String(qItem.showId))))) {
+                    continue;
+                  }
                   mergedCw.push(qItem);
-                  handledShows.add(String(qItem.showId || qItem.id));
+                  handledShows.add(qKey);
+                  if (baseKey) handledShows.add(baseKey);
                 }
               }
               for (const bItem of (Array.isArray(body.continueWatching) ? body.continueWatching : [])) {
                 if (bItem && (bItem.showId || bItem.id)) {
                   const bKey = String(bItem.showId || bItem.id);
-                  if (!handledShows.has(bKey)) {
+                  const baseKey = bKey.split(':')[0];
+                  if (!handledShows.has(bKey) && !handledShows.has(baseKey)) {
                     mergedCw.push(bItem);
                     handledShows.add(bKey);
+                    if (baseKey) handledShows.add(baseKey);
                   }
                 }
               }
@@ -3338,6 +3415,25 @@
             const tb = JSON.parse(trackingRaw);
             if (Array.isArray(tb.watchlist)) data.watchlist = tb.watchlist;
             if (Number(tb.watchlistUpdatedAt)) data.watchlistUpdatedAt = Number(tb.watchlistUpdatedAt);
+            if (Array.isArray(tb.continueWatching) && tb.continueWatching.length && Array.isArray(data.continueWatching)) {
+              const tbCwMap = new Map();
+              tb.continueWatching.forEach((it) => {
+                if (it && it.id) tbCwMap.set(String(it.id), it);
+              });
+              data.continueWatching.forEach((it) => {
+                if (!it || !it.id) return;
+                const tbItem = tbCwMap.get(String(it.id));
+                if (tbItem) {
+                  if (tbItem.isCompanion) it.isCompanion = true;
+                  if (tbItem.companionType && !it.companionType) it.companionType = tbItem.companionType;
+                  if (tbItem.companionNote && !it.companionNote) it.companionNote = tbItem.companionNote;
+                  if (tbItem.companionStoryline && !it.companionStoryline) it.companionStoryline = tbItem.companionStoryline;
+                  if (tbItem.precedingShowId && !it.precedingShowId) it.precedingShowId = tbItem.precedingShowId;
+                  if (tbItem.kind && !it.kind) it.kind = tbItem.kind;
+                  if (tbItem.type && it.type === 'episode' && tbItem.type !== 'episode') it.type = tbItem.type;
+                }
+              });
+            }
           } catch {}
         }
       } else if (trackingRaw) {

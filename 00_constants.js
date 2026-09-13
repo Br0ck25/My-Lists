@@ -34,7 +34,7 @@ const CURATED_RECOMMENDATION_LIMIT = 40;
 const PUBLISHED_LIST_ITEMS_MAX = 10000;
 const PUBLISHED_LIST_NAME_MAX = 200;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
-const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
+const SAVED_CONFIG_BYTES_MAX = 10 * 1024 * 1024;        // 10 MB of serialized JSON
 
 // --- Bounds on the AUTHENTICATED list write ----------------------------------
 //

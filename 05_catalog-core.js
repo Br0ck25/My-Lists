@@ -162,6 +162,10 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     }
   }
 
+  if (keys.adultContentFilter && Array.isArray(result) && result.length > 0) {
+    result = applyAdultContentFilterToMetas(result, keys.origin, entry);
+  }
+
   return result || [];
 }
 
@@ -598,11 +602,149 @@ function generateBadgedPosterSvg({ posterUrl, airDateText, bottomText, bottomBg,
 </svg>`;
 }
 
+function isAdultOrNsfw(item) {
+  if (!item) return false;
+  if (item.adult === true || item.isAdult === true) return true;
+  const cert = String(item.certification || item.ageRating || item.contentRating || '').toUpperCase().trim();
+  if (['NC-17', 'X', 'XXX', 'R18+', '18+', 'RX', 'TV-MA (ADULT)', 'TV-MA-S', 'ADULT'].includes(cert)) return true;
+  const genres = Array.isArray(item.genres)
+    ? item.genres.map((g) => (typeof g === 'string' ? g : g?.name || '').toLowerCase().trim())
+    : (typeof item.genres === 'string' ? item.genres.toLowerCase().split(',').map((g) => g.trim()) : []);
+  const nsfwTerms = ['adult', 'erotic', 'erotica', 'hentai', 'ecchi', 'porn', 'pornography', 'xxx', 'softcore', 'hardcore'];
+  if (genres.some((g) => nsfwTerms.some((t) => g === t || g.includes(t)))) return true;
+  const text = [item.name, item.title, item.showTitle, item.listName, item.franchise, item.user]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (text) {
+    const explicitPattern = /\b(hentai|porn|pornography|erotica|erotic|blowjob|creampie|gangbang|milf|dildo|masturbation|fetish|bdsm|softcore|hardcore|top wet girls|evil angel|brazzers|naughty america|wicked pictures|reality kings|jules jordan|sweet sinner)\b/i;
+    if (explicitPattern.test(text)) return true;
+  }
+  return false;
+}
+
+function generateSafePosterSvg({ title, year, type, certification }) {
+  const safeTitle = escapeXml(title || 'Untitled');
+  const safeYear = escapeXml(year ? String(year).slice(0, 4) : '');
+  const safeType = escapeXml(type ? (type.toLowerCase() === 'movie' ? 'MOVIE' : 'SERIES') : 'TITLE');
+  const safeCert = escapeXml(certification || 'AGE-FILTERED');
+  
+  const words = safeTitle.split(/\s+/);
+  const lines = [];
+  let currentLine = '';
+  for (const w of words) {
+    if ((currentLine + ' ' + w).trim().length <= 18) {
+      currentLine = (currentLine + ' ' + w).trim();
+    } else {
+      if (currentLine) lines.push(currentLine);
+      currentLine = w;
+    }
+  }
+  if (currentLine) lines.push(currentLine);
+  const displayLines = lines.slice(0, 4);
+  if (lines.length > 4) displayLines[3] += '...';
+  
+  const titleTextSpans = displayLines.map((l, i) => `<tspan x="250" dy="${i === 0 ? 0 : 44}">${l}</tspan>`).join('');
+  const titleStartY = 370 - ((displayLines.length - 1) * 22);
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="750" viewBox="0 0 500 750">
+  <defs>
+    <linearGradient id="safeBgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#141824"/>
+      <stop offset="50%" stop-color="#0f111a"/>
+      <stop offset="100%" stop-color="#07090e"/>
+    </linearGradient>
+    <linearGradient id="shieldGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <filter id="safeShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.6"/>
+    </filter>
+  </defs>
+  <rect width="500" height="750" fill="url(#safeBgGrad)"/>
+  <rect x="15" y="15" width="470" height="720" rx="16" ry="16" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+  
+  <!-- Safe Badge Pill at top -->
+  <g transform="translate(250, 60)" filter="url(#safeShadow)">
+    <rect x="-140" y="0" width="280" height="42" rx="21" ry="21" fill="url(#shieldGrad)"/>
+    <text x="0" y="27" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="800" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
+  </g>
+
+  <!-- Central Shield / Film Icon -->
+  <g transform="translate(250, 200)" filter="url(#safeShadow)">
+    <circle cx="0" cy="0" r="54" fill="rgba(16,185,129,0.12)" stroke="#10b981" stroke-width="3"/>
+    <!-- Lock / Shield Vector -->
+    <path d="M-18,-10 C-18,-20 18,-20 18,-10 L18,8 C18,22 0,32 0,32 C0,32 -18,22 -18,8 Z" fill="#10b981"/>
+    <circle cx="0" cy="3" r="4" fill="#0f111a"/>
+    <path d="M-2,3 L2,3 L1,11 L-1,11 Z" fill="#0f111a"/>
+  </g>
+
+  <!-- Title -->
+  <text x="250" y="${titleStartY}" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="34" font-weight="800" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
+    ${titleTextSpans}
+  </text>
+
+  <!-- Metadata: Type & Year -->
+  <g transform="translate(250, 560)">
+    <rect x="-90" y="-18" width="180" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
+    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="700" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
+      ${safeType}${safeYear ? ' • ' + safeYear : ''}
+    </text>
+  </g>
+
+  <!-- Certification / Footer -->
+  <g transform="translate(250, 680)">
+    <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
+      ${safeCert ? safeCert + ' • ' : ''}AGE-APPROPRIATE FILTER ACTIVE
+    </text>
+  </g>
+</svg>`;
+}
+
+function getSafePosterUrl(origin, { title, year, type, certification }) {
+  const params = new URLSearchParams();
+  if (title) params.set("title", title);
+  if (year) params.set("year", year);
+  if (type) params.set("type", type);
+  if (certification) params.set("cert", certification);
+  if (origin) {
+    return `${origin.replace(/\/+$/, "")}/api/safe-poster?${params.toString()}`;
+  }
+  return `/api/safe-poster?${params.toString()}`;
+}
+
+function applyAdultContentFilterToMetas(metas, origin, parentEntry) {
+  if (!Array.isArray(metas) || !metas.length) return metas;
+  const isParentAdult = parentEntry && isAdultOrNsfw(parentEntry);
+  const tot = metas.totalItems;
+  const mapped = metas.map((m) => {
+    if (!m) return m;
+    const isAdult = isParentAdult || isAdultOrNsfw(m);
+    if (!isAdult) return m;
+    const safeUrl = getSafePosterUrl(origin, {
+      title: m.name || m.title || '',
+      year: m.releaseInfo || (m.year ? String(m.year) : ''),
+      type: m.type || m.mediatype || '',
+      certification: m.certification || m.ageRating || m.contentRating || ''
+    });
+    return {
+      ...m,
+      adult: true,
+      isAdult: true,
+      poster: safeUrl,
+      isAdultPosterFiltered: true,
+    };
+  });
+  mapped.totalItems = tot;
+  return mapped;
+}
+
 function applyBadgedPostersToMetas(metas, origin) {
   if (!Array.isArray(metas) || !metas.length || !origin) return metas;
   const tot = metas.totalItems;
   const mapped = metas.map((m) => {
-    if (!m || !m.poster || m.poster.startsWith("data:image/svg") || m.poster.includes("/api/poster-badge")) return m;
+    if (!m || !m.poster || m.poster.startsWith("data:image/svg") || m.poster.includes("/api/poster-badge") || m.poster.includes("/api/safe-poster")) return m;
     const isPremiereEp = m.episodeNumber === 1 || m.episodeNum === 1 || (m.episodeNum == null && m.episodeNumber == null);
     const hasAired = m.airDate && typeof isEpisodeAired === "function" ? isEpisodeAired(m.airDate) : false;
     const hasPremiere = !!(m.isSeasonPremiere && isPremiereEp && !hasAired);
@@ -610,7 +752,8 @@ function applyBadgedPostersToMetas(metas, origin) {
     const finaleAired = m.seasonFinaleAirDate && typeof isEpisodeAired === "function" ? isEpisodeAired(m.seasonFinaleAirDate) : false;
     const hasFinaleDate = !!(m.seasonFinaleAirDate && !finaleAired);
     const hasAirDate = !!(m.airDate && !m.hideDateBadge && !hasAired);
-    if (!hasPremiere && !hasFinale && !hasFinaleDate && !hasAirDate) return m;
+    const hasCompanion = !!(m.isCompanion);
+    if (!hasPremiere && !hasFinale && !hasFinaleDate && !hasAirDate && !hasCompanion) return m;
 
     const params = new URLSearchParams();
     params.set("poster", m.poster);
@@ -620,6 +763,10 @@ function applyBadgedPostersToMetas(metas, origin) {
     if (hasPremiere) params.set("premiere", "1");
     if (hasFinale) params.set("finale", "1");
     if (hasFinaleDate) params.set("finaleDate", m.seasonFinaleAirDate);
+    if (hasCompanion) {
+      const compLabel = m.companionType === 'bridge_movie' ? 'Bridge Movie' : (m.companionType === 'sequel_movie' ? 'Sequel Film' : 'Storyline');
+      params.set("companion", compLabel);
+    }
 
     const badgedUrl = `${origin.replace(/\/+$/, "")}/api/poster-badge?${params.toString()}`;
     return {
@@ -1067,6 +1214,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
   
   try {
     let items;
+    let airingItems;
     if (env && env.DB) {
       if (slug === 'watch-history') {
         const rows = await env.DB.prepare(
@@ -1090,22 +1238,88 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
           }));
         }
       } else if (slug === 'continue-watching') {
-        const rows = await env.DB.prepare(
-          "SELECT * FROM continue_watching WHERE username = ? ORDER BY updated_at DESC LIMIT 100"
-        ).bind(username).all().then(r => r.results || []).catch(() => null);
+        const [rows, airingRows, fwRows] = await Promise.all([
+          env.DB.prepare(
+            "SELECT * FROM continue_watching WHERE username = ? ORDER BY updated_at DESC LIMIT 100"
+          ).bind(username).all().then(r => r.results || []).catch(() => null),
+          env.DB.prepare(
+            "SELECT * FROM airing_next WHERE username = ? ORDER BY air_date ASC LIMIT 100"
+          ).bind(username).all().then(r => r.results || []).catch(() => null),
+          env.DB.prepare(
+            "SELECT show_id FROM creator_show_states WHERE username = ? AND is_fully_watched = 1"
+          ).bind(username).all().then(r => r.results || []).catch(() => null),
+        ]);
+        const fullyWatchedSet = new Set((fwRows || []).map(r => String(r.show_id)));
         if (rows && rows.length) {
-          items = rows.map(r => ({
-            id: r.item_id,
-            showId: r.show_id,
-            type: "episode",
-            name: r.name || undefined,
-            poster: r.poster || undefined,
-            showTitle: r.show_title || undefined,
-            showPoster: r.show_poster || undefined,
-            seasonNum: r.season_num != null ? r.season_num : undefined,
-            episodeNum: r.episode_num != null ? r.episode_num : undefined,
-            updatedAt: r.updated_at,
-          }));
+          items = rows.filter(r => {
+            if (!r) return false;
+            const sid = String(r.show_id || '');
+            const base = sid.split(':')[0];
+            const isComp = r.show_title && r.show_title.startsWith('COMPANION:');
+            if (!isComp && (fullyWatchedSet.has(sid) || (base && fullyWatchedSet.has(base)))) return false;
+            return true;
+          }).map(r => {
+            let isCompanion = undefined;
+            let companionType = undefined;
+            let companionNote = undefined;
+            let companionStoryline = undefined;
+            let precedingShowId = undefined;
+            let showTitle = r.show_title || undefined;
+            let kind = undefined;
+            let type = (r.season_num == null && r.episode_num == null && !r.show_title) ? "movie" : "episode";
+            if (r.show_title && r.show_title.startsWith("COMPANION:")) {
+              try {
+                const compMeta = JSON.parse(r.show_title.slice(10));
+                isCompanion = true;
+                companionType = compMeta.companionType;
+                companionNote = compMeta.companionNote;
+                companionStoryline = compMeta.companionStoryline;
+                precedingShowId = compMeta.precedingShowId;
+                showTitle = compMeta.showTitle || undefined;
+                kind = compMeta.kind || (compMeta.type === 'movie' ? 'movie' : undefined);
+                type = compMeta.type || (kind === 'movie' ? 'movie' : 'episode');
+              } catch {}
+            } else if (type === "movie") {
+              kind = "movie";
+            }
+            return {
+              id: r.item_id,
+              showId: (type === 'movie' && !r.season_num && !r.episode_num && !showTitle) ? undefined : r.show_id,
+              type: type,
+              kind: kind,
+              name: r.name || undefined,
+              poster: r.poster || undefined,
+              showTitle: showTitle,
+              showPoster: r.show_poster || undefined,
+              seasonNum: r.season_num != null ? r.season_num : undefined,
+              episodeNum: r.episode_num != null ? r.episode_num : undefined,
+              updatedAt: r.updated_at,
+              isCompanion: isCompanion,
+              companionType: companionType,
+              companionNote: companionNote,
+              companionStoryline: companionStoryline,
+              precedingShowId: precedingShowId,
+            };
+          });
+          if (airingRows && airingRows.length) {
+            airingItems = airingRows.map(r => ({
+              id: r.item_id,
+              showId: r.show_id,
+              type: "episode",
+              name: r.name || undefined,
+              poster: r.poster || undefined,
+              showTitle: r.show_title || undefined,
+              showPoster: r.show_poster || undefined,
+              seasonNum: r.season_num != null ? r.season_num : undefined,
+              episodeNum: r.episode_num != null ? r.episode_num : undefined,
+              airDate: r.air_date || undefined,
+              isSeasonPremiere: r.is_season_premiere ? true : undefined,
+              isSeasonFinale: r.is_season_finale ? true : undefined,
+              seasonFinaleAirDate: r.season_finale_air_date || undefined,
+              seasonFinaleEpisodeNumber: r.season_finale_episode_number != null ? r.season_finale_episode_number : undefined,
+              updatedAt: r.updated_at,
+            }));
+          }
         }
       } else if (slug === 'airing-next') {
         const rows = await env.DB.prepare(
@@ -1141,15 +1355,60 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       if (trackingRaw) {
         const trackingBlob = JSON.parse(trackingRaw);
         items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
+        if (slug === 'continue-watching') {
+          airingItems = trackingBlob.airingNext || [];
+          const fwList = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds.map(String) : [];
+          if (fwList.length && Array.isArray(items)) {
+            const fwSet = new Set(fwList);
+            items = items.filter(it => {
+              if (!it) return false;
+              if (it.isCompanion) return true;
+              const sid = String(it.showId || it.id || '');
+              const base = sid.split(':')[0];
+              if (fwSet.has(sid) || (base && fwSet.has(base))) return false;
+              return true;
+            });
+          }
+        }
       } else {
         const blobStr = await env.CONFIGS.get('creatorsync:' + username);
         if (!blobStr) return [];
         const blob = JSON.parse(blobStr);
         items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
+        if (slug === 'continue-watching') {
+          airingItems = blob.airingNext || [];
+          const fwList = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds.map(String) : [];
+          if (fwList.length && Array.isArray(items)) {
+            const fwSet = new Set(fwList);
+            items = items.filter(it => {
+              if (!it) return false;
+              if (it.isCompanion) return true;
+              const sid = String(it.showId || it.id || '');
+              const base = sid.split(':')[0];
+              if (fwSet.has(sid) || (base && fwSet.has(base))) return false;
+              return true;
+            });
+          }
+        }
       }
     }
     if (!items || !items.length) return [];
     
+    const airingByShowId = new Map();
+    const airingByBaseId = new Map();
+    const airingByTitle = new Map();
+    if (slug === 'continue-watching' && Array.isArray(airingItems) && airingItems.length) {
+      airingItems.forEach(an => {
+        if (!an) return;
+        const sid = String(an.showId || an.id || '');
+        if (sid && !airingByShowId.has(sid)) airingByShowId.set(sid, an);
+        const base = sid.split(':')[0];
+        if (base && !airingByBaseId.has(base)) airingByBaseId.set(base, an);
+        const title = String(an.showTitle || an.title || an.name || '').toLowerCase().trim();
+        if (title && !airingByTitle.has(title)) airingByTitle.set(title, an);
+      });
+    }
+
     const mappedItems = [];
     
     items.forEach(it => {
@@ -1168,8 +1427,9 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       //
       // A real movie entry has none of these fields, so it still falls
       // through to the type/kind check exactly as before.
-      const hasSeriesShape = !!(it.showId || it.showTitle || it.seasonNum != null || it.episodeNum != null);
-      const isMovie = !hasSeriesShape && (it.kind === 'movie' || it.type === 'movie');
+      const isCompanionMovie = !!(it.isCompanion && (it.kind === 'movie' || it.type === 'movie' || it.companionType === 'bridge_movie' || it.companionType === 'sequel_movie'));
+      const hasSeriesShape = !isCompanionMovie && !!(it.showId || it.showTitle || it.seasonNum != null || it.episodeNum != null);
+      const isMovie = isCompanionMovie || (!hasSeriesShape && (it.kind === 'movie' || it.type === 'movie'));
       
       // Filter out types we don't want in this catalog
       if (targetType === 'movie' && !isMovie) return;
@@ -1181,6 +1441,64 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         : (it.showPoster ||
            (showId && showId.startsWith('tt') ? 'https://images.metahub.space/poster/medium/' + showId + '/img' : '') ||
            it.poster);
+
+      let effectiveAirDate = it.airDate || undefined;
+      let isSeasonPremiere = it.isSeasonPremiere ? true : undefined;
+      let isSeasonFinale = it.isSeasonFinale ? true : undefined;
+      let seasonFinaleAirDate = it.seasonFinaleAirDate || undefined;
+      let seasonFinaleEpisodeNumber = it.seasonFinaleEpisodeNumber != null ? it.seasonFinaleEpisodeNumber : undefined;
+
+      if (slug === 'continue-watching' && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
+        let airingMatch = null;
+        if (it.showId && airingByShowId.has(String(it.showId))) airingMatch = airingByShowId.get(String(it.showId));
+        else if (it.id && airingByShowId.has(String(it.id))) airingMatch = airingByShowId.get(String(it.id));
+        else {
+          const base = String(it.showId || it.id || '').split(':')[0];
+          if (base && airingByBaseId.has(base)) airingMatch = airingByBaseId.get(base);
+          else {
+            const title = String(it.showTitle || it.title || it.name || '').toLowerCase().trim();
+            if (title && airingByTitle.has(title)) airingMatch = airingByTitle.get(title);
+          }
+        }
+
+        if (airingMatch) {
+          const isOlderSeason = !!(airingMatch.seasonNum != null && it.seasonNum != null && it.seasonNum < airingMatch.seasonNum);
+          if (!isOlderSeason) {
+            const isSameSeason = !!(airingMatch.seasonNum != null && it.seasonNum != null && it.seasonNum === airingMatch.seasonNum);
+            const isSameEpisode = (!it.seasonNum || !airingMatch.seasonNum || it.seasonNum === airingMatch.seasonNum) &&
+              (!it.episodeNum || !airingMatch.episodeNum || it.episodeNum === airingMatch.episodeNum);
+            if (!effectiveAirDate && isSameEpisode && airingMatch.airDate) {
+              effectiveAirDate = airingMatch.airDate;
+            }
+            const currentEpNum = it.episodeNum != null ? it.episodeNum : (isSameEpisode ? airingMatch.episodeNum : null);
+            const hasLaterAiringEp = !!(isSameSeason && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
+            const epHasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' && isEpisodeAired(effectiveAirDate));
+            if (isSeasonPremiere == null) {
+              const isPremiere = !epHasAired && (currentEpNum === 1 || (currentEpNum == null && (it.isSeasonPremiere || (isSameEpisode && airingMatch.isSeasonPremiere))));
+              if (isPremiere) isSeasonPremiere = true;
+            } else if (epHasAired) {
+              isSeasonPremiere = undefined;
+            }
+            if (isSeasonFinale == null) {
+              const isFinale = !!(it.isSeasonFinale || (isSameEpisode && airingMatch.isSeasonFinale) || (airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
+              if (isFinale) isSeasonFinale = true;
+            }
+            if (!seasonFinaleAirDate) {
+              seasonFinaleAirDate = it.seasonFinaleAirDate || (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : undefined));
+            }
+            if (seasonFinaleEpisodeNumber == null) {
+              seasonFinaleEpisodeNumber = airingMatch.seasonFinaleEpisodeNumber;
+            }
+          } else {
+            effectiveAirDate = undefined;
+            isSeasonPremiere = undefined;
+            isSeasonFinale = undefined;
+            seasonFinaleAirDate = undefined;
+            seasonFinaleEpisodeNumber = undefined;
+          }
+        }
+      }
+
       const mapped = {
         id: isMovie ? (it.imdbId || it.id) : (showId || it.id),
         showId: showId || undefined,
@@ -1191,12 +1509,21 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         name: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
         poster: showPoster,
         releaseInfo: it.year || undefined,
-        airDate: it.airDate || undefined,
+        airDate: effectiveAirDate,
         isUnaired: it.isUnaired ? true : undefined,
-        isSeasonPremiere: it.isSeasonPremiere ? true : undefined,
-        isSeasonFinale: it.isSeasonFinale ? true : undefined,
-        seasonFinaleAirDate: it.seasonFinaleAirDate || undefined,
-        seasonFinaleEpisodeNumber: it.seasonFinaleEpisodeNumber || undefined,
+        isSeasonPremiere: isSeasonPremiere,
+        isSeasonFinale: isSeasonFinale,
+        seasonFinaleAirDate: seasonFinaleAirDate,
+        seasonFinaleEpisodeNumber: seasonFinaleEpisodeNumber,
+        isCompanion: it.isCompanion ? true : undefined,
+        companionType: it.companionType || undefined,
+        companionNote: it.companionNote || undefined,
+        companionStoryline: it.companionStoryline || undefined,
+        precedingShowId: it.precedingShowId || undefined,
+        adult: it.adult,
+        isAdult: it.isAdult,
+        certification: it.certification || it.ageRating || it.contentRating,
+        genres: it.genres,
       };
       
       if (!mapped.id) return;
@@ -1210,6 +1537,9 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       }
     });
     
+    if (keys && keys.adultContentFilter && Array.isArray(mappedItems) && mappedItems.length > 0) {
+      return applyAdultContentFilterToMetas(mappedItems, keys.origin, entry);
+    }
     return mappedItems;
   } catch (e) {
     return [];

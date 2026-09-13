@@ -78,7 +78,7 @@
       <div class="shelf-header" style="margin-bottom:8px;">
         <h2 class="shelf-title">Quick Add Popular Networks</h2>
       </div>
-      <p class="qa-shelf-sub">Instant 1-click TV channels with automatic daily episode rotation:</p>
+      <p class="qa-shelf-sub">Instant 1-click TV channels with up to 5,000 episodes, rotating 24 shows with 3 episodes every 24 hours:</p>
       <div class="channel-quick-grid">
         <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="A&amp;E" data-networkid="129">A&amp;E</button>
         <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="ABC" data-networkid="2">ABC</button>

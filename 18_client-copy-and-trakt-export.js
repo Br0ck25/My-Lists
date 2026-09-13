@@ -64,6 +64,82 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
   return items;
 }
 
+function getItemKey(it) {
+  if (!it) return '';
+  if (it.imdbId && String(it.imdbId).trim()) return String(it.imdbId).trim();
+  if (it.id && String(it.id).trim()) return String(it.id).trim();
+  if (it.tmdbId && String(it.tmdbId).trim()) return 'tmdb:' + String(it.tmdbId).trim();
+  const title = String(it.title || it.name || it.showTitle || '').toLowerCase().trim();
+  const year = String(it.year || '').trim();
+  return title ? (title + ':' + year) : '';
+}
+window.getItemKey = getItemKey;
+
+function performSmartListMerge(currentItems, baseItemIds, remoteItems, options) {
+  options = options || {};
+  const mirrorRemovals = !!options.mirrorRemovals;
+  const current = Array.isArray(currentItems) ? currentItems : [];
+  const remote = Array.isArray(remoteItems) ? remoteItems : [];
+  const baseList = Array.isArray(baseItemIds) ? baseItemIds.map(String) : [];
+
+  const currentKeys = new Set(current.map(getItemKey).filter(Boolean));
+  const baseSet = new Set(baseList);
+
+  // User removals: items that were in the base snapshot, but are not in current list
+  const userRemovedIds = new Set();
+  if (baseList.length > 0) {
+    baseList.forEach((id) => {
+      if (id && !currentKeys.has(id)) {
+        userRemovedIds.add(id);
+      }
+    });
+  }
+
+  // Merged items
+  const mergedItems = [];
+  const mergedKeys = new Set();
+
+  // 1. Keep all current items in their existing user-defined order
+  current.forEach((it) => {
+    const key = getItemKey(it);
+    // If mirroring remote removals and this item was in the base snapshot but dropped upstream, remove it
+    if (mirrorRemovals && baseSet.has(key)) {
+      const stillInRemote = remote.some((r) => getItemKey(r) === key);
+      if (!stillInRemote) return;
+    }
+    if (key) mergedKeys.add(key);
+    mergedItems.push(it);
+  });
+
+  // 2. Discover newly added remote items
+  let addedCount = 0;
+  remote.forEach((r) => {
+    const rKey = getItemKey(r);
+    if (!rKey) return;
+    // Do not resurrect items the user explicitly removed
+    if (userRemovedIds.has(rKey)) return;
+    // If it's already in the list, skip
+    if (mergedKeys.has(rKey)) return;
+
+    // If baseItemIds existed, verify it's a new remote item (not in base snapshot)
+    // Or if baseItemIds was empty, it's an item in remote not in current
+    if (baseList.length === 0 || !baseSet.has(rKey)) {
+      mergedItems.push(r);
+      mergedKeys.add(rKey);
+      addedCount++;
+    }
+  });
+
+  const newBaseItemIds = remote.map(getItemKey).filter(Boolean);
+
+  return {
+    items: mergedItems,
+    addedCount: addedCount,
+    newBaseItemIds: newBaseItemIds,
+  };
+}
+window.performSmartListMerge = performSmartListMerge;
+
 // Saves a fresh Custom List directly -- to the account if signed in
 // (mirroring confirmSaveAsCreator's /api/creator/lists/save call, Public
 // by default same as that picker's own default), to this browser's local
@@ -73,22 +149,34 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
 async function saveItemsAsNewCustomList(name, type, items, visibility, extraProps) {
   visibility = visibility === 'private' ? 'private' : 'public';
   extraProps = extraProps || {};
+  const sourceUrl = extraProps.sourceUrl || '';
+  const synced = extraProps.synced != null ? !!extraProps.synced : !!sourceUrl;
+  const lastSyncedAt = Number.isFinite(Number(extraProps.lastSyncedAt))
+    ? Number(extraProps.lastSyncedAt)
+    : (synced ? Date.now() : undefined);
+  const baseItemIds = Array.isArray(extraProps.baseItemIds)
+    ? extraProps.baseItemIds
+    : (synced ? items.map(getItemKey).filter(Boolean) : undefined);
+
   if (activeCreator) {
     const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     try {
+      const payload = {
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        name: name,
+        type: type,
+        items: items,
+        visibility: visibility,
+        sourceUrl: sourceUrl,
+        synced: synced,
+      };
+      if (lastSyncedAt !== undefined) payload.lastSyncedAt = lastSyncedAt;
+      if (baseItemIds !== undefined) payload.baseItemIds = baseItemIds;
       const res = await fetch(ORIGIN + '/api/creator/lists/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          creatorName: activeCreator.creatorName,
-          creatorKey: creatorKey,
-          name: name,
-          type: type,
-          items: items,
-          visibility: visibility,
-          sourceUrl: extraProps.sourceUrl || '',
-          synced: !!extraProps.sourceUrl,
-        }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (!data.ok) return { ok: false, error: data.error || 'unknown error' };
@@ -112,11 +200,13 @@ async function saveItemsAsNewCustomList(name, type, items, visibility, extraProp
     type: type,
     items: items,
     visibility: visibility,
-    sourceUrl: extraProps.sourceUrl || '',
-    synced: !!extraProps.sourceUrl,
+    sourceUrl: sourceUrl,
+    synced: synced,
     createdAt: now,
     updatedAt: now
   };
+  if (lastSyncedAt !== undefined) map[slug].lastSyncedAt = lastSyncedAt;
+  if (baseItemIds !== undefined) map[slug].baseItemIds = baseItemIds;
   const persisted = saveLocalCustomListsMap(map);
   if (!persisted) {
     return { ok: false, error: 'localStorage save failed (likely full \u2014 try clearing out some old Custom Lists, or importing fewer categories at once)' };
@@ -202,10 +292,17 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
   const baseListName = name;
   const created = [];
 
+  const syncProps = Object.assign({}, extraProps);
+  if (syncProps.sourceUrl) {
+    syncProps.synced = true;
+    syncProps.lastSyncedAt = Date.now();
+    syncProps.baseItemIds = allItems.map(getItemKey).filter(Boolean);
+  }
+
   for (let i = 0; i * CUSTOM_LIST_CHUNK_SIZE < allItems.length; i++) {
     const chunk = allItems.slice(i * CUSTOM_LIST_CHUNK_SIZE, (i + 1) * CUSTOM_LIST_CHUNK_SIZE);
     const listName = i === 0 ? baseListName : baseListName + ' ' + (i + 1);
-    const result = await saveItemsAsNewCustomList(listName, finalType, chunk, 'private', extraProps);
+    const result = await saveItemsAsNewCustomList(listName, finalType, chunk, 'private', syncProps);
     if (result.ok) {
       created.push({ name: listName, count: chunk.length });
     } else {
@@ -257,6 +354,168 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
     alert(msg);
   }
 }
+
+async function syncCustomListWithExternalSource(slug, btn, options) {
+  options = options || {};
+  const isSilent = !!options.silent;
+  if (!slug) return { ok: false, error: 'missing-slug' };
+
+  let listMeta = null;
+  let isServerList = false;
+  if (typeof activeCreator !== 'undefined' && activeCreator && Array.isArray(lastCreatorListsData)) {
+    listMeta = lastCreatorListsData.find((l) => l && l.slug === slug);
+    if (listMeta) isServerList = true;
+  }
+  const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  if (!listMeta) {
+    listMeta = localMap[slug];
+    if (listMeta) isServerList = false;
+  }
+  if (!listMeta) {
+    if (!isSilent) {
+      if (typeof showAppAlert === 'function') showAppAlert('Sync Error', 'Could not find list: ' + slug, false);
+      else alert('Could not find list: ' + slug);
+    }
+    return { ok: false, error: 'list-not-found' };
+  }
+
+  const sourceUrl = listMeta.sourceUrl || (localMap[slug] && localMap[slug].sourceUrl);
+  if (!sourceUrl) {
+    if (!isSilent) {
+      if (typeof showAppAlert === 'function') showAppAlert('Sync Error', 'This list does not have an external source URL.', false);
+      else alert('This list does not have an external source URL.');
+    }
+    return { ok: false, error: 'no-source-url' };
+  }
+
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Syncing\u2026';
+  }
+
+  try {
+    const listType = listMeta.type || (localMap[slug] && localMap[slug].type) || 'mixed';
+    const isSingle = listType === 'movie' || listType === 'series';
+    const typesToFetch = isSingle ? [listType] : ['movie', 'series'];
+    const remoteItems = [];
+
+    for (const type of typesToFetch) {
+      const typeLabel = type === 'movie' ? 'Movies' : 'Shows';
+      const items = await fetchAllItemsForList(sourceUrl, type, btn, !isSingle ? typeLabel : '');
+      if (Array.isArray(items)) {
+        items.forEach((it) => {
+          remoteItems.push({
+            id: it.imdbId || it.id,
+            imdbId: it.imdbId || (String(it.id || '').startsWith('tt') ? it.id : ''),
+            tmdbId: it.tmdbId || '',
+            title: it.title || it.name || '',
+            year: it.year || '',
+            poster: it.poster || null,
+            showTitle: it.showTitle || null,
+            type: it.type || (it.seasonNum != null ? 'episode' : (type === 'series' ? 'series' : 'movie')),
+            seasonNum: it.seasonNum != null ? it.seasonNum : (it.season != null ? it.season : null),
+            episodeNum: it.episodeNum != null ? it.episodeNum : (it.episode != null ? it.episode : null),
+          });
+        });
+      }
+    }
+
+    const currentItems = Array.isArray(listMeta.items) ? listMeta.items : ((localMap[slug] && Array.isArray(localMap[slug].items)) ? localMap[slug].items : []);
+    const baseItemIds = Array.isArray(listMeta.baseItemIds) ? listMeta.baseItemIds : ((localMap[slug] && Array.isArray(localMap[slug].baseItemIds)) ? localMap[slug].baseItemIds : null);
+
+    const mergeResult = performSmartListMerge(currentItems, baseItemIds, remoteItems, options);
+    const now = Date.now();
+
+    // Persist locally
+    if (localMap[slug]) {
+      localMap[slug].items = mergeResult.items;
+      localMap[slug].baseItemIds = mergeResult.newBaseItemIds;
+      localMap[slug].lastSyncedAt = now;
+      localMap[slug].updatedAt = now;
+      localMap[slug].synced = true;
+      localMap[slug].sourceUrl = sourceUrl;
+      saveLocalCustomListsMap(localMap);
+    }
+
+    // Persist to creator account if signed in
+    if (typeof activeCreator !== 'undefined' && activeCreator) {
+      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+      if (creatorKey) {
+        const body = {
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          slug: slug,
+          name: listMeta.name,
+          type: listType,
+          items: mergeResult.items,
+          visibility: listMeta.visibility || 'private',
+          sourceUrl: sourceUrl,
+          synced: true,
+          lastSyncedAt: now,
+          baseItemIds: mergeResult.newBaseItemIds,
+        };
+        if (Number.isFinite(listMeta.updatedAt)) body.expectedUpdatedAt = listMeta.updatedAt;
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const resData = await res.json();
+        if (resData && resData.ok && Number.isFinite(resData.updatedAt)) {
+          listMeta.updatedAt = resData.updatedAt;
+        }
+      }
+    }
+
+    // Update in-memory metadata
+    listMeta.items = mergeResult.items;
+    listMeta.itemCount = mergeResult.items.length;
+    listMeta.baseItemIds = mergeResult.newBaseItemIds;
+    listMeta.lastSyncedAt = now;
+    listMeta.synced = true;
+    listMeta.sourceUrl = sourceUrl;
+
+    // Sync to catalog shelf rows if added to user's catalogs
+    if (typeof syncCustomListToCatalogRows === 'function') {
+      syncCustomListToCatalogRows(slug, mergeResult.items, listMeta.name, listType);
+    }
+
+    // Refresh dashboard UI if function exists
+    if (typeof renderCreatorDashboard === 'function') {
+      renderCreatorDashboard({ silent: true });
+    }
+
+    if (!isSilent) {
+      const msg = mergeResult.addedCount > 0
+        ? 'Synced "' + listMeta.name + '": ' + mergeResult.addedCount + ' new item' + (mergeResult.addedCount === 1 ? '' : 's') + ' added.'
+        : 'Synced "' + listMeta.name + '": already up to date with external link.';
+      if (typeof showAddedToast === 'function') {
+        showAddedToast(msg);
+      } else if (typeof showAppAlert === 'function') {
+        showAppAlert('List Synced', msg, false);
+      } else {
+        alert(msg);
+      }
+    }
+
+    return { ok: true, addedCount: mergeResult.addedCount, totalCount: mergeResult.items.length };
+  } catch (err) {
+    console.error('syncCustomListWithExternalSource error:', err);
+    if (!isSilent) {
+      const errMsg = 'Could not sync list: ' + (err.message || 'network error');
+      if (typeof showAppAlert === 'function') showAppAlert('Sync Error', errMsg, false);
+      else alert(errMsg);
+    }
+    return { ok: false, error: err.message || 'sync-failed' };
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel || 'Sync';
+    }
+  }
+}
+window.syncCustomListWithExternalSource = syncCustomListWithExternalSource;
 
 // Walks the connected Trakt account's full watch history (movies, then
 // episodes) via /api/trakt-history-raw and adds every item to Watch

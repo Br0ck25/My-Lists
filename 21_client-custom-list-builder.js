@@ -556,6 +556,12 @@ async function saveCreatorListEdit(name) {
       items: customListDraftItems,
       visibility: visibility,
     };
+    if (cached) {
+      if (cached.sourceUrl) body.sourceUrl = cached.sourceUrl;
+      if (cached.synced != null) body.synced = cached.synced;
+      if (cached.lastSyncedAt != null) body.lastSyncedAt = cached.lastSyncedAt;
+      if (cached.baseItemIds) body.baseItemIds = cached.baseItemIds;
+    }
     if (baseline !== null) body.expectedUpdatedAt = baseline;
     const res = await fetch(ORIGIN + '/api/creator/lists/save', {
       method: 'POST',
@@ -641,6 +647,12 @@ async function saveLocalCustomListEdit(name) {
     createdAt: existing ? existing.createdAt : Date.now(),
     updatedAt: Date.now(),
   };
+  if (existing) {
+    if (existing.sourceUrl) map[slug].sourceUrl = existing.sourceUrl;
+    if (existing.synced != null) map[slug].synced = existing.synced;
+    if (existing.lastSyncedAt != null) map[slug].lastSyncedAt = existing.lastSyncedAt;
+    if (existing.baseItemIds) map[slug].baseItemIds = existing.baseItemIds;
+  }
   saveLocalCustomListsMap(map);
   if (slug === 'watchlist') {
     if (typeof pushTrackingSync === 'function') pushTrackingSync();
@@ -684,6 +696,18 @@ async function saveLocalCustomListEdit(name) {
         items: customListDraftItems,
         visibility: visibility,
       };
+      if (existing) {
+        if (existing.sourceUrl) target.sourceUrl = existing.sourceUrl;
+        if (existing.synced != null) target.synced = existing.synced;
+        if (existing.lastSyncedAt != null) target.lastSyncedAt = existing.lastSyncedAt;
+        if (existing.baseItemIds) target.baseItemIds = existing.baseItemIds;
+      }
+      if (cached) {
+        if (cached.sourceUrl && !target.sourceUrl) target.sourceUrl = cached.sourceUrl;
+        if (cached.synced != null && target.synced == null) target.synced = cached.synced;
+        if (cached.lastSyncedAt != null && target.lastSyncedAt == null) target.lastSyncedAt = cached.lastSyncedAt;
+        if (cached.baseItemIds && !target.baseItemIds) target.baseItemIds = cached.baseItemIds;
+      }
       if (cached && Number.isFinite(cached.updatedAt)) target.updatedAt = cached.updatedAt;
       mirror = await saveCreatorListWithBaseline(target, null, null);
       if (mirror && mirror.ok) {
@@ -1194,12 +1218,26 @@ function refreshWatchBadge(id, type) {
 // progress are mutually exclusive, so marking one clears the other.
 function setShowFullyWatched(showId, isFullyWatched) {
   if (!window._fullyWatchedShowIds) window._fullyWatchedShowIds = new Set();
-  const had = window._fullyWatchedShowIds.has(showId);
+  const had = window._fullyWatchedShowIds.has(String(showId));
+  const d = window._currentItemDetails;
+  const idsToMutate = new Set([String(showId)]);
+  if (d && (String(d.id) === String(showId) || String(d.imdbId) === String(showId) || String(d.tmdbId) === String(showId) || ('tmdb:' + d.tmdbId) === String(showId))) {
+    if (d.id) idsToMutate.add(String(d.id));
+    if (d.imdbId) idsToMutate.add(String(d.imdbId));
+    if (d.tmdbId) {
+      idsToMutate.add(String(d.tmdbId));
+      idsToMutate.add('tmdb:' + d.tmdbId);
+    }
+  }
   if (isFullyWatched) {
-    window._fullyWatchedShowIds.add(showId);
-    if (window._inProgressShowIds) window._inProgressShowIds.delete(showId);
+    idsToMutate.forEach((id) => {
+      window._fullyWatchedShowIds.add(id);
+      if (window._inProgressShowIds) window._inProgressShowIds.delete(id);
+    });
   } else {
-    window._fullyWatchedShowIds.delete(showId);
+    idsToMutate.forEach((id) => {
+      window._fullyWatchedShowIds.delete(id);
+    });
   }
   if (had !== isFullyWatched) {
     try {
@@ -1596,6 +1634,10 @@ window.toggleWatchStatus = function(id, type, name, poster) {
     if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
       updateSeasonWatchedButton(window._currentSeasonNum);
     }
+  } else if (type === 'movie' && existingIdx < 0) {
+    if (typeof advanceCompanionOnMovieWatched === 'function') {
+      advanceCompanionOnMovieWatched({ id, type, name, poster }).catch(() => {});
+    }
   }
   
   // Re-render UI
@@ -1680,7 +1722,20 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
       }
     });
 
-    list.items = list.items.filter(it => !removeIds.has(String(it.id)));
+    list.items = list.items.filter((it) => {
+      if (!it) return false;
+      const itId = String(it.id);
+      if (removeIds.has(itId)) return false;
+      if (it.imdbId && removeIds.has(String(it.imdbId))) return false;
+      if (it.tmdbId && (removeIds.has(String(it.tmdbId)) || removeIds.has('tmdb:' + it.tmdbId))) return false;
+      if (removeCompositeKeys.has(itId)) return false;
+      if (it.seasonNum != null && it.episodeNum != null) {
+        if (it.showId && removeCompositeKeys.has(String(it.showId) + ':' + it.seasonNum + ':' + it.episodeNum)) return false;
+        if (it.imdbId && removeCompositeKeys.has(String(it.imdbId) + ':' + it.seasonNum + ':' + it.episodeNum)) return false;
+        if (it.showTitle && removeCompositeKeys.has(String(it.showTitle) + ':' + it.seasonNum + ':' + it.episodeNum)) return false;
+      }
+      return true;
+    });
     window._rawWatchHistoryItems = list.items;
     removeIds.forEach(id => {
       if (window._watchedItemIds) {
@@ -1779,17 +1834,25 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
 // blue-checkmark badge.
 window.markShowWatched = async function(imdbId) {
   const d = window._currentItemDetails;
-  if (!d || !d.id || String(d.id) !== String(imdbId) || !d.seasonsData) return;
+  if (!d || !d.seasonsData) return;
+  const matchesId = !imdbId || (d.id && String(d.id) === String(imdbId)) || (d.imdbId && String(d.imdbId) === String(imdbId)) || (d.tmdbId && String(d.tmdbId) === String(imdbId));
+  if (!matchesId) return;
 
   const btn = document.getElementById('btnMarkShowWatched');
   const seasons = d.seasonsData.filter(s => s.season_number !== 0);
   if (!seasons.length) return;
 
-  // Capture intent from the button's own state before it's disabled/
-  // relabeled below -- see toggleBatchWatchStatus's forceUnwatch comment
-  // for why this is passed through explicitly rather than re-derived from
-  // window._watchedItemIds after the fresh TMDB fetch below.
-  const wasFullyWatched = window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(imdbId));
+  // Capture intent directly from the button's own state before it's disabled/
+  // relabeled below -- if the button says "Unwatched" or has class "secondary",
+  // the user's explicit intent is to unwatch the show.
+  const wasFullyWatched = btn
+    ? (btn.classList.contains('secondary') || btn.innerHTML.includes('Unwatched'))
+    : (window._fullyWatchedShowIds && (
+        window._fullyWatchedShowIds.has(String(imdbId)) ||
+        (d.id && window._fullyWatchedShowIds.has(String(d.id))) ||
+        (d.imdbId && window._fullyWatchedShowIds.has(String(d.imdbId))) ||
+        (d.tmdbId && (window._fullyWatchedShowIds.has(String(d.tmdbId)) || window._fullyWatchedShowIds.has('tmdb:' + d.tmdbId)))
+      ));
 
   if (btn) {
     btn.disabled = true;
@@ -1850,24 +1913,83 @@ window.markShowWatched = async function(imdbId) {
   btn.disabled = false;
 
   if (!allEpisodes.length) {
-    const stillFullyWatched = window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(imdbId));
     if (failedSeasons > 0) {
       btn.innerHTML = "Couldn't load episodes -- try again";
     } else {
-      btn.innerHTML = stillFullyWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched';
+      btn.innerHTML = wasFullyWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched';
     }
     return;
   }
 
   const result = window.toggleBatchWatchStatus(allEpisodes, wasFullyWatched);
   const nowWatched = result.nowWatched;
-  setShowFullyWatched(String(imdbId), nowWatched);
+
+  const allShowAliases = new Set([String(imdbId)]);
+  if (d.id) allShowAliases.add(String(d.id));
+  if (d.imdbId) allShowAliases.add(String(d.imdbId));
+  if (d.tmdbId) {
+    allShowAliases.add(String(d.tmdbId));
+    allShowAliases.add('tmdb:' + d.tmdbId);
+  }
+
+  allShowAliases.forEach((alias) => {
+    setShowFullyWatched(alias, nowWatched);
+    setShowInProgress(alias, false);
+  });
+
+  // Synchronously update Continue Watching so the completed show is immediately evicted
+  // and any storyline sequel/companion is queued without waiting on background season fetches:
+  if (typeof withCwCommitLock === 'function') {
+    await withCwCommitLock(() => {
+      const map = loadLocalCustomLists();
+      const cwList = getOrCreateContinueWatchingList();
+      const isShowItem = (it) => {
+        if (!it) return false;
+        const itShowId = String(it.showId || '');
+        const itImdbId = String(it.imdbId || '');
+        const itId = String(it.id || '');
+        if (allShowAliases.has(itShowId) || allShowAliases.has(itImdbId) || allShowAliases.has(itId)) return true;
+        const base = itId.split(':')[0];
+        if (base && allShowAliases.has(base)) return true;
+        return false;
+      };
+
+      if (nowWatched) {
+        // Evict any entry for this completed show from Continue Watching
+        cwList.items = (cwList.items || []).filter((it) => !isShowItem(it));
+        // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
+        let companion = null;
+        for (const alias of allShowAliases) {
+          if (typeof findCompanionShowConclusion === 'function') {
+            companion = findCompanionShowConclusion(alias);
+          }
+          if (companion) break;
+        }
+        if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
+          cwList.items.unshift(companion);
+        }
+      } else {
+        // If unwatching the whole show, remove any companion queued for this show
+        cwList.items = (cwList.items || []).filter((it) => {
+          if (!it) return false;
+          if (it.precedingShowId && allShowAliases.has(String(it.precedingShowId))) return false;
+          return true;
+        });
+      }
+
+      map['continue-watching'] = cwList;
+      cwList.updatedAt = Date.now();
+      saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    });
+  }
   if (nowWatched) {
-    btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched';
+    btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched';
     btn.classList.remove('primary');
     btn.classList.add('secondary');
   } else {
-    btn.innerHTML = 'Mark Whole Show Watched';
+    btn.innerHTML = 'Mark Show Watched';
     btn.classList.remove('secondary');
     btn.classList.add('primary');
   }
@@ -1949,6 +2071,14 @@ window.addItemsToWatchHistory = async function(items, skipExternalSync = false) 
   // fire while most of the batch is still mid-flight, and cwSucceeded/
   // cwTotal below let it report real numbers instead of assuming success.
   const cwResult = await updateContinueWatchingForBatch(items);
+  if (Array.isArray(items)) {
+    const movieItems = items.filter(it => it && it.type === 'movie');
+    for (const m of movieItems) {
+      if (typeof advanceCompanionOnMovieWatched === 'function') {
+        await advanceCompanionOnMovieWatched(m).catch(() => {});
+      }
+    }
+  }
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
   items.forEach((it) => {
     refreshWatchBadge(it.id, it.type);
@@ -2040,6 +2170,327 @@ function getOrCreateContinueWatchingList() {
 // comment for why. Network fetches still run in parallel across workers;
 // only the actual commit (load list, mutate, save list) queues up one at
 // a time, so it can never race with another commit in flight.
+// --- Continue Watching Storyline & Companion Continuations -------------------
+
+function getCompanionRecommendationSetting() {
+  try {
+    return localStorage.getItem('myListAddon:autoRecommendCompanions') !== '0';
+  } catch (e) {
+    return true;
+  }
+}
+window.getCompanionRecommendationSetting = getCompanionRecommendationSetting;
+
+function toggleCompanionRecommendationSetting(isChecked) {
+  try {
+    localStorage.setItem('myListAddon:autoRecommendCompanions', isChecked ? '1' : '0');
+  } catch (e) {}
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof saveState === 'function') saveState();
+}
+window.toggleCompanionRecommendationSetting = toggleCompanionRecommendationSetting;
+
+function getCrossoverRegistry() {
+  if (typeof TV_CROSSOVER_EVENTS !== 'undefined' && Array.isArray(TV_CROSSOVER_EVENTS)) {
+    return TV_CROSSOVER_EVENTS;
+  }
+  if (typeof window !== 'undefined' && Array.isArray(window.TV_CROSSOVER_EVENTS)) {
+    return window.TV_CROSSOVER_EVENTS;
+  }
+  return [];
+}
+
+function matchPartToShow(part, showId) {
+  if (!part || !showId) return false;
+  const rawId = String(showId).trim().toLowerCase();
+  const cleanTmdb = rawId.replace(/^tmdb:/, '');
+  if (part.imdbId && part.imdbId.toLowerCase() === rawId) return true;
+  if (part.tmdbId && (String(part.tmdbId).toLowerCase() === cleanTmdb || String(part.tmdbId).toLowerCase() === rawId)) return true;
+  return false;
+}
+
+function matchPartToMovie(part, movieTarget) {
+  if (!part || !movieTarget || part.type !== 'movie') return false;
+  const mId = String(movieTarget.imdbId || movieTarget.id || '').trim().toLowerCase();
+  const tmdbId = String(movieTarget.tmdbId || '').replace(/^tmdb:/, '').trim().toLowerCase();
+  if (part.imdbId && mId && part.imdbId.toLowerCase() === mId) return true;
+  if (part.tmdbId && tmdbId && String(part.tmdbId).toLowerCase() === tmdbId) return true;
+  if (part.tmdbId && mId && (String(part.tmdbId).toLowerCase() === mId || ('tmdb:' + part.tmdbId).toLowerCase() === mId)) return true;
+  const targetTitle = String(movieTarget.title || movieTarget.name || '').toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+  const partTitle = String(part.title || '').toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+  if (targetTitle && partTitle && targetTitle === partTitle) return true;
+  return false;
+}
+
+function isStorylinePartWatched(part) {
+  if (!part) return false;
+  const watchedSet = window._watchedItemIds;
+  if (part.imdbId && watchedSet && watchedSet.has(part.imdbId)) return true;
+  if (part.tmdbId && watchedSet && (watchedSet.has(String(part.tmdbId)) || watchedSet.has('tmdb:' + part.tmdbId))) return true;
+
+  try {
+    const map = loadLocalCustomLists();
+    const hist = (map && map['watch-history'] && map['watch-history'].items) || [];
+    return hist.some((it) => {
+      if (!it) return false;
+      if (part.imdbId && (it.imdbId === part.imdbId || it.id === part.imdbId || it.showId === part.imdbId)) return true;
+      if (part.tmdbId && (String(it.tmdbId) === String(part.tmdbId) || String(it.id) === String(part.tmdbId) || it.id === 'tmdb:' + part.tmdbId)) return true;
+      const t1 = String(it.name || it.title || '').toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+      const t2 = String(part.title || '').toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+      if (t1 && t2 && t1 === t2 && part.type === 'movie') return true;
+      return false;
+    });
+  } catch (e) {
+    return false;
+  }
+}
+
+function isStorylinePartDismissed(part) {
+  if (!part) return false;
+  const dismissed = window._dismissedContinueWatching || (function() {
+    try { return JSON.parse(localStorage.getItem('myListAddon:dismissedContinueWatching') || '{}'); } catch(e) { return {}; }
+  })();
+  if (part.imdbId && dismissed[part.imdbId]) return true;
+  if (part.tmdbId && (dismissed[String(part.tmdbId)] || dismissed['tmdb:' + part.tmdbId])) return true;
+  if (part.id && dismissed[part.id]) return true;
+  return false;
+}
+
+function findCompanionBridgeMovie(showId, currentSeason, nextSeason) {
+  if (!getCompanionRecommendationSetting()) return null;
+  const registry = getCrossoverRegistry();
+  if (!registry.length) return null;
+
+  for (const event of registry) {
+    const eps = event.episodes || [];
+    for (let i = 0; i < eps.length; i++) {
+      const part = eps[i];
+      if (!matchPartToShow(part, showId)) continue;
+
+      let coversCurrentSeason = false;
+      if (part.season != null && Number(part.season) === Number(currentSeason)) {
+        coversCurrentSeason = true;
+      } else if (Array.isArray(part.seasons) && part.seasons.includes(Number(currentSeason))) {
+        const maxSeason = Math.max(...part.seasons);
+        if (maxSeason === Number(currentSeason)) coversCurrentSeason = true;
+      } else if (part.type === 'show' && i < eps.length - 1) {
+        if (eps[i + 1] && eps[i + 1].type === 'movie') coversCurrentSeason = true;
+      }
+
+      if (!coversCurrentSeason) continue;
+
+      const nextPart = eps[i + 1];
+      if (nextPart && nextPart.type === 'movie') {
+        if (!isStorylinePartWatched(nextPart) && !isStorylinePartDismissed(nextPart)) {
+          return {
+            id: nextPart.imdbId || ('tmdb:' + nextPart.tmdbId),
+            type: 'movie',
+            kind: 'movie',
+            name: nextPart.title,
+            title: nextPart.title,
+            poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+            imdbId: nextPart.imdbId || '',
+            tmdbId: nextPart.tmdbId || null,
+            year: nextPart.year || null,
+            parentShowId: showId,
+            bridgeNextSeason: nextSeason,
+            isCompanion: true,
+            companionStoryline: event.name,
+            companionType: 'bridge_movie',
+            companionNote: 'Canon Bridge Movie'
+          };
+        }
+      }
+    }
+  }
+  return null;
+}
+window.findCompanionBridgeMovie = findCompanionBridgeMovie;
+
+function findCompanionShowConclusion(showId) {
+  if (!getCompanionRecommendationSetting()) return null;
+  const registry = getCrossoverRegistry();
+  if (!registry.length) return null;
+
+  for (const event of registry) {
+    const eps = event.episodes || [];
+    for (let i = 0; i < eps.length; i++) {
+      const part = eps[i];
+      if (!matchPartToShow(part, showId)) continue;
+
+      // Ensure this is the concluding part for this show in this event
+      const hasLaterPartForShow = eps.slice(i + 1).some((p) => matchPartToShow(p, showId));
+      if (hasLaterPartForShow) continue;
+
+      for (let j = i + 1; j < eps.length; j++) {
+        const nextPart = eps[j];
+        if (!nextPart) continue;
+
+        if (isStorylinePartWatched(nextPart)) {
+          continue;
+        }
+        if (isStorylinePartDismissed(nextPart)) {
+          break;
+        }
+
+        if (nextPart.type === 'movie') {
+          return {
+            id: nextPart.imdbId || ('tmdb:' + nextPart.tmdbId),
+            type: 'movie',
+            kind: 'movie',
+            name: nextPart.title,
+            title: nextPart.title,
+            poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+            imdbId: nextPart.imdbId || '',
+            tmdbId: nextPart.tmdbId || null,
+            year: nextPart.year || null,
+            precedingShowId: showId,
+            isCompanion: true,
+            companionStoryline: event.name,
+            companionType: 'sequel_movie',
+            companionNote: 'Sequel Film'
+          };
+        } else if (nextPart.type === 'show' || nextPart.type === 'season') {
+          const nextShowId = nextPart.imdbId || (nextPart.tmdbId ? 'tmdb:' + nextPart.tmdbId : '');
+          if (nextShowId) {
+            const startSeason = (nextPart.seasons && nextPart.seasons[0]) || nextPart.season || 1;
+            const startEp = nextPart.episode || 1;
+            return {
+              id: nextShowId + ':' + startSeason + ':' + startEp,
+              type: 'episode',
+              name: nextPart.title || nextPart.showName,
+              showId: nextShowId,
+              showTitle: nextPart.showName || nextPart.title,
+              showPoster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+              poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+              seasonNum: startSeason,
+              episodeNum: startEp,
+              precedingShowId: showId,
+              isCompanion: true,
+              companionStoryline: event.name,
+              companionType: 'spinoff_series',
+              companionNote: 'Next Series in Storyline'
+            };
+          }
+        }
+        break;
+      }
+    }
+  }
+  return null;
+}
+window.findCompanionShowConclusion = findCompanionShowConclusion;
+
+async function advanceCompanionOnMovieWatched(movieItem) {
+  if (!getCompanionRecommendationSetting() || !movieItem) return;
+  const registry = getCrossoverRegistry();
+  if (!registry.length) return;
+
+  const targetId = String(movieItem.imdbId || movieItem.id || '').trim();
+
+  for (const event of registry) {
+    const eps = event.episodes || [];
+    const idx = eps.findIndex((p) => matchPartToMovie(p, movieItem));
+    if (idx < 0) continue;
+
+    // Check if this was a bridge movie for a preceding TV show
+    if (idx > 0 && (eps[idx - 1].type === 'show' || eps[idx - 1].type === 'season')) {
+      const parentShow = eps[idx - 1];
+      const parentShowId = parentShow.imdbId || (parentShow.tmdbId ? 'tmdb:' + parentShow.tmdbId : '');
+      if (idx < eps.length - 1 && matchPartToShow(eps[idx + 1], parentShowId)) {
+        if (parentShowId) {
+          await updateContinueWatching(parentShowId);
+          return;
+        }
+      }
+    }
+
+    // Look for next unwatched part in storyline
+    for (let j = idx + 1; j < eps.length; j++) {
+      const nextPart = eps[j];
+      if (!nextPart) continue;
+
+      if (isStorylinePartWatched(nextPart)) {
+        continue;
+      }
+      if (isStorylinePartDismissed(nextPart)) {
+        break;
+      }
+
+      if (nextPart.type === 'movie') {
+        const companionEntry = {
+          id: nextPart.imdbId || ('tmdb:' + nextPart.tmdbId),
+          type: 'movie',
+          kind: 'movie',
+          name: nextPart.title,
+          title: nextPart.title,
+          poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+          imdbId: nextPart.imdbId || '',
+          tmdbId: nextPart.tmdbId || null,
+          year: nextPart.year || null,
+          isCompanion: true,
+          companionStoryline: event.name,
+          companionType: 'sequel_movie',
+          companionNote: 'Next Movie in Storyline'
+        };
+        await withCwCommitLock(() => {
+          const map = loadLocalCustomLists();
+          const cwList = getOrCreateContinueWatchingList();
+          cwList.items = (cwList.items || []).filter((it) => it && it.id !== targetId && it.id !== companionEntry.id);
+          cwList.items.unshift(companionEntry);
+          map['continue-watching'] = cwList;
+          cwList.updatedAt = Date.now();
+          saveLocalCustomListsMap(map);
+          if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+          if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+        });
+        return;
+      } else if (nextPart.type === 'show' || nextPart.type === 'season') {
+        const nextShowId = nextPart.imdbId || (nextPart.tmdbId ? 'tmdb:' + nextPart.tmdbId : '');
+        if (nextShowId) {
+          const startSeason = (nextPart.seasons && nextPart.seasons[0]) || nextPart.season || 1;
+          const startEp = nextPart.episode || 1;
+          const companionEntry = {
+            id: nextShowId + ':' + startSeason + ':' + startEp,
+            type: 'episode',
+            name: nextPart.title || nextPart.showName,
+            showId: nextShowId,
+            showTitle: nextPart.showName || nextPart.title,
+            showPoster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+            poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+            seasonNum: startSeason,
+            episodeNum: startEp,
+            isCompanion: true,
+            companionStoryline: event.name,
+            companionType: 'spinoff_series',
+            companionNote: 'Next Series in Storyline'
+          };
+          await withCwCommitLock(() => {
+            const map = loadLocalCustomLists();
+            const cwList = getOrCreateContinueWatchingList();
+            cwList.items = (cwList.items || []).filter((it) => it && it.id !== targetId && it.showId !== nextShowId && it.id !== companionEntry.id);
+            cwList.items.unshift(companionEntry);
+            map['continue-watching'] = cwList;
+            cwList.updatedAt = Date.now();
+            saveLocalCustomListsMap(map);
+            if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+            if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+          });
+          return;
+        }
+      }
+      break;
+    }
+  }
+}
+window.advanceCompanionOnMovieWatched = advanceCompanionOnMovieWatched;
+
+// Serializes the read-modify-write of localStorage's continue-watching
+// list (and the fullyWatchedShowIds/inProgressShowIds it triggers) across
+// concurrent updateContinueWatching calls -- see that function's own
+// comment for why. Network fetches still run in parallel across workers;
+// only the actual commit (load list, mutate, save list) queues up one at
+// a time, so it can never race with another commit in flight.
 let cwCommitLock = Promise.resolve();
 function withCwCommitLock(fn) {
   const run = cwCommitLock.then(fn, fn);
@@ -2054,7 +2505,7 @@ async function updateContinueWatching(showId) {
   if (!showId) return { ok: false };
 
   const tkInput = document.getElementById('tmdbKeyInput');
-  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || (typeof localStorage !== 'undefined' ? (localStorage.getItem('myListAddon:tmdbKey') || '') : '');
 
   // Reading Watch History here (outside the commit lock) is safe: nothing
   // concurrently writes to Watch History during a Continue Watching batch
@@ -2111,7 +2562,7 @@ async function updateContinueWatching(showId) {
 
     if (nextInSeason) {
       const aired = isEpisodeAired(nextInSeason);
-      const isPremiere = nextInSeason.episode_number === 1 && latest.seasonNum > 1;
+      const isPremiere = nextInSeason.episode_number === 1 && latest.seasonNum > 1 && !aired;
       const isFinale = nextInSeason.episode_number === allEps.length;
       const lastEp = allEps[allEps.length - 1];
       const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
@@ -2135,42 +2586,54 @@ async function updateContinueWatching(showId) {
       showFullyWatched = !aired;
     } else {
       const nextSeasonNum = latest.seasonNum + 1;
-      const res2 = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
-        '&seasonNum=' + nextSeasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
-      const data2 = await res2.json();
-      if (data2.ok && data2.season && Array.isArray(data2.season.episodes) && data2.season.episodes.length) {
-        const allEpsNext = data2.season.episodes;
-        const firstNext = allEpsNext[0];
-        if (firstNext) {
-          const aired = isEpisodeAired(firstNext);
-          const isPremiere = firstNext.episode_number === 1 && nextSeasonNum > 1;
-          const isFinale = allEpsNext.length === 1;
-          const lastEp = allEpsNext[allEpsNext.length - 1];
-          const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
-          newEntry = {
-            id: String(firstNext.id),
-            type: 'episode',
-            name: firstNext.name,
-            poster: latest.showPoster || '',
-            showId: showId,
-            showTitle: latest.showTitle || '',
-            showPoster: latest.showPoster || '',
-            seasonNum: nextSeasonNum,
-            episodeNum: firstNext.episode_number,
-            airDate: firstNext.air_date || null,
-            isUnaired: !aired,
-            isSeasonPremiere: isPremiere,
-            isSeasonFinale: isFinale,
-            seasonFinaleAirDate: (!isPremiere && !isFinale) ? finaleAir : null,
-          };
-          showFullyWatched = !aired;
-        } else {
-          showFullyWatched = true;
-        }
+      const bridgeMovie = findCompanionBridgeMovie(showId, latest.seasonNum, nextSeasonNum);
+      if (bridgeMovie) {
+        newEntry = bridgeMovie;
+        showFullyWatched = false;
       } else {
-        // No further season at all -- this was the last one, and it's
-        // fully watched.
-        showFullyWatched = true;
+        const res2 = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
+          '&seasonNum=' + nextSeasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
+        const data2 = await res2.json();
+        if (data2.ok && data2.season && Array.isArray(data2.season.episodes) && data2.season.episodes.length) {
+          const allEpsNext = data2.season.episodes;
+          const firstNext = allEpsNext[0];
+          if (firstNext) {
+            const aired = isEpisodeAired(firstNext);
+            const isPremiere = firstNext.episode_number === 1 && nextSeasonNum > 1 && !aired;
+            const isFinale = allEpsNext.length === 1;
+            const lastEp = allEpsNext[allEpsNext.length - 1];
+            const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
+            newEntry = {
+              id: String(firstNext.id),
+              type: 'episode',
+              name: firstNext.name,
+              poster: latest.showPoster || '',
+              showId: showId,
+              showTitle: latest.showTitle || '',
+              showPoster: latest.showPoster || '',
+              seasonNum: nextSeasonNum,
+              episodeNum: firstNext.episode_number,
+              airDate: firstNext.air_date || null,
+              isUnaired: !aired,
+              isSeasonPremiere: isPremiere,
+              isSeasonFinale: isFinale,
+              seasonFinaleAirDate: (!isPremiere && !isFinale) ? finaleAir : null,
+            };
+            showFullyWatched = !aired;
+          } else {
+            showFullyWatched = true;
+          }
+        } else {
+          // No further season at all -- this was the last one.
+          // Check if there is a sequel film or spinoff series in storyline.
+          const conclusionPart = findCompanionShowConclusion(showId);
+          if (conclusionPart) {
+            newEntry = conclusionPart;
+            showFullyWatched = true;
+          } else {
+            showFullyWatched = true;
+          }
+        }
       }
     }
   } catch (e) {
@@ -2183,7 +2646,19 @@ async function updateContinueWatching(showId) {
     // Removes any existing entry for this show -- including a stale one
     // that might otherwise never get cleaned up -- before (maybe) adding
     // the fresh one computed above.
-    cwList.items = cwList.items.filter(it => it.showId !== showId);
+    const isShowMatch = (it) => {
+      if (!it) return false;
+      const sId = String(it.showId || '');
+      const sTarget = String(showId || '');
+      if (sId && (sId === sTarget || sId.replace(/^tmdb:/, '') === sTarget.replace(/^tmdb:/, ''))) return true;
+      const epId = String(it.id || '');
+      if (epId === sTarget || epId.split(':')[0] === sTarget) return true;
+      if (it.imdbId && (String(it.imdbId) === sTarget || String(it.imdbId).replace(/^tmdb:/, '') === sTarget.replace(/^tmdb:/, ''))) return true;
+      const d = window._currentItemDetails;
+      if (d && (sId === String(d.id) || sId === String(d.imdbId) || sId === String(d.tmdbId) || sId === ('tmdb:' + d.tmdbId))) return true;
+      return false;
+    };
+    cwList.items = cwList.items.filter(it => !isShowMatch(it) && (!newEntry || (it.id !== newEntry.id && it.id !== showId)));
     if (newEntry) cwList.items.unshift(newEntry);
     map['continue-watching'] = cwList;
     cwList.updatedAt = Date.now();
@@ -2191,7 +2666,8 @@ async function updateContinueWatching(showId) {
     if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
     if (showFullyWatched !== null) setShowFullyWatched(showId, showFullyWatched);
-    if (showFullyWatched === false) setShowInProgress(showId, true);
+    if (showFullyWatched === true) setShowInProgress(showId, false);
+    else if (showFullyWatched === false) setShowInProgress(showId, true);
     return { ok: showFullyWatched !== null };
   });
 }
@@ -2277,6 +2753,8 @@ function dismissContinueWatchingShow(showId, btn) {
       return best;
     }, watchedEps[0]);
     window._dismissedContinueWatching[showId] = { seasonNum: latest.seasonNum, episodeNum: latest.episodeNum };
+  } else {
+    window._dismissedContinueWatching[showId] = { dismissedAt: Date.now() };
   }
   try {
     localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(window._dismissedContinueWatching));
@@ -2287,10 +2765,10 @@ function dismissContinueWatchingShow(showId, btn) {
   // Goes through the same commit lock updateContinueWatching's own writes
   // do, so this can't race with an in-flight commit for the same (or any
   // other) show -- see withCwCommitLock's own comment.
-  withCwCommitLock(() => {
+  const commitPromise = withCwCommitLock(() => {
     const map = loadLocalCustomLists();
     const cwList = getOrCreateContinueWatchingList();
-    cwList.items = cwList.items.filter(it => it.showId !== showId);
+    cwList.items = (cwList.items || []).filter(it => it && it.showId !== showId && it.id !== showId && it.imdbId !== showId);
     map['continue-watching'] = cwList;
     cwList.updatedAt = Date.now();
     saveLocalCustomListsMap(map);
@@ -2304,6 +2782,7 @@ function dismissContinueWatchingShow(showId, btn) {
   // real new episode later supersedes this dismissal.
   setShowFullyWatched(showId, true);
   if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+  return commitPromise;
 }
 
 // --- Airing Next ------------------------------------------------------------
@@ -2684,6 +3163,7 @@ async function backfillWatchHistoryEpisodeStills() {
   const groups = new Map();
   items.forEach((it) => {
     if (!needsEpisodeStill(it)) return;
+    if (checks['show_404:' + it.showId] && (now - checks['show_404:' + it.showId]) < EPISODE_STILL_RECHECK_MS) return;
     const key = String(it.showId) + '|' + String(it.seasonNum);
     const lastChecked = Number(checks[key]) || 0;
     if (lastChecked && (now - lastChecked) < EPISODE_STILL_RECHECK_MS) return;
@@ -2693,26 +3173,63 @@ async function backfillWatchHistoryEpisodeStills() {
   if (!groups.size) return 0;
 
   const pending = [...groups.entries()].slice(0, EPISODE_STILL_MAX_GROUPS_PER_RUN);
+  // Sort season 1 first so missing shows are detected before checking later seasons
+  pending.sort((a, b) => (Number(a[1].seasonNum) || 0) - (Number(b[1].seasonNum) || 0));
   const tkInput = document.getElementById('tmdbKeyInput');
   const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
 
   let changed = 0;
-  let nextIdx = 0;
+  const inFlightShows = new Set();
   async function worker() {
-    while (nextIdx < pending.length) {
-      const entry = pending[nextIdx++];
+    while (true) {
+      let entry = null;
+      for (let i = 0; i < pending.length; i++) {
+        const item = pending[i];
+        if (!item || item._claimed) continue;
+        const group = item[1];
+        if (inFlightShows.has(group.showId)) continue;
+        entry = item;
+        item._claimed = true;
+        break;
+      }
+      if (!entry) {
+        const hasUnclaimed = pending.some((p) => p && !p._claimed);
+        if (hasUnclaimed && inFlightShows.size > 0) {
+          await new Promise((r) => setTimeout(r, 60));
+          continue;
+        }
+        break;
+      }
       const key = entry[0];
       const group = entry[1];
+      if (checks['show_404:' + group.showId] || (checks[key] && (now - checks[key]) < EPISODE_STILL_RECHECK_MS)) continue;
+      inFlightShows.add(group.showId);
       try {
         const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(group.showId) +
           '&seasonNum=' + encodeURIComponent(group.seasonNum) +
           (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
-        const data = await res.json();
+        if (res.status === 404) {
+          // Season or show does not exist on TMDB -- record as checked so we
+          // don't spam 404 requests on every page load/run.
+          checks[key] = now;
+          if (Number(group.seasonNum) === 1) {
+            checks['show_404:' + group.showId] = now;
+          }
+          pending.forEach((other) => {
+            if (other && other[1] && other[1].showId === group.showId) {
+              checks[other[0]] = now;
+              if (Number(group.seasonNum) === 1) other._claimed = true;
+            }
+          });
+          continue;
+        }
+        let data = null;
+        try { data = await res.json(); } catch {}
         const episodes = (data && data.ok && data.season && Array.isArray(data.season.episodes)) ? data.season.episodes : null;
-        // A miss here is a network or TMDB failure, not "this season has
-        // no stills" -- deliberately left unrecorded so the next run
-        // retries it rather than writing it off for a week.
-        if (!episodes) continue;
+        if (!episodes) {
+          if (data && data.ok === false) checks[key] = now;
+          continue;
+        }
         const byNumber = new Map();
         episodes.forEach((ep) => {
           if (ep && ep.episode_number != null) byNumber.set(Number(ep.episode_number), ep);
@@ -2734,6 +3251,8 @@ async function backfillWatchHistoryEpisodeStills() {
         checks[key] = now;
       } catch (e) {
         // Same as above -- retried on the next run.
+      } finally {
+        inFlightShows.delete(group.showId);
       }
     }
   }
@@ -2820,7 +3339,7 @@ function buildAiringNextCardHtml() {
         };
     return '<div class="list-card-mini-poster-tile">' +
       '<div class="list-card-mini-poster-img-wrap">' +
-        '<img src="' + escapeAttr(it.showPoster || '') + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
+        '<img src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.showPoster || '') : (it.showPoster || '')) + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
         dateBadge +
         bottomBadge +
         overlays +
@@ -2872,7 +3391,9 @@ function openAiringNextDetailsPage() {
       type: 'series',
       name: label.title,
       subtitle: label.subtitle,
-      poster: it.showPoster,
+      poster: typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.showPoster) : it.showPoster,
+      isAdult: typeof isAdultOrNsfw === 'function' ? isAdultOrNsfw(it) : !!it.adult,
+      isAdultPosterFiltered: typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled() && (it.isAdult || (typeof isAdultOrNsfw === 'function' && isAdultOrNsfw(it))),
       airDate: it.airDate,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,

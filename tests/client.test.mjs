@@ -4,7 +4,7 @@
 // only parsing it. See tests/client-harness.mjs for how and why.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { loadClient, requestsTo } from "./client-harness.mjs";
+import { loadClient, requestsTo, renderPage } from "./client-harness.mjs";
 
 const SAVE = "/api/creator/lists/save";
 const LISTS = "/api/creator/lists";
@@ -1963,6 +1963,40 @@ describe("client: a card's poster preview retries once before giving up", () => 
     assert.equal(slot.className, "list-card-posters");
     assert.match(slot.innerHTML, /Film/, "and recovers once the list actually loads");
   });
+
+  it("renders empty state instead of error when preview succeeds with 0 items", async () => {
+    const client = loadClient({
+      routes: {
+        [PREVIEW]: () => ({ json: { ok: true, count: 0, sample: [] } }),
+      },
+    });
+    const slot = makeSlot(client, "slotEmpty");
+    await client.call("loadPosterSlot", slot);
+    assert.match(slot.className, /poster-preview-empty/);
+    assert.doesNotMatch(slot.className, /poster-preview-slot/);
+    assert.match(slot.innerHTML, /No items found in this list/);
+  });
+
+  it("falls back to alternate type when primary type returns 0 items", async () => {
+    const requests = [];
+    const client = loadClient({
+      routes: {
+        [PREVIEW]: (req) => {
+          requests.push(req.body.type);
+          if (req.body.type === "movie") {
+            return { json: { ok: true, count: 0, sample: [] } };
+          }
+          return { json: okBody("TV Show") };
+        },
+      },
+    });
+    const slot = makeSlot(client, "slotFallback", { type: "movie" });
+    await client.call("loadPosterSlot", slot);
+    assert.deepEqual(requests, ["movie", "series"]);
+    assert.equal(slot.dataset.type, "series");
+    assert.equal(slot.className, "list-card-posters");
+    assert.match(slot.innerHTML, /TV Show/);
+  });
 });
 
 // Behavioural companion to the source-level Discover header tests in
@@ -1992,3 +2026,1266 @@ describe("client: Discover's shared-feed header follows the active pill", () => 
     assert.equal(header.style.display, "none", "Curated has its own header too");
   });
 });
+
+describe("client: smart sync & merge strategy for external custom lists", () => {
+  it("getItemKey returns consistent unique keys across formats", () => {
+    const client = loadClient();
+    const getKey = (it) => client.call("getItemKey", it);
+    assert.equal(getKey({ imdbId: "tt12345" }), "tt12345");
+    assert.equal(getKey({ id: "tt12345" }), "tt12345");
+    assert.equal(getKey({ tmdbId: 999 }), "tmdb:999");
+    assert.equal(getKey({ title: "Inception", year: 2010 }), "inception:2010");
+  });
+
+  it("adds newly discovered remote items while preserving user additions and removals", () => {
+    const client = loadClient();
+    const merge = (c, b, r, opt) => client.call("performSmartListMerge", c, b, r, opt);
+
+    // Initial base: [A, B, C]
+    // User deleted B, added X: Current is [A, X, C]
+    // Remote author added D, kept A, B, C: Remote is [A, B, C, D]
+    const current = [
+      { id: "ttA", title: "A" },
+      { id: "ttX", title: "X" }, // user addition
+      { id: "ttC", title: "C" },
+    ];
+    const baseIds = ["ttA", "ttB", "ttC"]; // user removed ttB
+    const remote = [
+      { id: "ttA", title: "A" },
+      { id: "ttB", title: "B" },
+      { id: "ttC", title: "C" },
+      { id: "ttD", title: "D" }, // remote addition
+    ];
+
+    const result = merge(current, baseIds, remote);
+
+    // ttB must NOT be resurrected because user deleted it.
+    // ttX must be preserved because user added it.
+    // ttD must be added from remote.
+    // User order [A, X, C] must be preserved, with D appended.
+    const resultIds = Array.from(result.items, (it) => it.id);
+    assert.deepEqual(resultIds, ["ttA", "ttX", "ttC", "ttD"]);
+    assert.equal(result.addedCount, 1);
+    assert.deepEqual(Array.from(result.newBaseItemIds), ["ttA", "ttB", "ttC", "ttD"]);
+  });
+
+  it("handles initial sync when baseItemIds is missing without losing user items", () => {
+    const client = loadClient();
+    const merge = (c, b, r, opt) => client.call("performSmartListMerge", c, b, r, opt);
+
+    const current = [{ id: "ttA", title: "A" }, { id: "ttX", title: "X" }];
+    const remote = [{ id: "ttA", title: "A" }, { id: "ttB", title: "B" }];
+
+    const result = merge(current, null, remote);
+    const resultIds = Array.from(result.items, (it) => it.id);
+    assert.deepEqual(resultIds, ["ttA", "ttX", "ttB"]);
+    assert.equal(result.addedCount, 1);
+    assert.deepEqual(Array.from(result.newBaseItemIds), ["ttA", "ttB"]);
+  });
+
+  it("saveLocalCustomListEdit preserves sourceUrl, synced, lastSyncedAt, and baseItemIds", async () => {
+    const client = loadClient({
+      storage: {
+        "myListAddon:localCustomLists": JSON.stringify({
+          syncedList: {
+            slug: "syncedList",
+            name: "Synced List",
+            type: "movie",
+            items: [{ id: "tt1" }, { id: "tt2" }],
+            sourceUrl: "https://mdblist.com/lists/test/1",
+            synced: true,
+            lastSyncedAt: 1000,
+            baseItemIds: ["tt1", "tt2"],
+            createdAt: 1000,
+            updatedAt: 1000,
+          }
+        })
+      },
+      routes: {}
+    });
+    client.set("activeCreator", null);
+    client.set("editingLocalCustomListSlug", "syncedList");
+    client.set("customListDraftItems", [{ id: "tt1" }, { id: "tt3" }]);
+    client.set("customListDraftType", "movie");
+
+    await client.call("saveLocalCustomListEdit", "Synced List");
+    await new Promise((r) => setImmediate(r));
+
+    const stored = JSON.parse(client.localStorage.getItem("myListAddon:localCustomLists"));
+    const updated = stored.syncedList;
+    assert.ok(updated, "list was saved");
+    assert.equal(updated.sourceUrl, "https://mdblist.com/lists/test/1");
+    assert.equal(updated.synced, true);
+    assert.equal(updated.lastSyncedAt, 1000);
+    assert.deepEqual(Array.from(updated.baseItemIds), ["tt1", "tt2"]);
+    assert.deepEqual(Array.from(updated.items, (i) => i.id), ["tt1", "tt3"]);
+  });
+});
+
+describe("client: Discover header cards, descriptions, and channel pool limit", () => {
+  it("Discover header card displays title and tailored description for every shared-feed pill", () => {
+    const client = loadClient();
+    const header = client.document.getElementById("discoverListsFeedHeader");
+    const title = client.document.getElementById("discoverListsFeedTitle");
+    const desc = client.document.getElementById("discoverListsFeedDesc");
+
+    assert.ok(header, "header must exist");
+    assert.ok(desc, "header must include description element");
+
+    const cases = [
+      ["all", "All", "Explore popular charts"],
+      ["movie", "Movies", "Top charts, new releases"],
+      ["series", "Shows", "Trending TV series"],
+      ["gems", "Hidden Gems", "Under-the-radar masterpieces"],
+      ["kids", "Kids", "Family-friendly movies"],
+      ["holidays", "Holidays", "Seasonal favorites"],
+      ["genres", "Genres", "Browse top movies and series"],
+    ];
+    for (const [filter, expectedTitle, expectedSnippet] of cases) {
+      client.call("filterDiscoverShelves", filter, null);
+      assert.equal(header.style.display, "flex");
+      assert.equal(title.textContent, expectedTitle);
+      assert.match(desc.textContent, new RegExp(expectedSnippet));
+    }
+  });
+
+  it("Channels pool cap is 5000 and rotation is 24 shows x 3 episodes", () => {
+    const client = loadClient();
+    assert.equal(client.get("CHANNEL_POOL_MAX_ITEMS"), 5000);
+    assert.equal(client.get("CHANNEL_ROTATION_SHOWS_PER_DAY"), 24);
+    assert.equal(client.get("CHANNEL_ROTATION_EPISODES_PER_SHOW"), 3);
+  });
+});
+
+describe("client: local storage quota and creator profile watch history preservation", () => {
+  it("signed-in user keeps full items in memory when localStorage throws QuotaExceededError", () => {
+    let alertCalled = false;
+    let storageFullCalled = false;
+    const client = loadClient();
+    client.set("showAppAlert", (title, msg) => {
+      if (title === "Some list items could not be kept") alertCalled = true;
+      if (title === "Local storage is full") storageFullCalled = true;
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+
+    const storage = client.get("localStorage");
+    const originalSetItem = storage.setItem.bind(storage);
+    storage.setItem = (k, v) => {
+      if (k === "myListAddon:localCustomLists" && v.length > 5000) {
+        const err = new Error("QuotaExceededError");
+        err.name = "QuotaExceededError";
+        throw err;
+      }
+      return originalSetItem(k, v);
+    };
+
+    const items = Array.from({ length: 2500 }, (_, i) => ({
+      id: "tt" + i,
+      title: "Movie " + i,
+      type: "movie",
+    }));
+    const map = {
+      "watch-history": {
+        slug: "watch-history",
+        name: "Watch History",
+        type: "mixed",
+        isWatchHistory: true,
+        items: items,
+      },
+    };
+
+    const res = client.call("saveLocalCustomListsMap", map);
+    assert.equal(res, true, "saveLocalCustomListsMap must succeed for signed-in user");
+    assert.equal(alertCalled, false, "must NOT show 'Some list items could not be kept' to signed in user");
+    assert.equal(storageFullCalled, true, "must call notifyStorageFull for signed-in user");
+
+    const inMem = client.call("loadLocalCustomLists");
+    assert.equal(inMem["watch-history"].items.length, 2500, "in-memory watch history must keep all 2500 items");
+  });
+
+  it("signed-out user is notified of dropped items when localStorage quota is exceeded", () => {
+    let alertCalled = false;
+    const client = loadClient();
+    client.set("showAppAlert", (title, msg) => {
+      if (title === "Some list items could not be kept") alertCalled = true;
+    });
+    client.set("activeCreator", null);
+
+    const storage = client.get("localStorage");
+    const originalSetItem = storage.setItem.bind(storage);
+    storage.setItem = (k, v) => {
+      if (k === "myListAddon:localCustomLists" && v.length > 5000) {
+        const err = new Error("QuotaExceededError");
+        err.name = "QuotaExceededError";
+        throw err;
+      }
+      return originalSetItem(k, v);
+    };
+
+    const items = Array.from({ length: 800 }, (_, i) => ({
+      id: "tt" + i,
+      title: "Movie " + i,
+      type: "movie",
+    }));
+    const map = {
+      "watch-history": {
+        slug: "watch-history",
+        name: "Watch History",
+        type: "mixed",
+        isWatchHistory: true,
+        items: items,
+      },
+    };
+
+    client.call("saveLocalCustomListsMap", map);
+    assert.equal(alertCalled, true, "must notify signed-out user that items were dropped");
+    const inMem = client.call("loadLocalCustomLists");
+    assert.equal(inMem["watch-history"].items.length, 500, "signed-out user is truncated to 500 items");
+  });
+
+  it("large channel with 4938 items preserves all items in memory & session when localStorage throws QuotaExceededError", () => {
+    const client = loadClient();
+    const storage = client.get("localStorage");
+    const originalSetItem = storage.setItem.bind(storage);
+    storage.setItem = (k, v) => {
+      if (k === "myListAddon:localChannels" && v.length > 5000) {
+        const err = new Error("QuotaExceededError");
+        err.name = "QuotaExceededError";
+        throw err;
+      }
+      return originalSetItem(k, v);
+    };
+
+    const items = Array.from({ length: 4938 }, (_, i) => ({
+      kind: "episode",
+      imdbId: "tt" + i,
+      season: 1,
+      episode: i + 1,
+      showName: "A&E Show",
+      epName: "Episode " + (i + 1),
+      title: "A&E Show S1E" + (i + 1) + " — Episode " + (i + 1),
+      released: "2024-01-01",
+      poster: "https://image.tmdb.org/t/p/w500/ae.jpg",
+      thumbnail: "https://image.tmdb.org/t/p/w500/ae.jpg",
+      showPoster: "https://image.tmdb.org/t/p/w500/ae.jpg",
+    }));
+
+    const map = {
+      "channel-ae": {
+        channelId: "channel-ae",
+        name: "A&E",
+        poster: "https://image.tmdb.org/t/p/w500/ae.jpg",
+        items: items,
+      },
+    };
+
+    const res = client.call("saveLocalChannelsMap", map);
+    assert.equal(res, true, "saveLocalChannelsMap must succeed and handle QuotaExceededError gracefully");
+
+    const loaded = client.call("loadLocalChannels");
+    assert.ok(loaded["channel-ae"], "channel-ae must exist in loaded channels map");
+    assert.equal(loaded["channel-ae"].items.length, 4938, "must preserve all 4938 items in memory/session");
+
+    let openedDetails = null;
+    client.set("openListDetailsPage", (title, type, url, preloaded) => {
+      openedDetails = { title, type, url, preloaded };
+    });
+
+    client.call("openChannelDetailsPage", "channel-ae");
+    assert.ok(openedDetails, "openChannelDetailsPage must successfully trigger openListDetailsPage");
+    assert.equal(openedDetails.title, "A&E");
+    assert.equal(openedDetails.preloaded.count, 4938, "See All must receive full 4938 items");
+    assert.equal(openedDetails.preloaded.sample.length, 4938);
+  });
+});
+
+describe("client: season watched detection (isSeasonFullyWatched)", () => {
+  it("never returns true for an unwatched season even if the show is in _fullyWatchedShowIds", () => {
+    const client = loadClient();
+    client.set("_fullyWatchedShowIds", new Set(["tt0364845", "4614", "tmdb:4614"]));
+    client.set("_currentItemDetails", { id: "tt0364845", tmdbId: "4614", title: "NCIS" });
+
+    // 0 episodes watched in watch-history
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: [] } });
+
+    const isWatched = client.call("isSeasonFullyWatched", "tt0364845", 6, 25);
+    assert.equal(isWatched, false, "unwatched season must return false even if show is in _fullyWatchedShowIds");
+  });
+
+  it("returns true only when all episodes of the season have been watched", () => {
+    const client = loadClient();
+    client.set("_fullyWatchedShowIds", new Set());
+    client.set("_currentItemDetails", { id: "tt0364845", tmdbId: "4614", title: "NCIS" });
+
+    // Partially watched (3 of 25)
+    const partial = [1, 2, 3].map(n => ({
+      id: "tt0364845:6:" + n,
+      type: "episode",
+      showId: "tt0364845",
+      showTitle: "NCIS",
+      seasonNum: 6,
+      episodeNum: n
+    }));
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: partial } });
+    assert.equal(client.call("isSeasonFullyWatched", "tt0364845", 6, 25), false, "3 of 25 episodes is not fully watched");
+
+    // Fully watched (25 of 25)
+    const full = Array.from({ length: 25 }, (_, i) => ({
+      id: "tt0364845:6:" + (i + 1),
+      type: "episode",
+      showId: "tt0364845",
+      showTitle: "NCIS",
+      seasonNum: 6,
+      episodeNum: i + 1
+    }));
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: full } });
+    assert.equal(client.call("isSeasonFullyWatched", "tt0364845", 6, 25), true, "25 of 25 episodes is fully watched");
+  });
+
+  it("evaluates aired episodes when season episodes are expanded in _seasonEpisodesMap", () => {
+    const client = loadClient();
+    client.set("_fullyWatchedShowIds", new Set());
+    client.set("_currentItemDetails", { id: "tt0364845", tmdbId: "4614", title: "NCIS" });
+
+    client.set("_seasonEpisodesMap", {
+      6: Array.from({ length: 25 }, (_, i) => ({
+        id: 1000 + i,
+        episode_number: i + 1,
+        name: "Episode " + (i + 1),
+        air_date: "2008-10-01"
+      }))
+    });
+
+    // 0 watched
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: [] } });
+    assert.equal(client.call("isSeasonFullyWatched", "tt0364845", 6, 25), false, "expanded season with 0 watched episodes returns false");
+  });
+});
+
+describe("client: crossover and companion events detection in channel builder", () => {
+  it("registry integrity: all TV_CROSSOVER_EVENTS have valid structures, unique IDs, and sequential parts", () => {
+    const client = loadClient();
+    const events = client.get("TV_CROSSOVER_EVENTS");
+    assert.ok(Array.isArray(events), "TV_CROSSOVER_EVENTS is an array");
+    assert.ok(events.length >= 136, "TV_CROSSOVER_EVENTS contains at least 136 events");
+
+    const ids = new Set();
+    events.forEach((ev) => {
+      assert.ok(ev.id && typeof ev.id === "string", `Event missing string id: ${JSON.stringify(ev)}`);
+      assert.ok(!ids.has(ev.id), `Duplicate event id found: ${ev.id}`);
+      ids.add(ev.id);
+      assert.ok(ev.name && typeof ev.name === "string", `Event ${ev.id} missing name`);
+      assert.ok(ev.franchise && typeof ev.franchise === "string", `Event ${ev.id} missing franchise`);
+      assert.ok(Array.isArray(ev.episodes) && ev.episodes.length >= 2, `Event ${ev.id} must have at least 2 episodes/parts`);
+
+      ev.episodes.forEach((ep, idx) => {
+        assert.equal(ep.part, idx + 1, `Event ${ev.id} episode part number ${ep.part} is not sequential (${idx + 1})`);
+        assert.ok(ep.type === "movie" || ep.type === "episode" || ep.type === "show" || ep.type === "season", `Event ${ev.id} part ${ep.part} invalid type`);
+        if (ep.type === "movie") {
+          assert.ok(ep.title, `Event ${ev.id} part ${ep.part} missing movie title`);
+          assert.ok(ep.imdbId || ep.tmdbId, `Event ${ev.id} part ${ep.part} missing IDs`);
+        } else {
+          assert.ok(ep.showName, `Event ${ev.id} part ${ep.part} missing showName`);
+          assert.ok(ep.imdbId || ep.tmdbId, `Event ${ev.id} part ${ep.part} missing IDs`);
+        }
+      });
+    });
+  });
+
+  it("isCrossoverEpisodeMatch accurately matches movies and TV episodes/shows", () => {
+    const client = loadClient();
+    const events = client.get("TV_CROSSOVER_EVENTS");
+    const peacemaker = events.find((e) => e.id === "movie_peacemaker_suicide_squad");
+    assert.ok(peacemaker, "Peacemaker event exists");
+
+    const movieTarget = peacemaker.episodes[0]; // The Suicide Squad (2021)
+    const showTarget = peacemaker.episodes[1];  // Peacemaker Season 1
+
+    // Matching movie item
+    assert.equal(
+      client.call("isCrossoverEpisodeMatch", { kind: "movie", imdbId: "tt6334354", title: "The Suicide Squad" }, movieTarget),
+      true,
+      "Matches movie by imdbId"
+    );
+    assert.equal(
+      client.call("isCrossoverEpisodeMatch", { kind: "series", imdbId: "tt6334354", title: "The Suicide Squad" }, movieTarget),
+      false,
+      "Does not match movie target when item is a series"
+    );
+
+    // Matching TV show item
+    assert.equal(
+      client.call("isCrossoverEpisodeMatch", { kind: "series", imdbId: "tt13146404", showName: "Peacemaker", seasonNum: 1 }, showTarget),
+      true,
+      "Matches show by imdbId and season"
+    );
+    assert.equal(
+      client.call("isCrossoverEpisodeMatch", { kind: "series", imdbId: "tt13146404", showName: "Peacemaker", seasonNum: 2 }, showTarget),
+      false,
+      "Does not match show when season does not match target seasons array"
+    );
+  });
+
+  it("renderChannelCrossoverSuggestions suggests missing companion movies when show is drafted", () => {
+    const client = loadClient();
+    const doc = client.window.document;
+    let container = doc.getElementById("channelCrossoverSuggestions");
+    if (!container) {
+      container = doc.createElement("div");
+      container.id = "channelCrossoverSuggestions";
+      doc.body.appendChild(container);
+    }
+
+    // Add Peacemaker S1 to draft
+    client.set("channelDraftItems", [
+      {
+        id: "tt13146404",
+        kind: "series",
+        imdbId: "tt13146404",
+        tmdbId: 110492,
+        showName: "Peacemaker",
+        season: 1
+      }
+    ]);
+
+    client.call("renderChannelCrossoverSuggestions");
+    assert.equal(container.style.display, "block", "Suggestions banner displayed");
+    assert.ok(container.innerHTML.includes("Peacemaker"), "Banner mentions Peacemaker");
+    assert.ok(container.innerHTML.includes("The Suicide Squad"), "Banner suggests The Suicide Squad");
+    assert.ok(container.innerHTML.includes("spliceCrossoverEvent"), "Banner includes 1-click splice button");
+    assert.ok(container.innerHTML.includes("Missing Movie Continuation"), "Banner includes missing movie continuation label");
+  });
+
+  it("renderChannelCrossoverSuggestions suggests multi-show crossover episodes", () => {
+    const client = loadClient();
+    const doc = client.window.document;
+    let container = doc.getElementById("channelCrossoverSuggestions");
+    if (!container) {
+      container = doc.createElement("div");
+      container.id = "channelCrossoverSuggestions";
+      doc.body.appendChild(container);
+    }
+
+    // Add The Simpsons to draft
+    client.set("channelDraftItems", [
+      {
+        id: "tt0096697",
+        kind: "series",
+        imdbId: "tt0096697",
+        tmdbId: 456,
+        showName: "The Simpsons"
+      }
+    ]);
+
+    client.call("renderChannelCrossoverSuggestions");
+    assert.equal(container.style.display, "block", "Suggestions banner displayed");
+    assert.ok(container.innerHTML.includes("The Simpsons Guy"), "Banner suggests The Simpsons Guy crossover");
+    assert.ok(container.innerHTML.includes("Family Guy"), "Banner mentions Family Guy");
+  });
+
+  it("getStorylineCategories classifies companion and crossover events into appropriate genres", () => {
+    const client = loadClient();
+    const events = client.get("TV_CROSSOVER_EVENTS");
+
+    const peacemaker = events.find((e) => e.id === "movie_peacemaker_suicide_squad");
+    const peacemakerCats = client.call("getStorylineCategories", peacemaker);
+    assert.ok(peacemakerCats.includes("scifi"), "Peacemaker has scifi category");
+    assert.ok(peacemakerCats.includes("action"), "Peacemaker has action category");
+    assert.ok(peacemakerCats.includes("tvuniverses"), "Peacemaker has tvuniverses category");
+
+    const konosuba = events.find((e) => e.id === "movie_konosuba_legend_of_crimson");
+    const konosubaCats = client.call("getStorylineCategories", konosuba);
+    assert.ok(konosubaCats.includes("animation"), "KonoSuba has animation category");
+    assert.ok(konosubaCats.includes("tvuniverses"), "KonoSuba has tvuniverses category");
+
+    const bobs = events.find((e) => e.id === "movie_bobs_burgers_movie_saga");
+    const bobsCats = client.call("getStorylineCategories", bobs);
+    assert.ok(bobsCats.includes("animation"), "Bob's Burgers has animation category");
+  });
+});
+
+describe("client: livePreviewPosterHtml Continue Watching older season badge suppression", () => {
+  it("suppresses season finale badge on Continue Watching when user is watching an older season", () => {
+    const client = loadClient();
+    const fn = client.get("livePreviewPosterHtml");
+
+    // Configure Airing Next with Season 3 and upcoming finale
+    client.call("saveLocalCustomListsMap", {
+      "airing-next": {
+        slug: "airing-next",
+        items: [
+          {
+            id: "tt8360212:3:1",
+            showId: "tt8360212",
+            showTitle: "Grand Blue Dreaming",
+            name: "Episode 1",
+            seasonNum: 3,
+            episodeNum: 1,
+            airDate: "2099-07-05",
+            seasonFinaleAirDate: "2099-09-22",
+          },
+        ],
+      },
+      "continue-watching": {
+        slug: "continue-watching",
+        items: [
+          {
+            id: "tt8360212:2:5",
+            showId: "tt8360212",
+            showTitle: "Grand Blue Dreaming",
+            name: "Episode 5",
+            seasonNum: 2,
+            episodeNum: 5,
+          },
+        ],
+      },
+    });
+
+    // 1. CW item on Season 2 with seasonNum (older than airing Season 3)
+    const cwOlder = {
+      id: "tt8360212",
+      showId: "tt8360212",
+      showTitle: "Grand Blue Dreaming",
+      seasonNum: 2,
+      episodeNum: 5,
+      listSlug: "continue-watching",
+    };
+    const htmlOlder = fn(cwOlder);
+    assert.equal(htmlOlder.includes("cw-date-badge-finale-date"), false, "Older season must not display Finale date badge");
+    assert.equal(htmlOlder.includes("cw-date-badge-finale"), false, "Older season must not display Season Finale badge");
+
+    // 2. CW item on Season 2 with only season (fallback from /api/preview or raw meta)
+    const cwOlderOnlySeason = {
+      id: "tt8360212",
+      showId: "tt8360212",
+      showTitle: "Grand Blue Dreaming",
+      season: 2,
+      episode: 5,
+      listSlug: "continue-watching",
+    };
+    const htmlOlderOnlySeason = fn(cwOlderOnlySeason);
+    assert.equal(htmlOlderOnlySeason.includes("cw-date-badge-finale-date"), false, "Older season (via season prop) must not display Finale date badge");
+
+    // 3. CW item with no season on preview object, resolved via local CW item match
+    const cwOlderNoSeason = {
+      id: "tt8360212",
+      showId: "tt8360212",
+      showTitle: "Grand Blue Dreaming",
+      listSlug: "continue-watching",
+    };
+    const htmlOlderNoSeason = fn(cwOlderNoSeason);
+    assert.equal(htmlOlderNoSeason.includes("cw-date-badge-finale-date"), false, "Older season (via local CW match) must not display Finale date badge");
+
+    // 4. CW item on Season 3 (current season, episode 2) -> should display the season finale badge
+    const cwCurrent = {
+      id: "tt8360212",
+      showId: "tt8360212",
+      showTitle: "Grand Blue Dreaming",
+      seasonNum: 3,
+      episodeNum: 2,
+      listSlug: "continue-watching",
+    };
+    const htmlCurrent = fn(cwCurrent);
+    assert.equal(htmlCurrent.includes("cw-date-badge-finale-date"), true, "Current season must display Finale date badge when available");
+
+    // 5. CW item on Season 3 Episode 1 (current season, already aired) with Airing Next on Episode 11
+    client.call("saveLocalCustomListsMap", {
+      "airing-next": {
+        slug: "airing-next",
+        items: [
+          {
+            id: "tt8360212:3:11",
+            showId: "tt8360212",
+            showTitle: "Grand Blue Dreaming",
+            name: "Episode 11",
+            seasonNum: 3,
+            episodeNum: 11,
+            airDate: "2099-09-15",
+            seasonFinaleAirDate: "2099-09-22",
+          },
+        ],
+      },
+      "continue-watching": {
+        slug: "continue-watching",
+        items: [
+          {
+            id: "tt8360212:3:1",
+            showId: "tt8360212",
+            showTitle: "Grand Blue Dreaming",
+            name: "Unfinished Business",
+            seasonNum: 3,
+            episodeNum: 1,
+            airDate: "2020-07-05",
+          },
+        ],
+      },
+    });
+    client.call("invalidatePosterRenderCaches");
+
+    const cwCurrentEp1Aired = {
+      id: "tt8360212",
+      showId: "tt8360212",
+      showTitle: "Grand Blue Dreaming",
+      name: "Unfinished Business",
+      seasonNum: 3,
+      episodeNum: 1,
+      airDate: "2020-07-05",
+      listSlug: "continue-watching",
+    };
+    const htmlCurrentEp1Aired = fn(cwCurrentEp1Aired);
+    assert.equal(htmlCurrentEp1Aired.includes("cw-date-badge-finale-date"), true, "Aired episode 1 of current season must display Finale date badge in Live Preview");
+    assert.equal(htmlCurrentEp1Aired.includes("cw-date-badge-premiere"), false, "Aired episode 1 must not display Season Premiere badge");
+
+    // 6. CW item on Season 3 Episode 1 with no explicit airDate, but Airing Next is on Episode 11 (has later airing ep)
+    const cwCurrentEp1NoAirDate = {
+      id: "tt8360212",
+      showId: "tt8360212",
+      showTitle: "Grand Blue Dreaming",
+      name: "Unfinished Business",
+      seasonNum: 3,
+      episodeNum: 1,
+      listSlug: "continue-watching",
+    };
+    const htmlCurrentEp1NoAirDate = fn(cwCurrentEp1NoAirDate);
+    assert.equal(htmlCurrentEp1NoAirDate.includes("cw-date-badge-finale-date"), true, "Episode 1 with later airing ep must display Finale date badge");
+    assert.equal(htmlCurrentEp1NoAirDate.includes("cw-date-badge-premiere"), false, "Episode 1 with later airing ep must not display Premiere badge");
+
+    // 7. Verify buildLocalListCardHtml (Your Custom Lists) matches livePreviewPosterHtml (Live Preview)
+    const buildLocalCard = client.get("buildLocalListCardHtml");
+    const cwListCardHtml = buildLocalCard({
+      slug: "continue-watching",
+      name: "Continue Watching",
+      type: "series",
+      items: [cwCurrentEp1Aired],
+    });
+    assert.equal(cwListCardHtml.includes("cw-date-badge-finale-date"), true, "Your Custom Lists must display Finale date badge on aired Episode 1");
+    assert.equal(cwListCardHtml.includes("cw-date-badge-premiere"), false, "Your Custom Lists must not display Season Premiere badge on aired Episode 1");
+
+    // 8. Upcoming unaired Episode 1 (airing in future) must display Season Premiere badge, not Finale badge
+    client.call("saveLocalCustomListsMap", {
+      "airing-next": {
+        slug: "airing-next",
+        items: [
+          {
+            id: "tt8360212:4:1",
+            showId: "tt8360212",
+            showTitle: "Grand Blue Dreaming",
+            name: "Episode 1",
+            seasonNum: 4,
+            episodeNum: 1,
+            airDate: "2099-10-01",
+            seasonFinaleAirDate: "2099-12-20",
+          },
+        ],
+      },
+    });
+    client.call("invalidatePosterRenderCaches");
+    const cwUpcomingPremiere = {
+      id: "tt8360212",
+      showId: "tt8360212",
+      showTitle: "Grand Blue Dreaming",
+      seasonNum: 4,
+      episodeNum: 1,
+      airDate: "2099-10-01",
+      isUnaired: true,
+      listSlug: "continue-watching",
+    };
+    const htmlUpcomingPremiere = fn(cwUpcomingPremiere);
+    assert.equal(htmlUpcomingPremiere.includes("cw-date-badge-premiere"), true, "Upcoming unaired episode 1 must display Season Premiere badge");
+    assert.equal(htmlUpcomingPremiere.includes("cw-date-badge-finale-date"), false, "Upcoming unaired episode 1 must not display Finale date badge");
+  });
+});
+
+describe("client: adult content filter & safe poster replacement", () => {
+  it("detects when adultContentFilter is enabled via localStorage", () => {
+    const client = loadClient({
+      storage: { "myListAddon:adultContentFilter": "1" },
+    });
+    const isFilterEnabled = client.get("isAdultContentFilterEnabled");
+    assert.equal(isFilterEnabled(), true);
+
+    const clientOff = loadClient({
+      storage: { "myListAddon:adultContentFilter": "0" },
+    });
+    const isFilterEnabledOff = clientOff.get("isAdultContentFilterEnabled");
+    assert.equal(isFilterEnabledOff(), false);
+  });
+
+  it("isAdultOrNsfw identifies adult metadata in client scripts", () => {
+    const client = loadClient();
+    const isAdult = client.get("isAdultOrNsfw");
+
+    assert.equal(isAdult({ adult: true }), true);
+    assert.equal(isAdult({ isAdult: true }), true);
+    assert.equal(isAdult({ certification: "NC-17" }), true);
+    assert.equal(isAdult({ genres: ["Hentai"] }), true);
+    assert.equal(isAdult({ genres: "Erotica, Drama" }), true);
+    assert.equal(isAdult({ title: "Inception", genres: ["Action"] }), false);
+  });
+
+  it("getSafePosterUrl creates safe poster endpoint link with query params", () => {
+    const client = loadClient();
+    const getSafe = client.get("getSafePosterUrl");
+
+    const url = getSafe({ title: "Adult Show", year: "2024", type: "series", certification: "NC-17" });
+    assert.ok(url.includes("/api/safe-poster?title=Adult%20Show"));
+    assert.ok(url.includes("year=2024"));
+    assert.ok(url.includes("type=series"));
+    assert.ok(url.includes("cert=NC-17"));
+  });
+
+  it("resolveClientPoster returns safe poster URL when filter is enabled and item is adult", () => {
+    const client = loadClient({
+      storage: { "myListAddon:adultContentFilter": "1" },
+    });
+    const resolve = client.get("resolveClientPoster");
+
+    const safeAdult = resolve({ title: "Adult Show", adult: true }, "https://images.example.com/adult.jpg");
+    assert.ok(safeAdult.includes("/api/safe-poster"));
+
+    const safeNormal = resolve({ title: "Family Movie", adult: false }, "https://images.example.com/family.jpg");
+    assert.equal(safeNormal, "https://images.example.com/family.jpg");
+  });
+
+  it("resolveClientPoster preserves original poster when filter is disabled", () => {
+    const client = loadClient({
+      storage: { "myListAddon:adultContentFilter": "0" },
+    });
+    const resolve = client.get("resolveClientPoster");
+
+    const poster = resolve({ title: "Adult Show", adult: true }, "https://images.example.com/adult.jpg");
+    assert.equal(poster, "https://images.example.com/adult.jpg");
+  });
+
+  it("livePreviewPosterHtml replaces adult poster with safe poster when filter is on", () => {
+    const client = loadClient({
+      storage: { "myListAddon:adultContentFilter": "1" },
+    });
+    const renderTile = client.get("livePreviewPosterHtml");
+
+    const html = renderTile({
+      id: "tt_adult",
+      name: "NSFW Show",
+      poster: "https://images.example.com/nsfw.jpg",
+      adult: true,
+      type: "series",
+    });
+
+    assert.ok(html.includes("/api/safe-poster?title=NSFW%20Show"));
+    assert.equal(html.includes("https://images.example.com/nsfw.jpg"), false);
+  });
+
+  it("buildLocalListCardHtml renders safe poster for adult items when filter is on", () => {
+    const client = loadClient({
+      storage: { "myListAddon:adultContentFilter": "1" },
+    });
+    const buildCard = client.get("buildLocalListCardHtml");
+
+    const cardHtml = buildCard({
+      slug: "custom-safety-test",
+      name: "My Safety List",
+      type: "series",
+      items: [
+        { id: "tt_safe", title: "Safe Show", poster: "https://images.example.com/safe.jpg", adult: false },
+        { id: "tt_adult", title: "Adult Anime", poster: "https://images.example.com/nsfw.jpg", genres: ["Hentai"] },
+      ],
+    });
+
+    assert.ok(cardHtml.includes("https://images.example.com/safe.jpg"), "safe show poster remains intact");
+    assert.ok(cardHtml.includes("/api/safe-poster?title=Adult%20Anime"), "adult anime poster is replaced with safe poster");
+    assert.equal(cardHtml.includes("https://images.example.com/nsfw.jpg"), false, "raw nsfw poster is not rendered");
+  });
+
+  it("collectKeys returns adultContentFilter: true when enabled", () => {
+    const client = loadClient({
+      storage: { "myListAddon:adultContentFilter": "1" },
+    });
+    const collect = client.get("collectKeys");
+    const keys = collect();
+    assert.equal(keys.adultContentFilter, true);
+  });
+});
+
+describe("client: continue watching storyline & companion recommendations", () => {
+  it("settings toggle: defaults to enabled and persists toggling", () => {
+    const client = loadClient();
+    assert.equal(client.call("getCompanionRecommendationSetting"), true, "enabled by default");
+
+    client.call("toggleCompanionRecommendationSetting", false);
+    assert.equal(client.call("getCompanionRecommendationSetting"), false, "disabled after toggle false");
+
+    client.call("toggleCompanionRecommendationSetting", true);
+    assert.equal(client.call("getCompanionRecommendationSetting"), true, "enabled after toggle true");
+  });
+
+  it("findCompanionBridgeMovie: detects canon bridge movie between seasons (Demon Slayer Mugen Train)", () => {
+    const client = loadClient();
+    const bridge = client.call("findCompanionBridgeMovie", "tt9335498", 1, 2);
+    assert.ok(bridge, "bridge movie found for Demon Slayer between S1 and S2");
+    assert.equal(bridge.id, "tt11032374");
+    assert.equal(bridge.type, "movie");
+    assert.equal(bridge.isCompanion, true);
+    assert.equal(bridge.companionType, "bridge_movie");
+    assert.ok(bridge.name.includes("Mugen Train"));
+
+    // Once watched in Watch History, bridge movie should no longer be returned
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history",
+        items: [{ id: "tt11032374", imdbId: "tt11032374", type: "movie", title: "Mugen Train" }]
+      }
+    });
+    const bridgeAfterWatch = client.call("findCompanionBridgeMovie", "tt9335498", 1, 2);
+    assert.equal(bridgeAfterWatch, null, "bridge movie not returned if already watched");
+  });
+  it("findCompanionShowConclusion: recommends sequel film on show conclusion (Breaking Bad -> El Camino)", () => {
+    const client = loadClient();
+    const sequel = client.call("findCompanionShowConclusion", "tt0903747");
+    assert.ok(sequel, "sequel movie found for Breaking Bad finale");
+    assert.equal(sequel.id, "tt9243946");
+    assert.equal(sequel.type, "movie");
+    assert.equal(sequel.isCompanion, true);
+    assert.equal(sequel.companionType, "sequel_movie");
+    assert.ok(sequel.name.includes("El Camino"));
+
+    // When El Camino is already watched, it advances to Better Call Saul
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history",
+        items: [{ id: "tt9243946", imdbId: "tt9243946", type: "movie", title: "El Camino: A Breaking Bad Movie" }]
+      }
+    });
+    const nextSeries = client.call("findCompanionShowConclusion", "tt0903747");
+    assert.ok(nextSeries, "spinoff series found after El Camino watched");
+    assert.equal(nextSeries.showId, "tt3032476");
+    assert.equal(nextSeries.type, "episode");
+    assert.equal(nextSeries.seasonNum, 1);
+    assert.equal(nextSeries.episodeNum, 1);
+    assert.equal(nextSeries.companionType, "spinoff_series");
+  });
+
+  it("advanceCompanionOnMovieWatched: watching El Camino injects Better Call Saul S1E1 into Continue Watching", async () => {
+    const client = loadClient();
+    await client.call("advanceCompanionOnMovieWatched", {
+      id: "tt9243946",
+      imdbId: "tt9243946",
+      type: "movie",
+      title: "El Camino: A Breaking Bad Movie"
+    });
+
+    const map = client.call("loadLocalCustomLists");
+    const cwItems = (map["continue-watching"] && map["continue-watching"].items) || [];
+    const bcs = cwItems.find((it) => it.showId === "tt3032476");
+    assert.ok(bcs, "Better Call Saul was injected into Continue Watching");
+    assert.equal(bcs.seasonNum, 1);
+    assert.equal(bcs.episodeNum, 1);
+    assert.equal(bcs.isCompanion, true);
+  });
+
+  it("dismissContinueWatchingShow: dismissing companion movie removes it and prevents re-recommendation", async () => {
+    const client = loadClient({
+      storage: {
+        "myListAddon:localCustomLists": JSON.stringify({
+          "continue-watching": {
+            slug: "continue-watching",
+            items: [
+              {
+                id: "tt9243946",
+                imdbId: "tt9243946",
+                title: "El Camino",
+                isCompanion: true
+              }
+            ]
+          }
+        })
+      }
+    });
+
+    await client.call("dismissContinueWatchingShow", "tt9243946");
+    const map = client.call("loadLocalCustomLists");
+    const cwItems = (map["continue-watching"] && map["continue-watching"].items) || [];
+    assert.equal(cwItems.length, 0, "movie was removed from Continue Watching");
+
+    // Re-checking conclusion returns null because it is recorded in dismissed list
+    const conclusion = client.call("findCompanionShowConclusion", "tt0903747");
+    assert.equal(conclusion, null, "dismissed companion is not re-recommended");
+  });
+
+  it("disabled setting: returns null for companions when setting is disabled", () => {
+    const client = loadClient({
+      storage: { "myListAddon:autoRecommendCompanions": "0" }
+    });
+    assert.equal(client.call("getCompanionRecommendationSetting"), false);
+    assert.equal(client.call("findCompanionBridgeMovie", "tt9335498", 1, 2), null);
+    assert.equal(client.call("findCompanionShowConclusion", "tt0903747"), null);
+  });
+
+  it("UI badges: renders cw-date-badge-companion on companion cards", () => {
+    const client = loadClient();
+    const buildCard = client.get("buildLocalListCardHtml");
+    const cardHtml = buildCard({
+      slug: "continue-watching",
+      name: "Continue Watching",
+      type: "mixed",
+      items: [
+        {
+          id: "tt11032374",
+          imdbId: "tt11032374",
+          title: "Demon Slayer Mugen Train",
+          poster: "https://images.example.com/mugen.jpg",
+          isCompanion: true,
+          companionType: "bridge_movie",
+          companionNote: "Canon Bridge Movie"
+        }
+      ]
+    });
+    assert.ok(cardHtml.includes("cw-date-badge-companion"), "renders companion badge class");
+    assert.ok(cardHtml.includes("Bridge Movie"), "displays Bridge Movie text");
+
+    const livePreview = client.get("livePreviewPosterHtml");
+    const previewHtml = livePreview({
+      id: "tt9243946",
+      name: "El Camino: A Breaking Bad Movie",
+      poster: "https://images.example.com/elcamino.jpg",
+      isCompanion: true,
+      companionType: "sequel_movie",
+      companionNote: "Sequel Film",
+      listSlug: "continue-watching"
+    });
+    assert.ok(previewHtml.includes("cw-date-badge-companion"), "live preview renders companion badge class");
+    assert.ok(previewHtml.includes("Sequel Film"), "live preview displays Sequel Film text");
+  });
+});
+
+describe("client: Mark Show Watched and Unwatched modal button", () => {
+  const setupShowModal = (client, showDetails) => {
+    client.set("_currentItemDetails", showDetails);
+    const doc = client.get("document");
+    const btnShow = doc.getElementById("btnMarkShowWatched");
+    btnShow.classList.add("primary");
+    btnShow.innerHTML = "Mark Show Watched";
+    return { doc, btnShow };
+  };
+
+  it("markShowWatched marks whole show watched and toggles button to Mark Show Unwatched", async () => {
+    const episodesS1 = [
+      { id: 101, name: "Pilot", episode_number: 1, air_date: "2008-01-20" },
+      { id: 102, name: "Cat's in the Bag...", episode_number: 2, air_date: "2008-01-27" }
+    ];
+    const episodesS2 = [
+      { id: 201, name: "Seven Thirty-Seven", episode_number: 1, air_date: "2009-03-08" },
+      { id: 202, name: "Grilled", episode_number: 2, air_date: "2009-03-15" }
+    ];
+
+    const client = loadClient({
+      routes: {
+        "/api/season": (req) => {
+          const url = new URL(req.url, "https://example.com");
+          const s = url.searchParams.get("seasonNum");
+          if (s === "1") return { json: { ok: true, season: { episodes: episodesS1 } } };
+          if (s === "2") return { json: { ok: true, season: { episodes: episodesS2 } } };
+          return { json: { ok: false, error: "Not found" } };
+        }
+      }
+    });
+
+    const showDetails = {
+      id: "tt0903747",
+      tmdbId: 1396,
+      title: "Breaking Bad",
+      seasonsData: [
+        { season_number: 1, episode_count: 2 },
+        { season_number: 2, episode_count: 2 }
+      ]
+    };
+    const { btnShow } = setupShowModal(client, showDetails);
+
+    // 1. Mark Show Watched
+    await client.call("markShowWatched", "tt0903747");
+    assert.ok(btnShow.innerHTML.includes("Mark Show Unwatched"), "button changes to Mark Show Unwatched");
+    assert.ok(btnShow.classList.contains("secondary"), "button receives secondary class");
+    assert.equal(btnShow.classList.contains("primary"), false);
+
+    const map1 = client.call("loadLocalCustomLists");
+    const hist1 = map1["watch-history"]?.items || [];
+    assert.equal(hist1.length, 4, "all 4 episodes added to Watch History");
+    assert.equal(client.call("isShowFullyWatched", showDetails), true, "show is fully watched");
+
+    // 2. Mark Show Unwatched
+    await client.call("markShowWatched", "tt0903747");
+    assert.ok(btnShow.innerHTML.includes("Mark Show Watched"), "button flips back to Mark Show Watched");
+    assert.ok(btnShow.classList.contains("primary"), "button receives primary class");
+    assert.equal(btnShow.classList.contains("secondary"), false);
+
+    const map2 = client.call("loadLocalCustomLists");
+    const hist2 = map2["watch-history"]?.items || [];
+    assert.equal(hist2.length, 0, "all episodes removed from Watch History");
+    assert.equal(client.call("isShowFullyWatched", showDetails), false, "show is not fully watched");
+  });
+
+  it("marking whole show watched then making a season unwatched flips button back to Mark Show Watched", async () => {
+    const episodesS1 = [
+      { id: 101, name: "Pilot", episode_number: 1, air_date: "2008-01-20" }
+    ];
+    const episodesS2 = [
+      { id: 201, name: "Seven Thirty-Seven", episode_number: 1, air_date: "2009-03-08" }
+    ];
+
+    const client = loadClient({
+      routes: {
+        "/api/season": (req) => {
+          const url = new URL(req.url, "https://example.com");
+          const s = url.searchParams.get("seasonNum");
+          if (s === "1") return { json: { ok: true, season: { episodes: episodesS1 } } };
+          if (s === "2") return { json: { ok: true, season: { episodes: episodesS2 } } };
+          return { json: { ok: false, error: "Not found" } };
+        }
+      }
+    });
+
+    const showDetails = {
+      id: "tt0903747",
+      tmdbId: 1396,
+      title: "Breaking Bad",
+      seasonsData: [
+        { season_number: 1, episode_count: 1 },
+        { season_number: 2, episode_count: 1 }
+      ]
+    };
+    const { btnShow } = setupShowModal(client, showDetails);
+
+    // Mark whole show watched first
+    await client.call("markShowWatched", "tt0903747");
+    assert.ok(btnShow.innerHTML.includes("Mark Show Unwatched"), "initially Mark Show Unwatched");
+
+    // Now unwatch Season 2
+    const btnSeason2 = {
+      disabled: false,
+      textContent: "",
+      innerHTML: "",
+      classList: {
+        remove() {},
+        add() {}
+      }
+    };
+    await client.call("markSeasonWatched", 2, btnSeason2);
+
+    // The show button MUST turn back to Mark Show Watched
+    assert.ok(btnShow.innerHTML.includes("Mark Show Watched"), "button turns back to Mark Show Watched after season unwatched");
+    assert.ok(btnShow.classList.contains("primary"), "button receives primary class");
+    assert.equal(btnShow.classList.contains("secondary"), false);
+    assert.equal(client.call("isShowFullyWatched", showDetails), false);
+
+    // Re-watch Season 2 -> show button turns back to Mark Show Unwatched
+    await client.call("markSeasonWatched", 2, btnSeason2);
+    assert.ok(btnShow.innerHTML.includes("Mark Show Unwatched"), "button turns back to Mark Show Unwatched after season re-watched");
+    assert.ok(btnShow.classList.contains("secondary"), "button receives secondary class");
+    assert.equal(client.call("isShowFullyWatched", showDetails), true);
+  });
+
+  it("markShowWatched synchronously evicts completed show and immediately injects storyline companion into continue-watching", async () => {
+    const episodesS1 = [
+      { id: 101, name: "Pilot", episode_number: 1, air_date: "2008-01-20" },
+      { id: 102, name: "Cat's in the Bag...", episode_number: 2, air_date: "2008-01-27" }
+    ];
+    const episodesS2 = [
+      { id: 201, name: "Seven Thirty-Seven", episode_number: 1, air_date: "2009-03-08" },
+      { id: 202, name: "Grilled", episode_number: 2, air_date: "2009-03-15" }
+    ];
+
+    const client = loadClient({
+      routes: {
+        "/api/season": (req) => {
+          const url = new URL(req.url, "https://example.com");
+          const s = url.searchParams.get("seasonNum");
+          if (s === "1") return { json: { ok: true, season: { episodes: episodesS1 } } };
+          if (s === "2") return { json: { ok: true, season: { episodes: episodesS2 } } };
+          return { json: { ok: false, error: "Not found" } };
+        }
+      }
+    });
+
+    const showDetails = {
+      id: "tt0903747",
+      tmdbId: 1396,
+      title: "Breaking Bad",
+      seasonsData: [
+        { season_number: 1, episode_count: 2 },
+        { season_number: 2, episode_count: 2 }
+      ]
+    };
+    setupShowModal(client, showDetails);
+
+    // Seed continue-watching with Breaking Bad S2E2
+    const initLists = client.call("loadLocalCustomLists");
+    initLists["continue-watching"] = {
+      id: "continue-watching",
+      name: "Continue Watching",
+      items: [
+        { id: "tt0903747:2:2", showId: "tt0903747", name: "Grilled", seasonNum: 2, episodeNum: 2, type: "episode" }
+      ]
+    };
+    client.call("saveLocalCustomListsMap", initLists);
+
+    // 1. Mark Show Watched
+    await client.call("markShowWatched", "tt0903747");
+
+    const listsAfterWatched = client.call("loadLocalCustomLists");
+    const cwItems = listsAfterWatched["continue-watching"]?.items || [];
+    // Verify Breaking Bad is evicted
+    assert.equal(cwItems.some(it => String(it.showId || it.id).startsWith("tt0903747")), false, "completed show must be evicted from continue-watching");
+    // Verify El Camino is injected immediately
+    const companionItem = cwItems.find(it => it.isCompanion);
+    assert.ok(companionItem, "companion item must be injected immediately into continue-watching");
+    assert.equal(companionItem.name, "El Camino: A Breaking Bad Movie");
+    assert.equal(companionItem.companionType, "sequel_movie");
+    assert.equal(companionItem.precedingShowId, "tt0903747");
+    assert.equal(companionItem.type, "movie");
+
+    // 2. Mark Show Unwatched
+    await client.call("markShowWatched", "tt0903747");
+    const listsAfterUnwatched = client.call("loadLocalCustomLists");
+    const cwItems2 = listsAfterUnwatched["continue-watching"]?.items || [];
+    // Verify queued companion is cleaned up
+    assert.equal(cwItems2.some(it => it.precedingShowId === "tt0903747"), false, "queued companion must be cleaned up when show is unmarked");
+  });
+});
+
+describe("client: Item Details Storylines, Sagas & Universes watch order", () => {
+  it("renderItemStorylinesWatchOrder renders chronological watch order for Breaking Bad universe", () => {
+    const client = loadClient();
+    const bb = {
+      id: "tt0903747",
+      imdbId: "tt0903747",
+      tmdbId: 1396,
+      title: "Breaking Bad",
+      seasonsData: [{ season_number: 1, episode_count: 7 }]
+    };
+
+    const html = client.__scopeCall("renderItemStorylinesWatchOrder", [bb, "series"]);
+    assert.ok(html.includes("item-storylines-section"), "renders storylines section");
+    assert.ok(html.includes("Breaking Bad Complete Universe"), "includes saga title");
+    assert.ok(html.includes("Part 1"), "includes Part 1");
+    assert.ok(html.includes("Part 2"), "includes Part 2");
+    assert.ok(html.includes("Part 3"), "includes Part 3");
+    assert.ok(html.includes("El Camino: A Breaking Bad Movie"), "includes El Camino companion movie");
+    assert.ok(html.includes("Better Call Saul"), "includes Better Call Saul prequel/sequel series");
+    assert.ok(html.includes("openStorylineDetails"), "includes Open Saga button");
+
+    // Breaking Bad itself should be highlighted as current
+    assert.ok(html.includes("is-current"), "has is-current class on active title");
+    assert.ok(html.includes("item-storyline-current-pill"), "has Current badge pill");
+    // Other entries should have click handlers pointing to openItemDetailsModal
+    assert.ok(html.includes("openItemDetailsModal(&quot;tt9243946&quot;, &quot;movie&quot;)"), "El Camino has click handler");
+    assert.ok(html.includes("openItemDetailsModal(&quot;tt3032476&quot;, &quot;series&quot;)"), "Better Call Saul has click handler");
+  });
+
+  it("renderItemStorylinesWatchOrder highlights companion movie when viewing El Camino", () => {
+    const client = loadClient();
+    const elCamino = {
+      id: "tt9243946",
+      imdbId: "tt9243946",
+      tmdbId: 559969,
+      title: "El Camino: A Breaking Bad Movie"
+    };
+
+    const html = client.__scopeCall("renderItemStorylinesWatchOrder", [elCamino, "movie"]);
+    assert.ok(html.includes("Breaking Bad Complete Universe"), "includes saga title");
+    // El Camino is Part 2, and should have is-current
+    assert.ok(html.includes("is-current"), "highlights current movie");
+    // Breaking Bad should have click handler
+    assert.ok(html.includes("openItemDetailsModal(&quot;tt0903747&quot;, &quot;series&quot;)"), "Breaking Bad has click handler");
+  });
+
+  it("renderItemStorylinesWatchOrder renders movie sagas such as MCU Infinity Saga", () => {
+    const client = loadClient();
+    const ironMan = {
+      id: "tt0371746",
+      imdbId: "tt0371746",
+      tmdbId: 1726,
+      title: "Iron Man"
+    };
+
+    const html = client.__scopeCall("renderItemStorylinesWatchOrder", [ironMan, "movie"]);
+    assert.ok(html.includes("Marvel Cinematic Universe: The Infinity Saga"), "includes MCU Infinity Saga");
+    assert.ok(html.includes("is-current"), "highlights Iron Man as current");
+  });
+
+  it("renderItemStorylinesWatchOrder renders tab pills when title belongs to multiple storylines", () => {
+    const client = loadClient();
+    const theFlash = {
+      id: "tt3107288",
+      imdbId: "tt3107288",
+      tmdbId: 60735,
+      title: "The Flash",
+      seasonsData: [{ season_number: 1, episode_count: 23 }]
+    };
+
+    const html = client.__scopeCall("renderItemStorylinesWatchOrder", [theFlash, "series"]);
+    assert.ok(html.includes("subnav-pills-bar"), "renders tab pills when multiple storylines match");
+    assert.ok(html.includes("switchItemStorylineTab"), "includes switchItemStorylineTab handlers");
+    assert.ok(html.includes("The Complete Arrowverse Timeline"), "includes Arrowverse timeline");
+  });
+
+  it("renderItemStorylinesWatchOrder returns empty string for titles not in any storyline", () => {
+    const client = loadClient();
+    const standalone = {
+      id: "tt9999999",
+      imdbId: "tt9999999",
+      tmdbId: 999999,
+      title: "Random Standalone Film 12345"
+    };
+
+    const html = client.__scopeCall("renderItemStorylinesWatchOrder", [standalone, "movie"]);
+    assert.equal(html, "", "must return empty string for non-storyline titles");
+  });
+
+  it("openItemDetailsModal integrates Storylines watch order at bottom of details modal", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/details": (req) => {
+          const url = new URL(req.url, "https://example.com");
+          const id = url.searchParams.get("imdbId");
+          if (id === "tt0903747") {
+            return {
+              json: {
+                ok: true,
+                details: {
+                  id: "tt0903747",
+                  imdbId: "tt0903747",
+                  tmdbId: 1396,
+                  title: "Breaking Bad",
+                  seasonsData: [{ season_number: 1, episode_count: 7 }]
+                }
+              }
+            };
+          }
+          return {
+            json: {
+              ok: true,
+              details: {
+                id: "tt9999999",
+                title: "Standalone Indie Movie"
+              }
+            }
+          };
+        }
+      }
+    });
+
+    const doc = client.get("document");
+    const body = doc.getElementById("itemDetailsBody");
+
+    // 1. Open Breaking Bad details
+    await client.call("openItemDetailsModal", "tt0903747", "series");
+    assert.ok(body.innerHTML.includes("item-storylines-section"), "Breaking Bad modal contains storylines section");
+    assert.ok(body.innerHTML.includes("Breaking Bad Complete Universe"), "Breaking Bad modal contains saga title");
+    assert.ok(body.innerHTML.includes("item-storyline-current-pill"), "Breaking Bad modal highlights current part");
+
+    // 2. Open Standalone Movie details
+    await client.call("openItemDetailsModal", "tt9999999", "movie");
+    assert.equal(body.innerHTML.includes("item-storylines-section"), false, "Standalone movie modal does not contain storylines section");
+  });
+});
+
+

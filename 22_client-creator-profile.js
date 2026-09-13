@@ -55,6 +55,11 @@ function compactCustomListItem(it) {
   if (it.seasonFinaleAirDate) clean.seasonFinaleAirDate = it.seasonFinaleAirDate;
   if (it.isSeasonPremiere) clean.isSeasonPremiere = true;
   if (it.isSeasonFinale) clean.isSeasonFinale = true;
+  if (it.isCompanion) clean.isCompanion = true;
+  if (it.companionType) clean.companionType = it.companionType;
+  if (it.companionNote) clean.companionNote = it.companionNote;
+  if (it.companionStoryline) clean.companionStoryline = it.companionStoryline;
+  if (it.precedingShowId) clean.precedingShowId = it.precedingShowId;
   return clean;
 }
 
@@ -64,6 +69,8 @@ function compactCustomListItem(it) {
 let _trimNotified = false;
 function notifyListsTrimmed(trimmed) {
   if (_trimNotified || !trimmed || !trimmed.length) return;
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (signedIn) return; // Guard: Never show this alert to a logged-in user
   _trimNotified = true;
   const detail = trimmed.slice(0, 4).map((t) => t.slug + ' (' + t.dropped + ')').join(', ');
   const msg = 'Some lists are too large to store in this browser, so the oldest items were dropped to make them fit: ' +
@@ -100,6 +107,10 @@ function compactCustomListMap(map, maxItemsPerList) {
     if (list.isWatchlist) cleanList.isWatchlist = true;
     if (list.isContinueWatching) cleanList.isContinueWatching = true;
     if (list.isWatchHistory) cleanList.isWatchHistory = true;
+    if (list.sourceUrl) cleanList.sourceUrl = list.sourceUrl;
+    if (list.synced != null) cleanList.synced = !!list.synced;
+    if (list.lastSyncedAt != null) cleanList.lastSyncedAt = list.lastSyncedAt;
+    if (Array.isArray(list.baseItemIds)) cleanList.baseItemIds = list.baseItemIds;
     if (Array.isArray(list.items)) {
       // Truncation here is permanent: the trimmed map is what gets written
       // AND what is held in memory afterwards, so anything cut is gone at
@@ -172,7 +183,7 @@ function saveLocalCustomListsMap(map) {
   // longer silent.
   const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
   const leanMap = compactCustomListMap(map, signedIn ? 100000 : 1000);
-  if (_lastCompactionTrimmed.length) {
+  if (!signedIn && _lastCompactionTrimmed.length) {
     notifyListsTrimmed(_lastCompactionTrimmed.slice());
   }
   _memoryCustomListsObj = leanMap;
@@ -187,7 +198,26 @@ function saveLocalCustomListsMap(map) {
     localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, str);
     return true;
   } catch (e) {
-    // If quota exceeded, try a tighter compression (500 items max per list)
+    if (signedIn) {
+      // For signed-in accounts, the server is the primary storage and has no 5MB quota.
+      // _memoryCustomListsObj MUST remain leanMap (with all items intact) so account sync pushes everything.
+      // We only attempt to write a smaller 500-item cache to localStorage as a best-effort offline fallback.
+      try {
+        const cacheMap = compactCustomListMap(map, 500);
+        const cacheStr = JSON.stringify(cacheMap);
+        try { sessionStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, cacheStr); } catch (err) {}
+        localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, cacheStr);
+      } catch (cacheErr) {
+        console.warn('saveLocalCustomListsMap: localStorage quota exceeded for signed-in user:', cacheErr.message || cacheErr);
+        window._localStorageFull = true;
+      }
+      try { if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ force: true }); } catch (err) {}
+      try { if (typeof pushCreatorSync === 'function') pushCreatorSync(); } catch (err) {}
+      notifyStorageFull(true);
+      return true;
+    }
+
+    // If quota exceeded and NOT signed in, try a tighter compression (500 items max per list)
     try {
       const ultraLeanMap = compactCustomListMap(map, 500);
       if (_lastCompactionTrimmed.length) {
@@ -212,12 +242,6 @@ function saveLocalCustomListsMap(map) {
       // failure, and the caller (and the person) get told.
       console.warn('saveLocalCustomListsMap: localStorage quota exceeded:', retryErr.message || retryErr);
       window._localStorageFull = true;
-      if (typeof activeCreator !== 'undefined' && activeCreator) {
-        try { if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ force: true }); } catch (e) {}
-        try { if (typeof pushCreatorSync === 'function') pushCreatorSync(); } catch (e) {}
-        notifyStorageFull(true);
-        return true;
-      }
       notifyStorageFull(false);
       return false;
     }
@@ -2606,6 +2630,11 @@ async function loadCreatorSync(opts) {
         if (cb) cb.checked = synced.keys.hideNonDigitalReleases;
         try { localStorage.setItem('myListAddon:hideNonDigitalReleases', synced.keys.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
       }
+      if (typeof synced.keys.adultContentFilter === 'boolean') {
+        const cb = document.getElementById('adultContentFilterCheckbox');
+        if (cb) cb.checked = synced.keys.adultContentFilter;
+        try { localStorage.setItem('myListAddon:adultContentFilter', synced.keys.adultContentFilter ? '1' : '0'); } catch (e) {}
+      }
       if (typeof synced.keys.shuffleShelves === 'boolean') {
         const el = document.getElementById('shuffleShelvesCheckbox');
         if (el) el.checked = synced.keys.shuffleShelves;
@@ -3556,6 +3585,10 @@ function backfillCreatorListsIntoLocalMap(serverLists) {
       createdAt: l.createdAt || Date.now(),
       updatedAt: Date.now(),
     };
+    if (l.sourceUrl) map[l.slug].sourceUrl = l.sourceUrl;
+    if (l.synced != null) map[l.slug].synced = l.synced;
+    if (l.lastSyncedAt != null) map[l.slug].lastSyncedAt = l.lastSyncedAt;
+    if (l.baseItemIds) map[l.slug].baseItemIds = l.baseItemIds;
     restored.push(l.slug);
   });
   if (!restored.length) return 0;
@@ -3663,18 +3696,23 @@ async function uploadMissingLocalListsToAccount(lists, creatorKey) {
   try {
     for (const l of lists) {
       try {
+        const uploadBody = {
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          slug: l.creatorSlug || l.slug,
+          name: l.name || l.slug,
+          type: l.type || 'movie',
+          items: l.items || [],
+          visibility: l.visibility || 'private',
+        };
+        if (l.sourceUrl) uploadBody.sourceUrl = l.sourceUrl;
+        if (l.synced != null) uploadBody.synced = l.synced;
+        if (l.lastSyncedAt != null) uploadBody.lastSyncedAt = l.lastSyncedAt;
+        if (l.baseItemIds) uploadBody.baseItemIds = l.baseItemIds;
         const res = await fetch(ORIGIN + '/api/creator/lists/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            slug: l.creatorSlug || l.slug,
-            name: l.name || l.slug,
-            type: l.type || 'movie',
-            items: l.items || [],
-            visibility: l.visibility || 'private',
-          }),
+          body: JSON.stringify(uploadBody),
         });
         const data = await res.json();
         if (!data || !data.ok || !data.slug) continue;
@@ -3850,6 +3888,9 @@ async function renderCreatorDashboard(options) {
             p = 'https://images.metahub.space/poster/medium/' + sId + '/img';
           }
         }
+        if (typeof resolveClientPoster === 'function') {
+          return resolveClientPoster(it, p || '');
+        }
         return p || '';
       };
       const allPosters = (l.items || []).slice(0, 9).filter((it) => it && resolveItemPoster(it));
@@ -3885,6 +3926,10 @@ async function renderCreatorDashboard(options) {
         '</div>';
       }).join('');
       const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, l.type, l.slug) : false;
+      const isSynced = !!(l.synced && l.sourceUrl);
+      const syncBtnHtml = isSynced
+        ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
+        : '';
       return '<div class="list-card creator-list-row" draggable="true" data-slug="' + escapeAttr(l.slug) + '">' +
         '<div class="list-card-header">' +
           '<div class="list-card-body creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' +
@@ -3898,11 +3943,13 @@ async function renderCreatorDashboard(options) {
               '<span>' + (l.type === 'series' ? 'Shows' : (l.type === 'mixed' ? 'Mixed' : 'Movies')) + '</span>' +
               '<span class="list-card-meta-sep">&middot;</span>' +
               '<span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
+              (isSynced ? ('<span class="list-card-meta-sep">&middot;</span><span>Synced</span>') : '') +
               '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
             '</div>' +
           '</div>' +
           '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary creatorListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
+            syncBtnHtml +
             deleteBtnHtml +
             shareBtn +
             '<button type="button" class="lc-btn ' + (isAdded ? 'secondary creatorListAddToConfigBtn is-added' : 'primary creatorListAddToConfigBtn') + '" ' +
@@ -3979,14 +4026,23 @@ async function renderCreatorDashboard(options) {
 
     const visibleDashboardLists = (typeof isListHidden === 'function') ? allDashboardLists.filter((item) => !isListHidden(item.list && item.list.slug)) : allDashboardLists;
 
+    const localOrder = readDashboardListOrder();
     let savedOrder = [];
     if (Array.isArray(data.order) && data.order.length) {
-      savedOrder = data.order;
+      if (localOrder.length) {
+        const serverSlugs = new Set(data.order);
+        savedOrder = localOrder.filter((s) => serverSlugs.has(s) || ['continue-watching', 'watch-history', 'watchlist', 'airing-next'].includes(s));
+        data.order.forEach((s) => {
+          if (!savedOrder.includes(s)) savedOrder.push(s);
+        });
+      } else {
+        savedOrder = data.order;
+      }
       try {
         localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(savedOrder));
       } catch (e) {}
     } else {
-      savedOrder = readDashboardListOrder();
+      savedOrder = localOrder;
     }
     if (savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
@@ -4013,6 +4069,11 @@ async function renderCreatorDashboard(options) {
     if (prevScrollTop) box.scrollTop = prevScrollTop;
     document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
     if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+
+    // Auto-sync check for lists linked to external URLs if >24 hours stale
+    try {
+      checkAndAutoSyncExternalLists(visibleDashboardLists);
+    } catch (e) {}
   } catch (e) {
     console.error('renderCreatorDashboard error:', e);
     if (!hasExistingContent) {
@@ -4020,6 +4081,39 @@ async function renderCreatorDashboard(options) {
     }
   }
 }
+
+let _autoSyncRunning = false;
+async function checkAndAutoSyncExternalLists(dashboardItems) {
+  if (_autoSyncRunning || !Array.isArray(dashboardItems) || !dashboardItems.length) return;
+  if (typeof syncCustomListWithExternalSource !== 'function') return;
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const staleSlugs = [];
+
+  dashboardItems.forEach((it) => {
+    const l = it && it.list;
+    if (!l || !l.slug || !l.synced || !l.sourceUrl) return;
+    const lastSync = Number(l.lastSyncedAt) || 0;
+    if (now - lastSync > ONE_DAY_MS) {
+      staleSlugs.push(l.slug);
+    }
+  });
+
+  if (!staleSlugs.length) return;
+  _autoSyncRunning = true;
+  try {
+    for (const slug of staleSlugs) {
+      try {
+        await syncCustomListWithExternalSource(slug, null, { silent: true });
+      } catch (e) {
+        console.warn('Auto-sync failed for ' + slug, e);
+      }
+    }
+  } finally {
+    _autoSyncRunning = false;
+  }
+}
+window.checkAndAutoSyncExternalLists = checkAndAutoSyncExternalLists;
 
 function formatWatchItemLabel(it) {
   if (!it) return { title: '', subtitle: '' };
@@ -4041,10 +4135,14 @@ function buildLocalListCardHtml(l) {
   const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && String(l.name).toLowerCase() === 'watchlist');
   const liveMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : null;
   const liveEntry = (liveMap && l.slug) ? liveMap[l.slug] : null;
-  if (liveEntry && Array.isArray(liveEntry.items)) {
-    l.items = liveEntry.items;
+  if (liveEntry) {
+    if (Array.isArray(liveEntry.items)) l.items = liveEntry.items;
     if (liveEntry.visibility) l.visibility = liveEntry.visibility;
     if (liveEntry.type && !l.type) l.type = liveEntry.type;
+    if (liveEntry.sourceUrl) l.sourceUrl = liveEntry.sourceUrl;
+    if (liveEntry.synced != null) l.synced = liveEntry.synced;
+    if (liveEntry.lastSyncedAt != null) l.lastSyncedAt = liveEntry.lastSyncedAt;
+    if (liveEntry.baseItemIds) l.baseItemIds = liveEntry.baseItemIds;
   }
   const resolveItemPoster = (it) => {
     if (!it) return '';
@@ -4055,6 +4153,9 @@ function buildLocalListCardHtml(l) {
       if (sId && String(sId).startsWith('tt')) {
         p = 'https://images.metahub.space/poster/medium/' + sId + '/img';
       }
+    }
+    if (typeof resolveClientPoster === 'function') {
+      return resolveClientPoster(it, p || '');
     }
     return p || '';
   };
@@ -4076,8 +4177,9 @@ function buildLocalListCardHtml(l) {
     const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
     const label = formatWatchItemLabel(it);
     let removeBtn = '';
-    if (l.slug === 'continue-watching' && it.showId) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(it.showId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+    const cwRemoveId = it.showId || it.imdbId || it.id;
+    if (l.slug === 'continue-watching' && cwRemoveId) {
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
     } else if (isWatchlist) {
       removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
     } else if (l.slug === 'watch-history') {
@@ -4109,20 +4211,26 @@ function buildLocalListCardHtml(l) {
       if (aTitle && itTitle && aTitle === itTitle) return true;
       return false;
     });
-    const itSeason = it.seasonNum != null ? it.seasonNum : (airingMatch ? airingMatch.seasonNum : null);
-    const itEpisode = it.episodeNum != null ? it.episodeNum : (airingMatch ? airingMatch.episodeNum : null);
+    const effectiveSeasonNum = it.seasonNum != null ? it.seasonNum : (it.season != null ? it.season : null);
+    const effectiveEpisodeNum = it.episodeNum != null ? it.episodeNum : (it.episode != null ? it.episode : null);
+
+    const itSeason = effectiveSeasonNum != null ? effectiveSeasonNum : (!isCwList && airingMatch ? airingMatch.seasonNum : null);
+    const itEpisode = effectiveEpisodeNum != null ? effectiveEpisodeNum : (!isCwList && airingMatch ? airingMatch.episodeNum : null);
     
     // Check if this show is on an older past season (not the newest season)
-    const isOlderSeason = isCwList && !!(airingMatch && airingMatch.seasonNum != null && it.seasonNum != null && it.seasonNum < airingMatch.seasonNum);
+    const isOlderSeason = isCwList && !!(airingMatch && airingMatch.seasonNum != null && effectiveSeasonNum != null && effectiveSeasonNum < airingMatch.seasonNum);
 
     let dateBadge = '';
     let bottomBadge = '';
 
     if (showLocationBadges && !isOlderSeason) {
-      const isSameEpisode = !!(airingMatch && (!itSeason || !airingMatch.seasonNum || itSeason === airingMatch.seasonNum) && (!itEpisode || !airingMatch.episodeNum || itEpisode === airingMatch.episodeNum));
+      const isSameSeason = !!(airingMatch && (!itSeason || !airingMatch.seasonNum || itSeason === airingMatch.seasonNum));
+      const isSameEpisode = isSameSeason && (!itEpisode || !airingMatch.episodeNum || itEpisode === airingMatch.episodeNum);
       const effectiveAirDate = it.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
-      const hasAired = effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false;
-      const isUnairedEp = effectiveAirDate ? !hasAired : !!(it.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired));
+      const currentEpNum = itEpisode != null ? itEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
+      const hasLaterAiringEp = !!(isSameSeason && airingMatch && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
+      const hasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false);
+      const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(it.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
 
       if (showAirDate && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
         const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
@@ -4131,17 +4239,19 @@ function buildLocalListCardHtml(l) {
         }
       }
 
-      const currentEpNum = itEpisode != null ? itEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
       const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (it.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
       const isSeasonFinale = !!(it.isSeasonFinale || (isSameEpisode && airingMatch && airingMatch.isSeasonFinale) || (airingMatch && airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
       const seasonFinaleAirDate = it.seasonFinaleAirDate || (airingMatch ? (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : null)) : null);
       const isFinaleUnaired = seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(seasonFinaleAirDate) : !!seasonFinaleAirDate;
 
-      if (showPremiere && isSeasonPremiere && isUnairedEp) {
+      if (it.isCompanion) {
+        const compLabel = it.companionType === 'bridge_movie' ? 'Bridge Movie' : (it.companionType === 'sequel_movie' ? 'Sequel Film' : 'Storyline');
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-companion" title="' + escapeAttr(it.companionNote || it.companionStoryline || 'Next in Storyline') + '">' + escapeHtml(compLabel) + '</div>';
+      } else if (showPremiere && isSeasonPremiere && isUnairedEp) {
         bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(effectiveAirDate || '') + '">Season Premiere</div>';
       } else if (showFinale && isSeasonFinale) {
         bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(effectiveAirDate || seasonFinaleAirDate || '') + '">Season Finale</div>';
-      } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!currentEpNum || currentEpNum >= 2)) {
+      } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!isSeasonPremiere || !isUnairedEp || currentEpNum >= 2)) {
         const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(seasonFinaleAirDate) : '';
         if (finaleText) {
           bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
@@ -4202,6 +4312,11 @@ function buildLocalListCardHtml(l) {
     ? ''
     : '<button type="button" class="lc-btn secondary localListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>';
 
+  const isSynced = !isAutoTracked && !!(l.synced && l.sourceUrl);
+  const syncBtnHtml = isSynced
+    ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
+    : '';
+
   return '<div class="' + cardClass + '" draggable="true" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
     '<div class="list-card-header">' +
       '<div class="list-card-body localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type || 'movie') + '" style="cursor:pointer;">' +
@@ -4214,6 +4329,7 @@ function buildLocalListCardHtml(l) {
           '<span>' + typeLabel + '</span>' +
           '<span class="list-card-meta-sep">&middot;</span>' +
           '<span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
+          (isSynced ? ('<span class="list-card-meta-sep">&middot;</span><span>Synced</span>') : '') +
           (!isAutoTracked && l.slug !== 'watchlist' ? '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' : '') +
         '</div>' +
       '</div>' +
@@ -4224,6 +4340,7 @@ function buildLocalListCardHtml(l) {
           '</div>'
         : '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary localListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
+            syncBtnHtml +
             deleteBtnHtml +
             shareBtn +
             addBtnHtml +
@@ -4421,7 +4538,9 @@ if (_creatorDashEl) {
         type: itemType,
         name: label.title || it.title || it.name || 'Untitled',
         subtitle: label.subtitle || '',
-        poster: showPoster,
+        poster: typeof resolveClientPoster === 'function' ? resolveClientPoster(it, showPoster) : showPoster,
+        isAdult: typeof isAdultOrNsfw === 'function' ? isAdultOrNsfw(it) : !!it.adult,
+        isAdultPosterFiltered: typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled() && (it.isAdult || (typeof isAdultOrNsfw === 'function' && isAdultOrNsfw(it))),
         year: it.year,
         airDate: it.airDate,
         isUnaired: it.isUnaired,
@@ -4504,6 +4623,14 @@ if (_creatorDashEl) {
         }
       }
     }, true);
+    return;
+  }
+  const syncBtn = e.target.closest('.customListSyncBtn');
+  if (syncBtn) {
+    const slug = syncBtn.dataset.slug;
+    if (slug && typeof syncCustomListWithExternalSource === 'function') {
+      syncCustomListWithExternalSource(slug, syncBtn);
+    }
     return;
   }
   const editBtn = e.target.closest('.creatorListEditBtn');
@@ -4835,9 +4962,13 @@ async function persistCreatorListOrderFromDom() {
   const container = document.getElementById('creatorListRows');
   if (!container) return;
   const order = [...container.querySelectorAll('.creator-list-row')].map((row) => row.dataset.slug).filter(Boolean);
+  if (!order.length) return;
   try {
     localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(order));
   } catch (e) {}
+  if (typeof resetCreatorListsCache === 'function') {
+    resetCreatorListsCache();
+  }
   if (activeCreator) {
     const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     try {
@@ -4905,6 +5036,14 @@ document.addEventListener('dragover', (e) => {
   const afterEl = getCreatorListDragAfterElement(container, e.clientY);
   if (afterEl == null) container.appendChild(creatorListDragRow);
   else if (afterEl !== creatorListDragRow) container.insertBefore(creatorListDragRow, afterEl);
+});
+
+document.addEventListener('drop', (e) => {
+  if (!creatorListDragRow) return;
+  e.preventDefault();
+  if (creatorListDragRow) creatorListDragRow.classList.remove('dragging');
+  creatorListDragRow = null;
+  persistCreatorListOrderFromDom();
 });
 
 // Editing a row's name/url/type or toggling its checkbox doesn't go through
@@ -5372,6 +5511,10 @@ async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
       items: target.items,
       visibility: target.visibility || 'private',
     };
+    if (target.sourceUrl) body.sourceUrl = target.sourceUrl;
+    if (target.synced != null) body.synced = target.synced;
+    if (target.lastSyncedAt != null) body.lastSyncedAt = target.lastSyncedAt;
+    if (target.baseItemIds) body.baseItemIds = target.baseItemIds;
     // Only cite a baseline the server actually gave us. A legacy record has
     // no updatedAt, and inventing one (0, Date.now()) would either reject
     // every save or assert a version this browser never saw.

@@ -194,6 +194,59 @@ function escapeRegex(s) {
   return String(s).replace(/[.*+?^\x24\x7B\x7D()|[\]\\]/g, '\\$&');
 }
 
+function isAdultContentFilterEnabled() {
+  const localVal = (function() {
+    try { return localStorage.getItem('myListAddon:adultContentFilter'); } catch (e) { return null; }
+  })();
+  if (localVal !== null) return localVal === '1';
+  const cb = typeof document !== 'undefined' ? document.getElementById('adultContentFilterCheckbox') : null;
+  if (cb) return !!cb.checked;
+  return false;
+}
+
+function isAdultOrNsfw(item) {
+  if (!item) return false;
+  if (item.adult === true || item.isAdult === true) return true;
+  const cert = String(item.certification || item.ageRating || item.contentRating || '').toUpperCase().trim();
+  if (['NC-17', 'X', 'XXX', 'R18+', '18+', 'RX', 'TV-MA (ADULT)', 'TV-MA-S', 'ADULT'].includes(cert)) return true;
+  const genres = Array.isArray(item.genres)
+    ? item.genres.map((g) => (typeof g === 'string' ? g : (g && g.name ? g.name : '')).toLowerCase().trim())
+    : (typeof item.genres === 'string' ? item.genres.toLowerCase().split(',').map((g) => g.trim()) : []);
+  const nsfwTerms = ['adult', 'erotic', 'erotica', 'hentai', 'ecchi', 'porn', 'pornography', 'xxx', 'softcore', 'hardcore'];
+  if (genres.some((g) => nsfwTerms.some((t) => g === t || g.includes(t)))) return true;
+  const text = [item.name, item.title, item.showTitle, item.listName, item.franchise, item.user]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (text) {
+    const explicitPattern = /\\b(hentai|porn|pornography|erotica|erotic|blowjob|creampie|gangbang|milf|dildo|masturbation|fetish|bdsm|softcore|hardcore|top wet girls|evil angel|brazzers|naughty america|wicked pictures|reality kings|jules jordan|sweet sinner)\\b/i;
+    if (explicitPattern.test(text)) return true;
+  }
+  return false;
+}
+
+function getSafePosterUrl(item) {
+  const safeOrigin = typeof ORIGIN !== 'undefined' ? ORIGIN : '';
+  const safeTitle = (item && (item.title || item.name || item.showTitle)) || '';
+  const safeYear = (item && (item.year || item.releaseInfo)) || '';
+  const safeType = (item && (item.type || item.mediatype || (item.showId ? 'series' : 'movie'))) || '';
+  const safeCert = (item && (item.certification || item.ageRating || item.contentRating)) || '';
+  return safeOrigin + '/api/safe-poster?title=' + encodeURIComponent(safeTitle) +
+    (safeYear ? '&year=' + encodeURIComponent(safeYear) : '') +
+    (safeType ? '&type=' + encodeURIComponent(safeType) : '') +
+    (safeCert ? '&cert=' + encodeURIComponent(safeCert) : '');
+}
+
+function resolveClientPoster(it, fallbackPoster) {
+  if (!it) return fallbackPoster || '';
+  const p = fallbackPoster !== undefined ? fallbackPoster : (it.poster || it.showPoster || '');
+  if (p && p.includes('/api/safe-poster')) return p;
+  if (isAdultContentFilterEnabled() && (it.isAdult || it.isAdultPosterFiltered || isAdultOrNsfw(it))) {
+    return getSafePosterUrl(it);
+  }
+  return p;
+}
+
 function parseListSearchIntent(rawQuery) {
   const raw = String(rawQuery || '').trim();
   const q = raw.toLowerCase().replace(/['"“”]/g, '').trim();
@@ -404,7 +457,7 @@ async function executeUnifiedListSearch(rawQuery, targetBox) {
     fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(searchTerm))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
       .catch(() => ({ ok: false, lists: [] })),
-    fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(searchTerm) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''))
+    fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(searchTerm) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : '') + (isAdultContentFilterEnabled() ? '&adultContentFilter=1' : ''))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
       .catch(() => ({ ok: false, lists: [] })),
   ];
@@ -428,6 +481,25 @@ async function executeUnifiedListSearch(rawQuery, targetBox) {
   const myListsMatches = myListsResult && myListsResult.ok && Array.isArray(myListsResult.lists) ? myListsResult.lists : [];
   const tmdbMatches = tmdbResult && tmdbResult.ok && Array.isArray(tmdbResult.lists) ? tmdbResult.lists : [];
   const traktError = traktResult && !traktResult.ok ? traktResult.error : null;
+
+  if (mdblistMatches.length === 0 && traktMatches.length === 0 && tmdbMatches.length === 0 && myListsMatches.length === 0) {
+    const altTerm = searchTerm
+      .replace(/\\bpickup\\b/gi, 'pick up')
+      .replace(/\\bpick up\\b/gi, 'pickup')
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/([a-zA-Z])(\\d+)/g, '$1 $2');
+    if (altTerm !== searchTerm) {
+      try {
+        const altRes = await fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(altTerm) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : '') + (isAdultContentFilterEnabled() ? '&adultContentFilter=1' : ''));
+        if (altRes.ok && (altRes.headers.get('content-type') || '').includes('application/json')) {
+          const altData = await altRes.json();
+          if (altData && altData.ok && Array.isArray(altData.lists) && altData.lists.length > 0) {
+            tmdbMatches.push(...altData.lists);
+          }
+        }
+      } catch (e) {}
+    }
+  }
 
   // Save to client cache
   window._unifiedSearchCache.set(cacheKey, {
@@ -645,12 +717,24 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
   populateSearchResultPosters();
 }
 
+// In-memory cache of resolved list previews so switching tabs or encountering
+// the same list across multiple shelves doesn't re-trigger network fetches or
+// consume the /api/preview rate limit.
+window._listPreviewCache = window._listPreviewCache || new Map();
+
 // Fetches one page of a list preview from /api/preview. Pulled out of
 // populateSearchResultPosters (its only caller before this) so
 // fetchListPreviewWithRetry, right below, and the per-card retry button it
 // backs can both reach it without duplicating the six external-key lookups.
 async function fetchListPreviewOnce(listUrl, type, sample) {
+  const isAdultFilterOn = isAdultContentFilterEnabled();
+  const cacheKey = String(listUrl) + '|' + String(type) + '|' + String(sample || 12) + (isAdultFilterOn ? '|safe' : '');
+  if (window._listPreviewCache && window._listPreviewCache.has(cacheKey)) {
+    return window._listPreviewCache.get(cacheKey);
+  }
+
   const payload = { url: listUrl, type: type, sample: sample || 12 };
+  if (isAdultFilterOn) payload.adultContentFilter = true;
   const mkInput = document.getElementById('mdblistKeyInput');
   payload.mdblistKey = (mkInput && mkInput.value ? mkInput.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
   const tkInput = document.getElementById('tmdbKeyInput');
@@ -659,7 +743,11 @@ async function fetchListPreviewOnce(listUrl, type, sample) {
   payload.traktKey = (trkInput && trkInput.value ? trkInput.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
 
   const trkToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
-  if (trkToken) payload.traktAccessToken = trkToken;
+  if (trkToken) {
+    const myTraktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+    const isOwnList = !listUrl || listUrl.startsWith('trakt:') || (myTraktUser && listUrl.toLowerCase().includes('/users/' + myTraktUser.toLowerCase() + '/'));
+    if (isOwnList) payload.traktAccessToken = trkToken;
+  }
   const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
   if (mdbToken) payload.mdblistAccessToken = mdbToken;
   const smkToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
@@ -674,37 +762,45 @@ async function fetchListPreviewOnce(listUrl, type, sample) {
       body: JSON.stringify(payload),
       cache: 'no-store',
     });
-    if (!res.ok) return { ok: false };
+    if (!res.ok) return { ok: false, status: res.status };
     const ct = res.headers.get('content-type') || '';
     if (!ct.includes('application/json')) return { ok: false };
-    return await res.json();
+    const data = await res.json();
+    if (data && data.ok) {
+      if (!window._listPreviewCache) window._listPreviewCache = new Map();
+      window._listPreviewCache.set(cacheKey, data);
+    }
+    return data;
   } catch (e) {
     return { ok: false };
   }
 }
 
-// One immediate retry, no backoff. This is what a Discover/My Lists/Search
-// card's poster strip going permanently blank almost always was: not a real
-// failure, but a burst of concurrent /api/preview calls (up to 40 cards at
-// once, 5 at a time, a mixed-type card costing two) catching the per-IP
-// preview rate limit (25_api-catalog-routes.js), or one upstream timeout.
-// The caller used to treat "not ok" as final and leave the slot empty
-// forever -- nothing rendered, nothing logged anywhere a user could see,
-// and no way to get the card back short of a full page reload. This clears
-// the common transient case silently; loadPosterSlot below still leaves a
-// visible, retryable failure state for whatever is left after this.
+// One retry. When rate limited (HTTP 429), backs off briefly so the burst
+// has time to settle instead of hammering the limiter with an immediate retry.
 async function fetchListPreviewWithRetry(listUrl, type, sample) {
   const first = await fetchListPreviewOnce(listUrl, type, sample);
   if (first && first.ok) return first;
+  if (first && first.status === 429) {
+    await new Promise((r) => setTimeout(r, 1000));
+  }
   return fetchListPreviewOnce(listUrl, type, sample);
 }
 
 // Retry button inside the failure state loadPosterSlot renders below.
-// Restores the slot to its pre-fetch shape and re-runs the same per-card
-// logic a fresh render would have.
+// Clears any cached entry for this list, restores the slot to its pre-fetch
+// shape, and re-runs the per-card logic fresh.
 function retryPosterSlot(btn) {
   const slot = btn && btn.closest('.list-card-posters');
   if (!slot) return;
+  const listUrl = slot.dataset.url;
+  const type = slot.dataset.type || 'movie';
+  if (window._listPreviewCache) {
+    window._listPreviewCache.delete(String(listUrl) + '|' + String(type) + '|12');
+    window._listPreviewCache.delete(String(listUrl) + '|movie|12');
+    window._listPreviewCache.delete(String(listUrl) + '|series|12');
+    window._listPreviewCache.delete(String(listUrl) + '|mixed|12');
+  }
   slot.className = 'list-card-posters poster-preview-slot';
   slot.innerHTML = '';
   loadPosterSlot(slot);
@@ -712,7 +808,16 @@ function retryPosterSlot(btn) {
 
 async function fetchPreviewForSlot(listUrl, type) {
   if (type !== 'mixed') {
-    return fetchListPreviewWithRetry(listUrl, type);
+    const res = await fetchListPreviewWithRetry(listUrl, type);
+    if (res && res.ok && (!res.sample || res.sample.length === 0)) {
+      const altType = type === 'movie' ? 'series' : 'movie';
+      const altRes = await fetchListPreviewWithRetry(listUrl, altType).catch(() => null);
+      if (altRes && altRes.ok && altRes.sample && altRes.sample.length > 0) {
+        altRes.effectiveType = altType;
+        return altRes;
+      }
+    }
+    return res;
   }
   const [movieResult, seriesResult] = await Promise.all([
     fetchListPreviewWithRetry(listUrl, 'movie').catch(() => null),
@@ -756,7 +861,7 @@ async function fetchPreviewForSlot(listUrl, type) {
 async function loadPosterSlot(slot) {
   if (!slot) return;
   const listUrl = slot.dataset.url;
-  const type = slot.dataset.type || 'movie';
+  let type = slot.dataset.type || 'movie';
   const listName = slot.dataset.name || listUrl;
   const parentCard = slot.closest('.list-card');
   const cardCreator = (parentCard && parentCard.dataset.creator) || slot.dataset.creator || '';
@@ -765,82 +870,100 @@ async function loadPosterSlot(slot) {
 
   try {
     const data = await fetchPreviewForSlot(listUrl, type);
-    if (data.ok && data.sample && data.sample.length) {
-      const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
-      if (validPosters.length) {
-        // What this card can honestly claim about the list's size.
-        //
-        // This used to be data.count -- the number of items on the FIRST
-        // PAGE, which /api/preview caps at 100. So every list longer than
-        // that advertised "100", and the badge carried that 100 into the
-        // See All page as an exact item count (see the searchViewListBtn
-        // handler and openListDetailsPage's knownTotalItems), where it
-        // then overrode the real count as more pages loaded. A 303-item
-        // chart said 100 items, and went on saying it after the whole
-        // list had been scrolled through.
-        //
-        // So: a real total when the source reports one (totalItems), the
-        // stored count when the directory knows it (cardItems), and
-        // otherwise "100+" -- which is all that is actually known when a
-        // full page came back and more remains. exactCount is what the
-        // details page may adopt as a total; the "+" estimate is
-        // deliberately not passed on, so that page counts what it loads
-        // rather than believing a floor.
-        const previewTotal = (typeof data.totalItems === 'number' && data.totalItems > 0) ? data.totalItems : null;
-        const exactCount = cardItems || previewTotal || (data.maybeMore ? '' : data.count) || '';
-        const totalCount = exactCount || ((data.count || validPosters.length) + '+');
-        const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
-        const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
-
-        let inner = '';
-        validPosters.forEach((s, i) => {
-          const isMobileEnd = (i === 2 && validPosters.length > 3);
-          const isDesktopEnd = (i === validPosters.length - 1 && validPosters.length >= 4);
-
-          let overlays = '';
-          if (isMobileEnd) {
-            overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    if (data && data.ok) {
+      if (data.effectiveType) {
+        type = data.effectiveType;
+        slot.dataset.type = type;
+        if (parentCard) {
+          parentCard.dataset.type = type;
+          const addBtn = parentCard.querySelector('.searchAddBtn');
+          if (addBtn && !addBtn.classList.contains('is-added')) {
+            addBtn.dataset.type = type;
           }
-          if (isDesktopEnd) {
-            overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
-          }
-
-          let removeBtn = '';
-          if (isTraktSlot) {
-            const traktTarget = listUrl === 'trakt:watchlist' ? 'watchlist' : (listUrl === 'trakt:history' ? 'history' : 'custom');
-            const slugMatch = listUrl.match(new RegExp('lists/([^/?#]+)'));
-            const traktListId = traktTarget === 'custom' ? (slugMatch ? slugMatch[1] : listUrl) : traktTarget;
-            removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt">&times;</button>';
-          } else if (isMdblistSlot) {
-            const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (listUrl === 'mdblist:history' ? 'history' : 'custom');
-            const mdbMatch = listUrl.match(new RegExp('lists/[^/]+/([^/?#]+)'));
-            const mdbListId = mdbTarget === 'custom' ? (mdbMatch ? mdbMatch[1] : listUrl) : mdbTarget;
-            removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
-          }
-
-          inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
-            '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
-              '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
-              removeBtn +
-              '<div class="poster-add-overlay">+</div>' +
-              overlays +
-            '</div>' +
-            '<div class="list-card-mini-poster-name">' + escapeHtml(s.name || '') + '</div>' +
-            (s.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(s.year) + '</div>' : '') +
-          '</div>';
-        });
-        slot.className = 'list-card-posters';
-        slot.innerHTML = inner;
-        return;
+        }
       }
+      if (data.sample && data.sample.length) {
+        const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
+        if (validPosters.length) {
+          // What this card can honestly claim about the list's size.
+          //
+          // This used to be data.count -- the number of items on the FIRST
+          // PAGE, which /api/preview caps at 100. So every list longer than
+          // that advertised "100", and the badge carried that 100 into the
+          // See All page as an exact item count (see the searchViewListBtn
+          // handler and openListDetailsPage's knownTotalItems), where it
+          // then overrode the real count as more pages loaded. A 303-item
+          // chart said 100 items, and went on saying it after the whole
+          // list had been scrolled through.
+          //
+          // So: a real total when the source reports one (totalItems), the
+          // stored count when the directory knows it (cardItems), and
+          // otherwise "100+" -- which is all that is actually known when a
+          // full page came back and more remains. exactCount is what the
+          // details page may adopt as a total; the "+" estimate is
+          // deliberately not passed on, so that page counts what it loads
+          // rather than believing a floor.
+          const previewTotal = (typeof data.totalItems === 'number' && data.totalItems > 0) ? data.totalItems : null;
+          const exactCount = cardItems || previewTotal || (data.maybeMore ? '' : data.count) || '';
+          const totalCount = exactCount || ((data.count || validPosters.length) + '+');
+          const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
+          const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
+
+          let inner = '';
+          validPosters.forEach((s, i) => {
+            const isMobileEnd = (i === 2 && validPosters.length > 3);
+            const isDesktopEnd = (i === validPosters.length - 1 && validPosters.length >= 4);
+
+            let overlays = '';
+            if (isMobileEnd) {
+              overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+            }
+            if (isDesktopEnd) {
+              overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+            }
+
+            let removeBtn = '';
+            if (isTraktSlot) {
+              const traktTarget = listUrl === 'trakt:watchlist' ? 'watchlist' : (listUrl === 'trakt:history' ? 'history' : 'custom');
+              const slugMatch = listUrl.match(new RegExp('lists/([^/?#]+)'));
+              const traktListId = traktTarget === 'custom' ? (slugMatch ? slugMatch[1] : listUrl) : traktTarget;
+              removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt">&times;</button>';
+            } else if (isMdblistSlot) {
+              const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (listUrl === 'mdblist:history' ? 'history' : 'custom');
+              const mdbMatch = listUrl.match(new RegExp('lists/[^/]+/([^/?#]+)'));
+              const mdbListId = mdbTarget === 'custom' ? (mdbMatch ? mdbMatch[1] : listUrl) : mdbTarget;
+              removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
+            }
+
+            const itemPoster = resolveClientPoster(Object.assign({}, s, { listName, listUrl }), s.poster);
+            inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
+              '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(itemPoster || '') + '">' +
+                '<img src="' + escapeAttr(itemPoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">' +
+                removeBtn +
+                '<div class="poster-add-overlay">+</div>' +
+                overlays +
+              '</div>' +
+              '<div class="list-card-mini-poster-name">' + escapeHtml(s.name || '') + '</div>' +
+              (s.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(s.year) + '</div>' : '') +
+            '</div>';
+          });
+          slot.className = 'list-card-posters';
+          slot.innerHTML = inner;
+          if (window._currentDiscoverRenderedFilter && window._discoverFeedsCache && slot.closest('#discoverListsFeed')) {
+            const feedContainer = document.getElementById('discoverListsFeed');
+            if (feedContainer) window._discoverFeedsCache[window._currentDiscoverRenderedFilter] = feedContainer.innerHTML;
+          }
+          return;
+        }
+      }
+      slot.className = 'list-card-posters poster-preview-empty';
+      slot.innerHTML = '<p class="poster-preview-empty-msg">' +
+        ((data.sample && data.sample.length > 0) ? 'No preview posters available.' : 'No items found in this list.') +
+        '</p>';
+      return;
     }
     // Reached with nothing to show -- the fetch (and its automatic retry)
-    // both failed, or /api/preview genuinely came back with no posters. A
-    // sample this thin is rare enough among what this renders (charts,
-    // published lists, search results) that erring toward "couldn't load"
-    // and offering Retry is more useful than leaving the card silently
-    // blank, which is what a caller reported as "sometimes lists just don't
-    // load" with no way to tell why or fix it short of a page reload.
+    // both failed (data.ok is false or rejected)
     slot.className = 'list-card-posters poster-preview-error';
     slot.innerHTML = '<p class="poster-preview-error-msg">Couldn’t load previews for this list.' +
       ' <button type="button" class="lc-btn secondary" onclick="retryPosterSlot(this)">Retry</button></p>';
@@ -852,7 +975,11 @@ async function loadPosterSlot(slot) {
 }
 
 async function populateSearchResultPosters() {
-  const slots = [...document.querySelectorAll('.poster-preview-slot')];
+  const allSlots = [...document.querySelectorAll('.poster-preview-slot')];
+  // Filter out slots that are inside hidden containers (e.g. inactive tabs)
+  const slots = allSlots.filter((slot) => {
+    return !slot.closest('[style*="display: none"], [style*="display:none"]');
+  });
   let idx = 0;
   const CONCURRENCY = 5;
 
@@ -860,6 +987,7 @@ async function populateSearchResultPosters() {
     while (idx < slots.length) {
       const slot = slots[idx++];
       if (!slot) continue;
+      if (slot.closest('[style*="display: none"], [style*="display:none"]')) continue;
       await loadPosterSlot(slot);
     }
   }
@@ -1371,7 +1499,11 @@ async function loadCuratedListsFeed(forceRefresh) {
       ? CHART_SLUG_ENTRIES.map(c => ({ name: c.name, url: c.movieUrl || c.showUrl || c.url, type: (c.showUrl && c.showUrl.includes('shows')) ? 'series' : 'movie', user: 'Curated' }))
       : [];
 
-    const publicListsPool = [...(mdblists || []), ...(traktLists || []), ...chartCatalogList];
+    const curatedPresets = (typeof CURATED_LIST_ENTRIES !== 'undefined' && Array.isArray(CURATED_LIST_ENTRIES))
+      ? CURATED_LIST_ENTRIES.map(c => ({ name: c.name, url: 'custom:curated:' + c.slug, type: c.type, user: 'Curated' }))
+      : [];
+
+    const publicListsPool = [...curatedPresets, ...(mdblists || []), ...(traktLists || []), ...chartCatalogList];
     let sectionsHtml = '';
 
     // Keep a copy of exactly what these two cards are about to render, so
@@ -1407,24 +1539,84 @@ async function loadCuratedListsFeed(forceRefresh) {
         });
       });
 
-      let recommendedLists = [];
+      // Collect user watch history titles and keywords
+      const watchHistoryKeywords = new Set();
+      const historyTitles = [];
+      [...whItems, ...cwItems].forEach(function(it) {
+        if (!it) return;
+        const title = (it.title || it.name || it.showTitle || it.showName || '').trim();
+        if (title) {
+          historyTitles.push(title.toLowerCase());
+          title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).forEach(function(w) {
+            if (w.length > 3 && !['episode', 'season', 'movie', 'series', 'show', 'part'].includes(w)) {
+              watchHistoryKeywords.add(w);
+            }
+          });
+        }
+      });
+
+      // Collect liked lists keywords
+      const likedKeywords = new Set();
       if (likedUrls.length) {
-        const likedKeywords = likedUrls.map(u => {
+        likedUrls.forEach(function(u) {
           const parts = u.split('/').filter(Boolean);
-          return parts[parts.length - 1] ? parts[parts.length - 1].replace(/[-_]/g, ' ') : '';
-        }).filter(Boolean);
-
-        recommendedLists = publicListsPool.filter(l => {
-          if (likedUrls.includes(l.url)) return false;
-          const nameLower = (l.name || '').toLowerCase();
-          return likedKeywords.some(kw => kw.length > 3 && nameLower.includes(kw.toLowerCase()));
-        }).slice(0, 6);
+          const last = parts[parts.length - 1] ? parts[parts.length - 1].replace(/[-_]/g, ' ').toLowerCase() : '';
+          last.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).forEach(function(w) {
+            if (w.length > 3 && !['list', 'lists', 'user', 'collection'].includes(w)) {
+              likedKeywords.add(w);
+            }
+          });
+        });
       }
 
-      if (!recommendedLists.length) {
-        // Pick top popular & trending community lists
-        recommendedLists = publicListsPool.filter(l => !alreadyAdded.has(l.url + '|' + (l.type || 'movie'))).slice(0, 8);
-      }
+      // Candidate lists from publicListsPool that user hasn't added or liked
+      const candidates = publicListsPool.filter(function(l) {
+        if (!l || !l.url) return false;
+        if (likedUrls.includes(l.url)) return false;
+        if (alreadyAdded.has(l.url + '|' + (l.type || 'movie'))) return false;
+        return true;
+      });
+
+      // Score each candidate based on liked lists and watch history
+      const scored = candidates.map(function(l) {
+        const nameLower = (l.name || '').toLowerCase();
+        let matchScore = (Number(l.likes) || 0) * 0.1;
+        let matched = false;
+
+        for (let i = 0; i < historyTitles.length; i++) {
+          const ht = historyTitles[i];
+          if (ht.length > 3 && (nameLower.includes(ht) || ht.includes(nameLower))) {
+            matchScore += 40;
+            matched = true;
+            break;
+          }
+        }
+
+        watchHistoryKeywords.forEach(function(kw) {
+          if (nameLower.includes(kw)) {
+            matchScore += 15;
+            matched = true;
+          }
+        });
+
+        likedKeywords.forEach(function(kw) {
+          if (nameLower.includes(kw)) {
+            matchScore += 25;
+            matched = true;
+          }
+        });
+
+        return { list: l, score: matchScore, matched: matched };
+      });
+
+      scored.sort(function(a, b) {
+        if (a.matched && !b.matched) return -1;
+        if (!a.matched && b.matched) return 1;
+        if (b.score !== a.score) return b.score - a.score;
+        return (Number(b.list.likes) || 0) - (Number(a.list.likes) || 0);
+      });
+
+      const recommendedLists = scored.slice(0, 10).map(function(s) { return s.list; });
 
       if (recommendedLists.length) {
         sectionsHtml += '<div style="margin-top:24px; margin-bottom:8px;"><h3 style="font-size:0.95rem; margin:0 0 2px;">Recommended Community Lists</h3><p style="margin:0; font-size:0.8rem; color:var(--muted);">Top community and curated lists you might like</p></div>';
@@ -1513,6 +1705,7 @@ async function loadCuratedListsFeed(forceRefresh) {
       }
     }
 
+
     if (!sectionsHtml) {
       container.innerHTML =
         '<div style="text-align:center; padding:24px 16px; background:var(--card-bg); border:1px solid var(--border); border-radius:14px;">' +
@@ -1530,7 +1723,7 @@ async function loadCuratedListsFeed(forceRefresh) {
     container.innerHTML =
       '<div style="text-align:center; padding:24px 16px; background:var(--card-bg); border:1px solid var(--border); border-radius:14px;">' +
         '<p style="margin:0 0 10px; font-size:0.88rem; color:var(--muted);">Watch more items or like community lists to build personalized recommendations.</p>' +
-        '<button type="button" class="lc-btn primary" onclick="filterDiscoverShelves(&quot;all&quot;)">Explore Discover</button>' +
+        '<button type="button" class="lc-btn primary" onclick="filterDiscoverShelves(&quot;movie&quot;)">Explore Discover</button>' +
       '</div>';
   }
 }
@@ -1879,12 +2072,6 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
     (d && d.tmdbId) ? ('tmdb:' + d.tmdbId) : null,
   ].filter(Boolean));
 
-  if (window._fullyWatchedShowIds) {
-    for (const sid of showIdsToCheck) {
-      if (window._fullyWatchedShowIds.has(sid)) return true;
-    }
-  }
-
   try {
     const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     const hist = map['watch-history'];
@@ -1899,6 +2086,8 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
 
     const distinctEps = new Set(watchedEps.map(it => it.episodeNum != null ? Number(it.episodeNum) : null).filter(n => n != null));
 
+    if (distinctEps.size === 0) return false;
+
     if (window._seasonEpisodesMap && window._seasonEpisodesMap[sNum]) {
       const aired = window._seasonEpisodesMap[sNum].filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
       if (aired.length > 0) return distinctEps.size >= aired.length;
@@ -1907,7 +2096,7 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
     if (episodeCount && episodeCount > 0) {
       return distinctEps.size >= episodeCount;
     }
-    return distinctEps.size > 0;
+    return false;
   } catch (e) {
     return false;
   }
@@ -1997,8 +2186,9 @@ window.markSeasonWatched = async function(seasonNum, btn) {
     }
 
     // Check if whole show is watched or not
+    let allSeasonsWatched = false;
     if (d.seasonsData && Array.isArray(d.seasonsData)) {
-      const allSeasonsWatched = d.seasonsData.filter(s => s.season_number !== 0).every(s => {
+      allSeasonsWatched = d.seasonsData.filter(s => s.season_number !== 0).every(s => {
         if (s.season_number === seasonNum) return resBatch.nowWatched;
         return isSeasonFullyWatched(d.id, s.season_number, s.episode_count);
       });
@@ -2009,14 +2199,14 @@ window.markSeasonWatched = async function(seasonNum, btn) {
 
     // Update overall show watched button if present
     const btnShow = document.getElementById('btnMarkShowWatched');
-    if (btnShow && typeof isItemWatched === 'function') {
-      const showWatched = isItemWatched(d.id, d.tmdbId, d.imdbId);
+    if (btnShow) {
+      const showWatched = (d.seasonsData && Array.isArray(d.seasonsData)) ? allSeasonsWatched : isShowFullyWatched(d);
       if (showWatched) {
-        btnShow.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched';
+        btnShow.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched';
         btnShow.classList.remove('primary');
         btnShow.classList.add('secondary');
       } else {
-        btnShow.innerHTML = 'Mark Whole Show Watched';
+        btnShow.innerHTML = 'Mark Show Watched';
         btnShow.classList.remove('secondary');
         btnShow.classList.add('primary');
       }
@@ -2032,6 +2222,26 @@ window.markSeasonWatched = async function(seasonNum, btn) {
   }
 };
 
+function isShowFullyWatched(d) {
+  if (!d) return false;
+  const showIds = [d.id, d.imdbId, d.tmdbId, (d.tmdbId ? 'tmdb:' + d.tmdbId : null), (d.id ? 'tmdb:' + d.id : null)].filter(Boolean).map(String);
+
+  // If seasonsData is available and has non-specials seasons, verify that every season is fully watched
+  if (d.seasonsData && Array.isArray(d.seasonsData)) {
+    const regularSeasons = d.seasonsData.filter(s => s.season_number !== 0);
+    if (regularSeasons.length > 0) {
+      return regularSeasons.every(s => isSeasonFullyWatched(d.id, s.season_number, s.episode_count));
+    }
+  }
+
+  // Fallback to _fullyWatchedShowIds
+  if (window._fullyWatchedShowIds) {
+    if (showIds.some(id => window._fullyWatchedShowIds.has(id))) return true;
+  }
+  return false;
+}
+window.isShowFullyWatched = isShowFullyWatched;
+
 function isItemWatched(id, tmdbId, imdbId) {
   const idsToCheck = [id, tmdbId, imdbId, (tmdbId ? 'tmdb:' + tmdbId : null), (id ? 'tmdb:' + id : null)].filter(Boolean).map(String);
   if (window._watchedItemIds) {
@@ -2046,7 +2256,7 @@ function isItemWatched(id, tmdbId, imdbId) {
       const l = map[key];
       if (key === 'watch-history' || key.includes('watch-history') || (l && l.name && l.name.toLowerCase().includes('watch history'))) {
         if (l && Array.isArray(l.items)) {
-          if (l.items.some(it => idsToCheck.includes(String(it.id)) || idsToCheck.includes(String(it.imdbId)) || idsToCheck.includes(String(it.showId)))) {
+          if (l.items.some(it => idsToCheck.includes(String(it.id)) || (it.imdbId && idsToCheck.includes(String(it.imdbId))) || (it.tmdbId && (idsToCheck.includes(String(it.tmdbId)) || idsToCheck.includes('tmdb:' + it.tmdbId))))) {
             return true;
           }
         }
@@ -2055,11 +2265,162 @@ function isItemWatched(id, tmdbId, imdbId) {
   } catch (e) {}
   try {
     const rawWh = JSON.parse(localStorage.getItem('myListAddon:watchHistory') || '[]');
-    if (Array.isArray(rawWh) && rawWh.some(it => idsToCheck.includes(String(it.id)) || idsToCheck.includes(String(it.imdbId)))) {
+    if (Array.isArray(rawWh) && rawWh.some(it => idsToCheck.includes(String(it.id)) || (it.imdbId && idsToCheck.includes(String(it.imdbId))))) {
       return true;
     }
   } catch (e) {}
   return false;
+}
+
+function renderItemStorylinesWatchOrder(d, type) {
+  if (!d) return '';
+  const events = (typeof window !== 'undefined' && window.TV_CROSSOVER_EVENTS) || (typeof TV_CROSSOVER_EVENTS !== 'undefined' ? TV_CROSSOVER_EVENTS : []);
+  if (!events || !events.length) return '';
+
+  const isSeries = (type === 'series' || (d.seasonsData && d.seasonsData.length > 0));
+  const dImdb = String(d.imdbId || (String(d.id || '').startsWith('tt') ? d.id : '')).trim().toLowerCase();
+  const dTmdb = String(d.tmdbId || '').trim().replace(/^tmdb:/, '') || (String(d.id || '').startsWith('tmdb:') ? String(d.id).replace('tmdb:', '') : (!isNaN(d.id) ? String(d.id) : ''));
+  const dTitleNorm = String(d.title || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  const isPartMatch = (ep) => {
+    if (!ep) return false;
+    const epIsMovie = (ep.type === 'movie');
+    if (isSeries && epIsMovie) return false;
+    if (!isSeries && !epIsMovie) return false;
+
+    const epImdb = (ep.imdbId || '').trim().toLowerCase();
+    if (epImdb && dImdb && epImdb === dImdb) return true;
+
+    const epTmdb = ep.tmdbId ? String(ep.tmdbId).trim().replace(/^tmdb:/, '') : '';
+    if (epTmdb && dTmdb && epTmdb === dTmdb) return true;
+
+    if (!dTitleNorm) return false;
+    if (epIsMovie) {
+      const epTitleNorm = String(ep.title || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (epTitleNorm && (dTitleNorm === epTitleNorm)) return true;
+    } else {
+      const epShowNorm = String(ep.showName || ep.title || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (epShowNorm && (dTitleNorm === epShowNorm || (dTitleNorm.length >= 6 && epShowNorm.startsWith(dTitleNorm)) || (epShowNorm.length >= 6 && dTitleNorm.startsWith(epShowNorm)))) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const matchingEvents = events.filter((ev) => Array.isArray(ev.episodes) && ev.episodes.some(isPartMatch));
+  if (!matchingEvents.length) return '';
+
+  const storylineBlocksHtml = matchingEvents.map((event, eventIdx) => {
+    const isSingle = (matchingEvents.length === 1);
+    const displayStyle = (isSingle || eventIdx === 0) ? 'display:block;' : 'display:none;';
+
+    const cardsHtml = event.episodes.map((ep, i) => {
+      const isCurrent = isPartMatch(ep);
+      const isMovie = (ep.type === 'movie');
+      const displayTitle = ep.title || ep.showName || '';
+
+      let formatSubtitle = '';
+      if (isMovie) {
+        formatSubtitle = ep.year ? (ep.year + ' \u2022 Movie') : 'Movie';
+      } else if (Array.isArray(ep.seasons)) {
+        formatSubtitle = 'Seasons ' + ep.seasons[0] + '-' + ep.seasons[ep.seasons.length - 1] + (ep.year ? ' \u2022 ' + ep.year : '');
+      } else if (ep.season != null && ep.episode != null && ep.episode !== 'all') {
+        formatSubtitle = 'S' + ep.season + 'E' + ep.episode + (ep.year ? ' \u2022 ' + ep.year : '');
+      } else if (ep.season != null && ep.season !== 'all') {
+        formatSubtitle = 'Season ' + ep.season + (ep.year ? ' \u2022 ' + ep.year : '');
+      } else if (ep.type === 'show') {
+        formatSubtitle = ep.year ? (ep.year + ' \u2022 Series') : 'Series';
+      } else {
+        formatSubtitle = ep.year ? String(ep.year) : '';
+      }
+
+      const posterUrl = ep.poster || (ep.imdbId ? ('https://images.metahub.space/poster/medium/' + ep.imdbId + '/img') : '');
+      const partId = ep.imdbId || (ep.tmdbId ? ('tmdb:' + ep.tmdbId) : '');
+      const partType = isMovie ? 'movie' : 'series';
+
+      const isWatched = (typeof isStorylinePartWatched === 'function' ? isStorylinePartWatched(ep) : false) ||
+        (ep.imdbId && typeof isItemWatched === 'function' && isItemWatched(ep.imdbId, ep.tmdbId, ep.imdbId));
+
+      const clickHandler = (!isCurrent && partId) ?
+        ' onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeJsAttr(partId) + '&quot;, &quot;' + partType + '&quot;)"' :
+        (isCurrent ? ' onclick="event.stopPropagation(); window.scrollTo({ top: 0, behavior: &quot;smooth&quot; });"' : '');
+
+      return '<div class="item-storyline-card' + (isCurrent ? ' is-current' : '') + '"' + clickHandler + ' title="' + escapeAttr(displayTitle + (isCurrent ? ' (Currently Viewing)' : '')) + '">' +
+        '<div class="item-storyline-poster-wrap">' +
+          (posterUrl ?
+            '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(displayTitle) + '" onerror="handleStorylinePosterError(this)">' :
+            '<div class="season-header-poster-placeholder"></div>') +
+          '<span class="item-storyline-part-badge">Part ' + (ep.part != null ? ep.part : (i + 1)) + '</span>' +
+          (isCurrent ? '<span class="item-storyline-current-pill">Current</span>' : '') +
+          (isWatched && !isCurrent ? '<span class="item-storyline-watched-badge" title="Watched">&#x2713;</span>' : '') +
+        '</div>' +
+        '<div class="item-storyline-title">' + escapeHtml(displayTitle) + '</div>' +
+        '<div class="item-storyline-meta">' + escapeHtml(formatSubtitle) + '</div>' +
+      '</div>';
+    }).join('');
+
+    return '<div class="item-storyline-block" id="storyline-block-' + escapeAttr(event.id) + '" data-event-id="' + escapeAttr(event.id) + '" style="' + displayStyle + '">' +
+      '<div class="item-storyline-header">' +
+        '<div class="item-storyline-header-info">' +
+          '<div class="item-storyline-saga-title">' + escapeHtml(event.name) + '</div>' +
+          '<div class="item-storyline-saga-meta">' +
+            '<span>' + escapeHtml(event.franchise) + '</span>' +
+            '<span class="meta-sep">&middot;</span>' +
+            '<span>' + event.episodes.length + ' Parts in Chronological Watch Order</span>' +
+          '</div>' +
+          (event.description ? '<p class="item-storyline-saga-desc">' + escapeHtml(event.description) + '</p>' : '') +
+        '</div>' +
+        '<div class="item-storyline-header-actions">' +
+          '<button type="button" class="lc-btn secondary" onclick="event.stopPropagation(); openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" title="Open complete saga in catalog view">Open Saga</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="storyline-posters-scroll item-storyline-scroll">' +
+        cardsHtml +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  const pillsHtml = (matchingEvents.length > 1) ?
+    '<div class="subnav-pills-bar" style="margin-bottom:16px; flex-wrap:wrap;">' +
+      matchingEvents.map((ev, idx) =>
+        '<button type="button" class="subnav-pill' + (idx === 0 ? ' active' : '') + '" onclick="switchItemStorylineTab(&quot;' + escapeJsAttr(ev.id) + '&quot;, this)">' +
+          (idx === 0 ? '<span class="check-icon">&#x2713;</span> ' : '') + escapeHtml(ev.name) +
+        '</button>'
+      ).join('') +
+    '</div>' : '';
+
+  return '<div class="item-storylines-section">' +
+    '<div class="shelf-header" style="margin-bottom:12px;">' +
+      '<h3 style="margin: 0; font-family:serif; font-size:1.5rem;">Storylines, Sagas &amp; Universes</h3>' +
+    '</div>' +
+    pillsHtml +
+    '<div class="item-storylines-panels">' +
+      storylineBlocksHtml +
+    '</div>' +
+  '</div>';
+}
+
+function switchItemStorylineTab(eventId, btn) {
+  const container = btn ? btn.closest('.item-storylines-section') : document.querySelector('.item-storylines-section');
+  if (!container) return;
+  const pills = container.querySelectorAll('.subnav-pill');
+  pills.forEach((p) => {
+    p.classList.remove('active');
+    const ch = p.querySelector('.check-icon');
+    if (ch) ch.remove();
+  });
+  if (btn) {
+    btn.classList.add('active');
+    btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+  }
+  const blocks = container.querySelectorAll('.item-storyline-block');
+  blocks.forEach((b) => {
+    b.style.display = (b.dataset.eventId === eventId) ? 'block' : 'none';
+  });
+}
+if (typeof window !== 'undefined') {
+  window.switchItemStorylineTab = switchItemStorylineTab;
+  window.renderItemStorylinesWatchOrder = renderItemStorylinesWatchOrder;
 }
 
 // opts.skipPushState is set by the popstate handler and the initial
@@ -2195,6 +2556,8 @@ async function openItemDetailsModal(id, type, opts) {
       seasonsHtml += '</div>';
     }
 
+    const storylinesHtml = renderItemStorylinesWatchOrder(d, type);
+
     body.innerHTML = 
       '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap;">' +
         '<div style="flex: 0 0 300px; max-width: 100%;">' +
@@ -2207,8 +2570,8 @@ async function openItemDetailsModal(id, type, opts) {
           '<div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-top:20px;">' +
             '<button type="button" class="lc-btn primary" onclick="openSelectListModalFromItemModal()">+ Add to list</button>' +
             (((d.seasonsData && d.seasonsData.length > 0) || type === 'series') ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
-                (isItemWatched(d.id, d.tmdbId, d.imdbId) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched') +
+              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isShowFullyWatched(d) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
+                (isShowFullyWatched(d) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched') +
               '</button>'
               :
               '<button type="button" id="btnMarkWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="toggleMovieWatchStatusFromModal()">' +
@@ -2218,7 +2581,8 @@ async function openItemDetailsModal(id, type, opts) {
         '</div>' +
       '</div>' +
       (trailerHtml ? '<div style="margin-top:32px;">' + trailerHtml + '</div>' : '') +
-      (seasonsHtml ? '<div style="margin-top:32px;">' + seasonsHtml + '</div>' : '');
+      (seasonsHtml ? '<div style="margin-top:32px;">' + seasonsHtml + '</div>' : '') +
+      (storylinesHtml ? '<div style="margin-top:32px;">' + storylinesHtml + '</div>' : '');
       
   } catch (err) {
     body.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(err.message) + '</p>';
@@ -3443,8 +3807,9 @@ function renderTitlePosterCards(items, totalCount, resEl) {
 
   const postersHtml = items.map(m => {
     const posterClass = 'live-preview-poster';
-    const posterEl = m.poster
-      ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+    const effectivePoster = resolveClientPoster(m, m.poster);
+    const posterEl = effectivePoster
+      ? '<img class="' + posterClass + '" src="' + escapeAttr(effectivePoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
       : '<div class="' + posterClass + ' live-preview-poster-placeholder" data-needs-fallback="1"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
     
     const title = m.title || '';
@@ -3458,7 +3823,7 @@ function renderTitlePosterCards(items, totalCount, resEl) {
       'data-id="' + escapeAttr(id || '') + '" ' +
       'data-type="' + escapeAttr(type) + '" ' +
       'data-title="' + escapeAttr(m.title || '') + '" ' +
-      'data-poster="' + escapeAttr(m.poster || '') + '" ' +
+      'data-poster="' + escapeAttr(effectivePoster || '') + '" ' +
       '>' +
       '<div style="position:relative; width:100%;">' +
         posterEl +
@@ -3519,7 +3884,8 @@ async function renderDefaultCatalogSearch(force) {
   }
 
   try {
-    const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType);
+    const isAdultFilter = isAdultContentFilterEnabled();
+    const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + (isAdultFilter ? '&adultContentFilter=1' : ''));
     const data = await res.json();
     if (thisSeq !== currentTitleSearchSequence) return;
     if (inputEl && inputEl.value.trim()) return;
@@ -3559,7 +3925,8 @@ async function runCatalogSearch() {
   } catch (e) {}
 
   try {
-    const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q));
+    const isAdultFilter = isAdultContentFilterEnabled();
+    const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q) + (isAdultFilter ? '&adultContentFilter=1' : ''));
     const data = await res.json();
     // Superseded while this was in flight: a newer search, a type change, or
     // the box being cleared. Say nothing and touch nothing -- whatever ran

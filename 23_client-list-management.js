@@ -307,6 +307,7 @@ async function testSourceRow(btn) {
     if (keys.simklKey) body.simklKey = keys.simklKey;
     if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
     if (keys.creatorName) body.creatorName = keys.creatorName;
+    if (keys.adultContentFilter || (typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled())) body.adultContentFilter = true;
     const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -356,6 +357,7 @@ function buildConfig(entries, keys) {
   if (keys && keys.shuffleItems) payload.shuffleItems = true;
   if (keys && keys.region && keys.region !== 'US') payload.region = keys.region;
   if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
+  if (keys && keys.adultContentFilter) payload.adultContentFilter = true;
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -533,6 +535,7 @@ function collectKeys() {
       try { return localStorage.getItem('myListAddon:region') || 'US'; } catch (e) { return 'US'; }
     })(),
     hideNonDigitalReleases: document.getElementById('hideNonDigitalReleasesCheckbox') ? document.getElementById('hideNonDigitalReleasesCheckbox').checked : false,
+    adultContentFilter: typeof isAdultContentFilterEnabled === 'function' ? isAdultContentFilterEnabled() : (localStorage.getItem('myListAddon:adultContentFilter') === '1'),
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
@@ -622,6 +625,10 @@ function initBadgeSettingsUI() {
       el.checked = getBadgeSetting(key);
     }
   });
+  const compEl = document.getElementById('autoRecommendCompanionsCheckbox');
+  if (compEl && typeof getCompanionRecommendationSetting === 'function') {
+    compEl.checked = getCompanionRecommendationSetting();
+  }
   applyBadgeBodyClasses();
 }
 window.initBadgeSettingsUI = initBadgeSettingsUI;
@@ -735,6 +742,7 @@ async function renderLivePreview() {
         if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
         if (keys.creatorName) body.creatorName = keys.creatorName;
         if (keys.hideNonDigitalReleases) body.hideNonDigitalReleases = true;
+        if (keys.adultContentFilter) body.adultContentFilter = true;
         const res = await fetch(ORIGIN + '/api/preview', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1076,25 +1084,15 @@ function appendPosterGridItems(gridEl, items) {
 window.appendPosterGridItems = appendPosterGridItems;
 
 function livePreviewPosterHtml(m) {
+  if (typeof resolveClientPoster === 'function') {
+    m.poster = resolveClientPoster(m, m.poster);
+  }
   const landscape = m.posterShape === 'landscape';
   const posterClass = 'live-preview-poster' + (landscape ? ' landscape' : '');
   const posterEl = m.poster
     ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)" data-imdb="' + escapeAttr(m.id || '') + '"><div class="' + posterClass + ' live-preview-poster-placeholder" style="display:none;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>'
     : '<div class="' + posterClass + ' live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
   
-  let removeBtn = '';
-  if (m.removeShowId) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="cw" data-remove-id="' + escapeAttr(m.removeShowId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Continue Watching">&times;</button>';
-  } else if (m.removeWatchlistId) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="watchlist" data-remove-id="' + escapeAttr(m.removeWatchlistId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watchlist">&times;</button>';
-  } else if (m.removeHistoryId) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="history" data-remove-id="' + escapeAttr(m.removeHistoryId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watch History">&times;</button>';
-  } else if (m.removeCustomListSlug) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="custom" data-remove-id="' + escapeAttr(m.id) + '" data-remove-slug="' + escapeAttr(m.removeCustomListSlug) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from List">&times;</button>';
-  } else if (m.removeExternalProvider) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '">&times;</button>';
-  }
-
   const parentUrl = (m.listUrl || (window._currentListDetailsParams ? window._currentListDetailsParams.listUrl : '') || '').toLowerCase();
   const parentName = (m.listName || (window._currentListDetailsParams ? window._currentListDetailsParams.name : '') || '').toLowerCase();
 
@@ -1111,6 +1109,20 @@ function livePreviewPosterHtml(m) {
 
   const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext);
   const isAiringItem = !!(m.isAiringNext || m.listSlug === 'airing-next' || isAiringListContext);
+
+  let removeBtn = '';
+  const cwRemoveTarget = m.removeShowId || (isCwItem ? (m.showId || m.id || m.imdbId) : null);
+  if (cwRemoveTarget) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="cw" data-remove-id="' + escapeAttr(cwRemoveTarget) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Continue Watching">&times;</button>';
+  } else if (m.removeWatchlistId) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="watchlist" data-remove-id="' + escapeAttr(m.removeWatchlistId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watchlist">&times;</button>';
+  } else if (m.removeHistoryId) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="history" data-remove-id="' + escapeAttr(m.removeHistoryId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watch History">&times;</button>';
+  } else if (m.removeCustomListSlug) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="custom" data-remove-id="' + escapeAttr(m.id) + '" data-remove-slug="' + escapeAttr(m.removeCustomListSlug) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from List">&times;</button>';
+  } else if (m.removeExternalProvider) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '">&times;</button>';
+  }
   
   const badgeSettings = getPosterBadgeSettings();
   const locationAllowed = isCwItem
@@ -1126,21 +1138,31 @@ function livePreviewPosterHtml(m) {
   if (isCwItem || isAiringItem) {
     airingMatch = findAiringMatchFor(m);
   }
-  
-  const mSeason = m.seasonNum != null ? m.seasonNum : (airingMatch ? airingMatch.seasonNum : null);
-  const mEpisode = m.episodeNum != null ? m.episodeNum : (airingMatch ? airingMatch.episodeNum : null);
+
+  const localCwItem = (isCwItem && typeof loadLocalCustomLists === 'function')
+    ? (((loadLocalCustomLists()['continue-watching'] || {}).items || []).find(it => it && (it.showId === m.id || it.id === m.id || (m.showId && (it.showId === m.showId || it.id === m.showId)))))
+    : null;
+
+  const effectiveSeasonNum = m.seasonNum != null ? m.seasonNum : (m.season != null ? m.season : (localCwItem && localCwItem.seasonNum != null ? localCwItem.seasonNum : null));
+  const effectiveEpisodeNum = m.episodeNum != null ? m.episodeNum : (m.episode != null ? m.episode : (localCwItem && localCwItem.episodeNum != null ? localCwItem.episodeNum : null));
+
+  const mSeason = effectiveSeasonNum != null ? effectiveSeasonNum : (!isCwItem && airingMatch ? airingMatch.seasonNum : null);
+  const mEpisode = effectiveEpisodeNum != null ? effectiveEpisodeNum : (!isCwItem && airingMatch ? airingMatch.episodeNum : null);
   
   // Check if this show is on an older past season (not the newest season)
-  const isOlderSeason = isCwItem && !!(airingMatch && airingMatch.seasonNum != null && m.seasonNum != null && m.seasonNum < airingMatch.seasonNum);
+  const isOlderSeason = isCwItem && !!(airingMatch && airingMatch.seasonNum != null && effectiveSeasonNum != null && effectiveSeasonNum < airingMatch.seasonNum);
 
   let dateBadge = '';
   let bottomBadge = '';
 
   if (locationAllowed && !isOlderSeason) {
-    const isSameEpisode = !!(airingMatch && (!mSeason || !airingMatch.seasonNum || mSeason === airingMatch.seasonNum) && (!mEpisode || !airingMatch.episodeNum || mEpisode === airingMatch.episodeNum));
+    const isSameSeason = !!(airingMatch && (!mSeason || !airingMatch.seasonNum || mSeason === airingMatch.seasonNum));
+    const isSameEpisode = isSameSeason && (!mEpisode || !airingMatch.episodeNum || mEpisode === airingMatch.episodeNum);
     const effectiveAirDate = m.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
-    const hasAired = effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false;
-    const isUnairedEp = effectiveAirDate ? !hasAired : !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired));
+    const currentEpNum = mEpisode != null ? mEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
+    const hasLaterAiringEp = !!(isSameSeason && airingMatch && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
+    const hasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false);
+    const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
 
     if (showAirDate && !m.hideDateBadge && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
       const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
@@ -1149,17 +1171,21 @@ function livePreviewPosterHtml(m) {
       }
     }
 
-    const currentEpNum = mEpisode != null ? mEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
     const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (m.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
     const isSeasonFinale = !!(m.isSeasonFinale || (isSameEpisode && airingMatch && airingMatch.isSeasonFinale) || (airingMatch && airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
     const seasonFinaleAirDate = m.seasonFinaleAirDate || (airingMatch ? (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : null)) : null);
     const isFinaleUnaired = seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(seasonFinaleAirDate) : !!seasonFinaleAirDate;
 
-    if (showPremiere && isSeasonPremiere && isUnairedEp) {
+    if (m.isCompanion || (localCwItem && localCwItem.isCompanion)) {
+      const compType = m.companionType || (localCwItem && localCwItem.companionType);
+      const compNote = m.companionNote || (localCwItem && localCwItem.companionNote) || 'Next in Storyline';
+      const compLabel = compType === 'bridge_movie' ? 'Bridge Movie' : (compType === 'sequel_movie' ? 'Sequel Film' : 'Storyline');
+      bottomBadge = '<div class="cw-date-badge cw-date-badge-companion" title="' + escapeAttr(compNote) + '">' + escapeHtml(compLabel) + '</div>';
+    } else if (showPremiere && isSeasonPremiere && isUnairedEp) {
       bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(effectiveAirDate || '') + '">Season Premiere</div>';
     } else if (showFinale && isSeasonFinale) {
       bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(effectiveAirDate || seasonFinaleAirDate || '') + '">Season Finale</div>';
-    } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!currentEpNum || currentEpNum >= 2)) {
+    } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!isSeasonPremiere || !isUnairedEp || currentEpNum >= 2)) {
       const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(seasonFinaleAirDate) : '';
       if (finaleText) {
         bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
@@ -2599,10 +2625,14 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
       if (keys.mdblistAccessToken) body.mdblistAccessToken = keys.mdblistAccessToken;
       if (keys.traktKey) body.traktKey = keys.traktKey;
-      if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+      if (keys.traktAccessToken) {
+        const isOwnList = !listUrl || listUrl.startsWith('trakt:') || (traktUser && listUrl.toLowerCase().includes('/users/' + traktUser.toLowerCase() + '/'));
+        if (isOwnList) body.traktAccessToken = keys.traktAccessToken;
+      }
       if (keys.simklKey) body.simklKey = keys.simklKey;
       if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
       if (creatorName) body.creatorName = creatorName;
+      if (keys.adultContentFilter || (typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled())) body.adultContentFilter = true;
       const res = await fetch(ORIGIN + '/api/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

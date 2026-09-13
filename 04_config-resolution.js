@@ -65,6 +65,7 @@ async function resolveConfig(configParam, env) {
           shuffleItems: !!parsed.shuffleItems,
           region: parsed.region || "US",
           hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
+          adultContentFilter: !!parsed.adultContentFilter,
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
           showBadgesCatalogs: parsed.showBadgesCatalogs !== false,
@@ -86,8 +87,8 @@ async function resolveConfig(configParam, env) {
 // apikey to also reach a private/personal list you own (mdblist honors the
 // key on this endpoint the same way its own site does when you're signed
 // in) — public lists work fine with no key.
-function mdblistJsonUrl(input, apikey) {
-  let s = input.trim();
+function mdblistJsonUrl(input, apikey, type) {
+  let s = (input || "").trim();
   // Query string / fragment stripped before anything else. Without this,
   // a URL copied while some filter/view toggle on mdblist's own site is
   // active (e.g. "?sort=rank", or a trailing "/?Mode=Show"-shaped param)
@@ -97,6 +98,7 @@ function mdblistJsonUrl(input, apikey) {
   // list that doesn't exist, and mdblist 404s (or returns something
   // unrelated) instead of the real list.
   s = s.split(/[?#]/)[0];
+
   s = s.replace(/^https?:\/\/(www\.)?mdblist\.com\/lists\//i, "");
   s = s.replace(/\/(json\/?)?$/i, "");
   const parts = s.split("/").filter(Boolean);

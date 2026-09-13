@@ -32,6 +32,9 @@ function extractMdblistItem(it) {
   }
   const showPoster = inner.poster || it.poster || (rawImdb ? `https://images.metahub.space/poster/medium/${rawImdb}/img` : undefined);
   const poster = isEpisode ? (ep && (ep.poster || ep.still) || showPoster) : showPoster;
+  const isItemAdult = it.adult === true || inner.adult === true || it.is_adult === true || inner.is_adult === true;
+  const itemGenres = it.genres || inner.genres || undefined;
+  const itemCert = it.certification || inner.certification || it.age_rating || inner.age_rating || undefined;
   const releaseYear = inner.release_year || inner.year || it.release_year || it.year || undefined;
   return {
     id: rawId,
@@ -44,6 +47,10 @@ function extractMdblistItem(it) {
     releaseInfo: releaseYear ? String(releaseYear) : undefined,
     season: ep ? (ep.season || 1) : undefined,
     episode: ep ? (ep.number || ep.episode || 1) : undefined,
+    adult: isItemAdult ? true : undefined,
+    isAdult: isItemAdult ? true : undefined,
+    genres: itemGenres,
+    certification: itemCert,
   };
 }
 
@@ -118,6 +125,10 @@ function mapMdblistItems(data, type) {
         releaseInfo: it.releaseInfo,
         season: it.season,
         episode: it.episode,
+        adult: it.adult === true || it.isAdult === true ? true : undefined,
+        isAdult: it.adult === true || it.isAdult === true ? true : undefined,
+        genres: it.genres,
+        certification: it.certification,
       };
     });
 }
@@ -186,7 +197,7 @@ function withTraktTotal(metas, totalItems) {
 }
 
 async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = null) {
-  const src = mdblistJsonUrl(entry.url, mdblistKey);
+  const src = mdblistJsonUrl(entry.url, mdblistKey, entry.type);
   if (!src) {
     throw new Error(
       "Couldn't parse that as an mdblist.com list URL (expected .../lists/user/listname)."
@@ -207,7 +218,7 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = 
     kvTtlSec: 86400,
     providerLabel: "MDBList",
     fetchFn: async () => {
-      const res = await fetch(src, {
+      let res = await fetch(src, {
         headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
         cf: { cacheTtl: 600, cacheEverything: true },
       });
@@ -222,7 +233,8 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = 
         throw new Error(`MDBList request failed (HTTP ${res.status}).${hint}`);
       }
 
-      const data = await res.json();
+      let data = await res.json();
+
       const metas = mapMdblistItems(data, entry.type);
       const total = metas.length;
       const enriched = await enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
@@ -397,16 +409,28 @@ async function fetchMdblistHistory(entry, skip = 0, mdblistKey = "", mdblistAcce
 // back to treating the item itself as the movie/show object.
 function mapTraktItems(data, type) {
   const items = Array.isArray(data) ? data : [];
-  return items
-    .map((it) => it.movie || it.show || it)
-    .filter((it) => it && it.ids && it.ids.imdb)
-    .map((it) => ({
-      id: it.ids.imdb,
-      type,
-      name: it.title,
-      poster: `https://images.metahub.space/poster/medium/${it.ids.imdb}/img`,
-      releaseInfo: it.year ? String(it.year) : undefined,
-    }));
+  const seen = new Set();
+  const res = [];
+  for (const it of items) {
+    const obj = it.movie || it.show || it;
+    if (!obj || !obj.ids) continue;
+    const effectiveId = obj.ids.imdb || (obj.ids.tmdb ? `tmdb:${obj.ids.tmdb}` : "");
+    if (!effectiveId || seen.has(effectiveId)) continue;
+    seen.add(effectiveId);
+    const isItemAdult = it.adult === true || obj.adult === true;
+    res.push({
+      id: effectiveId,
+      type: it.movie ? "movie" : (it.show ? "series" : type),
+      name: obj.title,
+      poster: effectiveId.startsWith("tt") ? `https://images.metahub.space/poster/medium/${effectiveId}/img` : undefined,
+      releaseInfo: obj.year ? String(obj.year) : undefined,
+      adult: isItemAdult ? true : undefined,
+      isAdult: isItemAdult ? true : undefined,
+      genres: it.genres || obj.genres || undefined,
+      certification: it.certification || obj.certification || undefined,
+    });
+  }
+  return res;
 }
 
 // Pulls a public trakt.tv list via the official REST API. Trakt paginates
@@ -434,11 +458,12 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
     );
   }
 
-  const itemKind = entry.type === "series" ? "shows" : "movies";
+  const itemKind = entry.type === "series" ? "shows,seasons,episodes" : (entry.type === "mixed" ? "" : "movies");
+  const kindPath = itemKind ? `/${itemKind}` : "";
   const page = Math.floor(skip / PAGE_SIZE) + 1;
   const src = `https://api.trakt.tv/users/${encodeURIComponent(
     parsed.user
-  )}/lists/${encodeURIComponent(parsed.list)}/items/${itemKind}?limit=${PAGE_SIZE}&page=${page}`;
+  )}/lists/${encodeURIComponent(parsed.list)}/items${kindPath}?limit=${PAGE_SIZE}&page=${page}`;
 
   const headers = {
     "Content-Type": "application/json",
@@ -449,8 +474,8 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
   if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
 
   const userHash = accessToken ? safeUserHash(accessToken, parsed.user) : "public";
-  const cacheKey = `user_cache:trakt:list:${parsed.user}:${parsed.list}:${itemKind}:${skip}:${userHash}`;
-  const kvKey = !accessToken ? `trakt:list:${parsed.user}:${parsed.list}:${itemKind}:${page}` : "";
+  const cacheKey = `user_cache:trakt:list:${parsed.user}:${parsed.list}:${itemKind || "all"}:${skip}:${userHash}`;
+  const kvKey = !accessToken ? `trakt:list:${parsed.user}:${parsed.list}:${itemKind || "all"}:${page}` : "";
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
@@ -462,10 +487,21 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
     kvTtlSec: 86400,
     providerLabel: "Trakt List",
     fetchFn: async () => {
-      const res = await fetchTraktWithRetry(src, {
+      let res = await fetchTraktWithRetry(src, {
         headers,
         cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 1200, cacheEverything: true },
       });
+      if (!res.ok && accessToken && (res.status === 401 || res.status === 403)) {
+        const pubHeaders = Object.assign({}, headers);
+        delete pubHeaders["Authorization"];
+        const pubRes = await fetchTraktWithRetry(src, {
+          headers: pubHeaders,
+          cf: { cacheTtl: 1200, cacheEverything: true },
+        });
+        if (pubRes.ok) {
+          res = pubRes;
+        }
+      }
       if (!res.ok) {
         const hint =
           res.status === 404

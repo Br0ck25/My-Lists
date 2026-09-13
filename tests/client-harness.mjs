@@ -35,7 +35,7 @@ const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 // happens once per process and every loadClient() re-evaluates the same text.
 let CACHED_SCRIPT = null;
 
-function renderPage() {
+export function renderPage() {
   let src = fs.readFileSync(path.join(REPO_ROOT, "worker_entry_combined.js"), "utf8");
   const idx = src.lastIndexOf("export default");
   if (idx === -1) throw new Error("no `export default` in the combined Worker");
@@ -91,10 +91,16 @@ globalThis.__scopeCall = function (name, args) { return eval(name).apply(null, a
 }
 
 function makeElement() {
+  const classes = new Set();
   const node = {
     style: {}, dataset: {}, children: [], value: "", textContent: "", innerHTML: "",
     checked: false, hidden: false, disabled: false, id: "", className: "",
-    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    classList: {
+      add(...cs) { cs.forEach((c) => classes.add(c)); node.className = [...classes].join(" "); },
+      remove(...cs) { cs.forEach((c) => classes.delete(c)); node.className = [...classes].join(" "); },
+      toggle(c) { const has = classes.has(c); if (has) classes.delete(c); else classes.add(c); node.className = [...classes].join(" "); return !has; },
+      contains: (c) => classes.has(c),
+    },
     appendChild() {}, removeChild() {}, remove() {}, insertAdjacentHTML() {},
     setAttribute() {}, getAttribute: () => null, removeAttribute() {}, hasAttribute: () => false,
     addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true,

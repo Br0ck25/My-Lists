@@ -433,7 +433,9 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
       Array.isArray(r.release_dates) && r.release_dates.some((rd) => rd.type === 4 || rd.type === 5)
     );
   }
-  const result = { imdbId, videos, hasDigitalRelease };
+  const adult = data.adult === true || data.is_adult === true;
+  const genres = Array.isArray(data.genres) ? data.genres.map((g) => (typeof g === "string" ? g : g.name || "")) : undefined;
+  const result = { imdbId, videos, hasDigitalRelease, adult, genres };
   // Cache for 7 days (604800s)
   setPerUserCache(cacheKey, result, 604800, 2592000);
 
@@ -573,8 +575,8 @@ async function fetchTmdb(entry, skip = 0, apiKey = "") {
 
   const resolved = await mapWithConcurrency(page, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
-    if (!imdbId) return null;
-    return mapTmdbItem(it, imdbId, entry.type, videos);
+    const effectiveId = imdbId || ("tmdb:" + it.id);
+    return mapTmdbItem(it, effectiveId, entry.type, videos);
   });
 
   const out = resolved.filter(Boolean);
@@ -627,15 +629,17 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "", env = null, ctx
 
       const data = await res.json();
       const parts = Array.isArray(data.parts) ? data.parts : [];
+      const isCollectionAdult = data.adult === true || (typeof isAdultOrNsfw === "function" && isAdultOrNsfw({ name: data.name, title: data.name, franchise: data.name }));
       
       // Sort chronologically by release date
       parts.sort((a, b) => (a.release_date || "9999").localeCompare(b.release_date || "9999"));
 
       const windowItems = parts.slice(skip, skip + PAGE_SIZE);
       const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
-        const { imdbId, videos } = await fetchTmdbDetails(it.id, "movie", apiKey);
-        if (!imdbId) return null;
-        return mapTmdbItem(it, imdbId, "movie", videos);
+        const details = await fetchTmdbDetails(it.id, "movie", apiKey);
+        const effectiveId = details.imdbId || ("tmdb:" + it.id);
+        if (isCollectionAdult && !it.adult) it.adult = true;
+        return mapTmdbItem(it, effectiveId, "movie", details.videos, details);
       });
 
       // The whole collection came back in one response, so its size is
@@ -653,7 +657,7 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "", env = null, ctx
 // obscure titles more reliably than metahub.space's IMDB-keyed poster
 // database -- preferred over metahub, with metahub only as a fallback for
 // the rare item missing a poster_path.
-function mapTmdbItem(it, imdbId, type, videos) {
+function mapTmdbItem(it, imdbId, type, videos, extraDetails) {
   let poster = undefined;
   if (it.poster_path) {
     poster = `https://image.tmdb.org/t/p/w500${it.poster_path}`;
@@ -662,6 +666,7 @@ function mapTmdbItem(it, imdbId, type, videos) {
   } else if (imdbId && String(imdbId).startsWith("tt")) {
     poster = `https://images.metahub.space/poster/medium/${imdbId}/img`;
   }
+  const isAdult = it.adult === true || it.is_adult === true || it.isAdult === true || (extraDetails && (extraDetails.adult === true || extraDetails.isAdult === true)) || (typeof isAdultOrNsfw === "function" && (isAdultOrNsfw(it) || (extraDetails && isAdultOrNsfw(extraDetails))));
   return {
     id: imdbId,
     type,
@@ -670,6 +675,10 @@ function mapTmdbItem(it, imdbId, type, videos) {
     background: it.backdrop_path ? `https://image.tmdb.org/t/p/w1280${it.backdrop_path}` : undefined,
     releaseInfo: (it.release_date || it.first_air_date || "").slice(0, 4) || undefined,
     trailerStreams: trailerStreamsFor(pickTrailerKey(videos)),
+    adult: isAdult ? true : undefined,
+    isAdult: isAdult ? true : undefined,
+    genres: it.genres || (extraDetails && extraDetails.genres) || (Array.isArray(it.genre_ids) ? it.genre_ids : undefined),
+    certification: it.certification || (extraDetails && extraDetails.certification) || undefined,
   };
 }
 
@@ -1151,6 +1160,304 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
   return res;
 }
 
+// --- Anime Unpacking & Multi-Season Parts Resolution -------------------------
+// Fixes TMDB cataloging that compresses multi-season anime (e.g. MASHLE 24 eps,
+// Re:ZERO 85 eps, Jujutsu Kaisen 59 eps) into a single monolithic season.
+// Restores true seasonal divisions using TMDB Episode Groups with seamless
+// Cinemeta fallback for Stremio stream compatibility.
+
+const ANIME_UNPACK_EXCLUDE_RE = /edit|re-?cut|director'?s|deleted|alternat|chronolog|dvd|broadcast|air.?date|absolut|special|trailer|extra|\bova\b|\boad\b|production/i;
+const ANIME_UNPACK_ORIGINAL_RE = /original/i;
+const ANIME_UNPACK_PART_RE = /part/i;
+const ANIME_UNPACK_SEASON_RE = /seasons?/i;
+
+function pickDefaultEpisodeGroupId(groups, standardSeasonCount, standardEpisodeCount, totalEpisodeCountWithSpecials) {
+  if (!groups || !Array.isArray(groups) || groups.length === 0) return null;
+  if (!(standardSeasonCount > 0) || !(standardEpisodeCount > 0)) return null;
+  let best = null;
+  for (const g of groups) {
+    if (!g || !g.id) continue;
+    const gc = typeof g.group_count === "number" ? g.group_count : 0;
+    const ec = typeof g.episode_count === "number" ? g.episode_count : 0;
+    if (gc <= 1 || ec <= 0) continue;
+    if (gc === standardSeasonCount) continue;
+    const matchRegular = ec === standardEpisodeCount;
+    const matchWithSpecials =
+      typeof totalEpisodeCountWithSpecials === "number" &&
+      totalEpisodeCountWithSpecials > standardEpisodeCount &&
+      (ec === totalEpisodeCountWithSpecials ||
+        (ec > standardEpisodeCount && Math.abs(ec - totalEpisodeCountWithSpecials) <= 15));
+    if (!matchRegular && !matchWithSpecials) continue;
+    const text = `${g.name || ""} ${g.description || ""}`;
+    if (ANIME_UNPACK_EXCLUDE_RE.test(g.name || "")) continue;
+    if (standardSeasonCount > 1 && /volum/i.test(g.name || "")) continue;
+    let score = 0;
+    if (g.type === 1) score += 3;
+    if (standardSeasonCount > 1) {
+      if (ANIME_UNPACK_PART_RE.test(text)) {
+        score += 2;
+        if (ANIME_UNPACK_ORIGINAL_RE.test(text)) score += 3;
+      }
+    } else {
+      if (ANIME_UNPACK_ORIGINAL_RE.test(text)) score += 3;
+      if (ANIME_UNPACK_PART_RE.test(text)) score += 2;
+      if (ANIME_UNPACK_SEASON_RE.test(text)) score += 3;
+    }
+    if (score === 0) continue;
+    if (!best || score > best.score) best = { id: g.id, score };
+  }
+  return best ? best.id : null;
+}
+
+function resolveGroupSeasonNumber(grp, idx, sorted, hasZero, hasSpecials) {
+  if (typeof grp.order === "number") {
+    if (hasSpecials && (grp.name || "").toLowerCase().includes("special") && grp.order === 0) return 0;
+    if (hasZero) return hasSpecials ? grp.order : grp.order + 1;
+    return grp.order;
+  }
+  return idx + 1;
+}
+
+function unpackEpisodeGroupDetails(groupDetails) {
+  if (!groupDetails || !Array.isArray(groupDetails.groups) || groupDetails.groups.length === 0) return null;
+  const groups = groupDetails.groups;
+  const sorted = [...groups].sort((a, b) => (typeof a.order === "number" ? a.order : 0) - (typeof b.order === "number" ? b.order : 0));
+  const hasZero = sorted.some((g) => g.order === 0);
+  const hasSpecials = sorted.some((g) => (g.name || "").toLowerCase().includes("special"));
+
+  const seasons = [];
+  const episodesBySeason = {};
+
+  for (let gIdx = 0; gIdx < sorted.length; gIdx++) {
+    const grp = sorted[gIdx];
+    const sNum = resolveGroupSeasonNumber(grp, gIdx, sorted, hasZero, hasSpecials);
+    const rawEps = Array.isArray(grp.episodes) ? grp.episodes : [];
+    const sortedEps = [...rawEps].sort((a, b) => (typeof a.order === "number" ? a.order : 0) - (typeof b.order === "number" ? b.order : 0));
+    
+    const epList = [];
+    for (let epIdx = 0; epIdx < sortedEps.length; epIdx++) {
+      const ep = sortedEps[epIdx];
+      const epNum = typeof ep.order === "number" ? ep.order + 1 : epIdx + 1;
+      epList.push({
+        id: ep.id || (sNum * 1000 + epNum),
+        episode_number: epNum,
+        name: ep.name || `Episode ${epNum}`,
+        overview: ep.overview || "",
+        runtime: ep.runtime || null,
+        air_date: ep.air_date || null,
+        vote_average: typeof ep.vote_average === "number" ? ep.vote_average : null,
+        still_path: ep.still_path ? (ep.still_path.startsWith("http") ? ep.still_path : ("https://image.tmdb.org/t/p/w500" + ep.still_path)) : null,
+      });
+    }
+
+    episodesBySeason[sNum] = epList;
+    if (sNum > 0) {
+      seasons.push({
+        season_number: sNum,
+        season: sNum,
+        name: grp.name || `Season ${sNum}`,
+        episode_count: epList.length,
+        episodeCount: epList.length,
+      });
+    }
+  }
+
+  if (seasons.length <= 1) return null;
+  return { seasons, episodesBySeason, groupId: groupDetails.id };
+}
+
+async function fetchCinemetaSeriesUnpacked(imdbId) {
+  const cleanId = String(imdbId || "").split(":")[0].trim();
+  if (!cleanId.startsWith("tt")) return null;
+  try {
+    const res = await fetch(`https://v3-cinemeta.strem.io/meta/series/${encodeURIComponent(cleanId)}.json`, {
+      headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+      cf: { cacheTtl: 604800, cacheEverything: true },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const videos = (data && data.meta && Array.isArray(data.meta.videos)) ? data.meta.videos : [];
+    if (videos.length === 0) return null;
+
+    const seasonMap = {};
+    for (const v of videos) {
+      if (typeof v.season !== "number" || typeof v.episode !== "number") continue;
+      if (!seasonMap[v.season]) seasonMap[v.season] = [];
+      seasonMap[v.season].push(v);
+    }
+
+    const regSeasons = Object.keys(seasonMap).map(Number).filter((s) => s > 0).sort((a, b) => a - b);
+    if (regSeasons.length <= 1) return null;
+
+    const seasons = [];
+    const episodesBySeason = {};
+
+    for (const sNum of regSeasons) {
+      const vList = seasonMap[sNum].sort((a, b) => a.episode - b.episode);
+      // Skip placeholder / dummy unreleased seasons (e.g. Cinemeta stub season with no air date and <= 1 episode)
+      const hasAnyAired = vList.some((v) => v.released || v.firstAired);
+      if (!hasAnyAired && sNum > 1 && vList.length <= 1) continue;
+
+      const epList = vList.map((v) => ({
+        id: v.tvdb_id || (sNum * 1000 + v.episode),
+        episode_number: v.episode,
+        name: v.title || v.name || `Episode ${v.episode}`,
+        overview: v.overview || v.description || "",
+        runtime: null,
+        air_date: v.released ? v.released.slice(0, 10) : (v.firstAired ? v.firstAired.slice(0, 10) : null),
+        vote_average: null,
+        still_path: v.thumbnail || null,
+      }));
+      episodesBySeason[sNum] = epList;
+      seasons.push({
+        season_number: sNum,
+        season: sNum,
+        name: `Season ${sNum}`,
+        episode_count: epList.length,
+        episodeCount: epList.length,
+      });
+    }
+
+    if (seasons.length <= 1) return null;
+
+    return { seasons, episodesBySeason, source: "cinemeta" };
+  } catch {
+    return null;
+  }
+}
+
+const UNPACKED_SHOW_CACHE = new Map();
+const UNPACKED_SHOW_TTL_MS = 6 * 60 * 60 * 1000;
+const UNPACKED_SHOW_MAX = 500;
+
+function getUnpackedCache(key) {
+  const e = UNPACKED_SHOW_CACHE.get(key);
+  if (!e || Date.now() > e.expiry) {
+    if (e) UNPACKED_SHOW_CACHE.delete(key);
+    return null;
+  }
+  return e.data;
+}
+
+function setUnpackedCache(key, data) {
+  if (UNPACKED_SHOW_CACHE.size >= UNPACKED_SHOW_MAX) {
+    const oldest = UNPACKED_SHOW_CACHE.keys().next().value;
+    if (oldest !== undefined) UNPACKED_SHOW_CACHE.delete(oldest);
+  }
+  UNPACKED_SHOW_CACHE.set(key, { data, expiry: Date.now() + UNPACKED_SHOW_TTL_MS });
+}
+
+async function resolveUnpackedShowData(tmdbId, imdbId, standardSeasons, apiKey, env = null, ctx = null, preloadedGroups = null, meter = null) {
+  const spend = () => { if (meter && typeof meter.spent === "number") meter.spent++; };
+  const cleanTmdbId = tmdbId ? String(tmdbId).replace(/^tmdb:/, "").trim() : "";
+  const cleanImdbId = imdbId ? String(imdbId).split(":")[0].trim() : "";
+  const cacheKey = cleanTmdbId || cleanImdbId;
+  if (!cacheKey) return null;
+
+  const mem = getUnpackedCache(cacheKey);
+  if (mem) return mem;
+
+  if (env && env.CONFIGS) {
+    try {
+      const kv = await env.CONFIGS.get(`unpacked_show:${cacheKey}`);
+      if (kv) {
+        const parsed = JSON.parse(kv);
+        setUnpackedCache(cacheKey, parsed);
+        return parsed;
+      }
+    } catch {}
+  }
+
+  let effectiveSeasons = standardSeasons;
+  let groups = preloadedGroups;
+
+  // If standardSeasons not passed and we have TMDB ID + key, load show info
+  if (!effectiveSeasons && cleanTmdbId && apiKey) {
+    try {
+      spend();
+      const sRes = await fetch(`https://api.themoviedb.org/3/tv/${cleanTmdbId}?api_key=${encodeURIComponent(apiKey)}&append_to_response=episode_groups`, {
+        headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+        cf: { cacheTtl: 604800, cacheEverything: true },
+      });
+      if (sRes.ok) {
+        const sData = await sRes.json();
+        effectiveSeasons = sData.seasons;
+        if (!groups && sData.episode_groups && Array.isArray(sData.episode_groups.results)) {
+          groups = sData.episode_groups.results;
+        }
+      }
+    } catch {}
+  }
+
+  const regSeasons = Array.isArray(effectiveSeasons) ? effectiveSeasons.filter((s) => s && s.season_number > 0) : [];
+  const standardSeasonCount = regSeasons.length;
+  const standardEpisodeCount = regSeasons.reduce((sum, s) => sum + (s.episode_count || 0), 0);
+  const totalEpisodeCountWithSpecials = Array.isArray(effectiveSeasons)
+    ? effectiveSeasons.reduce((sum, s) => sum + (s.episode_count || 0), 0)
+    : standardEpisodeCount;
+
+  // Only unpack if the show has exactly 1 regular season with multiple episodes
+  if (standardSeasonCount !== 1 || standardEpisodeCount <= 1) {
+    return null;
+  }
+
+  let unpacked = null;
+
+  // 1. Try TMDB Episode Groups
+  if (cleanTmdbId && apiKey) {
+    try {
+      if (!groups || (Array.isArray(groups) && groups.length === 0)) {
+        spend();
+        const egRes = await fetch(`https://api.themoviedb.org/3/tv/${cleanTmdbId}/episode_groups?api_key=${encodeURIComponent(apiKey)}`, {
+          headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+          cf: { cacheTtl: 604800, cacheEverything: true },
+        });
+        if (egRes.ok) {
+          const egData = await egRes.json();
+          groups = egData.results;
+        }
+      }
+
+      if (groups && Array.isArray(groups) && groups.length > 0) {
+        const bestGroupId = pickDefaultEpisodeGroupId(groups, standardSeasonCount, standardEpisodeCount, totalEpisodeCountWithSpecials);
+        if (bestGroupId) {
+          spend();
+          const gRes = await fetch(`https://api.themoviedb.org/3/episode_group/${bestGroupId}?api_key=${encodeURIComponent(apiKey)}`, {
+            headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+            cf: { cacheTtl: 604800, cacheEverything: true },
+          });
+          if (gRes.ok) {
+            const gData = await gRes.json();
+            unpacked = unpackEpisodeGroupDetails(gData);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Cinemeta fallback
+  if (!unpacked && cleanImdbId.startsWith("tt")) {
+    spend();
+    unpacked = await fetchCinemetaSeriesUnpacked(cleanImdbId);
+  }
+
+  if (unpacked) {
+    setUnpackedCache(cacheKey, unpacked);
+    if (cleanTmdbId && cleanImdbId) {
+      setUnpackedCache(cleanImdbId, unpacked);
+      setUnpackedCache(cleanTmdbId, unpacked);
+    }
+    if (env && env.CONFIGS) {
+      const kvStr = JSON.stringify(unpacked);
+      const p1 = env.CONFIGS.put(`unpacked_show:${cacheKey}`, kvStr, { expirationTtl: 2592000 }).catch(() => {});
+      if (ctx && ctx.waitUntil) ctx.waitUntil(p1);
+    }
+    return unpacked;
+  }
+
+  return null;
+}
+
 // Wraps the real resolution logic (fetchTmdbItemDetailsUncached below) in
 // the same shared, canonical-key cache Trakt already uses
 // (fetchWithPerUserCacheAndCircuitBreaker) -- unlike the catalog/chart
@@ -1176,17 +1483,37 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
+
+  const upgradeIfUnpacked = async (d) => {
+    if (!d || !Array.isArray(d.seasonsData)) return d;
+    const reg = d.seasonsData.filter((s) => s && s.season_number > 0);
+    const epCount = reg.reduce((sum, s) => sum + (s.episode_count || 0), 0);
+    if (reg.length === 1 && epCount > 1) {
+      const unpacked = await resolveUnpackedShowData(d.tmdbId, d.id, d.seasonsData, apiKey, env, ctx, null, meter);
+      if (unpacked && Array.isArray(unpacked.seasons) && unpacked.seasons.length > 1) {
+        const upgraded = { ...d, seasonsData: unpacked.seasons, seasons: unpacked.seasons };
+        setPerUserCache(cacheKey, upgraded);
+        if (env && env.CONFIGS && apiKey) {
+          const p = env.CONFIGS.put(cacheKey, JSON.stringify(upgraded), { expirationTtl: 604800 }).catch(() => {});
+          if (ctx && ctx.waitUntil) ctx.waitUntil(p);
+        }
+        return upgraded;
+      }
+    }
+    return d;
+  };
+
   if (!bypassCache) {
     const cached = getPerUserCache(cacheKey);
     if (cached && cached.isFresh && cached.data) {
       if (cached.data.nextEpisodeAirDate && isEpisodeAiredServer(cached.data.nextEpisodeAirDate)) {
         // Scheduled episode has already aired; refresh to resolve the new upcoming episode
       } else {
-        return cached.data;
+        return await upgradeIfUnpacked(cached.data);
       }
     }
   }
-  return fetchWithPerUserCacheAndCircuitBreaker({
+  const details = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
     freshTtlSec: (fallbackType === "series" || fallbackType === "tv") ? 7200 : 604800,
     staleTtlSec: 2592000,
@@ -1195,11 +1522,12 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
     ctx: ctx,
     kvKey: apiKey ? cacheKey : "",
     kvTtlSec: 604800,
-    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion, meter),
+    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion, meter, env, ctx),
   });
+  return await upgradeIfUnpacked(details);
 }
 
-async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region, meter) {
+async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region, meter, env = null, ctx = null) {
   // One call per outbound fetch below. Counted here rather than by wrapping
   // fetch() globally, so nothing else in the Worker changes behaviour.
   const spend = () => { if (meter) meter.spent++; };
@@ -1281,7 +1609,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
   let match = null;
   let resolvedType = type;
   if (resolvedType) {
-    const detailSrc = "https://api.themoviedb.org/3/" + resolvedType + "/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+    const detailSrc = "https://api.themoviedb.org/3/" + resolvedType + "/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits" + (resolvedType === "tv" ? ",episode_groups" : "");
     spend();
     const detailRes = await fetch(detailSrc, {
       headers: { "User-Agent": "my-list-addon/1.14" },
@@ -1304,7 +1632,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
       resolvedType = "movie";
     } else {
       // Try tv
-      const tvSrc = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+      const tvSrc = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits,episode_groups";
       spend();
       const tvRes = await fetch(tvSrc, {
         headers: { "User-Agent": "my-list-addon/1.14" },
@@ -1388,6 +1716,18 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     } catch {}
     if (!poster && realImdbId.startsWith("tt")) {
       poster = "https://images.metahub.space/poster/medium/" + realImdbId + "/img";
+    }
+  }
+
+  if (type === "tv" && Array.isArray(match.seasons)) {
+    const regSeasons = match.seasons.filter((s) => s && s.season_number > 0);
+    const standardEpisodeCount = regSeasons.reduce((sum, s) => sum + (s.episode_count || 0), 0);
+    if (regSeasons.length === 1 && standardEpisodeCount > 1) {
+      const groups = match.episode_groups && Array.isArray(match.episode_groups.results) ? match.episode_groups.results : [];
+      const unpacked = await resolveUnpackedShowData(tmdbId, realImdbId, match.seasons, apiKey, env, ctx, groups, meter);
+      if (unpacked && Array.isArray(unpacked.seasons) && unpacked.seasons.length > 1) {
+        match.seasons = unpacked.seasons;
+      }
     }
   }
 
@@ -1542,11 +1882,11 @@ async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId, en
     ctx: ctx,
     kvKey: apiKey ? cacheKey : "",
     kvTtlSec: 604800,
-    fetchFn: () => fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId),
+    fetchFn: () => fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId, env, ctx),
   });
 }
 
-async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId) {
+async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId, env = null, ctx = null) {
   if (!apiKey) return null;
   // Shows opened from title search (Search Movies & TV Shows) carry a
   // "tmdb:<id>" identifier instead of a real IMDb id -- skip the IMDb
@@ -1597,6 +1937,14 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
       } catch {}
     }
   }
+  if (!tmdbId && !String(imdbId || "").startsWith("tt")) return null;
+
+  const numericSeason = parseInt(seasonNum, 10);
+  const unpacked = await resolveUnpackedShowData(tmdbId, imdbId, null, apiKey, env, ctx);
+  if (unpacked && unpacked.episodesBySeason && unpacked.episodesBySeason[numericSeason]) {
+    return { episodes: unpacked.episodesBySeason[numericSeason] };
+  }
+
   if (!tmdbId) return null;
 
   const src = "https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + seasonNum + "?api_key=" + encodeURIComponent(apiKey);
@@ -1604,7 +1952,15 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
     headers: { "User-Agent": "my-list-addon/1.14" },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
-  if (!res.ok) return null;
+  if (!res.ok) {
+    if (String(imdbId).startsWith("tt")) {
+      const cinUnpacked = await fetchCinemetaSeriesUnpacked(imdbId);
+      if (cinUnpacked && cinUnpacked.episodesBySeason && cinUnpacked.episodesBySeason[numericSeason]) {
+        return { episodes: cinUnpacked.episodesBySeason[numericSeason] };
+      }
+    }
+    return null;
+  }
   const data = await res.json();
   
   return {
@@ -2223,4 +2579,5 @@ async function prewarmSharedCatalogs(env, ctx, fetchBudget) {
   } catch (e) {
     console.warn("[Cron] MDBList warm error:", e && e.message ? e.message : e);
   }
+
 }

@@ -393,62 +393,164 @@ function addAllEpisodesToChannel(imdbId, showName, showPoster, showBackdrop) {
 
 const LOCAL_CHANNELS_KEY = 'myListAddon:localChannels';
 
+let _memoryChannelsMap = null;
+let _memoryChannelsString = '';
+
+function normalizeChannelItemFromStorage(it) {
+  if (!it || typeof it !== 'object') return it;
+  const poster = it.poster || it.showPoster || it.thumbnail || '';
+  const thumbnail = it.thumbnail || poster || '';
+  const showPoster = it.showPoster || poster || '';
+  return {
+    ...it,
+    kind: it.kind || 'episode',
+    poster: poster,
+    thumbnail: thumbnail,
+    showPoster: showPoster,
+  };
+}
+
 function loadLocalChannels() {
   try {
-    return JSON.parse(localStorage.getItem(LOCAL_CHANNELS_KEY) || '{}');
+    if (_memoryChannelsMap && typeof _memoryChannelsMap === 'object' && Object.keys(_memoryChannelsMap).length > 0) {
+      return _memoryChannelsMap;
+    }
+    let str = _memoryChannelsString;
+    if (!str) {
+      try { str = sessionStorage.getItem(LOCAL_CHANNELS_KEY); } catch (e) {}
+    }
+    if (!str) {
+      try { str = localStorage.getItem(LOCAL_CHANNELS_KEY); } catch (e) {}
+    }
+    const map = JSON.parse(str || '{}');
+    if (map && typeof map === 'object') {
+      for (const ch of Object.values(map)) {
+        if (ch && Array.isArray(ch.items)) {
+          ch.items = ch.items.map(normalizeChannelItemFromStorage);
+        }
+      }
+      _memoryChannelsString = str;
+      _memoryChannelsMap = map;
+      return map;
+    }
+    return _memoryChannelsMap || {};
   } catch (e) {
-    return {};
+    return _memoryChannelsMap || {};
   }
 }
 
-function compressChannelItemsForStorage(items) {
-  if (!Array.isArray(items)) return [];
-  return items.slice(0, 200).map((it) => ({
-    kind: it.kind || 'episode',
+function compactChannelItemForStorage(it) {
+  if (!it || typeof it !== 'object') return null;
+  const kind = it.kind || 'episode';
+  const out = {
+    kind: kind,
     imdbId: it.imdbId || '',
-    season: it.season != null ? it.season : 1,
-    episode: it.episode != null ? it.episode : 1,
+    season: it.season != null ? Number(it.season) : 1,
+    episode: it.episode != null ? Number(it.episode) : 1,
     showName: it.showName || '',
     epName: it.epName || '',
     title: it.title || '',
-    released: it.released || '',
-    thumbnail: it.thumbnail || it.poster || '',
-    poster: it.poster || it.thumbnail || '',
-    showPoster: it.showPoster || '',
-  }));
+  };
+  if (it.released) {
+    out.released = it.released.length > 10 ? it.released.slice(0, 10) : it.released;
+  }
+  const poster = it.poster || it.showPoster || it.thumbnail || '';
+  const thumbnail = it.thumbnail || '';
+  const showPoster = it.showPoster || '';
+
+  if (poster) out.poster = poster;
+  if (thumbnail && thumbnail !== poster) out.thumbnail = thumbnail;
+  if (showPoster && showPoster !== poster && showPoster !== thumbnail) out.showPoster = showPoster;
+  if (it.backdrop && it.backdrop !== poster && it.backdrop !== thumbnail) out.backdrop = it.backdrop;
+
+  return out;
+}
+
+function compressChannelItemsForStorage(items, maxItems = 5000) {
+  if (!Array.isArray(items)) return [];
+  const cap = typeof maxItems === 'number' ? maxItems : 5000;
+  return items.slice(0, cap).map(compactChannelItemForStorage).filter(Boolean);
 }
 
 function saveLocalChannelsMap(map) {
+  if (!map || typeof map !== 'object') return false;
+
+  // 1. Keep full fidelity in memory unconditionally so active session, "See All", and playback have all items
+  _memoryChannelsMap = map;
+
+  const fullMap = {};
+  for (const [id, ch] of Object.entries(map)) {
+    if (!ch) continue;
+    fullMap[id] = {
+      channelId: ch.channelId || id,
+      name: ch.name || 'Channel',
+      poster: ch.poster || null,
+      backdrop: ch.backdrop || null,
+      items: compressChannelItemsForStorage(ch.items, 5000),
+      shuffle: !!ch.shuffle,
+      dailyRotate: !!ch.dailyRotate,
+      createdAt: ch.createdAt || Date.now(),
+      updatedAt: ch.updatedAt || Date.now(),
+    };
+  }
+
+  let fullStr = '';
   try {
-    localStorage.setItem(LOCAL_CHANNELS_KEY, JSON.stringify(map));
-    if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
-    return true;
-  } catch (e) {
-    console.warn('saveLocalChannelsMap initial attempt failed, compressing...', e);
-    try {
-      const compressed = {};
-      for (const [id, ch] of Object.entries(map || {})) {
-        if (!ch) continue;
-        compressed[id] = {
-          channelId: ch.channelId,
-          name: ch.name || 'Channel',
-          poster: ch.poster || null,
-          backdrop: ch.backdrop || null,
-          items: compressChannelItemsForStorage(ch.items),
-          shuffle: !!ch.shuffle,
-          dailyRotate: !!ch.dailyRotate,
-          createdAt: ch.createdAt || Date.now(),
-          updatedAt: ch.updatedAt || Date.now(),
-        };
-      }
-      localStorage.setItem(LOCAL_CHANNELS_KEY, JSON.stringify(compressed));
+    fullStr = JSON.stringify(fullMap);
+    _memoryChannelsString = fullStr;
+    try { sessionStorage.setItem(LOCAL_CHANNELS_KEY, fullStr); } catch (se) {}
+  } catch (strErr) {}
+
+  // Tier 1: Try full compact map in localStorage
+  try {
+    if (fullStr) {
+      localStorage.setItem(LOCAL_CHANNELS_KEY, fullStr);
       if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
       return true;
-    } catch (err2) {
-      console.error('saveLocalChannelsMap failed even after compression:', err2);
-      return false;
+    }
+  } catch (e1) {
+    // Tier 2: Quota exceeded, compress channel items to 1000 items for offline storage
+    try {
+      const tier2Map = {};
+      for (const [id, ch] of Object.entries(fullMap)) {
+        tier2Map[id] = {
+          ...ch,
+          items: (ch.items || []).slice(0, 1000),
+        };
+      }
+      const tier2Str = JSON.stringify(tier2Map);
+      localStorage.setItem(LOCAL_CHANNELS_KEY, tier2Str);
+      if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
+      return true;
+    } catch (e2) {
+      // Tier 3: Ultra-compact to 300 items for offline storage
+      try {
+        const tier3Map = {};
+        for (const [id, ch] of Object.entries(fullMap)) {
+          tier3Map[id] = {
+            ...ch,
+            items: (ch.items || []).slice(0, 300),
+          };
+        }
+        const tier3Str = JSON.stringify(tier3Map);
+        localStorage.setItem(LOCAL_CHANNELS_KEY, tier3Str);
+        if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
+        return true;
+      } catch (e3) {
+        // Fallback: localStorage completely full across all keys.
+        // Full channel is still safely preserved in _memoryChannelsMap, sessionStorage, and #lists entries.
+        console.warn('saveLocalChannelsMap: localStorage quota exceeded, preserved in session & memory');
+        window._localStorageFull = true;
+        if (typeof notifyStorageFull === 'function') {
+          const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+          notifyStorageFull(signedIn);
+        }
+        if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
+        return true;
+      }
     }
   }
+  return true;
 }
 
 function ensureAllChannelsSyncedFromRows(map) {
@@ -4921,8 +5023,2244 @@ const TV_CROSSOVER_EVENTS = [
         "poster": "https://images.metahub.space/poster/medium/tt2647544/img"
       }
     ]
+  },
+  {
+    "id": "movie_peacemaker_suicide_squad",
+    "name": "Peacemaker: Complete Storyline & The Suicide Squad",
+    "franchise": "DC Universe",
+    "category": "tvuniverses",
+    "description": "The Suicide Squad (2021) is a direct prerequisite to Peacemaker: Peacemaker is shot and left for dead in the movie, and the post-credits scene sets up his hospital recovery and the task force assigned to him in Episode 1.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Suicide Squad",
+        "year": 2021,
+        "tmdbId": 436969,
+        "imdbId": "tt6334354",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt6334354/img"
+      },
+      {
+        "type": "show",
+        "showName": "Peacemaker",
+        "tmdbId": 110492,
+        "imdbId": "tt13146404",
+        "seasons": [
+          1
+        ],
+        "title": "Peacemaker (Season 1)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt13146404/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_the_batman_penguin",
+    "name": "The Batman & The Penguin Saga",
+    "franchise": "The Batman Epic Crime Saga",
+    "category": "tvuniverses",
+    "description": "The Penguin is a direct continuation of The Batman (2022), picking up one week after the flooding of Gotham and Carmine Falcone's death as Oz Cobb seizes control of the criminal underworld.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Batman",
+        "year": 2022,
+        "tmdbId": 414906,
+        "imdbId": "tt1877830",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1877830/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Penguin",
+        "tmdbId": 137437,
+        "imdbId": "tt15474916",
+        "seasons": [
+          1
+        ],
+        "title": "The Penguin (Season 1)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt15474916/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_battlestar_galactica_miniseries",
+    "name": "Battlestar Galactica: The Complete Modern Saga",
+    "franchise": "Battlestar Galactica",
+    "category": "tvuniverses",
+    "description": "The 2003 Miniseries is the mandatory pilot depicting the Cylon holocaust on the Twelve Colonies, immediately followed by the four-season fleet survival saga.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Battlestar Galactica: The Miniseries",
+        "year": 2003,
+        "tmdbId": 4130,
+        "imdbId": "tt0314979",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0314979/img"
+      },
+      {
+        "type": "show",
+        "showName": "Battlestar Galactica",
+        "tmdbId": 1973,
+        "imdbId": "tt0407362",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Battlestar Galactica (Seasons 1-4)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0407362/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_star_wars_clone_wars_canon",
+    "name": "Star Wars: The Clone Wars (Theatrical Film & Series)",
+    "franchise": "Star Wars",
+    "category": "tvuniverses",
+    "description": "The 2008 theatrical movie is the essential pilot introducing Ahsoka Tano as Anakin Skywalker's new Padawan, directly launching the seven-season animated series.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Star Wars: The Clone Wars",
+        "year": 2008,
+        "tmdbId": 12180,
+        "imdbId": "tt1185834",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1185834/img"
+      },
+      {
+        "type": "show",
+        "showName": "Star Wars: The Clone Wars",
+        "tmdbId": 4174,
+        "imdbId": "tt0458290",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "Star Wars: The Clone Wars (Seasons 1-7)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0458290/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_twin_peaks_complete_mythology",
+    "name": "Twin Peaks: Complete Canon Chronology",
+    "franchise": "Twin Peaks",
+    "category": "tvuniverses",
+    "description": "David Lynch's surreal mystery masterpiece: Seasons 1-2, the essential canon prequel film Fire Walk with Me, and the 2017 limited event series The Return.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Twin Peaks",
+        "tmdbId": 192,
+        "imdbId": "tt0098936",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "Twin Peaks (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0098936/img"
+      },
+      {
+        "type": "movie",
+        "title": "Twin Peaks: Fire Walk with Me",
+        "year": 1992,
+        "tmdbId": 1923,
+        "imdbId": "tt0105665",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0105665/img"
+      },
+      {
+        "type": "show",
+        "showName": "Twin Peaks",
+        "tmdbId": 63926,
+        "imdbId": "tt4093826",
+        "seasons": [
+          3
+        ],
+        "title": "Twin Peaks: The Return (Season 3)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt4093826/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_veronica_mars_complete_saga",
+    "name": "Veronica Mars: Complete Saga & Movie",
+    "franchise": "Veronica Mars",
+    "category": "tvuniverses",
+    "description": "The complete Veronica Mars story: Seasons 1-3, followed by the crowdfunded 2014 feature film, and concluding with the 2019 Hulu revival season.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Veronica Mars",
+        "tmdbId": 4370,
+        "imdbId": "tt0412253",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "Veronica Mars (Seasons 1-3)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0412253/img"
+      },
+      {
+        "type": "movie",
+        "title": "Veronica Mars",
+        "year": 2014,
+        "tmdbId": 185008,
+        "imdbId": "tt2771372",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2771372/img"
+      },
+      {
+        "type": "show",
+        "showName": "Veronica Mars",
+        "tmdbId": 4370,
+        "imdbId": "tt0412253",
+        "seasons": [
+          4
+        ],
+        "title": "Veronica Mars (Season 4)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0412253/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_power_rangers_zeo_turbo_bridge",
+    "name": "Power Rangers: Zeo to Turbo Canon Bridge",
+    "franchise": "Power Rangers",
+    "category": "tvuniverses",
+    "description": "Turbo: A Power Rangers Movie (1997) is the mandatory canon bridge film between Zeo and Turbo, explaining how the Rangers acquired Turbo powers and introducing Justin and Divatox.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Power Rangers Zeo",
+        "tmdbId": 1585,
+        "imdbId": "tt0115324",
+        "seasons": [
+          1
+        ],
+        "title": "Power Rangers Zeo",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0115324/img"
+      },
+      {
+        "type": "movie",
+        "title": "Turbo: A Power Rangers Movie",
+        "year": 1997,
+        "tmdbId": 9611,
+        "imdbId": "tt0120389",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0120389/img"
+      },
+      {
+        "type": "show",
+        "showName": "Power Rangers Turbo",
+        "tmdbId": 1667,
+        "imdbId": "tt0118433",
+        "seasons": [
+          1
+        ],
+        "title": "Power Rangers Turbo",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0118433/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_transformers_g1_1986_bridge",
+    "name": "The Transformers: G1 & 1986 Theatrical Movie",
+    "franchise": "Transformers",
+    "category": "tvuniverses",
+    "description": "The Transformers: The Movie (1986) is the pivotal canon turning point set between Seasons 2 and 3, depicting the death of Optimus Prime, Megatron's rebirth as Galvatron, and the ascension of Rodimus Prime.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Transformers",
+        "tmdbId": 1096,
+        "imdbId": "tt0086817",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "The Transformers (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0086817/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Transformers: The Movie",
+        "year": 1986,
+        "tmdbId": 1857,
+        "imdbId": "tt0092106",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0092106/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Transformers",
+        "tmdbId": 1096,
+        "imdbId": "tt0086817",
+        "seasons": [
+          3,
+          4
+        ],
+        "title": "The Transformers (Seasons 3-4)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0086817/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_sex_and_the_city_complete_saga",
+    "name": "Sex and the City: Complete Universe & Movies",
+    "franchise": "Sex and the City",
+    "category": "tvuniverses",
+    "description": "The complete chronology: Seasons 1-6 of the original HBO series, followed by the two theatrical continuation movies, leading into And Just Like That...",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Sex and the City",
+        "tmdbId": 105,
+        "imdbId": "tt0159206",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "title": "Sex and the City (Seasons 1-6)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0159206/img"
+      },
+      {
+        "type": "movie",
+        "title": "Sex and the City",
+        "year": 2008,
+        "tmdbId": 9479,
+        "imdbId": "tt1000774",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1000774/img"
+      },
+      {
+        "type": "movie",
+        "title": "Sex and the City 2",
+        "year": 2010,
+        "tmdbId": 33644,
+        "imdbId": "tt1261945",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1261945/img"
+      },
+      {
+        "type": "show",
+        "showName": "And Just Like That...",
+        "tmdbId": 115646,
+        "imdbId": "tt13819960",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "And Just Like That... (Seasons 1-2)",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt13819960/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_monk_complete_last_case",
+    "name": "Monk: Complete Saga & Last Case",
+    "franchise": "Monk",
+    "category": "tvuniverses",
+    "description": "The full eight seasons of Adrian Monk's obsessive-compulsive detective cases, culminating in the 2023 reunion film Mr. Monk's Last Case.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Monk",
+        "tmdbId": 1695,
+        "imdbId": "tt0312172",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "title": "Monk (Seasons 1-8)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0312172/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mr. Monk's Last Case: A Monk Movie",
+        "year": 2023,
+        "tmdbId": 1103445,
+        "imdbId": "tt27145784",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt27145784/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_luther_complete_fallen_sun",
+    "name": "Luther: Complete Saga & The Fallen Sun",
+    "franchise": "Luther",
+    "category": "tvuniverses",
+    "description": "Idris Elba's brilliant, tortured DCI John Luther across all five BBC series, followed by the 2023 Netflix continuation film Luther: The Fallen Sun.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Luther",
+        "tmdbId": 31586,
+        "imdbId": "tt1474684",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "title": "Luther (Seasons 1-5)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1474684/img"
+      },
+      {
+        "type": "movie",
+        "title": "Luther: The Fallen Sun",
+        "year": 2023,
+        "tmdbId": 885184,
+        "imdbId": "tt14752254",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14752254/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_burn_notice_sam_axe",
+    "name": "Burn Notice & The Fall of Sam Axe",
+    "franchise": "Burn Notice",
+    "category": "tvuniverses",
+    "description": "The action-packed spy saga in story order: prequel movie The Fall of Sam Axe detailing Sam's final military mission in Colombia, followed by all seven seasons of Burn Notice.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Burn Notice: The Fall of Sam Axe",
+        "year": 2011,
+        "tmdbId": 63216,
+        "imdbId": "tt1697851",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1697851/img"
+      },
+      {
+        "type": "show",
+        "showName": "Burn Notice",
+        "tmdbId": 2919,
+        "imdbId": "tt0810788",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "Burn Notice (Seasons 1-7)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0810788/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_farscape_peacekeeper_wars",
+    "name": "Farscape: Complete Saga & The Peacekeeper Wars",
+    "franchise": "Farscape",
+    "category": "tvuniverses",
+    "description": "Astronaut John Crichton's journey across the uncharted territories through four seasons, culminating in the epic miniseries finale The Peacekeeper Wars.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Farscape",
+        "tmdbId": 4271,
+        "imdbId": "tt0187636",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Farscape (Seasons 1-4)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0187636/img"
+      },
+      {
+        "type": "movie",
+        "title": "Farscape: The Peacekeeper Wars",
+        "year": 2004,
+        "tmdbId": 808,
+        "imdbId": "tt0387733",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0387733/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_csi_immortality_finale",
+    "name": "CSI: Crime Scene Investigation & Immortality",
+    "franchise": "CSI Universe",
+    "category": "tvuniverses",
+    "description": "Fifteen groundbreaking seasons of the flagship Las Vegas forensic unit, resolved in the two-part series finale television movie CSI: Immortality with Gil Grissom and Sara Sidle.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "CSI: Crime Scene Investigation",
+        "tmdbId": 1431,
+        "imdbId": "tt0247082",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "title": "CSI: Crime Scene Investigation (Seasons 1-15)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0247082/img"
+      },
+      {
+        "type": "movie",
+        "title": "CSI: Immortality",
+        "year": 2015,
+        "tmdbId": 359050,
+        "imdbId": "tt4687402",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4687402/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_the_sopranos_many_saints",
+    "name": "The Sopranos & The Many Saints of Newark",
+    "franchise": "The Sopranos",
+    "category": "tvuniverses",
+    "description": "The complete saga of Tony Soprano: David Chase's 1960s-70s origin prequel film The Many Saints of Newark followed by all six landmark seasons of The Sopranos.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Many Saints of Newark",
+        "year": 2021,
+        "tmdbId": 524369,
+        "imdbId": "tt8110330",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt8110330/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Sopranos",
+        "tmdbId": 1399,
+        "imdbId": "tt0141842",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "title": "The Sopranos (Seasons 1-6)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0141842/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_entourage_complete_and_film",
+    "name": "Entourage: Complete Series & Feature Film",
+    "franchise": "Entourage",
+    "category": "tvuniverses",
+    "description": "Vincent Chase and his Queens crew navigating Hollywood across all eight HBO seasons, concluding with the 2015 theatrical sequel movie.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Entourage",
+        "tmdbId": 1947,
+        "imdbId": "tt0387199",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "title": "Entourage (Seasons 1-8)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0387199/img"
+      },
+      {
+        "type": "movie",
+        "title": "Entourage",
+        "year": 2015,
+        "tmdbId": 216282,
+        "imdbId": "tt1674771",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1674771/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_the_librarians_trilogy_series",
+    "name": "The Librarians: Foundational Trilogy & Series",
+    "franchise": "The Librarians",
+    "category": "tvuniverses",
+    "description": "Noah Wyle's Flynn Carsen in the original film trilogy (Quest for the Spear, King Solomon's Mines, Curse of the Judas Chalice), establishing the Library before recruiting the new team in the TV series.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Librarian: Quest for the Spear",
+        "year": 2004,
+        "tmdbId": 11309,
+        "imdbId": "tt0412915",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0412915/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Librarian: Return to King Solomon's Mines",
+        "year": 2006,
+        "tmdbId": 11310,
+        "imdbId": "tt0481566",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0481566/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Librarian: Curse of the Judas Chalice",
+        "year": 2008,
+        "tmdbId": 13884,
+        "imdbId": "tt1146438",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1146438/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Librarians",
+        "tmdbId": 61889,
+        "imdbId": "tt3663440",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "The Librarians (Seasons 1-4)",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt3663440/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_gomorrah_limmortale_bridge",
+    "name": "Gomorrah: Complete Saga & L'immortale",
+    "franchise": "Gomorrah",
+    "category": "tvuniverses",
+    "description": "The gritty Camorra crime saga: Seasons 1-4, the mandatory canon bridge film L'immortale explaining Ciro Di Marzio's survival in Riga, and the climactic final Season 5.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Gomorrah",
+        "tmdbId": 46420,
+        "imdbId": "tt2049116",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Gomorrah (Seasons 1-4)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2049116/img"
+      },
+      {
+        "type": "movie",
+        "title": "L'immortale",
+        "year": 2019,
+        "tmdbId": 633116,
+        "imdbId": "tt10915740",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt10915740/img"
+      },
+      {
+        "type": "show",
+        "showName": "Gomorrah",
+        "tmdbId": 46420,
+        "imdbId": "tt2049116",
+        "seasons": [
+          5
+        ],
+        "title": "Gomorrah (Season 5)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2049116/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_spartacus_complete_chronology",
+    "name": "Spartacus: Complete Chronological Order",
+    "franchise": "Spartacus",
+    "category": "tvuniverses",
+    "description": "The complete gladiator rebellion in historical story order: prequel miniseries Gods of the Arena, followed by Blood and Sand (Season 1), Vengeance (Season 2), and War of the Damned (Season 3).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Spartacus: Gods of the Arena",
+        "tmdbId": 37604,
+        "imdbId": "tt1758604",
+        "seasons": [
+          1
+        ],
+        "title": "Spartacus: Gods of the Arena",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1758604/img"
+      },
+      {
+        "type": "show",
+        "showName": "Spartacus",
+        "tmdbId": 2316,
+        "imdbId": "tt1442449",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "Spartacus (Seasons 1-3)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1442449/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_venture_bros_radiant_blood",
+    "name": "The Venture Bros.: Complete Series & Finale Film",
+    "franchise": "The Venture Bros.",
+    "category": "tvuniverses",
+    "description": "All seven seasons of Jackson Publick & Doc Hammer's animated superhero satire, capped off by the 2023 feature film conclusion Radiant Is the Blood of the Baboon Heart.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Venture Bros.",
+        "tmdbId": 1539,
+        "imdbId": "tt0417373",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "The Venture Bros. (Seasons 1-7)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0417373/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Venture Bros.: Radiant Is the Blood of the Baboon Heart",
+        "year": 2023,
+        "tmdbId": 1134444,
+        "imdbId": "tt14642238",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14642238/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_metalocalypse_army_of_doomstar",
+    "name": "Metalocalypse: Complete Series & Army of the Doomstar",
+    "franchise": "Metalocalypse",
+    "category": "tvuniverses",
+    "description": "Dethklok's death metal saga across all four Adult Swim seasons and The Doomstar Requiem, culminating in the 2023 finale movie Army of the Doomstar.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Metalocalypse",
+        "tmdbId": 2868,
+        "imdbId": "tt0839188",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Metalocalypse (Seasons 1-4)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0839188/img"
+      },
+      {
+        "type": "movie",
+        "title": "Metalocalypse: Army of the Doomstar",
+        "year": 2023,
+        "tmdbId": 1114972,
+        "imdbId": "tt14642270",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14642270/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_simpsons_canon_and_film",
+    "name": "The Simpsons & The Simpsons Movie",
+    "franchise": "The Simpsons",
+    "category": "tvuniverses",
+    "description": "Matt Groening's legendary animated family in Springfield, including the 2007 blockbuster theatrical film.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Simpsons",
+        "tmdbId": 456,
+        "imdbId": "tt0096697",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18
+        ],
+        "title": "The Simpsons (Seasons 1-18)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0096697/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Simpsons Movie",
+        "year": 2007,
+        "tmdbId": 35,
+        "imdbId": "tt0462538",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0462538/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Simpsons",
+        "tmdbId": 456,
+        "imdbId": "tt0096697",
+        "seasons": [
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36
+        ],
+        "title": "The Simpsons (Seasons 19+)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0096697/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_south_park_bigger_longer_uncut",
+    "name": "South Park & Bigger, Longer & Uncut",
+    "franchise": "South Park",
+    "category": "tvuniverses",
+    "description": "Trey Parker and Matt Stone's animated satire in chronological release order, with the Oscar-nominated 1999 feature film.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "South Park",
+        "tmdbId": 2190,
+        "imdbId": "tt0121955",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "South Park (Seasons 1-3)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0121955/img"
+      },
+      {
+        "type": "movie",
+        "title": "South Park: Bigger, Longer & Uncut",
+        "year": 1999,
+        "tmdbId": 9473,
+        "imdbId": "tt0158983",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0158983/img"
+      },
+      {
+        "type": "show",
+        "showName": "South Park",
+        "tmdbId": 2190,
+        "imdbId": "tt0121955",
+        "seasons": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ],
+        "title": "South Park (Seasons 4+)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0121955/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_bobs_burgers_movie_saga",
+    "name": "Bob's Burgers & The Bob's Burgers Movie",
+    "franchise": "Bob's Burgers",
+    "category": "tvuniverses",
+    "description": "The Belcher family's seaside hamburger adventures across Seasons 1-12, followed by the 2022 musical mystery feature film and ongoing series.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Bob's Burgers",
+        "tmdbId": 32726,
+        "imdbId": "tt1561755",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "title": "Bob's Burgers (Seasons 1-12)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1561755/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Bob's Burgers Movie",
+        "year": 2022,
+        "tmdbId": 504827,
+        "imdbId": "tt7466442",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt7466442/img"
+      },
+      {
+        "type": "show",
+        "showName": "Bob's Burgers",
+        "tmdbId": 32726,
+        "imdbId": "tt1561755",
+        "seasons": [
+          13,
+          14,
+          15
+        ],
+        "title": "Bob's Burgers (Seasons 13+)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1561755/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_batman_tas_mask_of_phantasm",
+    "name": "Batman: The Animated Series & Mask of the Phantasm",
+    "franchise": "DC Animated Universe",
+    "category": "tvuniverses",
+    "description": "Bruce Timm and Paul Dini's definitive Batman adaptation, anchored by the critically acclaimed 1993 theatrical masterpiece Mask of the Phantasm.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Batman: Mask of the Phantasm",
+        "year": 1993,
+        "tmdbId": 14919,
+        "imdbId": "tt0106364",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0106364/img"
+      },
+      {
+        "type": "show",
+        "showName": "Batman: The Animated Series",
+        "tmdbId": 2098,
+        "imdbId": "tt0103359",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Batman: The Animated Series (Seasons 1-4)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0103359/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_steven_universe_complete_chronology",
+    "name": "Steven Universe: Complete Storyline Order",
+    "franchise": "Steven Universe",
+    "category": "tvuniverses",
+    "description": "Rebecca Sugar's coming-of-age gem saga: Seasons 1-5, followed by the essential canon bridge Steven Universe: The Movie, concluding with the epilogue series Steven Universe Future.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Steven Universe",
+        "tmdbId": 49737,
+        "imdbId": "tt3061046",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "title": "Steven Universe (Seasons 1-5)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt3061046/img"
+      },
+      {
+        "type": "movie",
+        "title": "Steven Universe: The Movie",
+        "year": 2019,
+        "tmdbId": 537061,
+        "imdbId": "tt8714088",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt8714088/img"
+      },
+      {
+        "type": "show",
+        "showName": "Steven Universe Future",
+        "tmdbId": 94553,
+        "imdbId": "tt11075702",
+        "seasons": [
+          1
+        ],
+        "title": "Steven Universe Future",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt11075702/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_tangled_rapunzel_chronology",
+    "name": "Tangled: Complete Corona Chronology",
+    "franchise": "Disney Tangled",
+    "category": "tvuniverses",
+    "description": "Disney's Tangled franchise: the original 2010 film, the mandatory 2017 pilot movie Tangled: Before Ever After (explaining her 70ft golden hair regrowing), and all three seasons of Rapunzel's Tangled Adventure.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Tangled",
+        "year": 2010,
+        "tmdbId": 38757,
+        "imdbId": "tt0398286",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0398286/img"
+      },
+      {
+        "type": "movie",
+        "title": "Tangled: Before Ever After",
+        "year": 2017,
+        "tmdbId": 437543,
+        "imdbId": "tt6593452",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt6593452/img"
+      },
+      {
+        "type": "show",
+        "showName": "Rapunzel's Tangled Adventure",
+        "tmdbId": 70289,
+        "imdbId": "tt4759904",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "Rapunzel's Tangled Adventure (Seasons 1-3)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt4759904/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_lilo_and_stitch_complete_timeline",
+    "name": "Lilo & Stitch: Complete Canon Timeline",
+    "franchise": "Lilo & Stitch",
+    "category": "tvuniverses",
+    "description": "The complete Hawaiian sci-fi saga: the original 2002 film, Stitch! The Movie (introducing Jumba's 625 experiment pods), the TV series, and the finale film Leroy & Stitch.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Lilo & Stitch",
+        "year": 2002,
+        "tmdbId": 11544,
+        "imdbId": "tt0275847",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0275847/img"
+      },
+      {
+        "type": "movie",
+        "title": "Stitch! The Movie",
+        "year": 2003,
+        "tmdbId": 11549,
+        "imdbId": "tt0371999",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0371999/img"
+      },
+      {
+        "type": "show",
+        "showName": "Lilo & Stitch: The Series",
+        "tmdbId": 3057,
+        "imdbId": "tt0364841",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "Lilo & Stitch: The Series (Seasons 1-2)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0364841/img"
+      },
+      {
+        "type": "movie",
+        "title": "Leroy & Stitch",
+        "year": 2006,
+        "tmdbId": 11551,
+        "imdbId": "tt0810922",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0810922/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_jimmy_neutron_boy_genius",
+    "name": "Jimmy Neutron: Boy Genius (Movie & Series)",
+    "franchise": "Jimmy Neutron",
+    "category": "tvuniverses",
+    "description": "The Oscar-nominated 2001 theatrical feature film that launched the franchise, followed by all three seasons of The Adventures of Jimmy Neutron, Boy Genius.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Jimmy Neutron: Boy Genius",
+        "year": 2001,
+        "tmdbId": 12589,
+        "imdbId": "tt0268397",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0268397/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Adventures of Jimmy Neutron, Boy Genius",
+        "tmdbId": 2210,
+        "imdbId": "tt0320808",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "The Adventures of Jimmy Neutron (Seasons 1-3)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0320808/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_rugrats_complete_movie_chronology",
+    "name": "Rugrats: Complete Series & Film Trilogy",
+    "franchise": "Rugrats",
+    "category": "tvuniverses",
+    "description": "The complete classic Rugrats timeline in story order: Seasons 1-5, The Rugrats Movie (where Dil is born), Seasons 6-7, Rugrats in Paris, Seasons 8-9, and the Rugrats Go Wild crossover movie.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Rugrats",
+        "tmdbId": 2403,
+        "imdbId": "tt0101188",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "title": "Rugrats (Seasons 1-5)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0101188/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Rugrats Movie",
+        "year": 1998,
+        "tmdbId": 14444,
+        "imdbId": "tt0134067",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0134067/img"
+      },
+      {
+        "type": "show",
+        "showName": "Rugrats",
+        "tmdbId": 2403,
+        "imdbId": "tt0101188",
+        "seasons": [
+          6,
+          7
+        ],
+        "title": "Rugrats (Seasons 6-7)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0101188/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rugrats in Paris: The Movie",
+        "year": 2000,
+        "tmdbId": 14445,
+        "imdbId": "tt0213203",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0213203/img"
+      },
+      {
+        "type": "show",
+        "showName": "Rugrats",
+        "tmdbId": 2403,
+        "imdbId": "tt0101188",
+        "seasons": [
+          8,
+          9
+        ],
+        "title": "Rugrats (Seasons 8-9)",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt0101188/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rugrats Go Wild",
+        "year": 2003,
+        "tmdbId": 15165,
+        "imdbId": "tt0337711",
+        "part": 6,
+        "poster": "https://images.metahub.space/poster/medium/tt0337711/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_beavis_and_butt_head_saga",
+    "name": "Beavis and Butt-Head: Complete Series & Movies",
+    "franchise": "Beavis and Butt-Head",
+    "category": "tvuniverses",
+    "description": "Mike Judge's slacker duo across the classic MTV series, the 1996 theatrical hit Do America, the 2022 sci-fi sequel Do the Universe, and the Paramount+ revival series.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Beavis and Butt-Head",
+        "tmdbId": 214,
+        "imdbId": "tt0105950",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "Beavis and Butt-Head (Original Series)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0105950/img"
+      },
+      {
+        "type": "movie",
+        "title": "Beavis and Butt-Head Do America",
+        "year": 1996,
+        "tmdbId": 9989,
+        "imdbId": "tt0115641",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0115641/img"
+      },
+      {
+        "type": "movie",
+        "title": "Beavis and Butt-Head Do the Universe",
+        "year": 2022,
+        "tmdbId": 926899,
+        "imdbId": "tt14115598",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt14115598/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_buzz_lightyear_star_command",
+    "name": "Buzz Lightyear of Star Command: Pilot & Series",
+    "franchise": "Toy Story Universe",
+    "category": "tvuniverses",
+    "description": "The mandatory pilot movie The Adventure Begins starring Tim Allen introducing Star Command and Emperor Zurg, followed by the animated television series.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Buzz Lightyear of Star Command: The Adventure Begins",
+        "year": 2000,
+        "tmdbId": 18501,
+        "imdbId": "tt0260779",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0260779/img"
+      },
+      {
+        "type": "show",
+        "showName": "Buzz Lightyear of Star Command",
+        "tmdbId": 2238,
+        "imdbId": "tt0260602",
+        "seasons": [
+          1
+        ],
+        "title": "Buzz Lightyear of Star Command",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0260602/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_scandal_htgawm_2018",
+    "name": "Scandal & How to Get Away with Murder Crossover (2018)",
+    "franchise": "Shondaland TGIT Universe",
+    "category": "tvuniverses",
+    "description": "Olivia Pope and Annalise Keating join forces to bring a historic class-action fast-track civil rights appeal before the United States Supreme Court.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Scandal",
+        "season": 7,
+        "episode": 12,
+        "title": "Allow Me to Reintroduce Myself",
+        "tmdbId": 39269,
+        "imdbId": "tt7853118",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1837576/img"
+      },
+      {
+        "type": "episode",
+        "showName": "How to Get Away with Murder",
+        "season": 4,
+        "episode": 13,
+        "title": "Lahey v. Commonwealth of Pennsylvania",
+        "tmdbId": 61056,
+        "imdbId": "tt7853036",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt3205802/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_simpsons_family_guy_2014",
+    "name": "The Simpsons & Family Guy: The Simpsons Guy (2014)",
+    "franchise": "Animation Domination",
+    "category": "tvuniverses",
+    "description": "The Griffins are stranded in Springfield and take refuge with Homer and Marge before Peter and Homer engage in a town-wrecking brawl over Duff vs. Pawtucket Patriot Ale.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Simpsons",
+        "title": "The Simpsons",
+        "tmdbId": 456,
+        "imdbId": "tt0096697",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0096697/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Family Guy",
+        "season": 13,
+        "episode": 1,
+        "title": "The Simpsons Guy",
+        "tmdbId": 1434,
+        "imdbId": "tt3061036",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0182576/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_supernatural_scoobydoo_2018",
+    "name": "Supernatural & Scooby-Doo: Scoobynatural (2018)",
+    "franchise": "Supernatural",
+    "category": "tvuniverses",
+    "description": "Sam, Dean, and Castiel are sucked into a haunted television set, finding themselves animated inside the classic 1969 Scooby-Doo episode A Night of Fright Is No Delight.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Scooby-Doo, Where Are You!",
+        "season": 1,
+        "episode": 16,
+        "title": "A Night of Fright Is No Delight",
+        "tmdbId": 2054,
+        "imdbId": "tt0695420",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0063950/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Supernatural",
+        "season": 13,
+        "episode": 16,
+        "title": "Scoobynatural",
+        "tmdbId": 1622,
+        "imdbId": "tt6877202",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0460681/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_xfiles_cops_2000",
+    "name": "The X-Files & Cops: X-Cops (2000)",
+    "franchise": "The X-Files",
+    "category": "tvuniverses",
+    "description": "Shot live on video by a Fox COPS camera crew, Mulder and Scully investigate a shape-shifting entity feeding on fear in Willow Park, Los Angeles.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Cops",
+        "title": "Cops",
+        "tmdbId": 2270,
+        "imdbId": "tt0096563",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0096563/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The X-Files",
+        "season": 7,
+        "episode": 12,
+        "title": "X-Cops",
+        "tmdbId": 4087,
+        "imdbId": "tt0751259",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0106179/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_suite_life_hannah_montana_2006",
+    "name": "That's So Suite Life of Hannah Montana (2006)",
+    "franchise": "Disney Channel Universe",
+    "category": "tvuniverses",
+    "description": "The 3-part Disney Channel crossover: Raven Baxter stays at the Tipton Hotel in Boston, crossing paths with Zack, Cody, and visiting pop superstar Hannah Montana.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "That's So Raven",
+        "season": 4,
+        "episode": 11,
+        "title": "Checkin' Out",
+        "tmdbId": 2214,
+        "imdbId": "tt0836585",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0341932/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The Suite Life of Zack & Cody",
+        "season": 2,
+        "episode": 20,
+        "title": "That's So Suite Life of Hannah Montana",
+        "tmdbId": 2208,
+        "imdbId": "tt0836584",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0426371/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Hannah Montana",
+        "season": 1,
+        "episode": 12,
+        "title": "On the Road Again?",
+        "tmdbId": 4263,
+        "imdbId": "tt0836583",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0493093/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_wizards_on_deck_hannah_montana_2009",
+    "name": "Wizards on Deck with Hannah Montana (2009)",
+    "franchise": "Disney Channel Universe",
+    "category": "tvuniverses",
+    "description": "The Russo family wins an ocean cruise on the SS Tipton where Alex, Justin, and Max encounter London, Zack, and Cody before Hannah Montana boards for a concert in Hawaii.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Wizards of Waverly Place",
+        "season": 2,
+        "episode": 25,
+        "title": "Cast-Away (To Another Show)",
+        "tmdbId": 2251,
+        "imdbId": "tt1423851",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0799922/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The Suite Life on Deck",
+        "season": 1,
+        "episode": 21,
+        "title": "Double-Crossed",
+        "tmdbId": 14120,
+        "imdbId": "tt1423850",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1230232/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Hannah Montana",
+        "season": 3,
+        "episode": 19,
+        "title": "Super(stitious) Girl",
+        "tmdbId": 4263,
+        "imdbId": "tt1423849",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0493093/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_jimmy_timmy_power_hour_trilogy",
+    "name": "The Jimmy Timmy Power Hour Trilogy (2004–2006)",
+    "franchise": "Nickelodeon Universe",
+    "category": "tvuniverses",
+    "description": "Jimmy Neutron's 3D CGI Retroville and Timmy Turner's 2D animated Dimmsdale collide when dimensional travel swaps the boys and unites Cosmo and Wanda with Goddard.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Jimmy Timmy Power Hour",
+        "year": 2004,
+        "tmdbId": 32788,
+        "imdbId": "tt0411545",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0411545/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Jimmy Timmy Power Hour 2: When Nerds Collide!",
+        "year": 2006,
+        "tmdbId": 37328,
+        "imdbId": "tt0811002",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0811002/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Jimmy Timmy Power Hour 3: The Jerkinators!",
+        "year": 2006,
+        "tmdbId": 37329,
+        "imdbId": "tt0846014",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0846014/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_icarly_victorious_iparty_2011",
+    "name": "iCarly & Victorious: iParty with Victorious (2011)",
+    "franchise": "Schneiderverse",
+    "category": "tvuniverses",
+    "description": "Carly and her Seattle web-show friends crash a party at Kenan Thompson's Hollywood house, teaming up with Tori Vega and Hollywood Arts students to bust a two-timing boyfriend.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "iCarly",
+        "season": 4,
+        "episode": 11,
+        "title": "iParty with Victorious: Part 1",
+        "tmdbId": 3624,
+        "imdbId": "tt1828114",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0972534/img"
+      },
+      {
+        "type": "episode",
+        "showName": "iCarly",
+        "season": 4,
+        "episode": 12,
+        "title": "iParty with Victorious: Part 2",
+        "tmdbId": 3624,
+        "imdbId": "tt1970228",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0972534/img"
+      },
+      {
+        "type": "episode",
+        "showName": "iCarly",
+        "season": 4,
+        "episode": 13,
+        "title": "iParty with Victorious: Part 3",
+        "tmdbId": 3624,
+        "imdbId": "tt1970229",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0972534/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_ben10_generator_rex_2011",
+    "name": "Ben 10 & Generator Rex: Heroes United (2011)",
+    "franchise": "Man of Action Universe",
+    "category": "tvuniverses",
+    "description": "Ben Tennyson is flung through a spatial rift into Generator Rex's nanite-infested dimension, joining forces with Rex Salazar against the devastating nanite entity Alpha.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Ben 10: Ultimate Alien",
+        "title": "Ben 10: Ultimate Alien",
+        "tmdbId": 32675,
+        "imdbId": "tt1627993",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1627993/img"
+      },
+      {
+        "type": "show",
+        "showName": "Generator Rex",
+        "title": "Generator Rex",
+        "tmdbId": 32904,
+        "imdbId": "tt1607567",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1607567/img"
+      },
+      {
+        "type": "movie",
+        "title": "Ben 10 / Generator Rex: Heroes United",
+        "year": 2011,
+        "tmdbId": 82772,
+        "imdbId": "tt2113645",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2113645/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_grim_adventures_knd_2007",
+    "name": "The Grim Adventures of the KND (2007)",
+    "franchise": "Cartoon Network Universe",
+    "category": "tvuniverses",
+    "description": "Billy wears his dad's cursed pants and accidentally fuses with the Delightful Children From Down the Lane, forcing Sector V and Mandy into a dimensional showdown with the Grim Reaper.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Grim Adventures of Billy & Mandy",
+        "title": "The Grim Adventures of Billy & Mandy",
+        "tmdbId": 2503,
+        "imdbId": "tt0292802",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0292802/img"
+      },
+      {
+        "type": "show",
+        "showName": "Codename: Kids Next Door",
+        "title": "Codename: Kids Next Door",
+        "tmdbId": 2420,
+        "imdbId": "tt0312109",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0312109/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Grim Adventures of the KND",
+        "year": 2007,
+        "tmdbId": 44976,
+        "imdbId": "tt1143139",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1143139/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_dragon_ball_super_canon_films",
+    "name": "Dragon Ball Super: Canon Continuation Films",
+    "franchise": "Dragon Ball",
+    "category": "tvuniverses",
+    "description": "The official canon storyline of Dragon Ball Super: the 131-episode anime series, followed by Akira Toriyama's blockbuster films DBS: Broly and DBS: Super Hero.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Dragon Ball Super",
+        "tmdbId": 62715,
+        "imdbId": "tt4644488",
+        "seasons": [
+          1
+        ],
+        "title": "Dragon Ball Super",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt4644488/img"
+      },
+      {
+        "type": "movie",
+        "title": "Dragon Ball Super: Broly",
+        "year": 2018,
+        "tmdbId": 503314,
+        "imdbId": "tt7961060",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt7961060/img"
+      },
+      {
+        "type": "movie",
+        "title": "Dragon Ball Super: Super Hero",
+        "year": 2022,
+        "tmdbId": 610150,
+        "imdbId": "tt14614892",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt14614892/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_made_in_abyss_dawn_deep_soul",
+    "name": "Made in Abyss: Complete Canon Chronology",
+    "franchise": "Made in Abyss",
+    "category": "tvuniverses",
+    "description": "Dawn of the Deep Soul (2020) is the essential canon bridge between Season 1 and Season 2: Riko, Reg, and Nanachi descend into the Fifth Layer to confront Sovereign of Dawn Bondrewd.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Made in Abyss",
+        "tmdbId": 72636,
+        "imdbId": "tt7222086",
+        "seasons": [
+          1
+        ],
+        "title": "Made in Abyss (Season 1)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt7222086/img"
+      },
+      {
+        "type": "movie",
+        "title": "Made in Abyss: Dawn of the Deep Soul",
+        "year": 2020,
+        "tmdbId": 569094,
+        "imdbId": "tt10609594",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt10609594/img"
+      },
+      {
+        "type": "show",
+        "showName": "Made in Abyss",
+        "tmdbId": 72636,
+        "imdbId": "tt7222086",
+        "seasons": [
+          2
+        ],
+        "title": "Made in Abyss: The Golden City of the Scorching Sun (Season 2)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt7222086/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_konosuba_legend_of_crimson",
+    "name": "KonoSuba: Complete Storyline & Legend of Crimson",
+    "franchise": "KonoSuba",
+    "category": "tvuniverses",
+    "description": "Legend of Crimson (2019) is the essential canon bridge between Seasons 2 and 3, sending Kazuma and party to Megumin's Crimson Demon village to battle Sylvia.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "KonoSuba: God's Blessing on This Wonderful World!",
+        "tmdbId": 65942,
+        "imdbId": "tt5312384",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "KonoSuba (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt5312384/img"
+      },
+      {
+        "type": "movie",
+        "title": "KonoSuba: God's Blessing on this Wonderful World! Legend of Crimson",
+        "year": 2019,
+        "tmdbId": 546554,
+        "imdbId": "tt8600494",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt8600494/img"
+      },
+      {
+        "type": "show",
+        "showName": "KonoSuba: God's Blessing on This Wonderful World!",
+        "tmdbId": 65942,
+        "imdbId": "tt5312384",
+        "seasons": [
+          3
+        ],
+        "title": "KonoSuba (Season 3)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt5312384/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_sao_ordinal_scale_canon",
+    "name": "Sword Art Online: Complete Chronology & Ordinal Scale",
+    "franchise": "Sword Art Online",
+    "category": "tvuniverses",
+    "description": "Ordinal Scale (2017) is the canon feature film set between Season 2 and Season 3 (Alicization), introducing the Augma augmented-reality device and the AI Yuna.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Sword Art Online",
+        "tmdbId": 45782,
+        "imdbId": "tt2250192",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "Sword Art Online (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2250192/img"
+      },
+      {
+        "type": "movie",
+        "title": "Sword Art Online: Ordinal Scale",
+        "year": 2017,
+        "tmdbId": 417870,
+        "imdbId": "tt5540962",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt5540962/img"
+      },
+      {
+        "type": "show",
+        "showName": "Sword Art Online",
+        "tmdbId": 45782,
+        "imdbId": "tt2250192",
+        "seasons": [
+          3
+        ],
+        "title": "Sword Art Online: Alicization (Season 3)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2250192/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_rascal_does_not_dream_chronology",
+    "name": "Rascal Does Not Dream: Complete Canon Timeline",
+    "franchise": "Rascal Does Not Dream",
+    "category": "tvuniverses",
+    "description": "Hajime Kamoshida's Puberty Syndrome romance in canon order: Bunny Girl Senpai (Season 1), Dreaming Girl (2019), Sister Venturing Out (2023), and Knapsack Kid (2023).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Rascal Does Not Dream of Bunny Girl Senpai",
+        "tmdbId": 82700,
+        "imdbId": "tt8993202",
+        "seasons": [
+          1
+        ],
+        "title": "Rascal Does Not Dream of Bunny Girl Senpai (Season 1)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt8993202/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rascal Does Not Dream of a Dreaming Girl",
+        "year": 2019,
+        "tmdbId": 572164,
+        "imdbId": "tt9811444",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt9811444/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rascal Does Not Dream of a Sister Venturing Out",
+        "year": 2023,
+        "tmdbId": 1058694,
+        "imdbId": "tt24151752",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt24151752/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rascal Does Not Dream of a Knapsack Kid",
+        "year": 2023,
+        "tmdbId": 1142996,
+        "imdbId": "tt28083818",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt28083818/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_steins_gate_complete_timeline",
+    "name": "Steins;Gate: Complete Chronology & Deja Vu",
+    "franchise": "Science Adventure",
+    "category": "tvuniverses",
+    "description": "Rintaro Okabe's world-line travels: the original 2011 anime series, the canon epilogue film Load Region of Déjà Vu, and the alternate dark worldline series Steins;Gate 0.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Steins;Gate",
+        "tmdbId": 39483,
+        "imdbId": "tt1910272",
+        "seasons": [
+          1
+        ],
+        "title": "Steins;Gate",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1910272/img"
+      },
+      {
+        "type": "movie",
+        "title": "Steins;Gate: The Movie − Load Region of Déjà Vu",
+        "year": 2013,
+        "tmdbId": 198539,
+        "imdbId": "tt2380549",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2380549/img"
+      },
+      {
+        "type": "show",
+        "showName": "Steins;Gate 0",
+        "tmdbId": 77696,
+        "imdbId": "tt4955642",
+        "seasons": [
+          1
+        ],
+        "title": "Steins;Gate 0",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt4955642/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_haruhi_suzumiya_disappearance",
+    "name": "The Melancholy & Disappearance of Haruhi Suzumiya",
+    "franchise": "Haruhi Suzumiya",
+    "category": "tvuniverses",
+    "description": "Kyoto Animation's beloved supernatural slice-of-life: both seasons of the SOS Brigade followed by the celebrated 2-hour 42-minute theatrical masterpiece The Disappearance of Haruhi Suzumiya.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Melancholy of Haruhi Suzumiya",
+        "tmdbId": 46440,
+        "imdbId": "tt0816247",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "The Melancholy of Haruhi Suzumiya",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0816247/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Disappearance of Haruhi Suzumiya",
+        "year": 2010,
+        "tmdbId": 38411,
+        "imdbId": "tt1572306",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1572306/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_haikyu_dumpster_battle",
+    "name": "Haikyu!! & The Dumpster Battle",
+    "franchise": "Haikyu!!",
+    "category": "tvuniverses",
+    "description": "Karasuno High's volleyball journey across all four seasons, directly continuing into the long-awaited canon showdown film Haikyu!! The Dumpster Battle against Nekoma High.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Haikyu!!",
+        "tmdbId": 60863,
+        "imdbId": "tt3396540",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Haikyu!! (Seasons 1-4)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt3396540/img"
+      },
+      {
+        "type": "movie",
+        "title": "Haikyu!! The Dumpster Battle",
+        "year": 2024,
+        "tmdbId": 1012201,
+        "imdbId": "tt21822882",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt21822882/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_quintuplets_complete_finale",
+    "name": "The Quintessential Quintuplets: Complete Saga & Film",
+    "franchise": "The Quintessential Quintuplets",
+    "category": "tvuniverses",
+    "description": "Futaro Uesugi tutoring the five Nakano sisters across Seasons 1-2, concluded in the 2022 canon theatrical finale film revealing his bride.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Quintessential Quintuplets",
+        "tmdbId": 85349,
+        "imdbId": "tt9428790",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "The Quintessential Quintuplets (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt9428790/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Quintessential Quintuplets Movie",
+        "year": 2022,
+        "tmdbId": 828613,
+        "imdbId": "tt14332468",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14332468/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_cowboy_bebop_knockin_on_heavens_door",
+    "name": "Cowboy Bebop & Knockin' on Heaven's Door",
+    "franchise": "Cowboy Bebop",
+    "category": "tvuniverses",
+    "description": "Shinichiro Watanabe's legendary jazz-space-western series, featuring the 2001 canon interquel film Knockin' on Heaven's Door set before the two-part finale.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Cowboy Bebop",
+        "tmdbId": 30991,
+        "imdbId": "tt0213338",
+        "seasons": [
+          1
+        ],
+        "title": "Cowboy Bebop (Episodes 1-22)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0213338/img"
+      },
+      {
+        "type": "movie",
+        "title": "Cowboy Bebop: Knockin' on Heaven's Door",
+        "year": 2001,
+        "tmdbId": 11299,
+        "imdbId": "tt0275277",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0275277/img"
+      },
+      {
+        "type": "show",
+        "showName": "Cowboy Bebop",
+        "tmdbId": 30991,
+        "imdbId": "tt0213338",
+        "seasons": [
+          1
+        ],
+        "title": "Cowboy Bebop (Episodes 23-26)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0213338/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_fullmetal_alchemist_2003_shamballa",
+    "name": "Fullmetal Alchemist (2003) & Conqueror of Shamballa",
+    "franchise": "Fullmetal Alchemist",
+    "category": "tvuniverses",
+    "description": "The original 2003 Fullmetal Alchemist anime series, concluded directly by the 2005 theatrical feature film Conqueror of Shamballa.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Fullmetal Alchemist",
+        "tmdbId": 31911,
+        "imdbId": "tt0421357",
+        "seasons": [
+          1
+        ],
+        "title": "Fullmetal Alchemist (2003)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0421357/img"
+      },
+      {
+        "type": "movie",
+        "title": "Fullmetal Alchemist the Movie: Conqueror of Shamballa",
+        "year": 2005,
+        "tmdbId": 20914,
+        "imdbId": "tt0456434",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0456434/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_gintama_very_final",
+    "name": "Gintama: Complete Saga & The Very Final",
+    "franchise": "Gintama",
+    "category": "tvuniverses",
+    "description": "Gintoki Sakata and the Odd Jobs crew across 367 episodes of sci-fi samurai comedy, concluding in the definitive 2021 feature film Gintama: The Very Final.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Gintama",
+        "tmdbId": 57243,
+        "imdbId": "tt0988818",
+        "seasons": [
+          1
+        ],
+        "title": "Gintama (Complete Series)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0988818/img"
+      },
+      {
+        "type": "movie",
+        "title": "Gintama: The Very Final",
+        "year": 2021,
+        "tmdbId": 635302,
+        "imdbId": "tt11488582",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt11488582/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_no_game_no_life_zero",
+    "name": "No Game No Life & No Game No Life: Zero",
+    "franchise": "No Game No Life",
+    "category": "tvuniverses",
+    "description": "The Disboard gaming universe: the 2017 theatrical prequel film Zero depicting the Great War 6,000 years prior, followed by the TV series with Sora and Shiro.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "No Game No Life: Zero",
+        "year": 2017,
+        "tmdbId": 441130,
+        "imdbId": "tt6677944",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt6677944/img"
+      },
+      {
+        "type": "show",
+        "showName": "No Game No Life",
+        "tmdbId": 61491,
+        "imdbId": "tt3645068",
+        "seasons": [
+          1
+        ],
+        "title": "No Game No Life",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt3645068/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_isekai_quartet_universe",
+    "name": "Isekai Quartet: Multiverse Crossover & Movie",
+    "franchise": "Kadokawa Isekai Multiverse",
+    "category": "tvuniverses",
+    "description": "Characters from KonoSuba, Overlord, Re:Zero, and The Saga of Tanya the Evil are transported via red button to a chibi high-school world across Seasons 1-2 and the 2022 movie.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Isekai Quartet",
+        "tmdbId": 87910,
+        "imdbId": "tt9173000",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "Isekai Quartet (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt9173000/img"
+      },
+      {
+        "type": "movie",
+        "title": "Isekai Quartet: The Movie - Another World",
+        "year": 2022,
+        "tmdbId": 849202,
+        "imdbId": "tt14991478",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14991478/img"
+      }
+    ]
   }
 ];
+if (typeof window !== 'undefined') window.TV_CROSSOVER_EVENTS = TV_CROSSOVER_EVENTS;
 
 function isCrossoverEpisodeMatch(item, epTarget) {
   if (!item || !epTarget) return false;
@@ -5451,7 +7789,7 @@ let activeStorylineCategory = 'all';
 
 function getStorylineCategories(event) {
   const cats = ['all'];
-  const franchise = String(event.franchise || '').toLowerCase();
+  const franchise = String(event.franchise || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const cat = String(event.category || '').toLowerCase();
 
   if (cat === 'moviesagas' || event.episodes.every((e) => e.type === 'movie')) {
@@ -5461,27 +7799,41 @@ function getStorylineCategories(event) {
     cats.push('tvuniverses');
   }
   if (
-    franchise.includes('star wars') || franchise.includes('marvel') || franchise.includes('lord of the rings') ||
-    franchise.includes('matrix') || franchise.includes('star trek') || franchise.includes('x-files') ||
-    franchise.includes('alien') || franchise.includes('planet of the apes') || franchise.includes('jurassic') ||
-    franchise.includes('firefly') || franchise.includes('transformers') || franchise.includes('homestead')
+    franchise.includes('starwars') || franchise.includes('marvel') || franchise.includes('lordoftherings') ||
+    franchise.includes('matrix') || franchise.includes('startrek') || franchise.includes('xfiles') ||
+    franchise.includes('alien') || franchise.includes('planetoftheapes') || franchise.includes('jurassic') ||
+    franchise.includes('firefly') || franchise.includes('transformers') || franchise.includes('homestead') ||
+    franchise.includes('battlestar') || franchise.includes('farscape') || franchise.includes('dcuniverse') ||
+    franchise.includes('manofaction') || franchise.includes('powerrangers')
   ) {
     cats.push('scifi');
   }
   if (
-    franchise.includes('fast & furious') || franchise.includes('batman') || franchise.includes('mission: impossible') ||
-    franchise.includes('james bond') || franchise.includes('john wick') || franchise.includes('hunger games') ||
-    franchise.includes('indiana jones') || franchise.includes('mad max') || franchise.includes('pirates') ||
-    franchise.includes('breaking bad') || franchise.includes('24') || franchise.includes('arrowverse')
+    franchise.includes('fastfurious') || franchise.includes('batman') || franchise.includes('missionimpossible') ||
+    franchise.includes('jamesbond') || franchise.includes('johnwick') || franchise.includes('hungergames') ||
+    franchise.includes('indianajones') || franchise.includes('madmax') || franchise.includes('pirates') ||
+    franchise.includes('breakingbad') || franchise.includes('24') || franchise.includes('arrowverse') ||
+    franchise.includes('dcuniverse') || franchise.includes('sopranos') || franchise.includes('gomorrah') ||
+    franchise.includes('spartacus') || franchise.includes('luther') || franchise.includes('burnnotice') ||
+    franchise.includes('monk') || franchise.includes('csi') || franchise.includes('veronicamars') ||
+    franchise.includes('shondaland')
   ) {
     cats.push('action');
   }
   if (
-    franchise.includes('toy story') || franchise.includes('shrek') || franchise.includes('demon slayer') ||
-    franchise.includes('jujutsu') || franchise.includes('futurama') || franchise.includes('cowboy bebop') ||
-    franchise.includes('evangelion') || franchise.includes('simpsons') || franchise.includes('bobs') ||
-    franchise.includes('steven') || franchise.includes('hey arnold') || franchise.includes('invader') ||
-    franchise.includes('beavis')
+    franchise.includes('toystory') || franchise.includes('shrek') || franchise.includes('demonslayer') ||
+    franchise.includes('jujutsu') || franchise.includes('futurama') || franchise.includes('cowboybebop') ||
+    franchise.includes('evangelion') || franchise.includes('simpsons') || franchise.includes('bobsburgers') ||
+    franchise.includes('stevenuniverse') || franchise.includes('heyarnold') || franchise.includes('invader') ||
+    franchise.includes('beavis') || franchise.includes('dragonball') || franchise.includes('southpark') ||
+    franchise.includes('konosuba') || franchise.includes('tangled') || franchise.includes('lilo') ||
+    franchise.includes('jimmyneutron') || franchise.includes('rugrats') || franchise.includes('madeinabyss') ||
+    franchise.includes('swordartonline') || franchise.includes('rascaldoesnotdream') ||
+    franchise.includes('steinsgate') || franchise.includes('haruhisuzumiya') || franchise.includes('haikyu') ||
+    franchise.includes('quintuplets') || franchise.includes('fullmetal') || franchise.includes('gintama') ||
+    franchise.includes('nogamenolife') || franchise.includes('metalocalypse') || franchise.includes('venturebros') ||
+    franchise.includes('disney') || franchise.includes('nickelodeon') || franchise.includes('cartoonnetwork') ||
+    franchise.includes('isekai') || franchise.includes('animationdomination') || franchise.includes('dcanimated')
   ) {
     cats.push('animation');
   }
@@ -6182,6 +8534,14 @@ function openChannelDetailsPage(channelIdOrDivId) {
   const map = loadLocalChannels();
   let channel = map[channelIdOrDivId];
   if (!channel) {
+    for (const ch of Object.values(map)) {
+      if (ch && (ch.channelId === channelIdOrDivId || ch.name === channelIdOrDivId)) {
+        channel = ch;
+        break;
+      }
+    }
+  }
+  if (!channel) {
     const div = document.getElementById(channelIdOrDivId);
     if (div) {
       const u = div.querySelector('.url');
@@ -6197,7 +8557,58 @@ function openChannelDetailsPage(channelIdOrDivId) {
       }
     }
   }
+  if (!channel) {
+    const rows = [...document.querySelectorAll('#lists .entry')];
+    for (const row of rows) {
+      if (row.dataset.channelId === channelIdOrDivId) {
+        const u = row.querySelector('.url');
+        if (u) {
+          try {
+            const payload = JSON.parse(u.value.trim().slice('channel:v1:'.length));
+            if (payload) {
+              channel = payload;
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+    }
+  }
+  if (!channel) {
+    const rows = [...document.querySelectorAll('#lists .entry')];
+    for (const row of rows) {
+      const u = row.querySelector('.url');
+      if (u && u.value.includes(channelIdOrDivId)) {
+        const lines = (u.value || '').split('\\n').map((s) => s.trim()).filter(Boolean);
+        for (const line of lines) {
+          if (line.startsWith('channel:v1:')) {
+            try {
+              const payload = JSON.parse(line.slice('channel:v1:'.length));
+              if (payload && (payload.channelId === channelIdOrDivId || payload.name === channelIdOrDivId || u.value.includes(channelIdOrDivId))) {
+                channel = payload;
+                break;
+              }
+            } catch (e) {}
+          }
+        }
+      }
+      if (channel) break;
+    }
+  }
+  if (!channel && typeof channelDraftItems !== 'undefined' && channelDraftItems.length && (typeof editingChannelId !== 'undefined' && editingChannelId === channelIdOrDivId)) {
+    const nameInput = document.getElementById('channelNameInput');
+    channel = {
+      channelId: editingChannelId,
+      name: (nameInput && nameInput.value) || 'TV Channel',
+      items: channelDraftItems,
+    };
+  }
   if (!channel) return;
+
+  if (channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
+    map[channel.channelId] = channel;
+    _memoryChannelsMap = map;
+  }
   
   // A merged channel (see mergeChannelsIntoRow/loadLocalMergedChannels)
   // stores channelIds -- references to the channels that were combined --
@@ -6433,7 +8844,7 @@ function renderMyCreatedChannelsList() {
     return '<div class="list-card" style="margin-bottom:12px;" data-channel-id="' + escapeAttr(ch.channelId) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title">' + escapeHtml(ch.name) + '</div>' +
+          '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' + escapeHtml(ch.name) + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + metaText + '</span>' +
           '</div>' +
@@ -6522,7 +8933,7 @@ document.addEventListener('click', (e) => {
 // channel's overall size well under whatever broke last time, with a
 // comfortable safety margin.
 const CHANNEL_MAX_EPISODES_PER_SHOW = 50;
-const CHANNEL_MAX_TOTAL_ITEMS = 2000;
+const CHANNEL_MAX_TOTAL_ITEMS = 5000;
 // Quick Add Channel (network-id based) stores a bigger pool than what's
 // ever shown and marks the payload for daily rotation (see dailyRotate
 // below and buildChannelMeta server-side) -- the server picks a fresh
@@ -6532,7 +8943,7 @@ const CHANNEL_MAX_TOTAL_ITEMS = 2000;
 // CHANNEL_MAX_TOTAL_ITEMS above stays the safe upper bound (and the only
 // cap that applies to the manual "Add every season" button, which has no
 // pool/rotation concept).
-const CHANNEL_POOL_MAX_ITEMS = 6000;
+const CHANNEL_POOL_MAX_ITEMS = 5000;
 // What a rotating day's lineup actually looks like -- must match
 // CHANNEL_ROTATION_SHOWS_PER_DAY / CHANNEL_ROTATION_EPISODES_PER_SHOW
 // server-side. Used here only for display text (the real selection logic
@@ -6550,38 +8961,29 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
   if (statusBox) statusBox.innerHTML = '<p><small>Adding ' + escapeHtml(name) + '\u2026</small></p>';
   try {
     if (networkId) {
-      const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name));
-      const data = await res.json();
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = originalLabel;
-      }
-      if (data.ok && data.channel) {
-        const channelId = generateChannelId();
-        const payload = Object.assign({}, data.channel, { channelId: channelId, name: name });
-        saveLocalChannel(payload);
-        addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
-        renderMyCreatedChannelsList();
-        renderChannelMergeList();
-        showAddedToast('Channel "' + name + '" added to your Catalogs.');
-        if (statusBox) {
-          statusBox.innerHTML = '<p class="testresult ok" style="margin:4px 0 0;">\u2713 Channel "' + escapeHtml(name) + '" added (' + (payload.items ? payload.items.length : 0) + ' episodes with daily rotation)!</p>';
-          setTimeout(() => {
-            if (statusBox) statusBox.innerHTML = '';
-          }, 4000);
+      try {
+        const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name));
+        const data = await res.json();
+        if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_POOL_MAX_ITEMS) {
+          const channelId = generateChannelId();
+          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name });
+          saveLocalChannel(payload);
+          addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+          renderMyCreatedChannelsList();
+          renderChannelMergeList();
+          showAddedToast('Channel "' + name + '" added to your Catalogs.');
+          if (statusBox) {
+            statusBox.innerHTML = '<p class="testresult ok" style="margin:4px 0 0;">\u2713 Channel "' + escapeHtml(name) + '" added (' + (payload.items ? payload.items.length : 0) + ' episodes with daily rotation)!</p>';
+            setTimeout(() => {
+              if (statusBox) statusBox.innerHTML = '';
+            }, 4000);
+          }
+          return;
         }
-      } else {
-        if (statusBox) statusBox.innerHTML = '';
-        if (typeof showAppAlert === 'function') {
-          showAppAlert('Could Not Add Channel', 'Could not add ' + name + ': ' + (data.error || 'unknown error'));
-        } else {
-          alert('Could not add ' + name + ': ' + (data.error || 'unknown error'));
-        }
-      }
-      return;
+      } catch (e) {}
     }
 
-    let params = 'url=' + encodeURIComponent(listUrl);
+    let params = networkId ? ('networkId=' + encodeURIComponent(networkId)) : ('url=' + encodeURIComponent(listUrl));
     const keys = collectKeys();
     if (keys.mdblistKey) params += '&mdblistKey=' + encodeURIComponent(keys.mdblistKey);
     if (keys.traktKey) params += '&traktKey=' + encodeURIComponent(keys.traktKey);
@@ -6685,6 +9087,12 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
     renderMyCreatedChannelsList();
     renderChannelMergeList();
     showAddedToast('Channel "' + name + '" added to your Catalogs.');
+    if (statusBox) {
+      statusBox.innerHTML = '<p class="testresult ok" style="margin:4px 0 0;">\u2713 Channel "' + escapeHtml(name) + '" added (' + items.length + ' episodes with daily rotation)!</p>';
+      setTimeout(function() {
+        if (statusBox) statusBox.innerHTML = '';
+      }, 4000);
+    }
   } catch (e) {
     if (typeof showAppAlert === 'function') {
       showAppAlert('Network Error', 'Network error while adding ' + name + '.');

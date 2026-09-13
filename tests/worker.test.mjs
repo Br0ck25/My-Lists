@@ -33,7 +33,7 @@ async function adminCookie(env) {
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 function loadSourceFunctions(relFile) {
   const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
-  const sandbox = { console, URL, URLSearchParams };
+  const sandbox = { console, URL, URLSearchParams, atob, btoa, Uint8Array, TextDecoder, TextEncoder };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(src, sandbox, { filename: relFile });
@@ -123,7 +123,7 @@ function loadOneClientFunction(relFile, fnName, extraGlobals = {}) {
 // `extraGlobals` supplies whatever free variables (isCw, formatWatchItemLabel,
 // ...) the surrounding function would normally have closed over.
 function loadInlineItemMapper(relFile, mapOpenSnippet, occurrence, extraGlobals = {}) {
-  const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
+  const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8").replace(/\r\n/g, "\n");
   let searchFrom = 0, mapStart = -1;
   for (let n = 0; n <= occurrence; n++) {
     mapStart = src.indexOf(mapOpenSnippet, searchFrom);
@@ -2817,6 +2817,21 @@ describe("audit fix 4: unauthenticated permanent writes are bounded", () => {
   it("still saves a normal install config", async () => {
     const env = makeEnv();
     const entries = Array.from({ length: 30 }, (_, i) => ({ name: "row " + i, url: "https://mdblist.com/lists/x/y" }));
+    const r = await call(env, "/api/save", { method: "POST", json: { entries } });
+    assert.equal(r.body.ok, true);
+    assert.ok(r.body.id);
+  });
+
+  it("saves large install configs with custom lists over 1MB", async () => {
+    const env = makeEnv();
+    const largeListItems = Array.from({ length: 500 }, (_, i) => ({
+      id: "tt" + (1000000 + i),
+      title: "Movie Title " + i,
+      year: "2020",
+      type: "movie",
+    }));
+    const customUrl = "customlist:v1:" + JSON.stringify({ listSlug: "large-custom", items: largeListItems });
+    const entries = Array.from({ length: 15 }, (_, i) => ({ name: "Custom " + i, url: customUrl, type: "movie" }));
     const r = await call(env, "/api/save", { method: "POST", json: { entries } });
     assert.equal(r.body.ok, true);
     assert.ok(r.body.id);
@@ -7953,6 +7968,31 @@ describe("a Trakt list reports its real size, not its first page's length", () =
     assert.equal(sandbox.isEmptyPayload([]), true);
     assert.equal(sandbox.isEmptyPayload([1]), false);
   });
+
+  it("mapTraktItems resolves season and episode entities to show IMDb or TMDB ID", () => {
+    const sandbox = loadSourceFunctions("06_source-fetchers-mdblist-trakt.js");
+    const rawItems = [
+      { type: "season", season: { number: 2, ids: { trakt: 10 } }, show: { title: "Show One", year: 2023, ids: { imdb: "tt1000", tmdb: 500 } } },
+      { type: "episode", episode: { season: 1, number: 5, ids: { trakt: 20 } }, show: { title: "Show Two", year: 2024, ids: { tmdb: 600 } } },
+      { type: "show", show: { title: "Show Three", year: 2025, ids: { imdb: "tt3000" } } },
+    ];
+    const mapped = sandbox.mapTraktItems(rawItems, "series");
+    assert.equal(mapped.length, 3);
+    assert.equal(mapped[0].id, "tt1000");
+    assert.equal(mapped[0].name, "Show One");
+    assert.equal(mapped[1].id, "tmdb:600");
+    assert.equal(mapped[1].name, "Show Two");
+    assert.equal(mapped[2].id, "tt3000");
+    assert.equal(mapped[2].name, "Show Three");
+  });
+
+  it("mapTmdbItem preserves tmdb:<id> when imdbId is unavailable", () => {
+    const sandbox = loadSourceFunctions("07_source-fetchers-tmdb-simkl.js");
+    const it = { id: 309880, title: "Tunnel Warfare", poster_path: "/img.jpg", release_date: "2020-01-01" };
+    const mapped = sandbox.mapTmdbItem(it, "tmdb:309880", "movie");
+    assert.equal(mapped.id, "tmdb:309880");
+    assert.equal(mapped.name, "Tunnel Warfare");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -8189,9 +8229,9 @@ describe("1.5.3: the admin dashboard reads those counters back out of D1", () =>
 // directly: "Popular Lists and Curated has a refresh button and the others
 // does not."
 describe("Discover: every sub-nav pill gets a header and a Refresh button", () => {
-  const tab = fs.readFileSync(path.join(REPO_ROOT, "11_tab-quick-add.js"), "utf8");
-  const core = fs.readFileSync(path.join(REPO_ROOT, "16_client-row-core.js"), "utf8");
-  const shell = fs.readFileSync(path.join(REPO_ROOT, "09_page-shell.js"), "utf8");
+  const tab = fs.readFileSync(path.join(REPO_ROOT, "11_tab-quick-add.js"), "utf8").replace(/\r\n/g, "\n");
+  const core = fs.readFileSync(path.join(REPO_ROOT, "16_client-row-core.js"), "utf8").replace(/\r\n/g, "\n");
+  const shell = fs.readFileSync(path.join(REPO_ROOT, "09_page-shell.js"), "utf8").replace(/\r\n/g, "\n");
 
   it("gives the shared discoverListsFeed its own header and Refresh button", () => {
     const before = tab.slice(0, tab.indexOf('id="discoverListsFeed"'));
@@ -9159,6 +9199,238 @@ describe("Phase 4: Split sync blobs into relational D1 tables", () => {
     assert.equal(anCat[0].airDate, "2026-12-01");
   });
 
+  it("fetchAutoTrackedCatalog enriches continue-watching with airing_next metadata and Stremio applies badges", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = "badgetestuser";
+
+    // 1. D1 path: insert continue_watching and airing_next with premiere/finale/airDate info
+    db.q(
+      `INSERT INTO continue_watching (username, show_id, item_id, name, show_title, season_num, episode_num, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt999", "tt999:2:1", "Season 2 Premiere", "Badge Show", 2, 1, 9050
+    );
+    db.q(
+      `INSERT INTO airing_next (username, show_id, item_id, name, show_title, season_num, episode_num, air_date, is_season_premiere, is_season_finale, season_finale_air_date, season_finale_episode_number, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt999", "tt999:2:1", "Season 2 Premiere", "Badge Show", 2, 1, "2027-02-15", 1, 0, "2027-05-10", 10, 9100
+    );
+
+    // Direct fetchAutoTrackedCatalog enrichment check
+    const cwCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env);
+    assert.equal(cwCat.length, 1);
+    assert.equal(cwCat[0].id, "tt999");
+    assert.equal(cwCat[0].airDate, "2027-02-15");
+    assert.equal(cwCat[0].isSeasonPremiere, true);
+    assert.equal(cwCat[0].seasonFinaleAirDate, "2027-05-10");
+    assert.equal(cwCat[0].seasonFinaleEpisodeNumber, 10);
+
+    // Stremio catalog request via call() with badging enabled
+    const cfgBadged = "cwbadgecfg1";
+    await kv.put(cfgBadged, JSON.stringify({
+      trackCreatorName: u,
+      entries: [
+        { id: "continue-watching", type: "series", name: "Continue Watching", url: `autotrack:continue-watching:series:${u}` }
+      ],
+      showBadgesStremio: true,
+      showBadgesStremioContinueWatching: true,
+    }));
+
+    const resBadged = await call(env, `/${cfgBadged}/catalog/series/continue-watching.json`);
+    assert.equal(resBadged.status, 200);
+    assert.equal(resBadged.body.metas.length, 1);
+    const posterBadged = resBadged.body.metas[0].poster;
+    assert.ok(posterBadged.includes("/api/poster-badge?"), "Poster must be converted to badge endpoint URL");
+    assert.ok(posterBadged.includes("airDate=2027-02-15"), "Poster badge URL must have upcoming airDate");
+    assert.ok(posterBadged.includes("premiere=1"), "Poster badge URL must include premiere=1");
+    assert.ok(posterBadged.includes("finaleDate=2027-05-10"), "Poster badge URL must include finaleDate");
+
+    // Stremio catalog request with showBadgesStremioContinueWatching disabled
+    const cfgUnbadged = "cwbadgecfg2";
+    await kv.put(cfgUnbadged, JSON.stringify({
+      trackCreatorName: u,
+      entries: [
+        { id: "continue-watching", type: "series", name: "Continue Watching", url: `autotrack:continue-watching:series:${u}` }
+      ],
+      showBadgesStremio: true,
+      showBadgesStremioContinueWatching: false,
+    }));
+
+    const resUnbadged = await call(env, `/${cfgUnbadged}/catalog/series/continue-watching.json`);
+    assert.equal(resUnbadged.status, 200);
+    assert.equal(resUnbadged.body.metas.length, 1);
+    const posterUnbadged = resUnbadged.body.metas[0].poster;
+    assert.ok(!posterUnbadged.includes("/api/poster-badge?"), "Poster must not be badged when toggle is disabled");
+
+    // 2. KV fallback path check
+    const uKv = "kvuserbadge";
+    await kv.put(`creatorsynctracking:${uKv}`, JSON.stringify({
+      continueWatching: [
+        { id: "tt888:1:1", showId: "tt888", showTitle: "KV Show", seasonNum: 1, episodeNum: 1, updatedAt: 9000 }
+      ],
+      airingNext: [
+        { id: "tt888:1:1", showId: "tt888", showTitle: "KV Show", seasonNum: 1, episodeNum: 1, airDate: "2027-03-01", isSeasonPremiere: true, seasonFinaleAirDate: "2027-06-01", seasonFinaleEpisodeNumber: 8, updatedAt: 9000 }
+      ]
+    }));
+
+    const cfgKv = "cwkvcfg1";
+    await kv.put(cfgKv, JSON.stringify({
+      trackCreatorName: uKv,
+      entries: [
+        { id: "continue-watching", type: "series", name: "Continue Watching", url: `autotrack:continue-watching:series:${uKv}` }
+      ],
+      showBadgesStremio: true,
+      showBadgesStremioContinueWatching: true,
+    }));
+
+    const resKv = await call(env, `/${cfgKv}/catalog/series/continue-watching.json`);
+    assert.equal(resKv.status, 200);
+    assert.equal(resKv.body.metas.length, 1);
+    assert.ok(resKv.body.metas[0].poster.includes("/api/poster-badge?"), "KV fallback must also produce badged poster");
+    assert.ok(resKv.body.metas[0].poster.includes("airDate=2027-03-01"), "KV fallback badge URL must include airDate");
+  });
+
+  it("saveCreatorTrackingD1 and readCreatorTrackingD1 faithfully round-trip companion metadata", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const u = "roundtripuser";
+
+    const trackingData = {
+      continueWatching: [
+        {
+          id: "tt9243946",
+          showId: "tt9243946",
+          name: "El Camino: A Breaking Bad Movie",
+          poster: "https://image.tmdb.org/t/p/w500/elcamino.jpg",
+          type: "movie",
+          kind: "movie",
+          isCompanion: true,
+          companionType: "sequel_movie",
+          companionNote: "Sequel Film",
+          companionStoryline: "Breaking Bad Complete Universe",
+          precedingShowId: "tt0903747",
+          updatedAt: 5000,
+        }
+      ],
+      updatedAt: 5000,
+    };
+
+    const saved = await saveCreatorTrackingD1(env, u, trackingData, false);
+    assert.equal(saved, true);
+
+    const rows = db.q("SELECT * FROM continue_watching WHERE username = ?", u);
+    assert.equal(rows.length, 1);
+    assert.ok(rows[0].show_title.startsWith("COMPANION:"), "show_title encodes companion JSON");
+
+    const loaded = await readCreatorTrackingD1(env, u);
+    assert.ok(loaded);
+    assert.equal(loaded.continueWatching.length, 1);
+    const item = loaded.continueWatching[0];
+    assert.equal(item.id, "tt9243946");
+    assert.equal(item.isCompanion, true);
+    assert.equal(item.companionType, "sequel_movie");
+    assert.equal(item.companionNote, "Sequel Film");
+    assert.equal(item.companionStoryline, "Breaking Bad Complete Universe");
+    assert.equal(item.precedingShowId, "tt0903747");
+    assert.equal(item.type, "movie");
+    assert.equal(item.kind, "movie");
+  });
+
+  it("fetchAutoTrackedCatalog filters out fully watched shows, preserves storyline companions, and routes companion movies to movie catalog", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = "companioncwuser";
+
+    // 1. Mark Breaking Bad (tt0903747) as fully watched in D1
+    db.q(
+      `INSERT INTO creator_show_states (username, show_id, is_fully_watched, updated_at)
+       VALUES (?, ?, 1, ?)`,
+      u, "tt0903747", 1000
+    );
+
+    // 2. Insert into continue_watching:
+    // a) Breaking Bad episode (should be filtered out because it is fully watched)
+    db.q(
+      `INSERT INTO continue_watching (username, show_id, item_id, name, show_title, season_num, episode_num, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt0903747", "tt0903747:5:16", "Felina", "Breaking Bad", 5, 16, 2000
+    );
+
+    // b) Storyline sequel companion movie: El Camino (encoded as COMPANION in show_title)
+    const compMeta = JSON.stringify({
+      isCompanion: true,
+      companionType: "sequel_movie",
+      companionNote: "Sequel Film",
+      companionStoryline: "Breaking Bad Complete Universe",
+      precedingShowId: "tt0903747",
+      type: "movie",
+      kind: "movie",
+    });
+    db.q(
+      `INSERT INTO continue_watching (username, show_id, item_id, name, poster, show_title, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt9243946", "tt9243946", "El Camino: A Breaking Bad Movie", "https://image.tmdb.org/t/p/w500/elcamino.jpg", "COMPANION:" + compMeta, 3000
+    );
+
+    // 3. Request Movie catalog for continue-watching:
+    // - Breaking Bad must NOT be in Movie catalog
+    // - El Camino (companion movie) MUST be in Movie catalog
+    const movieCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:movie:${u}` }, env, { origin: "https://example.com" });
+    assert.equal(movieCat.length, 1, "Movie continue-watching must contain only El Camino");
+    assert.equal(movieCat[0].id, "tt9243946");
+    assert.equal(movieCat[0].name, "El Camino: A Breaking Bad Movie");
+    assert.equal(movieCat[0].isCompanion, true);
+    assert.equal(movieCat[0].companionType, "sequel_movie");
+    assert.equal(movieCat[0].precedingShowId, "tt0903747");
+
+    // 4. Request Series catalog for continue-watching:
+    // - Breaking Bad must be excluded (fully watched)
+    // - El Camino must be excluded (it's a movie!)
+    const seriesCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env, { origin: "https://example.com" });
+    assert.equal(seriesCat.length, 0, "Series continue-watching must exclude fully watched shows and companion movies");
+
+    // 5. Stremio call with badged poster:
+    const cfg = "compbadgecfg";
+    await kv.put(cfg, JSON.stringify({
+      trackCreatorName: u,
+      entries: [
+        { id: "continue-watching", type: "movie", name: "Continue Watching", url: `autotrack:continue-watching:movie:${u}` }
+      ],
+      showBadgesStremio: true,
+      showBadgesStremioContinueWatching: true,
+    }));
+
+    const res = await call(env, `/${cfg}/catalog/movie/continue-watching.json`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.metas.length, 1);
+    const poster = res.body.metas[0].poster;
+    assert.ok(poster.includes("/api/poster-badge?"), "Poster must be converted to badge endpoint URL");
+    assert.ok(poster.includes("companion=Sequel+Film"), "Poster badge URL must include companion=Sequel+Film");
+  });
+
+  it("/api/poster-badge renders blue accent badge when companion param is provided", async () => {
+    const env = makeEnv();
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async (url) => {
+        return new Response(new Uint8Array([0xFF, 0xD8, 0xFF, 0xE0]), {
+          status: 200,
+          headers: { "Content-Type": "image/jpeg" },
+        });
+      };
+
+      const res = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://image.tmdb.org/t/p/w500/test.jpg") + "&companion=" + encodeURIComponent("Bridge Movie"));
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-type"), "image/svg+xml; charset=utf-8");
+      assert.ok(res.text.includes("Bridge Movie"), "SVG must include Bridge Movie text");
+      assert.ok(res.text.includes("rgba(37, 99, 235, 0.95)"), "SVG must include design system accent color");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("/admin/api/migrate-d1 backfills tracking and user lists into D1", async () => {
     const kv = makeKv();
     const db = makeD1();
@@ -9240,4 +9512,785 @@ describe("Phase 4: Split sync blobs into relational D1 tables", () => {
     }
   });
 });
+
+describe("Anime Unpacking: restoring multi-season division for compressed anime shows", () => {
+  const tmdbFns = loadSourceFunctions("07_source-fetchers-tmdb-simkl.js");
+
+  it("pickDefaultEpisodeGroupId selects 'Seasons' for MASHLE (TMDB 204832)", () => {
+    const mashleGroups = [
+      { id: "g_air", name: "Air Date", type: 1, group_count: 2, episode_count: 25 },
+      { id: "g_arc", name: "Story Arcs", type: 5, group_count: 3, episode_count: 24 },
+      { id: "65edb5c4e93e950161e0a6b1", name: "Seasons", type: 6, group_count: 3, episode_count: 26 },
+    ];
+    // MASHLE standard: 1 season (24 episodes), 2 specials (total 26 episodes)
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(mashleGroups, 1, 24, 26);
+    assert.equal(picked, "65edb5c4e93e950161e0a6b1");
+  });
+
+  it("pickDefaultEpisodeGroupId selects 'Seasons' for Re:ZERO (TMDB 65930) with specials", () => {
+    const rezeroGroups = [
+      { id: "g_story", name: "Story Arc", type: 5, group_count: 5, episode_count: 66 },
+      { id: "641eb9d6b234b9007ac67063", name: "Seasons", type: 6, group_count: 5, episode_count: 166 },
+    ];
+    // Re:ZERO standard: 1 season (85 episodes), 81 specials (total 166 episodes)
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(rezeroGroups, 1, 85, 166);
+    assert.equal(picked, "641eb9d6b234b9007ac67063");
+  });
+
+  it("pickDefaultEpisodeGroupId rejects volume splits on multi-season shows (e.g. Stranger Things)", () => {
+    const stGroups = [
+      { id: "g_vol", name: "Release Volumes", type: 1, group_count: 8, episode_count: 42 },
+    ];
+    // Standard: 5 seasons, 42 episodes
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(stGroups, 5, 42, 42);
+    assert.equal(picked, null, "volume split on multi-season series must be rejected");
+  });
+
+  it("pickDefaultEpisodeGroupId accepts volume splits on single-season shows", () => {
+    const singleVolGroups = [
+      { id: "g_vol_s1", name: "Release Volumes", type: 1, group_count: 3, episode_count: 24 },
+    ];
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(singleVolGroups, 1, 24, 24);
+    assert.equal(picked, "g_vol_s1");
+  });
+
+  it("pickDefaultEpisodeGroupId rejects editorial recuts and variants", () => {
+    const editGroups = [
+      { id: "g_dir", name: "Director's Cut Parts", group_count: 3, episode_count: 24 },
+      { id: "g_dvd", name: "DVD Ordering", group_count: 3, episode_count: 24 },
+      { id: "g_alt", name: "Alternate Broadcast", group_count: 3, episode_count: 24 },
+    ];
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(editGroups, 1, 24, 24);
+    assert.equal(picked, null);
+  });
+
+  it("pickDefaultEpisodeGroupId rejects groups where group_count matches standardSeasonCount", () => {
+    const groups = [
+      { id: "g_same", name: "Seasons", group_count: 2, episode_count: 24 },
+    ];
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(groups, 2, 24, 24);
+    assert.equal(picked, null);
+  });
+
+  it("unpackEpisodeGroupDetails maps specials to Season 0 and parts to Season 1, Season 2", () => {
+    const groupDetails = {
+      id: "grp_test",
+      groups: [
+        {
+          id: "g0",
+          name: "Specials",
+          order: 0,
+          episodes: [
+            { id: 101, name: "Special 1", order: 0, still_path: "/sp1.jpg", air_date: "2023-01-01" },
+          ],
+        },
+        {
+          id: "g1",
+          name: "Season 1",
+          order: 1,
+          episodes: [
+            { id: 201, name: "Ep 1", order: 0, still_path: "/ep1.jpg", air_date: "2023-04-01" },
+            { id: 202, name: "Ep 2", order: 1, still_path: "/ep2.jpg", air_date: "2023-04-08" },
+          ],
+        },
+        {
+          id: "g2",
+          name: "Season 2",
+          order: 2,
+          episodes: [
+            { id: 301, name: "S2 Ep 1", order: 0, still_path: "/s2ep1.jpg", air_date: "2024-01-06" },
+          ],
+        },
+      ],
+    };
+    const unpacked = tmdbFns.unpackEpisodeGroupDetails(groupDetails);
+    assert.ok(unpacked);
+    assert.equal(unpacked.seasons.length, 2);
+    assert.equal(unpacked.seasons[0].season, 1);
+    assert.equal(unpacked.seasons[0].episodeCount, 2);
+    assert.equal(unpacked.seasons[1].season, 2);
+    assert.equal(unpacked.seasons[1].episodeCount, 1);
+
+    // Verify episode numbering within Season 2 starts at 1
+    assert.equal(unpacked.episodesBySeason[2].length, 1);
+    assert.equal(unpacked.episodesBySeason[2][0].episode_number, 1);
+    assert.equal(unpacked.episodesBySeason[2][0].name, "S2 Ep 1");
+    assert.equal(unpacked.episodesBySeason[2][0].still_path, "https://image.tmdb.org/t/p/w500/s2ep1.jpg");
+  });
+
+  it("/api/show-seasons unpacks a compressed show into multiple seasons", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/204832?") || u.includes("/tv/204832/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 204832,
+          name: "MASHLE: MAGIC AND MUSCLES",
+          external_ids: { imdb_id: "tt21209804" },
+          seasons: [
+            { season_number: 0, name: "Specials", episode_count: 2 },
+            { season_number: 1, name: "Season 1", episode_count: 24 },
+          ],
+          episode_groups: {
+            results: [
+              { id: "g_mashle_grp", name: "Seasons", type: 6, group_count: 3, episode_count: 26 },
+            ],
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/episode_group/g_mashle_grp")) {
+        return new Response(JSON.stringify({
+          id: "g_mashle_grp",
+          groups: [
+            { id: "sp", name: "Specials", order: 0, episodes: [{}, {}] },
+            {
+              id: "s1",
+              name: "Season 1",
+              order: 1,
+              episodes: Array.from({ length: 12 }, (_, i) => ({ id: 100 + i, order: i, name: `Mashle S1E${i + 1}` })),
+            },
+            {
+              id: "s2",
+              name: "Season 2",
+              order: 2,
+              episodes: Array.from({ length: 12 }, (_, i) => ({ id: 200 + i, order: i, name: `Mashle S2E${i + 1}` })),
+            },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-seasons?tmdbId=204832");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.name, "MASHLE: MAGIC AND MUSCLES");
+      assert.equal(data.imdbId, "tt21209804");
+      assert.equal(data.seasons.length, 2, "must be unpacked into 2 seasons");
+      assert.equal(data.seasons[0].season, 1);
+      assert.equal(data.seasons[0].episodeCount, 12);
+      assert.equal(data.seasons[1].season, 2);
+      assert.equal(data.seasons[1].episodeCount, 12);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("/api/show-episodes serves episodes from unpacked season 2", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/204833?") || u.includes("/tv/204833/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 204833,
+          name: "MASHLE: MAGIC AND MUSCLES",
+          external_ids: { imdb_id: "tt21209804" },
+          seasons: [
+            { season_number: 1, name: "Season 1", episode_count: 24 },
+          ],
+          episode_groups: {
+            results: [
+              { id: "g_mashle_grp2", name: "Seasons", type: 6, group_count: 2, episode_count: 24 },
+            ],
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/episode_group/g_mashle_grp2")) {
+        return new Response(JSON.stringify({
+          id: "g_mashle_grp2",
+          groups: [
+            {
+              id: "s1",
+              name: "Season 1",
+              order: 1,
+              episodes: Array.from({ length: 12 }, (_, i) => ({ id: 100 + i, order: i, name: `Mashle S1E${i + 1}` })),
+            },
+            {
+              id: "s2",
+              name: "Season 2",
+              order: 2,
+              episodes: Array.from({ length: 12 }, (_, i) => ({
+                id: 200 + i,
+                order: i,
+                name: i === 0 ? "Mash Burnedead and the Divine Visionaries" : `Mashle S2E${i + 1}`,
+                still_path: "/s2e1.jpg",
+                air_date: "2024-01-06",
+              })),
+            },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-episodes?tmdbId=204833&season=2");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.episodes.length, 12);
+      assert.equal(data.episodes[0].episode, 1);
+      assert.equal(data.episodes[0].name, "Mash Burnedead and the Divine Visionaries");
+      assert.equal(data.episodes[0].released, "2024-01-06");
+      assert.equal(data.episodes[0].thumbnail, "https://image.tmdb.org/t/p/w500/s2e1.jpg");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("Cinemeta fallback unpacks seasons when TMDB has no episode groups", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/99999?") || u.includes("/tv/99999/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 99999,
+          name: "Anime Show With No Groups",
+          external_ids: { imdb_id: "tt9999999" },
+          seasons: [{ season_number: 1, name: "Season 1", episode_count: 24 }],
+          episode_groups: { results: [] },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("v3-cinemeta.strem.io/meta/series/tt9999999.json")) {
+        return new Response(JSON.stringify({
+          meta: {
+            name: "Anime Show With No Groups",
+            videos: [
+              { season: 1, episode: 1, title: "S1E1", id: "tt9999999:1:1" },
+              { season: 1, episode: 2, title: "S1E2", id: "tt9999999:1:2" },
+              { season: 2, episode: 1, title: "S2E1", id: "tt9999999:2:1" },
+              { season: 2, episode: 2, title: "S2E2", id: "tt9999999:2:2" },
+            ],
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-seasons?tmdbId=99999");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.seasons.length, 2);
+      assert.equal(data.seasons[0].season, 1);
+      assert.equal(data.seasons[0].episodeCount, 2);
+      assert.equal(data.seasons[1].season, 2);
+      assert.equal(data.seasons[1].episodeCount, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("Standard multi-season shows remain untouched", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/1396?") || u.includes("/tv/1396/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 1396,
+          name: "Breaking Bad",
+          external_ids: { imdb_id: "tt0903747" },
+          seasons: [
+            { season_number: 1, name: "Season 1", episode_count: 7 },
+            { season_number: 2, name: "Season 2", episode_count: 13 },
+            { season_number: 3, name: "Season 3", episode_count: 13 },
+            { season_number: 4, name: "Season 4", episode_count: 13 },
+            { season_number: 5, name: "Season 5", episode_count: 16 },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-seasons?tmdbId=1396");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.seasons.length, 5);
+      assert.equal(data.seasons[0].season, 1);
+      assert.equal(data.seasons[4].season, 5);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("/api/details unpacks compressed anime shows into multiple seasons", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/find/tt21209804")) {
+        return new Response(JSON.stringify({ tv_results: [{ id: 204832, media_type: "tv" }] }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/tv/204832?") && !u.includes("/episode_groups")) {
+        return new Response(JSON.stringify({
+          id: 204832,
+          name: "MASHLE: MAGIC AND MUSCLES",
+          external_ids: { imdb_id: "tt21209804" },
+          seasons: [{ season_number: 1, name: "Season 1", episode_count: 24 }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/tv/204832/episode_groups")) {
+        return new Response(JSON.stringify({
+          results: [{ id: "eg_mashle_details", name: "Seasons", type: 1, group_count: 2, episode_count: 24 }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/episode_group/eg_mashle_details")) {
+        return new Response(JSON.stringify({
+          id: "eg_mashle_details",
+          groups: [
+            { id: "s1", name: "Season 1", order: 1, episodes: Array.from({ length: 12 }, (_, i) => ({ id: 100 + i, order: i, name: `Ep ${i + 1}` })) },
+            { id: "s2", name: "Season 2", order: 2, episodes: Array.from({ length: 12 }, (_, i) => ({ id: 200 + i, order: i, name: `Ep ${i + 1}` })) },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/details?imdbId=tt21209804&type=series");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      const details = res.body.details;
+      assert.ok(details, "details object returned");
+      assert.ok(Array.isArray(details.seasonsData), "seasonsData is array");
+      assert.equal(details.seasonsData.length, 2, "must be unpacked into exactly 2 seasons");
+      assert.equal(details.seasonsData[0].season_number, 1);
+      assert.equal(details.seasonsData[0].episode_count, 12);
+      assert.equal(details.seasonsData[1].season_number, 2);
+      assert.equal(details.seasonsData[1].episode_count, 12);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("fetchTmdbItemDetails dynamically upgrades stale single-season cache entries", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const cacheKey = "cache:tmdb:itemdetails:tt21209804:series:US";
+    // Populate KV cache with stale single-season entry
+    await env.CONFIGS.put(cacheKey, JSON.stringify({
+      data: {
+        id: "tt21209804",
+        tmdbId: 204832,
+        title: "MASHLE: MAGIC AND MUSCLES",
+        seasonsData: [{ season_number: 1, name: "Season 1", episode_count: 24 }],
+      },
+      freshUntil: Date.now() + 100000,
+    }));
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/204832/episode_groups")) {
+        return new Response(JSON.stringify({
+          results: [{ id: "eg_mashle_kv", name: "Seasons", type: 1, group_count: 2, episode_count: 24 }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/episode_group/eg_mashle_kv")) {
+        return new Response(JSON.stringify({
+          id: "eg_mashle_kv",
+          groups: [
+            { id: "s1", name: "Season 1", order: 1, episodes: Array.from({ length: 12 }, (_, i) => ({ id: 100 + i, order: i, name: `Ep ${i + 1}` })) },
+            { id: "s2", name: "Season 2", order: 2, episodes: Array.from({ length: 12 }, (_, i) => ({ id: 200 + i, order: i, name: `Ep ${i + 1}` })) },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/details?imdbId=tt21209804&type=series");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      const details = res.body.details;
+      assert.equal(details.seasonsData.length, 2, "stale single season upgraded to 2 seasons");
+      assert.equal(details.seasonsData[0].episode_count, 12);
+      assert.equal(details.seasonsData[1].episode_count, 12);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("Cinemeta series fallback filters out unreleased placeholder seasons", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/88888?") || u.includes("/tv/88888/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 88888,
+          name: "Placeholder Season Anime",
+          external_ids: { imdb_id: "tt8888888" },
+          seasons: [{ season_number: 1, name: "Season 1", episode_count: 24 }],
+          episode_groups: { results: [] },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("v3-cinemeta.strem.io/meta/series/tt8888888.json")) {
+        return new Response(JSON.stringify({
+          meta: {
+            name: "Placeholder Season Anime",
+            videos: [
+              { season: 1, episode: 1, title: "S1E1", id: "tt8888888:1:1", released: "2023-04-08T00:00:00.000Z" },
+              { season: 1, episode: 2, title: "S1E2", id: "tt8888888:1:2", released: "2023-04-15T00:00:00.000Z" },
+              { season: 2, episode: 1, title: "S2E1", id: "tt8888888:2:1", released: "2024-01-06T00:00:00.000Z" },
+              { season: 2, episode: 2, title: "S2E2", id: "tt8888888:2:2", released: "2024-01-13T00:00:00.000Z" },
+              // Dummy Season 3 with no air date and 1 dummy episode
+              { season: 3, episode: 1, title: "Episode 1", id: "tt8888888:3:1", released: null, firstAired: null },
+            ],
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-seasons?tmdbId=88888");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.seasons.length, 2, "dummy season 3 must be filtered out");
+      assert.equal(data.seasons[0].season, 1);
+      assert.equal(data.seasons[1].season, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("/api/preview preserves seasonNum, episodeNum, and badge properties in sample items", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    await env.CONFIGS.put("creatorsynctracking:alice", JSON.stringify({
+      continueWatching: [
+        { id: "tt8360212:2:5", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 2, episodeNum: 5, airDate: "2024-08-01" },
+      ],
+      airingNext: [
+        { id: "tt8360212:3:1", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 1, airDate: "2099-07-05", seasonFinaleAirDate: "2099-09-22" },
+      ],
+    }));
+
+    const res = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        sample: 5,
+      },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true);
+    assert.ok(Array.isArray(res.body.sample), "sample is array");
+    assert.equal(res.body.sample.length, 1);
+    const sampleItem = res.body.sample[0];
+    assert.equal(sampleItem.seasonNum, 2);
+    assert.equal(sampleItem.episodeNum, 5);
+    assert.equal(sampleItem.showId, "tt8360212");
+    // Since user is on season 2 and airing is season 3, finale date must be stripped
+    assert.equal(sampleItem.seasonFinaleAirDate, undefined);
+
+    // Now test when user is on season 3 (matching airing season)
+    await env.CONFIGS.put("creatorsynctracking:alice", JSON.stringify({
+      continueWatching: [
+        { id: "tt8360212:3:2", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 2, airDate: "2024-08-01" },
+      ],
+      airingNext: [
+        { id: "tt8360212:3:1", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 1, airDate: "2099-07-05", seasonFinaleAirDate: "2099-09-22" },
+      ],
+    }));
+
+    const resS3 = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        sample: 5,
+      },
+    });
+    assert.equal(resS3.status, 200);
+    const s3Item = resS3.body.sample[0];
+    assert.equal(s3Item.seasonNum, 3);
+    assert.equal(s3Item.seasonFinaleAirDate, "2099-09-22", "season 3 item receives finale date");
+
+    // Test when user is on Season 3 Episode 1 (already aired), while Episode 11 is airing next
+    await env.CONFIGS.put("creatorsynctracking:alice", JSON.stringify({
+      continueWatching: [
+        { id: "tt8360212:3:1", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 1, airDate: "2024-07-05" },
+      ],
+      airingNext: [
+        { id: "tt8360212:3:11", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 11, airDate: "2099-09-15", seasonFinaleAirDate: "2099-09-22" },
+      ],
+    }));
+
+    const resS3Ep1 = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        sample: 5,
+      },
+    });
+    assert.equal(resS3Ep1.status, 200);
+    const s3Ep1Item = resS3Ep1.body.sample[0];
+    assert.equal(s3Ep1Item.seasonNum, 3);
+    assert.equal(s3Ep1Item.episodeNum, 1);
+    assert.equal(s3Ep1Item.seasonFinaleAirDate, "2099-09-22", "season 3 episode 1 receives finale date");
+    assert.equal(s3Ep1Item.isSeasonPremiere, undefined, "aired episode 1 is not flagged as season premiere");
+    assert.notEqual(s3Ep1Item.airDate, "2099-09-15", "airDate must not leak from different episode 11");
+  });
+});
+
+describe("worker: adult content filter & safe poster generator", () => {
+  const httpUtils = loadSourceFunctions("02_http-and-creator-utils.js");
+  const configFns = loadSourceFunctions("04_config-resolution.js");
+  const catalogFns = loadSourceFunctions("05_catalog-core.js");
+
+  it("serves SVG safe poster at /api/safe-poster with valid headers", async () => {
+    const env = makeEnv();
+    const res = await call(env, "/api/safe-poster?title=Adult+Anime&year=2024&type=series&cert=R18%2B");
+    assert.equal(res.status, 200);
+    assert.ok(res.headers.get("content-type")?.includes("image/svg+xml"));
+    assert.ok(res.headers.get("cache-control")?.includes("public"));
+    const svg = res.body;
+    assert.ok(svg.includes("<svg"), "must be valid SVG");
+    assert.ok(svg.includes("Adult Anime"), "must contain title");
+    assert.ok(svg.includes("2024"), "must contain year");
+    assert.ok(svg.includes("SERIES"), "must contain uppercase type");
+    assert.ok(svg.includes("R18+"), "must contain certification");
+    assert.ok(svg.includes("AGE-APPROPRIATE FILTER ACTIVE"), "must contain safe shield badge text");
+  });
+
+  it("serves fallback SVG when query parameters are missing", async () => {
+    const env = makeEnv();
+    const res = await call(env, "/api/safe-poster");
+    assert.equal(res.status, 200);
+    assert.ok(res.headers.get("content-type")?.includes("image/svg+xml"));
+    assert.ok(res.body.includes("Untitled"));
+  });
+
+  it("decodes and resolves adultContentFilter in config", async () => {
+    const b64True = btoa(JSON.stringify({ adultContentFilter: true }));
+    const decodedTrue = httpUtils.decodeConfig(b64True);
+    assert.equal(decodedTrue.adultContentFilter, true);
+
+    const b641 = btoa(JSON.stringify({ adultContentFilter: 1 }));
+    const decoded1 = httpUtils.decodeConfig(b641);
+    assert.equal(decoded1.adultContentFilter, true);
+
+    const b64False = btoa(JSON.stringify({ adultContentFilter: false }));
+    const decodedFalse = httpUtils.decodeConfig(b64False);
+    assert.equal(decodedFalse.adultContentFilter, false);
+
+    // Test resolveConfig through KV short-id config path with env
+    const env = makeEnv();
+    await env.CONFIGS.put("testadult", JSON.stringify({ adultContentFilter: true, entries: [] }));
+    const resolvedFromKv = await call(env, "/testadult/configure");
+    assert.equal(resolvedFromKv.status, 200);
+    assert.ok(resolvedFromKv.body.includes('id="adultContentFilterCheckbox" checked'));
+  });
+
+  it("isAdultOrNsfw accurately identifies adult, explicit certifications, and NSFW genres", () => {
+    const isAdult = catalogFns.isAdultOrNsfw;
+
+    assert.equal(isAdult({ adult: true }), true);
+    assert.equal(isAdult({ isAdult: true }), true);
+    assert.equal(isAdult({ certification: "NC-17" }), true);
+    assert.equal(isAdult({ certification: "XXX" }), true);
+    assert.equal(isAdult({ contentRating: "R18+" }), true);
+    assert.equal(isAdult({ ageRating: "18+" }), true);
+    assert.equal(isAdult({ genres: ["Animation", "Hentai"] }), true);
+    assert.equal(isAdult({ genres: ["Ecchi", "Comedy"] }), true);
+    assert.equal(isAdult({ genres: "Drama, Erotica" }), true);
+
+    // Non-adult items must return false
+    assert.equal(isAdult({ title: "Inception", certification: "PG-13", genres: ["Action", "Sci-Fi"] }), false);
+    assert.equal(isAdult({ title: "Frozen", adult: false, genres: ["Animation", "Family"] }), false);
+    assert.equal(isAdult(null), false);
+  });
+
+  it("applyAdultContentFilterToMetas filters adult posters and leaves clean items untouched", () => {
+    const metas = [
+      { id: "tt1", name: "Family Movie", poster: "https://images.example.com/family.jpg", adult: false },
+      { id: "tt2", name: "Explicit Anime", poster: "https://images.example.com/nsfw.jpg", genres: ["Hentai"] },
+    ];
+
+    const filtered = catalogFns.applyAdultContentFilterToMetas(metas, "https://mylistsaddon.com");
+    assert.equal(filtered[0].poster, "https://images.example.com/family.jpg");
+    assert.equal(filtered[0].isAdultPosterFiltered, undefined);
+
+    assert.ok(filtered[1].poster.startsWith("https://mylistsaddon.com/api/safe-poster"));
+    assert.ok(filtered[1].poster.includes("Explicit+Anime") || filtered[1].poster.includes("Explicit%20Anime"));
+    assert.equal(filtered[1].isAdultPosterFiltered, true);
+  });
+
+  it("/api/preview filters adult posters when adultContentFilter is requested", async () => {
+    const env = makeEnv();
+    await env.CONFIGS.put("creatorsynctracking:alice", JSON.stringify({
+      continueWatching: [
+        { id: "tt101", showTitle: "Safe Show", showPoster: "https://images.example.com/safe.jpg" },
+        { id: "tt102", showTitle: "Adult Show", showPoster: "https://images.example.com/nsfw.jpg", adult: true },
+      ],
+      airingNext: [],
+    }));
+
+    // 1. Without adultContentFilter
+    const resUnfiltered = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        adultContentFilter: false,
+      },
+    });
+    assert.equal(resUnfiltered.status, 200);
+    const itemUnfiltered = resUnfiltered.body.sample.find((i) => i.id === "tt102");
+    assert.equal(itemUnfiltered.poster, "https://images.example.com/nsfw.jpg");
+    assert.equal(itemUnfiltered.isAdult, true);
+    assert.equal(itemUnfiltered.isAdultPosterFiltered, false);
+
+    // 2. With adultContentFilter: true
+    const resFiltered = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        adultContentFilter: true,
+      },
+    });
+    assert.equal(resFiltered.status, 200);
+    const itemFiltered = resFiltered.body.sample.find((i) => i.id === "tt102");
+    assert.ok(itemFiltered.poster.includes("/api/safe-poster"));
+    assert.equal(itemFiltered.isAdult, true);
+    assert.equal(itemFiltered.isAdultPosterFiltered, true);
+  });
+});
+
+describe("Title Search resilience (word variations and fuzzy fallback)", () => {
+  it("handles missing space between words via fallback variation query", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const realFetch = globalThis.fetch;
+    const fetchedUrls = [];
+
+    globalThis.fetch = async (input) => {
+      const u = typeof input === "string" ? input : (input && input.url) || "";
+      fetchedUrls.push(u);
+
+      // Initial search with 'pickup' returns 0 results
+      if (u.includes("query=Is%20it%20wrong%20to%20pickup%20girls%20in%20the%20dungeon")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ results: [], total_pages: 1 }),
+        };
+      }
+      // Split query variation 'pick up' succeeds
+      if (u.includes("query=Is%20it%20wrong%20to%20pick%20up%20girls%20in%20the%20dungeon")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            results: [
+              {
+                id: 574475,
+                title: "Is It Wrong to Try to Pick Up Girls in a Dungeon?: Arrow of the Orion",
+                release_date: "2019-02-15",
+                poster_path: "/poster.jpg",
+                vote_average: 7.7,
+                genre_ids: [16, 28],
+              },
+            ],
+            total_pages: 1,
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ results: [] }) };
+    };
+
+    try {
+      const res = await call(env, "/api/title-search?q=Is%20it%20wrong%20to%20pickup%20girls%20in%20the%20dungeon&type=movie");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      assert.equal(res.body.results.length, 1);
+      assert.equal(res.body.results[0].tmdbId, 574475);
+      assert.ok(res.body.results[0].title.includes("Arrow of the Orion"));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("falls back to Cinemeta fuzzy search and resolves IMDB ID to TMDB when query has a typo", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const realFetch = globalThis.fetch;
+    const fetchedUrls = [];
+
+    globalThis.fetch = async (input) => {
+      const u = typeof input === "string" ? input : (input && input.url) || "";
+      fetchedUrls.push(u);
+
+      // Direct TMDB search with typo returns empty
+      if (u.includes("api.themoviedb.org/3/search/movie") && u.includes("query=Interstelar")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ results: [], total_pages: 0 }),
+        };
+      }
+      // Cinemeta search returns fuzzy match with IMDB id
+      if (u.includes("v3-cinemeta.strem.io")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            metas: [
+              {
+                id: "tt0816692",
+                imdb_id: "tt0816692",
+                name: "Interstellar",
+                releaseInfo: "2014",
+                poster: "https://example.com/interstellar.jpg",
+              },
+            ],
+          }),
+        };
+      }
+      // TMDB /3/find/ resolves tt0816692 to TMDB movie
+      if (u.includes("api.themoviedb.org/3/find/tt0816692")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            movie_results: [
+              {
+                id: 157336,
+                title: "Interstellar",
+                release_date: "2014-11-05",
+                poster_path: "/interstellar_tmdb.jpg",
+                vote_average: 8.4,
+              },
+            ],
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ results: [] }) };
+    };
+
+    try {
+      const res = await call(env, "/api/title-search?q=Interstelar&type=movie");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      assert.equal(res.body.results.length, 1);
+      assert.equal(res.body.results[0].tmdbId, 157336);
+      assert.equal(res.body.results[0].title, "Interstellar");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
+
 

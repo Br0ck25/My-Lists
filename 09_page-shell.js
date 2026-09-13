@@ -15,6 +15,7 @@ function renderBuilder(
   const initialShuffleItems = !!initialKeys.shuffleItems;
   const initialRegion = initialKeys.region || "US";
   const initialHideNonDigitalReleases = !!initialKeys.hideNonDigitalReleases;
+  const initialAdultContentFilter = !!initialKeys.adultContentFilter;
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();
@@ -156,7 +157,8 @@ ${seoHeadHtml}
       document.documentElement.setAttribute('data-initial-channels-sub', chSub);
       var setSub = localStorage.getItem('myListAddon:settingsSubmenu') || 'account';
       document.documentElement.setAttribute('data-initial-settings-sub', setSub);
-      var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+      var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'movie';
+      if (discSub === 'all') discSub = 'movie';
       document.documentElement.setAttribute('data-initial-discover-sub', discSub);
     } catch (e) {}
   })();
@@ -647,15 +649,26 @@ ${seoHeadHtml}
   html[data-initial-discover-sub="popular"] #discoverShelvesContainer,
   html[data-initial-discover-sub="popular"] #discoverListsFeedHeader,
   html[data-initial-discover-sub="popular"] #discoverListsFeed,
+  html[data-initial-discover-sub="popular"] #discoverSubSharedFeed,
   html[data-initial-discover-sub="curated"] #discoverShelvesContainer,
   html[data-initial-discover-sub="curated"] #discoverListsFeedHeader,
-  html[data-initial-discover-sub="curated"] #discoverListsFeed {
+  html[data-initial-discover-sub="curated"] #discoverListsFeed,
+  html[data-initial-discover-sub="curated"] #discoverSubSharedFeed {
     display: none !important;
   }
   html[data-initial-discover-sub="popular"] #discoverSubPopular {
     display: block !important;
   }
   html[data-initial-discover-sub="curated"] #discoverSubCurated {
+    display: block !important;
+  }
+  html[data-initial-discover-sub="all"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="movie"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="series"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="gems"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="kids"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="holidays"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="genres"] #discoverSubSharedFeed {
     display: block !important;
   }
   html[data-initial-discover-sub] #discoverSubnavBar .subnav-pill {
@@ -1469,11 +1482,13 @@ ${seoHeadHtml}
      one-line message and a Retry button in place of the poster grid, so a
      card that could not be fetched (even after its own automatic retry)
      says so instead of just sitting there blank. */
-  .list-card-posters.poster-preview-error {
+  .list-card-posters.poster-preview-error,
+  .list-card-posters.poster-preview-empty {
     display: flex;
     grid-template-columns: none;
   }
-  .poster-preview-error-msg {
+  .poster-preview-error-msg,
+  .poster-preview-empty-msg {
     margin: 0;
     display: flex;
     align-items: center;
@@ -1547,6 +1562,179 @@ ${seoHeadHtml}
     min-width: 105px !important;
     box-sizing: border-box !important;
     text-align: center !important;
+  }
+  .item-storylines-section {
+    border-top: 1px solid var(--border);
+    padding-top: 24px;
+    margin-top: 32px;
+  }
+  .item-storyline-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .item-storyline-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  .item-storyline-header-info {
+    flex: 1;
+    min-width: 240px;
+  }
+  .item-storyline-saga-title {
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+  .item-storyline-saga-meta {
+    font-size: 0.82rem;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+  }
+  .item-storyline-saga-desc {
+    font-size: 0.85rem;
+    color: var(--text-2);
+    line-height: 1.45;
+    margin: 4px 0 0;
+  }
+  .item-storyline-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .item-storyline-scroll {
+    display: flex !important;
+    flex-direction: row !important;
+    gap: 14px !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    -webkit-overflow-scrolling: touch !important;
+    touch-action: pan-x !important;
+    padding: 10px 4px 14px !important;
+    margin-top: 8px;
+  }
+  .item-storyline-card {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 120px;
+    width: 120px;
+    max-width: 120px;
+    min-width: 120px;
+    cursor: pointer;
+    text-align: left;
+    transition: transform 0.15s ease;
+  }
+  .item-storyline-card:hover {
+    transform: translateY(-2px);
+  }
+  .item-storyline-card.is-current {
+    cursor: default;
+    transform: none !important;
+  }
+  .item-storyline-poster-wrap {
+    position: relative;
+    aspect-ratio: 2 / 3;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: var(--panel-strong);
+    border: 1px solid var(--border);
+    margin-bottom: 8px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .item-storyline-card:hover .item-storyline-poster-wrap {
+    border-color: var(--border-strong);
+  }
+  .item-storyline-card.is-current .item-storyline-poster-wrap {
+    border: 2px solid var(--accent);
+    box-shadow: 0 0 10px rgba(0, 122, 255, 0.4);
+  }
+  .item-storyline-poster-wrap img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .item-storyline-part-badge {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #FFFFFF;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: var(--radius-pill);
+    letter-spacing: 0.02em;
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    z-index: 2;
+  }
+  .item-storyline-current-pill {
+    position: absolute;
+    bottom: 6px;
+    left: 6px;
+    right: 6px;
+    background: var(--accent);
+    color: #FFFFFF;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-align: center;
+    padding: 3px 0;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    z-index: 2;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  }
+  .item-storyline-watched-badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background: var(--accent);
+    color: #FFFFFF;
+    font-size: 0.75rem;
+    font-weight: 800;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    z-index: 2;
+  }
+  .item-storyline-title {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1.25;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    margin-bottom: 2px;
+  }
+  .item-storyline-card.is-current .item-storyline-title {
+    color: var(--accent);
+  }
+  .item-storyline-meta {
+    font-size: 0.72rem;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .cw-remove-btn {
     position: absolute;
@@ -1635,7 +1823,18 @@ ${seoHeadHtml}
     font-size: 0.58rem;
     font-weight: 700;
   }
-  body.hide-badge-air-date .cw-date-badge:not(.cw-date-badge-premiere):not(.cw-date-badge-finale):not(.cw-date-badge-finale-date) { display: none !important; }
+  .cw-date-badge-companion {
+    background: var(--accent, #6366f1);
+    color: #ffffff;
+    top: auto;
+    bottom: 4px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100% - 8px);
+    text-overflow: ellipsis;
+    overflow: hidden;
+  }
+  body.hide-badge-air-date .cw-date-badge:not(.cw-date-badge-premiere):not(.cw-date-badge-finale):not(.cw-date-badge-finale-date):not(.cw-date-badge-companion) { display: none !important; }
   body.hide-badge-season-premiere .cw-date-badge-premiere { display: none !important; }
   body.hide-badge-season-finale .cw-date-badge-finale { display: none !important; }
   body.hide-badge-season-finale-date .cw-date-badge-finale-date { display: none !important; }

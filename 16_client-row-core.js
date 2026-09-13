@@ -157,7 +157,8 @@ const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
     if (subFeedback) subFeedback.style.display = (setSub === 'feedback') ? 'block' : 'none';
 
     // 5. Discover submenu early sync
-    var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+    var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'movie';
+    if (discSub === 'all') discSub = 'movie';
     var discBar = document.getElementById('discoverSubnavBar');
     if (discBar) {
       discBar.querySelectorAll('.subnav-pill').forEach(function(p) {
@@ -802,11 +803,12 @@ function switchTab(name) {
   if (name === 'discover') {
     if (!window._discoverInitializedOnce) {
       window._discoverInitializedOnce = true;
-      let savedFilter = 'all';
+      let savedFilter = 'movie';
       try {
-        savedFilter = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+        savedFilter = localStorage.getItem('myListAddon:discoverSubmenu') || 'movie';
       } catch (e) {}
-      const activeFilter = window._currentDiscoverFilter || savedFilter;
+      if (savedFilter === 'all') savedFilter = 'movie';
+      const activeFilter = (window._currentDiscoverFilter && window._currentDiscoverFilter !== 'all') ? window._currentDiscoverFilter : savedFilter;
       window._currentDiscoverFilter = activeFilter;
       const pills = document.querySelectorAll('#discoverSubnavBar .subnav-pill');
       let targetBtn = null;
@@ -1578,9 +1580,9 @@ function filterDiscoverShelves(filter, btn) {
   try {
     document.documentElement.removeAttribute('data-initial-discover-sub');
   } catch (e) {}
-  window._currentDiscoverFilter = filter || 'all';
+  window._currentDiscoverFilter = filter || 'movie';
   try {
-    localStorage.setItem('myListAddon:discoverSubmenu', filter || 'all');
+    localStorage.setItem('myListAddon:discoverSubmenu', filter || 'movie');
   } catch (e) {}
   if (btn) {
     document.querySelectorAll('#discoverSubnavBar .subnav-pill').forEach(function(p) {
@@ -1595,6 +1597,7 @@ function filterDiscoverShelves(filter, btn) {
     } catch (e) {}
   }
   const shelvesContainer = document.getElementById('discoverShelvesContainer');
+  const sharedContainer = document.getElementById('discoverSubSharedFeed');
   const feedContainer = document.getElementById('discoverListsFeed');
   const feedHeader = document.getElementById('discoverListsFeedHeader');
   const popularContainer = document.getElementById('discoverSubPopular');
@@ -1602,6 +1605,7 @@ function filterDiscoverShelves(filter, btn) {
 
   if (popularContainer) popularContainer.style.display = 'none';
   if (curatedContainer) curatedContainer.style.display = 'none';
+  if (sharedContainer) sharedContainer.style.display = 'none';
   if (shelvesContainer) shelvesContainer.style.display = 'none';
   if (feedContainer) feedContainer.style.display = 'none';
   if (feedHeader) feedHeader.style.display = 'none';
@@ -1617,17 +1621,23 @@ function filterDiscoverShelves(filter, btn) {
       if (typeof loadCuratedListsFeed === 'function') loadCuratedListsFeed();
     }
   } else {
+    if (sharedContainer) sharedContainer.style.display = 'block';
     if (feedContainer) {
       feedContainer.style.display = 'block';
       if (feedHeader) {
         feedHeader.style.display = 'flex';
         const titleEl = document.getElementById('discoverListsFeedTitle');
-        if (titleEl) titleEl.textContent = DISCOVER_FEED_TITLES[window._currentDiscoverFilter] || 'All';
+        if (titleEl) titleEl.textContent = DISCOVER_FEED_TITLES[window._currentDiscoverFilter] || 'Movies';
+        const descEl = document.getElementById('discoverListsFeedDesc');
+        if (descEl) descEl.textContent = DISCOVER_FEED_DESCRIPTIONS[window._currentDiscoverFilter] || '';
       }
       window._discoverFeedsCache = window._discoverFeedsCache || {};
       if (window._discoverFeedsCache[filter]) {
         feedContainer.innerHTML = window._discoverFeedsCache[filter];
         window._currentDiscoverRenderedFilter = filter;
+        if (feedContainer.querySelector('.poster-preview-slot') && typeof populateSearchResultPosters === 'function') {
+          populateSearchResultPosters();
+        }
       } else if (typeof renderDiscoverChartsList === 'function') {
         renderDiscoverChartsList(filter);
       }
@@ -1646,6 +1656,18 @@ const DISCOVER_FEED_TITLES = {
   kids: 'Kids',
   holidays: 'Holidays',
   genres: 'Genres',
+};
+
+const DISCOVER_FEED_DESCRIPTIONS = {
+  all: 'Explore popular charts, trending movies, TV shows, and streaming catalogs across all services.',
+  movie: 'Top charts, new releases, and popular movie collections across streaming platforms.',
+  series: 'Trending TV series, top network charts, and new episodes across streaming platforms.',
+  popular: 'Top trending and highly-rated community lists shared by creators and viewers.',
+  curated: 'Personalized recommendations and curated lists tailored to your watch history and tastes.',
+  gems: 'Under-the-radar masterpieces, cult classics, and acclaimed titles you might have missed.',
+  kids: 'Family-friendly movies, animated favorites, and entertaining shows suitable for all ages.',
+  holidays: 'Seasonal favorites, festive classics, and holiday-themed movies and episodes for every celebration.',
+  genres: 'Browse top movies and series organized by action, comedy, sci-fi, horror, and more.',
 };
 
 // Renders the chart lists for the Movies or Shows tab in Discover as list-cards
@@ -1738,6 +1760,7 @@ function renderDiscoverChartsList(type, forceRefresh) {
   if (type === 'gems' || type === 'all') {
     pushSingle('Hidden Gems', 'tmdb:hidden-gems', 'movie', 'Hidden Gems');
     pushSingle('Hidden Gems', 'tmdb:hidden-gems', 'series', 'Hidden Gems');
+    pushSingle('Curated: Hidden Gems', 'custom:curated:hidden-gems', 'movie', 'Curated');
   }
 
   if (type === 'kids' || type === 'all') {

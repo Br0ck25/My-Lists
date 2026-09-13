@@ -157,6 +157,7 @@ function buildFullBackupPayload() {
       scrobbleAllowedUsers: localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '',
       scrobbleBlockAnonymous: localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1',
       hideNonDigitalReleases: localStorage.getItem('myListAddon:hideNonDigitalReleases') === '1',
+      adultContentFilter: localStorage.getItem('myListAddon:adultContentFilter') === '1',
       region: localStorage.getItem('myListAddon:region') || '',
       dashboardListOrder: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]'); } catch(e) { return []; } })(),
       hiddenLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch(e) { return []; } })(),
@@ -574,6 +575,11 @@ function applyImportedConfig(data) {
     const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
     if (cb) cb.checked = s.hideNonDigitalReleases;
     try { localStorage.setItem('myListAddon:hideNonDigitalReleases', s.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+  }
+  if (typeof s.adultContentFilter === 'boolean') {
+    const cb = document.getElementById('adultContentFilterCheckbox');
+    if (cb) cb.checked = s.adultContentFilter;
+    try { localStorage.setItem('myListAddon:adultContentFilter', s.adultContentFilter ? '1' : '0'); } catch (e) {}
   }
   if (typeof s.region === 'string' && s.region) {
     const el = document.getElementById('regionSelect');
@@ -1968,6 +1974,7 @@ function computeConfigStateHash() {
         simklUsername: keys.simklUsername,
         region: keys.region,
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
+        adultContentFilter: keys.adultContentFilter,
         shuffleShelves: keys.shuffleShelves,
         shuffleItems: keys.shuffleItems,
         track: !!keys.track,
@@ -2086,6 +2093,7 @@ async function generate() {
   // Worker has no CONFIGS KV namespace bound, fall back to the old
   // self-contained base64 link.
   let config = null;
+  let saveErrorMessage = null;
   try {
     const res = await fetch(ORIGIN + '/api/save', {
       method: 'POST',
@@ -2108,12 +2116,18 @@ async function generate() {
         shuffleItems: keys.shuffleItems,
         region: keys.region,
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
+        adultContentFilter: keys.adultContentFilter,
       }),
     });
     const data = await res.json();
-    if (data.ok) config = data.id;
+    if (data.ok) {
+      config = data.id;
+    } else {
+      saveErrorMessage = data.error || 'Server error';
+    }
   } catch (e) {
     // network error — fall through to the client-side link below
+    saveErrorMessage = 'Network error';
   }
 
   let sizeWarning = '';
@@ -2123,7 +2137,12 @@ async function generate() {
     // episodes can make the encoded config huge even with just one or two
     // rows total, so this checks the actual encoded length instead.
     if (config.length > 4000) {
-      sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including Wako. If you\\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
+      if (saveErrorMessage && saveErrorMessage !== 'no-kv') {
+        const errTxt = (typeof escapeHtml === 'function') ? escapeHtml(saveErrorMessage) : saveErrorMessage;
+        sizeWarning = '<p class="testresult err">\u26a0 Cloud storage save failed (' + errTxt + '). This fallback link encodes everything directly into the URL, so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including Wako.</p>';
+      } else {
+        sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including Wako. If you\\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
+      }
     }
   }
 
@@ -2248,6 +2267,13 @@ if (serverEntries.length && !serverEntriesAreDefaults) {
     const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
     if (cb) cb.checked = savedHideNonDigital === '1';
   }
+  const savedAdultFilter = (function() {
+    try { return localStorage.getItem('myListAddon:adultContentFilter'); } catch (e) { return null; }
+  })();
+  if (savedAdultFilter !== null) {
+    const cb = document.getElementById('adultContentFilterCheckbox');
+    if (cb) cb.checked = savedAdultFilter === '1';
+  }
 } else {
   // Fresh visit to the plain builder page — restore whatever was left off
   // last time, if anything was saved. Falls through to the server's
@@ -2269,6 +2295,14 @@ if (serverEntries.length && !serverEntriesAreDefaults) {
   }
   if (saved && saved.keys && document.getElementById('hideNonDigitalReleasesCheckbox')) {
     document.getElementById('hideNonDigitalReleasesCheckbox').checked = !!saved.keys.hideNonDigitalReleases;
+  }
+  const savedAdultFilterDirect = (function() {
+    try { return localStorage.getItem('myListAddon:adultContentFilter'); } catch (e) { return null; }
+  })();
+  if (savedAdultFilterDirect !== null && document.getElementById('adultContentFilterCheckbox')) {
+    document.getElementById('adultContentFilterCheckbox').checked = savedAdultFilterDirect === '1';
+  } else if (saved && saved.keys && document.getElementById('adultContentFilterCheckbox')) {
+    document.getElementById('adultContentFilterCheckbox').checked = !!saved.keys.adultContentFilter;
   }
   const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
   const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';

@@ -84,7 +84,7 @@ const CURATED_RECOMMENDATION_LIMIT = 40;
 const PUBLISHED_LIST_ITEMS_MAX = 10000;
 const PUBLISHED_LIST_NAME_MAX = 200;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
-const SAVED_CONFIG_BYTES_MAX = 512 * 1024;          // 512 KB of serialized JSON
+const SAVED_CONFIG_BYTES_MAX = 10 * 1024 * 1024;        // 10 MB of serialized JSON
 
 // --- Bounds on the AUTHENTICATED list write ----------------------------------
 //
@@ -2127,7 +2127,7 @@ function isPublicCorsPath(path) {
   if (p === "/lists/public.json" || p === "/api/public-lists.json") return true;
   if (/^\/lists\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\.json$/.test(p)) return true;
   if (p === "/icon.png" || p === "/unavailable-poster.svg") return true;
-  if (p === "/api/poster-badge" || p === "/api/channel-poster" || p === "/api/channel-logo") return true;
+  if (p === "/api/poster-badge" || p === "/api/channel-poster" || p === "/api/channel-logo" || p === "/api/safe-poster") return true;
   if (p.startsWith("/api/scrobble")) return true;
   return false;
 }
@@ -2456,7 +2456,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // links encode a bare entries array — those still decode fine, just with
 // no personal keys attached.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -2501,6 +2501,7 @@ function decodeConfig(config) {
       // predating this feature keeps showing everything, same reasoning
       // as region's own default above.
       hideNonDigitalReleases: !!(!Array.isArray(parsed) && parsed.hideNonDigitalReleases),
+      adultContentFilter: !!(!Array.isArray(parsed) && parsed.adultContentFilter),
     };
   } catch {
     return empty;
@@ -5282,10 +5283,16 @@ async function purgeCreatorData(env, username, options = {}) {
 async function getCreator(env, username) {
   if (env && env.DB) {
     try {
-      const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
+      let { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
+      if ((!results || results.length === 0) && typeof username === 'string') {
+        const clean = username.replace(/-/g, '').toLowerCase();
+        const res2 = await env.DB.prepare("SELECT * FROM creators WHERE LOWER(REPLACE(username, '-', '')) = ?").bind(clean).all();
+        if (res2 && res2.length > 0) results = res2;
+      }
       if (results && results.length > 0) {
         const row = results[0];
         const payload = {
+          username: row.username,
           displayName: row.display_name,
           keyHash: row.key_hash,
           recoveryAnswerHash: row.recovery_answer_hash,
@@ -5296,7 +5303,8 @@ async function getCreator(env, username) {
         };
         const raw = JSON.stringify(payload);
         try {
-          if (env.CONFIGS) await env.CONFIGS.put(`creator:${username}`, raw);
+          if (env.CONFIGS) await env.CONFIGS.put(`creator:${row.username}`, raw);
+          if (row.username !== username && env.CONFIGS) await env.CONFIGS.put(`creator:${username}`, raw);
         } catch (kvErr) {
           console.error("KV cache write error (getCreator):", kvErr);
         }
@@ -5707,7 +5715,21 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
         const itemId = String(item.id || showId);
         const name = item.name || null;
         const poster = item.poster || null;
-        const showTitle = item.showTitle || null;
+        let showTitle = item.showTitle || null;
+        if (item.isCompanion) {
+          try {
+            showTitle = "COMPANION:" + JSON.stringify({
+              isCompanion: true,
+              companionType: item.companionType,
+              companionNote: item.companionNote,
+              companionStoryline: item.companionStoryline,
+              precedingShowId: item.precedingShowId,
+              showTitle: item.showTitle || null,
+              type: item.type || (item.kind === 'movie' ? 'movie' : undefined),
+              kind: item.kind || (item.type === 'movie' ? 'movie' : undefined),
+            });
+          } catch {}
+        }
         const showPoster = item.showPoster || null;
         const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
         const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
@@ -5854,18 +5876,49 @@ async function readCreatorTrackingD1(env, username) {
       watchedAt: r.watched_at,
     }));
 
-    const continueWatching = cwRows.map((r) => ({
-      id: r.item_id,
-      showId: r.show_id,
-      type: "episode",
-      name: r.name || undefined,
-      poster: r.poster || undefined,
-      showTitle: r.show_title || undefined,
-      showPoster: r.show_poster || undefined,
-      seasonNum: r.season_num != null ? r.season_num : undefined,
-      episodeNum: r.episode_num != null ? r.episode_num : undefined,
-      updatedAt: r.updated_at,
-    }));
+    const continueWatching = cwRows.map((r) => {
+      let isCompanion = undefined;
+      let companionType = undefined;
+      let companionNote = undefined;
+      let companionStoryline = undefined;
+      let precedingShowId = undefined;
+      let showTitle = r.show_title || undefined;
+      let kind = undefined;
+      let type = (r.season_num == null && r.episode_num == null && !r.show_title) ? "movie" : "episode";
+      if (r.show_title && r.show_title.startsWith("COMPANION:")) {
+        try {
+          const compMeta = JSON.parse(r.show_title.slice(10));
+          isCompanion = true;
+          companionType = compMeta.companionType;
+          companionNote = compMeta.companionNote;
+          companionStoryline = compMeta.companionStoryline;
+          precedingShowId = compMeta.precedingShowId;
+          showTitle = compMeta.showTitle || undefined;
+          kind = compMeta.kind || (compMeta.type === 'movie' ? 'movie' : undefined);
+          type = compMeta.type || (kind === 'movie' ? 'movie' : 'episode');
+        } catch {}
+      } else if (type === "movie") {
+        kind = "movie";
+      }
+      return {
+        id: r.item_id,
+        showId: (type === 'movie' && !r.season_num && !r.episode_num && !showTitle) ? undefined : r.show_id,
+        type: type,
+        kind: kind,
+        name: r.name || undefined,
+        poster: r.poster || undefined,
+        showTitle: showTitle,
+        showPoster: r.show_poster || undefined,
+        seasonNum: r.season_num != null ? r.season_num : undefined,
+        episodeNum: r.episode_num != null ? r.episode_num : undefined,
+        updatedAt: r.updated_at,
+        isCompanion: isCompanion,
+        companionType: companionType,
+        companionNote: companionNote,
+        companionStoryline: companionStoryline,
+        precedingShowId: precedingShowId,
+      };
+    });
 
     const airingNext = anRows.map((r) => ({
       id: r.item_id,
@@ -9837,6 +9890,7 @@ async function resolveConfig(configParam, env) {
           shuffleItems: !!parsed.shuffleItems,
           region: parsed.region || "US",
           hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
+          adultContentFilter: !!parsed.adultContentFilter,
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
           showBadgesCatalogs: parsed.showBadgesCatalogs !== false,
@@ -9858,8 +9912,8 @@ async function resolveConfig(configParam, env) {
 // apikey to also reach a private/personal list you own (mdblist honors the
 // key on this endpoint the same way its own site does when you're signed
 // in) — public lists work fine with no key.
-function mdblistJsonUrl(input, apikey) {
-  let s = input.trim();
+function mdblistJsonUrl(input, apikey, type) {
+  let s = (input || "").trim();
   // Query string / fragment stripped before anything else. Without this,
   // a URL copied while some filter/view toggle on mdblist's own site is
   // active (e.g. "?sort=rank", or a trailing "/?Mode=Show"-shaped param)
@@ -9869,6 +9923,7 @@ function mdblistJsonUrl(input, apikey) {
   // list that doesn't exist, and mdblist 404s (or returns something
   // unrelated) instead of the real list.
   s = s.split(/[?#]/)[0];
+
   s = s.replace(/^https?:\/\/(www\.)?mdblist\.com\/lists\//i, "");
   s = s.replace(/\/(json\/?)?$/i, "");
   const parts = s.split("/").filter(Boolean);
@@ -10382,6 +10437,10 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     }
   }
 
+  if (keys.adultContentFilter && Array.isArray(result) && result.length > 0) {
+    result = applyAdultContentFilterToMetas(result, keys.origin, entry);
+  }
+
   return result || [];
 }
 
@@ -10818,11 +10877,149 @@ function generateBadgedPosterSvg({ posterUrl, airDateText, bottomText, bottomBg,
 </svg>`;
 }
 
+function isAdultOrNsfw(item) {
+  if (!item) return false;
+  if (item.adult === true || item.isAdult === true) return true;
+  const cert = String(item.certification || item.ageRating || item.contentRating || '').toUpperCase().trim();
+  if (['NC-17', 'X', 'XXX', 'R18+', '18+', 'RX', 'TV-MA (ADULT)', 'TV-MA-S', 'ADULT'].includes(cert)) return true;
+  const genres = Array.isArray(item.genres)
+    ? item.genres.map((g) => (typeof g === 'string' ? g : g?.name || '').toLowerCase().trim())
+    : (typeof item.genres === 'string' ? item.genres.toLowerCase().split(',').map((g) => g.trim()) : []);
+  const nsfwTerms = ['adult', 'erotic', 'erotica', 'hentai', 'ecchi', 'porn', 'pornography', 'xxx', 'softcore', 'hardcore'];
+  if (genres.some((g) => nsfwTerms.some((t) => g === t || g.includes(t)))) return true;
+  const text = [item.name, item.title, item.showTitle, item.listName, item.franchise, item.user]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (text) {
+    const explicitPattern = /\b(hentai|porn|pornography|erotica|erotic|blowjob|creampie|gangbang|milf|dildo|masturbation|fetish|bdsm|softcore|hardcore|top wet girls|evil angel|brazzers|naughty america|wicked pictures|reality kings|jules jordan|sweet sinner)\b/i;
+    if (explicitPattern.test(text)) return true;
+  }
+  return false;
+}
+
+function generateSafePosterSvg({ title, year, type, certification }) {
+  const safeTitle = escapeXml(title || 'Untitled');
+  const safeYear = escapeXml(year ? String(year).slice(0, 4) : '');
+  const safeType = escapeXml(type ? (type.toLowerCase() === 'movie' ? 'MOVIE' : 'SERIES') : 'TITLE');
+  const safeCert = escapeXml(certification || 'AGE-FILTERED');
+  
+  const words = safeTitle.split(/\s+/);
+  const lines = [];
+  let currentLine = '';
+  for (const w of words) {
+    if ((currentLine + ' ' + w).trim().length <= 18) {
+      currentLine = (currentLine + ' ' + w).trim();
+    } else {
+      if (currentLine) lines.push(currentLine);
+      currentLine = w;
+    }
+  }
+  if (currentLine) lines.push(currentLine);
+  const displayLines = lines.slice(0, 4);
+  if (lines.length > 4) displayLines[3] += '...';
+  
+  const titleTextSpans = displayLines.map((l, i) => `<tspan x="250" dy="${i === 0 ? 0 : 44}">${l}</tspan>`).join('');
+  const titleStartY = 370 - ((displayLines.length - 1) * 22);
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="500" height="750" viewBox="0 0 500 750">
+  <defs>
+    <linearGradient id="safeBgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#141824"/>
+      <stop offset="50%" stop-color="#0f111a"/>
+      <stop offset="100%" stop-color="#07090e"/>
+    </linearGradient>
+    <linearGradient id="shieldGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <filter id="safeShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.6"/>
+    </filter>
+  </defs>
+  <rect width="500" height="750" fill="url(#safeBgGrad)"/>
+  <rect x="15" y="15" width="470" height="720" rx="16" ry="16" fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="2"/>
+  
+  <!-- Safe Badge Pill at top -->
+  <g transform="translate(250, 60)" filter="url(#safeShadow)">
+    <rect x="-140" y="0" width="280" height="42" rx="21" ry="21" fill="url(#shieldGrad)"/>
+    <text x="0" y="27" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="800" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
+  </g>
+
+  <!-- Central Shield / Film Icon -->
+  <g transform="translate(250, 200)" filter="url(#safeShadow)">
+    <circle cx="0" cy="0" r="54" fill="rgba(16,185,129,0.12)" stroke="#10b981" stroke-width="3"/>
+    <!-- Lock / Shield Vector -->
+    <path d="M-18,-10 C-18,-20 18,-20 18,-10 L18,8 C18,22 0,32 0,32 C0,32 -18,22 -18,8 Z" fill="#10b981"/>
+    <circle cx="0" cy="3" r="4" fill="#0f111a"/>
+    <path d="M-2,3 L2,3 L1,11 L-1,11 Z" fill="#0f111a"/>
+  </g>
+
+  <!-- Title -->
+  <text x="250" y="${titleStartY}" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="34" font-weight="800" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
+    ${titleTextSpans}
+  </text>
+
+  <!-- Metadata: Type & Year -->
+  <g transform="translate(250, 560)">
+    <rect x="-90" y="-18" width="180" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
+    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="700" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
+      ${safeType}${safeYear ? ' • ' + safeYear : ''}
+    </text>
+  </g>
+
+  <!-- Certification / Footer -->
+  <g transform="translate(250, 680)">
+    <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
+      ${safeCert ? safeCert + ' • ' : ''}AGE-APPROPRIATE FILTER ACTIVE
+    </text>
+  </g>
+</svg>`;
+}
+
+function getSafePosterUrl(origin, { title, year, type, certification }) {
+  const params = new URLSearchParams();
+  if (title) params.set("title", title);
+  if (year) params.set("year", year);
+  if (type) params.set("type", type);
+  if (certification) params.set("cert", certification);
+  if (origin) {
+    return `${origin.replace(/\/+$/, "")}/api/safe-poster?${params.toString()}`;
+  }
+  return `/api/safe-poster?${params.toString()}`;
+}
+
+function applyAdultContentFilterToMetas(metas, origin, parentEntry) {
+  if (!Array.isArray(metas) || !metas.length) return metas;
+  const isParentAdult = parentEntry && isAdultOrNsfw(parentEntry);
+  const tot = metas.totalItems;
+  const mapped = metas.map((m) => {
+    if (!m) return m;
+    const isAdult = isParentAdult || isAdultOrNsfw(m);
+    if (!isAdult) return m;
+    const safeUrl = getSafePosterUrl(origin, {
+      title: m.name || m.title || '',
+      year: m.releaseInfo || (m.year ? String(m.year) : ''),
+      type: m.type || m.mediatype || '',
+      certification: m.certification || m.ageRating || m.contentRating || ''
+    });
+    return {
+      ...m,
+      adult: true,
+      isAdult: true,
+      poster: safeUrl,
+      isAdultPosterFiltered: true,
+    };
+  });
+  mapped.totalItems = tot;
+  return mapped;
+}
+
 function applyBadgedPostersToMetas(metas, origin) {
   if (!Array.isArray(metas) || !metas.length || !origin) return metas;
   const tot = metas.totalItems;
   const mapped = metas.map((m) => {
-    if (!m || !m.poster || m.poster.startsWith("data:image/svg") || m.poster.includes("/api/poster-badge")) return m;
+    if (!m || !m.poster || m.poster.startsWith("data:image/svg") || m.poster.includes("/api/poster-badge") || m.poster.includes("/api/safe-poster")) return m;
     const isPremiereEp = m.episodeNumber === 1 || m.episodeNum === 1 || (m.episodeNum == null && m.episodeNumber == null);
     const hasAired = m.airDate && typeof isEpisodeAired === "function" ? isEpisodeAired(m.airDate) : false;
     const hasPremiere = !!(m.isSeasonPremiere && isPremiereEp && !hasAired);
@@ -10830,7 +11027,8 @@ function applyBadgedPostersToMetas(metas, origin) {
     const finaleAired = m.seasonFinaleAirDate && typeof isEpisodeAired === "function" ? isEpisodeAired(m.seasonFinaleAirDate) : false;
     const hasFinaleDate = !!(m.seasonFinaleAirDate && !finaleAired);
     const hasAirDate = !!(m.airDate && !m.hideDateBadge && !hasAired);
-    if (!hasPremiere && !hasFinale && !hasFinaleDate && !hasAirDate) return m;
+    const hasCompanion = !!(m.isCompanion);
+    if (!hasPremiere && !hasFinale && !hasFinaleDate && !hasAirDate && !hasCompanion) return m;
 
     const params = new URLSearchParams();
     params.set("poster", m.poster);
@@ -10840,6 +11038,10 @@ function applyBadgedPostersToMetas(metas, origin) {
     if (hasPremiere) params.set("premiere", "1");
     if (hasFinale) params.set("finale", "1");
     if (hasFinaleDate) params.set("finaleDate", m.seasonFinaleAirDate);
+    if (hasCompanion) {
+      const compLabel = m.companionType === 'bridge_movie' ? 'Bridge Movie' : (m.companionType === 'sequel_movie' ? 'Sequel Film' : 'Storyline');
+      params.set("companion", compLabel);
+    }
 
     const badgedUrl = `${origin.replace(/\/+$/, "")}/api/poster-badge?${params.toString()}`;
     return {
@@ -11287,6 +11489,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
   
   try {
     let items;
+    let airingItems;
     if (env && env.DB) {
       if (slug === 'watch-history') {
         const rows = await env.DB.prepare(
@@ -11310,22 +11513,88 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
           }));
         }
       } else if (slug === 'continue-watching') {
-        const rows = await env.DB.prepare(
-          "SELECT * FROM continue_watching WHERE username = ? ORDER BY updated_at DESC LIMIT 100"
-        ).bind(username).all().then(r => r.results || []).catch(() => null);
+        const [rows, airingRows, fwRows] = await Promise.all([
+          env.DB.prepare(
+            "SELECT * FROM continue_watching WHERE username = ? ORDER BY updated_at DESC LIMIT 100"
+          ).bind(username).all().then(r => r.results || []).catch(() => null),
+          env.DB.prepare(
+            "SELECT * FROM airing_next WHERE username = ? ORDER BY air_date ASC LIMIT 100"
+          ).bind(username).all().then(r => r.results || []).catch(() => null),
+          env.DB.prepare(
+            "SELECT show_id FROM creator_show_states WHERE username = ? AND is_fully_watched = 1"
+          ).bind(username).all().then(r => r.results || []).catch(() => null),
+        ]);
+        const fullyWatchedSet = new Set((fwRows || []).map(r => String(r.show_id)));
         if (rows && rows.length) {
-          items = rows.map(r => ({
-            id: r.item_id,
-            showId: r.show_id,
-            type: "episode",
-            name: r.name || undefined,
-            poster: r.poster || undefined,
-            showTitle: r.show_title || undefined,
-            showPoster: r.show_poster || undefined,
-            seasonNum: r.season_num != null ? r.season_num : undefined,
-            episodeNum: r.episode_num != null ? r.episode_num : undefined,
-            updatedAt: r.updated_at,
-          }));
+          items = rows.filter(r => {
+            if (!r) return false;
+            const sid = String(r.show_id || '');
+            const base = sid.split(':')[0];
+            const isComp = r.show_title && r.show_title.startsWith('COMPANION:');
+            if (!isComp && (fullyWatchedSet.has(sid) || (base && fullyWatchedSet.has(base)))) return false;
+            return true;
+          }).map(r => {
+            let isCompanion = undefined;
+            let companionType = undefined;
+            let companionNote = undefined;
+            let companionStoryline = undefined;
+            let precedingShowId = undefined;
+            let showTitle = r.show_title || undefined;
+            let kind = undefined;
+            let type = (r.season_num == null && r.episode_num == null && !r.show_title) ? "movie" : "episode";
+            if (r.show_title && r.show_title.startsWith("COMPANION:")) {
+              try {
+                const compMeta = JSON.parse(r.show_title.slice(10));
+                isCompanion = true;
+                companionType = compMeta.companionType;
+                companionNote = compMeta.companionNote;
+                companionStoryline = compMeta.companionStoryline;
+                precedingShowId = compMeta.precedingShowId;
+                showTitle = compMeta.showTitle || undefined;
+                kind = compMeta.kind || (compMeta.type === 'movie' ? 'movie' : undefined);
+                type = compMeta.type || (kind === 'movie' ? 'movie' : 'episode');
+              } catch {}
+            } else if (type === "movie") {
+              kind = "movie";
+            }
+            return {
+              id: r.item_id,
+              showId: (type === 'movie' && !r.season_num && !r.episode_num && !showTitle) ? undefined : r.show_id,
+              type: type,
+              kind: kind,
+              name: r.name || undefined,
+              poster: r.poster || undefined,
+              showTitle: showTitle,
+              showPoster: r.show_poster || undefined,
+              seasonNum: r.season_num != null ? r.season_num : undefined,
+              episodeNum: r.episode_num != null ? r.episode_num : undefined,
+              updatedAt: r.updated_at,
+              isCompanion: isCompanion,
+              companionType: companionType,
+              companionNote: companionNote,
+              companionStoryline: companionStoryline,
+              precedingShowId: precedingShowId,
+            };
+          });
+          if (airingRows && airingRows.length) {
+            airingItems = airingRows.map(r => ({
+              id: r.item_id,
+              showId: r.show_id,
+              type: "episode",
+              name: r.name || undefined,
+              poster: r.poster || undefined,
+              showTitle: r.show_title || undefined,
+              showPoster: r.show_poster || undefined,
+              seasonNum: r.season_num != null ? r.season_num : undefined,
+              episodeNum: r.episode_num != null ? r.episode_num : undefined,
+              airDate: r.air_date || undefined,
+              isSeasonPremiere: r.is_season_premiere ? true : undefined,
+              isSeasonFinale: r.is_season_finale ? true : undefined,
+              seasonFinaleAirDate: r.season_finale_air_date || undefined,
+              seasonFinaleEpisodeNumber: r.season_finale_episode_number != null ? r.season_finale_episode_number : undefined,
+              updatedAt: r.updated_at,
+            }));
+          }
         }
       } else if (slug === 'airing-next') {
         const rows = await env.DB.prepare(
@@ -11361,15 +11630,60 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       if (trackingRaw) {
         const trackingBlob = JSON.parse(trackingRaw);
         items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
+        if (slug === 'continue-watching') {
+          airingItems = trackingBlob.airingNext || [];
+          const fwList = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds.map(String) : [];
+          if (fwList.length && Array.isArray(items)) {
+            const fwSet = new Set(fwList);
+            items = items.filter(it => {
+              if (!it) return false;
+              if (it.isCompanion) return true;
+              const sid = String(it.showId || it.id || '');
+              const base = sid.split(':')[0];
+              if (fwSet.has(sid) || (base && fwSet.has(base))) return false;
+              return true;
+            });
+          }
+        }
       } else {
         const blobStr = await env.CONFIGS.get('creatorsync:' + username);
         if (!blobStr) return [];
         const blob = JSON.parse(blobStr);
         items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
+        if (slug === 'continue-watching') {
+          airingItems = blob.airingNext || [];
+          const fwList = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds.map(String) : [];
+          if (fwList.length && Array.isArray(items)) {
+            const fwSet = new Set(fwList);
+            items = items.filter(it => {
+              if (!it) return false;
+              if (it.isCompanion) return true;
+              const sid = String(it.showId || it.id || '');
+              const base = sid.split(':')[0];
+              if (fwSet.has(sid) || (base && fwSet.has(base))) return false;
+              return true;
+            });
+          }
+        }
       }
     }
     if (!items || !items.length) return [];
     
+    const airingByShowId = new Map();
+    const airingByBaseId = new Map();
+    const airingByTitle = new Map();
+    if (slug === 'continue-watching' && Array.isArray(airingItems) && airingItems.length) {
+      airingItems.forEach(an => {
+        if (!an) return;
+        const sid = String(an.showId || an.id || '');
+        if (sid && !airingByShowId.has(sid)) airingByShowId.set(sid, an);
+        const base = sid.split(':')[0];
+        if (base && !airingByBaseId.has(base)) airingByBaseId.set(base, an);
+        const title = String(an.showTitle || an.title || an.name || '').toLowerCase().trim();
+        if (title && !airingByTitle.has(title)) airingByTitle.set(title, an);
+      });
+    }
+
     const mappedItems = [];
     
     items.forEach(it => {
@@ -11388,8 +11702,9 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       //
       // A real movie entry has none of these fields, so it still falls
       // through to the type/kind check exactly as before.
-      const hasSeriesShape = !!(it.showId || it.showTitle || it.seasonNum != null || it.episodeNum != null);
-      const isMovie = !hasSeriesShape && (it.kind === 'movie' || it.type === 'movie');
+      const isCompanionMovie = !!(it.isCompanion && (it.kind === 'movie' || it.type === 'movie' || it.companionType === 'bridge_movie' || it.companionType === 'sequel_movie'));
+      const hasSeriesShape = !isCompanionMovie && !!(it.showId || it.showTitle || it.seasonNum != null || it.episodeNum != null);
+      const isMovie = isCompanionMovie || (!hasSeriesShape && (it.kind === 'movie' || it.type === 'movie'));
       
       // Filter out types we don't want in this catalog
       if (targetType === 'movie' && !isMovie) return;
@@ -11401,6 +11716,64 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         : (it.showPoster ||
            (showId && showId.startsWith('tt') ? 'https://images.metahub.space/poster/medium/' + showId + '/img' : '') ||
            it.poster);
+
+      let effectiveAirDate = it.airDate || undefined;
+      let isSeasonPremiere = it.isSeasonPremiere ? true : undefined;
+      let isSeasonFinale = it.isSeasonFinale ? true : undefined;
+      let seasonFinaleAirDate = it.seasonFinaleAirDate || undefined;
+      let seasonFinaleEpisodeNumber = it.seasonFinaleEpisodeNumber != null ? it.seasonFinaleEpisodeNumber : undefined;
+
+      if (slug === 'continue-watching' && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
+        let airingMatch = null;
+        if (it.showId && airingByShowId.has(String(it.showId))) airingMatch = airingByShowId.get(String(it.showId));
+        else if (it.id && airingByShowId.has(String(it.id))) airingMatch = airingByShowId.get(String(it.id));
+        else {
+          const base = String(it.showId || it.id || '').split(':')[0];
+          if (base && airingByBaseId.has(base)) airingMatch = airingByBaseId.get(base);
+          else {
+            const title = String(it.showTitle || it.title || it.name || '').toLowerCase().trim();
+            if (title && airingByTitle.has(title)) airingMatch = airingByTitle.get(title);
+          }
+        }
+
+        if (airingMatch) {
+          const isOlderSeason = !!(airingMatch.seasonNum != null && it.seasonNum != null && it.seasonNum < airingMatch.seasonNum);
+          if (!isOlderSeason) {
+            const isSameSeason = !!(airingMatch.seasonNum != null && it.seasonNum != null && it.seasonNum === airingMatch.seasonNum);
+            const isSameEpisode = (!it.seasonNum || !airingMatch.seasonNum || it.seasonNum === airingMatch.seasonNum) &&
+              (!it.episodeNum || !airingMatch.episodeNum || it.episodeNum === airingMatch.episodeNum);
+            if (!effectiveAirDate && isSameEpisode && airingMatch.airDate) {
+              effectiveAirDate = airingMatch.airDate;
+            }
+            const currentEpNum = it.episodeNum != null ? it.episodeNum : (isSameEpisode ? airingMatch.episodeNum : null);
+            const hasLaterAiringEp = !!(isSameSeason && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
+            const epHasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' && isEpisodeAired(effectiveAirDate));
+            if (isSeasonPremiere == null) {
+              const isPremiere = !epHasAired && (currentEpNum === 1 || (currentEpNum == null && (it.isSeasonPremiere || (isSameEpisode && airingMatch.isSeasonPremiere))));
+              if (isPremiere) isSeasonPremiere = true;
+            } else if (epHasAired) {
+              isSeasonPremiere = undefined;
+            }
+            if (isSeasonFinale == null) {
+              const isFinale = !!(it.isSeasonFinale || (isSameEpisode && airingMatch.isSeasonFinale) || (airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
+              if (isFinale) isSeasonFinale = true;
+            }
+            if (!seasonFinaleAirDate) {
+              seasonFinaleAirDate = it.seasonFinaleAirDate || (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : undefined));
+            }
+            if (seasonFinaleEpisodeNumber == null) {
+              seasonFinaleEpisodeNumber = airingMatch.seasonFinaleEpisodeNumber;
+            }
+          } else {
+            effectiveAirDate = undefined;
+            isSeasonPremiere = undefined;
+            isSeasonFinale = undefined;
+            seasonFinaleAirDate = undefined;
+            seasonFinaleEpisodeNumber = undefined;
+          }
+        }
+      }
+
       const mapped = {
         id: isMovie ? (it.imdbId || it.id) : (showId || it.id),
         showId: showId || undefined,
@@ -11411,12 +11784,21 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         name: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
         poster: showPoster,
         releaseInfo: it.year || undefined,
-        airDate: it.airDate || undefined,
+        airDate: effectiveAirDate,
         isUnaired: it.isUnaired ? true : undefined,
-        isSeasonPremiere: it.isSeasonPremiere ? true : undefined,
-        isSeasonFinale: it.isSeasonFinale ? true : undefined,
-        seasonFinaleAirDate: it.seasonFinaleAirDate || undefined,
-        seasonFinaleEpisodeNumber: it.seasonFinaleEpisodeNumber || undefined,
+        isSeasonPremiere: isSeasonPremiere,
+        isSeasonFinale: isSeasonFinale,
+        seasonFinaleAirDate: seasonFinaleAirDate,
+        seasonFinaleEpisodeNumber: seasonFinaleEpisodeNumber,
+        isCompanion: it.isCompanion ? true : undefined,
+        companionType: it.companionType || undefined,
+        companionNote: it.companionNote || undefined,
+        companionStoryline: it.companionStoryline || undefined,
+        precedingShowId: it.precedingShowId || undefined,
+        adult: it.adult,
+        isAdult: it.isAdult,
+        certification: it.certification || it.ageRating || it.contentRating,
+        genres: it.genres,
       };
       
       if (!mapped.id) return;
@@ -11430,6 +11812,9 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       }
     });
     
+    if (keys && keys.adultContentFilter && Array.isArray(mappedItems) && mappedItems.length > 0) {
+      return applyAdultContentFilterToMetas(mappedItems, keys.origin, entry);
+    }
     return mappedItems;
   } catch (e) {
     return [];
@@ -11696,6 +12081,9 @@ function extractMdblistItem(it) {
   }
   const showPoster = inner.poster || it.poster || (rawImdb ? `https://images.metahub.space/poster/medium/${rawImdb}/img` : undefined);
   const poster = isEpisode ? (ep && (ep.poster || ep.still) || showPoster) : showPoster;
+  const isItemAdult = it.adult === true || inner.adult === true || it.is_adult === true || inner.is_adult === true;
+  const itemGenres = it.genres || inner.genres || undefined;
+  const itemCert = it.certification || inner.certification || it.age_rating || inner.age_rating || undefined;
   const releaseYear = inner.release_year || inner.year || it.release_year || it.year || undefined;
   return {
     id: rawId,
@@ -11708,6 +12096,10 @@ function extractMdblistItem(it) {
     releaseInfo: releaseYear ? String(releaseYear) : undefined,
     season: ep ? (ep.season || 1) : undefined,
     episode: ep ? (ep.number || ep.episode || 1) : undefined,
+    adult: isItemAdult ? true : undefined,
+    isAdult: isItemAdult ? true : undefined,
+    genres: itemGenres,
+    certification: itemCert,
   };
 }
 
@@ -11782,6 +12174,10 @@ function mapMdblistItems(data, type) {
         releaseInfo: it.releaseInfo,
         season: it.season,
         episode: it.episode,
+        adult: it.adult === true || it.isAdult === true ? true : undefined,
+        isAdult: it.adult === true || it.isAdult === true ? true : undefined,
+        genres: it.genres,
+        certification: it.certification,
       };
     });
 }
@@ -11850,7 +12246,7 @@ function withTraktTotal(metas, totalItems) {
 }
 
 async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = null) {
-  const src = mdblistJsonUrl(entry.url, mdblistKey);
+  const src = mdblistJsonUrl(entry.url, mdblistKey, entry.type);
   if (!src) {
     throw new Error(
       "Couldn't parse that as an mdblist.com list URL (expected .../lists/user/listname)."
@@ -11871,7 +12267,7 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = 
     kvTtlSec: 86400,
     providerLabel: "MDBList",
     fetchFn: async () => {
-      const res = await fetch(src, {
+      let res = await fetch(src, {
         headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
         cf: { cacheTtl: 600, cacheEverything: true },
       });
@@ -11886,7 +12282,8 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = 
         throw new Error(`MDBList request failed (HTTP ${res.status}).${hint}`);
       }
 
-      const data = await res.json();
+      let data = await res.json();
+
       const metas = mapMdblistItems(data, entry.type);
       const total = metas.length;
       const enriched = await enrichTrailers(metas.slice(skip, skip + PAGE_SIZE), entry.type, TMDB_API_KEY);
@@ -12061,16 +12458,28 @@ async function fetchMdblistHistory(entry, skip = 0, mdblistKey = "", mdblistAcce
 // back to treating the item itself as the movie/show object.
 function mapTraktItems(data, type) {
   const items = Array.isArray(data) ? data : [];
-  return items
-    .map((it) => it.movie || it.show || it)
-    .filter((it) => it && it.ids && it.ids.imdb)
-    .map((it) => ({
-      id: it.ids.imdb,
-      type,
-      name: it.title,
-      poster: `https://images.metahub.space/poster/medium/${it.ids.imdb}/img`,
-      releaseInfo: it.year ? String(it.year) : undefined,
-    }));
+  const seen = new Set();
+  const res = [];
+  for (const it of items) {
+    const obj = it.movie || it.show || it;
+    if (!obj || !obj.ids) continue;
+    const effectiveId = obj.ids.imdb || (obj.ids.tmdb ? `tmdb:${obj.ids.tmdb}` : "");
+    if (!effectiveId || seen.has(effectiveId)) continue;
+    seen.add(effectiveId);
+    const isItemAdult = it.adult === true || obj.adult === true;
+    res.push({
+      id: effectiveId,
+      type: it.movie ? "movie" : (it.show ? "series" : type),
+      name: obj.title,
+      poster: effectiveId.startsWith("tt") ? `https://images.metahub.space/poster/medium/${effectiveId}/img` : undefined,
+      releaseInfo: obj.year ? String(obj.year) : undefined,
+      adult: isItemAdult ? true : undefined,
+      isAdult: isItemAdult ? true : undefined,
+      genres: it.genres || obj.genres || undefined,
+      certification: it.certification || obj.certification || undefined,
+    });
+  }
+  return res;
 }
 
 // Pulls a public trakt.tv list via the official REST API. Trakt paginates
@@ -12098,11 +12507,12 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
     );
   }
 
-  const itemKind = entry.type === "series" ? "shows" : "movies";
+  const itemKind = entry.type === "series" ? "shows,seasons,episodes" : (entry.type === "mixed" ? "" : "movies");
+  const kindPath = itemKind ? `/${itemKind}` : "";
   const page = Math.floor(skip / PAGE_SIZE) + 1;
   const src = `https://api.trakt.tv/users/${encodeURIComponent(
     parsed.user
-  )}/lists/${encodeURIComponent(parsed.list)}/items/${itemKind}?limit=${PAGE_SIZE}&page=${page}`;
+  )}/lists/${encodeURIComponent(parsed.list)}/items${kindPath}?limit=${PAGE_SIZE}&page=${page}`;
 
   const headers = {
     "Content-Type": "application/json",
@@ -12113,8 +12523,8 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
   if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
 
   const userHash = accessToken ? safeUserHash(accessToken, parsed.user) : "public";
-  const cacheKey = `user_cache:trakt:list:${parsed.user}:${parsed.list}:${itemKind}:${skip}:${userHash}`;
-  const kvKey = !accessToken ? `trakt:list:${parsed.user}:${parsed.list}:${itemKind}:${page}` : "";
+  const cacheKey = `user_cache:trakt:list:${parsed.user}:${parsed.list}:${itemKind || "all"}:${skip}:${userHash}`;
+  const kvKey = !accessToken ? `trakt:list:${parsed.user}:${parsed.list}:${itemKind || "all"}:${page}` : "";
 
   const data = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
@@ -12126,10 +12536,21 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
     kvTtlSec: 86400,
     providerLabel: "Trakt List",
     fetchFn: async () => {
-      const res = await fetchTraktWithRetry(src, {
+      let res = await fetchTraktWithRetry(src, {
         headers,
         cf: accessToken ? { cacheTtl: 0, cacheEverything: false } : { cacheTtl: 1200, cacheEverything: true },
       });
+      if (!res.ok && accessToken && (res.status === 401 || res.status === 403)) {
+        const pubHeaders = Object.assign({}, headers);
+        delete pubHeaders["Authorization"];
+        const pubRes = await fetchTraktWithRetry(src, {
+          headers: pubHeaders,
+          cf: { cacheTtl: 1200, cacheEverything: true },
+        });
+        if (pubRes.ok) {
+          res = pubRes;
+        }
+      }
       if (!res.ok) {
         const hint =
           res.status === 404
@@ -13037,7 +13458,9 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
       Array.isArray(r.release_dates) && r.release_dates.some((rd) => rd.type === 4 || rd.type === 5)
     );
   }
-  const result = { imdbId, videos, hasDigitalRelease };
+  const adult = data.adult === true || data.is_adult === true;
+  const genres = Array.isArray(data.genres) ? data.genres.map((g) => (typeof g === "string" ? g : g.name || "")) : undefined;
+  const result = { imdbId, videos, hasDigitalRelease, adult, genres };
   // Cache for 7 days (604800s)
   setPerUserCache(cacheKey, result, 604800, 2592000);
 
@@ -13177,8 +13600,8 @@ async function fetchTmdb(entry, skip = 0, apiKey = "") {
 
   const resolved = await mapWithConcurrency(page, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
     const { imdbId, videos } = await fetchTmdbDetails(it.id, wantKind, apiKey);
-    if (!imdbId) return null;
-    return mapTmdbItem(it, imdbId, entry.type, videos);
+    const effectiveId = imdbId || ("tmdb:" + it.id);
+    return mapTmdbItem(it, effectiveId, entry.type, videos);
   });
 
   const out = resolved.filter(Boolean);
@@ -13231,15 +13654,17 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "", env = null, ctx
 
       const data = await res.json();
       const parts = Array.isArray(data.parts) ? data.parts : [];
+      const isCollectionAdult = data.adult === true || (typeof isAdultOrNsfw === "function" && isAdultOrNsfw({ name: data.name, title: data.name, franchise: data.name }));
       
       // Sort chronologically by release date
       parts.sort((a, b) => (a.release_date || "9999").localeCompare(b.release_date || "9999"));
 
       const windowItems = parts.slice(skip, skip + PAGE_SIZE);
       const resolved = await mapWithConcurrency(windowItems, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
-        const { imdbId, videos } = await fetchTmdbDetails(it.id, "movie", apiKey);
-        if (!imdbId) return null;
-        return mapTmdbItem(it, imdbId, "movie", videos);
+        const details = await fetchTmdbDetails(it.id, "movie", apiKey);
+        const effectiveId = details.imdbId || ("tmdb:" + it.id);
+        if (isCollectionAdult && !it.adult) it.adult = true;
+        return mapTmdbItem(it, effectiveId, "movie", details.videos, details);
       });
 
       // The whole collection came back in one response, so its size is
@@ -13257,7 +13682,7 @@ async function fetchTmdbCollection(entry, skip = 0, apiKey = "", env = null, ctx
 // obscure titles more reliably than metahub.space's IMDB-keyed poster
 // database -- preferred over metahub, with metahub only as a fallback for
 // the rare item missing a poster_path.
-function mapTmdbItem(it, imdbId, type, videos) {
+function mapTmdbItem(it, imdbId, type, videos, extraDetails) {
   let poster = undefined;
   if (it.poster_path) {
     poster = `https://image.tmdb.org/t/p/w500${it.poster_path}`;
@@ -13266,6 +13691,7 @@ function mapTmdbItem(it, imdbId, type, videos) {
   } else if (imdbId && String(imdbId).startsWith("tt")) {
     poster = `https://images.metahub.space/poster/medium/${imdbId}/img`;
   }
+  const isAdult = it.adult === true || it.is_adult === true || it.isAdult === true || (extraDetails && (extraDetails.adult === true || extraDetails.isAdult === true)) || (typeof isAdultOrNsfw === "function" && (isAdultOrNsfw(it) || (extraDetails && isAdultOrNsfw(extraDetails))));
   return {
     id: imdbId,
     type,
@@ -13274,6 +13700,10 @@ function mapTmdbItem(it, imdbId, type, videos) {
     background: it.backdrop_path ? `https://image.tmdb.org/t/p/w1280${it.backdrop_path}` : undefined,
     releaseInfo: (it.release_date || it.first_air_date || "").slice(0, 4) || undefined,
     trailerStreams: trailerStreamsFor(pickTrailerKey(videos)),
+    adult: isAdult ? true : undefined,
+    isAdult: isAdult ? true : undefined,
+    genres: it.genres || (extraDetails && extraDetails.genres) || (Array.isArray(it.genre_ids) ? it.genre_ids : undefined),
+    certification: it.certification || (extraDetails && extraDetails.certification) || undefined,
   };
 }
 
@@ -13755,6 +14185,304 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
   return res;
 }
 
+// --- Anime Unpacking & Multi-Season Parts Resolution -------------------------
+// Fixes TMDB cataloging that compresses multi-season anime (e.g. MASHLE 24 eps,
+// Re:ZERO 85 eps, Jujutsu Kaisen 59 eps) into a single monolithic season.
+// Restores true seasonal divisions using TMDB Episode Groups with seamless
+// Cinemeta fallback for Stremio stream compatibility.
+
+const ANIME_UNPACK_EXCLUDE_RE = /edit|re-?cut|director'?s|deleted|alternat|chronolog|dvd|broadcast|air.?date|absolut|special|trailer|extra|\bova\b|\boad\b|production/i;
+const ANIME_UNPACK_ORIGINAL_RE = /original/i;
+const ANIME_UNPACK_PART_RE = /part/i;
+const ANIME_UNPACK_SEASON_RE = /seasons?/i;
+
+function pickDefaultEpisodeGroupId(groups, standardSeasonCount, standardEpisodeCount, totalEpisodeCountWithSpecials) {
+  if (!groups || !Array.isArray(groups) || groups.length === 0) return null;
+  if (!(standardSeasonCount > 0) || !(standardEpisodeCount > 0)) return null;
+  let best = null;
+  for (const g of groups) {
+    if (!g || !g.id) continue;
+    const gc = typeof g.group_count === "number" ? g.group_count : 0;
+    const ec = typeof g.episode_count === "number" ? g.episode_count : 0;
+    if (gc <= 1 || ec <= 0) continue;
+    if (gc === standardSeasonCount) continue;
+    const matchRegular = ec === standardEpisodeCount;
+    const matchWithSpecials =
+      typeof totalEpisodeCountWithSpecials === "number" &&
+      totalEpisodeCountWithSpecials > standardEpisodeCount &&
+      (ec === totalEpisodeCountWithSpecials ||
+        (ec > standardEpisodeCount && Math.abs(ec - totalEpisodeCountWithSpecials) <= 15));
+    if (!matchRegular && !matchWithSpecials) continue;
+    const text = `${g.name || ""} ${g.description || ""}`;
+    if (ANIME_UNPACK_EXCLUDE_RE.test(g.name || "")) continue;
+    if (standardSeasonCount > 1 && /volum/i.test(g.name || "")) continue;
+    let score = 0;
+    if (g.type === 1) score += 3;
+    if (standardSeasonCount > 1) {
+      if (ANIME_UNPACK_PART_RE.test(text)) {
+        score += 2;
+        if (ANIME_UNPACK_ORIGINAL_RE.test(text)) score += 3;
+      }
+    } else {
+      if (ANIME_UNPACK_ORIGINAL_RE.test(text)) score += 3;
+      if (ANIME_UNPACK_PART_RE.test(text)) score += 2;
+      if (ANIME_UNPACK_SEASON_RE.test(text)) score += 3;
+    }
+    if (score === 0) continue;
+    if (!best || score > best.score) best = { id: g.id, score };
+  }
+  return best ? best.id : null;
+}
+
+function resolveGroupSeasonNumber(grp, idx, sorted, hasZero, hasSpecials) {
+  if (typeof grp.order === "number") {
+    if (hasSpecials && (grp.name || "").toLowerCase().includes("special") && grp.order === 0) return 0;
+    if (hasZero) return hasSpecials ? grp.order : grp.order + 1;
+    return grp.order;
+  }
+  return idx + 1;
+}
+
+function unpackEpisodeGroupDetails(groupDetails) {
+  if (!groupDetails || !Array.isArray(groupDetails.groups) || groupDetails.groups.length === 0) return null;
+  const groups = groupDetails.groups;
+  const sorted = [...groups].sort((a, b) => (typeof a.order === "number" ? a.order : 0) - (typeof b.order === "number" ? b.order : 0));
+  const hasZero = sorted.some((g) => g.order === 0);
+  const hasSpecials = sorted.some((g) => (g.name || "").toLowerCase().includes("special"));
+
+  const seasons = [];
+  const episodesBySeason = {};
+
+  for (let gIdx = 0; gIdx < sorted.length; gIdx++) {
+    const grp = sorted[gIdx];
+    const sNum = resolveGroupSeasonNumber(grp, gIdx, sorted, hasZero, hasSpecials);
+    const rawEps = Array.isArray(grp.episodes) ? grp.episodes : [];
+    const sortedEps = [...rawEps].sort((a, b) => (typeof a.order === "number" ? a.order : 0) - (typeof b.order === "number" ? b.order : 0));
+    
+    const epList = [];
+    for (let epIdx = 0; epIdx < sortedEps.length; epIdx++) {
+      const ep = sortedEps[epIdx];
+      const epNum = typeof ep.order === "number" ? ep.order + 1 : epIdx + 1;
+      epList.push({
+        id: ep.id || (sNum * 1000 + epNum),
+        episode_number: epNum,
+        name: ep.name || `Episode ${epNum}`,
+        overview: ep.overview || "",
+        runtime: ep.runtime || null,
+        air_date: ep.air_date || null,
+        vote_average: typeof ep.vote_average === "number" ? ep.vote_average : null,
+        still_path: ep.still_path ? (ep.still_path.startsWith("http") ? ep.still_path : ("https://image.tmdb.org/t/p/w500" + ep.still_path)) : null,
+      });
+    }
+
+    episodesBySeason[sNum] = epList;
+    if (sNum > 0) {
+      seasons.push({
+        season_number: sNum,
+        season: sNum,
+        name: grp.name || `Season ${sNum}`,
+        episode_count: epList.length,
+        episodeCount: epList.length,
+      });
+    }
+  }
+
+  if (seasons.length <= 1) return null;
+  return { seasons, episodesBySeason, groupId: groupDetails.id };
+}
+
+async function fetchCinemetaSeriesUnpacked(imdbId) {
+  const cleanId = String(imdbId || "").split(":")[0].trim();
+  if (!cleanId.startsWith("tt")) return null;
+  try {
+    const res = await fetch(`https://v3-cinemeta.strem.io/meta/series/${encodeURIComponent(cleanId)}.json`, {
+      headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+      cf: { cacheTtl: 604800, cacheEverything: true },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const videos = (data && data.meta && Array.isArray(data.meta.videos)) ? data.meta.videos : [];
+    if (videos.length === 0) return null;
+
+    const seasonMap = {};
+    for (const v of videos) {
+      if (typeof v.season !== "number" || typeof v.episode !== "number") continue;
+      if (!seasonMap[v.season]) seasonMap[v.season] = [];
+      seasonMap[v.season].push(v);
+    }
+
+    const regSeasons = Object.keys(seasonMap).map(Number).filter((s) => s > 0).sort((a, b) => a - b);
+    if (regSeasons.length <= 1) return null;
+
+    const seasons = [];
+    const episodesBySeason = {};
+
+    for (const sNum of regSeasons) {
+      const vList = seasonMap[sNum].sort((a, b) => a.episode - b.episode);
+      // Skip placeholder / dummy unreleased seasons (e.g. Cinemeta stub season with no air date and <= 1 episode)
+      const hasAnyAired = vList.some((v) => v.released || v.firstAired);
+      if (!hasAnyAired && sNum > 1 && vList.length <= 1) continue;
+
+      const epList = vList.map((v) => ({
+        id: v.tvdb_id || (sNum * 1000 + v.episode),
+        episode_number: v.episode,
+        name: v.title || v.name || `Episode ${v.episode}`,
+        overview: v.overview || v.description || "",
+        runtime: null,
+        air_date: v.released ? v.released.slice(0, 10) : (v.firstAired ? v.firstAired.slice(0, 10) : null),
+        vote_average: null,
+        still_path: v.thumbnail || null,
+      }));
+      episodesBySeason[sNum] = epList;
+      seasons.push({
+        season_number: sNum,
+        season: sNum,
+        name: `Season ${sNum}`,
+        episode_count: epList.length,
+        episodeCount: epList.length,
+      });
+    }
+
+    if (seasons.length <= 1) return null;
+
+    return { seasons, episodesBySeason, source: "cinemeta" };
+  } catch {
+    return null;
+  }
+}
+
+const UNPACKED_SHOW_CACHE = new Map();
+const UNPACKED_SHOW_TTL_MS = 6 * 60 * 60 * 1000;
+const UNPACKED_SHOW_MAX = 500;
+
+function getUnpackedCache(key) {
+  const e = UNPACKED_SHOW_CACHE.get(key);
+  if (!e || Date.now() > e.expiry) {
+    if (e) UNPACKED_SHOW_CACHE.delete(key);
+    return null;
+  }
+  return e.data;
+}
+
+function setUnpackedCache(key, data) {
+  if (UNPACKED_SHOW_CACHE.size >= UNPACKED_SHOW_MAX) {
+    const oldest = UNPACKED_SHOW_CACHE.keys().next().value;
+    if (oldest !== undefined) UNPACKED_SHOW_CACHE.delete(oldest);
+  }
+  UNPACKED_SHOW_CACHE.set(key, { data, expiry: Date.now() + UNPACKED_SHOW_TTL_MS });
+}
+
+async function resolveUnpackedShowData(tmdbId, imdbId, standardSeasons, apiKey, env = null, ctx = null, preloadedGroups = null, meter = null) {
+  const spend = () => { if (meter && typeof meter.spent === "number") meter.spent++; };
+  const cleanTmdbId = tmdbId ? String(tmdbId).replace(/^tmdb:/, "").trim() : "";
+  const cleanImdbId = imdbId ? String(imdbId).split(":")[0].trim() : "";
+  const cacheKey = cleanTmdbId || cleanImdbId;
+  if (!cacheKey) return null;
+
+  const mem = getUnpackedCache(cacheKey);
+  if (mem) return mem;
+
+  if (env && env.CONFIGS) {
+    try {
+      const kv = await env.CONFIGS.get(`unpacked_show:${cacheKey}`);
+      if (kv) {
+        const parsed = JSON.parse(kv);
+        setUnpackedCache(cacheKey, parsed);
+        return parsed;
+      }
+    } catch {}
+  }
+
+  let effectiveSeasons = standardSeasons;
+  let groups = preloadedGroups;
+
+  // If standardSeasons not passed and we have TMDB ID + key, load show info
+  if (!effectiveSeasons && cleanTmdbId && apiKey) {
+    try {
+      spend();
+      const sRes = await fetch(`https://api.themoviedb.org/3/tv/${cleanTmdbId}?api_key=${encodeURIComponent(apiKey)}&append_to_response=episode_groups`, {
+        headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+        cf: { cacheTtl: 604800, cacheEverything: true },
+      });
+      if (sRes.ok) {
+        const sData = await sRes.json();
+        effectiveSeasons = sData.seasons;
+        if (!groups && sData.episode_groups && Array.isArray(sData.episode_groups.results)) {
+          groups = sData.episode_groups.results;
+        }
+      }
+    } catch {}
+  }
+
+  const regSeasons = Array.isArray(effectiveSeasons) ? effectiveSeasons.filter((s) => s && s.season_number > 0) : [];
+  const standardSeasonCount = regSeasons.length;
+  const standardEpisodeCount = regSeasons.reduce((sum, s) => sum + (s.episode_count || 0), 0);
+  const totalEpisodeCountWithSpecials = Array.isArray(effectiveSeasons)
+    ? effectiveSeasons.reduce((sum, s) => sum + (s.episode_count || 0), 0)
+    : standardEpisodeCount;
+
+  // Only unpack if the show has exactly 1 regular season with multiple episodes
+  if (standardSeasonCount !== 1 || standardEpisodeCount <= 1) {
+    return null;
+  }
+
+  let unpacked = null;
+
+  // 1. Try TMDB Episode Groups
+  if (cleanTmdbId && apiKey) {
+    try {
+      if (!groups || (Array.isArray(groups) && groups.length === 0)) {
+        spend();
+        const egRes = await fetch(`https://api.themoviedb.org/3/tv/${cleanTmdbId}/episode_groups?api_key=${encodeURIComponent(apiKey)}`, {
+          headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+          cf: { cacheTtl: 604800, cacheEverything: true },
+        });
+        if (egRes.ok) {
+          const egData = await egRes.json();
+          groups = egData.results;
+        }
+      }
+
+      if (groups && Array.isArray(groups) && groups.length > 0) {
+        const bestGroupId = pickDefaultEpisodeGroupId(groups, standardSeasonCount, standardEpisodeCount, totalEpisodeCountWithSpecials);
+        if (bestGroupId) {
+          spend();
+          const gRes = await fetch(`https://api.themoviedb.org/3/episode_group/${bestGroupId}?api_key=${encodeURIComponent(apiKey)}`, {
+            headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+            cf: { cacheTtl: 604800, cacheEverything: true },
+          });
+          if (gRes.ok) {
+            const gData = await gRes.json();
+            unpacked = unpackEpisodeGroupDetails(gData);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Cinemeta fallback
+  if (!unpacked && cleanImdbId.startsWith("tt")) {
+    spend();
+    unpacked = await fetchCinemetaSeriesUnpacked(cleanImdbId);
+  }
+
+  if (unpacked) {
+    setUnpackedCache(cacheKey, unpacked);
+    if (cleanTmdbId && cleanImdbId) {
+      setUnpackedCache(cleanImdbId, unpacked);
+      setUnpackedCache(cleanTmdbId, unpacked);
+    }
+    if (env && env.CONFIGS) {
+      const kvStr = JSON.stringify(unpacked);
+      const p1 = env.CONFIGS.put(`unpacked_show:${cacheKey}`, kvStr, { expirationTtl: 2592000 }).catch(() => {});
+      if (ctx && ctx.waitUntil) ctx.waitUntil(p1);
+    }
+    return unpacked;
+  }
+
+  return null;
+}
+
 // Wraps the real resolution logic (fetchTmdbItemDetailsUncached below) in
 // the same shared, canonical-key cache Trakt already uses
 // (fetchWithPerUserCacheAndCircuitBreaker) -- unlike the catalog/chart
@@ -13780,17 +14508,37 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
   const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
+
+  const upgradeIfUnpacked = async (d) => {
+    if (!d || !Array.isArray(d.seasonsData)) return d;
+    const reg = d.seasonsData.filter((s) => s && s.season_number > 0);
+    const epCount = reg.reduce((sum, s) => sum + (s.episode_count || 0), 0);
+    if (reg.length === 1 && epCount > 1) {
+      const unpacked = await resolveUnpackedShowData(d.tmdbId, d.id, d.seasonsData, apiKey, env, ctx, null, meter);
+      if (unpacked && Array.isArray(unpacked.seasons) && unpacked.seasons.length > 1) {
+        const upgraded = { ...d, seasonsData: unpacked.seasons, seasons: unpacked.seasons };
+        setPerUserCache(cacheKey, upgraded);
+        if (env && env.CONFIGS && apiKey) {
+          const p = env.CONFIGS.put(cacheKey, JSON.stringify(upgraded), { expirationTtl: 604800 }).catch(() => {});
+          if (ctx && ctx.waitUntil) ctx.waitUntil(p);
+        }
+        return upgraded;
+      }
+    }
+    return d;
+  };
+
   if (!bypassCache) {
     const cached = getPerUserCache(cacheKey);
     if (cached && cached.isFresh && cached.data) {
       if (cached.data.nextEpisodeAirDate && isEpisodeAiredServer(cached.data.nextEpisodeAirDate)) {
         // Scheduled episode has already aired; refresh to resolve the new upcoming episode
       } else {
-        return cached.data;
+        return await upgradeIfUnpacked(cached.data);
       }
     }
   }
-  return fetchWithPerUserCacheAndCircuitBreaker({
+  const details = await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
     freshTtlSec: (fallbackType === "series" || fallbackType === "tv") ? 7200 : 604800,
     staleTtlSec: 2592000,
@@ -13799,11 +14547,12 @@ async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypass
     ctx: ctx,
     kvKey: apiKey ? cacheKey : "",
     kvTtlSec: 604800,
-    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion, meter),
+    fetchFn: () => fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, effectiveRegion, meter, env, ctx),
   });
+  return await upgradeIfUnpacked(details);
 }
 
-async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region, meter) {
+async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region, meter, env = null, ctx = null) {
   // One call per outbound fetch below. Counted here rather than by wrapping
   // fetch() globally, so nothing else in the Worker changes behaviour.
   const spend = () => { if (meter) meter.spent++; };
@@ -13885,7 +14634,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
   let match = null;
   let resolvedType = type;
   if (resolvedType) {
-    const detailSrc = "https://api.themoviedb.org/3/" + resolvedType + "/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+    const detailSrc = "https://api.themoviedb.org/3/" + resolvedType + "/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits" + (resolvedType === "tv" ? ",episode_groups" : "");
     spend();
     const detailRes = await fetch(detailSrc, {
       headers: { "User-Agent": "my-list-addon/1.14" },
@@ -13908,7 +14657,7 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
       resolvedType = "movie";
     } else {
       // Try tv
-      const tvSrc = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits";
+      const tvSrc = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + encodeURIComponent(apiKey) + "&append_to_response=videos,release_dates,content_ratings,external_ids,credits,episode_groups";
       spend();
       const tvRes = await fetch(tvSrc, {
         headers: { "User-Agent": "my-list-addon/1.14" },
@@ -13992,6 +14741,18 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     } catch {}
     if (!poster && realImdbId.startsWith("tt")) {
       poster = "https://images.metahub.space/poster/medium/" + realImdbId + "/img";
+    }
+  }
+
+  if (type === "tv" && Array.isArray(match.seasons)) {
+    const regSeasons = match.seasons.filter((s) => s && s.season_number > 0);
+    const standardEpisodeCount = regSeasons.reduce((sum, s) => sum + (s.episode_count || 0), 0);
+    if (regSeasons.length === 1 && standardEpisodeCount > 1) {
+      const groups = match.episode_groups && Array.isArray(match.episode_groups.results) ? match.episode_groups.results : [];
+      const unpacked = await resolveUnpackedShowData(tmdbId, realImdbId, match.seasons, apiKey, env, ctx, groups, meter);
+      if (unpacked && Array.isArray(unpacked.seasons) && unpacked.seasons.length > 1) {
+        match.seasons = unpacked.seasons;
+      }
     }
   }
 
@@ -14146,11 +14907,11 @@ async function fetchTmdbSeasonDetails(imdbId, seasonNum, apiKey, knownTmdbId, en
     ctx: ctx,
     kvKey: apiKey ? cacheKey : "",
     kvTtlSec: 604800,
-    fetchFn: () => fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId),
+    fetchFn: () => fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId, env, ctx),
   });
 }
 
-async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId) {
+async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTmdbId, env = null, ctx = null) {
   if (!apiKey) return null;
   // Shows opened from title search (Search Movies & TV Shows) carry a
   // "tmdb:<id>" identifier instead of a real IMDb id -- skip the IMDb
@@ -14201,6 +14962,14 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
       } catch {}
     }
   }
+  if (!tmdbId && !String(imdbId || "").startsWith("tt")) return null;
+
+  const numericSeason = parseInt(seasonNum, 10);
+  const unpacked = await resolveUnpackedShowData(tmdbId, imdbId, null, apiKey, env, ctx);
+  if (unpacked && unpacked.episodesBySeason && unpacked.episodesBySeason[numericSeason]) {
+    return { episodes: unpacked.episodesBySeason[numericSeason] };
+  }
+
   if (!tmdbId) return null;
 
   const src = "https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + seasonNum + "?api_key=" + encodeURIComponent(apiKey);
@@ -14208,7 +14977,15 @@ async function fetchTmdbSeasonDetailsUncached(imdbId, seasonNum, apiKey, knownTm
     headers: { "User-Agent": "my-list-addon/1.14" },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
-  if (!res.ok) return null;
+  if (!res.ok) {
+    if (String(imdbId).startsWith("tt")) {
+      const cinUnpacked = await fetchCinemetaSeriesUnpacked(imdbId);
+      if (cinUnpacked && cinUnpacked.episodesBySeason && cinUnpacked.episodesBySeason[numericSeason]) {
+        return { episodes: cinUnpacked.episodesBySeason[numericSeason] };
+      }
+    }
+    return null;
+  }
   const data = await res.json();
   
   return {
@@ -14827,6 +15604,7 @@ async function prewarmSharedCatalogs(env, ctx, fetchBudget) {
   } catch (e) {
     console.warn("[Cron] MDBList warm error:", e && e.message ? e.message : e);
   }
+
 }
 // --- config UI (served at / and /:config/configure) -----------------------
 
@@ -15405,6 +16183,7 @@ function renderBuilder(
   const initialShuffleItems = !!initialKeys.shuffleItems;
   const initialRegion = initialKeys.region || "US";
   const initialHideNonDigitalReleases = !!initialKeys.hideNonDigitalReleases;
+  const initialAdultContentFilter = !!initialKeys.adultContentFilter;
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();
@@ -15546,7 +16325,8 @@ ${seoHeadHtml}
       document.documentElement.setAttribute('data-initial-channels-sub', chSub);
       var setSub = localStorage.getItem('myListAddon:settingsSubmenu') || 'account';
       document.documentElement.setAttribute('data-initial-settings-sub', setSub);
-      var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+      var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'movie';
+      if (discSub === 'all') discSub = 'movie';
       document.documentElement.setAttribute('data-initial-discover-sub', discSub);
     } catch (e) {}
   })();
@@ -16037,15 +16817,26 @@ ${seoHeadHtml}
   html[data-initial-discover-sub="popular"] #discoverShelvesContainer,
   html[data-initial-discover-sub="popular"] #discoverListsFeedHeader,
   html[data-initial-discover-sub="popular"] #discoverListsFeed,
+  html[data-initial-discover-sub="popular"] #discoverSubSharedFeed,
   html[data-initial-discover-sub="curated"] #discoverShelvesContainer,
   html[data-initial-discover-sub="curated"] #discoverListsFeedHeader,
-  html[data-initial-discover-sub="curated"] #discoverListsFeed {
+  html[data-initial-discover-sub="curated"] #discoverListsFeed,
+  html[data-initial-discover-sub="curated"] #discoverSubSharedFeed {
     display: none !important;
   }
   html[data-initial-discover-sub="popular"] #discoverSubPopular {
     display: block !important;
   }
   html[data-initial-discover-sub="curated"] #discoverSubCurated {
+    display: block !important;
+  }
+  html[data-initial-discover-sub="all"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="movie"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="series"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="gems"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="kids"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="holidays"] #discoverSubSharedFeed,
+  html[data-initial-discover-sub="genres"] #discoverSubSharedFeed {
     display: block !important;
   }
   html[data-initial-discover-sub] #discoverSubnavBar .subnav-pill {
@@ -16859,11 +17650,13 @@ ${seoHeadHtml}
      one-line message and a Retry button in place of the poster grid, so a
      card that could not be fetched (even after its own automatic retry)
      says so instead of just sitting there blank. */
-  .list-card-posters.poster-preview-error {
+  .list-card-posters.poster-preview-error,
+  .list-card-posters.poster-preview-empty {
     display: flex;
     grid-template-columns: none;
   }
-  .poster-preview-error-msg {
+  .poster-preview-error-msg,
+  .poster-preview-empty-msg {
     margin: 0;
     display: flex;
     align-items: center;
@@ -16937,6 +17730,179 @@ ${seoHeadHtml}
     min-width: 105px !important;
     box-sizing: border-box !important;
     text-align: center !important;
+  }
+  .item-storylines-section {
+    border-top: 1px solid var(--border);
+    padding-top: 24px;
+    margin-top: 32px;
+  }
+  .item-storyline-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .item-storyline-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  .item-storyline-header-info {
+    flex: 1;
+    min-width: 240px;
+  }
+  .item-storyline-saga-title {
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+  .item-storyline-saga-meta {
+    font-size: 0.82rem;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+  }
+  .item-storyline-saga-desc {
+    font-size: 0.85rem;
+    color: var(--text-2);
+    line-height: 1.45;
+    margin: 4px 0 0;
+  }
+  .item-storyline-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .item-storyline-scroll {
+    display: flex !important;
+    flex-direction: row !important;
+    gap: 14px !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    -webkit-overflow-scrolling: touch !important;
+    touch-action: pan-x !important;
+    padding: 10px 4px 14px !important;
+    margin-top: 8px;
+  }
+  .item-storyline-card {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 120px;
+    width: 120px;
+    max-width: 120px;
+    min-width: 120px;
+    cursor: pointer;
+    text-align: left;
+    transition: transform 0.15s ease;
+  }
+  .item-storyline-card:hover {
+    transform: translateY(-2px);
+  }
+  .item-storyline-card.is-current {
+    cursor: default;
+    transform: none !important;
+  }
+  .item-storyline-poster-wrap {
+    position: relative;
+    aspect-ratio: 2 / 3;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: var(--panel-strong);
+    border: 1px solid var(--border);
+    margin-bottom: 8px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .item-storyline-card:hover .item-storyline-poster-wrap {
+    border-color: var(--border-strong);
+  }
+  .item-storyline-card.is-current .item-storyline-poster-wrap {
+    border: 2px solid var(--accent);
+    box-shadow: 0 0 10px rgba(0, 122, 255, 0.4);
+  }
+  .item-storyline-poster-wrap img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .item-storyline-part-badge {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    background: rgba(0, 0, 0, 0.75);
+    color: #FFFFFF;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: var(--radius-pill);
+    letter-spacing: 0.02em;
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    z-index: 2;
+  }
+  .item-storyline-current-pill {
+    position: absolute;
+    bottom: 6px;
+    left: 6px;
+    right: 6px;
+    background: var(--accent);
+    color: #FFFFFF;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-align: center;
+    padding: 3px 0;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    z-index: 2;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  }
+  .item-storyline-watched-badge {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background: var(--accent);
+    color: #FFFFFF;
+    font-size: 0.75rem;
+    font-weight: 800;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    z-index: 2;
+  }
+  .item-storyline-title {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1.25;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    margin-bottom: 2px;
+  }
+  .item-storyline-card.is-current .item-storyline-title {
+    color: var(--accent);
+  }
+  .item-storyline-meta {
+    font-size: 0.72rem;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .cw-remove-btn {
     position: absolute;
@@ -17025,7 +17991,18 @@ ${seoHeadHtml}
     font-size: 0.58rem;
     font-weight: 700;
   }
-  body.hide-badge-air-date .cw-date-badge:not(.cw-date-badge-premiere):not(.cw-date-badge-finale):not(.cw-date-badge-finale-date) { display: none !important; }
+  .cw-date-badge-companion {
+    background: var(--accent, #6366f1);
+    color: #ffffff;
+    top: auto;
+    bottom: 4px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100% - 8px);
+    text-overflow: ellipsis;
+    overflow: hidden;
+  }
+  body.hide-badge-air-date .cw-date-badge:not(.cw-date-badge-premiere):not(.cw-date-badge-finale):not(.cw-date-badge-finale-date):not(.cw-date-badge-companion) { display: none !important; }
   body.hide-badge-season-premiere .cw-date-badge-premiere { display: none !important; }
   body.hide-badge-season-finale .cw-date-badge-finale { display: none !important; }
   body.hide-badge-season-finale-date .cw-date-badge-finale-date { display: none !important; }
@@ -19021,8 +19998,8 @@ if ('serviceWorker' in navigator) {
 <div class="tab-panel" data-tab-panel="discover" id="content-discover" role="tabpanel" aria-labelledby="tab-desktop-discover">
   <!-- Discover Top Submenu Pills -->
   <div class="subnav-pills-bar" id="discoverSubnavBar">
-    <button type="button" class="subnav-pill active" data-sub="all" onclick="filterDiscoverShelves('all', this)"><span class="check-icon">&#x2713;</span> All</button>
-    <button type="button" class="subnav-pill" data-sub="movie" onclick="filterDiscoverShelves('movie', this)">Movies</button>
+    <button type="button" class="subnav-pill" data-sub="all" onclick="filterDiscoverShelves('all', this)">All</button>
+    <button type="button" class="subnav-pill active" data-sub="movie" onclick="filterDiscoverShelves('movie', this)"><span class="check-icon">&#x2713;</span> Movies</button>
     <button type="button" class="subnav-pill" data-sub="series" onclick="filterDiscoverShelves('series', this)">Shows</button>
     <button type="button" class="subnav-pill" data-sub="popular" onclick="filterDiscoverShelves('popular', this)">Popular Lists</button>
     <button type="button" class="subnav-pill" data-sub="curated" onclick="filterDiscoverShelves('curated', this)">Curated</button>
@@ -19068,36 +20045,40 @@ if ('serviceWorker' in navigator) {
     ${genresHtml}
   </div>
 
-  <!-- Discover Lists Feed (Movies / Shows / Hidden Gems / Kids / Holidays /
-       Genres list view matching search). Same header + Refresh shape as the
-       Popular Lists and Curated cards below -- one shared header, since all
-       six share this one container, with filterDiscoverShelves swapping its
-       title text to match the active pill. Refresh re-runs
-       renderDiscoverChartsList with forceRefresh, which also retries any
-       poster preview that failed to load the first time. -->
-  <div class="shelf-header" id="discoverListsFeedHeader" style="display:none; margin-bottom:10px;">
-    <h2 class="shelf-title" id="discoverListsFeedTitle">All</h2>
-    <button type="button" class="secondary lc-btn" onclick="if (typeof renderDiscoverChartsList === 'function') renderDiscoverChartsList(window._currentDiscoverFilter || 'all', true);">Refresh</button>
+  <!-- Discover Shared Lists Feed (All / Movies / Shows / Hidden Gems / Kids / Holidays / Genres) -->
+  <div class="discover-subpanel" id="discoverSubSharedFeed" style="display:none;">
+    <div class="panel">
+      <div class="shelf-header" id="discoverListsFeedHeader" style="margin-bottom:10px;">
+        <h2 class="shelf-title" id="discoverListsFeedTitle">Movies</h2>
+        <button type="button" class="secondary lc-btn" onclick="if (typeof renderDiscoverChartsList === 'function') renderDiscoverChartsList(window._currentDiscoverFilter || 'movie', true);">Refresh</button>
+      </div>
+      <p id="discoverListsFeedDesc" style="margin:0 0 14px; color:var(--muted); font-size:0.85rem; line-height:1.45;">Top charts, new releases, and popular movie collections across streaming platforms.</p>
+      <div id="discoverListsFeed"></div>
+    </div>
   </div>
-  <div id="discoverListsFeed" style="display:none;"></div>
 
   <!-- Popular Lists Feed in Discover -->
   <div class="discover-subpanel" id="discoverSubPopular" style="display:none;">
-    <div class="shelf-header" style="margin-bottom:10px;">
-      <h2 class="shelf-title">Popular Community Lists</h2>
-      <button type="button" class="secondary lc-btn" onclick="loadPopularListsFeed(true)">Refresh</button>
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:10px;">
+        <h2 class="shelf-title">Popular Community Lists</h2>
+        <button type="button" class="secondary lc-btn" onclick="loadPopularListsFeed(true)">Refresh</button>
+      </div>
+      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem; line-height:1.45;">Top trending and highly-rated community lists shared by creators and viewers.</p>
+      <div id="popularListsFeed"></div>
     </div>
-    <div id="popularListsFeed"></div>
   </div>
 
   <!-- Curated Lists Feed in Discover -->
   <div class="discover-subpanel" id="discoverSubCurated" style="display:none;">
-    <div class="shelf-header" style="margin-bottom:10px;">
-      <h2 class="shelf-title">Curated For You</h2>
-      <button type="button" class="secondary lc-btn" onclick="loadCuratedListsFeed(true)">Refresh</button>
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:10px;">
+        <h2 class="shelf-title">Curated For You</h2>
+        <button type="button" class="secondary lc-btn" onclick="loadCuratedListsFeed(true)">Refresh</button>
+      </div>
+      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem; line-height:1.45;">Personalized recommendations and curated lists tailored to your watch history and tastes.</p>
+      <div id="curatedListsFeed"></div>
     </div>
-    <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Personalized recommendations and curated lists tailored to your watch history and tastes.</p>
-    <div id="curatedListsFeed"></div>
   </div>
 </div>
 <div class="tab-panel" data-tab-panel="lists" id="content-lists" role="tabpanel" aria-labelledby="tab-desktop-lists" hidden>
@@ -19342,7 +20323,7 @@ if ('serviceWorker' in navigator) {
       <div class="shelf-header" style="margin-bottom:8px;">
         <h2 class="shelf-title">Quick Add Popular Networks</h2>
       </div>
-      <p class="qa-shelf-sub">Instant 1-click TV channels with automatic daily episode rotation:</p>
+      <p class="qa-shelf-sub">Instant 1-click TV channels with up to 5,000 episodes, rotating 24 shows with 3 episodes every 24 hours:</p>
       <div class="channel-quick-grid">
         <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="A&amp;E" data-networkid="129">A&amp;E</button>
         <button type="button" class="secondary lc-btn channelQuickAddBtn" data-name="ABC" data-networkid="2">ABC</button>
@@ -19638,6 +20619,17 @@ if ('serviceWorker' in navigator) {
     </div>
 
     <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Adult Content &amp; Poster Safety</h2>
+      <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.92rem; user-select:none;">
+        <input type="checkbox" id="adultContentFilterCheckbox" ${initialAdultContentFilter ? 'checked' : ''} onchange="localStorage.setItem('myListAddon:adultContentFilter', this.checked ? '1' : '0'); if (window._listPreviewCache) window._listPreviewCache.clear(); saveState()" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+        <div>
+          <span style="font-weight:600;">Adult Content Filter</span>
+          <p style="margin:4px 0 0; color:var(--muted); font-size:0.82rem;">Filter NSFW posters and replace default unfiltered posters with safe, age-appropriate ones across your catalogs, search, continue watching, and Stremio/Nuvio.</p>
+        </div>
+      </label>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Poster Badges &amp; Labels</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Customize which badges and indicators are displayed on posters across your website dashboard, catalogs, and Stremio/Nuvio.</p>
       <div style="display:flex; flex-direction:column; gap:12px;">
@@ -19739,6 +20731,15 @@ if ('serviceWorker' in navigator) {
 
     <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Watch History &amp; Continue Watching</h2>
+      <div style="border-bottom:1px solid var(--border); padding-bottom:12px; margin-bottom:12px;">
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="autoRecommendCompanionsCheckbox" checked onchange="toggleCompanionRecommendationSetting(this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Storyline &amp; Companion Recommendations</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Automatically recommend canon bridge movies between seasons (e.g. <em>Demon Slayer: Mugen Train</em>) and sequel films or spin-off series when a show concludes (e.g. <em>Breaking Bad &rarr; El Camino &rarr; Better Call Saul</em>).</p>
+          </div>
+        </label>
+      </div>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Reset or clear all recorded movies and episodes from your personal Watch History or in-progress Continue Watching.</p>
       <div id="watchHistorySettingsSection" style="display:flex; gap:10px; flex-wrap:wrap;">
         <button type="button" class="secondary lc-btn" onclick="clearWatchHistoryAll()" style="color:var(--danger); border-color:rgba(255,59,48,0.3); font-weight:600; padding:8px 16px;">Clear Watch History</button>
@@ -20157,7 +21158,8 @@ const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
     if (subFeedback) subFeedback.style.display = (setSub === 'feedback') ? 'block' : 'none';
 
     // 5. Discover submenu early sync
-    var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+    var discSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'movie';
+    if (discSub === 'all') discSub = 'movie';
     var discBar = document.getElementById('discoverSubnavBar');
     if (discBar) {
       discBar.querySelectorAll('.subnav-pill').forEach(function(p) {
@@ -20802,11 +21804,12 @@ function switchTab(name) {
   if (name === 'discover') {
     if (!window._discoverInitializedOnce) {
       window._discoverInitializedOnce = true;
-      let savedFilter = 'all';
+      let savedFilter = 'movie';
       try {
-        savedFilter = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+        savedFilter = localStorage.getItem('myListAddon:discoverSubmenu') || 'movie';
       } catch (e) {}
-      const activeFilter = window._currentDiscoverFilter || savedFilter;
+      if (savedFilter === 'all') savedFilter = 'movie';
+      const activeFilter = (window._currentDiscoverFilter && window._currentDiscoverFilter !== 'all') ? window._currentDiscoverFilter : savedFilter;
       window._currentDiscoverFilter = activeFilter;
       const pills = document.querySelectorAll('#discoverSubnavBar .subnav-pill');
       let targetBtn = null;
@@ -21578,9 +22581,9 @@ function filterDiscoverShelves(filter, btn) {
   try {
     document.documentElement.removeAttribute('data-initial-discover-sub');
   } catch (e) {}
-  window._currentDiscoverFilter = filter || 'all';
+  window._currentDiscoverFilter = filter || 'movie';
   try {
-    localStorage.setItem('myListAddon:discoverSubmenu', filter || 'all');
+    localStorage.setItem('myListAddon:discoverSubmenu', filter || 'movie');
   } catch (e) {}
   if (btn) {
     document.querySelectorAll('#discoverSubnavBar .subnav-pill').forEach(function(p) {
@@ -21595,6 +22598,7 @@ function filterDiscoverShelves(filter, btn) {
     } catch (e) {}
   }
   const shelvesContainer = document.getElementById('discoverShelvesContainer');
+  const sharedContainer = document.getElementById('discoverSubSharedFeed');
   const feedContainer = document.getElementById('discoverListsFeed');
   const feedHeader = document.getElementById('discoverListsFeedHeader');
   const popularContainer = document.getElementById('discoverSubPopular');
@@ -21602,6 +22606,7 @@ function filterDiscoverShelves(filter, btn) {
 
   if (popularContainer) popularContainer.style.display = 'none';
   if (curatedContainer) curatedContainer.style.display = 'none';
+  if (sharedContainer) sharedContainer.style.display = 'none';
   if (shelvesContainer) shelvesContainer.style.display = 'none';
   if (feedContainer) feedContainer.style.display = 'none';
   if (feedHeader) feedHeader.style.display = 'none';
@@ -21617,17 +22622,23 @@ function filterDiscoverShelves(filter, btn) {
       if (typeof loadCuratedListsFeed === 'function') loadCuratedListsFeed();
     }
   } else {
+    if (sharedContainer) sharedContainer.style.display = 'block';
     if (feedContainer) {
       feedContainer.style.display = 'block';
       if (feedHeader) {
         feedHeader.style.display = 'flex';
         const titleEl = document.getElementById('discoverListsFeedTitle');
-        if (titleEl) titleEl.textContent = DISCOVER_FEED_TITLES[window._currentDiscoverFilter] || 'All';
+        if (titleEl) titleEl.textContent = DISCOVER_FEED_TITLES[window._currentDiscoverFilter] || 'Movies';
+        const descEl = document.getElementById('discoverListsFeedDesc');
+        if (descEl) descEl.textContent = DISCOVER_FEED_DESCRIPTIONS[window._currentDiscoverFilter] || '';
       }
       window._discoverFeedsCache = window._discoverFeedsCache || {};
       if (window._discoverFeedsCache[filter]) {
         feedContainer.innerHTML = window._discoverFeedsCache[filter];
         window._currentDiscoverRenderedFilter = filter;
+        if (feedContainer.querySelector('.poster-preview-slot') && typeof populateSearchResultPosters === 'function') {
+          populateSearchResultPosters();
+        }
       } else if (typeof renderDiscoverChartsList === 'function') {
         renderDiscoverChartsList(filter);
       }
@@ -21646,6 +22657,18 @@ const DISCOVER_FEED_TITLES = {
   kids: 'Kids',
   holidays: 'Holidays',
   genres: 'Genres',
+};
+
+const DISCOVER_FEED_DESCRIPTIONS = {
+  all: 'Explore popular charts, trending movies, TV shows, and streaming catalogs across all services.',
+  movie: 'Top charts, new releases, and popular movie collections across streaming platforms.',
+  series: 'Trending TV series, top network charts, and new episodes across streaming platforms.',
+  popular: 'Top trending and highly-rated community lists shared by creators and viewers.',
+  curated: 'Personalized recommendations and curated lists tailored to your watch history and tastes.',
+  gems: 'Under-the-radar masterpieces, cult classics, and acclaimed titles you might have missed.',
+  kids: 'Family-friendly movies, animated favorites, and entertaining shows suitable for all ages.',
+  holidays: 'Seasonal favorites, festive classics, and holiday-themed movies and episodes for every celebration.',
+  genres: 'Browse top movies and series organized by action, comedy, sci-fi, horror, and more.',
 };
 
 // Renders the chart lists for the Movies or Shows tab in Discover as list-cards
@@ -21738,6 +22761,7 @@ function renderDiscoverChartsList(type, forceRefresh) {
   if (type === 'gems' || type === 'all') {
     pushSingle('Hidden Gems', 'tmdb:hidden-gems', 'movie', 'Hidden Gems');
     pushSingle('Hidden Gems', 'tmdb:hidden-gems', 'series', 'Hidden Gems');
+    pushSingle('Curated: Hidden Gems', 'custom:curated:hidden-gems', 'movie', 'Curated');
   }
 
   if (type === 'kids' || type === 'all') {
@@ -22784,9 +23808,10 @@ function renderMyMdblistLists(lists) {
                   subtitle: it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
                 };
 
+            const mdbPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster) : it.poster;
             return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">' +
               '<div class="list-card-mini-poster-img-wrap">' +
-                (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+                (mdbPoster ? '<img src="' + escapeAttr(mdbPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(mdbPoster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
                 (dateBadge + bottomBadge) +
                 overlays +
               '</div>' +
@@ -23595,9 +24620,10 @@ function renderMyPrivateTraktLists(lists) {
                   subtitle: it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
                 };
 
+            const traktPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster) : it.poster;
             return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">' +
               '<div class="list-card-mini-poster-img-wrap">' +
-                (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+                (traktPoster ? '<img src="' + escapeAttr(traktPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(traktPoster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
                 (dateBadge + bottomBadge) +
                 overlays +
               '</div>' +
@@ -23913,9 +24939,10 @@ function renderMyTmdbLists(lists) {
           const tmdbTarget = isWatchlist ? 'watchlist' : (isFavorites ? 'favorite' : 'custom');
           const tmdbListId = isWatchlist ? 'watchlist' : (isFavorites ? 'favorite' : listIdStr);
           const removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="tmdb" data-target="' + tmdbTarget + '" data-list-id="' + escapeAttr(tmdbListId) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(posterType) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from TMDB">&times;</button>';
+          const tmdbPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster) : it.poster;
           return '<div class="list-card-mini-poster-tile">' +
             '<div class="list-card-mini-poster-img-wrap">' +
-              '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
+              '<img src="' + escapeAttr(tmdbPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
               removeBtn +
               overlays +
             '</div>' +
@@ -24393,9 +25420,10 @@ function renderMySimklLists(lists) {
                 subtitle: it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
               };
 
+          const smkPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster) : it.poster;
           return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
             '<div class="list-card-mini-poster-img-wrap">' +
-              (it.poster ? '<img src="' + escapeAttr(it.poster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(it.poster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+              (smkPoster ? '<img src="' + escapeAttr(smkPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(smkPoster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
               (isAiringNext ? (dateBadge + bottomBadge) : '') +
               removeBtn +
               overlays +
@@ -24747,6 +25775,82 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
   return items;
 }
 
+function getItemKey(it) {
+  if (!it) return '';
+  if (it.imdbId && String(it.imdbId).trim()) return String(it.imdbId).trim();
+  if (it.id && String(it.id).trim()) return String(it.id).trim();
+  if (it.tmdbId && String(it.tmdbId).trim()) return 'tmdb:' + String(it.tmdbId).trim();
+  const title = String(it.title || it.name || it.showTitle || '').toLowerCase().trim();
+  const year = String(it.year || '').trim();
+  return title ? (title + ':' + year) : '';
+}
+window.getItemKey = getItemKey;
+
+function performSmartListMerge(currentItems, baseItemIds, remoteItems, options) {
+  options = options || {};
+  const mirrorRemovals = !!options.mirrorRemovals;
+  const current = Array.isArray(currentItems) ? currentItems : [];
+  const remote = Array.isArray(remoteItems) ? remoteItems : [];
+  const baseList = Array.isArray(baseItemIds) ? baseItemIds.map(String) : [];
+
+  const currentKeys = new Set(current.map(getItemKey).filter(Boolean));
+  const baseSet = new Set(baseList);
+
+  // User removals: items that were in the base snapshot, but are not in current list
+  const userRemovedIds = new Set();
+  if (baseList.length > 0) {
+    baseList.forEach((id) => {
+      if (id && !currentKeys.has(id)) {
+        userRemovedIds.add(id);
+      }
+    });
+  }
+
+  // Merged items
+  const mergedItems = [];
+  const mergedKeys = new Set();
+
+  // 1. Keep all current items in their existing user-defined order
+  current.forEach((it) => {
+    const key = getItemKey(it);
+    // If mirroring remote removals and this item was in the base snapshot but dropped upstream, remove it
+    if (mirrorRemovals && baseSet.has(key)) {
+      const stillInRemote = remote.some((r) => getItemKey(r) === key);
+      if (!stillInRemote) return;
+    }
+    if (key) mergedKeys.add(key);
+    mergedItems.push(it);
+  });
+
+  // 2. Discover newly added remote items
+  let addedCount = 0;
+  remote.forEach((r) => {
+    const rKey = getItemKey(r);
+    if (!rKey) return;
+    // Do not resurrect items the user explicitly removed
+    if (userRemovedIds.has(rKey)) return;
+    // If it's already in the list, skip
+    if (mergedKeys.has(rKey)) return;
+
+    // If baseItemIds existed, verify it's a new remote item (not in base snapshot)
+    // Or if baseItemIds was empty, it's an item in remote not in current
+    if (baseList.length === 0 || !baseSet.has(rKey)) {
+      mergedItems.push(r);
+      mergedKeys.add(rKey);
+      addedCount++;
+    }
+  });
+
+  const newBaseItemIds = remote.map(getItemKey).filter(Boolean);
+
+  return {
+    items: mergedItems,
+    addedCount: addedCount,
+    newBaseItemIds: newBaseItemIds,
+  };
+}
+window.performSmartListMerge = performSmartListMerge;
+
 // Saves a fresh Custom List directly -- to the account if signed in
 // (mirroring confirmSaveAsCreator's /api/creator/lists/save call, Public
 // by default same as that picker's own default), to this browser's local
@@ -24756,22 +25860,34 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
 async function saveItemsAsNewCustomList(name, type, items, visibility, extraProps) {
   visibility = visibility === 'private' ? 'private' : 'public';
   extraProps = extraProps || {};
+  const sourceUrl = extraProps.sourceUrl || '';
+  const synced = extraProps.synced != null ? !!extraProps.synced : !!sourceUrl;
+  const lastSyncedAt = Number.isFinite(Number(extraProps.lastSyncedAt))
+    ? Number(extraProps.lastSyncedAt)
+    : (synced ? Date.now() : undefined);
+  const baseItemIds = Array.isArray(extraProps.baseItemIds)
+    ? extraProps.baseItemIds
+    : (synced ? items.map(getItemKey).filter(Boolean) : undefined);
+
   if (activeCreator) {
     const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     try {
+      const payload = {
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        name: name,
+        type: type,
+        items: items,
+        visibility: visibility,
+        sourceUrl: sourceUrl,
+        synced: synced,
+      };
+      if (lastSyncedAt !== undefined) payload.lastSyncedAt = lastSyncedAt;
+      if (baseItemIds !== undefined) payload.baseItemIds = baseItemIds;
       const res = await fetch(ORIGIN + '/api/creator/lists/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          creatorName: activeCreator.creatorName,
-          creatorKey: creatorKey,
-          name: name,
-          type: type,
-          items: items,
-          visibility: visibility,
-          sourceUrl: extraProps.sourceUrl || '',
-          synced: !!extraProps.sourceUrl,
-        }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (!data.ok) return { ok: false, error: data.error || 'unknown error' };
@@ -24795,11 +25911,13 @@ async function saveItemsAsNewCustomList(name, type, items, visibility, extraProp
     type: type,
     items: items,
     visibility: visibility,
-    sourceUrl: extraProps.sourceUrl || '',
-    synced: !!extraProps.sourceUrl,
+    sourceUrl: sourceUrl,
+    synced: synced,
     createdAt: now,
     updatedAt: now
   };
+  if (lastSyncedAt !== undefined) map[slug].lastSyncedAt = lastSyncedAt;
+  if (baseItemIds !== undefined) map[slug].baseItemIds = baseItemIds;
   const persisted = saveLocalCustomListsMap(map);
   if (!persisted) {
     return { ok: false, error: 'localStorage save failed (likely full \u2014 try clearing out some old Custom Lists, or importing fewer categories at once)' };
@@ -24885,10 +26003,17 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
   const baseListName = name;
   const created = [];
 
+  const syncProps = Object.assign({}, extraProps);
+  if (syncProps.sourceUrl) {
+    syncProps.synced = true;
+    syncProps.lastSyncedAt = Date.now();
+    syncProps.baseItemIds = allItems.map(getItemKey).filter(Boolean);
+  }
+
   for (let i = 0; i * CUSTOM_LIST_CHUNK_SIZE < allItems.length; i++) {
     const chunk = allItems.slice(i * CUSTOM_LIST_CHUNK_SIZE, (i + 1) * CUSTOM_LIST_CHUNK_SIZE);
     const listName = i === 0 ? baseListName : baseListName + ' ' + (i + 1);
-    const result = await saveItemsAsNewCustomList(listName, finalType, chunk, 'private', extraProps);
+    const result = await saveItemsAsNewCustomList(listName, finalType, chunk, 'private', syncProps);
     if (result.ok) {
       created.push({ name: listName, count: chunk.length });
     } else {
@@ -24940,6 +26065,168 @@ async function copyListToCustomList(name, listUrl, contentType, btn, historyMode
     alert(msg);
   }
 }
+
+async function syncCustomListWithExternalSource(slug, btn, options) {
+  options = options || {};
+  const isSilent = !!options.silent;
+  if (!slug) return { ok: false, error: 'missing-slug' };
+
+  let listMeta = null;
+  let isServerList = false;
+  if (typeof activeCreator !== 'undefined' && activeCreator && Array.isArray(lastCreatorListsData)) {
+    listMeta = lastCreatorListsData.find((l) => l && l.slug === slug);
+    if (listMeta) isServerList = true;
+  }
+  const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  if (!listMeta) {
+    listMeta = localMap[slug];
+    if (listMeta) isServerList = false;
+  }
+  if (!listMeta) {
+    if (!isSilent) {
+      if (typeof showAppAlert === 'function') showAppAlert('Sync Error', 'Could not find list: ' + slug, false);
+      else alert('Could not find list: ' + slug);
+    }
+    return { ok: false, error: 'list-not-found' };
+  }
+
+  const sourceUrl = listMeta.sourceUrl || (localMap[slug] && localMap[slug].sourceUrl);
+  if (!sourceUrl) {
+    if (!isSilent) {
+      if (typeof showAppAlert === 'function') showAppAlert('Sync Error', 'This list does not have an external source URL.', false);
+      else alert('This list does not have an external source URL.');
+    }
+    return { ok: false, error: 'no-source-url' };
+  }
+
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Syncing\u2026';
+  }
+
+  try {
+    const listType = listMeta.type || (localMap[slug] && localMap[slug].type) || 'mixed';
+    const isSingle = listType === 'movie' || listType === 'series';
+    const typesToFetch = isSingle ? [listType] : ['movie', 'series'];
+    const remoteItems = [];
+
+    for (const type of typesToFetch) {
+      const typeLabel = type === 'movie' ? 'Movies' : 'Shows';
+      const items = await fetchAllItemsForList(sourceUrl, type, btn, !isSingle ? typeLabel : '');
+      if (Array.isArray(items)) {
+        items.forEach((it) => {
+          remoteItems.push({
+            id: it.imdbId || it.id,
+            imdbId: it.imdbId || (String(it.id || '').startsWith('tt') ? it.id : ''),
+            tmdbId: it.tmdbId || '',
+            title: it.title || it.name || '',
+            year: it.year || '',
+            poster: it.poster || null,
+            showTitle: it.showTitle || null,
+            type: it.type || (it.seasonNum != null ? 'episode' : (type === 'series' ? 'series' : 'movie')),
+            seasonNum: it.seasonNum != null ? it.seasonNum : (it.season != null ? it.season : null),
+            episodeNum: it.episodeNum != null ? it.episodeNum : (it.episode != null ? it.episode : null),
+          });
+        });
+      }
+    }
+
+    const currentItems = Array.isArray(listMeta.items) ? listMeta.items : ((localMap[slug] && Array.isArray(localMap[slug].items)) ? localMap[slug].items : []);
+    const baseItemIds = Array.isArray(listMeta.baseItemIds) ? listMeta.baseItemIds : ((localMap[slug] && Array.isArray(localMap[slug].baseItemIds)) ? localMap[slug].baseItemIds : null);
+
+    const mergeResult = performSmartListMerge(currentItems, baseItemIds, remoteItems, options);
+    const now = Date.now();
+
+    // Persist locally
+    if (localMap[slug]) {
+      localMap[slug].items = mergeResult.items;
+      localMap[slug].baseItemIds = mergeResult.newBaseItemIds;
+      localMap[slug].lastSyncedAt = now;
+      localMap[slug].updatedAt = now;
+      localMap[slug].synced = true;
+      localMap[slug].sourceUrl = sourceUrl;
+      saveLocalCustomListsMap(localMap);
+    }
+
+    // Persist to creator account if signed in
+    if (typeof activeCreator !== 'undefined' && activeCreator) {
+      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+      if (creatorKey) {
+        const body = {
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          slug: slug,
+          name: listMeta.name,
+          type: listType,
+          items: mergeResult.items,
+          visibility: listMeta.visibility || 'private',
+          sourceUrl: sourceUrl,
+          synced: true,
+          lastSyncedAt: now,
+          baseItemIds: mergeResult.newBaseItemIds,
+        };
+        if (Number.isFinite(listMeta.updatedAt)) body.expectedUpdatedAt = listMeta.updatedAt;
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const resData = await res.json();
+        if (resData && resData.ok && Number.isFinite(resData.updatedAt)) {
+          listMeta.updatedAt = resData.updatedAt;
+        }
+      }
+    }
+
+    // Update in-memory metadata
+    listMeta.items = mergeResult.items;
+    listMeta.itemCount = mergeResult.items.length;
+    listMeta.baseItemIds = mergeResult.newBaseItemIds;
+    listMeta.lastSyncedAt = now;
+    listMeta.synced = true;
+    listMeta.sourceUrl = sourceUrl;
+
+    // Sync to catalog shelf rows if added to user's catalogs
+    if (typeof syncCustomListToCatalogRows === 'function') {
+      syncCustomListToCatalogRows(slug, mergeResult.items, listMeta.name, listType);
+    }
+
+    // Refresh dashboard UI if function exists
+    if (typeof renderCreatorDashboard === 'function') {
+      renderCreatorDashboard({ silent: true });
+    }
+
+    if (!isSilent) {
+      const msg = mergeResult.addedCount > 0
+        ? 'Synced "' + listMeta.name + '": ' + mergeResult.addedCount + ' new item' + (mergeResult.addedCount === 1 ? '' : 's') + ' added.'
+        : 'Synced "' + listMeta.name + '": already up to date with external link.';
+      if (typeof showAddedToast === 'function') {
+        showAddedToast(msg);
+      } else if (typeof showAppAlert === 'function') {
+        showAppAlert('List Synced', msg, false);
+      } else {
+        alert(msg);
+      }
+    }
+
+    return { ok: true, addedCount: mergeResult.addedCount, totalCount: mergeResult.items.length };
+  } catch (err) {
+    console.error('syncCustomListWithExternalSource error:', err);
+    if (!isSilent) {
+      const errMsg = 'Could not sync list: ' + (err.message || 'network error');
+      if (typeof showAppAlert === 'function') showAppAlert('Sync Error', errMsg, false);
+      else alert(errMsg);
+    }
+    return { ok: false, error: err.message || 'sync-failed' };
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel || 'Sync';
+    }
+  }
+}
+window.syncCustomListWithExternalSource = syncCustomListWithExternalSource;
 
 // Walks the connected Trakt account's full watch history (movies, then
 // episodes) via /api/trakt-history-raw and adds every item to Watch
@@ -26860,6 +28147,59 @@ function escapeRegex(s) {
   return String(s).replace(/[.*+?^\x24\x7B\x7D()|[\]\\]/g, '\\$&');
 }
 
+function isAdultContentFilterEnabled() {
+  const localVal = (function() {
+    try { return localStorage.getItem('myListAddon:adultContentFilter'); } catch (e) { return null; }
+  })();
+  if (localVal !== null) return localVal === '1';
+  const cb = typeof document !== 'undefined' ? document.getElementById('adultContentFilterCheckbox') : null;
+  if (cb) return !!cb.checked;
+  return false;
+}
+
+function isAdultOrNsfw(item) {
+  if (!item) return false;
+  if (item.adult === true || item.isAdult === true) return true;
+  const cert = String(item.certification || item.ageRating || item.contentRating || '').toUpperCase().trim();
+  if (['NC-17', 'X', 'XXX', 'R18+', '18+', 'RX', 'TV-MA (ADULT)', 'TV-MA-S', 'ADULT'].includes(cert)) return true;
+  const genres = Array.isArray(item.genres)
+    ? item.genres.map((g) => (typeof g === 'string' ? g : (g && g.name ? g.name : '')).toLowerCase().trim())
+    : (typeof item.genres === 'string' ? item.genres.toLowerCase().split(',').map((g) => g.trim()) : []);
+  const nsfwTerms = ['adult', 'erotic', 'erotica', 'hentai', 'ecchi', 'porn', 'pornography', 'xxx', 'softcore', 'hardcore'];
+  if (genres.some((g) => nsfwTerms.some((t) => g === t || g.includes(t)))) return true;
+  const text = [item.name, item.title, item.showTitle, item.listName, item.franchise, item.user]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (text) {
+    const explicitPattern = /\\b(hentai|porn|pornography|erotica|erotic|blowjob|creampie|gangbang|milf|dildo|masturbation|fetish|bdsm|softcore|hardcore|top wet girls|evil angel|brazzers|naughty america|wicked pictures|reality kings|jules jordan|sweet sinner)\\b/i;
+    if (explicitPattern.test(text)) return true;
+  }
+  return false;
+}
+
+function getSafePosterUrl(item) {
+  const safeOrigin = typeof ORIGIN !== 'undefined' ? ORIGIN : '';
+  const safeTitle = (item && (item.title || item.name || item.showTitle)) || '';
+  const safeYear = (item && (item.year || item.releaseInfo)) || '';
+  const safeType = (item && (item.type || item.mediatype || (item.showId ? 'series' : 'movie'))) || '';
+  const safeCert = (item && (item.certification || item.ageRating || item.contentRating)) || '';
+  return safeOrigin + '/api/safe-poster?title=' + encodeURIComponent(safeTitle) +
+    (safeYear ? '&year=' + encodeURIComponent(safeYear) : '') +
+    (safeType ? '&type=' + encodeURIComponent(safeType) : '') +
+    (safeCert ? '&cert=' + encodeURIComponent(safeCert) : '');
+}
+
+function resolveClientPoster(it, fallbackPoster) {
+  if (!it) return fallbackPoster || '';
+  const p = fallbackPoster !== undefined ? fallbackPoster : (it.poster || it.showPoster || '');
+  if (p && p.includes('/api/safe-poster')) return p;
+  if (isAdultContentFilterEnabled() && (it.isAdult || it.isAdultPosterFiltered || isAdultOrNsfw(it))) {
+    return getSafePosterUrl(it);
+  }
+  return p;
+}
+
 function parseListSearchIntent(rawQuery) {
   const raw = String(rawQuery || '').trim();
   const q = raw.toLowerCase().replace(/['"“”]/g, '').trim();
@@ -27070,7 +28410,7 @@ async function executeUnifiedListSearch(rawQuery, targetBox) {
     fetch(ORIGIN + '/api/search-published-lists?q=' + encodeURIComponent(searchTerm))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
       .catch(() => ({ ok: false, lists: [] })),
-    fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(searchTerm) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''))
+    fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(searchTerm) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : '') + (isAdultContentFilterEnabled() ? '&adultContentFilter=1' : ''))
       .then(async (r) => (r.ok && (r.headers.get('content-type') || '').includes('application/json') ? await r.json() : { ok: false, lists: [] }))
       .catch(() => ({ ok: false, lists: [] })),
   ];
@@ -27094,6 +28434,25 @@ async function executeUnifiedListSearch(rawQuery, targetBox) {
   const myListsMatches = myListsResult && myListsResult.ok && Array.isArray(myListsResult.lists) ? myListsResult.lists : [];
   const tmdbMatches = tmdbResult && tmdbResult.ok && Array.isArray(tmdbResult.lists) ? tmdbResult.lists : [];
   const traktError = traktResult && !traktResult.ok ? traktResult.error : null;
+
+  if (mdblistMatches.length === 0 && traktMatches.length === 0 && tmdbMatches.length === 0 && myListsMatches.length === 0) {
+    const altTerm = searchTerm
+      .replace(/\\bpickup\\b/gi, 'pick up')
+      .replace(/\\bpick up\\b/gi, 'pickup')
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/([a-zA-Z])(\\d+)/g, '$1 $2');
+    if (altTerm !== searchTerm) {
+      try {
+        const altRes = await fetch(ORIGIN + '/api/tmdb-search-lists?q=' + encodeURIComponent(altTerm) + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : '') + (isAdultContentFilterEnabled() ? '&adultContentFilter=1' : ''));
+        if (altRes.ok && (altRes.headers.get('content-type') || '').includes('application/json')) {
+          const altData = await altRes.json();
+          if (altData && altData.ok && Array.isArray(altData.lists) && altData.lists.length > 0) {
+            tmdbMatches.push(...altData.lists);
+          }
+        }
+      } catch (e) {}
+    }
+  }
 
   // Save to client cache
   window._unifiedSearchCache.set(cacheKey, {
@@ -27311,12 +28670,24 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
   populateSearchResultPosters();
 }
 
+// In-memory cache of resolved list previews so switching tabs or encountering
+// the same list across multiple shelves doesn't re-trigger network fetches or
+// consume the /api/preview rate limit.
+window._listPreviewCache = window._listPreviewCache || new Map();
+
 // Fetches one page of a list preview from /api/preview. Pulled out of
 // populateSearchResultPosters (its only caller before this) so
 // fetchListPreviewWithRetry, right below, and the per-card retry button it
 // backs can both reach it without duplicating the six external-key lookups.
 async function fetchListPreviewOnce(listUrl, type, sample) {
+  const isAdultFilterOn = isAdultContentFilterEnabled();
+  const cacheKey = String(listUrl) + '|' + String(type) + '|' + String(sample || 12) + (isAdultFilterOn ? '|safe' : '');
+  if (window._listPreviewCache && window._listPreviewCache.has(cacheKey)) {
+    return window._listPreviewCache.get(cacheKey);
+  }
+
   const payload = { url: listUrl, type: type, sample: sample || 12 };
+  if (isAdultFilterOn) payload.adultContentFilter = true;
   const mkInput = document.getElementById('mdblistKeyInput');
   payload.mdblistKey = (mkInput && mkInput.value ? mkInput.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
   const tkInput = document.getElementById('tmdbKeyInput');
@@ -27325,7 +28696,11 @@ async function fetchListPreviewOnce(listUrl, type, sample) {
   payload.traktKey = (trkInput && trkInput.value ? trkInput.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
 
   const trkToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
-  if (trkToken) payload.traktAccessToken = trkToken;
+  if (trkToken) {
+    const myTraktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+    const isOwnList = !listUrl || listUrl.startsWith('trakt:') || (myTraktUser && listUrl.toLowerCase().includes('/users/' + myTraktUser.toLowerCase() + '/'));
+    if (isOwnList) payload.traktAccessToken = trkToken;
+  }
   const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
   if (mdbToken) payload.mdblistAccessToken = mdbToken;
   const smkToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
@@ -27340,37 +28715,45 @@ async function fetchListPreviewOnce(listUrl, type, sample) {
       body: JSON.stringify(payload),
       cache: 'no-store',
     });
-    if (!res.ok) return { ok: false };
+    if (!res.ok) return { ok: false, status: res.status };
     const ct = res.headers.get('content-type') || '';
     if (!ct.includes('application/json')) return { ok: false };
-    return await res.json();
+    const data = await res.json();
+    if (data && data.ok) {
+      if (!window._listPreviewCache) window._listPreviewCache = new Map();
+      window._listPreviewCache.set(cacheKey, data);
+    }
+    return data;
   } catch (e) {
     return { ok: false };
   }
 }
 
-// One immediate retry, no backoff. This is what a Discover/My Lists/Search
-// card's poster strip going permanently blank almost always was: not a real
-// failure, but a burst of concurrent /api/preview calls (up to 40 cards at
-// once, 5 at a time, a mixed-type card costing two) catching the per-IP
-// preview rate limit (25_api-catalog-routes.js), or one upstream timeout.
-// The caller used to treat "not ok" as final and leave the slot empty
-// forever -- nothing rendered, nothing logged anywhere a user could see,
-// and no way to get the card back short of a full page reload. This clears
-// the common transient case silently; loadPosterSlot below still leaves a
-// visible, retryable failure state for whatever is left after this.
+// One retry. When rate limited (HTTP 429), backs off briefly so the burst
+// has time to settle instead of hammering the limiter with an immediate retry.
 async function fetchListPreviewWithRetry(listUrl, type, sample) {
   const first = await fetchListPreviewOnce(listUrl, type, sample);
   if (first && first.ok) return first;
+  if (first && first.status === 429) {
+    await new Promise((r) => setTimeout(r, 1000));
+  }
   return fetchListPreviewOnce(listUrl, type, sample);
 }
 
 // Retry button inside the failure state loadPosterSlot renders below.
-// Restores the slot to its pre-fetch shape and re-runs the same per-card
-// logic a fresh render would have.
+// Clears any cached entry for this list, restores the slot to its pre-fetch
+// shape, and re-runs the per-card logic fresh.
 function retryPosterSlot(btn) {
   const slot = btn && btn.closest('.list-card-posters');
   if (!slot) return;
+  const listUrl = slot.dataset.url;
+  const type = slot.dataset.type || 'movie';
+  if (window._listPreviewCache) {
+    window._listPreviewCache.delete(String(listUrl) + '|' + String(type) + '|12');
+    window._listPreviewCache.delete(String(listUrl) + '|movie|12');
+    window._listPreviewCache.delete(String(listUrl) + '|series|12');
+    window._listPreviewCache.delete(String(listUrl) + '|mixed|12');
+  }
   slot.className = 'list-card-posters poster-preview-slot';
   slot.innerHTML = '';
   loadPosterSlot(slot);
@@ -27378,7 +28761,16 @@ function retryPosterSlot(btn) {
 
 async function fetchPreviewForSlot(listUrl, type) {
   if (type !== 'mixed') {
-    return fetchListPreviewWithRetry(listUrl, type);
+    const res = await fetchListPreviewWithRetry(listUrl, type);
+    if (res && res.ok && (!res.sample || res.sample.length === 0)) {
+      const altType = type === 'movie' ? 'series' : 'movie';
+      const altRes = await fetchListPreviewWithRetry(listUrl, altType).catch(() => null);
+      if (altRes && altRes.ok && altRes.sample && altRes.sample.length > 0) {
+        altRes.effectiveType = altType;
+        return altRes;
+      }
+    }
+    return res;
   }
   const [movieResult, seriesResult] = await Promise.all([
     fetchListPreviewWithRetry(listUrl, 'movie').catch(() => null),
@@ -27422,7 +28814,7 @@ async function fetchPreviewForSlot(listUrl, type) {
 async function loadPosterSlot(slot) {
   if (!slot) return;
   const listUrl = slot.dataset.url;
-  const type = slot.dataset.type || 'movie';
+  let type = slot.dataset.type || 'movie';
   const listName = slot.dataset.name || listUrl;
   const parentCard = slot.closest('.list-card');
   const cardCreator = (parentCard && parentCard.dataset.creator) || slot.dataset.creator || '';
@@ -27431,82 +28823,100 @@ async function loadPosterSlot(slot) {
 
   try {
     const data = await fetchPreviewForSlot(listUrl, type);
-    if (data.ok && data.sample && data.sample.length) {
-      const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
-      if (validPosters.length) {
-        // What this card can honestly claim about the list's size.
-        //
-        // This used to be data.count -- the number of items on the FIRST
-        // PAGE, which /api/preview caps at 100. So every list longer than
-        // that advertised "100", and the badge carried that 100 into the
-        // See All page as an exact item count (see the searchViewListBtn
-        // handler and openListDetailsPage's knownTotalItems), where it
-        // then overrode the real count as more pages loaded. A 303-item
-        // chart said 100 items, and went on saying it after the whole
-        // list had been scrolled through.
-        //
-        // So: a real total when the source reports one (totalItems), the
-        // stored count when the directory knows it (cardItems), and
-        // otherwise "100+" -- which is all that is actually known when a
-        // full page came back and more remains. exactCount is what the
-        // details page may adopt as a total; the "+" estimate is
-        // deliberately not passed on, so that page counts what it loads
-        // rather than believing a floor.
-        const previewTotal = (typeof data.totalItems === 'number' && data.totalItems > 0) ? data.totalItems : null;
-        const exactCount = cardItems || previewTotal || (data.maybeMore ? '' : data.count) || '';
-        const totalCount = exactCount || ((data.count || validPosters.length) + '+');
-        const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
-        const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
-
-        let inner = '';
-        validPosters.forEach((s, i) => {
-          const isMobileEnd = (i === 2 && validPosters.length > 3);
-          const isDesktopEnd = (i === validPosters.length - 1 && validPosters.length >= 4);
-
-          let overlays = '';
-          if (isMobileEnd) {
-            overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    if (data && data.ok) {
+      if (data.effectiveType) {
+        type = data.effectiveType;
+        slot.dataset.type = type;
+        if (parentCard) {
+          parentCard.dataset.type = type;
+          const addBtn = parentCard.querySelector('.searchAddBtn');
+          if (addBtn && !addBtn.classList.contains('is-added')) {
+            addBtn.dataset.type = type;
           }
-          if (isDesktopEnd) {
-            overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
-          }
-
-          let removeBtn = '';
-          if (isTraktSlot) {
-            const traktTarget = listUrl === 'trakt:watchlist' ? 'watchlist' : (listUrl === 'trakt:history' ? 'history' : 'custom');
-            const slugMatch = listUrl.match(new RegExp('lists/([^/?#]+)'));
-            const traktListId = traktTarget === 'custom' ? (slugMatch ? slugMatch[1] : listUrl) : traktTarget;
-            removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt">&times;</button>';
-          } else if (isMdblistSlot) {
-            const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (listUrl === 'mdblist:history' ? 'history' : 'custom');
-            const mdbMatch = listUrl.match(new RegExp('lists/[^/]+/([^/?#]+)'));
-            const mdbListId = mdbTarget === 'custom' ? (mdbMatch ? mdbMatch[1] : listUrl) : mdbTarget;
-            removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
-          }
-
-          inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
-            '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
-              '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
-              removeBtn +
-              '<div class="poster-add-overlay">+</div>' +
-              overlays +
-            '</div>' +
-            '<div class="list-card-mini-poster-name">' + escapeHtml(s.name || '') + '</div>' +
-            (s.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(s.year) + '</div>' : '') +
-          '</div>';
-        });
-        slot.className = 'list-card-posters';
-        slot.innerHTML = inner;
-        return;
+        }
       }
+      if (data.sample && data.sample.length) {
+        const validPosters = data.sample.filter((s) => s.poster).slice(0, 9);
+        if (validPosters.length) {
+          // What this card can honestly claim about the list's size.
+          //
+          // This used to be data.count -- the number of items on the FIRST
+          // PAGE, which /api/preview caps at 100. So every list longer than
+          // that advertised "100", and the badge carried that 100 into the
+          // See All page as an exact item count (see the searchViewListBtn
+          // handler and openListDetailsPage's knownTotalItems), where it
+          // then overrode the real count as more pages loaded. A 303-item
+          // chart said 100 items, and went on saying it after the whole
+          // list had been scrolled through.
+          //
+          // So: a real total when the source reports one (totalItems), the
+          // stored count when the directory knows it (cardItems), and
+          // otherwise "100+" -- which is all that is actually known when a
+          // full page came back and more remains. exactCount is what the
+          // details page may adopt as a total; the "+" estimate is
+          // deliberately not passed on, so that page counts what it loads
+          // rather than believing a floor.
+          const previewTotal = (typeof data.totalItems === 'number' && data.totalItems > 0) ? data.totalItems : null;
+          const exactCount = cardItems || previewTotal || (data.maybeMore ? '' : data.count) || '';
+          const totalCount = exactCount || ((data.count || validPosters.length) + '+');
+          const isTraktSlot = !!slot.closest('#myPrivateTraktListsResult, #myTraktListsResult') || listUrl === 'trakt:watchlist' || listUrl === 'trakt:history';
+          const isMdblistSlot = !!slot.closest('#myMdblistListsResult');
+
+          let inner = '';
+          validPosters.forEach((s, i) => {
+            const isMobileEnd = (i === 2 && validPosters.length > 3);
+            const isDesktopEnd = (i === validPosters.length - 1 && validPosters.length >= 4);
+
+            let overlays = '';
+            if (isMobileEnd) {
+              overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+            }
+            if (isDesktopEnd) {
+              overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+            }
+
+            let removeBtn = '';
+            if (isTraktSlot) {
+              const traktTarget = listUrl === 'trakt:watchlist' ? 'watchlist' : (listUrl === 'trakt:history' ? 'history' : 'custom');
+              const slugMatch = listUrl.match(new RegExp('lists/([^/?#]+)'));
+              const traktListId = traktTarget === 'custom' ? (slugMatch ? slugMatch[1] : listUrl) : traktTarget;
+              removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt">&times;</button>';
+            } else if (isMdblistSlot) {
+              const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (listUrl === 'mdblist:history' ? 'history' : 'custom');
+              const mdbMatch = listUrl.match(new RegExp('lists/[^/]+/([^/?#]+)'));
+              const mdbListId = mdbTarget === 'custom' ? (mdbMatch ? mdbMatch[1] : listUrl) : mdbTarget;
+              removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
+            }
+
+            const itemPoster = resolveClientPoster(Object.assign({}, s, { listName, listUrl }), s.poster);
+            inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
+              '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(itemPoster || '') + '">' +
+                '<img src="' + escapeAttr(itemPoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">' +
+                removeBtn +
+                '<div class="poster-add-overlay">+</div>' +
+                overlays +
+              '</div>' +
+              '<div class="list-card-mini-poster-name">' + escapeHtml(s.name || '') + '</div>' +
+              (s.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(s.year) + '</div>' : '') +
+            '</div>';
+          });
+          slot.className = 'list-card-posters';
+          slot.innerHTML = inner;
+          if (window._currentDiscoverRenderedFilter && window._discoverFeedsCache && slot.closest('#discoverListsFeed')) {
+            const feedContainer = document.getElementById('discoverListsFeed');
+            if (feedContainer) window._discoverFeedsCache[window._currentDiscoverRenderedFilter] = feedContainer.innerHTML;
+          }
+          return;
+        }
+      }
+      slot.className = 'list-card-posters poster-preview-empty';
+      slot.innerHTML = '<p class="poster-preview-empty-msg">' +
+        ((data.sample && data.sample.length > 0) ? 'No preview posters available.' : 'No items found in this list.') +
+        '</p>';
+      return;
     }
     // Reached with nothing to show -- the fetch (and its automatic retry)
-    // both failed, or /api/preview genuinely came back with no posters. A
-    // sample this thin is rare enough among what this renders (charts,
-    // published lists, search results) that erring toward "couldn't load"
-    // and offering Retry is more useful than leaving the card silently
-    // blank, which is what a caller reported as "sometimes lists just don't
-    // load" with no way to tell why or fix it short of a page reload.
+    // both failed (data.ok is false or rejected)
     slot.className = 'list-card-posters poster-preview-error';
     slot.innerHTML = '<p class="poster-preview-error-msg">Couldn’t load previews for this list.' +
       ' <button type="button" class="lc-btn secondary" onclick="retryPosterSlot(this)">Retry</button></p>';
@@ -27518,7 +28928,11 @@ async function loadPosterSlot(slot) {
 }
 
 async function populateSearchResultPosters() {
-  const slots = [...document.querySelectorAll('.poster-preview-slot')];
+  const allSlots = [...document.querySelectorAll('.poster-preview-slot')];
+  // Filter out slots that are inside hidden containers (e.g. inactive tabs)
+  const slots = allSlots.filter((slot) => {
+    return !slot.closest('[style*="display: none"], [style*="display:none"]');
+  });
   let idx = 0;
   const CONCURRENCY = 5;
 
@@ -27526,6 +28940,7 @@ async function populateSearchResultPosters() {
     while (idx < slots.length) {
       const slot = slots[idx++];
       if (!slot) continue;
+      if (slot.closest('[style*="display: none"], [style*="display:none"]')) continue;
       await loadPosterSlot(slot);
     }
   }
@@ -28037,7 +29452,11 @@ async function loadCuratedListsFeed(forceRefresh) {
       ? CHART_SLUG_ENTRIES.map(c => ({ name: c.name, url: c.movieUrl || c.showUrl || c.url, type: (c.showUrl && c.showUrl.includes('shows')) ? 'series' : 'movie', user: 'Curated' }))
       : [];
 
-    const publicListsPool = [...(mdblists || []), ...(traktLists || []), ...chartCatalogList];
+    const curatedPresets = (typeof CURATED_LIST_ENTRIES !== 'undefined' && Array.isArray(CURATED_LIST_ENTRIES))
+      ? CURATED_LIST_ENTRIES.map(c => ({ name: c.name, url: 'custom:curated:' + c.slug, type: c.type, user: 'Curated' }))
+      : [];
+
+    const publicListsPool = [...curatedPresets, ...(mdblists || []), ...(traktLists || []), ...chartCatalogList];
     let sectionsHtml = '';
 
     // Keep a copy of exactly what these two cards are about to render, so
@@ -28073,24 +29492,84 @@ async function loadCuratedListsFeed(forceRefresh) {
         });
       });
 
-      let recommendedLists = [];
+      // Collect user watch history titles and keywords
+      const watchHistoryKeywords = new Set();
+      const historyTitles = [];
+      [...whItems, ...cwItems].forEach(function(it) {
+        if (!it) return;
+        const title = (it.title || it.name || it.showTitle || it.showName || '').trim();
+        if (title) {
+          historyTitles.push(title.toLowerCase());
+          title.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).forEach(function(w) {
+            if (w.length > 3 && !['episode', 'season', 'movie', 'series', 'show', 'part'].includes(w)) {
+              watchHistoryKeywords.add(w);
+            }
+          });
+        }
+      });
+
+      // Collect liked lists keywords
+      const likedKeywords = new Set();
       if (likedUrls.length) {
-        const likedKeywords = likedUrls.map(u => {
+        likedUrls.forEach(function(u) {
           const parts = u.split('/').filter(Boolean);
-          return parts[parts.length - 1] ? parts[parts.length - 1].replace(/[-_]/g, ' ') : '';
-        }).filter(Boolean);
-
-        recommendedLists = publicListsPool.filter(l => {
-          if (likedUrls.includes(l.url)) return false;
-          const nameLower = (l.name || '').toLowerCase();
-          return likedKeywords.some(kw => kw.length > 3 && nameLower.includes(kw.toLowerCase()));
-        }).slice(0, 6);
+          const last = parts[parts.length - 1] ? parts[parts.length - 1].replace(/[-_]/g, ' ').toLowerCase() : '';
+          last.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).forEach(function(w) {
+            if (w.length > 3 && !['list', 'lists', 'user', 'collection'].includes(w)) {
+              likedKeywords.add(w);
+            }
+          });
+        });
       }
 
-      if (!recommendedLists.length) {
-        // Pick top popular & trending community lists
-        recommendedLists = publicListsPool.filter(l => !alreadyAdded.has(l.url + '|' + (l.type || 'movie'))).slice(0, 8);
-      }
+      // Candidate lists from publicListsPool that user hasn't added or liked
+      const candidates = publicListsPool.filter(function(l) {
+        if (!l || !l.url) return false;
+        if (likedUrls.includes(l.url)) return false;
+        if (alreadyAdded.has(l.url + '|' + (l.type || 'movie'))) return false;
+        return true;
+      });
+
+      // Score each candidate based on liked lists and watch history
+      const scored = candidates.map(function(l) {
+        const nameLower = (l.name || '').toLowerCase();
+        let matchScore = (Number(l.likes) || 0) * 0.1;
+        let matched = false;
+
+        for (let i = 0; i < historyTitles.length; i++) {
+          const ht = historyTitles[i];
+          if (ht.length > 3 && (nameLower.includes(ht) || ht.includes(nameLower))) {
+            matchScore += 40;
+            matched = true;
+            break;
+          }
+        }
+
+        watchHistoryKeywords.forEach(function(kw) {
+          if (nameLower.includes(kw)) {
+            matchScore += 15;
+            matched = true;
+          }
+        });
+
+        likedKeywords.forEach(function(kw) {
+          if (nameLower.includes(kw)) {
+            matchScore += 25;
+            matched = true;
+          }
+        });
+
+        return { list: l, score: matchScore, matched: matched };
+      });
+
+      scored.sort(function(a, b) {
+        if (a.matched && !b.matched) return -1;
+        if (!a.matched && b.matched) return 1;
+        if (b.score !== a.score) return b.score - a.score;
+        return (Number(b.list.likes) || 0) - (Number(a.list.likes) || 0);
+      });
+
+      const recommendedLists = scored.slice(0, 10).map(function(s) { return s.list; });
 
       if (recommendedLists.length) {
         sectionsHtml += '<div style="margin-top:24px; margin-bottom:8px;"><h3 style="font-size:0.95rem; margin:0 0 2px;">Recommended Community Lists</h3><p style="margin:0; font-size:0.8rem; color:var(--muted);">Top community and curated lists you might like</p></div>';
@@ -28179,6 +29658,7 @@ async function loadCuratedListsFeed(forceRefresh) {
       }
     }
 
+
     if (!sectionsHtml) {
       container.innerHTML =
         '<div style="text-align:center; padding:24px 16px; background:var(--card-bg); border:1px solid var(--border); border-radius:14px;">' +
@@ -28196,7 +29676,7 @@ async function loadCuratedListsFeed(forceRefresh) {
     container.innerHTML =
       '<div style="text-align:center; padding:24px 16px; background:var(--card-bg); border:1px solid var(--border); border-radius:14px;">' +
         '<p style="margin:0 0 10px; font-size:0.88rem; color:var(--muted);">Watch more items or like community lists to build personalized recommendations.</p>' +
-        '<button type="button" class="lc-btn primary" onclick="filterDiscoverShelves(&quot;all&quot;)">Explore Discover</button>' +
+        '<button type="button" class="lc-btn primary" onclick="filterDiscoverShelves(&quot;movie&quot;)">Explore Discover</button>' +
       '</div>';
   }
 }
@@ -28545,12 +30025,6 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
     (d && d.tmdbId) ? ('tmdb:' + d.tmdbId) : null,
   ].filter(Boolean));
 
-  if (window._fullyWatchedShowIds) {
-    for (const sid of showIdsToCheck) {
-      if (window._fullyWatchedShowIds.has(sid)) return true;
-    }
-  }
-
   try {
     const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     const hist = map['watch-history'];
@@ -28565,6 +30039,8 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
 
     const distinctEps = new Set(watchedEps.map(it => it.episodeNum != null ? Number(it.episodeNum) : null).filter(n => n != null));
 
+    if (distinctEps.size === 0) return false;
+
     if (window._seasonEpisodesMap && window._seasonEpisodesMap[sNum]) {
       const aired = window._seasonEpisodesMap[sNum].filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
       if (aired.length > 0) return distinctEps.size >= aired.length;
@@ -28573,7 +30049,7 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
     if (episodeCount && episodeCount > 0) {
       return distinctEps.size >= episodeCount;
     }
-    return distinctEps.size > 0;
+    return false;
   } catch (e) {
     return false;
   }
@@ -28663,8 +30139,9 @@ window.markSeasonWatched = async function(seasonNum, btn) {
     }
 
     // Check if whole show is watched or not
+    let allSeasonsWatched = false;
     if (d.seasonsData && Array.isArray(d.seasonsData)) {
-      const allSeasonsWatched = d.seasonsData.filter(s => s.season_number !== 0).every(s => {
+      allSeasonsWatched = d.seasonsData.filter(s => s.season_number !== 0).every(s => {
         if (s.season_number === seasonNum) return resBatch.nowWatched;
         return isSeasonFullyWatched(d.id, s.season_number, s.episode_count);
       });
@@ -28675,14 +30152,14 @@ window.markSeasonWatched = async function(seasonNum, btn) {
 
     // Update overall show watched button if present
     const btnShow = document.getElementById('btnMarkShowWatched');
-    if (btnShow && typeof isItemWatched === 'function') {
-      const showWatched = isItemWatched(d.id, d.tmdbId, d.imdbId);
+    if (btnShow) {
+      const showWatched = (d.seasonsData && Array.isArray(d.seasonsData)) ? allSeasonsWatched : isShowFullyWatched(d);
       if (showWatched) {
-        btnShow.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched';
+        btnShow.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched';
         btnShow.classList.remove('primary');
         btnShow.classList.add('secondary');
       } else {
-        btnShow.innerHTML = 'Mark Whole Show Watched';
+        btnShow.innerHTML = 'Mark Show Watched';
         btnShow.classList.remove('secondary');
         btnShow.classList.add('primary');
       }
@@ -28698,6 +30175,26 @@ window.markSeasonWatched = async function(seasonNum, btn) {
   }
 };
 
+function isShowFullyWatched(d) {
+  if (!d) return false;
+  const showIds = [d.id, d.imdbId, d.tmdbId, (d.tmdbId ? 'tmdb:' + d.tmdbId : null), (d.id ? 'tmdb:' + d.id : null)].filter(Boolean).map(String);
+
+  // If seasonsData is available and has non-specials seasons, verify that every season is fully watched
+  if (d.seasonsData && Array.isArray(d.seasonsData)) {
+    const regularSeasons = d.seasonsData.filter(s => s.season_number !== 0);
+    if (regularSeasons.length > 0) {
+      return regularSeasons.every(s => isSeasonFullyWatched(d.id, s.season_number, s.episode_count));
+    }
+  }
+
+  // Fallback to _fullyWatchedShowIds
+  if (window._fullyWatchedShowIds) {
+    if (showIds.some(id => window._fullyWatchedShowIds.has(id))) return true;
+  }
+  return false;
+}
+window.isShowFullyWatched = isShowFullyWatched;
+
 function isItemWatched(id, tmdbId, imdbId) {
   const idsToCheck = [id, tmdbId, imdbId, (tmdbId ? 'tmdb:' + tmdbId : null), (id ? 'tmdb:' + id : null)].filter(Boolean).map(String);
   if (window._watchedItemIds) {
@@ -28712,7 +30209,7 @@ function isItemWatched(id, tmdbId, imdbId) {
       const l = map[key];
       if (key === 'watch-history' || key.includes('watch-history') || (l && l.name && l.name.toLowerCase().includes('watch history'))) {
         if (l && Array.isArray(l.items)) {
-          if (l.items.some(it => idsToCheck.includes(String(it.id)) || idsToCheck.includes(String(it.imdbId)) || idsToCheck.includes(String(it.showId)))) {
+          if (l.items.some(it => idsToCheck.includes(String(it.id)) || (it.imdbId && idsToCheck.includes(String(it.imdbId))) || (it.tmdbId && (idsToCheck.includes(String(it.tmdbId)) || idsToCheck.includes('tmdb:' + it.tmdbId))))) {
             return true;
           }
         }
@@ -28721,11 +30218,162 @@ function isItemWatched(id, tmdbId, imdbId) {
   } catch (e) {}
   try {
     const rawWh = JSON.parse(localStorage.getItem('myListAddon:watchHistory') || '[]');
-    if (Array.isArray(rawWh) && rawWh.some(it => idsToCheck.includes(String(it.id)) || idsToCheck.includes(String(it.imdbId)))) {
+    if (Array.isArray(rawWh) && rawWh.some(it => idsToCheck.includes(String(it.id)) || (it.imdbId && idsToCheck.includes(String(it.imdbId))))) {
       return true;
     }
   } catch (e) {}
   return false;
+}
+
+function renderItemStorylinesWatchOrder(d, type) {
+  if (!d) return '';
+  const events = (typeof window !== 'undefined' && window.TV_CROSSOVER_EVENTS) || (typeof TV_CROSSOVER_EVENTS !== 'undefined' ? TV_CROSSOVER_EVENTS : []);
+  if (!events || !events.length) return '';
+
+  const isSeries = (type === 'series' || (d.seasonsData && d.seasonsData.length > 0));
+  const dImdb = String(d.imdbId || (String(d.id || '').startsWith('tt') ? d.id : '')).trim().toLowerCase();
+  const dTmdb = String(d.tmdbId || '').trim().replace(/^tmdb:/, '') || (String(d.id || '').startsWith('tmdb:') ? String(d.id).replace('tmdb:', '') : (!isNaN(d.id) ? String(d.id) : ''));
+  const dTitleNorm = String(d.title || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  const isPartMatch = (ep) => {
+    if (!ep) return false;
+    const epIsMovie = (ep.type === 'movie');
+    if (isSeries && epIsMovie) return false;
+    if (!isSeries && !epIsMovie) return false;
+
+    const epImdb = (ep.imdbId || '').trim().toLowerCase();
+    if (epImdb && dImdb && epImdb === dImdb) return true;
+
+    const epTmdb = ep.tmdbId ? String(ep.tmdbId).trim().replace(/^tmdb:/, '') : '';
+    if (epTmdb && dTmdb && epTmdb === dTmdb) return true;
+
+    if (!dTitleNorm) return false;
+    if (epIsMovie) {
+      const epTitleNorm = String(ep.title || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (epTitleNorm && (dTitleNorm === epTitleNorm)) return true;
+    } else {
+      const epShowNorm = String(ep.showName || ep.title || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (epShowNorm && (dTitleNorm === epShowNorm || (dTitleNorm.length >= 6 && epShowNorm.startsWith(dTitleNorm)) || (epShowNorm.length >= 6 && dTitleNorm.startsWith(epShowNorm)))) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const matchingEvents = events.filter((ev) => Array.isArray(ev.episodes) && ev.episodes.some(isPartMatch));
+  if (!matchingEvents.length) return '';
+
+  const storylineBlocksHtml = matchingEvents.map((event, eventIdx) => {
+    const isSingle = (matchingEvents.length === 1);
+    const displayStyle = (isSingle || eventIdx === 0) ? 'display:block;' : 'display:none;';
+
+    const cardsHtml = event.episodes.map((ep, i) => {
+      const isCurrent = isPartMatch(ep);
+      const isMovie = (ep.type === 'movie');
+      const displayTitle = ep.title || ep.showName || '';
+
+      let formatSubtitle = '';
+      if (isMovie) {
+        formatSubtitle = ep.year ? (ep.year + ' \u2022 Movie') : 'Movie';
+      } else if (Array.isArray(ep.seasons)) {
+        formatSubtitle = 'Seasons ' + ep.seasons[0] + '-' + ep.seasons[ep.seasons.length - 1] + (ep.year ? ' \u2022 ' + ep.year : '');
+      } else if (ep.season != null && ep.episode != null && ep.episode !== 'all') {
+        formatSubtitle = 'S' + ep.season + 'E' + ep.episode + (ep.year ? ' \u2022 ' + ep.year : '');
+      } else if (ep.season != null && ep.season !== 'all') {
+        formatSubtitle = 'Season ' + ep.season + (ep.year ? ' \u2022 ' + ep.year : '');
+      } else if (ep.type === 'show') {
+        formatSubtitle = ep.year ? (ep.year + ' \u2022 Series') : 'Series';
+      } else {
+        formatSubtitle = ep.year ? String(ep.year) : '';
+      }
+
+      const posterUrl = ep.poster || (ep.imdbId ? ('https://images.metahub.space/poster/medium/' + ep.imdbId + '/img') : '');
+      const partId = ep.imdbId || (ep.tmdbId ? ('tmdb:' + ep.tmdbId) : '');
+      const partType = isMovie ? 'movie' : 'series';
+
+      const isWatched = (typeof isStorylinePartWatched === 'function' ? isStorylinePartWatched(ep) : false) ||
+        (ep.imdbId && typeof isItemWatched === 'function' && isItemWatched(ep.imdbId, ep.tmdbId, ep.imdbId));
+
+      const clickHandler = (!isCurrent && partId) ?
+        ' onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeJsAttr(partId) + '&quot;, &quot;' + partType + '&quot;)"' :
+        (isCurrent ? ' onclick="event.stopPropagation(); window.scrollTo({ top: 0, behavior: &quot;smooth&quot; });"' : '');
+
+      return '<div class="item-storyline-card' + (isCurrent ? ' is-current' : '') + '"' + clickHandler + ' title="' + escapeAttr(displayTitle + (isCurrent ? ' (Currently Viewing)' : '')) + '">' +
+        '<div class="item-storyline-poster-wrap">' +
+          (posterUrl ?
+            '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(displayTitle) + '" onerror="handleStorylinePosterError(this)">' :
+            '<div class="season-header-poster-placeholder"></div>') +
+          '<span class="item-storyline-part-badge">Part ' + (ep.part != null ? ep.part : (i + 1)) + '</span>' +
+          (isCurrent ? '<span class="item-storyline-current-pill">Current</span>' : '') +
+          (isWatched && !isCurrent ? '<span class="item-storyline-watched-badge" title="Watched">&#x2713;</span>' : '') +
+        '</div>' +
+        '<div class="item-storyline-title">' + escapeHtml(displayTitle) + '</div>' +
+        '<div class="item-storyline-meta">' + escapeHtml(formatSubtitle) + '</div>' +
+      '</div>';
+    }).join('');
+
+    return '<div class="item-storyline-block" id="storyline-block-' + escapeAttr(event.id) + '" data-event-id="' + escapeAttr(event.id) + '" style="' + displayStyle + '">' +
+      '<div class="item-storyline-header">' +
+        '<div class="item-storyline-header-info">' +
+          '<div class="item-storyline-saga-title">' + escapeHtml(event.name) + '</div>' +
+          '<div class="item-storyline-saga-meta">' +
+            '<span>' + escapeHtml(event.franchise) + '</span>' +
+            '<span class="meta-sep">&middot;</span>' +
+            '<span>' + event.episodes.length + ' Parts in Chronological Watch Order</span>' +
+          '</div>' +
+          (event.description ? '<p class="item-storyline-saga-desc">' + escapeHtml(event.description) + '</p>' : '') +
+        '</div>' +
+        '<div class="item-storyline-header-actions">' +
+          '<button type="button" class="lc-btn secondary" onclick="event.stopPropagation(); openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" title="Open complete saga in catalog view">Open Saga</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="storyline-posters-scroll item-storyline-scroll">' +
+        cardsHtml +
+      '</div>' +
+    '</div>';
+  }).join('');
+
+  const pillsHtml = (matchingEvents.length > 1) ?
+    '<div class="subnav-pills-bar" style="margin-bottom:16px; flex-wrap:wrap;">' +
+      matchingEvents.map((ev, idx) =>
+        '<button type="button" class="subnav-pill' + (idx === 0 ? ' active' : '') + '" onclick="switchItemStorylineTab(&quot;' + escapeJsAttr(ev.id) + '&quot;, this)">' +
+          (idx === 0 ? '<span class="check-icon">&#x2713;</span> ' : '') + escapeHtml(ev.name) +
+        '</button>'
+      ).join('') +
+    '</div>' : '';
+
+  return '<div class="item-storylines-section">' +
+    '<div class="shelf-header" style="margin-bottom:12px;">' +
+      '<h3 style="margin: 0; font-family:serif; font-size:1.5rem;">Storylines, Sagas &amp; Universes</h3>' +
+    '</div>' +
+    pillsHtml +
+    '<div class="item-storylines-panels">' +
+      storylineBlocksHtml +
+    '</div>' +
+  '</div>';
+}
+
+function switchItemStorylineTab(eventId, btn) {
+  const container = btn ? btn.closest('.item-storylines-section') : document.querySelector('.item-storylines-section');
+  if (!container) return;
+  const pills = container.querySelectorAll('.subnav-pill');
+  pills.forEach((p) => {
+    p.classList.remove('active');
+    const ch = p.querySelector('.check-icon');
+    if (ch) ch.remove();
+  });
+  if (btn) {
+    btn.classList.add('active');
+    btn.insertAdjacentHTML('afterbegin', '<span class="check-icon">&#x2713;</span> ');
+  }
+  const blocks = container.querySelectorAll('.item-storyline-block');
+  blocks.forEach((b) => {
+    b.style.display = (b.dataset.eventId === eventId) ? 'block' : 'none';
+  });
+}
+if (typeof window !== 'undefined') {
+  window.switchItemStorylineTab = switchItemStorylineTab;
+  window.renderItemStorylinesWatchOrder = renderItemStorylinesWatchOrder;
 }
 
 // opts.skipPushState is set by the popstate handler and the initial
@@ -28861,6 +30509,8 @@ async function openItemDetailsModal(id, type, opts) {
       seasonsHtml += '</div>';
     }
 
+    const storylinesHtml = renderItemStorylinesWatchOrder(d, type);
+
     body.innerHTML = 
       '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap;">' +
         '<div style="flex: 0 0 300px; max-width: 100%;">' +
@@ -28873,8 +30523,8 @@ async function openItemDetailsModal(id, type, opts) {
           '<div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-top:20px;">' +
             '<button type="button" class="lc-btn primary" onclick="openSelectListModalFromItemModal()">+ Add to list</button>' +
             (((d.seasonsData && d.seasonsData.length > 0) || type === 'series') ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
-                (isItemWatched(d.id, d.tmdbId, d.imdbId) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched') +
+              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isShowFullyWatched(d) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
+                (isShowFullyWatched(d) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched') +
               '</button>'
               :
               '<button type="button" id="btnMarkWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="toggleMovieWatchStatusFromModal()">' +
@@ -28884,7 +30534,8 @@ async function openItemDetailsModal(id, type, opts) {
         '</div>' +
       '</div>' +
       (trailerHtml ? '<div style="margin-top:32px;">' + trailerHtml + '</div>' : '') +
-      (seasonsHtml ? '<div style="margin-top:32px;">' + seasonsHtml + '</div>' : '');
+      (seasonsHtml ? '<div style="margin-top:32px;">' + seasonsHtml + '</div>' : '') +
+      (storylinesHtml ? '<div style="margin-top:32px;">' + storylinesHtml + '</div>' : '');
       
   } catch (err) {
     body.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(err.message) + '</p>';
@@ -30109,8 +31760,9 @@ function renderTitlePosterCards(items, totalCount, resEl) {
 
   const postersHtml = items.map(m => {
     const posterClass = 'live-preview-poster';
-    const posterEl = m.poster
-      ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+    const effectivePoster = resolveClientPoster(m, m.poster);
+    const posterEl = effectivePoster
+      ? '<img class="' + posterClass + '" src="' + escapeAttr(effectivePoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
       : '<div class="' + posterClass + ' live-preview-poster-placeholder" data-needs-fallback="1"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
     
     const title = m.title || '';
@@ -30124,7 +31776,7 @@ function renderTitlePosterCards(items, totalCount, resEl) {
       'data-id="' + escapeAttr(id || '') + '" ' +
       'data-type="' + escapeAttr(type) + '" ' +
       'data-title="' + escapeAttr(m.title || '') + '" ' +
-      'data-poster="' + escapeAttr(m.poster || '') + '" ' +
+      'data-poster="' + escapeAttr(effectivePoster || '') + '" ' +
       '>' +
       '<div style="position:relative; width:100%;">' +
         posterEl +
@@ -30185,7 +31837,8 @@ async function renderDefaultCatalogSearch(force) {
   }
 
   try {
-    const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType);
+    const isAdultFilter = isAdultContentFilterEnabled();
+    const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + (isAdultFilter ? '&adultContentFilter=1' : ''));
     const data = await res.json();
     if (thisSeq !== currentTitleSearchSequence) return;
     if (inputEl && inputEl.value.trim()) return;
@@ -30225,7 +31878,8 @@ async function runCatalogSearch() {
   } catch (e) {}
 
   try {
-    const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q));
+    const isAdultFilter = isAdultContentFilterEnabled();
+    const res = await fetch(ORIGIN + '/api/title-search?type=' + currentCatalogSearchType + '&q=' + encodeURIComponent(q) + (isAdultFilter ? '&adultContentFilter=1' : ''));
     const data = await res.json();
     // Superseded while this was in flight: a newer search, a type change, or
     // the box being cleared. Say nothing and touch nothing -- whatever ran
@@ -30649,62 +32303,164 @@ function addAllEpisodesToChannel(imdbId, showName, showPoster, showBackdrop) {
 
 const LOCAL_CHANNELS_KEY = 'myListAddon:localChannels';
 
+let _memoryChannelsMap = null;
+let _memoryChannelsString = '';
+
+function normalizeChannelItemFromStorage(it) {
+  if (!it || typeof it !== 'object') return it;
+  const poster = it.poster || it.showPoster || it.thumbnail || '';
+  const thumbnail = it.thumbnail || poster || '';
+  const showPoster = it.showPoster || poster || '';
+  return {
+    ...it,
+    kind: it.kind || 'episode',
+    poster: poster,
+    thumbnail: thumbnail,
+    showPoster: showPoster,
+  };
+}
+
 function loadLocalChannels() {
   try {
-    return JSON.parse(localStorage.getItem(LOCAL_CHANNELS_KEY) || '{}');
+    if (_memoryChannelsMap && typeof _memoryChannelsMap === 'object' && Object.keys(_memoryChannelsMap).length > 0) {
+      return _memoryChannelsMap;
+    }
+    let str = _memoryChannelsString;
+    if (!str) {
+      try { str = sessionStorage.getItem(LOCAL_CHANNELS_KEY); } catch (e) {}
+    }
+    if (!str) {
+      try { str = localStorage.getItem(LOCAL_CHANNELS_KEY); } catch (e) {}
+    }
+    const map = JSON.parse(str || '{}');
+    if (map && typeof map === 'object') {
+      for (const ch of Object.values(map)) {
+        if (ch && Array.isArray(ch.items)) {
+          ch.items = ch.items.map(normalizeChannelItemFromStorage);
+        }
+      }
+      _memoryChannelsString = str;
+      _memoryChannelsMap = map;
+      return map;
+    }
+    return _memoryChannelsMap || {};
   } catch (e) {
-    return {};
+    return _memoryChannelsMap || {};
   }
 }
 
-function compressChannelItemsForStorage(items) {
-  if (!Array.isArray(items)) return [];
-  return items.slice(0, 200).map((it) => ({
-    kind: it.kind || 'episode',
+function compactChannelItemForStorage(it) {
+  if (!it || typeof it !== 'object') return null;
+  const kind = it.kind || 'episode';
+  const out = {
+    kind: kind,
     imdbId: it.imdbId || '',
-    season: it.season != null ? it.season : 1,
-    episode: it.episode != null ? it.episode : 1,
+    season: it.season != null ? Number(it.season) : 1,
+    episode: it.episode != null ? Number(it.episode) : 1,
     showName: it.showName || '',
     epName: it.epName || '',
     title: it.title || '',
-    released: it.released || '',
-    thumbnail: it.thumbnail || it.poster || '',
-    poster: it.poster || it.thumbnail || '',
-    showPoster: it.showPoster || '',
-  }));
+  };
+  if (it.released) {
+    out.released = it.released.length > 10 ? it.released.slice(0, 10) : it.released;
+  }
+  const poster = it.poster || it.showPoster || it.thumbnail || '';
+  const thumbnail = it.thumbnail || '';
+  const showPoster = it.showPoster || '';
+
+  if (poster) out.poster = poster;
+  if (thumbnail && thumbnail !== poster) out.thumbnail = thumbnail;
+  if (showPoster && showPoster !== poster && showPoster !== thumbnail) out.showPoster = showPoster;
+  if (it.backdrop && it.backdrop !== poster && it.backdrop !== thumbnail) out.backdrop = it.backdrop;
+
+  return out;
+}
+
+function compressChannelItemsForStorage(items, maxItems = 5000) {
+  if (!Array.isArray(items)) return [];
+  const cap = typeof maxItems === 'number' ? maxItems : 5000;
+  return items.slice(0, cap).map(compactChannelItemForStorage).filter(Boolean);
 }
 
 function saveLocalChannelsMap(map) {
+  if (!map || typeof map !== 'object') return false;
+
+  // 1. Keep full fidelity in memory unconditionally so active session, "See All", and playback have all items
+  _memoryChannelsMap = map;
+
+  const fullMap = {};
+  for (const [id, ch] of Object.entries(map)) {
+    if (!ch) continue;
+    fullMap[id] = {
+      channelId: ch.channelId || id,
+      name: ch.name || 'Channel',
+      poster: ch.poster || null,
+      backdrop: ch.backdrop || null,
+      items: compressChannelItemsForStorage(ch.items, 5000),
+      shuffle: !!ch.shuffle,
+      dailyRotate: !!ch.dailyRotate,
+      createdAt: ch.createdAt || Date.now(),
+      updatedAt: ch.updatedAt || Date.now(),
+    };
+  }
+
+  let fullStr = '';
   try {
-    localStorage.setItem(LOCAL_CHANNELS_KEY, JSON.stringify(map));
-    if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
-    return true;
-  } catch (e) {
-    console.warn('saveLocalChannelsMap initial attempt failed, compressing...', e);
-    try {
-      const compressed = {};
-      for (const [id, ch] of Object.entries(map || {})) {
-        if (!ch) continue;
-        compressed[id] = {
-          channelId: ch.channelId,
-          name: ch.name || 'Channel',
-          poster: ch.poster || null,
-          backdrop: ch.backdrop || null,
-          items: compressChannelItemsForStorage(ch.items),
-          shuffle: !!ch.shuffle,
-          dailyRotate: !!ch.dailyRotate,
-          createdAt: ch.createdAt || Date.now(),
-          updatedAt: ch.updatedAt || Date.now(),
-        };
-      }
-      localStorage.setItem(LOCAL_CHANNELS_KEY, JSON.stringify(compressed));
+    fullStr = JSON.stringify(fullMap);
+    _memoryChannelsString = fullStr;
+    try { sessionStorage.setItem(LOCAL_CHANNELS_KEY, fullStr); } catch (se) {}
+  } catch (strErr) {}
+
+  // Tier 1: Try full compact map in localStorage
+  try {
+    if (fullStr) {
+      localStorage.setItem(LOCAL_CHANNELS_KEY, fullStr);
       if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
       return true;
-    } catch (err2) {
-      console.error('saveLocalChannelsMap failed even after compression:', err2);
-      return false;
+    }
+  } catch (e1) {
+    // Tier 2: Quota exceeded, compress channel items to 1000 items for offline storage
+    try {
+      const tier2Map = {};
+      for (const [id, ch] of Object.entries(fullMap)) {
+        tier2Map[id] = {
+          ...ch,
+          items: (ch.items || []).slice(0, 1000),
+        };
+      }
+      const tier2Str = JSON.stringify(tier2Map);
+      localStorage.setItem(LOCAL_CHANNELS_KEY, tier2Str);
+      if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
+      return true;
+    } catch (e2) {
+      // Tier 3: Ultra-compact to 300 items for offline storage
+      try {
+        const tier3Map = {};
+        for (const [id, ch] of Object.entries(fullMap)) {
+          tier3Map[id] = {
+            ...ch,
+            items: (ch.items || []).slice(0, 300),
+          };
+        }
+        const tier3Str = JSON.stringify(tier3Map);
+        localStorage.setItem(LOCAL_CHANNELS_KEY, tier3Str);
+        if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
+        return true;
+      } catch (e3) {
+        // Fallback: localStorage completely full across all keys.
+        // Full channel is still safely preserved in _memoryChannelsMap, sessionStorage, and #lists entries.
+        console.warn('saveLocalChannelsMap: localStorage quota exceeded, preserved in session & memory');
+        window._localStorageFull = true;
+        if (typeof notifyStorageFull === 'function') {
+          const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+          notifyStorageFull(signedIn);
+        }
+        if (typeof scheduleChannelsSync === 'function') scheduleChannelsSync();
+        return true;
+      }
     }
   }
+  return true;
 }
 
 function ensureAllChannelsSyncedFromRows(map) {
@@ -35177,8 +36933,2244 @@ const TV_CROSSOVER_EVENTS = [
         "poster": "https://images.metahub.space/poster/medium/tt2647544/img"
       }
     ]
+  },
+  {
+    "id": "movie_peacemaker_suicide_squad",
+    "name": "Peacemaker: Complete Storyline & The Suicide Squad",
+    "franchise": "DC Universe",
+    "category": "tvuniverses",
+    "description": "The Suicide Squad (2021) is a direct prerequisite to Peacemaker: Peacemaker is shot and left for dead in the movie, and the post-credits scene sets up his hospital recovery and the task force assigned to him in Episode 1.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Suicide Squad",
+        "year": 2021,
+        "tmdbId": 436969,
+        "imdbId": "tt6334354",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt6334354/img"
+      },
+      {
+        "type": "show",
+        "showName": "Peacemaker",
+        "tmdbId": 110492,
+        "imdbId": "tt13146404",
+        "seasons": [
+          1
+        ],
+        "title": "Peacemaker (Season 1)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt13146404/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_the_batman_penguin",
+    "name": "The Batman & The Penguin Saga",
+    "franchise": "The Batman Epic Crime Saga",
+    "category": "tvuniverses",
+    "description": "The Penguin is a direct continuation of The Batman (2022), picking up one week after the flooding of Gotham and Carmine Falcone's death as Oz Cobb seizes control of the criminal underworld.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Batman",
+        "year": 2022,
+        "tmdbId": 414906,
+        "imdbId": "tt1877830",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1877830/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Penguin",
+        "tmdbId": 137437,
+        "imdbId": "tt15474916",
+        "seasons": [
+          1
+        ],
+        "title": "The Penguin (Season 1)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt15474916/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_battlestar_galactica_miniseries",
+    "name": "Battlestar Galactica: The Complete Modern Saga",
+    "franchise": "Battlestar Galactica",
+    "category": "tvuniverses",
+    "description": "The 2003 Miniseries is the mandatory pilot depicting the Cylon holocaust on the Twelve Colonies, immediately followed by the four-season fleet survival saga.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Battlestar Galactica: The Miniseries",
+        "year": 2003,
+        "tmdbId": 4130,
+        "imdbId": "tt0314979",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0314979/img"
+      },
+      {
+        "type": "show",
+        "showName": "Battlestar Galactica",
+        "tmdbId": 1973,
+        "imdbId": "tt0407362",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Battlestar Galactica (Seasons 1-4)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0407362/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_star_wars_clone_wars_canon",
+    "name": "Star Wars: The Clone Wars (Theatrical Film & Series)",
+    "franchise": "Star Wars",
+    "category": "tvuniverses",
+    "description": "The 2008 theatrical movie is the essential pilot introducing Ahsoka Tano as Anakin Skywalker's new Padawan, directly launching the seven-season animated series.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Star Wars: The Clone Wars",
+        "year": 2008,
+        "tmdbId": 12180,
+        "imdbId": "tt1185834",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1185834/img"
+      },
+      {
+        "type": "show",
+        "showName": "Star Wars: The Clone Wars",
+        "tmdbId": 4174,
+        "imdbId": "tt0458290",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "Star Wars: The Clone Wars (Seasons 1-7)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0458290/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_twin_peaks_complete_mythology",
+    "name": "Twin Peaks: Complete Canon Chronology",
+    "franchise": "Twin Peaks",
+    "category": "tvuniverses",
+    "description": "David Lynch's surreal mystery masterpiece: Seasons 1-2, the essential canon prequel film Fire Walk with Me, and the 2017 limited event series The Return.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Twin Peaks",
+        "tmdbId": 192,
+        "imdbId": "tt0098936",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "Twin Peaks (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0098936/img"
+      },
+      {
+        "type": "movie",
+        "title": "Twin Peaks: Fire Walk with Me",
+        "year": 1992,
+        "tmdbId": 1923,
+        "imdbId": "tt0105665",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0105665/img"
+      },
+      {
+        "type": "show",
+        "showName": "Twin Peaks",
+        "tmdbId": 63926,
+        "imdbId": "tt4093826",
+        "seasons": [
+          3
+        ],
+        "title": "Twin Peaks: The Return (Season 3)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt4093826/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_veronica_mars_complete_saga",
+    "name": "Veronica Mars: Complete Saga & Movie",
+    "franchise": "Veronica Mars",
+    "category": "tvuniverses",
+    "description": "The complete Veronica Mars story: Seasons 1-3, followed by the crowdfunded 2014 feature film, and concluding with the 2019 Hulu revival season.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Veronica Mars",
+        "tmdbId": 4370,
+        "imdbId": "tt0412253",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "Veronica Mars (Seasons 1-3)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0412253/img"
+      },
+      {
+        "type": "movie",
+        "title": "Veronica Mars",
+        "year": 2014,
+        "tmdbId": 185008,
+        "imdbId": "tt2771372",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2771372/img"
+      },
+      {
+        "type": "show",
+        "showName": "Veronica Mars",
+        "tmdbId": 4370,
+        "imdbId": "tt0412253",
+        "seasons": [
+          4
+        ],
+        "title": "Veronica Mars (Season 4)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0412253/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_power_rangers_zeo_turbo_bridge",
+    "name": "Power Rangers: Zeo to Turbo Canon Bridge",
+    "franchise": "Power Rangers",
+    "category": "tvuniverses",
+    "description": "Turbo: A Power Rangers Movie (1997) is the mandatory canon bridge film between Zeo and Turbo, explaining how the Rangers acquired Turbo powers and introducing Justin and Divatox.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Power Rangers Zeo",
+        "tmdbId": 1585,
+        "imdbId": "tt0115324",
+        "seasons": [
+          1
+        ],
+        "title": "Power Rangers Zeo",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0115324/img"
+      },
+      {
+        "type": "movie",
+        "title": "Turbo: A Power Rangers Movie",
+        "year": 1997,
+        "tmdbId": 9611,
+        "imdbId": "tt0120389",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0120389/img"
+      },
+      {
+        "type": "show",
+        "showName": "Power Rangers Turbo",
+        "tmdbId": 1667,
+        "imdbId": "tt0118433",
+        "seasons": [
+          1
+        ],
+        "title": "Power Rangers Turbo",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0118433/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_transformers_g1_1986_bridge",
+    "name": "The Transformers: G1 & 1986 Theatrical Movie",
+    "franchise": "Transformers",
+    "category": "tvuniverses",
+    "description": "The Transformers: The Movie (1986) is the pivotal canon turning point set between Seasons 2 and 3, depicting the death of Optimus Prime, Megatron's rebirth as Galvatron, and the ascension of Rodimus Prime.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Transformers",
+        "tmdbId": 1096,
+        "imdbId": "tt0086817",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "The Transformers (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0086817/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Transformers: The Movie",
+        "year": 1986,
+        "tmdbId": 1857,
+        "imdbId": "tt0092106",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0092106/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Transformers",
+        "tmdbId": 1096,
+        "imdbId": "tt0086817",
+        "seasons": [
+          3,
+          4
+        ],
+        "title": "The Transformers (Seasons 3-4)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0086817/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_sex_and_the_city_complete_saga",
+    "name": "Sex and the City: Complete Universe & Movies",
+    "franchise": "Sex and the City",
+    "category": "tvuniverses",
+    "description": "The complete chronology: Seasons 1-6 of the original HBO series, followed by the two theatrical continuation movies, leading into And Just Like That...",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Sex and the City",
+        "tmdbId": 105,
+        "imdbId": "tt0159206",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "title": "Sex and the City (Seasons 1-6)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0159206/img"
+      },
+      {
+        "type": "movie",
+        "title": "Sex and the City",
+        "year": 2008,
+        "tmdbId": 9479,
+        "imdbId": "tt1000774",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1000774/img"
+      },
+      {
+        "type": "movie",
+        "title": "Sex and the City 2",
+        "year": 2010,
+        "tmdbId": 33644,
+        "imdbId": "tt1261945",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1261945/img"
+      },
+      {
+        "type": "show",
+        "showName": "And Just Like That...",
+        "tmdbId": 115646,
+        "imdbId": "tt13819960",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "And Just Like That... (Seasons 1-2)",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt13819960/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_monk_complete_last_case",
+    "name": "Monk: Complete Saga & Last Case",
+    "franchise": "Monk",
+    "category": "tvuniverses",
+    "description": "The full eight seasons of Adrian Monk's obsessive-compulsive detective cases, culminating in the 2023 reunion film Mr. Monk's Last Case.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Monk",
+        "tmdbId": 1695,
+        "imdbId": "tt0312172",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "title": "Monk (Seasons 1-8)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0312172/img"
+      },
+      {
+        "type": "movie",
+        "title": "Mr. Monk's Last Case: A Monk Movie",
+        "year": 2023,
+        "tmdbId": 1103445,
+        "imdbId": "tt27145784",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt27145784/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_luther_complete_fallen_sun",
+    "name": "Luther: Complete Saga & The Fallen Sun",
+    "franchise": "Luther",
+    "category": "tvuniverses",
+    "description": "Idris Elba's brilliant, tortured DCI John Luther across all five BBC series, followed by the 2023 Netflix continuation film Luther: The Fallen Sun.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Luther",
+        "tmdbId": 31586,
+        "imdbId": "tt1474684",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "title": "Luther (Seasons 1-5)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1474684/img"
+      },
+      {
+        "type": "movie",
+        "title": "Luther: The Fallen Sun",
+        "year": 2023,
+        "tmdbId": 885184,
+        "imdbId": "tt14752254",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14752254/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_burn_notice_sam_axe",
+    "name": "Burn Notice & The Fall of Sam Axe",
+    "franchise": "Burn Notice",
+    "category": "tvuniverses",
+    "description": "The action-packed spy saga in story order: prequel movie The Fall of Sam Axe detailing Sam's final military mission in Colombia, followed by all seven seasons of Burn Notice.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Burn Notice: The Fall of Sam Axe",
+        "year": 2011,
+        "tmdbId": 63216,
+        "imdbId": "tt1697851",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1697851/img"
+      },
+      {
+        "type": "show",
+        "showName": "Burn Notice",
+        "tmdbId": 2919,
+        "imdbId": "tt0810788",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "Burn Notice (Seasons 1-7)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0810788/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_farscape_peacekeeper_wars",
+    "name": "Farscape: Complete Saga & The Peacekeeper Wars",
+    "franchise": "Farscape",
+    "category": "tvuniverses",
+    "description": "Astronaut John Crichton's journey across the uncharted territories through four seasons, culminating in the epic miniseries finale The Peacekeeper Wars.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Farscape",
+        "tmdbId": 4271,
+        "imdbId": "tt0187636",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Farscape (Seasons 1-4)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0187636/img"
+      },
+      {
+        "type": "movie",
+        "title": "Farscape: The Peacekeeper Wars",
+        "year": 2004,
+        "tmdbId": 808,
+        "imdbId": "tt0387733",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0387733/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_csi_immortality_finale",
+    "name": "CSI: Crime Scene Investigation & Immortality",
+    "franchise": "CSI Universe",
+    "category": "tvuniverses",
+    "description": "Fifteen groundbreaking seasons of the flagship Las Vegas forensic unit, resolved in the two-part series finale television movie CSI: Immortality with Gil Grissom and Sara Sidle.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "CSI: Crime Scene Investigation",
+        "tmdbId": 1431,
+        "imdbId": "tt0247082",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "title": "CSI: Crime Scene Investigation (Seasons 1-15)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0247082/img"
+      },
+      {
+        "type": "movie",
+        "title": "CSI: Immortality",
+        "year": 2015,
+        "tmdbId": 359050,
+        "imdbId": "tt4687402",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt4687402/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_the_sopranos_many_saints",
+    "name": "The Sopranos & The Many Saints of Newark",
+    "franchise": "The Sopranos",
+    "category": "tvuniverses",
+    "description": "The complete saga of Tony Soprano: David Chase's 1960s-70s origin prequel film The Many Saints of Newark followed by all six landmark seasons of The Sopranos.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Many Saints of Newark",
+        "year": 2021,
+        "tmdbId": 524369,
+        "imdbId": "tt8110330",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt8110330/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Sopranos",
+        "tmdbId": 1399,
+        "imdbId": "tt0141842",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "title": "The Sopranos (Seasons 1-6)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0141842/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_entourage_complete_and_film",
+    "name": "Entourage: Complete Series & Feature Film",
+    "franchise": "Entourage",
+    "category": "tvuniverses",
+    "description": "Vincent Chase and his Queens crew navigating Hollywood across all eight HBO seasons, concluding with the 2015 theatrical sequel movie.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Entourage",
+        "tmdbId": 1947,
+        "imdbId": "tt0387199",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "title": "Entourage (Seasons 1-8)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0387199/img"
+      },
+      {
+        "type": "movie",
+        "title": "Entourage",
+        "year": 2015,
+        "tmdbId": 216282,
+        "imdbId": "tt1674771",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1674771/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_the_librarians_trilogy_series",
+    "name": "The Librarians: Foundational Trilogy & Series",
+    "franchise": "The Librarians",
+    "category": "tvuniverses",
+    "description": "Noah Wyle's Flynn Carsen in the original film trilogy (Quest for the Spear, King Solomon's Mines, Curse of the Judas Chalice), establishing the Library before recruiting the new team in the TV series.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Librarian: Quest for the Spear",
+        "year": 2004,
+        "tmdbId": 11309,
+        "imdbId": "tt0412915",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0412915/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Librarian: Return to King Solomon's Mines",
+        "year": 2006,
+        "tmdbId": 11310,
+        "imdbId": "tt0481566",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0481566/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Librarian: Curse of the Judas Chalice",
+        "year": 2008,
+        "tmdbId": 13884,
+        "imdbId": "tt1146438",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1146438/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Librarians",
+        "tmdbId": 61889,
+        "imdbId": "tt3663440",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "The Librarians (Seasons 1-4)",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt3663440/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_gomorrah_limmortale_bridge",
+    "name": "Gomorrah: Complete Saga & L'immortale",
+    "franchise": "Gomorrah",
+    "category": "tvuniverses",
+    "description": "The gritty Camorra crime saga: Seasons 1-4, the mandatory canon bridge film L'immortale explaining Ciro Di Marzio's survival in Riga, and the climactic final Season 5.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Gomorrah",
+        "tmdbId": 46420,
+        "imdbId": "tt2049116",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Gomorrah (Seasons 1-4)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2049116/img"
+      },
+      {
+        "type": "movie",
+        "title": "L'immortale",
+        "year": 2019,
+        "tmdbId": 633116,
+        "imdbId": "tt10915740",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt10915740/img"
+      },
+      {
+        "type": "show",
+        "showName": "Gomorrah",
+        "tmdbId": 46420,
+        "imdbId": "tt2049116",
+        "seasons": [
+          5
+        ],
+        "title": "Gomorrah (Season 5)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2049116/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_spartacus_complete_chronology",
+    "name": "Spartacus: Complete Chronological Order",
+    "franchise": "Spartacus",
+    "category": "tvuniverses",
+    "description": "The complete gladiator rebellion in historical story order: prequel miniseries Gods of the Arena, followed by Blood and Sand (Season 1), Vengeance (Season 2), and War of the Damned (Season 3).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Spartacus: Gods of the Arena",
+        "tmdbId": 37604,
+        "imdbId": "tt1758604",
+        "seasons": [
+          1
+        ],
+        "title": "Spartacus: Gods of the Arena",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1758604/img"
+      },
+      {
+        "type": "show",
+        "showName": "Spartacus",
+        "tmdbId": 2316,
+        "imdbId": "tt1442449",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "Spartacus (Seasons 1-3)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1442449/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_venture_bros_radiant_blood",
+    "name": "The Venture Bros.: Complete Series & Finale Film",
+    "franchise": "The Venture Bros.",
+    "category": "tvuniverses",
+    "description": "All seven seasons of Jackson Publick & Doc Hammer's animated superhero satire, capped off by the 2023 feature film conclusion Radiant Is the Blood of the Baboon Heart.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Venture Bros.",
+        "tmdbId": 1539,
+        "imdbId": "tt0417373",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "The Venture Bros. (Seasons 1-7)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0417373/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Venture Bros.: Radiant Is the Blood of the Baboon Heart",
+        "year": 2023,
+        "tmdbId": 1134444,
+        "imdbId": "tt14642238",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14642238/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_metalocalypse_army_of_doomstar",
+    "name": "Metalocalypse: Complete Series & Army of the Doomstar",
+    "franchise": "Metalocalypse",
+    "category": "tvuniverses",
+    "description": "Dethklok's death metal saga across all four Adult Swim seasons and The Doomstar Requiem, culminating in the 2023 finale movie Army of the Doomstar.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Metalocalypse",
+        "tmdbId": 2868,
+        "imdbId": "tt0839188",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Metalocalypse (Seasons 1-4)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0839188/img"
+      },
+      {
+        "type": "movie",
+        "title": "Metalocalypse: Army of the Doomstar",
+        "year": 2023,
+        "tmdbId": 1114972,
+        "imdbId": "tt14642270",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14642270/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_simpsons_canon_and_film",
+    "name": "The Simpsons & The Simpsons Movie",
+    "franchise": "The Simpsons",
+    "category": "tvuniverses",
+    "description": "Matt Groening's legendary animated family in Springfield, including the 2007 blockbuster theatrical film.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Simpsons",
+        "tmdbId": 456,
+        "imdbId": "tt0096697",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18
+        ],
+        "title": "The Simpsons (Seasons 1-18)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0096697/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Simpsons Movie",
+        "year": 2007,
+        "tmdbId": 35,
+        "imdbId": "tt0462538",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0462538/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Simpsons",
+        "tmdbId": 456,
+        "imdbId": "tt0096697",
+        "seasons": [
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36
+        ],
+        "title": "The Simpsons (Seasons 19+)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0096697/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_south_park_bigger_longer_uncut",
+    "name": "South Park & Bigger, Longer & Uncut",
+    "franchise": "South Park",
+    "category": "tvuniverses",
+    "description": "Trey Parker and Matt Stone's animated satire in chronological release order, with the Oscar-nominated 1999 feature film.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "South Park",
+        "tmdbId": 2190,
+        "imdbId": "tt0121955",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "South Park (Seasons 1-3)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0121955/img"
+      },
+      {
+        "type": "movie",
+        "title": "South Park: Bigger, Longer & Uncut",
+        "year": 1999,
+        "tmdbId": 9473,
+        "imdbId": "tt0158983",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0158983/img"
+      },
+      {
+        "type": "show",
+        "showName": "South Park",
+        "tmdbId": 2190,
+        "imdbId": "tt0121955",
+        "seasons": [
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26
+        ],
+        "title": "South Park (Seasons 4+)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0121955/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_bobs_burgers_movie_saga",
+    "name": "Bob's Burgers & The Bob's Burgers Movie",
+    "franchise": "Bob's Burgers",
+    "category": "tvuniverses",
+    "description": "The Belcher family's seaside hamburger adventures across Seasons 1-12, followed by the 2022 musical mystery feature film and ongoing series.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Bob's Burgers",
+        "tmdbId": 32726,
+        "imdbId": "tt1561755",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ],
+        "title": "Bob's Burgers (Seasons 1-12)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1561755/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Bob's Burgers Movie",
+        "year": 2022,
+        "tmdbId": 504827,
+        "imdbId": "tt7466442",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt7466442/img"
+      },
+      {
+        "type": "show",
+        "showName": "Bob's Burgers",
+        "tmdbId": 32726,
+        "imdbId": "tt1561755",
+        "seasons": [
+          13,
+          14,
+          15
+        ],
+        "title": "Bob's Burgers (Seasons 13+)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1561755/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_batman_tas_mask_of_phantasm",
+    "name": "Batman: The Animated Series & Mask of the Phantasm",
+    "franchise": "DC Animated Universe",
+    "category": "tvuniverses",
+    "description": "Bruce Timm and Paul Dini's definitive Batman adaptation, anchored by the critically acclaimed 1993 theatrical masterpiece Mask of the Phantasm.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Batman: Mask of the Phantasm",
+        "year": 1993,
+        "tmdbId": 14919,
+        "imdbId": "tt0106364",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0106364/img"
+      },
+      {
+        "type": "show",
+        "showName": "Batman: The Animated Series",
+        "tmdbId": 2098,
+        "imdbId": "tt0103359",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Batman: The Animated Series (Seasons 1-4)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0103359/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_steven_universe_complete_chronology",
+    "name": "Steven Universe: Complete Storyline Order",
+    "franchise": "Steven Universe",
+    "category": "tvuniverses",
+    "description": "Rebecca Sugar's coming-of-age gem saga: Seasons 1-5, followed by the essential canon bridge Steven Universe: The Movie, concluding with the epilogue series Steven Universe Future.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Steven Universe",
+        "tmdbId": 49737,
+        "imdbId": "tt3061046",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "title": "Steven Universe (Seasons 1-5)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt3061046/img"
+      },
+      {
+        "type": "movie",
+        "title": "Steven Universe: The Movie",
+        "year": 2019,
+        "tmdbId": 537061,
+        "imdbId": "tt8714088",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt8714088/img"
+      },
+      {
+        "type": "show",
+        "showName": "Steven Universe Future",
+        "tmdbId": 94553,
+        "imdbId": "tt11075702",
+        "seasons": [
+          1
+        ],
+        "title": "Steven Universe Future",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt11075702/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_tangled_rapunzel_chronology",
+    "name": "Tangled: Complete Corona Chronology",
+    "franchise": "Disney Tangled",
+    "category": "tvuniverses",
+    "description": "Disney's Tangled franchise: the original 2010 film, the mandatory 2017 pilot movie Tangled: Before Ever After (explaining her 70ft golden hair regrowing), and all three seasons of Rapunzel's Tangled Adventure.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Tangled",
+        "year": 2010,
+        "tmdbId": 38757,
+        "imdbId": "tt0398286",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0398286/img"
+      },
+      {
+        "type": "movie",
+        "title": "Tangled: Before Ever After",
+        "year": 2017,
+        "tmdbId": 437543,
+        "imdbId": "tt6593452",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt6593452/img"
+      },
+      {
+        "type": "show",
+        "showName": "Rapunzel's Tangled Adventure",
+        "tmdbId": 70289,
+        "imdbId": "tt4759904",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "Rapunzel's Tangled Adventure (Seasons 1-3)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt4759904/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_lilo_and_stitch_complete_timeline",
+    "name": "Lilo & Stitch: Complete Canon Timeline",
+    "franchise": "Lilo & Stitch",
+    "category": "tvuniverses",
+    "description": "The complete Hawaiian sci-fi saga: the original 2002 film, Stitch! The Movie (introducing Jumba's 625 experiment pods), the TV series, and the finale film Leroy & Stitch.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Lilo & Stitch",
+        "year": 2002,
+        "tmdbId": 11544,
+        "imdbId": "tt0275847",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0275847/img"
+      },
+      {
+        "type": "movie",
+        "title": "Stitch! The Movie",
+        "year": 2003,
+        "tmdbId": 11549,
+        "imdbId": "tt0371999",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0371999/img"
+      },
+      {
+        "type": "show",
+        "showName": "Lilo & Stitch: The Series",
+        "tmdbId": 3057,
+        "imdbId": "tt0364841",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "Lilo & Stitch: The Series (Seasons 1-2)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0364841/img"
+      },
+      {
+        "type": "movie",
+        "title": "Leroy & Stitch",
+        "year": 2006,
+        "tmdbId": 11551,
+        "imdbId": "tt0810922",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0810922/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_jimmy_neutron_boy_genius",
+    "name": "Jimmy Neutron: Boy Genius (Movie & Series)",
+    "franchise": "Jimmy Neutron",
+    "category": "tvuniverses",
+    "description": "The Oscar-nominated 2001 theatrical feature film that launched the franchise, followed by all three seasons of The Adventures of Jimmy Neutron, Boy Genius.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Jimmy Neutron: Boy Genius",
+        "year": 2001,
+        "tmdbId": 12589,
+        "imdbId": "tt0268397",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0268397/img"
+      },
+      {
+        "type": "show",
+        "showName": "The Adventures of Jimmy Neutron, Boy Genius",
+        "tmdbId": 2210,
+        "imdbId": "tt0320808",
+        "seasons": [
+          1,
+          2,
+          3
+        ],
+        "title": "The Adventures of Jimmy Neutron (Seasons 1-3)",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0320808/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_rugrats_complete_movie_chronology",
+    "name": "Rugrats: Complete Series & Film Trilogy",
+    "franchise": "Rugrats",
+    "category": "tvuniverses",
+    "description": "The complete classic Rugrats timeline in story order: Seasons 1-5, The Rugrats Movie (where Dil is born), Seasons 6-7, Rugrats in Paris, Seasons 8-9, and the Rugrats Go Wild crossover movie.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Rugrats",
+        "tmdbId": 2403,
+        "imdbId": "tt0101188",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "title": "Rugrats (Seasons 1-5)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0101188/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Rugrats Movie",
+        "year": 1998,
+        "tmdbId": 14444,
+        "imdbId": "tt0134067",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0134067/img"
+      },
+      {
+        "type": "show",
+        "showName": "Rugrats",
+        "tmdbId": 2403,
+        "imdbId": "tt0101188",
+        "seasons": [
+          6,
+          7
+        ],
+        "title": "Rugrats (Seasons 6-7)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0101188/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rugrats in Paris: The Movie",
+        "year": 2000,
+        "tmdbId": 14445,
+        "imdbId": "tt0213203",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt0213203/img"
+      },
+      {
+        "type": "show",
+        "showName": "Rugrats",
+        "tmdbId": 2403,
+        "imdbId": "tt0101188",
+        "seasons": [
+          8,
+          9
+        ],
+        "title": "Rugrats (Seasons 8-9)",
+        "part": 5,
+        "poster": "https://images.metahub.space/poster/medium/tt0101188/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rugrats Go Wild",
+        "year": 2003,
+        "tmdbId": 15165,
+        "imdbId": "tt0337711",
+        "part": 6,
+        "poster": "https://images.metahub.space/poster/medium/tt0337711/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_beavis_and_butt_head_saga",
+    "name": "Beavis and Butt-Head: Complete Series & Movies",
+    "franchise": "Beavis and Butt-Head",
+    "category": "tvuniverses",
+    "description": "Mike Judge's slacker duo across the classic MTV series, the 1996 theatrical hit Do America, the 2022 sci-fi sequel Do the Universe, and the Paramount+ revival series.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Beavis and Butt-Head",
+        "tmdbId": 214,
+        "imdbId": "tt0105950",
+        "seasons": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "title": "Beavis and Butt-Head (Original Series)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0105950/img"
+      },
+      {
+        "type": "movie",
+        "title": "Beavis and Butt-Head Do America",
+        "year": 1996,
+        "tmdbId": 9989,
+        "imdbId": "tt0115641",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0115641/img"
+      },
+      {
+        "type": "movie",
+        "title": "Beavis and Butt-Head Do the Universe",
+        "year": 2022,
+        "tmdbId": 926899,
+        "imdbId": "tt14115598",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt14115598/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_buzz_lightyear_star_command",
+    "name": "Buzz Lightyear of Star Command: Pilot & Series",
+    "franchise": "Toy Story Universe",
+    "category": "tvuniverses",
+    "description": "The mandatory pilot movie The Adventure Begins starring Tim Allen introducing Star Command and Emperor Zurg, followed by the animated television series.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "Buzz Lightyear of Star Command: The Adventure Begins",
+        "year": 2000,
+        "tmdbId": 18501,
+        "imdbId": "tt0260779",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0260779/img"
+      },
+      {
+        "type": "show",
+        "showName": "Buzz Lightyear of Star Command",
+        "tmdbId": 2238,
+        "imdbId": "tt0260602",
+        "seasons": [
+          1
+        ],
+        "title": "Buzz Lightyear of Star Command",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0260602/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_scandal_htgawm_2018",
+    "name": "Scandal & How to Get Away with Murder Crossover (2018)",
+    "franchise": "Shondaland TGIT Universe",
+    "category": "tvuniverses",
+    "description": "Olivia Pope and Annalise Keating join forces to bring a historic class-action fast-track civil rights appeal before the United States Supreme Court.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Scandal",
+        "season": 7,
+        "episode": 12,
+        "title": "Allow Me to Reintroduce Myself",
+        "tmdbId": 39269,
+        "imdbId": "tt7853118",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1837576/img"
+      },
+      {
+        "type": "episode",
+        "showName": "How to Get Away with Murder",
+        "season": 4,
+        "episode": 13,
+        "title": "Lahey v. Commonwealth of Pennsylvania",
+        "tmdbId": 61056,
+        "imdbId": "tt7853036",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt3205802/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_simpsons_family_guy_2014",
+    "name": "The Simpsons & Family Guy: The Simpsons Guy (2014)",
+    "franchise": "Animation Domination",
+    "category": "tvuniverses",
+    "description": "The Griffins are stranded in Springfield and take refuge with Homer and Marge before Peter and Homer engage in a town-wrecking brawl over Duff vs. Pawtucket Patriot Ale.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Simpsons",
+        "title": "The Simpsons",
+        "tmdbId": 456,
+        "imdbId": "tt0096697",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0096697/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Family Guy",
+        "season": 13,
+        "episode": 1,
+        "title": "The Simpsons Guy",
+        "tmdbId": 1434,
+        "imdbId": "tt3061036",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0182576/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_supernatural_scoobydoo_2018",
+    "name": "Supernatural & Scooby-Doo: Scoobynatural (2018)",
+    "franchise": "Supernatural",
+    "category": "tvuniverses",
+    "description": "Sam, Dean, and Castiel are sucked into a haunted television set, finding themselves animated inside the classic 1969 Scooby-Doo episode A Night of Fright Is No Delight.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Scooby-Doo, Where Are You!",
+        "season": 1,
+        "episode": 16,
+        "title": "A Night of Fright Is No Delight",
+        "tmdbId": 2054,
+        "imdbId": "tt0695420",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0063950/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Supernatural",
+        "season": 13,
+        "episode": 16,
+        "title": "Scoobynatural",
+        "tmdbId": 1622,
+        "imdbId": "tt6877202",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0460681/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_xfiles_cops_2000",
+    "name": "The X-Files & Cops: X-Cops (2000)",
+    "franchise": "The X-Files",
+    "category": "tvuniverses",
+    "description": "Shot live on video by a Fox COPS camera crew, Mulder and Scully investigate a shape-shifting entity feeding on fear in Willow Park, Los Angeles.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Cops",
+        "title": "Cops",
+        "tmdbId": 2270,
+        "imdbId": "tt0096563",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0096563/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The X-Files",
+        "season": 7,
+        "episode": 12,
+        "title": "X-Cops",
+        "tmdbId": 4087,
+        "imdbId": "tt0751259",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0106179/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_suite_life_hannah_montana_2006",
+    "name": "That's So Suite Life of Hannah Montana (2006)",
+    "franchise": "Disney Channel Universe",
+    "category": "tvuniverses",
+    "description": "The 3-part Disney Channel crossover: Raven Baxter stays at the Tipton Hotel in Boston, crossing paths with Zack, Cody, and visiting pop superstar Hannah Montana.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "That's So Raven",
+        "season": 4,
+        "episode": 11,
+        "title": "Checkin' Out",
+        "tmdbId": 2214,
+        "imdbId": "tt0836585",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0341932/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The Suite Life of Zack & Cody",
+        "season": 2,
+        "episode": 20,
+        "title": "That's So Suite Life of Hannah Montana",
+        "tmdbId": 2208,
+        "imdbId": "tt0836584",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0426371/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Hannah Montana",
+        "season": 1,
+        "episode": 12,
+        "title": "On the Road Again?",
+        "tmdbId": 4263,
+        "imdbId": "tt0836583",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0493093/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_wizards_on_deck_hannah_montana_2009",
+    "name": "Wizards on Deck with Hannah Montana (2009)",
+    "franchise": "Disney Channel Universe",
+    "category": "tvuniverses",
+    "description": "The Russo family wins an ocean cruise on the SS Tipton where Alex, Justin, and Max encounter London, Zack, and Cody before Hannah Montana boards for a concert in Hawaii.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "Wizards of Waverly Place",
+        "season": 2,
+        "episode": 25,
+        "title": "Cast-Away (To Another Show)",
+        "tmdbId": 2251,
+        "imdbId": "tt1423851",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0799922/img"
+      },
+      {
+        "type": "episode",
+        "showName": "The Suite Life on Deck",
+        "season": 1,
+        "episode": 21,
+        "title": "Double-Crossed",
+        "tmdbId": 14120,
+        "imdbId": "tt1423850",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1230232/img"
+      },
+      {
+        "type": "episode",
+        "showName": "Hannah Montana",
+        "season": 3,
+        "episode": 19,
+        "title": "Super(stitious) Girl",
+        "tmdbId": 4263,
+        "imdbId": "tt1423849",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0493093/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_jimmy_timmy_power_hour_trilogy",
+    "name": "The Jimmy Timmy Power Hour Trilogy (2004–2006)",
+    "franchise": "Nickelodeon Universe",
+    "category": "tvuniverses",
+    "description": "Jimmy Neutron's 3D CGI Retroville and Timmy Turner's 2D animated Dimmsdale collide when dimensional travel swaps the boys and unites Cosmo and Wanda with Goddard.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "The Jimmy Timmy Power Hour",
+        "year": 2004,
+        "tmdbId": 32788,
+        "imdbId": "tt0411545",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0411545/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Jimmy Timmy Power Hour 2: When Nerds Collide!",
+        "year": 2006,
+        "tmdbId": 37328,
+        "imdbId": "tt0811002",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0811002/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Jimmy Timmy Power Hour 3: The Jerkinators!",
+        "year": 2006,
+        "tmdbId": 37329,
+        "imdbId": "tt0846014",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0846014/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_icarly_victorious_iparty_2011",
+    "name": "iCarly & Victorious: iParty with Victorious (2011)",
+    "franchise": "Schneiderverse",
+    "category": "tvuniverses",
+    "description": "Carly and her Seattle web-show friends crash a party at Kenan Thompson's Hollywood house, teaming up with Tori Vega and Hollywood Arts students to bust a two-timing boyfriend.",
+    "episodes": [
+      {
+        "type": "episode",
+        "showName": "iCarly",
+        "season": 4,
+        "episode": 11,
+        "title": "iParty with Victorious: Part 1",
+        "tmdbId": 3624,
+        "imdbId": "tt1828114",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0972534/img"
+      },
+      {
+        "type": "episode",
+        "showName": "iCarly",
+        "season": 4,
+        "episode": 12,
+        "title": "iParty with Victorious: Part 2",
+        "tmdbId": 3624,
+        "imdbId": "tt1970228",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0972534/img"
+      },
+      {
+        "type": "episode",
+        "showName": "iCarly",
+        "season": 4,
+        "episode": 13,
+        "title": "iParty with Victorious: Part 3",
+        "tmdbId": 3624,
+        "imdbId": "tt1970229",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0972534/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_ben10_generator_rex_2011",
+    "name": "Ben 10 & Generator Rex: Heroes United (2011)",
+    "franchise": "Man of Action Universe",
+    "category": "tvuniverses",
+    "description": "Ben Tennyson is flung through a spatial rift into Generator Rex's nanite-infested dimension, joining forces with Rex Salazar against the devastating nanite entity Alpha.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Ben 10: Ultimate Alien",
+        "title": "Ben 10: Ultimate Alien",
+        "tmdbId": 32675,
+        "imdbId": "tt1627993",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1627993/img"
+      },
+      {
+        "type": "show",
+        "showName": "Generator Rex",
+        "title": "Generator Rex",
+        "tmdbId": 32904,
+        "imdbId": "tt1607567",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1607567/img"
+      },
+      {
+        "type": "movie",
+        "title": "Ben 10 / Generator Rex: Heroes United",
+        "year": 2011,
+        "tmdbId": 82772,
+        "imdbId": "tt2113645",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2113645/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_grim_adventures_knd_2007",
+    "name": "The Grim Adventures of the KND (2007)",
+    "franchise": "Cartoon Network Universe",
+    "category": "tvuniverses",
+    "description": "Billy wears his dad's cursed pants and accidentally fuses with the Delightful Children From Down the Lane, forcing Sector V and Mandy into a dimensional showdown with the Grim Reaper.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Grim Adventures of Billy & Mandy",
+        "title": "The Grim Adventures of Billy & Mandy",
+        "tmdbId": 2503,
+        "imdbId": "tt0292802",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0292802/img"
+      },
+      {
+        "type": "show",
+        "showName": "Codename: Kids Next Door",
+        "title": "Codename: Kids Next Door",
+        "tmdbId": 2420,
+        "imdbId": "tt0312109",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0312109/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Grim Adventures of the KND",
+        "year": 2007,
+        "tmdbId": 44976,
+        "imdbId": "tt1143139",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt1143139/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_dragon_ball_super_canon_films",
+    "name": "Dragon Ball Super: Canon Continuation Films",
+    "franchise": "Dragon Ball",
+    "category": "tvuniverses",
+    "description": "The official canon storyline of Dragon Ball Super: the 131-episode anime series, followed by Akira Toriyama's blockbuster films DBS: Broly and DBS: Super Hero.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Dragon Ball Super",
+        "tmdbId": 62715,
+        "imdbId": "tt4644488",
+        "seasons": [
+          1
+        ],
+        "title": "Dragon Ball Super",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt4644488/img"
+      },
+      {
+        "type": "movie",
+        "title": "Dragon Ball Super: Broly",
+        "year": 2018,
+        "tmdbId": 503314,
+        "imdbId": "tt7961060",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt7961060/img"
+      },
+      {
+        "type": "movie",
+        "title": "Dragon Ball Super: Super Hero",
+        "year": 2022,
+        "tmdbId": 610150,
+        "imdbId": "tt14614892",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt14614892/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_made_in_abyss_dawn_deep_soul",
+    "name": "Made in Abyss: Complete Canon Chronology",
+    "franchise": "Made in Abyss",
+    "category": "tvuniverses",
+    "description": "Dawn of the Deep Soul (2020) is the essential canon bridge between Season 1 and Season 2: Riko, Reg, and Nanachi descend into the Fifth Layer to confront Sovereign of Dawn Bondrewd.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Made in Abyss",
+        "tmdbId": 72636,
+        "imdbId": "tt7222086",
+        "seasons": [
+          1
+        ],
+        "title": "Made in Abyss (Season 1)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt7222086/img"
+      },
+      {
+        "type": "movie",
+        "title": "Made in Abyss: Dawn of the Deep Soul",
+        "year": 2020,
+        "tmdbId": 569094,
+        "imdbId": "tt10609594",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt10609594/img"
+      },
+      {
+        "type": "show",
+        "showName": "Made in Abyss",
+        "tmdbId": 72636,
+        "imdbId": "tt7222086",
+        "seasons": [
+          2
+        ],
+        "title": "Made in Abyss: The Golden City of the Scorching Sun (Season 2)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt7222086/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_konosuba_legend_of_crimson",
+    "name": "KonoSuba: Complete Storyline & Legend of Crimson",
+    "franchise": "KonoSuba",
+    "category": "tvuniverses",
+    "description": "Legend of Crimson (2019) is the essential canon bridge between Seasons 2 and 3, sending Kazuma and party to Megumin's Crimson Demon village to battle Sylvia.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "KonoSuba: God's Blessing on This Wonderful World!",
+        "tmdbId": 65942,
+        "imdbId": "tt5312384",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "KonoSuba (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt5312384/img"
+      },
+      {
+        "type": "movie",
+        "title": "KonoSuba: God's Blessing on this Wonderful World! Legend of Crimson",
+        "year": 2019,
+        "tmdbId": 546554,
+        "imdbId": "tt8600494",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt8600494/img"
+      },
+      {
+        "type": "show",
+        "showName": "KonoSuba: God's Blessing on This Wonderful World!",
+        "tmdbId": 65942,
+        "imdbId": "tt5312384",
+        "seasons": [
+          3
+        ],
+        "title": "KonoSuba (Season 3)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt5312384/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_sao_ordinal_scale_canon",
+    "name": "Sword Art Online: Complete Chronology & Ordinal Scale",
+    "franchise": "Sword Art Online",
+    "category": "tvuniverses",
+    "description": "Ordinal Scale (2017) is the canon feature film set between Season 2 and Season 3 (Alicization), introducing the Augma augmented-reality device and the AI Yuna.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Sword Art Online",
+        "tmdbId": 45782,
+        "imdbId": "tt2250192",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "Sword Art Online (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt2250192/img"
+      },
+      {
+        "type": "movie",
+        "title": "Sword Art Online: Ordinal Scale",
+        "year": 2017,
+        "tmdbId": 417870,
+        "imdbId": "tt5540962",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt5540962/img"
+      },
+      {
+        "type": "show",
+        "showName": "Sword Art Online",
+        "tmdbId": 45782,
+        "imdbId": "tt2250192",
+        "seasons": [
+          3
+        ],
+        "title": "Sword Art Online: Alicization (Season 3)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt2250192/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_rascal_does_not_dream_chronology",
+    "name": "Rascal Does Not Dream: Complete Canon Timeline",
+    "franchise": "Rascal Does Not Dream",
+    "category": "tvuniverses",
+    "description": "Hajime Kamoshida's Puberty Syndrome romance in canon order: Bunny Girl Senpai (Season 1), Dreaming Girl (2019), Sister Venturing Out (2023), and Knapsack Kid (2023).",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Rascal Does Not Dream of Bunny Girl Senpai",
+        "tmdbId": 82700,
+        "imdbId": "tt8993202",
+        "seasons": [
+          1
+        ],
+        "title": "Rascal Does Not Dream of Bunny Girl Senpai (Season 1)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt8993202/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rascal Does Not Dream of a Dreaming Girl",
+        "year": 2019,
+        "tmdbId": 572164,
+        "imdbId": "tt9811444",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt9811444/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rascal Does Not Dream of a Sister Venturing Out",
+        "year": 2023,
+        "tmdbId": 1058694,
+        "imdbId": "tt24151752",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt24151752/img"
+      },
+      {
+        "type": "movie",
+        "title": "Rascal Does Not Dream of a Knapsack Kid",
+        "year": 2023,
+        "tmdbId": 1142996,
+        "imdbId": "tt28083818",
+        "part": 4,
+        "poster": "https://images.metahub.space/poster/medium/tt28083818/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_steins_gate_complete_timeline",
+    "name": "Steins;Gate: Complete Chronology & Deja Vu",
+    "franchise": "Science Adventure",
+    "category": "tvuniverses",
+    "description": "Rintaro Okabe's world-line travels: the original 2011 anime series, the canon epilogue film Load Region of Déjà Vu, and the alternate dark worldline series Steins;Gate 0.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Steins;Gate",
+        "tmdbId": 39483,
+        "imdbId": "tt1910272",
+        "seasons": [
+          1
+        ],
+        "title": "Steins;Gate",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt1910272/img"
+      },
+      {
+        "type": "movie",
+        "title": "Steins;Gate: The Movie − Load Region of Déjà Vu",
+        "year": 2013,
+        "tmdbId": 198539,
+        "imdbId": "tt2380549",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt2380549/img"
+      },
+      {
+        "type": "show",
+        "showName": "Steins;Gate 0",
+        "tmdbId": 77696,
+        "imdbId": "tt4955642",
+        "seasons": [
+          1
+        ],
+        "title": "Steins;Gate 0",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt4955642/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_haruhi_suzumiya_disappearance",
+    "name": "The Melancholy & Disappearance of Haruhi Suzumiya",
+    "franchise": "Haruhi Suzumiya",
+    "category": "tvuniverses",
+    "description": "Kyoto Animation's beloved supernatural slice-of-life: both seasons of the SOS Brigade followed by the celebrated 2-hour 42-minute theatrical masterpiece The Disappearance of Haruhi Suzumiya.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Melancholy of Haruhi Suzumiya",
+        "tmdbId": 46440,
+        "imdbId": "tt0816247",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "The Melancholy of Haruhi Suzumiya",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0816247/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Disappearance of Haruhi Suzumiya",
+        "year": 2010,
+        "tmdbId": 38411,
+        "imdbId": "tt1572306",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt1572306/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_haikyu_dumpster_battle",
+    "name": "Haikyu!! & The Dumpster Battle",
+    "franchise": "Haikyu!!",
+    "category": "tvuniverses",
+    "description": "Karasuno High's volleyball journey across all four seasons, directly continuing into the long-awaited canon showdown film Haikyu!! The Dumpster Battle against Nekoma High.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Haikyu!!",
+        "tmdbId": 60863,
+        "imdbId": "tt3396540",
+        "seasons": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "title": "Haikyu!! (Seasons 1-4)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt3396540/img"
+      },
+      {
+        "type": "movie",
+        "title": "Haikyu!! The Dumpster Battle",
+        "year": 2024,
+        "tmdbId": 1012201,
+        "imdbId": "tt21822882",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt21822882/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_quintuplets_complete_finale",
+    "name": "The Quintessential Quintuplets: Complete Saga & Film",
+    "franchise": "The Quintessential Quintuplets",
+    "category": "tvuniverses",
+    "description": "Futaro Uesugi tutoring the five Nakano sisters across Seasons 1-2, concluded in the 2022 canon theatrical finale film revealing his bride.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "The Quintessential Quintuplets",
+        "tmdbId": 85349,
+        "imdbId": "tt9428790",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "The Quintessential Quintuplets (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt9428790/img"
+      },
+      {
+        "type": "movie",
+        "title": "The Quintessential Quintuplets Movie",
+        "year": 2022,
+        "tmdbId": 828613,
+        "imdbId": "tt14332468",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14332468/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_cowboy_bebop_knockin_on_heavens_door",
+    "name": "Cowboy Bebop & Knockin' on Heaven's Door",
+    "franchise": "Cowboy Bebop",
+    "category": "tvuniverses",
+    "description": "Shinichiro Watanabe's legendary jazz-space-western series, featuring the 2001 canon interquel film Knockin' on Heaven's Door set before the two-part finale.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Cowboy Bebop",
+        "tmdbId": 30991,
+        "imdbId": "tt0213338",
+        "seasons": [
+          1
+        ],
+        "title": "Cowboy Bebop (Episodes 1-22)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0213338/img"
+      },
+      {
+        "type": "movie",
+        "title": "Cowboy Bebop: Knockin' on Heaven's Door",
+        "year": 2001,
+        "tmdbId": 11299,
+        "imdbId": "tt0275277",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0275277/img"
+      },
+      {
+        "type": "show",
+        "showName": "Cowboy Bebop",
+        "tmdbId": 30991,
+        "imdbId": "tt0213338",
+        "seasons": [
+          1
+        ],
+        "title": "Cowboy Bebop (Episodes 23-26)",
+        "part": 3,
+        "poster": "https://images.metahub.space/poster/medium/tt0213338/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_fullmetal_alchemist_2003_shamballa",
+    "name": "Fullmetal Alchemist (2003) & Conqueror of Shamballa",
+    "franchise": "Fullmetal Alchemist",
+    "category": "tvuniverses",
+    "description": "The original 2003 Fullmetal Alchemist anime series, concluded directly by the 2005 theatrical feature film Conqueror of Shamballa.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Fullmetal Alchemist",
+        "tmdbId": 31911,
+        "imdbId": "tt0421357",
+        "seasons": [
+          1
+        ],
+        "title": "Fullmetal Alchemist (2003)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0421357/img"
+      },
+      {
+        "type": "movie",
+        "title": "Fullmetal Alchemist the Movie: Conqueror of Shamballa",
+        "year": 2005,
+        "tmdbId": 20914,
+        "imdbId": "tt0456434",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt0456434/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_gintama_very_final",
+    "name": "Gintama: Complete Saga & The Very Final",
+    "franchise": "Gintama",
+    "category": "tvuniverses",
+    "description": "Gintoki Sakata and the Odd Jobs crew across 367 episodes of sci-fi samurai comedy, concluding in the definitive 2021 feature film Gintama: The Very Final.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Gintama",
+        "tmdbId": 57243,
+        "imdbId": "tt0988818",
+        "seasons": [
+          1
+        ],
+        "title": "Gintama (Complete Series)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt0988818/img"
+      },
+      {
+        "type": "movie",
+        "title": "Gintama: The Very Final",
+        "year": 2021,
+        "tmdbId": 635302,
+        "imdbId": "tt11488582",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt11488582/img"
+      }
+    ]
+  },
+  {
+    "id": "movie_no_game_no_life_zero",
+    "name": "No Game No Life & No Game No Life: Zero",
+    "franchise": "No Game No Life",
+    "category": "tvuniverses",
+    "description": "The Disboard gaming universe: the 2017 theatrical prequel film Zero depicting the Great War 6,000 years prior, followed by the TV series with Sora and Shiro.",
+    "episodes": [
+      {
+        "type": "movie",
+        "title": "No Game No Life: Zero",
+        "year": 2017,
+        "tmdbId": 441130,
+        "imdbId": "tt6677944",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt6677944/img"
+      },
+      {
+        "type": "show",
+        "showName": "No Game No Life",
+        "tmdbId": 61491,
+        "imdbId": "tt3645068",
+        "seasons": [
+          1
+        ],
+        "title": "No Game No Life",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt3645068/img"
+      }
+    ]
+  },
+  {
+    "id": "crossover_isekai_quartet_universe",
+    "name": "Isekai Quartet: Multiverse Crossover & Movie",
+    "franchise": "Kadokawa Isekai Multiverse",
+    "category": "tvuniverses",
+    "description": "Characters from KonoSuba, Overlord, Re:Zero, and The Saga of Tanya the Evil are transported via red button to a chibi high-school world across Seasons 1-2 and the 2022 movie.",
+    "episodes": [
+      {
+        "type": "show",
+        "showName": "Isekai Quartet",
+        "tmdbId": 87910,
+        "imdbId": "tt9173000",
+        "seasons": [
+          1,
+          2
+        ],
+        "title": "Isekai Quartet (Seasons 1-2)",
+        "part": 1,
+        "poster": "https://images.metahub.space/poster/medium/tt9173000/img"
+      },
+      {
+        "type": "movie",
+        "title": "Isekai Quartet: The Movie - Another World",
+        "year": 2022,
+        "tmdbId": 849202,
+        "imdbId": "tt14991478",
+        "part": 2,
+        "poster": "https://images.metahub.space/poster/medium/tt14991478/img"
+      }
+    ]
   }
 ];
+if (typeof window !== 'undefined') window.TV_CROSSOVER_EVENTS = TV_CROSSOVER_EVENTS;
 
 function isCrossoverEpisodeMatch(item, epTarget) {
   if (!item || !epTarget) return false;
@@ -35707,7 +39699,7 @@ let activeStorylineCategory = 'all';
 
 function getStorylineCategories(event) {
   const cats = ['all'];
-  const franchise = String(event.franchise || '').toLowerCase();
+  const franchise = String(event.franchise || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const cat = String(event.category || '').toLowerCase();
 
   if (cat === 'moviesagas' || event.episodes.every((e) => e.type === 'movie')) {
@@ -35717,27 +39709,41 @@ function getStorylineCategories(event) {
     cats.push('tvuniverses');
   }
   if (
-    franchise.includes('star wars') || franchise.includes('marvel') || franchise.includes('lord of the rings') ||
-    franchise.includes('matrix') || franchise.includes('star trek') || franchise.includes('x-files') ||
-    franchise.includes('alien') || franchise.includes('planet of the apes') || franchise.includes('jurassic') ||
-    franchise.includes('firefly') || franchise.includes('transformers') || franchise.includes('homestead')
+    franchise.includes('starwars') || franchise.includes('marvel') || franchise.includes('lordoftherings') ||
+    franchise.includes('matrix') || franchise.includes('startrek') || franchise.includes('xfiles') ||
+    franchise.includes('alien') || franchise.includes('planetoftheapes') || franchise.includes('jurassic') ||
+    franchise.includes('firefly') || franchise.includes('transformers') || franchise.includes('homestead') ||
+    franchise.includes('battlestar') || franchise.includes('farscape') || franchise.includes('dcuniverse') ||
+    franchise.includes('manofaction') || franchise.includes('powerrangers')
   ) {
     cats.push('scifi');
   }
   if (
-    franchise.includes('fast & furious') || franchise.includes('batman') || franchise.includes('mission: impossible') ||
-    franchise.includes('james bond') || franchise.includes('john wick') || franchise.includes('hunger games') ||
-    franchise.includes('indiana jones') || franchise.includes('mad max') || franchise.includes('pirates') ||
-    franchise.includes('breaking bad') || franchise.includes('24') || franchise.includes('arrowverse')
+    franchise.includes('fastfurious') || franchise.includes('batman') || franchise.includes('missionimpossible') ||
+    franchise.includes('jamesbond') || franchise.includes('johnwick') || franchise.includes('hungergames') ||
+    franchise.includes('indianajones') || franchise.includes('madmax') || franchise.includes('pirates') ||
+    franchise.includes('breakingbad') || franchise.includes('24') || franchise.includes('arrowverse') ||
+    franchise.includes('dcuniverse') || franchise.includes('sopranos') || franchise.includes('gomorrah') ||
+    franchise.includes('spartacus') || franchise.includes('luther') || franchise.includes('burnnotice') ||
+    franchise.includes('monk') || franchise.includes('csi') || franchise.includes('veronicamars') ||
+    franchise.includes('shondaland')
   ) {
     cats.push('action');
   }
   if (
-    franchise.includes('toy story') || franchise.includes('shrek') || franchise.includes('demon slayer') ||
-    franchise.includes('jujutsu') || franchise.includes('futurama') || franchise.includes('cowboy bebop') ||
-    franchise.includes('evangelion') || franchise.includes('simpsons') || franchise.includes('bobs') ||
-    franchise.includes('steven') || franchise.includes('hey arnold') || franchise.includes('invader') ||
-    franchise.includes('beavis')
+    franchise.includes('toystory') || franchise.includes('shrek') || franchise.includes('demonslayer') ||
+    franchise.includes('jujutsu') || franchise.includes('futurama') || franchise.includes('cowboybebop') ||
+    franchise.includes('evangelion') || franchise.includes('simpsons') || franchise.includes('bobsburgers') ||
+    franchise.includes('stevenuniverse') || franchise.includes('heyarnold') || franchise.includes('invader') ||
+    franchise.includes('beavis') || franchise.includes('dragonball') || franchise.includes('southpark') ||
+    franchise.includes('konosuba') || franchise.includes('tangled') || franchise.includes('lilo') ||
+    franchise.includes('jimmyneutron') || franchise.includes('rugrats') || franchise.includes('madeinabyss') ||
+    franchise.includes('swordartonline') || franchise.includes('rascaldoesnotdream') ||
+    franchise.includes('steinsgate') || franchise.includes('haruhisuzumiya') || franchise.includes('haikyu') ||
+    franchise.includes('quintuplets') || franchise.includes('fullmetal') || franchise.includes('gintama') ||
+    franchise.includes('nogamenolife') || franchise.includes('metalocalypse') || franchise.includes('venturebros') ||
+    franchise.includes('disney') || franchise.includes('nickelodeon') || franchise.includes('cartoonnetwork') ||
+    franchise.includes('isekai') || franchise.includes('animationdomination') || franchise.includes('dcanimated')
   ) {
     cats.push('animation');
   }
@@ -36438,6 +40444,14 @@ function openChannelDetailsPage(channelIdOrDivId) {
   const map = loadLocalChannels();
   let channel = map[channelIdOrDivId];
   if (!channel) {
+    for (const ch of Object.values(map)) {
+      if (ch && (ch.channelId === channelIdOrDivId || ch.name === channelIdOrDivId)) {
+        channel = ch;
+        break;
+      }
+    }
+  }
+  if (!channel) {
     const div = document.getElementById(channelIdOrDivId);
     if (div) {
       const u = div.querySelector('.url');
@@ -36453,7 +40467,58 @@ function openChannelDetailsPage(channelIdOrDivId) {
       }
     }
   }
+  if (!channel) {
+    const rows = [...document.querySelectorAll('#lists .entry')];
+    for (const row of rows) {
+      if (row.dataset.channelId === channelIdOrDivId) {
+        const u = row.querySelector('.url');
+        if (u) {
+          try {
+            const payload = JSON.parse(u.value.trim().slice('channel:v1:'.length));
+            if (payload) {
+              channel = payload;
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+    }
+  }
+  if (!channel) {
+    const rows = [...document.querySelectorAll('#lists .entry')];
+    for (const row of rows) {
+      const u = row.querySelector('.url');
+      if (u && u.value.includes(channelIdOrDivId)) {
+        const lines = (u.value || '').split('\\n').map((s) => s.trim()).filter(Boolean);
+        for (const line of lines) {
+          if (line.startsWith('channel:v1:')) {
+            try {
+              const payload = JSON.parse(line.slice('channel:v1:'.length));
+              if (payload && (payload.channelId === channelIdOrDivId || payload.name === channelIdOrDivId || u.value.includes(channelIdOrDivId))) {
+                channel = payload;
+                break;
+              }
+            } catch (e) {}
+          }
+        }
+      }
+      if (channel) break;
+    }
+  }
+  if (!channel && typeof channelDraftItems !== 'undefined' && channelDraftItems.length && (typeof editingChannelId !== 'undefined' && editingChannelId === channelIdOrDivId)) {
+    const nameInput = document.getElementById('channelNameInput');
+    channel = {
+      channelId: editingChannelId,
+      name: (nameInput && nameInput.value) || 'TV Channel',
+      items: channelDraftItems,
+    };
+  }
   if (!channel) return;
+
+  if (channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
+    map[channel.channelId] = channel;
+    _memoryChannelsMap = map;
+  }
   
   // A merged channel (see mergeChannelsIntoRow/loadLocalMergedChannels)
   // stores channelIds -- references to the channels that were combined --
@@ -36689,7 +40754,7 @@ function renderMyCreatedChannelsList() {
     return '<div class="list-card" style="margin-bottom:12px;" data-channel-id="' + escapeAttr(ch.channelId) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title">' + escapeHtml(ch.name) + '</div>' +
+          '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' + escapeHtml(ch.name) + '</div>' +
           '<div class="list-card-meta">' +
             '<span>' + metaText + '</span>' +
           '</div>' +
@@ -36778,7 +40843,7 @@ document.addEventListener('click', (e) => {
 // channel's overall size well under whatever broke last time, with a
 // comfortable safety margin.
 const CHANNEL_MAX_EPISODES_PER_SHOW = 50;
-const CHANNEL_MAX_TOTAL_ITEMS = 2000;
+const CHANNEL_MAX_TOTAL_ITEMS = 5000;
 // Quick Add Channel (network-id based) stores a bigger pool than what's
 // ever shown and marks the payload for daily rotation (see dailyRotate
 // below and buildChannelMeta server-side) -- the server picks a fresh
@@ -36788,7 +40853,7 @@ const CHANNEL_MAX_TOTAL_ITEMS = 2000;
 // CHANNEL_MAX_TOTAL_ITEMS above stays the safe upper bound (and the only
 // cap that applies to the manual "Add every season" button, which has no
 // pool/rotation concept).
-const CHANNEL_POOL_MAX_ITEMS = 6000;
+const CHANNEL_POOL_MAX_ITEMS = 5000;
 // What a rotating day's lineup actually looks like -- must match
 // CHANNEL_ROTATION_SHOWS_PER_DAY / CHANNEL_ROTATION_EPISODES_PER_SHOW
 // server-side. Used here only for display text (the real selection logic
@@ -36806,38 +40871,29 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
   if (statusBox) statusBox.innerHTML = '<p><small>Adding ' + escapeHtml(name) + '\u2026</small></p>';
   try {
     if (networkId) {
-      const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name));
-      const data = await res.json();
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = originalLabel;
-      }
-      if (data.ok && data.channel) {
-        const channelId = generateChannelId();
-        const payload = Object.assign({}, data.channel, { channelId: channelId, name: name });
-        saveLocalChannel(payload);
-        addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
-        renderMyCreatedChannelsList();
-        renderChannelMergeList();
-        showAddedToast('Channel "' + name + '" added to your Catalogs.');
-        if (statusBox) {
-          statusBox.innerHTML = '<p class="testresult ok" style="margin:4px 0 0;">\u2713 Channel "' + escapeHtml(name) + '" added (' + (payload.items ? payload.items.length : 0) + ' episodes with daily rotation)!</p>';
-          setTimeout(() => {
-            if (statusBox) statusBox.innerHTML = '';
-          }, 4000);
+      try {
+        const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name));
+        const data = await res.json();
+        if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_POOL_MAX_ITEMS) {
+          const channelId = generateChannelId();
+          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name });
+          saveLocalChannel(payload);
+          addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+          renderMyCreatedChannelsList();
+          renderChannelMergeList();
+          showAddedToast('Channel "' + name + '" added to your Catalogs.');
+          if (statusBox) {
+            statusBox.innerHTML = '<p class="testresult ok" style="margin:4px 0 0;">\u2713 Channel "' + escapeHtml(name) + '" added (' + (payload.items ? payload.items.length : 0) + ' episodes with daily rotation)!</p>';
+            setTimeout(() => {
+              if (statusBox) statusBox.innerHTML = '';
+            }, 4000);
+          }
+          return;
         }
-      } else {
-        if (statusBox) statusBox.innerHTML = '';
-        if (typeof showAppAlert === 'function') {
-          showAppAlert('Could Not Add Channel', 'Could not add ' + name + ': ' + (data.error || 'unknown error'));
-        } else {
-          alert('Could not add ' + name + ': ' + (data.error || 'unknown error'));
-        }
-      }
-      return;
+      } catch (e) {}
     }
 
-    let params = 'url=' + encodeURIComponent(listUrl);
+    let params = networkId ? ('networkId=' + encodeURIComponent(networkId)) : ('url=' + encodeURIComponent(listUrl));
     const keys = collectKeys();
     if (keys.mdblistKey) params += '&mdblistKey=' + encodeURIComponent(keys.mdblistKey);
     if (keys.traktKey) params += '&traktKey=' + encodeURIComponent(keys.traktKey);
@@ -36941,6 +40997,12 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
     renderMyCreatedChannelsList();
     renderChannelMergeList();
     showAddedToast('Channel "' + name + '" added to your Catalogs.');
+    if (statusBox) {
+      statusBox.innerHTML = '<p class="testresult ok" style="margin:4px 0 0;">\u2713 Channel "' + escapeHtml(name) + '" added (' + items.length + ' episodes with daily rotation)!</p>';
+      setTimeout(function() {
+        if (statusBox) statusBox.innerHTML = '';
+      }, 4000);
+    }
   } catch (e) {
     if (typeof showAppAlert === 'function') {
       showAppAlert('Network Error', 'Network error while adding ' + name + '.');
@@ -37921,6 +41983,12 @@ async function saveCreatorListEdit(name) {
       items: customListDraftItems,
       visibility: visibility,
     };
+    if (cached) {
+      if (cached.sourceUrl) body.sourceUrl = cached.sourceUrl;
+      if (cached.synced != null) body.synced = cached.synced;
+      if (cached.lastSyncedAt != null) body.lastSyncedAt = cached.lastSyncedAt;
+      if (cached.baseItemIds) body.baseItemIds = cached.baseItemIds;
+    }
     if (baseline !== null) body.expectedUpdatedAt = baseline;
     const res = await fetch(ORIGIN + '/api/creator/lists/save', {
       method: 'POST',
@@ -38006,6 +42074,12 @@ async function saveLocalCustomListEdit(name) {
     createdAt: existing ? existing.createdAt : Date.now(),
     updatedAt: Date.now(),
   };
+  if (existing) {
+    if (existing.sourceUrl) map[slug].sourceUrl = existing.sourceUrl;
+    if (existing.synced != null) map[slug].synced = existing.synced;
+    if (existing.lastSyncedAt != null) map[slug].lastSyncedAt = existing.lastSyncedAt;
+    if (existing.baseItemIds) map[slug].baseItemIds = existing.baseItemIds;
+  }
   saveLocalCustomListsMap(map);
   if (slug === 'watchlist') {
     if (typeof pushTrackingSync === 'function') pushTrackingSync();
@@ -38049,6 +42123,18 @@ async function saveLocalCustomListEdit(name) {
         items: customListDraftItems,
         visibility: visibility,
       };
+      if (existing) {
+        if (existing.sourceUrl) target.sourceUrl = existing.sourceUrl;
+        if (existing.synced != null) target.synced = existing.synced;
+        if (existing.lastSyncedAt != null) target.lastSyncedAt = existing.lastSyncedAt;
+        if (existing.baseItemIds) target.baseItemIds = existing.baseItemIds;
+      }
+      if (cached) {
+        if (cached.sourceUrl && !target.sourceUrl) target.sourceUrl = cached.sourceUrl;
+        if (cached.synced != null && target.synced == null) target.synced = cached.synced;
+        if (cached.lastSyncedAt != null && target.lastSyncedAt == null) target.lastSyncedAt = cached.lastSyncedAt;
+        if (cached.baseItemIds && !target.baseItemIds) target.baseItemIds = cached.baseItemIds;
+      }
       if (cached && Number.isFinite(cached.updatedAt)) target.updatedAt = cached.updatedAt;
       mirror = await saveCreatorListWithBaseline(target, null, null);
       if (mirror && mirror.ok) {
@@ -38559,12 +42645,26 @@ function refreshWatchBadge(id, type) {
 // progress are mutually exclusive, so marking one clears the other.
 function setShowFullyWatched(showId, isFullyWatched) {
   if (!window._fullyWatchedShowIds) window._fullyWatchedShowIds = new Set();
-  const had = window._fullyWatchedShowIds.has(showId);
+  const had = window._fullyWatchedShowIds.has(String(showId));
+  const d = window._currentItemDetails;
+  const idsToMutate = new Set([String(showId)]);
+  if (d && (String(d.id) === String(showId) || String(d.imdbId) === String(showId) || String(d.tmdbId) === String(showId) || ('tmdb:' + d.tmdbId) === String(showId))) {
+    if (d.id) idsToMutate.add(String(d.id));
+    if (d.imdbId) idsToMutate.add(String(d.imdbId));
+    if (d.tmdbId) {
+      idsToMutate.add(String(d.tmdbId));
+      idsToMutate.add('tmdb:' + d.tmdbId);
+    }
+  }
   if (isFullyWatched) {
-    window._fullyWatchedShowIds.add(showId);
-    if (window._inProgressShowIds) window._inProgressShowIds.delete(showId);
+    idsToMutate.forEach((id) => {
+      window._fullyWatchedShowIds.add(id);
+      if (window._inProgressShowIds) window._inProgressShowIds.delete(id);
+    });
   } else {
-    window._fullyWatchedShowIds.delete(showId);
+    idsToMutate.forEach((id) => {
+      window._fullyWatchedShowIds.delete(id);
+    });
   }
   if (had !== isFullyWatched) {
     try {
@@ -38961,6 +43061,10 @@ window.toggleWatchStatus = function(id, type, name, poster) {
     if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
       updateSeasonWatchedButton(window._currentSeasonNum);
     }
+  } else if (type === 'movie' && existingIdx < 0) {
+    if (typeof advanceCompanionOnMovieWatched === 'function') {
+      advanceCompanionOnMovieWatched({ id, type, name, poster }).catch(() => {});
+    }
   }
   
   // Re-render UI
@@ -39045,7 +43149,20 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
       }
     });
 
-    list.items = list.items.filter(it => !removeIds.has(String(it.id)));
+    list.items = list.items.filter((it) => {
+      if (!it) return false;
+      const itId = String(it.id);
+      if (removeIds.has(itId)) return false;
+      if (it.imdbId && removeIds.has(String(it.imdbId))) return false;
+      if (it.tmdbId && (removeIds.has(String(it.tmdbId)) || removeIds.has('tmdb:' + it.tmdbId))) return false;
+      if (removeCompositeKeys.has(itId)) return false;
+      if (it.seasonNum != null && it.episodeNum != null) {
+        if (it.showId && removeCompositeKeys.has(String(it.showId) + ':' + it.seasonNum + ':' + it.episodeNum)) return false;
+        if (it.imdbId && removeCompositeKeys.has(String(it.imdbId) + ':' + it.seasonNum + ':' + it.episodeNum)) return false;
+        if (it.showTitle && removeCompositeKeys.has(String(it.showTitle) + ':' + it.seasonNum + ':' + it.episodeNum)) return false;
+      }
+      return true;
+    });
     window._rawWatchHistoryItems = list.items;
     removeIds.forEach(id => {
       if (window._watchedItemIds) {
@@ -39144,17 +43261,25 @@ window.toggleBatchWatchStatus = function(items, forceUnwatch) {
 // blue-checkmark badge.
 window.markShowWatched = async function(imdbId) {
   const d = window._currentItemDetails;
-  if (!d || !d.id || String(d.id) !== String(imdbId) || !d.seasonsData) return;
+  if (!d || !d.seasonsData) return;
+  const matchesId = !imdbId || (d.id && String(d.id) === String(imdbId)) || (d.imdbId && String(d.imdbId) === String(imdbId)) || (d.tmdbId && String(d.tmdbId) === String(imdbId));
+  if (!matchesId) return;
 
   const btn = document.getElementById('btnMarkShowWatched');
   const seasons = d.seasonsData.filter(s => s.season_number !== 0);
   if (!seasons.length) return;
 
-  // Capture intent from the button's own state before it's disabled/
-  // relabeled below -- see toggleBatchWatchStatus's forceUnwatch comment
-  // for why this is passed through explicitly rather than re-derived from
-  // window._watchedItemIds after the fresh TMDB fetch below.
-  const wasFullyWatched = window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(imdbId));
+  // Capture intent directly from the button's own state before it's disabled/
+  // relabeled below -- if the button says "Unwatched" or has class "secondary",
+  // the user's explicit intent is to unwatch the show.
+  const wasFullyWatched = btn
+    ? (btn.classList.contains('secondary') || btn.innerHTML.includes('Unwatched'))
+    : (window._fullyWatchedShowIds && (
+        window._fullyWatchedShowIds.has(String(imdbId)) ||
+        (d.id && window._fullyWatchedShowIds.has(String(d.id))) ||
+        (d.imdbId && window._fullyWatchedShowIds.has(String(d.imdbId))) ||
+        (d.tmdbId && (window._fullyWatchedShowIds.has(String(d.tmdbId)) || window._fullyWatchedShowIds.has('tmdb:' + d.tmdbId)))
+      ));
 
   if (btn) {
     btn.disabled = true;
@@ -39215,24 +43340,83 @@ window.markShowWatched = async function(imdbId) {
   btn.disabled = false;
 
   if (!allEpisodes.length) {
-    const stillFullyWatched = window._fullyWatchedShowIds && window._fullyWatchedShowIds.has(String(imdbId));
     if (failedSeasons > 0) {
       btn.innerHTML = "Couldn't load episodes -- try again";
     } else {
-      btn.innerHTML = stillFullyWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched' : 'Mark Whole Show Watched';
+      btn.innerHTML = wasFullyWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched';
     }
     return;
   }
 
   const result = window.toggleBatchWatchStatus(allEpisodes, wasFullyWatched);
   const nowWatched = result.nowWatched;
-  setShowFullyWatched(String(imdbId), nowWatched);
+
+  const allShowAliases = new Set([String(imdbId)]);
+  if (d.id) allShowAliases.add(String(d.id));
+  if (d.imdbId) allShowAliases.add(String(d.imdbId));
+  if (d.tmdbId) {
+    allShowAliases.add(String(d.tmdbId));
+    allShowAliases.add('tmdb:' + d.tmdbId);
+  }
+
+  allShowAliases.forEach((alias) => {
+    setShowFullyWatched(alias, nowWatched);
+    setShowInProgress(alias, false);
+  });
+
+  // Synchronously update Continue Watching so the completed show is immediately evicted
+  // and any storyline sequel/companion is queued without waiting on background season fetches:
+  if (typeof withCwCommitLock === 'function') {
+    await withCwCommitLock(() => {
+      const map = loadLocalCustomLists();
+      const cwList = getOrCreateContinueWatchingList();
+      const isShowItem = (it) => {
+        if (!it) return false;
+        const itShowId = String(it.showId || '');
+        const itImdbId = String(it.imdbId || '');
+        const itId = String(it.id || '');
+        if (allShowAliases.has(itShowId) || allShowAliases.has(itImdbId) || allShowAliases.has(itId)) return true;
+        const base = itId.split(':')[0];
+        if (base && allShowAliases.has(base)) return true;
+        return false;
+      };
+
+      if (nowWatched) {
+        // Evict any entry for this completed show from Continue Watching
+        cwList.items = (cwList.items || []).filter((it) => !isShowItem(it));
+        // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
+        let companion = null;
+        for (const alias of allShowAliases) {
+          if (typeof findCompanionShowConclusion === 'function') {
+            companion = findCompanionShowConclusion(alias);
+          }
+          if (companion) break;
+        }
+        if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
+          cwList.items.unshift(companion);
+        }
+      } else {
+        // If unwatching the whole show, remove any companion queued for this show
+        cwList.items = (cwList.items || []).filter((it) => {
+          if (!it) return false;
+          if (it.precedingShowId && allShowAliases.has(String(it.precedingShowId))) return false;
+          return true;
+        });
+      }
+
+      map['continue-watching'] = cwList;
+      cwList.updatedAt = Date.now();
+      saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    });
+  }
   if (nowWatched) {
-    btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Whole Show Unwatched';
+    btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched';
     btn.classList.remove('primary');
     btn.classList.add('secondary');
   } else {
-    btn.innerHTML = 'Mark Whole Show Watched';
+    btn.innerHTML = 'Mark Show Watched';
     btn.classList.remove('secondary');
     btn.classList.add('primary');
   }
@@ -39314,6 +43498,14 @@ window.addItemsToWatchHistory = async function(items, skipExternalSync = false) 
   // fire while most of the batch is still mid-flight, and cwSucceeded/
   // cwTotal below let it report real numbers instead of assuming success.
   const cwResult = await updateContinueWatchingForBatch(items);
+  if (Array.isArray(items)) {
+    const movieItems = items.filter(it => it && it.type === 'movie');
+    for (const m of movieItems) {
+      if (typeof advanceCompanionOnMovieWatched === 'function') {
+        await advanceCompanionOnMovieWatched(m).catch(() => {});
+      }
+    }
+  }
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
   items.forEach((it) => {
     refreshWatchBadge(it.id, it.type);
@@ -39405,6 +43597,327 @@ function getOrCreateContinueWatchingList() {
 // comment for why. Network fetches still run in parallel across workers;
 // only the actual commit (load list, mutate, save list) queues up one at
 // a time, so it can never race with another commit in flight.
+// --- Continue Watching Storyline & Companion Continuations -------------------
+
+function getCompanionRecommendationSetting() {
+  try {
+    return localStorage.getItem('myListAddon:autoRecommendCompanions') !== '0';
+  } catch (e) {
+    return true;
+  }
+}
+window.getCompanionRecommendationSetting = getCompanionRecommendationSetting;
+
+function toggleCompanionRecommendationSetting(isChecked) {
+  try {
+    localStorage.setItem('myListAddon:autoRecommendCompanions', isChecked ? '1' : '0');
+  } catch (e) {}
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof saveState === 'function') saveState();
+}
+window.toggleCompanionRecommendationSetting = toggleCompanionRecommendationSetting;
+
+function getCrossoverRegistry() {
+  if (typeof TV_CROSSOVER_EVENTS !== 'undefined' && Array.isArray(TV_CROSSOVER_EVENTS)) {
+    return TV_CROSSOVER_EVENTS;
+  }
+  if (typeof window !== 'undefined' && Array.isArray(window.TV_CROSSOVER_EVENTS)) {
+    return window.TV_CROSSOVER_EVENTS;
+  }
+  return [];
+}
+
+function matchPartToShow(part, showId) {
+  if (!part || !showId) return false;
+  const rawId = String(showId).trim().toLowerCase();
+  const cleanTmdb = rawId.replace(/^tmdb:/, '');
+  if (part.imdbId && part.imdbId.toLowerCase() === rawId) return true;
+  if (part.tmdbId && (String(part.tmdbId).toLowerCase() === cleanTmdb || String(part.tmdbId).toLowerCase() === rawId)) return true;
+  return false;
+}
+
+function matchPartToMovie(part, movieTarget) {
+  if (!part || !movieTarget || part.type !== 'movie') return false;
+  const mId = String(movieTarget.imdbId || movieTarget.id || '').trim().toLowerCase();
+  const tmdbId = String(movieTarget.tmdbId || '').replace(/^tmdb:/, '').trim().toLowerCase();
+  if (part.imdbId && mId && part.imdbId.toLowerCase() === mId) return true;
+  if (part.tmdbId && tmdbId && String(part.tmdbId).toLowerCase() === tmdbId) return true;
+  if (part.tmdbId && mId && (String(part.tmdbId).toLowerCase() === mId || ('tmdb:' + part.tmdbId).toLowerCase() === mId)) return true;
+  const targetTitle = String(movieTarget.title || movieTarget.name || '').toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+  const partTitle = String(part.title || '').toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+  if (targetTitle && partTitle && targetTitle === partTitle) return true;
+  return false;
+}
+
+function isStorylinePartWatched(part) {
+  if (!part) return false;
+  const watchedSet = window._watchedItemIds;
+  if (part.imdbId && watchedSet && watchedSet.has(part.imdbId)) return true;
+  if (part.tmdbId && watchedSet && (watchedSet.has(String(part.tmdbId)) || watchedSet.has('tmdb:' + part.tmdbId))) return true;
+
+  try {
+    const map = loadLocalCustomLists();
+    const hist = (map && map['watch-history'] && map['watch-history'].items) || [];
+    return hist.some((it) => {
+      if (!it) return false;
+      if (part.imdbId && (it.imdbId === part.imdbId || it.id === part.imdbId || it.showId === part.imdbId)) return true;
+      if (part.tmdbId && (String(it.tmdbId) === String(part.tmdbId) || String(it.id) === String(part.tmdbId) || it.id === 'tmdb:' + part.tmdbId)) return true;
+      const t1 = String(it.name || it.title || '').toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+      const t2 = String(part.title || '').toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+      if (t1 && t2 && t1 === t2 && part.type === 'movie') return true;
+      return false;
+    });
+  } catch (e) {
+    return false;
+  }
+}
+
+function isStorylinePartDismissed(part) {
+  if (!part) return false;
+  const dismissed = window._dismissedContinueWatching || (function() {
+    try { return JSON.parse(localStorage.getItem('myListAddon:dismissedContinueWatching') || '{}'); } catch(e) { return {}; }
+  })();
+  if (part.imdbId && dismissed[part.imdbId]) return true;
+  if (part.tmdbId && (dismissed[String(part.tmdbId)] || dismissed['tmdb:' + part.tmdbId])) return true;
+  if (part.id && dismissed[part.id]) return true;
+  return false;
+}
+
+function findCompanionBridgeMovie(showId, currentSeason, nextSeason) {
+  if (!getCompanionRecommendationSetting()) return null;
+  const registry = getCrossoverRegistry();
+  if (!registry.length) return null;
+
+  for (const event of registry) {
+    const eps = event.episodes || [];
+    for (let i = 0; i < eps.length; i++) {
+      const part = eps[i];
+      if (!matchPartToShow(part, showId)) continue;
+
+      let coversCurrentSeason = false;
+      if (part.season != null && Number(part.season) === Number(currentSeason)) {
+        coversCurrentSeason = true;
+      } else if (Array.isArray(part.seasons) && part.seasons.includes(Number(currentSeason))) {
+        const maxSeason = Math.max(...part.seasons);
+        if (maxSeason === Number(currentSeason)) coversCurrentSeason = true;
+      } else if (part.type === 'show' && i < eps.length - 1) {
+        if (eps[i + 1] && eps[i + 1].type === 'movie') coversCurrentSeason = true;
+      }
+
+      if (!coversCurrentSeason) continue;
+
+      const nextPart = eps[i + 1];
+      if (nextPart && nextPart.type === 'movie') {
+        if (!isStorylinePartWatched(nextPart) && !isStorylinePartDismissed(nextPart)) {
+          return {
+            id: nextPart.imdbId || ('tmdb:' + nextPart.tmdbId),
+            type: 'movie',
+            kind: 'movie',
+            name: nextPart.title,
+            title: nextPart.title,
+            poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+            imdbId: nextPart.imdbId || '',
+            tmdbId: nextPart.tmdbId || null,
+            year: nextPart.year || null,
+            parentShowId: showId,
+            bridgeNextSeason: nextSeason,
+            isCompanion: true,
+            companionStoryline: event.name,
+            companionType: 'bridge_movie',
+            companionNote: 'Canon Bridge Movie'
+          };
+        }
+      }
+    }
+  }
+  return null;
+}
+window.findCompanionBridgeMovie = findCompanionBridgeMovie;
+
+function findCompanionShowConclusion(showId) {
+  if (!getCompanionRecommendationSetting()) return null;
+  const registry = getCrossoverRegistry();
+  if (!registry.length) return null;
+
+  for (const event of registry) {
+    const eps = event.episodes || [];
+    for (let i = 0; i < eps.length; i++) {
+      const part = eps[i];
+      if (!matchPartToShow(part, showId)) continue;
+
+      // Ensure this is the concluding part for this show in this event
+      const hasLaterPartForShow = eps.slice(i + 1).some((p) => matchPartToShow(p, showId));
+      if (hasLaterPartForShow) continue;
+
+      for (let j = i + 1; j < eps.length; j++) {
+        const nextPart = eps[j];
+        if (!nextPart) continue;
+
+        if (isStorylinePartWatched(nextPart)) {
+          continue;
+        }
+        if (isStorylinePartDismissed(nextPart)) {
+          break;
+        }
+
+        if (nextPart.type === 'movie') {
+          return {
+            id: nextPart.imdbId || ('tmdb:' + nextPart.tmdbId),
+            type: 'movie',
+            kind: 'movie',
+            name: nextPart.title,
+            title: nextPart.title,
+            poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+            imdbId: nextPart.imdbId || '',
+            tmdbId: nextPart.tmdbId || null,
+            year: nextPart.year || null,
+            precedingShowId: showId,
+            isCompanion: true,
+            companionStoryline: event.name,
+            companionType: 'sequel_movie',
+            companionNote: 'Sequel Film'
+          };
+        } else if (nextPart.type === 'show' || nextPart.type === 'season') {
+          const nextShowId = nextPart.imdbId || (nextPart.tmdbId ? 'tmdb:' + nextPart.tmdbId : '');
+          if (nextShowId) {
+            const startSeason = (nextPart.seasons && nextPart.seasons[0]) || nextPart.season || 1;
+            const startEp = nextPart.episode || 1;
+            return {
+              id: nextShowId + ':' + startSeason + ':' + startEp,
+              type: 'episode',
+              name: nextPart.title || nextPart.showName,
+              showId: nextShowId,
+              showTitle: nextPart.showName || nextPart.title,
+              showPoster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+              poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+              seasonNum: startSeason,
+              episodeNum: startEp,
+              precedingShowId: showId,
+              isCompanion: true,
+              companionStoryline: event.name,
+              companionType: 'spinoff_series',
+              companionNote: 'Next Series in Storyline'
+            };
+          }
+        }
+        break;
+      }
+    }
+  }
+  return null;
+}
+window.findCompanionShowConclusion = findCompanionShowConclusion;
+
+async function advanceCompanionOnMovieWatched(movieItem) {
+  if (!getCompanionRecommendationSetting() || !movieItem) return;
+  const registry = getCrossoverRegistry();
+  if (!registry.length) return;
+
+  const targetId = String(movieItem.imdbId || movieItem.id || '').trim();
+
+  for (const event of registry) {
+    const eps = event.episodes || [];
+    const idx = eps.findIndex((p) => matchPartToMovie(p, movieItem));
+    if (idx < 0) continue;
+
+    // Check if this was a bridge movie for a preceding TV show
+    if (idx > 0 && (eps[idx - 1].type === 'show' || eps[idx - 1].type === 'season')) {
+      const parentShow = eps[idx - 1];
+      const parentShowId = parentShow.imdbId || (parentShow.tmdbId ? 'tmdb:' + parentShow.tmdbId : '');
+      if (idx < eps.length - 1 && matchPartToShow(eps[idx + 1], parentShowId)) {
+        if (parentShowId) {
+          await updateContinueWatching(parentShowId);
+          return;
+        }
+      }
+    }
+
+    // Look for next unwatched part in storyline
+    for (let j = idx + 1; j < eps.length; j++) {
+      const nextPart = eps[j];
+      if (!nextPart) continue;
+
+      if (isStorylinePartWatched(nextPart)) {
+        continue;
+      }
+      if (isStorylinePartDismissed(nextPart)) {
+        break;
+      }
+
+      if (nextPart.type === 'movie') {
+        const companionEntry = {
+          id: nextPart.imdbId || ('tmdb:' + nextPart.tmdbId),
+          type: 'movie',
+          kind: 'movie',
+          name: nextPart.title,
+          title: nextPart.title,
+          poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+          imdbId: nextPart.imdbId || '',
+          tmdbId: nextPart.tmdbId || null,
+          year: nextPart.year || null,
+          isCompanion: true,
+          companionStoryline: event.name,
+          companionType: 'sequel_movie',
+          companionNote: 'Next Movie in Storyline'
+        };
+        await withCwCommitLock(() => {
+          const map = loadLocalCustomLists();
+          const cwList = getOrCreateContinueWatchingList();
+          cwList.items = (cwList.items || []).filter((it) => it && it.id !== targetId && it.id !== companionEntry.id);
+          cwList.items.unshift(companionEntry);
+          map['continue-watching'] = cwList;
+          cwList.updatedAt = Date.now();
+          saveLocalCustomListsMap(map);
+          if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+          if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+        });
+        return;
+      } else if (nextPart.type === 'show' || nextPart.type === 'season') {
+        const nextShowId = nextPart.imdbId || (nextPart.tmdbId ? 'tmdb:' + nextPart.tmdbId : '');
+        if (nextShowId) {
+          const startSeason = (nextPart.seasons && nextPart.seasons[0]) || nextPart.season || 1;
+          const startEp = nextPart.episode || 1;
+          const companionEntry = {
+            id: nextShowId + ':' + startSeason + ':' + startEp,
+            type: 'episode',
+            name: nextPart.title || nextPart.showName,
+            showId: nextShowId,
+            showTitle: nextPart.showName || nextPart.title,
+            showPoster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+            poster: nextPart.poster || (nextPart.imdbId ? 'https://images.metahub.space/poster/medium/' + nextPart.imdbId + '/img' : ''),
+            seasonNum: startSeason,
+            episodeNum: startEp,
+            isCompanion: true,
+            companionStoryline: event.name,
+            companionType: 'spinoff_series',
+            companionNote: 'Next Series in Storyline'
+          };
+          await withCwCommitLock(() => {
+            const map = loadLocalCustomLists();
+            const cwList = getOrCreateContinueWatchingList();
+            cwList.items = (cwList.items || []).filter((it) => it && it.id !== targetId && it.showId !== nextShowId && it.id !== companionEntry.id);
+            cwList.items.unshift(companionEntry);
+            map['continue-watching'] = cwList;
+            cwList.updatedAt = Date.now();
+            saveLocalCustomListsMap(map);
+            if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+            if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+          });
+          return;
+        }
+      }
+      break;
+    }
+  }
+}
+window.advanceCompanionOnMovieWatched = advanceCompanionOnMovieWatched;
+
+// Serializes the read-modify-write of localStorage's continue-watching
+// list (and the fullyWatchedShowIds/inProgressShowIds it triggers) across
+// concurrent updateContinueWatching calls -- see that function's own
+// comment for why. Network fetches still run in parallel across workers;
+// only the actual commit (load list, mutate, save list) queues up one at
+// a time, so it can never race with another commit in flight.
 let cwCommitLock = Promise.resolve();
 function withCwCommitLock(fn) {
   const run = cwCommitLock.then(fn, fn);
@@ -39419,7 +43932,7 @@ async function updateContinueWatching(showId) {
   if (!showId) return { ok: false };
 
   const tkInput = document.getElementById('tmdbKeyInput');
-  const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || (typeof localStorage !== 'undefined' ? (localStorage.getItem('myListAddon:tmdbKey') || '') : '');
 
   // Reading Watch History here (outside the commit lock) is safe: nothing
   // concurrently writes to Watch History during a Continue Watching batch
@@ -39476,7 +43989,7 @@ async function updateContinueWatching(showId) {
 
     if (nextInSeason) {
       const aired = isEpisodeAired(nextInSeason);
-      const isPremiere = nextInSeason.episode_number === 1 && latest.seasonNum > 1;
+      const isPremiere = nextInSeason.episode_number === 1 && latest.seasonNum > 1 && !aired;
       const isFinale = nextInSeason.episode_number === allEps.length;
       const lastEp = allEps[allEps.length - 1];
       const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
@@ -39500,42 +44013,54 @@ async function updateContinueWatching(showId) {
       showFullyWatched = !aired;
     } else {
       const nextSeasonNum = latest.seasonNum + 1;
-      const res2 = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
-        '&seasonNum=' + nextSeasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
-      const data2 = await res2.json();
-      if (data2.ok && data2.season && Array.isArray(data2.season.episodes) && data2.season.episodes.length) {
-        const allEpsNext = data2.season.episodes;
-        const firstNext = allEpsNext[0];
-        if (firstNext) {
-          const aired = isEpisodeAired(firstNext);
-          const isPremiere = firstNext.episode_number === 1 && nextSeasonNum > 1;
-          const isFinale = allEpsNext.length === 1;
-          const lastEp = allEpsNext[allEpsNext.length - 1];
-          const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
-          newEntry = {
-            id: String(firstNext.id),
-            type: 'episode',
-            name: firstNext.name,
-            poster: latest.showPoster || '',
-            showId: showId,
-            showTitle: latest.showTitle || '',
-            showPoster: latest.showPoster || '',
-            seasonNum: nextSeasonNum,
-            episodeNum: firstNext.episode_number,
-            airDate: firstNext.air_date || null,
-            isUnaired: !aired,
-            isSeasonPremiere: isPremiere,
-            isSeasonFinale: isFinale,
-            seasonFinaleAirDate: (!isPremiere && !isFinale) ? finaleAir : null,
-          };
-          showFullyWatched = !aired;
-        } else {
-          showFullyWatched = true;
-        }
+      const bridgeMovie = findCompanionBridgeMovie(showId, latest.seasonNum, nextSeasonNum);
+      if (bridgeMovie) {
+        newEntry = bridgeMovie;
+        showFullyWatched = false;
       } else {
-        // No further season at all -- this was the last one, and it's
-        // fully watched.
-        showFullyWatched = true;
+        const res2 = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(showId) +
+          '&seasonNum=' + nextSeasonNum + '&tmdbKey=' + encodeURIComponent(tmdbKey));
+        const data2 = await res2.json();
+        if (data2.ok && data2.season && Array.isArray(data2.season.episodes) && data2.season.episodes.length) {
+          const allEpsNext = data2.season.episodes;
+          const firstNext = allEpsNext[0];
+          if (firstNext) {
+            const aired = isEpisodeAired(firstNext);
+            const isPremiere = firstNext.episode_number === 1 && nextSeasonNum > 1 && !aired;
+            const isFinale = allEpsNext.length === 1;
+            const lastEp = allEpsNext[allEpsNext.length - 1];
+            const finaleAir = (lastEp && lastEp.air_date) ? lastEp.air_date : null;
+            newEntry = {
+              id: String(firstNext.id),
+              type: 'episode',
+              name: firstNext.name,
+              poster: latest.showPoster || '',
+              showId: showId,
+              showTitle: latest.showTitle || '',
+              showPoster: latest.showPoster || '',
+              seasonNum: nextSeasonNum,
+              episodeNum: firstNext.episode_number,
+              airDate: firstNext.air_date || null,
+              isUnaired: !aired,
+              isSeasonPremiere: isPremiere,
+              isSeasonFinale: isFinale,
+              seasonFinaleAirDate: (!isPremiere && !isFinale) ? finaleAir : null,
+            };
+            showFullyWatched = !aired;
+          } else {
+            showFullyWatched = true;
+          }
+        } else {
+          // No further season at all -- this was the last one.
+          // Check if there is a sequel film or spinoff series in storyline.
+          const conclusionPart = findCompanionShowConclusion(showId);
+          if (conclusionPart) {
+            newEntry = conclusionPart;
+            showFullyWatched = true;
+          } else {
+            showFullyWatched = true;
+          }
+        }
       }
     }
   } catch (e) {
@@ -39548,7 +44073,19 @@ async function updateContinueWatching(showId) {
     // Removes any existing entry for this show -- including a stale one
     // that might otherwise never get cleaned up -- before (maybe) adding
     // the fresh one computed above.
-    cwList.items = cwList.items.filter(it => it.showId !== showId);
+    const isShowMatch = (it) => {
+      if (!it) return false;
+      const sId = String(it.showId || '');
+      const sTarget = String(showId || '');
+      if (sId && (sId === sTarget || sId.replace(/^tmdb:/, '') === sTarget.replace(/^tmdb:/, ''))) return true;
+      const epId = String(it.id || '');
+      if (epId === sTarget || epId.split(':')[0] === sTarget) return true;
+      if (it.imdbId && (String(it.imdbId) === sTarget || String(it.imdbId).replace(/^tmdb:/, '') === sTarget.replace(/^tmdb:/, ''))) return true;
+      const d = window._currentItemDetails;
+      if (d && (sId === String(d.id) || sId === String(d.imdbId) || sId === String(d.tmdbId) || sId === ('tmdb:' + d.tmdbId))) return true;
+      return false;
+    };
+    cwList.items = cwList.items.filter(it => !isShowMatch(it) && (!newEntry || (it.id !== newEntry.id && it.id !== showId)));
     if (newEntry) cwList.items.unshift(newEntry);
     map['continue-watching'] = cwList;
     cwList.updatedAt = Date.now();
@@ -39556,7 +44093,8 @@ async function updateContinueWatching(showId) {
     if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
     if (showFullyWatched !== null) setShowFullyWatched(showId, showFullyWatched);
-    if (showFullyWatched === false) setShowInProgress(showId, true);
+    if (showFullyWatched === true) setShowInProgress(showId, false);
+    else if (showFullyWatched === false) setShowInProgress(showId, true);
     return { ok: showFullyWatched !== null };
   });
 }
@@ -39642,6 +44180,8 @@ function dismissContinueWatchingShow(showId, btn) {
       return best;
     }, watchedEps[0]);
     window._dismissedContinueWatching[showId] = { seasonNum: latest.seasonNum, episodeNum: latest.episodeNum };
+  } else {
+    window._dismissedContinueWatching[showId] = { dismissedAt: Date.now() };
   }
   try {
     localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(window._dismissedContinueWatching));
@@ -39652,10 +44192,10 @@ function dismissContinueWatchingShow(showId, btn) {
   // Goes through the same commit lock updateContinueWatching's own writes
   // do, so this can't race with an in-flight commit for the same (or any
   // other) show -- see withCwCommitLock's own comment.
-  withCwCommitLock(() => {
+  const commitPromise = withCwCommitLock(() => {
     const map = loadLocalCustomLists();
     const cwList = getOrCreateContinueWatchingList();
-    cwList.items = cwList.items.filter(it => it.showId !== showId);
+    cwList.items = (cwList.items || []).filter(it => it && it.showId !== showId && it.id !== showId && it.imdbId !== showId);
     map['continue-watching'] = cwList;
     cwList.updatedAt = Date.now();
     saveLocalCustomListsMap(map);
@@ -39669,6 +44209,7 @@ function dismissContinueWatchingShow(showId, btn) {
   // real new episode later supersedes this dismissal.
   setShowFullyWatched(showId, true);
   if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+  return commitPromise;
 }
 
 // --- Airing Next ------------------------------------------------------------
@@ -40049,6 +44590,7 @@ async function backfillWatchHistoryEpisodeStills() {
   const groups = new Map();
   items.forEach((it) => {
     if (!needsEpisodeStill(it)) return;
+    if (checks['show_404:' + it.showId] && (now - checks['show_404:' + it.showId]) < EPISODE_STILL_RECHECK_MS) return;
     const key = String(it.showId) + '|' + String(it.seasonNum);
     const lastChecked = Number(checks[key]) || 0;
     if (lastChecked && (now - lastChecked) < EPISODE_STILL_RECHECK_MS) return;
@@ -40058,26 +44600,63 @@ async function backfillWatchHistoryEpisodeStills() {
   if (!groups.size) return 0;
 
   const pending = [...groups.entries()].slice(0, EPISODE_STILL_MAX_GROUPS_PER_RUN);
+  // Sort season 1 first so missing shows are detected before checking later seasons
+  pending.sort((a, b) => (Number(a[1].seasonNum) || 0) - (Number(b[1].seasonNum) || 0));
   const tkInput = document.getElementById('tmdbKeyInput');
   const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
 
   let changed = 0;
-  let nextIdx = 0;
+  const inFlightShows = new Set();
   async function worker() {
-    while (nextIdx < pending.length) {
-      const entry = pending[nextIdx++];
+    while (true) {
+      let entry = null;
+      for (let i = 0; i < pending.length; i++) {
+        const item = pending[i];
+        if (!item || item._claimed) continue;
+        const group = item[1];
+        if (inFlightShows.has(group.showId)) continue;
+        entry = item;
+        item._claimed = true;
+        break;
+      }
+      if (!entry) {
+        const hasUnclaimed = pending.some((p) => p && !p._claimed);
+        if (hasUnclaimed && inFlightShows.size > 0) {
+          await new Promise((r) => setTimeout(r, 60));
+          continue;
+        }
+        break;
+      }
       const key = entry[0];
       const group = entry[1];
+      if (checks['show_404:' + group.showId] || (checks[key] && (now - checks[key]) < EPISODE_STILL_RECHECK_MS)) continue;
+      inFlightShows.add(group.showId);
       try {
         const res = await fetch(ORIGIN + '/api/season?imdbId=' + encodeURIComponent(group.showId) +
           '&seasonNum=' + encodeURIComponent(group.seasonNum) +
           (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
-        const data = await res.json();
+        if (res.status === 404) {
+          // Season or show does not exist on TMDB -- record as checked so we
+          // don't spam 404 requests on every page load/run.
+          checks[key] = now;
+          if (Number(group.seasonNum) === 1) {
+            checks['show_404:' + group.showId] = now;
+          }
+          pending.forEach((other) => {
+            if (other && other[1] && other[1].showId === group.showId) {
+              checks[other[0]] = now;
+              if (Number(group.seasonNum) === 1) other._claimed = true;
+            }
+          });
+          continue;
+        }
+        let data = null;
+        try { data = await res.json(); } catch {}
         const episodes = (data && data.ok && data.season && Array.isArray(data.season.episodes)) ? data.season.episodes : null;
-        // A miss here is a network or TMDB failure, not "this season has
-        // no stills" -- deliberately left unrecorded so the next run
-        // retries it rather than writing it off for a week.
-        if (!episodes) continue;
+        if (!episodes) {
+          if (data && data.ok === false) checks[key] = now;
+          continue;
+        }
         const byNumber = new Map();
         episodes.forEach((ep) => {
           if (ep && ep.episode_number != null) byNumber.set(Number(ep.episode_number), ep);
@@ -40099,6 +44678,8 @@ async function backfillWatchHistoryEpisodeStills() {
         checks[key] = now;
       } catch (e) {
         // Same as above -- retried on the next run.
+      } finally {
+        inFlightShows.delete(group.showId);
       }
     }
   }
@@ -40185,7 +44766,7 @@ function buildAiringNextCardHtml() {
         };
     return '<div class="list-card-mini-poster-tile">' +
       '<div class="list-card-mini-poster-img-wrap">' +
-        '<img src="' + escapeAttr(it.showPoster || '') + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
+        '<img src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.showPoster || '') : (it.showPoster || '')) + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
         dateBadge +
         bottomBadge +
         overlays +
@@ -40237,7 +44818,9 @@ function openAiringNextDetailsPage() {
       type: 'series',
       name: label.title,
       subtitle: label.subtitle,
-      poster: it.showPoster,
+      poster: typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.showPoster) : it.showPoster,
+      isAdult: typeof isAdultOrNsfw === 'function' ? isAdultOrNsfw(it) : !!it.adult,
+      isAdultPosterFiltered: typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled() && (it.isAdult || (typeof isAdultOrNsfw === 'function' && isAdultOrNsfw(it))),
       airDate: it.airDate,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,
@@ -40436,6 +45019,11 @@ function compactCustomListItem(it) {
   if (it.seasonFinaleAirDate) clean.seasonFinaleAirDate = it.seasonFinaleAirDate;
   if (it.isSeasonPremiere) clean.isSeasonPremiere = true;
   if (it.isSeasonFinale) clean.isSeasonFinale = true;
+  if (it.isCompanion) clean.isCompanion = true;
+  if (it.companionType) clean.companionType = it.companionType;
+  if (it.companionNote) clean.companionNote = it.companionNote;
+  if (it.companionStoryline) clean.companionStoryline = it.companionStoryline;
+  if (it.precedingShowId) clean.precedingShowId = it.precedingShowId;
   return clean;
 }
 
@@ -40445,6 +45033,8 @@ function compactCustomListItem(it) {
 let _trimNotified = false;
 function notifyListsTrimmed(trimmed) {
   if (_trimNotified || !trimmed || !trimmed.length) return;
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (signedIn) return; // Guard: Never show this alert to a logged-in user
   _trimNotified = true;
   const detail = trimmed.slice(0, 4).map((t) => t.slug + ' (' + t.dropped + ')').join(', ');
   const msg = 'Some lists are too large to store in this browser, so the oldest items were dropped to make them fit: ' +
@@ -40481,6 +45071,10 @@ function compactCustomListMap(map, maxItemsPerList) {
     if (list.isWatchlist) cleanList.isWatchlist = true;
     if (list.isContinueWatching) cleanList.isContinueWatching = true;
     if (list.isWatchHistory) cleanList.isWatchHistory = true;
+    if (list.sourceUrl) cleanList.sourceUrl = list.sourceUrl;
+    if (list.synced != null) cleanList.synced = !!list.synced;
+    if (list.lastSyncedAt != null) cleanList.lastSyncedAt = list.lastSyncedAt;
+    if (Array.isArray(list.baseItemIds)) cleanList.baseItemIds = list.baseItemIds;
     if (Array.isArray(list.items)) {
       // Truncation here is permanent: the trimmed map is what gets written
       // AND what is held in memory afterwards, so anything cut is gone at
@@ -40553,7 +45147,7 @@ function saveLocalCustomListsMap(map) {
   // longer silent.
   const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
   const leanMap = compactCustomListMap(map, signedIn ? 100000 : 1000);
-  if (_lastCompactionTrimmed.length) {
+  if (!signedIn && _lastCompactionTrimmed.length) {
     notifyListsTrimmed(_lastCompactionTrimmed.slice());
   }
   _memoryCustomListsObj = leanMap;
@@ -40568,7 +45162,26 @@ function saveLocalCustomListsMap(map) {
     localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, str);
     return true;
   } catch (e) {
-    // If quota exceeded, try a tighter compression (500 items max per list)
+    if (signedIn) {
+      // For signed-in accounts, the server is the primary storage and has no 5MB quota.
+      // _memoryCustomListsObj MUST remain leanMap (with all items intact) so account sync pushes everything.
+      // We only attempt to write a smaller 500-item cache to localStorage as a best-effort offline fallback.
+      try {
+        const cacheMap = compactCustomListMap(map, 500);
+        const cacheStr = JSON.stringify(cacheMap);
+        try { sessionStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, cacheStr); } catch (err) {}
+        localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, cacheStr);
+      } catch (cacheErr) {
+        console.warn('saveLocalCustomListsMap: localStorage quota exceeded for signed-in user:', cacheErr.message || cacheErr);
+        window._localStorageFull = true;
+      }
+      try { if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ force: true }); } catch (err) {}
+      try { if (typeof pushCreatorSync === 'function') pushCreatorSync(); } catch (err) {}
+      notifyStorageFull(true);
+      return true;
+    }
+
+    // If quota exceeded and NOT signed in, try a tighter compression (500 items max per list)
     try {
       const ultraLeanMap = compactCustomListMap(map, 500);
       if (_lastCompactionTrimmed.length) {
@@ -40593,12 +45206,6 @@ function saveLocalCustomListsMap(map) {
       // failure, and the caller (and the person) get told.
       console.warn('saveLocalCustomListsMap: localStorage quota exceeded:', retryErr.message || retryErr);
       window._localStorageFull = true;
-      if (typeof activeCreator !== 'undefined' && activeCreator) {
-        try { if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ force: true }); } catch (e) {}
-        try { if (typeof pushCreatorSync === 'function') pushCreatorSync(); } catch (e) {}
-        notifyStorageFull(true);
-        return true;
-      }
       notifyStorageFull(false);
       return false;
     }
@@ -42987,6 +47594,11 @@ async function loadCreatorSync(opts) {
         if (cb) cb.checked = synced.keys.hideNonDigitalReleases;
         try { localStorage.setItem('myListAddon:hideNonDigitalReleases', synced.keys.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
       }
+      if (typeof synced.keys.adultContentFilter === 'boolean') {
+        const cb = document.getElementById('adultContentFilterCheckbox');
+        if (cb) cb.checked = synced.keys.adultContentFilter;
+        try { localStorage.setItem('myListAddon:adultContentFilter', synced.keys.adultContentFilter ? '1' : '0'); } catch (e) {}
+      }
       if (typeof synced.keys.shuffleShelves === 'boolean') {
         const el = document.getElementById('shuffleShelvesCheckbox');
         if (el) el.checked = synced.keys.shuffleShelves;
@@ -43937,6 +48549,10 @@ function backfillCreatorListsIntoLocalMap(serverLists) {
       createdAt: l.createdAt || Date.now(),
       updatedAt: Date.now(),
     };
+    if (l.sourceUrl) map[l.slug].sourceUrl = l.sourceUrl;
+    if (l.synced != null) map[l.slug].synced = l.synced;
+    if (l.lastSyncedAt != null) map[l.slug].lastSyncedAt = l.lastSyncedAt;
+    if (l.baseItemIds) map[l.slug].baseItemIds = l.baseItemIds;
     restored.push(l.slug);
   });
   if (!restored.length) return 0;
@@ -44044,18 +48660,23 @@ async function uploadMissingLocalListsToAccount(lists, creatorKey) {
   try {
     for (const l of lists) {
       try {
+        const uploadBody = {
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          slug: l.creatorSlug || l.slug,
+          name: l.name || l.slug,
+          type: l.type || 'movie',
+          items: l.items || [],
+          visibility: l.visibility || 'private',
+        };
+        if (l.sourceUrl) uploadBody.sourceUrl = l.sourceUrl;
+        if (l.synced != null) uploadBody.synced = l.synced;
+        if (l.lastSyncedAt != null) uploadBody.lastSyncedAt = l.lastSyncedAt;
+        if (l.baseItemIds) uploadBody.baseItemIds = l.baseItemIds;
         const res = await fetch(ORIGIN + '/api/creator/lists/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            creatorName: activeCreator.creatorName,
-            creatorKey: creatorKey,
-            slug: l.creatorSlug || l.slug,
-            name: l.name || l.slug,
-            type: l.type || 'movie',
-            items: l.items || [],
-            visibility: l.visibility || 'private',
-          }),
+          body: JSON.stringify(uploadBody),
         });
         const data = await res.json();
         if (!data || !data.ok || !data.slug) continue;
@@ -44231,6 +48852,9 @@ async function renderCreatorDashboard(options) {
             p = 'https://images.metahub.space/poster/medium/' + sId + '/img';
           }
         }
+        if (typeof resolveClientPoster === 'function') {
+          return resolveClientPoster(it, p || '');
+        }
         return p || '';
       };
       const allPosters = (l.items || []).slice(0, 9).filter((it) => it && resolveItemPoster(it));
@@ -44266,6 +48890,10 @@ async function renderCreatorDashboard(options) {
         '</div>';
       }).join('');
       const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, l.type, l.slug) : false;
+      const isSynced = !!(l.synced && l.sourceUrl);
+      const syncBtnHtml = isSynced
+        ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
+        : '';
       return '<div class="list-card creator-list-row" draggable="true" data-slug="' + escapeAttr(l.slug) + '">' +
         '<div class="list-card-header">' +
           '<div class="list-card-body creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' +
@@ -44279,11 +48907,13 @@ async function renderCreatorDashboard(options) {
               '<span>' + (l.type === 'series' ? 'Shows' : (l.type === 'mixed' ? 'Mixed' : 'Movies')) + '</span>' +
               '<span class="list-card-meta-sep">&middot;</span>' +
               '<span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
+              (isSynced ? ('<span class="list-card-meta-sep">&middot;</span><span>Synced</span>') : '') +
               '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
             '</div>' +
           '</div>' +
           '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary creatorListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
+            syncBtnHtml +
             deleteBtnHtml +
             shareBtn +
             '<button type="button" class="lc-btn ' + (isAdded ? 'secondary creatorListAddToConfigBtn is-added' : 'primary creatorListAddToConfigBtn') + '" ' +
@@ -44360,14 +48990,23 @@ async function renderCreatorDashboard(options) {
 
     const visibleDashboardLists = (typeof isListHidden === 'function') ? allDashboardLists.filter((item) => !isListHidden(item.list && item.list.slug)) : allDashboardLists;
 
+    const localOrder = readDashboardListOrder();
     let savedOrder = [];
     if (Array.isArray(data.order) && data.order.length) {
-      savedOrder = data.order;
+      if (localOrder.length) {
+        const serverSlugs = new Set(data.order);
+        savedOrder = localOrder.filter((s) => serverSlugs.has(s) || ['continue-watching', 'watch-history', 'watchlist', 'airing-next'].includes(s));
+        data.order.forEach((s) => {
+          if (!savedOrder.includes(s)) savedOrder.push(s);
+        });
+      } else {
+        savedOrder = data.order;
+      }
       try {
         localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(savedOrder));
       } catch (e) {}
     } else {
-      savedOrder = readDashboardListOrder();
+      savedOrder = localOrder;
     }
     if (savedOrder.length) {
       const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
@@ -44394,6 +49033,11 @@ async function renderCreatorDashboard(options) {
     if (prevScrollTop) box.scrollTop = prevScrollTop;
     document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
     if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+
+    // Auto-sync check for lists linked to external URLs if >24 hours stale
+    try {
+      checkAndAutoSyncExternalLists(visibleDashboardLists);
+    } catch (e) {}
   } catch (e) {
     console.error('renderCreatorDashboard error:', e);
     if (!hasExistingContent) {
@@ -44401,6 +49045,39 @@ async function renderCreatorDashboard(options) {
     }
   }
 }
+
+let _autoSyncRunning = false;
+async function checkAndAutoSyncExternalLists(dashboardItems) {
+  if (_autoSyncRunning || !Array.isArray(dashboardItems) || !dashboardItems.length) return;
+  if (typeof syncCustomListWithExternalSource !== 'function') return;
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const staleSlugs = [];
+
+  dashboardItems.forEach((it) => {
+    const l = it && it.list;
+    if (!l || !l.slug || !l.synced || !l.sourceUrl) return;
+    const lastSync = Number(l.lastSyncedAt) || 0;
+    if (now - lastSync > ONE_DAY_MS) {
+      staleSlugs.push(l.slug);
+    }
+  });
+
+  if (!staleSlugs.length) return;
+  _autoSyncRunning = true;
+  try {
+    for (const slug of staleSlugs) {
+      try {
+        await syncCustomListWithExternalSource(slug, null, { silent: true });
+      } catch (e) {
+        console.warn('Auto-sync failed for ' + slug, e);
+      }
+    }
+  } finally {
+    _autoSyncRunning = false;
+  }
+}
+window.checkAndAutoSyncExternalLists = checkAndAutoSyncExternalLists;
 
 function formatWatchItemLabel(it) {
   if (!it) return { title: '', subtitle: '' };
@@ -44422,10 +49099,14 @@ function buildLocalListCardHtml(l) {
   const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && String(l.name).toLowerCase() === 'watchlist');
   const liveMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : null;
   const liveEntry = (liveMap && l.slug) ? liveMap[l.slug] : null;
-  if (liveEntry && Array.isArray(liveEntry.items)) {
-    l.items = liveEntry.items;
+  if (liveEntry) {
+    if (Array.isArray(liveEntry.items)) l.items = liveEntry.items;
     if (liveEntry.visibility) l.visibility = liveEntry.visibility;
     if (liveEntry.type && !l.type) l.type = liveEntry.type;
+    if (liveEntry.sourceUrl) l.sourceUrl = liveEntry.sourceUrl;
+    if (liveEntry.synced != null) l.synced = liveEntry.synced;
+    if (liveEntry.lastSyncedAt != null) l.lastSyncedAt = liveEntry.lastSyncedAt;
+    if (liveEntry.baseItemIds) l.baseItemIds = liveEntry.baseItemIds;
   }
   const resolveItemPoster = (it) => {
     if (!it) return '';
@@ -44436,6 +49117,9 @@ function buildLocalListCardHtml(l) {
       if (sId && String(sId).startsWith('tt')) {
         p = 'https://images.metahub.space/poster/medium/' + sId + '/img';
       }
+    }
+    if (typeof resolveClientPoster === 'function') {
+      return resolveClientPoster(it, p || '');
     }
     return p || '';
   };
@@ -44457,8 +49141,9 @@ function buildLocalListCardHtml(l) {
     const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
     const label = formatWatchItemLabel(it);
     let removeBtn = '';
-    if (l.slug === 'continue-watching' && it.showId) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(it.showId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+    const cwRemoveId = it.showId || it.imdbId || it.id;
+    if (l.slug === 'continue-watching' && cwRemoveId) {
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
     } else if (isWatchlist) {
       removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
     } else if (l.slug === 'watch-history') {
@@ -44490,20 +49175,26 @@ function buildLocalListCardHtml(l) {
       if (aTitle && itTitle && aTitle === itTitle) return true;
       return false;
     });
-    const itSeason = it.seasonNum != null ? it.seasonNum : (airingMatch ? airingMatch.seasonNum : null);
-    const itEpisode = it.episodeNum != null ? it.episodeNum : (airingMatch ? airingMatch.episodeNum : null);
+    const effectiveSeasonNum = it.seasonNum != null ? it.seasonNum : (it.season != null ? it.season : null);
+    const effectiveEpisodeNum = it.episodeNum != null ? it.episodeNum : (it.episode != null ? it.episode : null);
+
+    const itSeason = effectiveSeasonNum != null ? effectiveSeasonNum : (!isCwList && airingMatch ? airingMatch.seasonNum : null);
+    const itEpisode = effectiveEpisodeNum != null ? effectiveEpisodeNum : (!isCwList && airingMatch ? airingMatch.episodeNum : null);
     
     // Check if this show is on an older past season (not the newest season)
-    const isOlderSeason = isCwList && !!(airingMatch && airingMatch.seasonNum != null && it.seasonNum != null && it.seasonNum < airingMatch.seasonNum);
+    const isOlderSeason = isCwList && !!(airingMatch && airingMatch.seasonNum != null && effectiveSeasonNum != null && effectiveSeasonNum < airingMatch.seasonNum);
 
     let dateBadge = '';
     let bottomBadge = '';
 
     if (showLocationBadges && !isOlderSeason) {
-      const isSameEpisode = !!(airingMatch && (!itSeason || !airingMatch.seasonNum || itSeason === airingMatch.seasonNum) && (!itEpisode || !airingMatch.episodeNum || itEpisode === airingMatch.episodeNum));
+      const isSameSeason = !!(airingMatch && (!itSeason || !airingMatch.seasonNum || itSeason === airingMatch.seasonNum));
+      const isSameEpisode = isSameSeason && (!itEpisode || !airingMatch.episodeNum || itEpisode === airingMatch.episodeNum);
       const effectiveAirDate = it.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
-      const hasAired = effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false;
-      const isUnairedEp = effectiveAirDate ? !hasAired : !!(it.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired));
+      const currentEpNum = itEpisode != null ? itEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
+      const hasLaterAiringEp = !!(isSameSeason && airingMatch && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
+      const hasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false);
+      const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(it.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
 
       if (showAirDate && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
         const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
@@ -44512,17 +49203,19 @@ function buildLocalListCardHtml(l) {
         }
       }
 
-      const currentEpNum = itEpisode != null ? itEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
       const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (it.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
       const isSeasonFinale = !!(it.isSeasonFinale || (isSameEpisode && airingMatch && airingMatch.isSeasonFinale) || (airingMatch && airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
       const seasonFinaleAirDate = it.seasonFinaleAirDate || (airingMatch ? (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : null)) : null);
       const isFinaleUnaired = seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(seasonFinaleAirDate) : !!seasonFinaleAirDate;
 
-      if (showPremiere && isSeasonPremiere && isUnairedEp) {
+      if (it.isCompanion) {
+        const compLabel = it.companionType === 'bridge_movie' ? 'Bridge Movie' : (it.companionType === 'sequel_movie' ? 'Sequel Film' : 'Storyline');
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-companion" title="' + escapeAttr(it.companionNote || it.companionStoryline || 'Next in Storyline') + '">' + escapeHtml(compLabel) + '</div>';
+      } else if (showPremiere && isSeasonPremiere && isUnairedEp) {
         bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(effectiveAirDate || '') + '">Season Premiere</div>';
       } else if (showFinale && isSeasonFinale) {
         bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(effectiveAirDate || seasonFinaleAirDate || '') + '">Season Finale</div>';
-      } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!currentEpNum || currentEpNum >= 2)) {
+      } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!isSeasonPremiere || !isUnairedEp || currentEpNum >= 2)) {
         const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(seasonFinaleAirDate) : '';
         if (finaleText) {
           bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
@@ -44583,6 +49276,11 @@ function buildLocalListCardHtml(l) {
     ? ''
     : '<button type="button" class="lc-btn secondary localListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>';
 
+  const isSynced = !isAutoTracked && !!(l.synced && l.sourceUrl);
+  const syncBtnHtml = isSynced
+    ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
+    : '';
+
   return '<div class="' + cardClass + '" draggable="true" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
     '<div class="list-card-header">' +
       '<div class="list-card-body localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type || 'movie') + '" style="cursor:pointer;">' +
@@ -44595,6 +49293,7 @@ function buildLocalListCardHtml(l) {
           '<span>' + typeLabel + '</span>' +
           '<span class="list-card-meta-sep">&middot;</span>' +
           '<span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
+          (isSynced ? ('<span class="list-card-meta-sep">&middot;</span><span>Synced</span>') : '') +
           (!isAutoTracked && l.slug !== 'watchlist' ? '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' : '') +
         '</div>' +
       '</div>' +
@@ -44605,6 +49304,7 @@ function buildLocalListCardHtml(l) {
           '</div>'
         : '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary localListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
+            syncBtnHtml +
             deleteBtnHtml +
             shareBtn +
             addBtnHtml +
@@ -44802,7 +49502,9 @@ if (_creatorDashEl) {
         type: itemType,
         name: label.title || it.title || it.name || 'Untitled',
         subtitle: label.subtitle || '',
-        poster: showPoster,
+        poster: typeof resolveClientPoster === 'function' ? resolveClientPoster(it, showPoster) : showPoster,
+        isAdult: typeof isAdultOrNsfw === 'function' ? isAdultOrNsfw(it) : !!it.adult,
+        isAdultPosterFiltered: typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled() && (it.isAdult || (typeof isAdultOrNsfw === 'function' && isAdultOrNsfw(it))),
         year: it.year,
         airDate: it.airDate,
         isUnaired: it.isUnaired,
@@ -44885,6 +49587,14 @@ if (_creatorDashEl) {
         }
       }
     }, true);
+    return;
+  }
+  const syncBtn = e.target.closest('.customListSyncBtn');
+  if (syncBtn) {
+    const slug = syncBtn.dataset.slug;
+    if (slug && typeof syncCustomListWithExternalSource === 'function') {
+      syncCustomListWithExternalSource(slug, syncBtn);
+    }
     return;
   }
   const editBtn = e.target.closest('.creatorListEditBtn');
@@ -45216,9 +49926,13 @@ async function persistCreatorListOrderFromDom() {
   const container = document.getElementById('creatorListRows');
   if (!container) return;
   const order = [...container.querySelectorAll('.creator-list-row')].map((row) => row.dataset.slug).filter(Boolean);
+  if (!order.length) return;
   try {
     localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(order));
   } catch (e) {}
+  if (typeof resetCreatorListsCache === 'function') {
+    resetCreatorListsCache();
+  }
   if (activeCreator) {
     const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     try {
@@ -45286,6 +50000,14 @@ document.addEventListener('dragover', (e) => {
   const afterEl = getCreatorListDragAfterElement(container, e.clientY);
   if (afterEl == null) container.appendChild(creatorListDragRow);
   else if (afterEl !== creatorListDragRow) container.insertBefore(creatorListDragRow, afterEl);
+});
+
+document.addEventListener('drop', (e) => {
+  if (!creatorListDragRow) return;
+  e.preventDefault();
+  if (creatorListDragRow) creatorListDragRow.classList.remove('dragging');
+  creatorListDragRow = null;
+  persistCreatorListOrderFromDom();
 });
 
 // Editing a row's name/url/type or toggling its checkbox doesn't go through
@@ -45753,6 +50475,10 @@ async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
       items: target.items,
       visibility: target.visibility || 'private',
     };
+    if (target.sourceUrl) body.sourceUrl = target.sourceUrl;
+    if (target.synced != null) body.synced = target.synced;
+    if (target.lastSyncedAt != null) body.lastSyncedAt = target.lastSyncedAt;
+    if (target.baseItemIds) body.baseItemIds = target.baseItemIds;
     // Only cite a baseline the server actually gave us. A legacy record has
     // no updatedAt, and inventing one (0, Date.now()) would either reject
     // every save or assert a version this browser never saw.
@@ -46510,6 +51236,7 @@ async function testSourceRow(btn) {
     if (keys.simklKey) body.simklKey = keys.simklKey;
     if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
     if (keys.creatorName) body.creatorName = keys.creatorName;
+    if (keys.adultContentFilter || (typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled())) body.adultContentFilter = true;
     const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -46559,6 +51286,7 @@ function buildConfig(entries, keys) {
   if (keys && keys.shuffleItems) payload.shuffleItems = true;
   if (keys && keys.region && keys.region !== 'US') payload.region = keys.region;
   if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
+  if (keys && keys.adultContentFilter) payload.adultContentFilter = true;
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -46736,6 +51464,7 @@ function collectKeys() {
       try { return localStorage.getItem('myListAddon:region') || 'US'; } catch (e) { return 'US'; }
     })(),
     hideNonDigitalReleases: document.getElementById('hideNonDigitalReleasesCheckbox') ? document.getElementById('hideNonDigitalReleasesCheckbox').checked : false,
+    adultContentFilter: typeof isAdultContentFilterEnabled === 'function' ? isAdultContentFilterEnabled() : (localStorage.getItem('myListAddon:adultContentFilter') === '1'),
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
@@ -46825,6 +51554,10 @@ function initBadgeSettingsUI() {
       el.checked = getBadgeSetting(key);
     }
   });
+  const compEl = document.getElementById('autoRecommendCompanionsCheckbox');
+  if (compEl && typeof getCompanionRecommendationSetting === 'function') {
+    compEl.checked = getCompanionRecommendationSetting();
+  }
   applyBadgeBodyClasses();
 }
 window.initBadgeSettingsUI = initBadgeSettingsUI;
@@ -46938,6 +51671,7 @@ async function renderLivePreview() {
         if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
         if (keys.creatorName) body.creatorName = keys.creatorName;
         if (keys.hideNonDigitalReleases) body.hideNonDigitalReleases = true;
+        if (keys.adultContentFilter) body.adultContentFilter = true;
         const res = await fetch(ORIGIN + '/api/preview', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -47279,25 +52013,15 @@ function appendPosterGridItems(gridEl, items) {
 window.appendPosterGridItems = appendPosterGridItems;
 
 function livePreviewPosterHtml(m) {
+  if (typeof resolveClientPoster === 'function') {
+    m.poster = resolveClientPoster(m, m.poster);
+  }
   const landscape = m.posterShape === 'landscape';
   const posterClass = 'live-preview-poster' + (landscape ? ' landscape' : '');
   const posterEl = m.poster
     ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)" data-imdb="' + escapeAttr(m.id || '') + '"><div class="' + posterClass + ' live-preview-poster-placeholder" style="display:none;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>'
     : '<div class="' + posterClass + ' live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
   
-  let removeBtn = '';
-  if (m.removeShowId) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="cw" data-remove-id="' + escapeAttr(m.removeShowId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Continue Watching">&times;</button>';
-  } else if (m.removeWatchlistId) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="watchlist" data-remove-id="' + escapeAttr(m.removeWatchlistId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watchlist">&times;</button>';
-  } else if (m.removeHistoryId) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="history" data-remove-id="' + escapeAttr(m.removeHistoryId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watch History">&times;</button>';
-  } else if (m.removeCustomListSlug) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="custom" data-remove-id="' + escapeAttr(m.id) + '" data-remove-slug="' + escapeAttr(m.removeCustomListSlug) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from List">&times;</button>';
-  } else if (m.removeExternalProvider) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '">&times;</button>';
-  }
-
   const parentUrl = (m.listUrl || (window._currentListDetailsParams ? window._currentListDetailsParams.listUrl : '') || '').toLowerCase();
   const parentName = (m.listName || (window._currentListDetailsParams ? window._currentListDetailsParams.name : '') || '').toLowerCase();
 
@@ -47314,6 +52038,20 @@ function livePreviewPosterHtml(m) {
 
   const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext);
   const isAiringItem = !!(m.isAiringNext || m.listSlug === 'airing-next' || isAiringListContext);
+
+  let removeBtn = '';
+  const cwRemoveTarget = m.removeShowId || (isCwItem ? (m.showId || m.id || m.imdbId) : null);
+  if (cwRemoveTarget) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="cw" data-remove-id="' + escapeAttr(cwRemoveTarget) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Continue Watching">&times;</button>';
+  } else if (m.removeWatchlistId) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="watchlist" data-remove-id="' + escapeAttr(m.removeWatchlistId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watchlist">&times;</button>';
+  } else if (m.removeHistoryId) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="history" data-remove-id="' + escapeAttr(m.removeHistoryId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watch History">&times;</button>';
+  } else if (m.removeCustomListSlug) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="custom" data-remove-id="' + escapeAttr(m.id) + '" data-remove-slug="' + escapeAttr(m.removeCustomListSlug) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from List">&times;</button>';
+  } else if (m.removeExternalProvider) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '">&times;</button>';
+  }
   
   const badgeSettings = getPosterBadgeSettings();
   const locationAllowed = isCwItem
@@ -47329,21 +52067,31 @@ function livePreviewPosterHtml(m) {
   if (isCwItem || isAiringItem) {
     airingMatch = findAiringMatchFor(m);
   }
-  
-  const mSeason = m.seasonNum != null ? m.seasonNum : (airingMatch ? airingMatch.seasonNum : null);
-  const mEpisode = m.episodeNum != null ? m.episodeNum : (airingMatch ? airingMatch.episodeNum : null);
+
+  const localCwItem = (isCwItem && typeof loadLocalCustomLists === 'function')
+    ? (((loadLocalCustomLists()['continue-watching'] || {}).items || []).find(it => it && (it.showId === m.id || it.id === m.id || (m.showId && (it.showId === m.showId || it.id === m.showId)))))
+    : null;
+
+  const effectiveSeasonNum = m.seasonNum != null ? m.seasonNum : (m.season != null ? m.season : (localCwItem && localCwItem.seasonNum != null ? localCwItem.seasonNum : null));
+  const effectiveEpisodeNum = m.episodeNum != null ? m.episodeNum : (m.episode != null ? m.episode : (localCwItem && localCwItem.episodeNum != null ? localCwItem.episodeNum : null));
+
+  const mSeason = effectiveSeasonNum != null ? effectiveSeasonNum : (!isCwItem && airingMatch ? airingMatch.seasonNum : null);
+  const mEpisode = effectiveEpisodeNum != null ? effectiveEpisodeNum : (!isCwItem && airingMatch ? airingMatch.episodeNum : null);
   
   // Check if this show is on an older past season (not the newest season)
-  const isOlderSeason = isCwItem && !!(airingMatch && airingMatch.seasonNum != null && m.seasonNum != null && m.seasonNum < airingMatch.seasonNum);
+  const isOlderSeason = isCwItem && !!(airingMatch && airingMatch.seasonNum != null && effectiveSeasonNum != null && effectiveSeasonNum < airingMatch.seasonNum);
 
   let dateBadge = '';
   let bottomBadge = '';
 
   if (locationAllowed && !isOlderSeason) {
-    const isSameEpisode = !!(airingMatch && (!mSeason || !airingMatch.seasonNum || mSeason === airingMatch.seasonNum) && (!mEpisode || !airingMatch.episodeNum || mEpisode === airingMatch.episodeNum));
+    const isSameSeason = !!(airingMatch && (!mSeason || !airingMatch.seasonNum || mSeason === airingMatch.seasonNum));
+    const isSameEpisode = isSameSeason && (!mEpisode || !airingMatch.episodeNum || mEpisode === airingMatch.episodeNum);
     const effectiveAirDate = m.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
-    const hasAired = effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false;
-    const isUnairedEp = effectiveAirDate ? !hasAired : !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired));
+    const currentEpNum = mEpisode != null ? mEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
+    const hasLaterAiringEp = !!(isSameSeason && airingMatch && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
+    const hasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false);
+    const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
 
     if (showAirDate && !m.hideDateBadge && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
       const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
@@ -47352,17 +52100,21 @@ function livePreviewPosterHtml(m) {
       }
     }
 
-    const currentEpNum = mEpisode != null ? mEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
     const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (m.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
     const isSeasonFinale = !!(m.isSeasonFinale || (isSameEpisode && airingMatch && airingMatch.isSeasonFinale) || (airingMatch && airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
     const seasonFinaleAirDate = m.seasonFinaleAirDate || (airingMatch ? (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : null)) : null);
     const isFinaleUnaired = seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(seasonFinaleAirDate) : !!seasonFinaleAirDate;
 
-    if (showPremiere && isSeasonPremiere && isUnairedEp) {
+    if (m.isCompanion || (localCwItem && localCwItem.isCompanion)) {
+      const compType = m.companionType || (localCwItem && localCwItem.companionType);
+      const compNote = m.companionNote || (localCwItem && localCwItem.companionNote) || 'Next in Storyline';
+      const compLabel = compType === 'bridge_movie' ? 'Bridge Movie' : (compType === 'sequel_movie' ? 'Sequel Film' : 'Storyline');
+      bottomBadge = '<div class="cw-date-badge cw-date-badge-companion" title="' + escapeAttr(compNote) + '">' + escapeHtml(compLabel) + '</div>';
+    } else if (showPremiere && isSeasonPremiere && isUnairedEp) {
       bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(effectiveAirDate || '') + '">Season Premiere</div>';
     } else if (showFinale && isSeasonFinale) {
       bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(effectiveAirDate || seasonFinaleAirDate || '') + '">Season Finale</div>';
-    } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!currentEpNum || currentEpNum >= 2)) {
+    } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!isSeasonPremiere || !isUnairedEp || currentEpNum >= 2)) {
       const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(seasonFinaleAirDate) : '';
       if (finaleText) {
         bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
@@ -48802,10 +53554,14 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       if (keys.mdblistKey) body.mdblistKey = keys.mdblistKey;
       if (keys.mdblistAccessToken) body.mdblistAccessToken = keys.mdblistAccessToken;
       if (keys.traktKey) body.traktKey = keys.traktKey;
-      if (keys.traktAccessToken) body.traktAccessToken = keys.traktAccessToken;
+      if (keys.traktAccessToken) {
+        const isOwnList = !listUrl || listUrl.startsWith('trakt:') || (traktUser && listUrl.toLowerCase().includes('/users/' + traktUser.toLowerCase() + '/'));
+        if (isOwnList) body.traktAccessToken = keys.traktAccessToken;
+      }
       if (keys.simklKey) body.simklKey = keys.simklKey;
       if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
       if (creatorName) body.creatorName = creatorName;
+      if (keys.adultContentFilter || (typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled())) body.adultContentFilter = true;
       const res = await fetch(ORIGIN + '/api/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -49045,6 +53801,7 @@ function buildFullBackupPayload() {
       scrobbleAllowedUsers: localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '',
       scrobbleBlockAnonymous: localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1',
       hideNonDigitalReleases: localStorage.getItem('myListAddon:hideNonDigitalReleases') === '1',
+      adultContentFilter: localStorage.getItem('myListAddon:adultContentFilter') === '1',
       region: localStorage.getItem('myListAddon:region') || '',
       dashboardListOrder: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]'); } catch(e) { return []; } })(),
       hiddenLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch(e) { return []; } })(),
@@ -49462,6 +54219,11 @@ function applyImportedConfig(data) {
     const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
     if (cb) cb.checked = s.hideNonDigitalReleases;
     try { localStorage.setItem('myListAddon:hideNonDigitalReleases', s.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+  }
+  if (typeof s.adultContentFilter === 'boolean') {
+    const cb = document.getElementById('adultContentFilterCheckbox');
+    if (cb) cb.checked = s.adultContentFilter;
+    try { localStorage.setItem('myListAddon:adultContentFilter', s.adultContentFilter ? '1' : '0'); } catch (e) {}
   }
   if (typeof s.region === 'string' && s.region) {
     const el = document.getElementById('regionSelect');
@@ -50856,6 +55618,7 @@ function computeConfigStateHash() {
         simklUsername: keys.simklUsername,
         region: keys.region,
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
+        adultContentFilter: keys.adultContentFilter,
         shuffleShelves: keys.shuffleShelves,
         shuffleItems: keys.shuffleItems,
         track: !!keys.track,
@@ -50974,6 +55737,7 @@ async function generate() {
   // Worker has no CONFIGS KV namespace bound, fall back to the old
   // self-contained base64 link.
   let config = null;
+  let saveErrorMessage = null;
   try {
     const res = await fetch(ORIGIN + '/api/save', {
       method: 'POST',
@@ -50996,12 +55760,18 @@ async function generate() {
         shuffleItems: keys.shuffleItems,
         region: keys.region,
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
+        adultContentFilter: keys.adultContentFilter,
       }),
     });
     const data = await res.json();
-    if (data.ok) config = data.id;
+    if (data.ok) {
+      config = data.id;
+    } else {
+      saveErrorMessage = data.error || 'Server error';
+    }
   } catch (e) {
     // network error — fall through to the client-side link below
+    saveErrorMessage = 'Network error';
   }
 
   let sizeWarning = '';
@@ -51011,7 +55781,12 @@ async function generate() {
     // episodes can make the encoded config huge even with just one or two
     // rows total, so this checks the actual encoded length instead.
     if (config.length > 4000) {
-      sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including Wako. If you\\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
+      if (saveErrorMessage && saveErrorMessage !== 'no-kv') {
+        const errTxt = (typeof escapeHtml === 'function') ? escapeHtml(saveErrorMessage) : saveErrorMessage;
+        sizeWarning = '<p class="testresult err">\u26a0 Cloud storage save failed (' + errTxt + '). This fallback link encodes everything directly into the URL, so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including Wako.</p>';
+      } else {
+        sizeWarning = '<p class="testresult err">\u26a0 This link encodes everything directly into the URL (no server-side storage is set up on this Worker), so it\\\'s long and may fail to install in apps with URL-length limits \u2014 including Wako. If you\\\'re the Worker owner, binding a KV namespace named "CONFIGS" fixes this by giving links a short id instead.</p>';
+      }
     }
   }
 
@@ -51136,6 +55911,13 @@ if (serverEntries.length && !serverEntriesAreDefaults) {
     const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
     if (cb) cb.checked = savedHideNonDigital === '1';
   }
+  const savedAdultFilter = (function() {
+    try { return localStorage.getItem('myListAddon:adultContentFilter'); } catch (e) { return null; }
+  })();
+  if (savedAdultFilter !== null) {
+    const cb = document.getElementById('adultContentFilterCheckbox');
+    if (cb) cb.checked = savedAdultFilter === '1';
+  }
 } else {
   // Fresh visit to the plain builder page — restore whatever was left off
   // last time, if anything was saved. Falls through to the server's
@@ -51157,6 +55939,14 @@ if (serverEntries.length && !serverEntriesAreDefaults) {
   }
   if (saved && saved.keys && document.getElementById('hideNonDigitalReleasesCheckbox')) {
     document.getElementById('hideNonDigitalReleasesCheckbox').checked = !!saved.keys.hideNonDigitalReleases;
+  }
+  const savedAdultFilterDirect = (function() {
+    try { return localStorage.getItem('myListAddon:adultContentFilter'); } catch (e) { return null; }
+  })();
+  if (savedAdultFilterDirect !== null && document.getElementById('adultContentFilterCheckbox')) {
+    document.getElementById('adultContentFilterCheckbox').checked = savedAdultFilterDirect === '1';
+  } else if (saved && saved.keys && document.getElementById('adultContentFilterCheckbox')) {
+    document.getElementById('adultContentFilterCheckbox').checked = !!saved.keys.adultContentFilter;
   }
   const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
   const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
@@ -52604,6 +57394,7 @@ function isAllowedPosterUrl(raw) {
     return false;
   }
   if (u.protocol !== "https:") return false;
+  if (u.pathname.startsWith("/api/safe-poster")) return true;
   return POSTER_IMAGE_HOSTS.has(u.hostname.toLowerCase());
 }
 
@@ -52793,6 +57584,22 @@ async function handleFetch(request, env, ctx) {
       });
     }
 
+    // /api/safe-poster -> Dynamic age-appropriate vector SVG poster for Adult Content Filter
+    if (path === "/api/safe-poster") {
+      const title = url.searchParams.get("title") || "Untitled";
+      const year = url.searchParams.get("year") || "";
+      const type = url.searchParams.get("type") || "movie";
+      const cert = url.searchParams.get("cert") || "AGE-FILTERED";
+      const svg = generateSafePosterSvg({ title, year, type, certification: cert });
+      return new Response(svg, {
+        headers: {
+          "Content-Type": "image/svg+xml; charset=utf-8",
+          "Cache-Control": "public, max-age=86400",
+          ...corsHeaders(),
+        },
+      });
+    }
+
     // /api/poster-badge -> Dynamic badged SVG poster for Stremio / Nuvio
     if (path === "/api/poster-badge") {
       const posterUrl = url.searchParams.get("poster") || "";
@@ -52804,6 +57611,7 @@ async function handleFetch(request, env, ctx) {
       const rawFinaleDate = url.searchParams.get("finaleDate") || "";
       const isFinaleAired = rawFinaleDate && typeof isEpisodeAired === "function" && isEpisodeAired(rawFinaleDate);
       const finaleDate = !isFinaleAired ? rawFinaleDate : "";
+      const companion = url.searchParams.get("companion") || "";
 
       if (!posterUrl || !isAllowedPosterUrl(posterUrl)) {
         // Missing entirely, or not one of the image hosts this add-on
@@ -52819,7 +57627,7 @@ async function handleFetch(request, env, ctx) {
       }
 
       // If no badges are requested or all dates have aired, redirect straight to the original poster
-      if (!airDate && !isPremiere && !isFinale && !finaleDate) {
+      if (!airDate && !isPremiere && !isFinale && !finaleDate && !companion) {
         return Response.redirect(posterUrl, 302);
       }
 
@@ -52869,7 +57677,12 @@ async function handleFetch(request, env, ctx) {
       let bottomBorder = "rgba(48, 209, 88, 0.4)";
       let bottomColor = "#ffffff";
 
-      if (isPremiere) {
+      if (companion) {
+        bottomText = companion;
+        bottomBg = "rgba(37, 99, 235, 0.95)";
+        bottomBorder = "rgba(37, 99, 235, 0.8)";
+        bottomColor = "#ffffff";
+      } else if (isPremiere) {
         bottomText = "Season Premiere";
         bottomBg = "#28a745";
         bottomBorder = "rgba(40, 167, 69, 0.6)";
@@ -52922,7 +57735,7 @@ async function handleFetch(request, env, ctx) {
     let m = path.match(/^\/([^/]+)\/configure$/);
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases } = await resolveConfig(m[1], env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter } = await resolveConfig(m[1], env);
       // The one page that still sends no-store (it renders the person's own
       // API keys -- see the note on the headers below), but it should not
       // also be re-sending the 1.3MB client bundle every time. The split
@@ -52932,7 +57745,7 @@ async function handleFetch(request, env, ctx) {
       return new Response(
         await pageWithExternalBundle(renderBuilder(url.origin, {
           initialEntries: entries,
-          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases },
+          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter },
           isConfigureMode: true,
         })),
         // The one builder page that deliberately keeps no-store rather than
@@ -53327,7 +58140,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, adultContentFilter, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
@@ -53345,7 +58158,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const staleKey = env && env.CONFIGS && !isAutoTrack && !isUserPersonal ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
@@ -53452,7 +58265,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // callers with a normal-sized url (a plain mdblist/trakt/tmdb list
     // link is never going to hit that limit).
     if (path === "/api/preview") {
-      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName, hideNonDigitalReleases;
+      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName, hideNonDigitalReleases, adultContentFilter, region;
       if (request.method === "POST") {
         let reqBody;
         try {
@@ -53470,7 +58283,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
         simklKey = reqBody.simklKey || "";
         simklAccessToken = reqBody.simklAccessToken || "";
         creatorName = reqBody.creatorName || "";
+        region = reqBody.region || "";
         hideNonDigitalReleases = !!reqBody.hideNonDigitalReleases;
+        adultContentFilter = !!reqBody.adultContentFilter;
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(reqBody.sample, 10) || 5));
         skip = Math.max(0, parseInt(reqBody.skip, 10) || 0);
       } else {
@@ -53485,21 +58300,23 @@ Sitemap: ${url.origin}/sitemap.xml`;
         simklKey = url.searchParams.get("simklKey") || "";
         simklAccessToken = url.searchParams.get("simklAccessToken") || "";
         creatorName = url.searchParams.get("creatorName") || "";
+        region = url.searchParams.get("region") || "";
         hideNonDigitalReleases = url.searchParams.get("hideNonDigitalReleases") === "1";
+        adultContentFilter = url.searchParams.get("adultContentFilter") === "1";
         sampleSize = Math.max(1, Math.min(PAGE_SIZE, parseInt(url.searchParams.get("sample"), 10) || 5));
         skip = Math.max(0, parseInt(url.searchParams.get("skip"), 10) || 0);
       }
 
       // Unauthenticated and heavyweight: each call can fan out to TMDB /
       // Trakt / MDBList. Same IP-keyed KV slot as create/restore/feedback
-      // -- 80/minute is enough for Live Preview paging a shelf, not enough
-      // to use this as a free outbound scanner.
+      // -- 240/minute provides sufficient budget for browsing multi-card
+      // Discover shelves while protecting against automated scraping.
       const ip = clientIpKey(request);
       if (!ip) return json({ ok: false, error: "Couldn't load that list." }, 400, { "Cache-Control": "no-store" });
       if (env && env.CONFIGS) {
         const rateKey = `ratelimit:preview:${ip}`;
         const n = parseInt((await env.CONFIGS.get(rateKey)) || "0", 10) || 0;
-        if (n >= 80) {
+        if (n >= 240) {
           return json({ ok: false, error: "Couldn't load that list." }, 429, { "Cache-Control": "no-store" });
         }
         ctx.waitUntil(env.CONFIGS.put(rateKey, String(n + 1), { expirationTtl: 60 }));
@@ -53512,7 +58329,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       let body;
       try {
-        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, adultContentFilter, region, env, ctx, origin: url.origin });
         const totalItems = (typeof metas.totalItems === "number") ? metas.totalItems : (metas.length < PAGE_SIZE && skip === 0 ? metas.length : null);
         body = {
           ok: true,
@@ -53521,6 +58338,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
           maybeMore: totalItems != null ? (skip + metas.length < totalItems) : (metas.length >= PAGE_SIZE),
           sample: metas.slice(0, sampleSize).map((m) => ({
             id: m.id,
+            showId: m.showId || undefined,
             type: m.type || (m.mediatype === "show" || m.mediatype === "series" || m.mediatype === "tv" ? "series" : (m.mediatype === "episode" ? "episode" : (type === "series" ? "series" : "movie"))),
             name: m.name,
             poster: m.poster,
@@ -53529,6 +58347,16 @@ Sitemap: ${url.origin}/sitemap.xml`;
             posterShape: m.posterShape,
             season: m.season,
             episode: m.episode,
+            seasonNum: m.seasonNum != null ? m.seasonNum : (m.season != null ? m.season : undefined),
+            episodeNum: m.episodeNum != null ? m.episodeNum : (m.episode != null ? m.episode : undefined),
+            airDate: m.airDate || undefined,
+            isUnaired: m.isUnaired || undefined,
+            isSeasonPremiere: m.isSeasonPremiere || undefined,
+            isSeasonFinale: m.isSeasonFinale || undefined,
+            seasonFinaleAirDate: m.seasonFinaleAirDate || undefined,
+            seasonFinaleEpisodeNumber: m.seasonFinaleEpisodeNumber != null ? m.seasonFinaleEpisodeNumber : undefined,
+            isAdult: isAdultOrNsfw(m),
+            isAdultPosterFiltered: !!m.isAdultPosterFiltered,
           })),
         };
       } catch (err) {
@@ -53800,6 +58628,56 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: true, season: seasonData }, 200, { "Cache-Control": "max-age=60" });
       }
 
+function generateSearchVariations(query) {
+  if (!query || typeof query !== "string") return [];
+  const variations = new Set();
+  const trimmed = query.trim();
+
+  // 1. Common missing-space words / compound nouns
+  const compounds = [
+    [/\bpickup\b/gi, "pick up"],
+    [/\bpick up\b/gi, "pickup"],
+    [/\bstandby\b/gi, "stand by"],
+    [/\bspiderman\b/gi, "spider-man"],
+    [/\bironman\b/gi, "iron man"],
+    [/\bstarwars\b/gi, "star wars"],
+    [/\bstartrek\b/gi, "star trek"],
+    [/\bbreakingbad\b/gi, "breaking bad"],
+    [/\bgameofthrones\b/gi, "game of thrones"],
+    [/\blordoftherings\b/gi, "lord of the rings"],
+    [/\bxmen\b/gi, "x-men"],
+    [/\bantman\b/gi, "ant-man"],
+    [/\btopgun\b/gi, "top gun"],
+    [/\bdeadpool\b/gi, "dead pool"],
+    [/\bfallout\b/gi, "fall out"],
+    [/\bpayback\b/gi, "pay back"],
+    [/\bstepup\b/gi, "step up"],
+    [/\bhangover\b/gi, "hang over"],
+    [/\bknockout\b/gi, "knock out"],
+    [/\bstrangerthings\b/gi, "stranger things"],
+  ];
+  for (const [re, replacement] of compounds) {
+    if (re.test(trimmed)) {
+      variations.add(trimmed.replace(re, replacement));
+    }
+  }
+
+  // 2. Glued numbers and words (e.g. "matrix4" -> "matrix 4", "ironman2" -> "ironman 2")
+  const withSpacedNumbers = trimmed.replace(/([a-zA-Z])(\d+)/g, "$1 $2").replace(/(\d+)([a-zA-Z])/g, "$1 $2");
+  if (withSpacedNumbers !== trimmed) variations.add(withSpacedNumbers);
+
+  // 3. CamelCase transitions (e.g. "SpiderMan" -> "Spider Man")
+  const withSpacedCamel = trimmed.replace(/([a-z])([A-Z])/g, "$1 $2");
+  if (withSpacedCamel !== trimmed) variations.add(withSpacedCamel);
+
+  // 4. Hyphen/colon variants
+  if (trimmed.includes("-")) variations.add(trimmed.replace(/-/g, " "));
+  if (trimmed.includes(":")) variations.add(trimmed.replace(/:/g, " "));
+
+  variations.delete(trimmed);
+  return Array.from(variations);
+}
+
     // /api/title-search?q=...&type=movie|tv
     // -> powers the "Search a show/movie" box in the Channel builder and the Search tab.
     // When no query is provided, returns the top 20 trending/popular titles for that category.
@@ -53807,6 +58685,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
     if (path === "/api/title-search") {
       const q = (url.searchParams.get("q") || "").trim();
       const kind = url.searchParams.get("type") === "movie" ? "movie" : "tv";
+      const adultFilterParam = url.searchParams.get("adultContentFilter");
+      const isAdultFilterActive = adultFilterParam === "1" || adultFilterParam === "true";
       try {
         // Always the shared key -- no per-user override for this endpoint.
         ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
@@ -53819,16 +58699,31 @@ Sitemap: ${url.origin}/sitemap.xml`;
           });
           if (!res.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${res.status}).` });
           const data = await res.json();
-          const results = (data.results || []).slice(0, 20).map((it) => ({
-            tmdbId: it.id,
-            title: it.title || it.name,
-            year: (it.release_date || it.first_air_date || "").slice(0, 4),
-            poster: it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : null,
-            backdrop: it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null,
-            rating: typeof it.vote_average === "number" ? Math.round(it.vote_average * 10) / 10 : null,
-            genreIds: Array.isArray(it.genre_ids) ? it.genre_ids : [],
-            type: kind,
-          }));
+          const results = (data.results || []).slice(0, 20).map((it) => {
+            const isAdultItem = it.adult === true || it.is_adult === true || isAdultOrNsfw(it);
+            let poster = it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : null;
+            if (isAdultFilterActive && isAdultItem) {
+              poster = getSafePosterUrl(url.origin, {
+                title: it.title || it.name,
+                year: (it.release_date || it.first_air_date || "").slice(0, 4),
+                type: kind === "tv" ? "series" : "movie",
+                certification: "ADULT",
+              });
+            }
+            return {
+              tmdbId: it.id,
+              title: it.title || it.name,
+              year: (it.release_date || it.first_air_date || "").slice(0, 4),
+              poster,
+              backdrop: it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null,
+              rating: typeof it.vote_average === "number" ? Math.round(it.vote_average * 10) / 10 : null,
+              genreIds: Array.isArray(it.genre_ids) ? it.genre_ids : [],
+              type: kind,
+              adult: isAdultItem,
+              isAdult: isAdultItem,
+              isAdultPosterFiltered: isAdultFilterActive && isAdultItem,
+            };
+          });
           return json({ ok: true, results });
         }
 
@@ -53839,7 +58734,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
         const page1Src = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
           TMDB_API_KEY
-        )}&query=${encodeURIComponent(q)}&include_adult=false&page=1`;
+        )}&query=${encodeURIComponent(q)}&include_adult=true&page=1`;
         const page1Res = await fetch(page1Src, {
           headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
           cf: { cacheTtl: 3600, cacheEverything: true },
@@ -53860,7 +58755,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
               try {
                 const pSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
                   TMDB_API_KEY
-                )}&query=${encodeURIComponent(q)}&include_adult=false&page=${p}`;
+                )}&query=${encodeURIComponent(q)}&include_adult=true&page=${p}`;
                 const pRes = await fetch(pSrc, {
                   headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                   cf: { cacheTtl: 3600, cacheEverything: true },
@@ -53878,7 +58773,117 @@ Sitemap: ${url.origin}/sitemap.xml`;
           }
         }
 
-        // Deduplicate by TMDB ID
+        // Fallback 1: Query Variations (missing spaces, glued numbers, compounds)
+        if (allRawItems.length === 0) {
+          const variations = generateSearchVariations(q);
+          for (const altQ of variations) {
+            try {
+              const altSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
+                TMDB_API_KEY
+              )}&query=${encodeURIComponent(altQ)}&include_adult=true&page=1`;
+              const altRes = await fetch(altSrc, {
+                headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+                cf: { cacheTtl: 3600, cacheEverything: true },
+              });
+              if (altRes.ok) {
+                const altData = await altRes.json();
+                if (Array.isArray(altData.results) && altData.results.length > 0) {
+                  allRawItems = altData.results;
+                  break;
+                }
+              }
+            } catch {}
+          }
+        }
+
+        // Fallback 2: Cinemeta Fuzzy Search (handles misspellings, typos, phonetic matches, missing words)
+        if (allRawItems.length === 0) {
+          try {
+            const cinemetaType = kind === "tv" ? "series" : "movie";
+            const cUrl = `https://v3-cinemeta.strem.io/catalog/${cinemetaType}/top/search=${encodeURIComponent(q)}.json`;
+            const cRes = await fetch(cUrl, {
+              headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+              cf: { cacheTtl: 86400, cacheEverything: true },
+            });
+            if (cRes.ok) {
+              const cData = await cRes.json();
+              const metas = Array.isArray(cData.metas) ? cData.metas.slice(0, 10) : [];
+              if (metas.length > 0) {
+                // A. Resolve top IMDB IDs to TMDB items via /3/find/
+                if (TMDB_API_KEY) {
+                  const foundItems = await Promise.all(
+                    metas.slice(0, 6).map(async (m) => {
+                      const imdbId = m.imdb_id || (typeof m.id === "string" && m.id.startsWith("tt") ? m.id : null);
+                      if (!imdbId) return null;
+                      try {
+                        const findUrl = `https://api.themoviedb.org/3/find/${encodeURIComponent(imdbId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&external_source=imdb_id`;
+                        const fRes = await fetch(findUrl, {
+                          headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+                          cf: { cacheTtl: 604800, cacheEverything: true },
+                        });
+                        if (!fRes.ok) return null;
+                        const fData = await fRes.json();
+                        const match = kind === "tv"
+                          ? ((fData.tv_results || [])[0] || (fData.tv_episode_results || [])[0])
+                          : ((fData.movie_results || [])[0]);
+                        return match || null;
+                      } catch {
+                        return null;
+                      }
+                    })
+                  );
+                  for (const it of foundItems) {
+                    if (it && it.id) allRawItems.push(it);
+                  }
+                }
+
+                // B. If still needed, search TMDB using Cinemeta's top match title
+                if (allRawItems.length === 0 && metas[0] && metas[0].name && TMDB_API_KEY) {
+                  const cleanTopTitle = metas[0].name.replace(/[-–—].*$/, "").trim() || metas[0].name.trim();
+                  if (cleanTopTitle && cleanTopTitle.toLowerCase() !== q.toLowerCase()) {
+                    try {
+                      const tSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
+                        TMDB_API_KEY
+                      )}&query=${encodeURIComponent(cleanTopTitle)}&include_adult=true&page=1`;
+                      const tRes = await fetch(tSrc, {
+                        headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+                        cf: { cacheTtl: 3600, cacheEverything: true },
+                      });
+                      if (tRes.ok) {
+                        const tData = await tRes.json();
+                        if (Array.isArray(tData.results) && tData.results.length > 0) {
+                          allRawItems.push(...tData.results);
+                        }
+                      }
+                    } catch {}
+                  }
+                }
+
+                // C. Fallback: map Cinemeta metas directly if TMDB didn't match
+                if (allRawItems.length === 0) {
+                  for (const m of metas) {
+                    allRawItems.push({
+                      id: m.id || m.imdb_id,
+                      title: m.name,
+                      name: m.name,
+                      release_date: m.releaseInfo || m.year || "",
+                      first_air_date: m.releaseInfo || m.year || "",
+                      poster_path: null,
+                      direct_poster: m.poster || null,
+                      backdrop_path: null,
+                      direct_backdrop: m.background || m.poster || null,
+                      vote_average: m.imdbRating ? parseFloat(m.imdbRating) : null,
+                      genre_ids: [],
+                      adult: false,
+                    });
+                  }
+                }
+              }
+            }
+          } catch {}
+        }
+
+        // Deduplicate by TMDB ID (or IMDB ID if Cinemeta fallback)
         const seenIds = new Set();
         const rawResults = [];
         for (const it of allRawItems) {
@@ -53889,8 +58894,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
         const results = await Promise.all(
           rawResults.map(async (it) => {
-            let poster = it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : null;
-            const backdrop = it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null;
+            let poster = it.poster_path ? `https://image.tmdb.org/t/p/w200${it.poster_path}` : (it.direct_poster || null);
+            const backdrop = it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : (it.direct_backdrop || poster || null);
+            const isAdultItem = it.adult === true || it.is_adult === true || isAdultOrNsfw(it);
 
             // If TMDB poster is missing, try backdrop or Cinemeta fallback
             if (!poster) {
@@ -53916,6 +58922,15 @@ Sitemap: ${url.origin}/sitemap.xml`;
               }
             }
 
+            if (isAdultFilterActive && isAdultItem) {
+              poster = getSafePosterUrl(url.origin, {
+                title: it.title || it.name,
+                year: (it.release_date || it.first_air_date || "").slice(0, 4),
+                type: kind === "tv" ? "series" : "movie",
+                certification: "ADULT",
+              });
+            }
+
             return {
               tmdbId: it.id,
               title: it.title || it.name,
@@ -53925,6 +58940,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
               rating: typeof it.vote_average === "number" ? Math.round(it.vote_average * 10) / 10 : null,
               genreIds: Array.isArray(it.genre_ids) ? it.genre_ids : [],
               type: kind,
+              adult: isAdultItem,
+              isAdult: isAdultItem,
+              isAdultPosterFiltered: isAdultFilterActive && isAdultItem,
             };
           })
         );
@@ -54053,8 +59071,8 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // Always the shared key -- 2 outbound TMDB calls per request.
         ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
         const [details, showRes] = await Promise.all([
-          fetchTmdbDetails(tmdbId, "tv", TMDB_API_KEY),
-          fetch(`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${encodeURIComponent(TMDB_API_KEY)}`, {
+          fetchTmdbDetails(tmdbId, "tv", TMDB_API_KEY, env),
+          fetch(`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=episode_groups`, {
             headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
             cf: { cacheTtl: 3600, cacheEverything: true },
           }),
@@ -54064,9 +59082,21 @@ Sitemap: ${url.origin}/sitemap.xml`;
         }
         if (!showRes.ok) return json({ ok: false, error: `TMDB show lookup failed (HTTP ${showRes.status}).` });
         const data = await showRes.json();
-        const seasons = (data.seasons || [])
+        let seasons = (data.seasons || [])
           .filter((s) => s.season_number > 0) // skip "Specials" (season 0)
           .map((s) => ({ season: s.season_number, name: s.name, episodeCount: s.episode_count }));
+        const standardEpisodeCount = seasons.reduce((sum, s) => sum + (s.episodeCount || 0), 0);
+        if (seasons.length === 1 && standardEpisodeCount > 1) {
+          const groups = (data.episode_groups && Array.isArray(data.episode_groups.results)) ? data.episode_groups.results : [];
+          const unpacked = await resolveUnpackedShowData(tmdbId, details.imdbId, data.seasons, TMDB_API_KEY, env, ctx, groups);
+          if (unpacked && Array.isArray(unpacked.seasons) && unpacked.seasons.length > 1) {
+            seasons = unpacked.seasons.map((s) => ({
+              season: s.season_number || s.season,
+              name: s.name || `Season ${s.season_number || s.season}`,
+              episodeCount: s.episode_count || s.episodeCount,
+            }));
+          }
+        }
         return json({
           ok: true,
           imdbId: details.imdbId,
@@ -54088,6 +59118,19 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const season = url.searchParams.get("season") || "";
       if (!tmdbId || !season) return json({ ok: false, error: "Missing tmdbId or season." }, 400);
       try {
+        const numericSeason = parseInt(season, 10);
+        // Check if show is unpacked
+        const unpacked = await resolveUnpackedShowData(tmdbId, null, null, TMDB_API_KEY, env, ctx);
+        if (unpacked && unpacked.episodesBySeason && unpacked.episodesBySeason[numericSeason]) {
+          const episodes = unpacked.episodesBySeason[numericSeason].map((e) => ({
+            episode: e.episode_number,
+            name: e.name,
+            released: e.air_date || null,
+            thumbnail: e.still_path || null,
+          }));
+          return json({ ok: true, episodes });
+        }
+
         // Always the shared key.
         ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const src = `https://api.themoviedb.org/3/tv/${tmdbId}/season/${encodeURIComponent(
@@ -54097,7 +59140,19 @@ Sitemap: ${url.origin}/sitemap.xml`;
           headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
           cf: { cacheTtl: 3600, cacheEverything: true },
         });
-        if (!res.ok) return json({ ok: false, error: `TMDB season lookup failed (HTTP ${res.status}).` });
+        if (!res.ok) {
+          const fallbackUnpacked = await resolveUnpackedShowData(tmdbId, null, null, TMDB_API_KEY, env, ctx);
+          if (fallbackUnpacked && fallbackUnpacked.episodesBySeason && fallbackUnpacked.episodesBySeason[numericSeason]) {
+            const episodes = fallbackUnpacked.episodesBySeason[numericSeason].map((e) => ({
+              episode: e.episode_number,
+              name: e.name,
+              released: e.air_date || null,
+              thumbnail: e.still_path || null,
+            }));
+            return json({ ok: true, episodes });
+          }
+          return json({ ok: false, error: `TMDB season lookup failed (HTTP ${res.status}).` });
+        }
         const data = await res.json();
         const episodes = (data.episodes || []).map((e) => ({
           episode: e.episode_number,
@@ -54634,6 +59689,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const q = (url.searchParams.get("q") || "").trim();
       const tmdbKeyParam = url.searchParams.get("tmdbKey") || "";
       const tmdbKey = tmdbKeyParam || TMDB_API_KEY;
+      const isAdultFilterActive = url.searchParams.get("adultContentFilter") === "1";
       if (!q || !tmdbKey) {
         return json({ ok: true, lists: [] });
       }
@@ -54645,7 +59701,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
         // 1. Search TMDB Collections
         const collRes = await fetch(
-          `https://api.themoviedb.org/3/search/collection?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(q)}`,
+          `https://api.themoviedb.org/3/search/collection?api_key=${encodeURIComponent(tmdbKey)}&query=${encodeURIComponent(q)}&include_adult=true`,
           {
             headers: { "User-Agent": "my-list-addon/1.14" },
             cf: { cacheTtl: 86400, cacheEverything: true },
@@ -54657,15 +59713,22 @@ Sitemap: ${url.origin}/sitemap.xml`;
           const collections = Array.isArray(collData.results) ? collData.results : [];
           for (const c of collections.slice(0, 15)) {
             if (!c || !c.id) continue;
+            const isCollAdult = c.adult === true || (typeof isAdultOrNsfw === "function" && isAdultOrNsfw({ name: c.name, title: c.name, franchise: c.name }));
+            const poster = isAdultFilterActive && isCollAdult
+              ? getSafePosterUrl(url.origin, { title: c.name || "Collection", type: "movie", certification: "ADULT" })
+              : (c.poster_path ? `https://image.tmdb.org/t/p/w500${c.poster_path}` : undefined);
             results.push({
               name: c.name || "Unnamed Collection",
               user: "TMDB Franchise",
               url: `https://www.themoviedb.org/collection/${c.id}`,
               type: "movie",
               items: "Franchise",
-              poster: c.poster_path ? `https://image.tmdb.org/t/p/w500${c.poster_path}` : undefined,
+              poster,
               likes: 0,
               isCollection: true,
+              adult: isCollAdult,
+              isAdult: isCollAdult,
+              isAdultPosterFiltered: isAdultFilterActive && isCollAdult,
             });
           }
         }
@@ -58401,6 +63464,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       if (body.shuffleItems) payload.shuffleItems = true;
       if (body.region && body.region !== "US") payload.region = body.region;
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
+      if (body.adultContentFilter) payload.adultContentFilter = true;
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a
@@ -58851,7 +63915,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // Fire-and-forget, not awaited -- see touchCreatorLastSeen's own
       // comment for why this is throttled and safe to never wait on.
       touchCreatorLastSeen(env, v.normalized);
-      return { ok: true, username: v.normalized, displayName: profile.displayName };
+      return { ok: true, username: profile.username || v.normalized, displayName: profile.displayName };
     }
 
     // Every failure path above returns the exact same generic message
@@ -60400,14 +65464,30 @@ Sitemap: ${url.origin}/sitemap.xml`;
           console.error("D1 order read error (/api/creator/lists):", e);
         }
       }
-      if (!d1Ordered && env.CONFIGS) {
-        const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+      if (env.CONFIGS) {
         try {
-          order = orderRaw ? JSON.parse(orderRaw).order || [] : [];
+          const orderRaw = await env.CONFIGS.get(`creatorlistorder:${auth.username}`);
+          const kvOrder = orderRaw ? JSON.parse(orderRaw).order || [] : [];
+          if (Array.isArray(kvOrder) && kvOrder.length > 0) {
+            if (d1Ordered && order.length > 0) {
+              const d1Slugs = new Set(order);
+              const merged = [];
+              kvOrder.forEach((s) => {
+                if (typeof s === "string" && (d1Slugs.has(s) || s === "continue-watching" || s === "watch-history" || s === "watchlist" || s === "airing-next")) {
+                  merged.push(s);
+                }
+              });
+              order.forEach((s) => {
+                if (!merged.includes(s)) merged.push(s);
+              });
+              order = merged;
+            } else if (!d1Ordered) {
+              order = kvOrder.filter((s) => typeof s === "string" && s);
+            }
+          }
         } catch {
-          order = [];
+          if (!d1Ordered) order = [];
         }
-        order = order.filter((s) => typeof s === "string" && s);
       }
 
       // Anything the account owns that creatorlistorder: has lost.
@@ -60530,6 +65610,10 @@ Sitemap: ${url.origin}/sitemap.xml`;
                 itemCount: (data.items || []).length,
                 likes: data.likes || 0,
                 visibility: effectiveListVisibility(data.visibility),
+                sourceUrl: data.sourceUrl || undefined,
+                synced: !!data.synced || undefined,
+                lastSyncedAt: Number.isFinite(data.lastSyncedAt) ? data.lastSyncedAt : undefined,
+                baseItemIds: Array.isArray(data.baseItemIds) ? data.baseItemIds : undefined,
                 // The version these items are, so an editor can send it back
                 // as expectedUpdatedAt and have lists/save refuse a write
                 // built on a copy another device has since replaced.
@@ -60664,6 +65748,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
                   slug,
                   items,
                   itemCount: items.length,
+                  baseItemIds: Array.isArray(data.baseItemIds) ? data.baseItemIds : undefined,
                   updatedAt: Number.isFinite(data.updatedAt) ? data.updatedAt : undefined,
                 };
               } catch {
@@ -60841,17 +65926,32 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: false, error: "expectedUpdatedAt must be a number." }, 400);
       }
 
+      const sourceUrl = typeof body.sourceUrl === "string" ? body.sourceUrl.trim() : (body.sourceUrl === "" ? "" : null);
+      const synced = body.synced != null ? !!body.synced : (sourceUrl ? true : null);
+      const lastSyncedAt = Number.isFinite(Number(body.lastSyncedAt)) ? Number(body.lastSyncedAt) : null;
+      const baseItemIds = Array.isArray(body.baseItemIds)
+        ? body.baseItemIds.filter((id) => typeof id === "string" || typeof id === "number").map(String)
+        : null;
+
       const existingRaw = editingSlug ? await getCreatorList(env, auth.username, slug) : null;
       let createdAt = now;
       let likes = 0;
       let storedUpdatedAt = 0;
       let existingReadable = false;
+      let existingSourceUrl = "";
+      let existingSynced = false;
+      let existingLastSyncedAt = null;
+      let existingBaseItemIds = null;
       if (existingRaw) {
         try {
           const existing = JSON.parse(existingRaw);
           createdAt = existing.createdAt || now;
           likes = existing.likes || 0;
           storedUpdatedAt = Number(existing.updatedAt) || 0;
+          existingSourceUrl = existing.sourceUrl || "";
+          existingSynced = !!existing.synced;
+          existingLastSyncedAt = Number.isFinite(existing.lastSyncedAt) ? existing.lastSyncedAt : null;
+          existingBaseItemIds = Array.isArray(existing.baseItemIds) ? existing.baseItemIds : null;
           existingReadable = true;
         } catch {
           // Unreadable stored record -- nothing coherent to protect against,
@@ -60902,12 +66002,23 @@ Sitemap: ${url.origin}/sitemap.xml`;
         }
       }
       
+      const finalSourceUrl = (sourceUrl !== null) ? sourceUrl : existingSourceUrl;
+      const finalSynced = (synced !== null) ? synced : (finalSourceUrl ? existingSynced : false);
+      const finalLastSyncedAt = (lastSyncedAt !== null) ? lastSyncedAt : existingLastSyncedAt;
+      const finalBaseItemIds = (baseItemIds !== null) ? baseItemIds : existingBaseItemIds;
+
       // Unconditional -- KV must not be allowed to hold a stale copy of a
       // list that D1 has since updated, because the public read paths
       // (/lists/:user/:slug, the directory, search) all read KV.
+      const kvPayload = { name, slug, type, items, visibility, likes, createdAt, updatedAt };
+      if (finalSourceUrl) kvPayload.sourceUrl = finalSourceUrl;
+      if (finalSynced) kvPayload.synced = true;
+      if (finalLastSyncedAt) kvPayload.lastSyncedAt = finalLastSyncedAt;
+      if (finalBaseItemIds) kvPayload.baseItemIds = finalBaseItemIds;
+
       await env.CONFIGS.put(
         `creatorlist:${auth.username}:${slug}`,
-        JSON.stringify({ name, slug, type, items, visibility, likes, createdAt, updatedAt })
+        JSON.stringify(kvPayload)
       );
       if (!order.includes(slug)) {
         // Re-read and MERGE rather than writing back the array this handler
@@ -60986,9 +66097,16 @@ Sitemap: ${url.origin}/sitemap.xml`;
           console.error("D1 write error (lists_fts save):", dbErr);
         }
       }
-      // updatedAt comes back so the client can advance its own baseline
-      // without a separate read, exactly as /api/creator/sync/save does.
-      return json({ ok: true, slug, updatedAt, url: `${url.origin}/lists/${auth.username}/${slug}` });
+      return json({
+        ok: true,
+        slug,
+        updatedAt,
+        sourceUrl: finalSourceUrl || undefined,
+        synced: finalSynced || undefined,
+        lastSyncedAt: finalLastSyncedAt || undefined,
+        baseItemIds: finalBaseItemIds || undefined,
+        url: `${url.origin}/lists/${auth.username}/${slug}`,
+      });
     }
 
     // /api/creator/lists/delete  (POST)  { creatorName, creatorKey, slug }
@@ -61452,22 +66570,33 @@ Sitemap: ${url.origin}/sitemap.xml`;
               const incomingCwList = Array.isArray(body.continueWatching) ? body.continueWatching : [];
               const mergedCw = [];
               const handledShows = new Set();
+              const fullyWatchedSet = new Set([
+                ...(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []),
+                ...(Array.isArray(existingBlob.fullyWatchedShowIds) ? existingBlob.fullyWatchedShowIds.map(String) : [])
+              ]);
               
-              // Server's updated Continue Watching items come first
+              // Server's updated Continue Watching items come first, but NEVER resurrect fully watched shows!
               for (const sItem of serverCwList) {
                 if (sItem && (sItem.showId || sItem.id)) {
                   const sKey = String(sItem.showId || sItem.id);
+                  const baseKey = sKey.split(':')[0];
+                  if (!sItem.isCompanion && (fullyWatchedSet.has(sKey) || fullyWatchedSet.has(baseKey) || (sItem.showId && fullyWatchedSet.has(String(sItem.showId))))) {
+                    continue;
+                  }
                   mergedCw.push(sItem);
                   handledShows.add(sKey);
+                  if (baseKey) handledShows.add(baseKey);
                 }
               }
               // Add any client-only Continue Watching shows that aren't on the server
               for (const cItem of incomingCwList) {
                 if (cItem && (cItem.showId || cItem.id)) {
                   const cKey = String(cItem.showId || cItem.id);
-                  if (!handledShows.has(cKey)) {
+                  const baseKey = cKey.split(':')[0];
+                  if (!handledShows.has(cKey) && !handledShows.has(baseKey)) {
                     mergedCw.push(cItem);
                     handledShows.add(cKey);
+                    if (baseKey) handledShows.add(baseKey);
                   }
                 }
               }
@@ -61575,20 +66704,32 @@ Sitemap: ${url.origin}/sitemap.xml`;
               }
             }
             if (queueCw.length) {
+              const fullyWatchedSet = new Set([
+                ...(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []),
+                ...(Array.isArray(existingBlob.fullyWatchedShowIds) ? existingBlob.fullyWatchedShowIds.map(String) : [])
+              ]);
               const mergedCw = [];
               const handledShows = new Set();
               for (const qItem of queueCw) {
                 if (qItem && (qItem.showId || qItem.id)) {
+                  const qKey = String(qItem.showId || qItem.id);
+                  const baseKey = qKey.split(':')[0];
+                  if (!qItem.isCompanion && (fullyWatchedSet.has(qKey) || fullyWatchedSet.has(baseKey) || (qItem.showId && fullyWatchedSet.has(String(qItem.showId))))) {
+                    continue;
+                  }
                   mergedCw.push(qItem);
-                  handledShows.add(String(qItem.showId || qItem.id));
+                  handledShows.add(qKey);
+                  if (baseKey) handledShows.add(baseKey);
                 }
               }
               for (const bItem of (Array.isArray(body.continueWatching) ? body.continueWatching : [])) {
                 if (bItem && (bItem.showId || bItem.id)) {
                   const bKey = String(bItem.showId || bItem.id);
-                  if (!handledShows.has(bKey)) {
+                  const baseKey = bKey.split(':')[0];
+                  if (!handledShows.has(bKey) && !handledShows.has(baseKey)) {
                     mergedCw.push(bItem);
                     handledShows.add(bKey);
+                    if (baseKey) handledShows.add(baseKey);
                   }
                 }
               }
@@ -62110,6 +67251,25 @@ Sitemap: ${url.origin}/sitemap.xml`;
             const tb = JSON.parse(trackingRaw);
             if (Array.isArray(tb.watchlist)) data.watchlist = tb.watchlist;
             if (Number(tb.watchlistUpdatedAt)) data.watchlistUpdatedAt = Number(tb.watchlistUpdatedAt);
+            if (Array.isArray(tb.continueWatching) && tb.continueWatching.length && Array.isArray(data.continueWatching)) {
+              const tbCwMap = new Map();
+              tb.continueWatching.forEach((it) => {
+                if (it && it.id) tbCwMap.set(String(it.id), it);
+              });
+              data.continueWatching.forEach((it) => {
+                if (!it || !it.id) return;
+                const tbItem = tbCwMap.get(String(it.id));
+                if (tbItem) {
+                  if (tbItem.isCompanion) it.isCompanion = true;
+                  if (tbItem.companionType && !it.companionType) it.companionType = tbItem.companionType;
+                  if (tbItem.companionNote && !it.companionNote) it.companionNote = tbItem.companionNote;
+                  if (tbItem.companionStoryline && !it.companionStoryline) it.companionStoryline = tbItem.companionStoryline;
+                  if (tbItem.precedingShowId && !it.precedingShowId) it.precedingShowId = tbItem.precedingShowId;
+                  if (tbItem.kind && !it.kind) it.kind = tbItem.kind;
+                  if (tbItem.type && it.type === 'episode' && tbItem.type !== 'episode') it.type = tbItem.type;
+                }
+              });
+            }
           } catch {}
         }
       } else if (trackingRaw) {

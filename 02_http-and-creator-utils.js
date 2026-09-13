@@ -21,7 +21,7 @@ function isPublicCorsPath(path) {
   if (p === "/lists/public.json" || p === "/api/public-lists.json") return true;
   if (/^\/lists\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\.json$/.test(p)) return true;
   if (p === "/icon.png" || p === "/unavailable-poster.svg") return true;
-  if (p === "/api/poster-badge" || p === "/api/channel-poster" || p === "/api/channel-logo") return true;
+  if (p === "/api/poster-badge" || p === "/api/channel-poster" || p === "/api/channel-logo" || p === "/api/safe-poster") return true;
   if (p.startsWith("/api/scrobble")) return true;
   return false;
 }
@@ -350,7 +350,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // links encode a bare entries array — those still decode fine, just with
 // no personal keys attached.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -395,6 +395,7 @@ function decodeConfig(config) {
       // predating this feature keeps showing everything, same reasoning
       // as region's own default above.
       hideNonDigitalReleases: !!(!Array.isArray(parsed) && parsed.hideNonDigitalReleases),
+      adultContentFilter: !!(!Array.isArray(parsed) && parsed.adultContentFilter),
     };
   } catch {
     return empty;
@@ -3176,10 +3177,16 @@ async function purgeCreatorData(env, username, options = {}) {
 async function getCreator(env, username) {
   if (env && env.DB) {
     try {
-      const { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
+      let { results } = await env.DB.prepare('SELECT * FROM creators WHERE username = ?').bind(username).all();
+      if ((!results || results.length === 0) && typeof username === 'string') {
+        const clean = username.replace(/-/g, '').toLowerCase();
+        const res2 = await env.DB.prepare("SELECT * FROM creators WHERE LOWER(REPLACE(username, '-', '')) = ?").bind(clean).all();
+        if (res2 && res2.length > 0) results = res2;
+      }
       if (results && results.length > 0) {
         const row = results[0];
         const payload = {
+          username: row.username,
           displayName: row.display_name,
           keyHash: row.key_hash,
           recoveryAnswerHash: row.recovery_answer_hash,
@@ -3190,7 +3197,8 @@ async function getCreator(env, username) {
         };
         const raw = JSON.stringify(payload);
         try {
-          if (env.CONFIGS) await env.CONFIGS.put(`creator:${username}`, raw);
+          if (env.CONFIGS) await env.CONFIGS.put(`creator:${row.username}`, raw);
+          if (row.username !== username && env.CONFIGS) await env.CONFIGS.put(`creator:${username}`, raw);
         } catch (kvErr) {
           console.error("KV cache write error (getCreator):", kvErr);
         }
@@ -3601,7 +3609,21 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
         const itemId = String(item.id || showId);
         const name = item.name || null;
         const poster = item.poster || null;
-        const showTitle = item.showTitle || null;
+        let showTitle = item.showTitle || null;
+        if (item.isCompanion) {
+          try {
+            showTitle = "COMPANION:" + JSON.stringify({
+              isCompanion: true,
+              companionType: item.companionType,
+              companionNote: item.companionNote,
+              companionStoryline: item.companionStoryline,
+              precedingShowId: item.precedingShowId,
+              showTitle: item.showTitle || null,
+              type: item.type || (item.kind === 'movie' ? 'movie' : undefined),
+              kind: item.kind || (item.type === 'movie' ? 'movie' : undefined),
+            });
+          } catch {}
+        }
         const showPoster = item.showPoster || null;
         const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
         const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
@@ -3748,18 +3770,49 @@ async function readCreatorTrackingD1(env, username) {
       watchedAt: r.watched_at,
     }));
 
-    const continueWatching = cwRows.map((r) => ({
-      id: r.item_id,
-      showId: r.show_id,
-      type: "episode",
-      name: r.name || undefined,
-      poster: r.poster || undefined,
-      showTitle: r.show_title || undefined,
-      showPoster: r.show_poster || undefined,
-      seasonNum: r.season_num != null ? r.season_num : undefined,
-      episodeNum: r.episode_num != null ? r.episode_num : undefined,
-      updatedAt: r.updated_at,
-    }));
+    const continueWatching = cwRows.map((r) => {
+      let isCompanion = undefined;
+      let companionType = undefined;
+      let companionNote = undefined;
+      let companionStoryline = undefined;
+      let precedingShowId = undefined;
+      let showTitle = r.show_title || undefined;
+      let kind = undefined;
+      let type = (r.season_num == null && r.episode_num == null && !r.show_title) ? "movie" : "episode";
+      if (r.show_title && r.show_title.startsWith("COMPANION:")) {
+        try {
+          const compMeta = JSON.parse(r.show_title.slice(10));
+          isCompanion = true;
+          companionType = compMeta.companionType;
+          companionNote = compMeta.companionNote;
+          companionStoryline = compMeta.companionStoryline;
+          precedingShowId = compMeta.precedingShowId;
+          showTitle = compMeta.showTitle || undefined;
+          kind = compMeta.kind || (compMeta.type === 'movie' ? 'movie' : undefined);
+          type = compMeta.type || (kind === 'movie' ? 'movie' : 'episode');
+        } catch {}
+      } else if (type === "movie") {
+        kind = "movie";
+      }
+      return {
+        id: r.item_id,
+        showId: (type === 'movie' && !r.season_num && !r.episode_num && !showTitle) ? undefined : r.show_id,
+        type: type,
+        kind: kind,
+        name: r.name || undefined,
+        poster: r.poster || undefined,
+        showTitle: showTitle,
+        showPoster: r.show_poster || undefined,
+        seasonNum: r.season_num != null ? r.season_num : undefined,
+        episodeNum: r.episode_num != null ? r.episode_num : undefined,
+        updatedAt: r.updated_at,
+        isCompanion: isCompanion,
+        companionType: companionType,
+        companionNote: companionNote,
+        companionStoryline: companionStoryline,
+        precedingShowId: precedingShowId,
+      };
+    });
 
     const airingNext = anRows.map((r) => ({
       id: r.item_id,
