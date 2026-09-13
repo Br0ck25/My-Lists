@@ -1,7 +1,7 @@
 # Frontend audit probes — 2026-09-13
 
 Executable reproductions for every confirmed finding in
-[`AUDIT-2026-09-13-FRONTEND.md`](../../AUDIT-2026-09-13-FRONTEND.md).
+[`AUDIT-2026-09-13-FRONTEND.md`](../../docs/history/AUDIT-2026-09-13-FRONTEND.md).
 
 Like the 2026-09-07 set, these drive **real Chromium** against the **real
 Worker**. Nothing here is a mock of the app: `server.mjs` runs

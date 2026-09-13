@@ -6,7 +6,7 @@
 the real `worker_entry_combined.js` export driven through the repo's own in-memory KV/D1
 harness, the client bundle driven through `tests/client-harness.mjs`, and two findings
 reproduced end-to-end in **real Chromium** against the Worker served over HTTP.
-**Executable probes:** [`audit/adversarial-III-2026-09-08/`](./audit/adversarial-III-2026-09-08/)
+**Executable probes:** [`audit/adversarial-III-2026-09-08/`](../../audit/adversarial-III-2026-09-08/)
 — every claim below names the probe that produced it.
 
 ---

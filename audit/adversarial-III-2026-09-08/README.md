@@ -1,7 +1,7 @@
 # Adversarial Audit III — executable probes (2026-09-08)
 
 The findings these produce are written up in
-[`../../AUDIT-2026-09-08-ADVERSARIAL-III.md`](../../AUDIT-2026-09-08-ADVERSARIAL-III.md).
+[`../../docs/history/AUDIT-2026-09-08-ADVERSARIAL-III.md`](../../docs/history/AUDIT-2026-09-08-ADVERSARIAL-III.md).
 
 Every probe drives the real `worker_entry_combined.js` export (or the real client bundle)
 through the repo's own harnesses in `tests/`. Nothing here modifies the Worker. Run from this

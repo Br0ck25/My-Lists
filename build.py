@@ -14,8 +14,13 @@ out = bytearray(open('header.js', 'rb').read())
 for f in sorted(glob.glob('[0-9][0-9]_*.js')):
     data = open(f, 'rb').read()
     out += data
+    # LF, not CRLF. This separator only fires for a source that does not end
+    # with a newline, so it was a single stray CRLF in an otherwise-LF file --
+    # invisible to verify.sh and CI (both ignore CR at EOL) but enough to make
+    # check_sync.py's byte-exact compare fail on a clean checkout. See
+    # .gitattributes.
     if not data.endswith(b'\n'):
-        out += b'\r\n'
+        out += b'\n'
 open('worker_entry_combined.js', 'wb').write(bytes(out))
 print("header bytes:", len(open('header.js', 'rb').read()))
 print("combined bytes:", len(out))

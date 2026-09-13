@@ -72,6 +72,11 @@ Write-Host "Building worker_entry_combined.js from $($parts.Count) files..."
 # Write header then append each split file (UTF-8 no BOM).
 $encoding = New-Object System.Text.UTF8Encoding($false)  # $false = no BOM
 $writer   = [System.IO.StreamWriter]::new($output, $false, $encoding)
+# LF, always. WriteLine() below defaults to Environment.NewLine, which is
+# CRLF on Windows -- that would put a stray CRLF into an otherwise-LF file
+# and make this script disagree with build.py byte-for-byte. See
+# .gitattributes for why the whole repository is pinned to LF.
+$writer.NewLine = "`n"
 
 try {
     $writer.Write($header)

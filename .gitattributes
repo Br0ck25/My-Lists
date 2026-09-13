@@ -1,0 +1,30 @@
+# Line endings are pinned, because this repository builds one file by
+# concatenating others byte-for-byte.
+#
+# build.py reads the numbered sources out of the WORKING TREE and writes
+# worker_entry_combined.js from those exact bytes. That makes the build a
+# function of whatever line endings the checkout happens to have -- so on a
+# checkout that materialised CRLF (Windows, core.autocrlf=true) the build
+# produced a CRLF Worker, and on Linux an LF one, from identical sources.
+#
+# That is how the two ended up disagreeing: the sources are committed LF and
+# worker_entry_combined.js was committed CRLF. Nothing caught it, because
+# verify.sh and CI both compare with `git diff --ignore-cr-at-eol`. What did
+# notice was check_sync.py, which compared raw bytes and therefore failed on a
+# clean checkout -- and told you to run build.py, which would have committed
+# 3.3MB of line-ending churn and flipped the file back again for the next
+# person on the other platform.
+#
+# eol=lf rather than `text=auto` alone: normalising in the repository is not
+# enough here, because the build reads the working tree. The checkout itself
+# has to be LF on every platform for the build to be reproducible.
+* text=auto eol=lf
+
+# Generated -- `python3 build.py` from header.js + the numbered sources.
+# Never edit it by hand; CI rebuilds it and fails on drift. Marked generated so
+# GitHub collapses its 3.3MB by default in reviews, where it is noise next to
+# the sources it was built from.
+worker_entry_combined.js linguist-generated=true
+
+# Sample data, not source. Same reasoning: large, not meaningfully reviewable.
+my-lists-full-backup1.json linguist-generated=true
