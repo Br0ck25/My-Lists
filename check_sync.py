@@ -10,6 +10,15 @@
 # check. Rather than leave a weaker duplicate around to be trusted by mistake,
 # this now does the same thing they do, and can be run on its own:
 #
+# "The same thing they do" includes ignoring line endings, which this did not.
+# Both of those compare with `git diff --ignore-cr-at-eol`; this compared raw
+# bytes. worker_entry_combined.js is committed with CRLF while the numbered
+# sources are committed with LF, so on a clean checkout the byte compare
+# always failed -- and told you to run build.py, which would rewrite the whole
+# 3.3MB file with LF endings and commit a diff of nothing but line-ending
+# churn (CI, ignoring CR at EOL, would not have objected). It now normalises
+# the same way, so the only mismatch it reports is a real one:
+#
 #   python3 check_sync.py
 #
 # Exits non-zero, and says where the first difference is, if the committed
@@ -26,8 +35,17 @@ for name in sorted(glob.glob("[0-9][0-9]_*.js")):
 
 actual = open("worker_entry_combined.js", "rb").read()
 
+# Normalised exactly like `git diff --ignore-cr-at-eol`: a trailing CR before a
+# newline is not a difference. Everything below compares the normalised forms,
+# so a reported byte offset points at real content, not at a line ending.
+def lf(b):
+    return b.replace(b"\r\n", b"\n")
+
+expected = bytearray(lf(bytes(expected)))
+actual = lf(actual)
+
 if bytes(expected) == actual:
-    print(f"  ok: worker_entry_combined.js matches its sources ({len(actual):,} bytes)")
+    print(f"  ok: worker_entry_combined.js matches its sources ({len(actual):,} bytes, line endings ignored)")
     sys.exit(0)
 
 print(f"  MISMATCH: expected {len(expected):,} bytes, found {len(actual):,}")

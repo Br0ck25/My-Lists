@@ -65,7 +65,7 @@
         </div>
         <div id="channelMergeList"><p style="color:var(--muted); font-size:0.85rem;"><small>No saved channels yet.</small></p></div>
         <div class="row" style="margin-top:8px;">
-          <input type="text" id="channelMergeNameInput" placeholder="Combined catalog name (e.g. Live TV)">
+          <input type="text" id="channelMergeNameInput" aria-label="Combined catalog name" placeholder="Combined catalog name (e.g. Live TV)">
           <button type="button" class="secondary" onclick="mergeChannelsIntoRow()">Merge into catalog</button>
         </div>
       </div>
@@ -196,7 +196,7 @@
     <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Search to find movies, shows and lists to add to your lists.</p>
     
     <div class="row">
-      <input type="text" id="catalogSearchInput" placeholder="Search by title or list name..." oninput="handleCatalogSearchInput(this)" onkeydown="if(event.key==='Enter'){event.preventDefault();runCatalogSearch();}">
+      <input type="text" id="catalogSearchInput" aria-label="Search by title or list name" placeholder="Search by title or list name..." oninput="handleCatalogSearchInput(this)" onkeydown="if(event.key==='Enter'){event.preventDefault();runCatalogSearch();}">
       <button type="button" class="primary" onclick="runCatalogSearch()">Search</button>
     </div>
 

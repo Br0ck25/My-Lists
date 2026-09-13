@@ -3276,6 +3276,19 @@ ${seoHeadHtml}
     gap: 4px;
     flex-shrink: 0;
   }
+  /* The label is what gives way when the banner runs out of room, not the
+     button. The banner is a nowrap flex row capped at calc(100vw - 24px),
+     and a flex item's default min-width:auto will not shrink below its
+     content -- which under white-space:nowrap is the full sentence. So the
+     line overflowed the banner's own box and pushed the button (flex-shrink:0)
+     past it: at 320px only 37px of the 111px "Update Link" button was on
+     screen, with .page's overflow-x:hidden leaving no way to reach the rest.
+     min-width:0 lets the text shrink; the ellipsis keeps it readable. */
+  #unsavedInstallText {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .unsaved-install-banner-btn:hover {
     background: var(--accent-hover);
   }

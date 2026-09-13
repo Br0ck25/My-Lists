@@ -3138,8 +3138,16 @@ function openSelectListModal(id, type, title, poster) {
   }
   
   body.innerHTML = html;
+  // Only lock when this open is actually a transition from closed. The
+  // matching close is idempotent (closeSelectListModal returns early when
+  // already hidden, taking no lock off the counter), so an unconditional
+  // lock here meant re-opening an already-open modal pushed the depth to 2
+  // and one close could never bring it back to 0 -- leaving the page
+  // permanently unscrollable with no modal on screen and no way back but a
+  // refresh. Open and close now agree about what a transition is.
+  const wasOpen = modal.style.display && modal.style.display !== 'none';
   modal.style.display = 'flex';
-  lockBackgroundScroll(true);
+  if (!wasOpen) lockBackgroundScroll(true);
 
   // Background check for Simkl lists membership if not cached yet
   if (hasSimkl && !window._mySimklLists) {

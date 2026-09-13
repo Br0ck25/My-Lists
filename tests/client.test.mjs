@@ -3289,3 +3289,131 @@ describe("client: Item Details Storylines, Sagas & Universes watch order", () =>
 });
 
 
+
+// --- FE2-01: a backup field of the wrong JSON type must not eat the import ---
+//
+// addRow read `name` without coercing it -- the one read in that function that
+// did not -- so a list literally called 2024, written unquoted by a hand-edited
+// or third-party-generated backup, threw
+// "(name || group || 'L').trim is not a function" mid-import. The throw escaped
+// applyImportedConfig AND the click handler, so the rows already cleared stayed
+// cleared, the remaining entries were never added, and the report modal (which
+// renders at the END of applyImportedConfig) never appeared. Measured in a real
+// browser before the fix: 8 catalogs in, 1 row out, no message.
+describe("client: a backup field stored as the wrong JSON type", () => {
+  const NUMERIC_NAME_BACKUP = {
+    version: "3.0",
+    entries: [
+      { name: "My Good List", url: "tmdb:chart:popular", type: "movie", enabled: true, group: "Custom" },
+      { name: 2024, url: "tmdb:chart:top_rated", type: "movie", enabled: true, group: "Custom" },
+      { name: "Another List", url: "tmdb:chart:trending", type: "movie", enabled: true, group: "Custom" },
+    ],
+  };
+
+  it("addRow survives a non-string name instead of throwing", () => {
+    const client = loadClient();
+    // The exact sink. A number, and the two shapes a careless generator emits.
+    assert.doesNotThrow(() => client.call("addRow", 2024, "tmdb:chart:popular", "movie", true, "Custom"));
+    assert.doesNotThrow(() => client.call("addRow", null, "tmdb:chart:popular", "movie", true, 7));
+    assert.doesNotThrow(() => client.call("addRow", { a: 1 }, "tmdb:chart:popular", "movie", true, "Custom"));
+  });
+
+  it("imports every entry and does not stop at the bad one", () => {
+    const client = loadClient();
+    // The DOM stub does not build a tree, so collectEntries cannot see rows.
+    // What regressed is reachability: the throw meant every entry after the
+    // numeric one was never added at all. Count what actually reaches addRow.
+    client.__scopeGet("(function(){ globalThis.__added = []; const o = addRow;"
+      + " addRow = function(name){ globalThis.__added.push(String(name)); return o.apply(null, arguments); };"
+      + " return 1; })()");
+    assert.doesNotThrow(() => client.call("applyImportedConfig", JSON.parse(JSON.stringify(NUMERIC_NAME_BACKUP))));
+    const added = client.__scopeGet("globalThis.__added") || [];
+    assert.ok(added.includes("My Good List"));
+    assert.ok(added.includes("2024"), "the numeric name is coerced, not discarded");
+    assert.ok(added.includes("Another List"), "entries AFTER the bad one must still be imported");
+  });
+
+  it("validateAndRepairBackup coerces the field and says so", () => {
+    const client = loadClient();
+    const data = JSON.parse(JSON.stringify(NUMERIC_NAME_BACKUP));
+    const report = client.call("validateAndRepairBackup", data);
+    assert.equal(typeof data.entries[1].name, "string", "repaired in place");
+    assert.equal(data.entries[1].name, "2024");
+    const said = [...(report.warnings || []), ...(report.notes || [])].join(" ");
+    assert.match(said, /number or object/i, "a silent repair is the failure mode this file exists to prevent");
+  });
+
+  it("an object or array name is dropped rather than stringified to [object Object]", () => {
+    const client = loadClient();
+    const data = { version: "3.0", entries: [{ name: { nope: 1 }, url: "tmdb:chart:popular", type: "movie", enabled: true }] };
+    client.call("validateAndRepairBackup", data);
+    assert.equal(data.entries[0].name, "", "falls back to the usual guessed name instead of [object Object]");
+  });
+});
+
+// --- FE2-02: the interactive toggle must win over its own background job -----
+//
+// toggleBatchWatchStatus kicked off updateContinueWatchingForBatch and dropped
+// the promise; markShowWatched then committed its own Continue Watching state.
+// Both rewrite _fullyWatchedShowIds and the continue-watching list, so a second
+// toggle that began before the first one's background work settled lost to it:
+// the show stayed flagged fully watched with a phantom companion queued, while
+// the button read the opposite -- and scheduleCreatorSyncSave pushed that state
+// to the account. The gap in a browser is a real /api/season round trip.
+describe("client: markShowWatched is not raced by its own background reconciliation", () => {
+  const S1 = [
+    { id: 101, name: "Pilot", episode_number: 1, air_date: "2008-01-20" },
+    { id: 102, name: "Cat's in the Bag...", episode_number: 2, air_date: "2008-01-27" },
+  ];
+  const S2 = [
+    { id: 201, name: "Seven Thirty-Seven", episode_number: 1, air_date: "2009-03-08" },
+    { id: 202, name: "Grilled", episode_number: 2, air_date: "2009-03-15" },
+  ];
+
+  const setup = () => {
+    const client = loadClient({
+      routes: {
+        "/api/season": (req) => {
+          const s = new URL(req.url, "https://example.com").searchParams.get("seasonNum");
+          if (s === "1") return { json: { ok: true, season: { episodes: S1 } } };
+          if (s === "2") return { json: { ok: true, season: { episodes: S2 } } };
+          return { json: { ok: false, error: "Not found" } };
+        },
+      },
+    });
+    client.set("_currentItemDetails", {
+      id: "tt0903747", tmdbId: 1396, title: "Breaking Bad",
+      seasonsData: [{ season_number: 1, episode_count: 2 }, { season_number: 2, episode_count: 2 }],
+    });
+    const btn = client.get("document").getElementById("btnMarkShowWatched");
+    btn.classList.add("primary");
+    btn.innerHTML = "Mark Show Watched";
+    return { client, btn };
+  };
+
+  it("leaves no fully-watched flag behind when watched and unwatched back to back", async () => {
+    const { client, btn } = setup();
+    // Back to back, with NO gap -- the reproduction. Before the fix the first
+    // toggle's floating promise landed during the second and undid it.
+    await client.call("markShowWatched", "tt0903747");
+    await client.call("markShowWatched", "tt0903747");
+    await settle();
+
+    const flagged = [...(client.get("window")._fullyWatchedShowIds || [])];
+    assert.deepEqual(flagged, [], "an unwatched show must not stay flagged fully watched");
+
+    const cw = client.call("loadLocalCustomLists")["continue-watching"]?.items || [];
+    assert.equal(cw.some((it) => it && it.precedingShowId === "tt0903747"), false,
+      "the queued companion must be cleaned up when the show is unmarked");
+    // The state and what the button claims must agree.
+    assert.equal(btn.innerHTML.includes("Unwatched"), false, "button and stored state must not disagree");
+  });
+
+  it("keeps the button disabled until the whole sequence has settled", async () => {
+    const { client, btn } = setup();
+    const pending = client.call("markShowWatched", "tt0903747");
+    assert.equal(btn.disabled, true, "a live button during the async tail is the race window");
+    await pending;
+    assert.equal(btn.disabled, false, "and it must come back afterwards");
+  });
+});
