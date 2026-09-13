@@ -12,12 +12,17 @@
 #
 # "The same thing they do" includes ignoring line endings, which this did not.
 # Both of those compare with `git diff --ignore-cr-at-eol`; this compared raw
-# bytes. worker_entry_combined.js is committed with CRLF while the numbered
-# sources are committed with LF, so on a clean checkout the byte compare
-# always failed -- and told you to run build.py, which would rewrite the whole
-# 3.3MB file with LF endings and commit a diff of nothing but line-ending
-# churn (CI, ignoring CR at EOL, would not have objected). It now normalises
-# the same way, so the only mismatch it reports is a real one:
+# bytes. worker_entry_combined.js used to be committed CRLF while the numbered
+# sources were LF, so on a clean checkout the byte compare always failed -- and
+# told you to run build.py, which would have committed 3.3MB of line-ending
+# churn (CI, ignoring CR at EOL, would not have objected) and flipped the file
+# straight back for the next person on the other platform.
+#
+# That split is now fixed at the root: .gitattributes pins the whole repository
+# to LF, including the working tree, so the build is reproducible on any
+# platform and this compare is byte-exact in practice. The normalisation below
+# is kept anyway -- it costs nothing, and it means a checkout that somehow
+# gains CRLF still reports only real mismatches instead of every line:
 #
 #   python3 check_sync.py
 #
@@ -31,7 +36,7 @@ for name in sorted(glob.glob("[0-9][0-9]_*.js")):
     data = open(name, "rb").read()
     expected += data
     if not data.endswith(b"\n"):
-        expected += b"\r\n"
+        expected += b"\n"
 
 actual = open("worker_entry_combined.js", "rb").read()
 

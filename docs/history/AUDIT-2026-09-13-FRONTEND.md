@@ -8,7 +8,7 @@ describes `main`.
 Static reading of the 16 frontend sources, then **execution**: the real
 `worker_entry_combined.js` served over HTTP against the repo's own in-memory KV and
 SQLite-backed D1, driven by **real Chromium**.
-**Probes:** [`audit/frontend-2026-09-13/`](./audit/frontend-2026-09-13/) — every claim
+**Probes:** [`audit/frontend-2026-09-13/`](../../audit/frontend-2026-09-13/) — every claim
 below names the probe that produced it and its output is quoted verbatim.
 
 ---
