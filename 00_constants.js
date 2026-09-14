@@ -300,26 +300,44 @@ const NEW_ON_STREAMING_PROVIDERS = [
 // in the catalog's own error path rather than silently.
 const NEW_ON_STREAMING_REGIONS = ["US"];
 
-// How deep into each provider catalog the rolling walk goes, in TMDB pages of
-// 20. The walk is sorted by release date descending -- NOT popularity, which
-// reorders between pages mid-walk and makes a walk skip and double-count
-// titles -- so page 1 is always the newest and depth is a horizon, not a
-// sample: 40 pages is the most recent ~800 titles per provider per kind.
-// Beyond that is back-catalog that cannot arrive "new" often enough to pay for
-// re-reading it every few hours.
-const NEW_ON_STREAMING_WALK_DEPTH_PAGES = 40;
-
-// Sweep units (one provider + kind + page) per tick. 8 providers x 2 kinds x
-// 40 pages = 640 units, so at 12 a tick the walk comes all the way round about
-// every 53 ticks -- a little over five hours on the recommended */6 schedule.
-// That is the detection latency for a BACK-CATALOGUE arrival.
+// The walk reads each provider catalog to its END, and the depth is LEARNED
+// rather than configured: every discover response carries total_pages, so the
+// sweep records how deep each provider+kind actually goes and walks exactly
+// that far.
 //
-// It is not how long the shelf takes to look right, because the walk is
-// page-major (see newOnStreamingUnits): the first 16 units are page 1 of every
-// provider and kind, so two ticks -- about twelve minutes -- cover the newest
-// titles everywhere, and the hours after that only add depth. A new release is
-// found on the next tick either way, since it lands on page 1.
-const NEW_ON_STREAMING_PAGES_PER_TICK = 12;
+// It shipped with a fixed 40-page horizon instead, and that quietly broke the
+// feature's whole premise. Sorted by release date descending, 40 pages is the
+// ~800 most recently RELEASED titles -- one to three years. A 2010 film added
+// to Netflix today sits far outside that window, so the sweep never fetched
+// the page it was on and the title never entered the table at all: not as an
+// arrival, not even as a seeded row. The list could only ever report new
+// releases arriving, which is the case that needed it least, and is exactly
+// the failure this feature was built to fix.
+//
+// This is the only hard bound left, and it is TMDB's, not a choice: discover
+// stops paginating at page 500 (10,000 titles). No single service's flatrate
+// catalogue in one region comes near it.
+const NEW_ON_STREAMING_MAX_PAGES_PER_CATALOG = 500;
+
+// Sweep units (one provider + kind + page) per tick.
+//
+// Raised from 12 now that a pass covers whole catalogues rather than their
+// first 40 pages. A pass is roughly 1,000-1,500 pages in total across the
+// eight services and both types -- the sweep measures the real number and the
+// admin panel reports it -- so 40 a tick brings a full pass in around three
+// hours on the recommended */6 schedule. That is the detection latency for a
+// back-catalogue arrival and, now, for a removal.
+//
+// It is not how long the shelf takes to look right: the walk is page-major
+// (see newOnStreamingCombos), so the first 16 units are page 1 of every
+// provider and kind and the newest titles everywhere are in within one tick.
+// The hours after that only add depth.
+//
+// The budget check uses NEW_ON_STREAMING_SWEEP_FETCHES (21) as a per-page
+// ceiling, so 40 pages reserves 840 against the ~1,175 the sweep is given.
+// That ceiling is only ever paid on a first walk; once IMDb ids are cached a
+// page costs one fetch.
+const NEW_ON_STREAMING_PAGES_PER_TICK = 40;
 
 // Budget ceiling for one sweep unit: the discover page itself, plus an IMDb
 // resolution for each of its 20 items. Like CRON_CHART_WARM_FETCHES this is a
@@ -364,6 +382,31 @@ const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 const NEW_ON_STREAMING_EPISODE_WINDOW_DAYS = 10;
 const NEW_ON_STREAMING_EPISODE_SCAN_PAGES = 3;
 const NEW_ON_STREAMING_EPISODE_SHOWS_PER_TICK = 40;
+
+// --- Marking a title as gone ------------------------------------------------
+//
+// A completed pass has visited every page of every catalogue, so a row it did
+// not see is a title that is no longer there. That is the only evidence
+// available, and it is worth being careful with: the cost of a false removal
+// is a title vanishing from the shelf, and then -- when the next pass finds it
+// again -- reappearing at the top as an arrival that never happened.
+//
+// Three guards, in increasing order of how badly things have to be going:
+//
+//   GRACE_WALKS   a row must be missed by this many CONSECUTIVE completed
+//                 passes before it is marked gone. Two passes is several hours
+//                 of TMDB consistently not listing it, which no ordinary
+//                 hiccup survives.
+//   MAX_PASS_ERRORS  a pass that could not read this many pages did not
+//                 establish that anything is absent; it marks nothing.
+//   MAX_REMOVAL_SHARE  and if a pass somehow still concludes that more than
+//                 this fraction of everything on record has vanished at once,
+//                 the conclusion is wrong. It marks nothing and says so
+//                 loudly, because that is a provider or an API having a bad
+//                 day, not a quarter of the catalogue leaving overnight.
+const NEW_ON_STREAMING_REMOVAL_GRACE_WALKS = 2;
+const NEW_ON_STREAMING_MAX_PASS_ERRORS = 20;
+const NEW_ON_STREAMING_MAX_REMOVAL_SHARE = 0.25;
 
 // Ships dark. The sweep, the catalog and the /lists route are live as soon as
 // this deploys -- tmdb:new-on-streaming resolves, installs into Stremio and
