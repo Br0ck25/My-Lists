@@ -50,6 +50,12 @@ function compactCustomListItem(it) {
   if (it.watchedAt) clean.watchedAt = it.watchedAt;
   if (it.imdbId) clean.imdbId = it.imdbId;
   if (it.tmdbId) clean.tmdbId = it.tmdbId;
+  // The resolved TMDB id an Airing Next entry is deduped and matched by
+  // (refreshAiringNext, and the Continue Watching badge matching in
+  // buildLocalListCardHtml). It was dropped here, so every consumer of it
+  // was reading a field that existed only in the seconds between the shelf
+  // being computed and the map being saved -- which is to say, never.
+  if (it.canonicalTmdbId) clean.canonicalTmdbId = it.canonicalTmdbId;
   if (it.airDate) clean.airDate = it.airDate;
   if (it.isUnaired) clean.isUnaired = true;
   if (it.seasonFinaleAirDate) clean.seasonFinaleAirDate = it.seasonFinaleAirDate;
@@ -479,6 +485,16 @@ async function openResetAccountModal() {
 
       // Stop anything in flight from re-uploading what we are about to clear.
       window._suppressCreatorSync = true;
+      // Up BEFORE the local clear, not after the request: clearing this
+      // browser empties every list on screen instantly, and from there until
+      // the server answers -- a second or two -- the page looked like an
+      // account that had lost its data with nothing to say why. This is the
+      // only thing on screen that says the reset is running, so it goes up
+      // before the first thing that changes. Replaced below by the success
+      // or failure dialog, whichever the round trip produces.
+      if (typeof showAppBusy === 'function') {
+        showAppBusy('Resetting Account', 'Clearing your lists, channels, presets and watch history\u2026 this takes a moment.');
+      }
       try {
         if (typeof clearLocalAccountData === 'function') clearLocalAccountData();
 
@@ -491,7 +507,9 @@ async function openResetAccountModal() {
         if (!data || !data.ok) {
           const msg = (data && data.error) || 'The reset could not be completed.';
           if (typeof showAppAlert === 'function') showAppAlert('Reset Failed', msg + ' Your local data has been cleared; sign in again to restore it from your account.', false);
-          else alert(msg);
+          // Nothing replaces the busy dialog on this branch, so take it down
+          // rather than leave a spinner turning over a finished request.
+          else { if (typeof closeModal === 'function') closeModal(); alert(msg); }
           return;
         }
 
@@ -516,6 +534,7 @@ async function openResetAccountModal() {
         }
       } catch (e) {
         if (typeof showAppAlert === 'function') showAppAlert('Reset Failed', 'Could not reach the server. Your local data has been cleared; sign in again to restore it from your account.', false);
+        else if (typeof closeModal === 'function') closeModal();
       } finally {
         window._suppressCreatorSync = false;
       }
@@ -805,6 +824,52 @@ function onHiddenSectionToggle(cb) {
   if (!section) return;
   // Same checked = hidden convention as onHiddenListToggle above.
   if (typeof setMyListsSectionHidden === 'function') setMyListsSectionHidden(section, cb.checked);
+}
+
+// "Removed from Airing Next" panel on Settings -- the way back from the "x"
+// on an Airing Next poster (removeAiringNextShow, 21_client-custom-list-
+// builder.js).
+//
+// A removal undoes itself the moment another episode of the show is watched,
+// so this panel is not the only route back. It is the route for the person
+// who removed the wrong show, or changed their mind about one they are not
+// currently watching -- without it, a show removed by mistake could only be
+// recovered by watching an episode of it.
+//
+// Deliberately hidden entirely when nothing is removed: an empty panel
+// explaining a feature nobody has used is noise on a Settings tab that
+// already has a lot to read.
+function renderRemovedAiringNextSettingsSection() {
+  const box = document.getElementById('removedAiringNextSettingsSection');
+  if (!box) return;
+  const panel = box.closest('.panel');
+  const shows = (typeof getRemovedAiringNextShows === 'function') ? getRemovedAiringNextShows() : [];
+  if (!shows.length) {
+    box.innerHTML = '';
+    if (panel) panel.style.display = 'none';
+    return;
+  }
+  if (panel) panel.style.display = '';
+  box.innerHTML = shows.map((sh) =>
+    '<div style="display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid var(--border);">' +
+      // onerror takes the element out rather than hiding it: a backslash in
+      // this file never reaches the browser (the whole bundle is served from
+      // inside a template literal), so an inline handler here cannot contain
+      // an escaped quote -- the admin page lost a whole day to exactly that,
+      // see CHANGELOG.md. this.remove() needs no nested string at all.
+      (sh.poster
+        ? '<img src="' + escapeAttr(sh.poster) + '" alt="" loading="lazy" style="width:34px; height:51px; object-fit:cover; border-radius:4px; flex-shrink:0;" onerror="this.remove()">'
+        : '') +
+      '<span style="font-weight:600; min-width:0; overflow-wrap:anywhere; flex:1;">' + escapeHtml(sh.title) + '</span>' +
+      '<button type="button" class="lc-btn secondary" data-show-id="' + escapeAttr(sh.showIds.join(',')) + '" onclick="onRestoreAiringNextShow(this)" style="flex-shrink:0;">Put Back</button>' +
+    '</div>'
+  ).join('');
+}
+
+function onRestoreAiringNextShow(btn) {
+  const showId = btn && btn.dataset ? btn.dataset.showId : '';
+  if (!showId) return;
+  if (typeof restoreAiringNextShow === 'function') restoreAiringNextShow(showId);
 }
 
 // that persists anywhere outside a single browser for that link to
@@ -1185,6 +1250,9 @@ function clearLocalAccountData() {
   // Read everywhere else as a plain object (Object.keys(...), map lookups by
   // show id), so resetting it to a Set left a value nothing could use.
   window._dismissedContinueWatching = {};
+  // Same shape and the same reason as the line above: read everywhere else
+  // as a plain object keyed by show id.
+  window._removedAiringNext = {};
   window._fullyWatchedShowIds = new Set();
   window._inProgressShowIds = new Set();
 
@@ -1296,6 +1364,7 @@ function clearLocalAccountData() {
   if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
   if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
   if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+  if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
   if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
   if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
@@ -2108,6 +2177,7 @@ function trackingSyncSignature(localMap) {
     Number(wl.updatedAt) || 0,
     (window._fullyWatchedShowIds ? window._fullyWatchedShowIds.size || [...window._fullyWatchedShowIds].length : 0),
     Object.keys(window._dismissedContinueWatching || {}).length,
+    Object.keys(window._removedAiringNext || {}).length,
     localStorage.getItem('myListAddon:trackPlayback') === '1' ? 1 : 0,
     localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0' ? 1 : 0,
     localStorage.getItem('myListAddon:scrobbleFilterUsers') === '1' ? 1 : 0,
@@ -2189,6 +2259,13 @@ async function pushTrackingSync(opts) {
         scrobbleBlockAnonymous: localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1',
         fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
         dismissedContinueWatching: window._dismissedContinueWatching || {},
+        // Which shows have been taken off Airing Next, and at which watched
+        // episode -- see removeAiringNextShow (21_client-custom-list-
+        // builder.js). Carried on the account rather than left in this
+        // browser because the shelf is REBUILT from Watch History on every
+        // device: another browser that had never heard of the removal would
+        // recompute the show straight back onto it and push that up.
+        removedAiringNext: window._removedAiringNext || {},
         // Set only by flows that are deliberately shrinking Watch History
         // (Clear Watch History, removing a single item) -- tells the
         // server to trust this array exactly as sent instead of rescuing
@@ -2936,6 +3013,35 @@ async function loadCreatorSync(opts) {
         try {
           localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(synced.dismissedContinueWatching));
         } catch (e) {}
+      }
+      // Guarded by isRecentRemoval for the same reason the dismissals above
+      // are: a removal made on this device moments ago must not be undone by
+      // an account copy that predates it.
+      if (!isRecentRemoval && synced.removedAiringNext && typeof synced.removedAiringNext === 'object') {
+        window._removedAiringNext = synced.removedAiringNext;
+        try {
+          localStorage.setItem(REMOVED_AIRING_NEXT_KEY, JSON.stringify(synced.removedAiringNext));
+        } catch (e) {}
+        // The shelf this browser is holding can predate the removals just
+        // applied -- it may have computed one before this account's state
+        // arrived, or before another device removed a show. Filtered here
+        // rather than by calling syncAiringNextWatchState, which would see
+        // shows it has no air dates for and start a full TMDB rebuild on
+        // every sign-in load.
+        try {
+          const anMap = loadLocalCustomLists();
+          const anList = anMap['airing-next'];
+          if (anList && Array.isArray(anList.items) && anList.items.length) {
+            const kept = anList.items.filter((it) => !isAiringNextRemoved(it && (it.showId || it.id)));
+            if (kept.length !== anList.items.length) {
+              anList.items = kept;
+              anList.updatedAt = Date.now();
+              anMap['airing-next'] = anList;
+              saveLocalCustomListsMap(anMap);
+            }
+          }
+        } catch (e) {}
+        touchedTracking = true;
       }
       if (Array.isArray(synced.dashboardListOrder) && synced.dashboardListOrder.length) {
         try {
@@ -4179,6 +4285,7 @@ async function renderCreatorDashboard(options) {
     if (prevScrollTop) box.scrollTop = prevScrollTop;
     document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
     if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+    if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
 
     // Auto-sync check for lists linked to external URLs if >24 hours stale
     try {
@@ -4290,6 +4397,13 @@ function buildLocalListCardHtml(l) {
     const cwRemoveId = it.showId || it.imdbId || it.id;
     if (l.slug === 'continue-watching' && cwRemoveId) {
       removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+    } else if (l.slug === 'airing-next' && cwRemoveId) {
+      // The dashboard renders Airing Next through buildAiringNextCardHtml
+      // (21_client-custom-list-builder.js), which has its own copy of this
+      // button. This branch is for anything that reaches the generic card
+      // with the airing-next slug, so the shelf never renders an "x" that
+      // removes the wrong thing -- or, worse, none at all.
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeAiringNextShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Airing Next">&times;</button>';
     } else if (isWatchlist) {
       removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
     } else if (l.slug === 'watch-history') {
@@ -4564,6 +4678,7 @@ function renderLocalCustomListsDashboard(box, silent) {
   if (prevScrollTop) box.scrollTop = prevScrollTop;
   document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
   if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+  if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
 }
 
 

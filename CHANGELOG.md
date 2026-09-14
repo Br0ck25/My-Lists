@@ -6,6 +6,58 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 📺 Airing Next: take one show off the shelf without unwatching anything
+
+- **What was missing**: Airing Next lists the next upcoming episode of every show with at least one watched
+  episode, and there was no way to say "not this one". The only ways to get a show off it were to remove its
+  Watch History entries or to mark the whole show unwatched -- both of which throw away the very record the
+  person wanted to keep, and both of which change what is watched everywhere else in the app.
+- **The "x" on an Airing Next poster** (dashboard card and the full-page view) now removes just that show
+  from just that shelf. Watch History is untouched, every watched badge stays, and Continue Watching is not
+  involved at all.
+- **Watching another episode brings it back.** The removal is stored as the watched episode it was made at
+  -- the same shape `dismissContinueWatchingShow` has always used for Continue Watching -- not as a
+  permanent flag. Watching a later episode supersedes it and the show returns on its own, which is what
+  makes this a "stop reminding me" rather than a "never show me again". Rewatching an older episode does
+  not: nothing about what airs next has changed. The record is dropped once it is superseded, so the stored
+  set stays the size of what is actually removed.
+- **Applied in one place**: `collectAiringNextCandidateShowIds`, which every rebuild starts from -- the
+  6-hourly TMDB refresh, the immediate watch-state sync, the dashboard card's own eligibility check, and the
+  list pushed to the `autotrack:airing-next:series:<username>` Stremio catalog. A removal that only reached
+  the renderer would have lasted until the next refresh and no longer.
+- **Carried on the account, not just the browser.** The shelf is recomputed from Watch History by every
+  device that loads the page, so a removal that lived only where it was made would be undone by the next
+  device to rebuild and push. It now travels with the tracking record: new columns `airing_removed_season`
+  and `airing_removed_episode` on `creator_show_states` (**migration 0012**, listed in the schema manifest
+  the `/admin` panel reports on). The Worker checks for the columns before writing them and falls back to
+  the pre-0012 statement when they are absent, so a deployment that has not run the migration keeps syncing
+  everything else -- it just cannot remember removals. A push that does not mention removals at all (an
+  older browser) is treated as having no opinion rather than as saying there are none, so an ordinary
+  autosave cannot clear them.
+- **A way back by hand**: a "Removed from Airing Next" panel in Settings -> Account & Sync lists what has
+  been removed and puts one back, for the show that was removed by mistake and is not currently being
+  watched. Hidden entirely when nothing is removed.
+- **Found on the way**: `compactCustomListItem` -- which every local list save runs every item through --
+  dropped `canonicalTmdbId`, the resolved TMDB id an Airing Next entry is deduped and badge-matched by. The
+  field therefore existed only between the shelf being computed and the map being saved, so the dedupe in
+  `refreshAiringNext` and the Continue Watching badge match in `buildLocalListCardHtml` were both reading
+  something that was never there on a reload. It is kept now, which is also what lets a removal cover both
+  ids a show can be recorded under.
+
+### ⏳ "Reset Account Data" looked like nothing was happening
+
+- **What was wrong**: the reset clears this browser first and only then waits on the server -- deliberately,
+  so no autosave or scrobble can push the old lists back into the account being emptied. The cost is a
+  second or two in which the confirm dialog has already closed, every list on screen has already vanished,
+  and nothing says why. That is indistinguishable from a reset that failed, and pressing Reset again is the
+  obvious thing to try.
+- **A working dialog now covers the gap**, put up before the local clear rather than after the request, and
+  replaced by the success or failure dialog when the round trip finishes. New `showAppBusy` next to
+  `showAppAlert`/`showAppConfirm`, so the next slow action has one to use.
+- **The spinner now spins.** Two places asked for `animation: spin` and the page declared no `@keyframes
+  spin` at all, so both -- the new dialog and "Generating install link..." -- sat perfectly still. A test
+  now fails on any animation used by name and never declared.
+
 ### 🔁 New on Streaming: read whole catalogues, and notice when a title leaves
 
 Two defects in the sweep shipped in the entry below, both found by running it and asking it questions.

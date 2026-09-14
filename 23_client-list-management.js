@@ -1170,6 +1170,8 @@ function livePreviewPosterHtml(m) {
   const cwRemoveTarget = m.removeShowId || (isCwItem ? (m.showId || m.id || m.imdbId) : null);
   if (cwRemoveTarget) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="cw" data-remove-id="' + escapeAttr(cwRemoveTarget) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Continue Watching">&times;</button>';
+  } else if (m.removeAiringShowId) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="airing" data-remove-id="' + escapeAttr(m.removeAiringShowId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Airing Next">&times;</button>';
   } else if (m.removeWatchlistId) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="watchlist" data-remove-id="' + escapeAttr(m.removeWatchlistId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watchlist">&times;</button>';
   } else if (m.removeHistoryId) {
@@ -1293,13 +1295,15 @@ function removeListItemFromDetails(btn) {
     Object.keys(window._listPreloadedCache).forEach((k) => {
       const cache = window._listPreloadedCache[k];
       if (cache && Array.isArray(cache.sample)) {
-        cache.sample = cache.sample.filter((it) => it && String(it.id || it.removeShowId || it.removeWatchlistId || it.removeHistoryId) !== targetId);
+        cache.sample = cache.sample.filter((it) => it && String(it.id || it.removeShowId || it.removeAiringShowId || it.removeWatchlistId || it.removeHistoryId) !== targetId);
       }
     });
   }
 
   if (type === 'cw') {
     if (typeof dismissContinueWatchingShow === 'function') dismissContinueWatchingShow(targetId, btn);
+  } else if (type === 'airing') {
+    if (typeof removeAiringNextShow === 'function') removeAiringNextShow(targetId, btn);
   } else if (type === 'watchlist') {
     if (typeof removeWatchlistItemDirect === 'function') removeWatchlistItemDirect(targetId, btn);
   } else if (type === 'history') {

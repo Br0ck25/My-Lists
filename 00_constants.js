@@ -908,5 +908,13 @@ const D1_SCHEMA_MANIFEST = [
     migration: "0011", kind: "index", name: "idx_streaming_events_tmdb",
     consequence: "The sweep's \"which of these titles do I already have\" lookup scans the table once per page walked, and so does the episode re-bump. Slower, not broken.",
   },
+  {
+    migration: "0012", kind: "column", table: "creator_show_states", name: "airing_removed_season",
+    consequence: "Removing a show from Airing Next stops sticking: the removal cannot be stored on the account, so it holds only in the browser that made it and any other device puts the show back. Everything else about tracking keeps working -- the Worker checks for this column and writes the older statement without it.",
+  },
+  {
+    migration: "0012", kind: "column", table: "creator_show_states", name: "airing_removed_episode",
+    consequence: "The other half of the pair above; without it a stored removal has no episode to be superseded by, so watching another episode could not bring the show back.",
+  },
 ];
 

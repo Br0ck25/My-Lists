@@ -1,5 +1,82 @@
 # Changes Log
 
+## 2026-09-14 - Airing Next gets a remove, and Reset Account Data stops looking stuck
+
+### Files Changed
+`00_constants.js`, `02_http-and-creator-utils.js`, `09_page-shell.js`, `15_tab-settings-html.js`,
+`16_client-row-core.js`, `21_client-custom-list-builder.js`, `22_client-creator-profile.js`,
+`23_client-list-management.js`, `24_client-backup-restore-presets.js`,
+`26_api-creator-and-admin-routes.js`, `schema.sql`,
+`migrations/0012_add_airing_next_removals.sql`, `worker_entry_combined.js`, `CHANGELOG.md`, `Changes.md`,
+`FUNCTION-MAP.md`, `README.md`, `tests/client.test.mjs`, `tests/worker.test.mjs`
+
+### Root Cause
+
+Two reports. "Reset Account Data takes a sec or two to complete and the user has no idea what is happening
+during this time," and "airing next, add a remove feature to allow a user to stop seeing airing next for a
+show but keep the episodes they currently have marked as watched and if they watch another episode it gets
+added back to airing next."
+
+**Reset.** `openResetAccountModal` clears this browser *before* it calls the server, and the comment above it
+explains why: the reverse order leaves a window in which an autosave or a scrobble can push the old lists
+straight back into the account that was just emptied. What it costs is a gap -- the confirm dialog has closed,
+`clearLocalAccountData` has emptied every shelf on screen, and the fetch has not answered yet. Nothing at all
+was rendered during that gap, so a successful reset and a failed one looked identical for a second or two.
+
+**Airing Next.** The shelf is derived, not stored: `collectAiringNextCandidateShowIds` takes every show with a
+watched episode and `refreshAiringNext` asks TMDB for each one's next air date. Nothing in that pipeline had a
+notion of "not this show", so the only ways off the shelf were to delete the show's Watch History rows or mark
+the whole show unwatched -- both of which destroy the record the person wanted to keep. The shape for the fix
+was already in the file: `dismissContinueWatchingShow` records a *watched snapshot* rather than a flag, so
+watching a newer episode supersedes the dismissal on its own.
+
+### What changed -- Airing Next removals
+
+**Client (`21`)** -- `removeAiringNextShow` records `{seasonNum, episodeNum}` for the show (its furthest-along
+watched episode, via the new shared `latestWatchedEpisodeForShowIds`, which `dismissContinueWatchingShow` now
+uses too), drops it from the cached shelf and pushes the shortened list with `intentionalRemoval` -- which is
+what lets an empty shelf replace a stored one, since save-tracking otherwise refuses that.
+`isAiringNextRemoved` is the only place the rule lives and is a pure read; `collectAiringNextCandidateShowIds`
+applies it, which covers the 6-hourly refresh, the watch-state sync, the dashboard card's eligibility check
+and the Stremio catalog push in one. `pruneSupersededAiringRemovals` (called from `syncAiringNextWatchState`,
+where watch state has just moved) drops a record the person has already passed.
+
+**UI (`21`, `22`, `23`)** -- an "x" on every Airing Next poster: the dashboard card, the generic list card,
+and the full-page view (a `removeAiringShowId` field on the sample, deliberately not `removeShowId`, which
+`livePreviewPosterHtml` reads as "this is a Continue Watching tile"). A "Removed from Airing Next" panel in
+Settings -> Account & Sync (`15`, `22`) lists what is removed and puts one back; hidden when empty.
+
+**Found on the way (`22`)** -- `compactCustomListItem` runs over every item on every local list save and
+did not carry `canonicalTmdbId` through, so the resolved TMDB id that `refreshAiringNext`'s dedupe and
+`buildLocalListCardHtml`'s badge matching both key on survived only until the next save. Kept now; it is also
+what lets a removal cover both ids one show can be recorded under.
+
+**Sync (`22`, `26`, `02`, `schema.sql`, `migrations/0012`)** -- the shelf is rebuilt from Watch History by
+every device, so a removal held only where it was made is undone by the next device to rebuild and push. It
+travels with the tracking record as `removedAiringNext` and lands in two new `creator_show_states` columns.
+The write probes for those columns first (`d1HasAiringRemovalColumns`) and falls back to the pre-0012
+statement when they are absent, so an unmigrated deployment keeps syncing everything else. A payload with no
+`removedAiringNext` at all is treated as "no opinion", not "none" -- both in the D1 write and in the blob the
+route stores -- so an older browser's ordinary autosave cannot clear the account's removals.
+
+### What changed -- Reset Account Data
+
+**Client (`16`, `22`, `09`)** -- a new `showAppBusy` beside `showAppAlert`/`showAppConfirm`: a dialog with a
+spinner and no buttons, raised *before* the local clear and replaced by the outcome dialog when the request
+finishes. And the spinner actually turns now -- `animation: spin` was referenced in two places and
+`@keyframes spin` was declared in none.
+
+### Tests
+
+Client: a removal leaves Watch History whole, keeps the show out of the candidate set a rebuild starts from,
+comes back when a later episode is watched and does not when an older one is rewatched, is forgotten once
+superseded, can be undone from Settings, reaches the account with `intentionalRemoval`, and is applied (and
+filtered out of an already-computed shelf) when another device made it. The reset shows the working dialog
+before anything disappears and always lands on an outcome dialog, and no animation may be used by name
+without being declared. Worker: the removal survives the save/load round trip and reaches
+`creator_show_states`; a write that omits it leaves the stored ones alone; a database without migration 0012
+still stores Watch History, Continue Watching and Airing Next, and reports no removals rather than failing.
+
 ## 2026-09-09 - Discover: a header and Refresh on every sub-nav tab, and poster previews that retry
 
 ### Files Changed

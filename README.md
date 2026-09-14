@@ -45,6 +45,11 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 ### Continue Watching & Background Watch Sync
 - Automatically tracks watch progress and next unwatched episode per show.
 - Mark titles as watched/unwatched directly from the UI or scrobble integrations.
+- **Airing Next** lists the next upcoming episode of every show you have watched, soonest first. The **x** on
+  a poster takes one show off that shelf without changing a thing about what you have watched -- and watching
+  another episode of it puts it back by itself. Settings -> Account & Sync lists what you have removed if you
+  want one back sooner. Needs `migrations/0012_add_airing_next_removals.sql` to remember removals across
+  devices; without it everything else still syncs and a removal holds only in the browser that made it.
 - **Scheduled Cron Worker**: Automatically queries TMDB every 6 minutes via Cloudflare Cron Triggers (`*/6 * * * *`, cursor-paginated so it does not re-sweep every account on every tick) to find newly-aired episodes for caught-up shows and push them to Continue Watching, to record what has arrived on each streaming service for [New on Streaming](#new-on-streaming), and to keep the shared provider charts pre-warmed in KV.
 
 ### Creator Profiles & Cloud Sync

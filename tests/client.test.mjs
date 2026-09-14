@@ -3569,3 +3569,318 @@ describe("client: Live Preview proves who is asking before reading a personal sh
       "a signed-out browser has no ownership to claim over someone else's shelf");
   });
 });
+
+describe("client: taking one show off Airing Next", () => {
+  const LOAD = "/api/creator/sync/load";
+  const SAVE_TRACKING = "/api/creator/sync/save-tracking";
+  const BATCH = "/api/details/batch";
+
+  // A show with three watched episodes and an upcoming one on the shelf,
+  // alongside a second show that must be left entirely alone.
+  const seedShelf = (client) => {
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history", name: "Watch History", type: "series",
+        items: [
+          { id: "ttB:4:7", showId: "ttB", showTitle: "Removed Show", type: "episode", seasonNum: 4, episodeNum: 7, watchedAt: 30 },
+          { id: "ttB:4:6", showId: "ttB", showTitle: "Removed Show", type: "episode", seasonNum: 4, episodeNum: 6, watchedAt: 20 },
+          { id: "ttA:1:1", showId: "ttA", showTitle: "Kept Show", type: "episode", seasonNum: 1, episodeNum: 1, watchedAt: 10 },
+        ],
+        updatedAt: 1000,
+      },
+      "airing-next": {
+        slug: "airing-next", name: "Airing Next", type: "series",
+        items: [
+          { id: "ttA", showId: "ttA", showTitle: "Kept Show", airDate: "2099-01-01", seasonNum: 1, episodeNum: 2 },
+          { id: "ttB", showId: "ttB", showTitle: "Removed Show", airDate: "2099-02-02", seasonNum: 4, episodeNum: 8 },
+        ],
+        updatedAt: 1000,
+      },
+    });
+  };
+
+  const shelfIds = (client) =>
+    ((client.call("loadLocalCustomLists")["airing-next"] || {}).items || []).map((it) => it.showId);
+  const historyIds = (client) =>
+    ((client.call("loadLocalCustomLists")["watch-history"] || {}).items || []).map((it) => it.id);
+
+  it("takes the show off the shelf without touching what is watched", () => {
+    const client = loadClient();
+    seedShelf(client);
+
+    client.call("removeAiringNextShow", "ttB", null);
+
+    assert.deepEqual(shelfIds(client), ["ttA"], "only the removed show leaves the shelf");
+    // The whole point of the feature: a removal says nothing about what has
+    // been watched, so every episode stays exactly where it was.
+    assert.deepEqual(historyIds(client).sort(), ["ttA:1:1", "ttB:4:6", "ttB:4:7"]);
+    // Recorded at the furthest-along watched episode, which is what a later
+    // one supersedes. (Field by field: the object was built inside the
+    // bundle's own realm, so it is not deep-equal to a plain one out here.)
+    const mark = client.window._removedAiringNext.ttB;
+    assert.equal(mark.seasonNum, 4);
+    assert.equal(mark.episodeNum, 7);
+  });
+
+  it("keeps it off when the shelf is rebuilt", () => {
+    const client = loadClient();
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+
+    // collectAiringNextCandidateShowIds is what every rebuild starts from --
+    // the 6-hourly refresh, the watch-state sync, and the dashboard card's own
+    // eligibility check. A removal that did not reach here would last until
+    // the next refresh and no longer.
+    const candidates = [...client.call("collectAiringNextCandidateShowIds")];
+    assert.deepEqual(candidates, ["ttA"]);
+  });
+
+  it("puts it back as soon as another episode is watched", () => {
+    const client = loadClient();
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), true);
+
+    // The next episode of the removed show, watched.
+    const map = client.call("loadLocalCustomLists");
+    map["watch-history"].items.unshift({
+      id: "ttB:4:8", showId: "ttB", showTitle: "Removed Show", type: "episode",
+      seasonNum: 4, episodeNum: 8, watchedAt: 40,
+    });
+    client.call("saveLocalCustomListsMap", map);
+
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), false,
+      "watching on is how the show comes back -- there is no second switch to flip");
+    assert.ok([...client.call("collectAiringNextCandidateShowIds")].includes("ttB"));
+  });
+
+  it("stays removed when an older episode is rewatched", () => {
+    const client = loadClient();
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+
+    const map = client.call("loadLocalCustomLists");
+    map["watch-history"].items.unshift({
+      id: "ttB:1:1", showId: "ttB", showTitle: "Removed Show", type: "episode",
+      seasonNum: 1, episodeNum: 1, watchedAt: 50,
+    });
+    client.call("saveLocalCustomListsMap", map);
+
+    // Rewatching season 1 is not "I am following this again" -- the shelf is
+    // about what airs next, and nothing about what airs next has changed.
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), true);
+  });
+
+  it("forgets a removal once it has been superseded", () => {
+    const client = loadClient();
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+
+    const map = client.call("loadLocalCustomLists");
+    map["watch-history"].items.unshift({
+      id: "ttB:5:1", showId: "ttB", showTitle: "Removed Show", type: "episode",
+      seasonNum: 5, episodeNum: 1, watchedAt: 60,
+    });
+    client.call("saveLocalCustomListsMap", map);
+
+    assert.equal(client.call("pruneSupersededAiringRemovals"), true);
+    assert.deepEqual(Object.keys(client.window._removedAiringNext), [],
+      "otherwise the stored set grows by one entry per show, forever");
+  });
+
+  it("can be undone by hand from Settings", async () => {
+    const client = loadClient({ routes: { [BATCH]: () => ({ json: { ok: true, results: {} } }) } });
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+    const removedRows = client.call("getRemovedAiringNextShows");
+    assert.equal(removedRows.length, 1);
+    assert.equal(removedRows[0].title, "Removed Show");
+
+    client.call("restoreAiringNextShow", "ttB");
+    await settle();
+
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), false);
+    assert.ok([...client.call("collectAiringNextCandidateShowIds")].includes("ttB"));
+    assert.equal(client.call("getRemovedAiringNextShows").length, 0);
+  });
+
+  it("puts the x on the full-page view, wired to the right shelf", () => {
+    const client = loadClient();
+    const html = client.call("livePreviewPosterHtml", {
+      id: "ttB", type: "series", name: "Removed Show", showTitle: "Removed Show",
+      removeAiringShowId: "ttB", listUrl: "custom:airing-next",
+    });
+    assert.match(html, /data-remove-type="airing"/);
+    assert.match(html, /data-remove-id="ttB"/);
+    // livePreviewPosterHtml reads removeShowId as "this is a Continue
+    // Watching tile", so an Airing Next tile must not carry it -- the x would
+    // dismiss the show from the wrong shelf and mark it fully watched.
+    assert.doesNotMatch(html, /data-remove-type="cw"/);
+
+    // And the dispatch behind that button reaches the removal, not one of
+    // its four neighbours in the same switch.
+    seedShelf(client);
+    const btn = client.window.document.createElement("button");
+    btn.dataset.removeType = "airing";
+    btn.dataset.removeId = "ttB";
+    client.call("removeListItemFromDetails", btn);
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), true);
+    assert.deepEqual(historyIds(client).sort(), ["ttA:1:1", "ttB:4:6", "ttB:4:7"]);
+  });
+
+  it("covers the second id the same show is recorded under", async () => {
+    // Watch History can hold both an imdb and a tmdb-prefixed id for one
+    // series -- refreshAiringNext dedupes exactly that when it builds the
+    // shelf. Marking only the id the tile was rendered under leaves the other
+    // one a candidate, and the next rebuild puts the show straight back.
+    const client = loadClient({ routes: { [BATCH]: () => ({ json: { ok: true, results: {} } }) } });
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history", name: "Watch History", type: "series",
+        items: [
+          { id: "tt9:1:1", showId: "tt9", showTitle: "Twin Show", type: "episode", seasonNum: 1, episodeNum: 1, watchedAt: 10 },
+          { id: "tmdb:55:1:2", showId: "tmdb:55", showTitle: "Twin Show", type: "episode", seasonNum: 1, episodeNum: 2, watchedAt: 20 },
+        ],
+        updatedAt: 1000,
+      },
+      "airing-next": {
+        slug: "airing-next", name: "Airing Next", type: "series",
+        items: [{ id: "tt9", showId: "tt9", canonicalTmdbId: "55", showTitle: "Twin Show", airDate: "2099-03-03" }],
+        updatedAt: 1000,
+      },
+    });
+
+    client.call("removeAiringNextShow", "tt9", null);
+    assert.deepEqual([...client.call("collectAiringNextCandidateShowIds")], [],
+      "both ids for the removed show have to go, or the shelf rebuilds it under the other one");
+
+    // One show, one row -- and putting it back clears both marks, or the
+    // leftover would go on hiding it.
+    const rows = client.call("getRemovedAiringNextShows");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].title, "Twin Show");
+    client.call("restoreAiringNextShow", rows[0].showIds.join(","));
+    await settle();
+    assert.deepEqual([...client.call("collectAiringNextCandidateShowIds")].sort(), ["tmdb:55", "tt9"]);
+  });
+
+  it("tells the account, so another device does not rebuild the show back on", async () => {
+    const pushes = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice" },
+      routes: {
+        [LOAD]: () => ({ json: { ok: true, data: { watchHistory: [], trackingUpdatedAt: 6000, trackingClientVersion: 3 } } }),
+        [SAVE_TRACKING]: (req) => { pushes.push(req.body); return { json: { ok: true, clientVersion: 4 } }; },
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("markCreatorSyncLoaded");
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+
+    await client.call("pushTrackingSync", { intentionalRemoval: true });
+    await settle();
+
+    assert.equal(pushes.length, 1);
+    assert.deepEqual(pushes[0].removedAiringNext, { ttB: { seasonNum: 4, episodeNum: 7 } });
+    assert.deepEqual(pushes[0].airingNext.map((it) => it.showId), ["ttA"]);
+    // Removing the last show on the shelf sends an empty array, and
+    // save-tracking refuses to let an empty derived list replace a stored one
+    // unless this flag is set -- without it the Stremio row keeps serving the
+    // show that was just removed.
+    assert.equal(pushes[0].intentionalRemoval, true);
+  });
+
+  it("applies a removal made on another device", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice" },
+      routes: {
+        [LOAD]: () => ({ json: { ok: true, data: {
+          trackingUpdatedAt: 6000,
+          trackingClientVersion: 3,
+          removedAiringNext: { ttB: { seasonNum: 4, episodeNum: 7 } },
+        } } }),
+        [SAVE_TRACKING]: () => ({ json: { ok: true, clientVersion: 4 } }),
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    seedShelf(client);
+
+    await client.call("loadCreatorSync");
+    await settle();
+
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), true);
+    // This browser had already computed a shelf with the show on it, so
+    // applying the account's removals has to reach that copy too.
+    assert.deepEqual(shelfIds(client), ["ttA"]);
+  });
+});
+
+describe("client: Reset Account Data says it is working", () => {
+  const RESET = "/api/creator/account/reset";
+
+  // Resetting clears this browser first and only then waits on the server --
+  // deliberately, so nothing can re-upload the old lists into the account
+  // being emptied. The cost is a second or two in which every list on screen
+  // has already vanished and the confirm dialog has already closed. Before
+  // this, nothing at all was on screen during that gap, and pressing Reset
+  // again was the obvious thing to try.
+  const arrange = (client, events, resetResponse) => {
+    client.set("activeCreator", { creatorName: "alice", displayName: "Alice" });
+    client.set("showAppConfirm", (title, msg, btn, onConfirm) => { client.window.__pending = onConfirm(); });
+    client.set("showAppBusy", () => { events.push("busy"); });
+    client.set("showAppAlert", (title) => { events.push("alert:" + title); });
+    client.set("clearLocalAccountData", () => { events.push("cleared"); });
+    return resetResponse;
+  };
+
+  it("puts a working dialog up before anything disappears, and replaces it with the result", async () => {
+    const events = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice" },
+      routes: { [RESET]: () => { events.push("request"); return { json: { ok: true, resetAt: 5 } }; } },
+    });
+    arrange(client, events);
+
+    client.call("openResetAccountModal");
+    await client.window.__pending;
+    await settle();
+
+    assert.deepEqual(events, ["busy", "cleared", "request", "alert:Account Reset"],
+      "the working dialog goes up before the local clear, and the outcome dialog replaces it");
+  });
+
+  it("still lands on a dialog when the reset fails", async () => {
+    const events = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice" },
+      routes: { [RESET]: () => { events.push("request"); return { status: 500, json: { ok: false, error: "Nope." } }; } },
+    });
+    arrange(client, events);
+
+    client.call("openResetAccountModal");
+    await client.window.__pending;
+    await settle();
+
+    // A spinner left turning over a finished request is worse than no
+    // spinner at all.
+    assert.equal(events[events.length - 1], "alert:Reset Failed");
+  });
+
+  it("ships the animation the spinner is named after", () => {
+    // Two places asked for `animation: spin` and the page declared no such
+    // keyframes, so both spinners sat perfectly still -- a progress indicator
+    // that does not move says "stuck", which is the exact impression this is
+    // here to remove. Cheap to lose again in a CSS edit, so it is asserted.
+    const html = renderPage();
+    assert.match(html, /@keyframes spin\b/, "the page must declare the animation it uses by name");
+    for (const m of html.matchAll(/animation:\s*([A-Za-z_-][\w-]*)/g)) {
+      // `animation: none` is the CSS keyword for "no animation", not a name.
+      if (m[1] === "none") continue;
+      assert.match(html, new RegExp("@keyframes\\s+" + m[1] + "\\b"),
+        `animation "${m[1]}" is used but never declared`);
+    }
+  });
+});

@@ -2469,6 +2469,7 @@ renderCreatorProfileBar();
 renderAccountKeySection();
 if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
 if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
 renderTrackPlaybackSection();
 renderCreatorDashboard();
 if (typeof pickUpMdblistTokenFromUrl === 'function') pickUpMdblistTokenFromUrl();
