@@ -2142,13 +2142,11 @@
       // the same helper, as the sync blobs: see nextSyncVersion.
       const updatedAt = nextSyncVersion(storedUpdatedAt);
       if (env.DB) {
-        let d1Success = false;
         try {
           const listId = `${auth.username}:${slug}`;
           await env.DB.prepare(
             "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
           ).bind(listId, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, updatedAt, order.length).run();
-          d1Success = true;
         } catch (dbErr) {
           const backfilled = await backfillCreatorRowInD1(env, auth.username);
           if (backfilled) {
@@ -2156,7 +2154,6 @@
               await env.DB.prepare(
                 "INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, type=excluded.type, visibility=excluded.visibility, items_json=excluded.items_json, updated_at=excluded.updated_at"
               ).bind(`${auth.username}:${slug}`, auth.username, name, type, visibility, itemsJson, likes || 0, createdAt, updatedAt, order.length).run();
-              d1Success = true;
             } catch (retryErr) {
               console.error("D1 write error (creatorlist put, after creator backfill):", retryErr);
             }
@@ -2174,6 +2171,14 @@
       // Unconditional -- KV must not be allowed to hold a stale copy of a
       // list that D1 has since updated, because the public read paths
       // (/lists/:user/:slug, the directory, search) all read KV.
+      //
+      // And unlike the tracking record, a D1 failure above is NOT reported as a
+      // failed save, because it genuinely is not one: this write lands in KV
+      // either way, and getCreatorList compares the two stamps on every read
+      // ("If KV has a fresher edit because a D1 write was dropped, prefer KV
+      // and repair D1"). The list recovers by itself. There used to be a
+      // `d1Success` flag here tracking that outcome and nothing ever read it;
+      // this comment is what it was reaching for.
       const kvPayload = { name, slug, type, items, visibility, likes, createdAt, updatedAt };
       if (finalSourceUrl) kvPayload.sourceUrl = finalSourceUrl;
       if (finalSynced) kvPayload.synced = true;
@@ -2743,7 +2748,7 @@
               for (const sItem of serverCwList) {
                 if (sItem && (sItem.showId || sItem.id)) {
                   const sKey = String(sItem.showId || sItem.id);
-                  const baseKey = sKey.split(':')[0];
+                  const baseKey = trackingShowKey(sKey);
                   if (!sItem.isCompanion && (fullyWatchedSet.has(sKey) || fullyWatchedSet.has(baseKey) || (sItem.showId && fullyWatchedSet.has(String(sItem.showId))))) {
                     continue;
                   }
@@ -2756,7 +2761,7 @@
               for (const cItem of incomingCwList) {
                 if (cItem && (cItem.showId || cItem.id)) {
                   const cKey = String(cItem.showId || cItem.id);
-                  const baseKey = cKey.split(':')[0];
+                  const baseKey = trackingShowKey(cKey);
                   if (!handledShows.has(cKey) && !handledShows.has(baseKey)) {
                     mergedCw.push(cItem);
                     handledShows.add(cKey);
@@ -2877,7 +2882,7 @@
               for (const qItem of queueCw) {
                 if (qItem && (qItem.showId || qItem.id)) {
                   const qKey = String(qItem.showId || qItem.id);
-                  const baseKey = qKey.split(':')[0];
+                  const baseKey = trackingShowKey(qKey);
                   if (!qItem.isCompanion && (fullyWatchedSet.has(qKey) || fullyWatchedSet.has(baseKey) || (qItem.showId && fullyWatchedSet.has(String(qItem.showId))))) {
                     continue;
                   }
@@ -2889,7 +2894,7 @@
               for (const bItem of (Array.isArray(body.continueWatching) ? body.continueWatching : [])) {
                 if (bItem && (bItem.showId || bItem.id)) {
                   const bKey = String(bItem.showId || bItem.id);
-                  const baseKey = bKey.split(':')[0];
+                  const baseKey = trackingShowKey(bKey);
                   if (!handledShows.has(bKey) && !handledShows.has(baseKey)) {
                     mergedCw.push(bItem);
                     handledShows.add(bKey);
@@ -2951,11 +2956,39 @@
       if (serialized.length > 24 * 1024 * 1024) {
         return json({ ok: false, error: "Your Watch History is too large to store (over the 25MB limit)." });
       }
-      if (env.DB) {
-        await saveCreatorTrackingD1(env, auth.username, blob, !!body.intentionalRemoval);
-      }
+      // A D1 write that did not land must not be reported as a save.
+      //
+      // saveCreatorTrackingD1 returns false on failure and that value was
+      // dropped on the floor, so this route answered ok:true with a new
+      // clientVersion whatever happened. D1 is what /api/creator/sync/load and
+      // every personal catalog row read FIRST, so the account then served the
+      // pre-save state -- and the browser, told the push succeeded, advanced its
+      // baseline (saveSyncBaselines) and recorded the pushed stamps
+      // (recordTrackingLocalBaseline). On the next load shouldLocalOnlyTracking
+      // therefore judged its own unsaved items stale and dropped them. A
+      // transient D1 error turned into permanent, silent data loss, with a
+      // console line the only trace.
+      //
+      // KV is written first and kept either way: it holds the only surviving
+      // copy of this push, which is what getCreatorList's kvIsFresher repair
+      // exists to recover from on the list side. Then the failure is reported,
+      // so the browser keeps its copy and retries.
+      let trackingD1Ok = true;
       try {
         await env.CONFIGS.put(`creatorsynctracking:${auth.username}`, serialized);
+      } catch (e) {
+        return json({ ok: false, error: "Could not save to storage right now. Please try again in a moment." }, 500);
+      }
+      if (env.DB) {
+        trackingD1Ok = await saveCreatorTrackingD1(env, auth.username, blob, !!body.intentionalRemoval);
+      }
+      if (!trackingD1Ok) {
+        return json({
+          ok: false,
+          error: "Could not save your Watch History right now. Your changes are still here -- please try again in a moment.",
+        }, 500);
+      }
+      try {
         if (Array.isArray(body.watchlist)) {
           const wlRaw = await getCreatorList(env, auth.username, "watchlist");
           let wlObj = null;

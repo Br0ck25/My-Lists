@@ -5874,6 +5874,123 @@ describe("AIII fix: the low-severity cleanup", () => {
   });
 });
 
+describe("Tracking writes: a save that did not land must not report success", () => {
+  const seed = async (env, name) => {
+    const u = await createUser(env, name);
+    return { creatorName: name, creatorKey: u.creatorKey };
+  };
+
+  // DB-001. continue_watching and airing_next are keyed (username, show_id) and
+  // their INSERTs carried no ON CONFLICT, so ONE duplicated show id in a
+  // client-supplied array raised a UNIQUE violation -- and a D1 batch is one
+  // transaction, so it took the meta row, the show states, Continue Watching,
+  // Airing Next and Watch History down with it. The route answered ok:true.
+  it("a duplicated show id does not discard the whole tracking write", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "dupeguard");
+
+    const r = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      intentionalRemoval: true,
+      watchHistory: [{ id: "ttA:1:1", showId: "ttA", seasonNum: 1, episodeNum: 1, watchedAt: 10 }],
+      continueWatching: [
+        { id: "ttB:1:1", showId: "ttB", name: "first", seasonNum: 1, episodeNum: 1 },
+        { id: "ttB:1:2", showId: "ttB", name: "second", seasonNum: 1, episodeNum: 2 },
+      ],
+      airingNext: [
+        { id: "ttC:2:1", showId: "ttC", name: "an-first", airDate: "2099-01-01" },
+        { id: "ttC:2:2", showId: "ttC", name: "an-second", airDate: "2099-02-02" },
+      ],
+    }});
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+
+    // The duplicate collapses to one row, and -- the point -- everything else
+    // in the same write survived.
+    assert.equal(env.DB.q("SELECT show_id FROM continue_watching").length, 1);
+    assert.equal(env.DB.q("SELECT show_id FROM airing_next").length, 1);
+    assert.equal(env.DB.q("SELECT item_id FROM watch_history").length, 1);
+    assert.equal(env.DB.q("SELECT username FROM creator_tracking_meta").length, 1);
+    // First occurrence wins, matching the client's own dedupe.
+    assert.equal(env.DB.q("SELECT name FROM continue_watching")[0].name, "first");
+  });
+
+  // BE-001. saveCreatorTrackingD1 returns false on failure and the route dropped
+  // that value, so a D1 outage answered ok:true -- and because D1 is what
+  // /api/creator/sync/load reads first, the browser was then told its push had
+  // landed, advanced its baseline, and discarded its own copy on the next load.
+  it("a failed D1 tracking write is reported, not swallowed", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "d1failguard");
+
+    env.DB.failWhen((sql) => /INSERT INTO watch_history/i.test(sql));
+    const r = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      watchHistory: [{ id: "ttZ:1:1", showId: "ttZ", seasonNum: 1, episodeNum: 1, watchedAt: 5 }],
+    }});
+    env.DB.failWhen(null);
+
+    assert.equal(r.status, 500, "a tracking write that did not reach D1 must not answer 200");
+    assert.equal(r.body.ok, false);
+    // KV still holds the push, so nothing the user did was thrown away.
+    const kept = JSON.parse(env.CONFIGS._store.get("creatorsynctracking:d1failguard"));
+    assert.equal(kept.watchHistory.length, 1);
+  });
+
+  // The other half of BE-001: with KV holding a copy D1 does not have, the
+  // authoritative read has to notice rather than serve the stale one. This is
+  // the repair getCreatorList has carried for list records all along.
+  it("a KV tracking record newer than D1 wins, and repairs D1", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "freshguard");
+
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      watchHistory: [{ id: "tt1:1:1", showId: "tt1", seasonNum: 1, episodeNum: 1, watchedAt: 1 }],
+    }});
+
+    // A push that reached KV and not D1 -- exactly what a dropped D1 write
+    // leaves behind.
+    const blob = JSON.parse(env.CONFIGS._store.get("creatorsynctracking:freshguard"));
+    blob.watchHistory.push({ id: "tt2:1:1", showId: "tt2", seasonNum: 1, episodeNum: 1, watchedAt: 2 });
+    blob.updatedAt = Date.now() + 60000;
+    env.CONFIGS._store.set("creatorsynctracking:freshguard", JSON.stringify(blob));
+
+    const loaded = await call(env, "/api/creator/sync/load", { method: "POST", json: cred });
+    assert.equal(loaded.status, 200);
+    assert.equal(loaded.body.data.watchHistory.length, 2,
+      "the load served D1's stale copy instead of the newer one in KV");
+  });
+
+  // DB-002. The Continue Watching merge reduced a show id to its show with
+  // split(':')[0]. For "tmdb:222" that is the literal "tmdb", so one
+  // server-side tmdb: entry marked every incoming tmdb: show as handled and
+  // dropped it -- on an ordinary autosave, with ok:true.
+  it("a tmdb-prefixed show id is not collapsed onto the namespace", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "nskeyguard");
+
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred, intentionalRemoval: true,
+      continueWatching: [{ id: "tmdb:111:1:1", showId: "tmdb:111", name: "One", seasonNum: 1, episodeNum: 1 }],
+    }});
+
+    const r = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      continueWatching: [
+        { id: "tmdb:111:1:1", showId: "tmdb:111", name: "One", seasonNum: 1, episodeNum: 1 },
+        { id: "tmdb:222:3:4", showId: "tmdb:222", name: "Two", seasonNum: 3, episodeNum: 4 },
+        { id: "tmdb:333:2:9", showId: "tmdb:333", name: "Three", seasonNum: 2, episodeNum: 9 },
+        { id: "tt444:1:1", showId: "tt444", name: "Four", seasonNum: 1, episodeNum: 1 },
+      ],
+    }});
+    assert.equal(r.status, 200);
+    const stored = env.DB.q("SELECT show_id FROM continue_watching ORDER BY show_id").map((x) => x.show_id);
+    assert.deepEqual(stored, ["tmdb:111", "tmdb:222", "tmdb:333", "tt444"],
+      "tmdb-namespaced shows were dropped by the merge");
+  });
+});
+
 describe("A15: a fresh schema.sql and a migrated database must be the same shape", () => {
   it("schema.sql declares every index the migrations create", async () => {
     const { DatabaseSync } = await import("node:sqlite");

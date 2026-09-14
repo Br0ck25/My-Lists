@@ -3275,6 +3275,36 @@ async function getCreator(env, username) {
 // Only three slugs have a share flag -- /api/creator/sync/share-tracking's
 // ALLOWED_SHARE_SLUGS -- so `airing-next` is owner-only, which is what "not
 // expressible as shared" has to mean if the default is private.
+// The show a tracking entry belongs to, from whatever id it carries.
+//
+// Entries are keyed on a show id that may be namespaced ("tmdb:1399") and may
+// have season/episode appended ("tt0944947:1:2", "tmdb:1399:1:2"). Three places
+// reduced one to its show by `id.split(':')[0]`, which is right for the IMDb
+// shape and catastrophically wrong for the TMDB one: "tmdb:1399".split(':')[0]
+// is the literal string "tmdb", so EVERY tmdb-namespaced show collapsed onto a
+// single key.
+//
+// What that cost, measured:
+//   * /api/creator/sync/save-tracking's Continue Watching merge marked "tmdb"
+//     handled after the first server-side entry and dropped every incoming
+//     tmdb: show behind it -- four shows pushed, two stored, ok:true returned;
+//   * fetchAutoTrackedCatalog matched every tmdb: Continue Watching row to the
+//     FIRST tmdb: Airing Next entry, so unrelated shows inherited each other's
+//     air dates and season-finale badges.
+//
+// The client has always got this right (dedupeContinueWatchingItems,
+// 21_client-custom-list-builder.js, keeps "tmdb:" + the id after it). This is
+// that rule, server-side, in one place so the two cannot drift apart again.
+function trackingShowKey(rawId) {
+  const s = String(rawId == null ? "" : rawId);
+  if (!s) return "";
+  if (s.startsWith("tmdb:")) {
+    const parts = s.split(":");
+    return parts.length >= 2 ? parts[0] + ":" + parts[1] : s;
+  }
+  return s.split(":")[0];
+}
+
 const TRACKED_SHELF_SHARE_SLUGS = new Set(["watchlist", "watch-history", "continue-watching"]);
 
 // The opt-in flags: D1 first (authoritative), KV otherwise, {} on anything
@@ -3648,6 +3678,50 @@ async function checkD1Schema(env) {
 
 // --- Phase 4: Relational D1 Storage for Sync Tracking & User Lists -----------
 
+// Replaces a set of rows for one account WITHOUT a blanket delete.
+//
+// Every "replace the whole set" here used to be `DELETE WHERE username = ?`
+// followed by plain INSERTs, and both halves were wrong in the same way.
+//
+// The INSERTs carried no ON CONFLICT clause while continue_watching and
+// airing_next are keyed (username, show_id) -- so ONE duplicated show id in a
+// client-supplied array raised a UNIQUE violation, and since a D1 batch is one
+// transaction that rolled back everything in it: the meta row, the show states,
+// Continue Watching, Airing Next and Watch History, all of it. The route then
+// answered ok:true (see its caller), /api/creator/sync/load prefers D1, and the
+// account's tracking state silently stopped moving. watch_history next door had
+// had ON CONFLICT ... DO UPDATE all along.
+//
+// And the statements are chunked, because a whole account can be thousands of
+// them -- so the blanket DELETE could commit in chunk 1 while a later chunk
+// failed, leaving the shelf genuinely emptied rather than merely stale.
+//
+// This inverts the order: read what is there, upsert everything incoming, and
+// delete only the rows that are actually gone, by id, last. A failure anywhere
+// in that sequence leaves stale EXTRAS -- which the next push corrects and the
+// catalog read already filters -- instead of a hole. There is no point at which
+// a partial write has removed something it has not replaced.
+async function d1ReplaceRowsById(env, table, username, keyColumn, keepIds) {
+  const stale = [];
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT ${keyColumn} AS k FROM ${table} WHERE username = ?`
+    ).bind(username).all();
+    for (const row of (results || [])) {
+      const k = row && row.k != null ? String(row.k) : "";
+      if (k && !keepIds.has(k)) stale.push(k);
+    }
+  } catch (e) {
+    // Unreadable right now: skip the prune rather than guess. Stale extras are
+    // the failure mode this whole shape exists to prefer.
+    console.error(`D1 read error (prune ${table}):`, e);
+    return [];
+  }
+  return stale.map((k) =>
+    env.DB.prepare(`DELETE FROM ${table} WHERE username = ? AND ${keyColumn} = ?`).bind(username, k)
+  );
+}
+
 async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   if (!env || !env.DB || !username || !trackingData) return false;
   try {
@@ -3700,10 +3774,13 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       ? trackingData.dismissedContinueWatching
       : {};
 
-    if (isIntentionalRemoval) {
-      stmts.push(env.DB.prepare("DELETE FROM creator_show_states WHERE username = ?").bind(username));
-    }
+    // Deferred to the end and narrowed to the rows that are actually gone --
+    // see d1ReplaceRowsById.
+    const prunes = [];
     const allShows = new Set([...fullyWatched, ...Object.keys(dismissed)]);
+    if (isIntentionalRemoval) {
+      prunes.push(...await d1ReplaceRowsById(env, "creator_show_states", username, "show_id", allShows));
+    }
     for (const sid of allShows) {
       const isFw = fullyWatched.includes(sid) ? 1 : 0;
       const dis = dismissed[sid];
@@ -3724,11 +3801,17 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
 
     // 3. Continue Watching: replace whole set
     if (Array.isArray(trackingData.continueWatching)) {
-      stmts.push(env.DB.prepare("DELETE FROM continue_watching WHERE username = ?").bind(username));
+      // One row per show, and the array is whatever a browser sent -- so it has
+      // to be deduped HERE, on the key this table is actually stored under,
+      // rather than trusted. First occurrence wins, matching the client's own
+      // dedupeContinueWatchingItems (21_client-custom-list-builder.js), so the
+      // two sides cannot disagree about which entry survives.
+      const cwSeen = new Set();
       for (const item of trackingData.continueWatching) {
         if (!item) continue;
         const showId = String(item.showId || item.id || "");
-        if (!showId) continue;
+        if (!showId || cwSeen.has(showId)) continue;
+        cwSeen.add(showId);
         const itemId = String(item.id || showId);
         const name = item.name || null;
         const poster = item.poster || null;
@@ -3754,19 +3837,31 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
         stmts.push(
           env.DB.prepare(
             `INSERT INTO continue_watching (username, show_id, item_id, name, poster, show_title, show_poster, season_num, episode_num, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(username, show_id) DO UPDATE SET
+               item_id = excluded.item_id,
+               name = excluded.name,
+               poster = excluded.poster,
+               show_title = excluded.show_title,
+               show_poster = excluded.show_poster,
+               season_num = excluded.season_num,
+               episode_num = excluded.episode_num,
+               updated_at = excluded.updated_at`
           ).bind(username, showId, itemId, name, poster, showTitle, showPoster, seasonNum, episodeNum, itemUpdated)
         );
       }
+      prunes.push(...await d1ReplaceRowsById(env, "continue_watching", username, "show_id", cwSeen));
     }
 
     // 4. Airing Next: replace whole set
     if (Array.isArray(trackingData.airingNext)) {
-      stmts.push(env.DB.prepare("DELETE FROM airing_next WHERE username = ?").bind(username));
+      // Same key, same reasoning as Continue Watching above.
+      const anSeen = new Set();
       for (const item of trackingData.airingNext) {
         if (!item) continue;
         const showId = String(item.showId || item.id || "");
-        if (!showId) continue;
+        if (!showId || anSeen.has(showId)) continue;
+        anSeen.add(showId);
         const itemId = String(item.id || showId);
         const name = item.name || null;
         const poster = item.poster || null;
@@ -3786,7 +3881,21 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
               username, show_id, item_id, name, poster, show_title, show_poster,
               season_num, episode_num, air_date, is_season_premiere, is_season_finale,
               season_finale_air_date, season_finale_episode_number, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(username, show_id) DO UPDATE SET
+               item_id = excluded.item_id,
+               name = excluded.name,
+               poster = excluded.poster,
+               show_title = excluded.show_title,
+               show_poster = excluded.show_poster,
+               season_num = excluded.season_num,
+               episode_num = excluded.episode_num,
+               air_date = excluded.air_date,
+               is_season_premiere = excluded.is_season_premiere,
+               is_season_finale = excluded.is_season_finale,
+               season_finale_air_date = excluded.season_finale_air_date,
+               season_finale_episode_number = excluded.season_finale_episode_number,
+               updated_at = excluded.updated_at`
           ).bind(
             username, showId, itemId, name, poster, showTitle, showPoster,
             seasonNum, episodeNum, airDate, isSeasonPremiere, isSeasonFinale,
@@ -3794,17 +3903,17 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
           )
         );
       }
+      prunes.push(...await d1ReplaceRowsById(env, "airing_next", username, "show_id", anSeen));
     }
 
     // 5. Watch History
     if (Array.isArray(trackingData.watchHistory)) {
-      if (isIntentionalRemoval) {
-        stmts.push(env.DB.prepare("DELETE FROM watch_history WHERE username = ?").bind(username));
-      }
+      const whSeen = new Set();
       for (const item of trackingData.watchHistory) {
         if (!item) continue;
         const itemId = String(item.id || (item.showId ? `${item.showId}:${item.seasonNum}:${item.episodeNum}` : ""));
-        if (!itemId) continue;
+        if (!itemId || whSeen.has(itemId)) continue;
+        whSeen.add(itemId);
         const itemType = item.type || (item.seasonNum != null ? "episode" : "movie");
         const title = item.name || item.title || null;
         const poster = item.poster || null;
@@ -3840,11 +3949,26 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
           )
         );
       }
+      // Only an INTENTIONAL removal shortens Watch History -- an ordinary
+      // autosave is additive, and the rescue-merge in save-tracking exists
+      // precisely so a stale push cannot shorten it by accident.
+      if (isIntentionalRemoval) {
+        prunes.push(...await d1ReplaceRowsById(env, "watch_history", username, "item_id", whSeen));
+      }
     }
 
+    // Upserts first, deletions last, in that order across the whole write.
+    //
+    // The statements are chunked because one account can be thousands of them
+    // and a D1 batch is one transaction with a real size bound -- so the write
+    // is not atomic end to end, and never was. What IS guaranteed now is the
+    // ordering: nothing is removed until everything that replaces it has
+    // already landed. A chunk that fails partway leaves stale extras, which the
+    // next push corrects; it can no longer leave a hole.
     const CHUNK_SIZE = 80;
-    for (let i = 0; i < stmts.length; i += CHUNK_SIZE) {
-      const chunk = stmts.slice(i, i + CHUNK_SIZE);
+    const ordered = stmts.concat(prunes);
+    for (let i = 0; i < ordered.length; i += CHUNK_SIZE) {
+      const chunk = ordered.slice(i, i + CHUNK_SIZE);
       await env.DB.batch(chunk);
     }
     return true;
@@ -3854,6 +3978,21 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
   }
 }
 
+// D1 is authoritative for this record -- /api/creator/sync/load and every
+// personal catalog row read it first -- so this has to be able to notice when
+// it is NOT the freshest copy.
+//
+// saveCreatorTrackingD1 writes KV first and D1 second, and a D1 write can fail.
+// Its caller now reports that failure (see /api/creator/sync/save-tracking), but
+// a record that was already left behind by an older build, or by a write that
+// failed after the KV half landed, would otherwise be served as the truth for
+// as long as it sat there -- and being "authoritative" would make a stale copy
+// win over a good one.
+//
+// getCreatorList has carried exactly this repair for list records since a
+// previous audit ("If KV has a fresher edit because a D1 write was dropped,
+// prefer KV and repair D1"); the tracking record simply never got it. Same
+// shape: compare the stamps, hand back the newer copy, and say so.
 async function readCreatorTrackingD1(env, username) {
   if (!env || !env.DB || !username) return null;
   try {
@@ -3861,6 +4000,32 @@ async function readCreatorTrackingD1(env, username) {
       "SELECT * FROM creator_tracking_meta WHERE username = ?"
     ).bind(username).first();
     if (!metaRow) return null;
+
+    // A KV copy stamped later than D1's means a push landed in KV and not here.
+    // Returning null hands the caller back to its own KV branch, which is the
+    // copy that actually holds the user's data.
+    if (env.CONFIGS) {
+      try {
+        const kvRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
+        if (kvRaw) {
+          const kvBlob = JSON.parse(kvRaw);
+          const kvStamp = Number(kvBlob && kvBlob.updatedAt) || 0;
+          const d1Stamp = Number(metaRow.updated_at) || 0;
+          if (kvStamp > d1Stamp) {
+            console.warn(
+              `[tracking] D1 is behind KV for ${username} (${d1Stamp} < ${kvStamp}); serving KV and repairing D1.`
+            );
+            // Best-effort repair, not awaited into the read path: if it fails,
+            // the next successful push fixes it and this branch keeps serving
+            // the right answer in the meantime.
+            saveCreatorTrackingD1(env, username, kvBlob, false).catch(() => {});
+            return null;
+          }
+        }
+      } catch {
+        // Unreadable or unparseable KV copy -- D1 is the best answer available.
+      }
+    }
 
     const [whRows, cwRows, anRows, stateRows] = await Promise.all([
       env.DB.prepare(

@@ -1275,7 +1275,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
           items = rows.filter(r => {
             if (!r) return false;
             const sid = String(r.show_id || '');
-            const base = sid.split(':')[0];
+            const base = trackingShowKey(sid);
             const isComp = r.show_title && r.show_title.startsWith('COMPANION:');
             if (!isComp && (fullyWatchedSet.has(sid) || (base && fullyWatchedSet.has(base)))) return false;
             return true;
@@ -1385,7 +1385,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
               if (!it) return false;
               if (it.isCompanion) return true;
               const sid = String(it.showId || it.id || '');
-              const base = sid.split(':')[0];
+              const base = trackingShowKey(sid);
               if (fwSet.has(sid) || (base && fwSet.has(base))) return false;
               return true;
             });
@@ -1405,7 +1405,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
               if (!it) return false;
               if (it.isCompanion) return true;
               const sid = String(it.showId || it.id || '');
-              const base = sid.split(':')[0];
+              const base = trackingShowKey(sid);
               if (fwSet.has(sid) || (base && fwSet.has(base))) return false;
               return true;
             });
@@ -1423,7 +1423,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         if (!an) return;
         const sid = String(an.showId || an.id || '');
         if (sid && !airingByShowId.has(sid)) airingByShowId.set(sid, an);
-        const base = sid.split(':')[0];
+        const base = trackingShowKey(sid);
         if (base && !airingByBaseId.has(base)) airingByBaseId.set(base, an);
         const title = String(an.showTitle || an.title || an.name || '').toLowerCase().trim();
         if (title && !airingByTitle.has(title)) airingByTitle.set(title, an);
@@ -1474,7 +1474,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         if (it.showId && airingByShowId.has(String(it.showId))) airingMatch = airingByShowId.get(String(it.showId));
         else if (it.id && airingByShowId.has(String(it.id))) airingMatch = airingByShowId.get(String(it.id));
         else {
-          const base = String(it.showId || it.id || '').split(':')[0];
+          const base = trackingShowKey(String(it.showId || it.id || ''));
           if (base && airingByBaseId.has(base)) airingMatch = airingByBaseId.get(base);
           else {
             const title = String(it.showTitle || it.title || it.name || '').toLowerCase().trim();

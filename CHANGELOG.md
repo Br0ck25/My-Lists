@@ -37,6 +37,41 @@ the reports now live in `docs/history/`.
   configs, share and un-share. `loadSourceFunctions` now loads several sources into ONE sandbox, because
   loading `05_` without `02_` is a different program from the concatenated Worker, not a smaller one.
 
+### 🧬 Watch History / Continue Watching could be discarded without saying so (2026-09-14)
+- **DB-001 — one duplicated show id discarded the whole write**: `continue_watching` and `airing_next` are
+  keyed `(username, show_id)` and their INSERTs carried no `ON CONFLICT`, so a single repeated show id in a
+  client-supplied array raised a UNIQUE violation. A D1 batch is one transaction, so that took the meta row,
+  the show states, Continue Watching, Airing Next **and** Watch History down with it — and the route answered
+  `ok:true`. `watch_history` next door had had `ON CONFLICT … DO UPDATE` all along. Both tables now upsert,
+  and both arrays are deduped server-side on the key they are actually stored under (first occurrence wins,
+  matching the client's own `dedupeContinueWatchingItems`).
+- **…and the blanket delete that went with it**: every "replace the whole set" was `DELETE WHERE username = ?`
+  followed by INSERTs, chunked 80 at a time — so the delete could commit while a later chunk failed, leaving
+  the shelf genuinely emptied. Replaced by `d1ReplaceRowsById`: read what is there, upsert everything
+  incoming, and delete only the rows that are actually gone, by id, **last**. A failure now leaves stale
+  extras — which the next push corrects — instead of a hole.
+- **BE-001 — a failed D1 write reported success**: `saveCreatorTrackingD1` returns `false` on failure and the
+  value was dropped. Because D1 is what `/api/creator/sync/load` and every personal catalog row read first,
+  the browser was told its push had landed, advanced its sync baseline, and then discarded its own unsaved
+  copy on the next load. `/api/creator/sync/save-tracking` now writes KV first (so the push survives),
+  reports the D1 failure as a 500, and the browser keeps its copy and retries.
+- **…and the read now notices when D1 is behind**: `readCreatorTrackingD1` compares its meta stamp against the
+  KV blob and hands back the newer copy, repairing D1 in the background — the same repair `getCreatorList`
+  has carried for list records since a previous audit.
+- **DB-002 / BE-002 — `"tmdb:1399".split(':')[0]` is `"tmdb"`**: three places reduced a show id to its show
+  that way. In `/api/creator/sync/save-tracking`'s merge it meant one server-side `tmdb:` entry marked the
+  whole namespace handled and dropped every incoming `tmdb:` show behind it (measured: four shows pushed, two
+  stored, `ok:true`). In `fetchAutoTrackedCatalog` it matched every `tmdb:` Continue Watching row to the first
+  `tmdb:` Airing Next entry, so unrelated shows inherited each other's air dates and season-finale badges.
+  One `trackingShowKey` helper now does what the client has always done.
+- **BE-004 — the cron wrote a stale snapshot back**: `checkForNewEpisodes` re-read the record before writing
+  and then assigned the array it had built from the copy read *before* several seconds of TMDB I/O, so the
+  re-read did nothing and a browser save in between was reverted. It now applies only the two edits it
+  actually makes — append a newly-aired episode, and take that show out of `fullyWatchedShowIds`.
+- **Dead flag removed**: `d1Success` in `/api/creator/lists/save` was assigned in two places and never read.
+  The list path deliberately tolerates a failed D1 write (KV holds it and `getCreatorList` repairs on read);
+  that is now written down instead of implied by an unused variable.
+
 ### 🌌 Storylines, Sagas & Universes Watch Order in Item Details (2026-09-12)
 - **Chronological watch order display at bottom of Item Details**:
   - When clicking any poster to inspect details (`openItemDetailsModal`), the modal automatically detects whether the title belongs to any canon saga, trilogy, or franchise universe in `TV_CROSSOVER_EVENTS`.

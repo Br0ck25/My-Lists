@@ -2244,6 +2244,10 @@ async function checkForNewEpisodes(env, fetchBudget) {
     if (!fullyWatched.length) continue;
 
     const continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
+    // What THIS sweep works out, kept apart from the snapshot it was computed
+    // against -- see the write-back at the bottom of this account's turn for
+    // why the two must not be conflated.
+    const additions = [];
     const alreadyQueued = new Set(continueWatching.map((it) => it.showId));
     const watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
     const dismissed = blob.dismissedContinueWatching && typeof blob.dismissedContinueWatching === 'object' ? blob.dismissedContinueWatching : {};
@@ -2293,7 +2297,7 @@ async function checkForNewEpisodes(env, fetchBudget) {
         continue;
       }
 
-      continueWatching.unshift({
+      additions.push({
         id: String(next.episode.id),
         type: 'episode',
         name: next.episode.name,
@@ -2341,8 +2345,38 @@ async function checkForNewEpisodes(env, fetchBudget) {
         // already have rather than dropping a real Continue Watching update.
         target = blob;
       }
-      target.continueWatching = continueWatching;
-      target.fullyWatchedShowIds = stillFullyWatched;
+      // Apply what this sweep DECIDED, not the snapshot it decided against.
+      //
+      // Re-reading the record and then assigning `continueWatching` -- an array
+      // built from the copy read at the top of this account's turn, before
+      // several seconds of TMDB network I/O -- put that stale snapshot back over
+      // whatever the account's own browser saved in the meantime. The re-read
+      // was doing nothing. Worse, `blob` is read from D1 first, so a KV record
+      // that was ahead of D1 got rolled back to it by the next tick.
+      //
+      // This sweep only ever does two things: it appends a newly-aired episode
+      // to Continue Watching, and it takes that show out of fullyWatchedShowIds.
+      // Those are the only two edits that belong to it, so those are the only
+      // two it makes.
+      const freshCw = Array.isArray(target.continueWatching) ? target.continueWatching : [];
+      const freshShows = new Set(
+        freshCw.map((it) => it && trackingShowKey(it.showId || it.id)).filter(Boolean)
+      );
+      for (const added of additions) {
+        const k = trackingShowKey(added.showId || added.id);
+        if (k && freshShows.has(k)) continue;
+        if (k) freshShows.add(k);
+        freshCw.unshift(added);
+      }
+      target.continueWatching = freshCw;
+
+      const noLongerFullyWatched = new Set(
+        fullyWatched.map(String).filter((id) => !stillFullyWatched.includes(id))
+      );
+      const freshFullyWatched = Array.isArray(target.fullyWatchedShowIds)
+        ? target.fullyWatchedShowIds
+        : stillFullyWatched;
+      target.fullyWatchedShowIds = freshFullyWatched.filter((id) => !noLongerFullyWatched.has(String(id)));
       target.updatedAt = Date.now();
       await env.CONFIGS.put(targetKey, JSON.stringify(target));
       if (env.DB) {

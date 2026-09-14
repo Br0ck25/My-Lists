@@ -12,8 +12,13 @@ await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
     { id: "tmdb:100", showId: "tmdb:100", showTitle: "Show One", airDate: "2026-10-01", seasonNum: 1, episodeNum: 2, isSeasonFinale: true },
   ],
 }});
-const b64 = (o) => Buffer.from(JSON.stringify(o), "utf8").toString("base64").replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-const cfg = b64({ entries: [{ id: "cw", name: "Continue", type: "series", url: "autotrack:continue-watching:series:xmatch" }] });
+// A personal shelf now needs the config to prove it owns the account (SEC-001),
+// so this mints one the way the builder page does.
+const saved = await call(env, "/api/save", { method: "POST", json: {
+  entries: [{ id: "cw", name: "Continue", type: "series", url: "autotrack:continue-watching:series:xmatch" }],
+  trackCreatorName: "xmatch", trackCreatorKey: u.creatorKey,
+}});
+const cfg = saved.body.id;
 const r = await call(env, "/" + cfg + "/catalog/series/cw.json");
 for (const m of (r.body.metas || [])) {
   console.log(JSON.stringify(m));
