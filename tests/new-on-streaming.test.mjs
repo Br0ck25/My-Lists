@@ -34,13 +34,13 @@ function loadNewOnStreamingHelpers() {
   }
 
   const consts = [];
-  for (const name of ["NEW_ON_STREAMING_PROVIDERS", "NEW_ON_STREAMING_REGIONS", "NEW_ON_STREAMING_WALK_DEPTH_PAGES"]) {
+  for (const name of ["NEW_ON_STREAMING_PROVIDERS", "NEW_ON_STREAMING_REGIONS", "NEW_ON_STREAMING_WALK_DEPTH_PAGES", "NEW_ON_STREAMING_PAGES_PER_TICK"]) {
     const m = src00.match(new RegExp(`const ${name}[\\s\\S]*?;`));
     if (!m) throw new Error(`missing const ${name}`);
     consts.push(m[0]);
   }
 
-  const fn = new Function(`${consts.join("\n")}\n${chunks.join("\n")}\nreturn { ${names.join(", ")}, NEW_ON_STREAMING_PROVIDERS, NEW_ON_STREAMING_WALK_DEPTH_PAGES };`);
+  const fn = new Function(`${consts.join("\n")}\n${chunks.join("\n")}\nreturn { ${names.join(", ")}, NEW_ON_STREAMING_PROVIDERS, NEW_ON_STREAMING_WALK_DEPTH_PAGES, NEW_ON_STREAMING_PAGES_PER_TICK };`);
   return fn();
 }
 
@@ -149,6 +149,33 @@ describe("newOnStreamingUnits", () => {
   it("starts every provider at page 1 and never asks TMDB for page 0", () => {
     assert.ok(units.every((u) => u.page >= 1));
     assert.equal(units[0].page, 1);
+  });
+
+  // The ordering bug this pins, found from the admin panel on a real first
+  // walk: nested provider-first, the sweep drained all 40 pages of Netflix
+  // movies before it touched Netflix shows, and all 80 of those before the
+  // second provider -- so for over four hours the shelf was Netflix films and
+  // nothing else, having collected Netflix's 800th-newest title before Hulu's
+  // newest. Page-major fixes it, and a "newest first" list is worth nothing if
+  // this is ever nested back the other way.
+  it("walks page 1 of EVERY provider and kind before page 2 of any", () => {
+    const combos = H.NEW_ON_STREAMING_PROVIDERS.length * 2;
+    const firstPass = units.slice(0, combos);
+    assert.ok(firstPass.every((u) => u.page === 1),
+      "the first units of the walk must all be page 1");
+    assert.equal(new Set(firstPass.map((u) => `${u.provider.key}/${u.kind}`)).size, combos,
+      "and between them must cover every provider and both kinds");
+    assert.equal(units[combos].page, 2, "only then does page 2 begin");
+  });
+
+  it("reaches every provider and kind within the first couple of ticks", () => {
+    const perTick = H.NEW_ON_STREAMING_PAGES_PER_TICK;
+    const seen = new Set();
+    for (let i = 0; i < perTick * 2 && i < units.length; i++) {
+      seen.add(`${units[i].provider.key}/${units[i].kind}`);
+    }
+    assert.equal(seen.size, H.NEW_ON_STREAMING_PROVIDERS.length * 2,
+      "two ticks must have touched every provider and both kinds");
   });
 });
 
