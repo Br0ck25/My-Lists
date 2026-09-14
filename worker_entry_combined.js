@@ -53101,6 +53101,8 @@ async function testSourceRow(btn) {
     if (keys.simklKey) body.simklKey = keys.simklKey;
     if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
     if (keys.creatorName) body.creatorName = keys.creatorName;
+    const previewKey = previewCreatorKey(url);
+    if (previewKey) body.creatorKey = previewKey;
     if (keys.adultContentFilter || (typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled())) body.adultContentFilter = true;
     const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
@@ -53186,6 +53188,42 @@ function repairAutotrackUrl(url) {
   const m = /^autotrack:([a-z0-9-]+):(movie|series|mixed):(.*)$/.exec(url);
   if (!m || m[3] === activeCreator.creatorName) return url;
   return 'autotrack:' + m[1] + ':' + m[2] + ':' + activeCreator.creatorName;
+}
+
+// The Creator Key that lets /api/preview prove who is asking.
+//
+// Watch History, Continue Watching, Watchlist and Airing Next are
+// 'autotrack:<slug>:<type>:<username>' rows, and reading one server-side
+// means reading that account's private tracking record. /api/preview is an
+// unauthenticated endpoint, so the username inside that string is a claim and
+// nothing more until the caller proves it -- and mayReadTrackedShelf
+// (02_http-and-creator-utils.js) answers an unproven reader with an EMPTY
+// shelf rather than an error, because a catalog row has no way to show a
+// message. That is exactly what "No items found." in Live Preview & Editor
+// was: not a missing shelf, an unauthenticated read of one. Airing Next has
+// no share flag at all (only watchlist, watch-history and continue-watching
+// have one), so proving ownership is the ONLY way to read it -- which is why
+// adding it to the config could never preview even for its own owner.
+//
+// Sent only for a url that actually names one of those shelves, for the same
+// reason collectKeys only puts trackCreatorKey into a config that carries
+// one: the key is a bearer credential, and a preview of a public
+// mdblist/trakt/tmdb list has no business carrying it.
+function previewCreatorKey(url) {
+  if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return '';
+  if (!urlHasAutotrackSource(url)) return '';
+  try {
+    return localStorage.getItem('myListAddon:creatorKey') || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// A merged row stacks several sources into one newline-separated url (see
+// collectEntries), so a personal shelf can sit on any line of it, not only
+// the first.
+function urlHasAutotrackSource(url) {
+  return String(url || '').split('\\n').some((line) => line.trim().startsWith('autotrack:'));
 }
 
 function collectEntries() {
@@ -53551,6 +53589,8 @@ async function renderLivePreview() {
         if (keys.simklKey) body.simklKey = keys.simklKey;
         if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
         if (keys.creatorName) body.creatorName = keys.creatorName;
+        const previewKey = previewCreatorKey(s.url);
+        if (previewKey) body.creatorKey = previewKey;
         if (keys.hideNonDigitalReleases) body.hideNonDigitalReleases = true;
         if (keys.adultContentFilter) body.adultContentFilter = true;
         const res = await fetch(ORIGIN + '/api/preview', {

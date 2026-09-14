@@ -50,6 +50,29 @@ Two defects in the sweep shipped in the entry below, both found by running it an
   real departure on a healthy service, a returning title re-dated, and a still-present title keeping its
   original arrival date across passes.
 
+### 🔧 Watch History, Continue Watching and Airing Next read "No items found." in Live Preview & Editor
+
+- **What was wrong**: those three rows are `autotrack:<slug>:<type>:<username>` sources, and reading one
+  server-side means reading that account's private tracking record. `/api/preview` is unauthenticated, so
+  the username inside that string is a claim until the caller proves it with a Creator Key the endpoint can
+  verify — and `mayReadTrackedShelf` answers an unproven reader with an **empty shelf** rather than an error,
+  because a catalog row has no way to show a message. Live Preview & Editor and the per-row **Test** button
+  both sent `creatorName` with no `creatorKey`, so every one of those shelves came back `ok:true` with
+  nothing in it and rendered "No items found." — for its own owner, while the same shelves showed their
+  items everywhere else on the page. Airing Next has no share flag at all (only `watchlist`,
+  `watch-history` and `continue-watching` do), so proving ownership is the **only** way to read it and it
+  could never preview under any setting.
+- **Where it came from**: SEC-001's remediation notes "`/api/preview` call sites send the signed-in
+  account's key". Two of them did not. `previewCreatorKey` (`23_client-list-management.js`) is now the one
+  place that decides, and both call sites use it.
+- **The key still travels only where it is needed**: it is attached for a url that actually names a personal
+  shelf and nothing else — the same rule `collectKeys` already applies to `trackCreatorKey`, because a
+  Creator Key is a bearer credential and a preview of a public mdblist/trakt/tmdb list has no use for one.
+  A merged row stacks its sources one per line, so any line naming a personal shelf arms it, not just the
+  first. Signed out, nothing is claimed.
+- **Tests**: `tests/client.test.mjs` drives `renderLivePreview` against the real bundle — the key is sent for
+  Continue Watching, Watch History and Airing Next rows and for a merged row whose personal source is not
+  first, and is absent from a public list preview and from a signed-out browser.
 
 ### ✨ New on Streaming — a catalog of what actually arrived on a streaming service
 

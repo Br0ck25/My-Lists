@@ -3417,3 +3417,155 @@ describe("client: markShowWatched is not raced by its own background reconciliat
     assert.equal(btn.disabled, false, "and it must come back afterwards");
   });
 });
+
+// Live Preview & Editor renders a personal shelf by asking /api/preview for it,
+// and that endpoint is unauthenticated: the username inside an
+// 'autotrack:<slug>:<type>:<username>' url is an unproven claim until the call
+// also carries a Creator Key it can verify. mayReadTrackedShelf answers an
+// unproven reader with an EMPTY shelf rather than an error (a catalog row has
+// no way to show a message), so the request that omitted the key did not fail
+// -- it came back ok:true with nothing in it, and Watch History, Continue
+// Watching and Airing Next each rendered "No items found." the moment they
+// were added to the config, for their own owner.
+describe("client: Live Preview proves who is asking before reading a personal shelf", () => {
+  // renderLivePreview walks real rows, and the harness's document stub answers
+  // every querySelectorAll with []. These are the few nodes it actually reads.
+  function fakeInput(value) {
+    return { value, dataset: {} };
+  }
+
+  function fakeEntry(name, url, type) {
+    const posters = { innerHTML: "", classList: { add() {}, remove() {}, toggle() {} } };
+    const status = { innerHTML: "" };
+    const entry = {
+      dataset: {},
+      posters,
+      status,
+      querySelector(sel) {
+        if (sel === ".name") return fakeInput(name);
+        if (sel === ".type") return fakeInput(type);
+        if (sel === ".url") return fakeInput(url);
+        if (sel === ".live-preview-posters") return posters;
+        if (sel === ".live-preview-shelf-status") return status;
+        return null;
+      },
+      querySelectorAll(sel) {
+        if (sel === ".url") return [fakeInput(url)];
+        return [];
+      },
+    };
+    return entry;
+  }
+
+  // One row per shelf, wired up the way the builder page would have them.
+  function withRows(client, rows) {
+    const entries = rows.map((r) => fakeEntry(r.name, r.url, r.type));
+    const doc = client.get("document");
+    const lists = doc.getElementById("lists");
+    lists.querySelectorAll = (sel) => (sel === ".entry" ? entries : []);
+    doc.querySelectorAll = (sel) => {
+      if (sel === "#lists .entry") return entries;
+      if (sel === "#lists .entry .url") return rows.map((r) => fakeInput(r.url));
+      return [];
+    };
+    return entries;
+  }
+
+  const previewOk = (req) => ({
+    json: {
+      ok: true,
+      count: 1,
+      totalItems: 1,
+      maybeMore: false,
+      sample: [{ id: "tt0903747", type: "series", name: "Breaking Bad", poster: "" }],
+    },
+  });
+
+  it("sends the Creator Key for an autotrack row so the shelf is readable", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { "/api/preview": previewOk },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    withRows(client, [
+      { name: "Continue Watching", url: "autotrack:continue-watching:series:alice", type: "series" },
+      { name: "Watch History", url: "autotrack:watch-history:movie:alice", type: "movie" },
+      { name: "Airing Next", url: "autotrack:airing-next:series:alice", type: "series" },
+    ]);
+
+    await client.call("renderLivePreview");
+    await settle();
+
+    const sent = requestsTo(client, "/api/preview");
+    assert.equal(sent.length, 3, "one preview call per enabled shelf");
+    for (const req of sent) {
+      // Without this the server cannot place the caller, mayReadTrackedShelf
+      // falls back to the owner's share flags -- and airing-next has none at
+      // all -- so the answer is an empty shelf and the row reads
+      // "No items found."
+      assert.equal(req.body.creatorKey, "KEY-123",
+        `a personal shelf preview must prove ownership: ${req.body.url}`);
+      assert.equal(req.body.creatorName, "alice", "and name the account it is proving");
+    }
+  });
+
+  it("finds a personal shelf on any line of a merged row's url", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { "/api/preview": previewOk },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    withRows(client, [
+      { name: "Mixed", url: "mdblist:trending\nautotrack:watch-history:movie:alice", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+    await settle();
+
+    const sent = requestsTo(client, "/api/preview");
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].body.creatorKey, "KEY-123",
+      "a merged row stacks sources one per line; the personal one need not be first");
+  });
+
+  it("keeps the key out of a preview that does not need it", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { "/api/preview": previewOk },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    withRows(client, [
+      { name: "Trending", url: "https://mdblist.com/lists/someone/trending", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+    await settle();
+
+    const sent = requestsTo(client, "/api/preview");
+    assert.equal(sent.length, 1);
+    // The Creator Key is a bearer credential. A public list preview has no use
+    // for it, the same reason collectKeys only puts trackCreatorKey into a
+    // config that actually carries a personal shelf.
+    assert.equal(sent[0].body.creatorKey, undefined,
+      "a public list preview must not carry the account key");
+  });
+
+  it("sends nothing to prove when nobody is signed in", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { "/api/preview": previewOk },
+    });
+    client.set("activeCreator", null);
+    withRows(client, [
+      { name: "Watch History", url: "autotrack:watch-history:movie:alice", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+    await settle();
+
+    const sent = requestsTo(client, "/api/preview");
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].body.creatorKey, undefined,
+      "a signed-out browser has no ownership to claim over someone else's shelf");
+  });
+});
