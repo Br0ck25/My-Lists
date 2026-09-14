@@ -2029,6 +2029,7 @@ async function renderAdminDashboard(env) {
     <button type="button" class="subnav-pill" data-sub-tab="creators" onclick="switchAdminSubTab('creators')">Creator Accounts</button>
     <button type="button" class="subnav-pill" data-sub-tab="feedback" onclick="switchAdminSubTab('feedback')">Feedback</button>
     <button type="button" class="subnav-pill" data-sub-tab="netflixpreview" onclick="switchAdminSubTab('netflixpreview')">Provider Preview</button>
+    <button type="button" class="subnav-pill" data-sub-tab="newonstreaming" onclick="switchAdminSubTab('newonstreaming')">New on Streaming</button>
     <button type="button" class="subnav-pill" data-sub-tab="maintenance" onclick="switchAdminSubTab('maintenance')">Maintenance</button>
   </div>
 
@@ -2255,6 +2256,56 @@ async function renderAdminDashboard(env) {
     <div id="netflixPreviewShows" style="margin-top:28px;"></div>
   </div>
 
+  <div class="admin-tab-panel" data-admin-panel="newonstreaming">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it just has no Quick Add card and no Discover entry until it is turned on for everyone.</p>
+    <p style="color:#8E8E93; margin:0 0 16px; font-size:0.82rem;">Nothing upstream publishes the date a title landed on a service, so this add-on watches for it: every cron tick walks a slice of each provider&rsquo;s catalog, and a title that was not in the table already is an arrival. That means the list is only as old as the sweep &mdash; the first full pass is <em>seeded</em> (dated by each title&rsquo;s own release, because there was nothing to compare against yet) and every pass after it records real arrivals. Watch the <strong>observed</strong> number below: while it is zero, the ordering is still release dates.</p>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Sweep status</div>
+      <div id="nosStatus" style="font-size:0.85rem; color:#8E8E93;">Loading&hellip;</div>
+      <div style="margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button type="button" class="secondary lc-btn" onclick="loadNewOnStreaming()">Refresh</button>
+        <label style="font-size:0.85rem; color:#8E8E93;">Units
+          <input type="number" id="nosSweepUnits" class="admin-select" style="margin-right:0; width:70px;" value="12" min="1" max="40">
+        </label>
+        <label style="font-size:0.85rem; color:#8E8E93; display:inline-flex; align-items:center; gap:6px;">
+          <input type="checkbox" id="nosSweepBump" checked style="width:15px; height:15px;"> also re-bump episodes
+        </label>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="nosSweepBtn" onclick="runNewOnStreamingSweep()">Run a sweep now</button>
+        <span id="nosSweepStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">One unit is one provider, one type, one page of 20 &mdash; the same slice the cron takes. Running a sweep here advances the same cursor the cron uses, so it brings the first walk in sooner rather than duplicating it. Capped at 40 units a click because this spends the request&rsquo;s own subrequest allowance, not the cron&rsquo;s.</p>
+    </div>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Rows collected</div>
+      <div class="table-wrap">
+        <table>
+          <tr><th>Service</th><th>Type</th><th>Titles</th><th>Seeded</th><th>Observed</th><th>Newest</th></tr>
+          <tbody id="nosByServiceBody"><tr><td colspan="6">Loading&hellip;</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Preview the catalog</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Read through the same code that serves the row to Stremio, so this is the actual shelf and not a second implementation of it. Order is always most recently arrived first.</p>
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap;">
+        <select class="admin-select" id="nosPreviewType" onchange="loadNewOnStreamingPreview()">
+          <option value="movie">Movies</option>
+          <option value="series">Shows</option>
+        </select>
+        <select class="admin-select" id="nosPreviewService" onchange="loadNewOnStreamingPreview()">
+          <option value="">All services</option>
+        </select>
+        <button type="button" class="secondary lc-btn" onclick="loadNewOnStreamingPreview()">Load preview</button>
+        <span id="nosPreviewStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+      <div style="margin-bottom:12px; font-size:0.82rem; color:#8E8E93;">Catalog URL: <code id="nosPreviewSource">tmdb:new-on-streaming</code> &mdash; paste this into <strong>Catalogs &rarr; + New Catalog</strong> on the main site to install this exact row into Stremio or Nuvio while it is still hidden.</div>
+      <div id="nosPreviewResults"></div>
+    </div>
+  </div>
+
   <div class="admin-tab-panel" data-admin-panel="maintenance">
     <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">One-off, click-to-run maintenance actions -- everything here is also reachable as a raw <code>POST</code> request for anyone using <code>wrangler</code>/curl, but these buttons are the point-and-click way to run the same thing entirely from this dashboard, no terminal required.</p>
 
@@ -2349,6 +2400,7 @@ async function renderAdminDashboard(env) {
       creators: 'management',
       feedback: 'management',
       netflixpreview: 'management',
+      newonstreaming: 'management',
       maintenance: 'management',
     };
 
@@ -2397,6 +2449,7 @@ async function renderAdminDashboard(env) {
       if (tabId === 'feedback' && !window._feedbackLoadedOnce) { window._feedbackLoadedOnce = true; loadFeedback(); }
       if (tabId === 'apiusage' && !window._apiUsageLoadedOnce) { window._apiUsageLoadedOnce = true; loadApiUsage(); }
       if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
+      if (tabId === 'newonstreaming' && !window._newOnStreamingLoadedOnce) { window._newOnStreamingLoadedOnce = true; loadNewOnStreaming(); }
     }
 
     function restoreAdminActiveTab() {
@@ -3313,6 +3366,163 @@ async function renderAdminDashboard(env) {
         ).join('');
       } catch (e) {
         statusEl.textContent = 'Could not search -- check your connection.';
+      }
+    }
+
+
+    // --- New on Streaming ---------------------------------------------------
+    //
+    // The whole test surface for a catalog that is deliberately not on the
+    // site yet: what the sweep has collected, a way to push it along, and a
+    // preview that goes through the real fetchNewOnStreaming rather than
+    // re-deriving the shelf here (a second implementation would be the one
+    // thing guaranteed to disagree with what Stremio gets).
+    let nosProviders = [];
+
+    function nosEpochToDay(sec) {
+      const n = Number(sec) || 0;
+      if (!n) return '--';
+      try {
+        return new Date(n * 1000).toISOString().slice(0, 10);
+      } catch (e) {
+        return '--';
+      }
+    }
+
+    async function loadNewOnStreaming() {
+      const statusEl = document.getElementById('nosStatus');
+      const bodyEl = document.getElementById('nosByServiceBody');
+      statusEl.textContent = 'Loading…';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming');
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not load status.';
+          return;
+        }
+        const st = data.status || {};
+        nosProviders = st.providers || [];
+
+        const bits = [];
+        bits.push('<div>D1: ' + (st.d1Bound
+          ? (st.tableReady
+            ? '<span style="color:#30d158;">bound, streaming_events ready</span>'
+            : '<span style="color:#FF3B30;">bound, but the table is missing</span>')
+          : '<span style="color:#FF3B30;">not bound -- this catalog is D1-only</span>') + '</div>');
+        if (st.error) {
+          bits.push('<div style="color:#FF3B30;">' + escapeHtmlAdmin(st.error) + '</div>');
+        }
+        bits.push('<div>Region swept: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong></div>');
+        bits.push('<div>Visible to users: ' + (st.inQuickAdd
+          ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
+          : '<span style="color:#FF9500;">no -- admin only (NEW_ON_STREAMING_IN_QUICK_ADD is false)</span>') + '</div>');
+        const cursor = st.cursor || { unit: 0, walk: 0 };
+        const pct = st.totalUnits ? Math.floor((cursor.unit / st.totalUnits) * 100) : 0;
+        bits.push('<div>Walk: generation <strong>' + cursor.walk + '</strong>, at unit ' + cursor.unit + ' of ' + st.totalUnits + ' (' + pct + '% through this pass), ' + st.unitsPerTick + ' units a tick</div>');
+        bits.push('<div>' + (cursor.walk === 0
+          ? '<span style="color:#FF9500;">Still on the seeding pass</span> -- dates are the titles&rsquo; own release dates until this first pass finishes.'
+          : '<span style="color:#30d158;">Past the seeding pass</span> -- arrivals found from here on are observed, not inferred.') + '</div>');
+        const totals = st.totals || {};
+        bits.push('<div>Titles: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows &mdash; ' + (totals.seeded || 0) + ' seeded, <strong>' + (totals.observed || 0) + ' observed</strong></div>');
+        if (st.lastSweep) {
+          bits.push('<div>Last sweep: ' + nosEpochToDay(st.lastSweep.at) + ' &mdash; ' + (st.lastSweep.units || 0) + ' pages, ' + (st.lastSweep.added || 0) + ' new rows, ' + (st.lastSweep.resolved || 0) + ' IMDb lookups, ' + (st.lastSweep.errors || 0) + ' errors' + (st.lastSweep.reason ? ' (' + escapeHtmlAdmin(st.lastSweep.reason) + ')' : '') + '</div>');
+        } else {
+          bits.push('<div style="color:#FF9500;">No sweep has completed yet.</div>');
+        }
+        if (st.lastBump) {
+          bits.push('<div>Last episode re-bump: ' + nosEpochToDay(st.lastBump.at) + ' &mdash; ' + (st.lastBump.checked || 0) + ' shows checked, ' + (st.lastBump.bumped || 0) + ' moved to the top</div>');
+        }
+        statusEl.innerHTML = bits.join('');
+
+        const rows = st.byService || [];
+        bodyEl.innerHTML = rows.length
+          ? rows.map(function (r) {
+              return '<tr><td>' + escapeHtmlAdmin(r.service) + '</td><td>' + escapeHtmlAdmin(r.kind) + '</td><td>' + r.count + '</td><td>' + r.seeded + '</td><td>' + r.observed + '</td><td>' + nosEpochToDay(r.newest) + '</td></tr>';
+            }).join('')
+          : '<tr><td colspan="6">Nothing collected yet -- run a sweep.</td></tr>';
+
+        const sel = document.getElementById('nosPreviewService');
+        if (sel && sel.options.length <= 1) {
+          nosProviders.forEach(function (p) {
+            const opt = document.createElement('option');
+            opt.value = p.key;
+            opt.textContent = p.name;
+            sel.appendChild(opt);
+          });
+        }
+      } catch (e) {
+        statusEl.textContent = 'Could not load -- check your connection.';
+      }
+    }
+
+    async function runNewOnStreamingSweep() {
+      const btn = document.getElementById('nosSweepBtn');
+      const statusEl = document.getElementById('nosSweepStatus');
+      const units = parseInt(document.getElementById('nosSweepUnits').value, 10) || 12;
+      const bump = document.getElementById('nosSweepBump').checked;
+      btn.disabled = true;
+      statusEl.textContent = 'Sweeping… this can take a minute on a first pass.';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming/sweep', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units: units, bump: bump }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Sweep failed.';
+          btn.disabled = false;
+          return;
+        }
+        const sw = data.sweep || {};
+        if (!sw.ran) {
+          statusEl.textContent = sw.reason || 'The sweep did not run.';
+        } else {
+          let msg = sw.units + ' pages, ' + sw.seen + ' titles seen, ' + sw.added + ' new rows, ' + sw.touched + ' already known';
+          if (data.bump && data.bump.ran) msg += '; ' + data.bump.bumped + ' shows re-bumped';
+          if (sw.errors) msg += '; ' + sw.errors + ' errors (see the Worker log)';
+          statusEl.textContent = msg;
+        }
+        await loadNewOnStreaming();
+      } catch (e) {
+        statusEl.textContent = 'Could not run -- check your connection.';
+      }
+      btn.disabled = false;
+    }
+
+    async function loadNewOnStreamingPreview() {
+      const statusEl = document.getElementById('nosPreviewStatus');
+      const resultsEl = document.getElementById('nosPreviewResults');
+      const sourceEl = document.getElementById('nosPreviewSource');
+      const type = document.getElementById('nosPreviewType').value;
+      const service = document.getElementById('nosPreviewService').value;
+      statusEl.textContent = 'Loading…';
+      resultsEl.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming/preview?type=' + encodeURIComponent(type) + (service ? '&services=' + encodeURIComponent(service) : ''));
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not load preview.';
+          return;
+        }
+        sourceEl.textContent = data.source;
+        statusEl.textContent = (data.totalItems != null ? data.totalItems + ' titles in this row' : '');
+        if (!data.items.length) {
+          resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">Empty -- the sweep has not collected anything for this service and type yet.</p>';
+          return;
+        }
+        resultsEl.innerHTML =
+          '<div class="table-wrap"><table><tr><th>#</th><th>Poster</th><th>Title</th><th>Year</th><th>Id</th></tr>' +
+          data.items.map(function (it, i) {
+            return '<tr><td>' + (i + 1) + '</td>' +
+              '<td>' + (it.poster ? '<img src="' + escapeHtmlAdmin(it.poster) + '" alt="" style="width:40px; border-radius:4px;">' : '') + '</td>' +
+              '<td>' + escapeHtmlAdmin(it.name || '') + '</td>' +
+              '<td>' + escapeHtmlAdmin(it.releaseInfo || '') + '</td>' +
+              '<td style="color:#8E8E93;">' + escapeHtmlAdmin(it.id || '') + '</td></tr>';
+          }).join('') +
+          '</table></div>';
+      } catch (e) {
+        statusEl.textContent = 'Could not load -- check your connection.';
       }
     }
 

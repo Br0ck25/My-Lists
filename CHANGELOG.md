@@ -4,6 +4,61 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ---
 
+## [Unreleased]
+
+### ✨ New on Streaming — a catalog of what actually arrived on a streaming service
+
+A new catalog source, `tmdb:new-on-streaming[:service1+service2]`, sorted by arrival: most recently
+added first, with a show pushed back to the top the day a new episode airs. It **ships dark** —
+`NEW_ON_STREAMING_IN_QUICK_ADD` (`00_constants.js`) is `false`, so there is no Quick Add card, no
+Discover entry and no `/lists/<slug>` page — while the catalog itself is live and installable, which is
+the point: it can be judged against real swept data before anyone else can add it.
+
+- **Why it needed building rather than querying**: nothing upstream publishes the date a title landed on
+  a service. TMDB's `with_watch_providers` answers "is this on Netflix right now" and says nothing about
+  yesterday; Trakt and Simkl do not model provider catalogs at all. The existing `tmdb:genre:stream-releases`
+  row sorts by *release* date instead, which is why it shows theatrical-era titles and completely misses an
+  old film being added to a service this morning. So the add-on observes arrivals on the cron tick and owns
+  the dates: `streaming_events` (`migrations/0011_add_streaming_events.sql`) records the first sighting of a
+  title on a service, and that is what the shelf sorts on.
+- **The sweep** (`sweepNewOnStreaming`, `07_source-fetchers-tmdb-simkl.js`) walks a slice of each provider
+  catalog per tick from a rotating cursor — 8 providers x 2 kinds x 40 pages, 12 units a tick, about five
+  hours for a full pass. Sorted by **release date, not popularity**: a popularity-sorted walk reorders itself
+  between the ticks that read its pages, so titles slide across page boundaries and arrivals are both missed
+  and invented. A page only costs its own fetch in steady state — the sweep asks D1 which of its TMDB ids it
+  already holds and resolves IMDb ids for the rest, and a title arriving on a second service costs no TMDB
+  call at all because the first service's row already carries the id.
+- **The episode half** (`bumpNewOnStreamingEpisodes`) scans two providers a tick for shows with an episode in
+  the last 10 days, keeps only the ones already on the shelf, reads `last_episode_to_air` for the exact date,
+  and re-bumps every service's row for that show — a new episode is new wherever you watch it.
+- **The first pass is seeded, and says so.** Every title is "new" the first time you look at a catalog, so
+  walk 0 dates each title by its own release date rather than pretending it just arrived; walk 1 onward
+  records real arrivals. The admin dashboard reports the split as **seeded** versus **observed**, which is
+  the one number that says whether the list is working yet.
+- **Serving it makes no outbound request at all.** Title, poster, backdrop and year are denormalised into the
+  row, so a catalog page is one indexed D1 read — the only shelf here a provider outage cannot slow down or
+  empty. Covered by a test that fails if a single `fetch` is issued while rendering it.
+- **Admin dashboard**: **Management & Tools → New on Streaming** shows sweep state (cursor, walk generation,
+  rows per service, seeded vs observed), runs a sweep on demand, and previews the catalog *through
+  `fetchNewOnStreaming` itself* rather than re-deriving the shelf — a second implementation would be the one
+  thing guaranteed to disagree with what Stremio gets. Routes: `GET /admin/api/new-on-streaming`,
+  `POST /admin/api/new-on-streaming/sweep`, `GET /admin/api/new-on-streaming/preview`.
+- **Budget, and the regression it nearly caused**: the sweep is paid for out of the episode sweep's own
+  unreachable reserve, not the pre-warm's share. `episodeBudget` is half the tick (5,000 at the default)
+  while `CRON_EPISODE_CHECK_MAX` caps actual spend at 300, so 4,700 fetches are reserved by something that
+  will never ask for them. Taking a quarter of *that* leaves `cronBudget - episodeBudget` intact — which
+  matters, because taking it from the pre-warm dropped it from 40 charts a tick to 35 and quietly broke its
+  "the whole list fits in one tick" guarantee. On a free Worker the share comes out at 0 and the sweep skips
+  itself with one log line, exactly as chart pre-warming does.
+- **Requires D1.** Unlike everything else in this add-on there is no KV fallback: these dates are observed
+  over time and cannot be refetched, so a tick that runs without the table is history not collected rather
+  than a cache miss. `D1_SCHEMA_MANIFEST` says so, so the schema check reports it.
+- **Tests**: `tests/new-on-streaming.test.mjs` — the walk query's ordering and filters, date parsing and
+  future-date clamping, selection parsing (including an unknown service degrading to "all" rather than
+  building an empty `IN ()`), unit-list stability under the cursor, and the catalog itself through the real
+  Worker against real SQLite: arrival ordering, episode re-bump ordering, per-service filtering, a title on
+  several services appearing once dated by its latest arrival, removals hidden, and zero outbound requests.
+
 ## [1.5.4] - 2026-09-14
 
 Everything below the "Earlier unreleased entries" heading predates 2026-09-03. What
