@@ -72,6 +72,42 @@ the reports now live in `docs/history/`.
   The list path deliberately tolerates a failed D1 write (KV holds it and `getCreatorList` repairs on read);
   that is now written down instead of implied by an unused variable.
 
+### 🧹 Reliability, protocol and dead-code fixes (2026-09-14)
+- **BE-003 — rotating a leaked webhook token failed open**: `getOrCreateScrobbleToken` logged a failed D1
+  rotation and wrote KV anyway. `usernameForScrobbleToken` consults D1 first, so it then found the **old**
+  token recorded as active, rejected the new one and kept honouring the old one — the caller was handed a
+  token that did not work while the credential they believed they had just revoked carried on authorising
+  writes. Rotation now fails closed (the caller already turns that into a 500). A first mint still tolerates a
+  D1 miss, because nothing contradicts it and the lazy backfill repairs it.
+- **CF-001 — `/admin/api/creator-lists` could exceed the per-invocation storage cap**: `list({ limit: 1000 })`
+  with no cursor plus one `get` per key is up to 1,001 operations against Cloudflare's 1,000 limit, and
+  anything past the first 1,000 keys was invisible either way. Bounded by
+  `ADMIN_CREATOR_LIST_KV_SCAN_MAX` (250), and the response now reports `kvScanTruncated` when it hits it
+  instead of implying it saw everything.
+- **DB-004 — the search index update was two statements**: FTS5 has no primary key, so updating `lists_fts`
+  is delete-then-insert; as two separate awaits, two concurrent saves of one list could interleave into zero
+  rows or two, and a failure between them left the list unsearchable silently. Now one `batch`, which is one
+  transaction.
+- **PROTO-001 — the manifest did not declare an id prefix it serves**: Watch History and Continue Watching
+  entries for titles with no IMDb id are `tmdb:<id>`, and `/meta` has always resolved them — but
+  `idPrefixes` said only `["tt", "channel_"]`, which is how a Stremio-protocol client decides who owns an id.
+  Strict clients filtered those tiles out of the row and no client routed their detail page here. Both
+  `idPrefixes` arrays now include `"tmdb:"`.
+- **FE-001 — an optimistic dashboard update was never rolled back**: the list reconciliation save used
+  `.catch(() => {})` and never looked at `data.ok`, so a refusal the server states plainly (413 over the size
+  ceiling, 409 on a conflicting edit) left the dashboard showing items the account does not have. The change
+  is now reverted and reported.
+- **FE-002 — ~520 lines of unreachable import code removed**: the Trakt-export and Letterboxd-export zip
+  importers bound their file inputs with `getElementById('traktExportFileInput')?.addEventListener(...)` at
+  script-evaluation time, and neither id exists in the page — optional chaining meant they never attached.
+  The unified importer replaced both and reads `.zip` itself. `mapTraktExportEntryToWatchHistoryItem`, the one
+  piece the live Trakt history import still calls, was kept.
+- **FE-003 — a stale saved sub-tab opened the Lists tab blank**: `#listsSubBulk` was removed from the page but
+  the value that selects it is still in people's `localStorage`, and `switchListsSubmenu` hides every panel
+  before showing the one it was asked for — so a browser holding `'bulk'` showed nothing, on every load,
+  with no way back but clearing site data. The saved value is validated against the panels that exist, in the
+  bundle **and** in the pre-paint inline script, since the CSS hides panels before the bundle runs.
+
 ### 🌌 Storylines, Sagas & Universes Watch Order in Item Details (2026-09-12)
 - **Chronological watch order display at bottom of Item Details**:
   - When clicking any poster to inspect details (`openItemDetailsModal`), the modal automatically detects whether the title belongs to any canon saga, trilogy, or franchise universe in `TV_CROSSOVER_EVENTS`.

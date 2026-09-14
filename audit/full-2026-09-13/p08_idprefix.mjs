@@ -9,11 +9,15 @@ await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
   ],
   continueWatching: [{ id: "tmdb:999:1:2", showId: "tmdb:999", showTitle: "TMDB Only Show", seasonNum: 1, episodeNum: 2 }],
 }});
-const b64 = (o) => Buffer.from(JSON.stringify(o), "utf8").toString("base64").replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-const cfg = b64({ entries: [
-  { id: "wh", name: "History", type: "series", url: "autotrack:watch-history:series:prefixuser" },
-  { id: "cw", name: "Continue", type: "series", url: "autotrack:continue-watching:series:prefixuser" },
-]});
+// A personal shelf needs a config that proves it owns the account (SEC-001).
+const saved = await call(env, "/api/save", { method: "POST", json: {
+  entries: [
+    { id: "wh", name: "History", type: "series", url: "autotrack:watch-history:series:prefixuser" },
+    { id: "cw", name: "Continue", type: "series", url: "autotrack:continue-watching:series:prefixuser" },
+  ],
+  trackCreatorName: "prefixuser", trackCreatorKey: u.creatorKey,
+}});
+const cfg = saved.body.id;
 let r = await call(env, "/" + cfg + "/manifest.json");
 console.log("manifest idPrefixes:", JSON.stringify(r.body.idPrefixes),
             " meta resource:", JSON.stringify(r.body.resources.find(x=>x && x.name==="meta")));

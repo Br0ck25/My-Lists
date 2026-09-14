@@ -5,8 +5,18 @@ function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
   if (shuffleShelves && active.length > 1) {
     active = deterministicDailyShuffle(active, `shelves:${configSeed || ''}`);
   }
-  const resources = ["catalog", { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "channel_"] }];
-  const idPrefixes = ["tt", "channel_"];
+  // "tmdb:" belongs here because this add-on actually serves those ids.
+  //
+  // A Watch History or Continue Watching entry for a title with no IMDb id is
+  // stored and returned as "tmdb:<id>" (see fetchAutoTrackedCatalog below), and
+  // the /meta route has always resolved them -- `id.startsWith("tt") ||
+  // id.startsWith("tmdb:")`. The manifest did not say so, and idPrefixes is how
+  // a Stremio-protocol client decides which add-on owns an id: undeclared, those
+  // tiles get filtered out of the row by strict clients and their detail pages
+  // are never routed back here by any client. This file's own placeholder tile
+  // already cites that behaviour ("some clients filter out anything else").
+  const resources = ["catalog", { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "tmdb:", "channel_"] }];
+  const idPrefixes = ["tt", "tmdb:", "channel_"];
   // Stremio/wako call every installed addon's subtitles resource the
   // instant ANY video starts playing (checking for subtitle tracks) --
   // regardless of which addon's catalog the video came from, or whether

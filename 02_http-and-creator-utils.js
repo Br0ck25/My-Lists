@@ -1855,6 +1855,25 @@ async function getOrCreateScrobbleToken(env, username, rotate = false) {
       ]);
     } catch (dbErr) {
       console.error("D1 write error (scrobble_tokens):", dbErr);
+      // A ROTATION that could not reach D1 must not be reported as one.
+      //
+      // The KV writes below would still run, and usernameForScrobbleToken
+      // consults D1 first: it would find the OLD token still recorded as this
+      // account's active one, reject the new token outright ("active.token !==
+      // t"), and keep honouring the old one. So the caller was handed a token
+      // that does not work while the token they were rotating AWAY from -- the
+      // one they believe they just revoked -- carried on authorising writes.
+      //
+      // Rotation is the only revocation control for a credential that lives in
+      // a webhook URL, i.e. in a media server's config and its logs. Failing
+      // open there is the wrong answer; the caller turns "" into a 500 and the
+      // person tries again with nothing changed.
+      //
+      // Only rotation. A FIRST mint that misses D1 is recoverable on its own --
+      // D1 has no row for the account, so nothing contradicts the new token and
+      // the lazy backfill in usernameForScrobbleToken repairs it -- and failing
+      // that would deny a working feature over a transient error.
+      if (rotate) return "";
     }
   }
   if (env && env.CONFIGS) {

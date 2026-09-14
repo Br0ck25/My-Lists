@@ -2253,15 +2253,23 @@
       await bumpCreatorListsStamp(env, auth.username);
 
       // Keep search index (lists_fts) in step with this save.
+      //
+      // FTS5 has no primary key, so "update" here is delete-then-insert -- and
+      // as two separate statements that is not one. Two concurrent saves of the
+      // same list could interleave into zero rows (both deletes, then both
+      // inserts is fine; delete/insert/delete is not) or two, and a failure
+      // between them left the list unsearchable with nothing to say so. One
+      // batch is one transaction, which is what this always meant.
       if (env.DB) {
         try {
           const ftsListId = `c:${auth.username}:${slug}`;
-          await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(ftsListId).run();
+          const ftsStmts = [env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(ftsListId)];
           if (isPublicListVisibility(visibility)) {
-            await env.DB.prepare(
+            ftsStmts.push(env.DB.prepare(
               "INSERT INTO lists_fts (list_id, name, creator_name, username) VALUES (?, ?, ?, ?)"
-            ).bind(ftsListId, name, auth.displayName || auth.username, auth.username).run();
+            ).bind(ftsListId, name, auth.displayName || auth.username, auth.username));
           }
+          await env.DB.batch(ftsStmts);
         } catch (dbErr) {
           console.error("D1 write error (lists_fts save):", dbErr);
         }
@@ -5107,11 +5115,21 @@
         }
       }
 
+      let kvScanTruncated = false;
       if (env.CONFIGS) {
         const prefix = `creatorlist:${targetUsername}:`;
         try {
-          const kvListed = await env.CONFIGS.list({ prefix, limit: 1000 });
+          // Bounded, and honest about being bounded.
+          //
+          // This was list({ limit: 1000 }) with no cursor followed by one get
+          // per key, all inside one invocation -- so an account with a lot of
+          // lists could spend the whole 1,000-storage-operations budget here and
+          // the request would die, and anything past the first 1,000 keys was
+          // silently invisible either way. D1 above is the real source for this
+          // panel; this scan exists to surface records D1 does not have.
+          const kvListed = await env.CONFIGS.list({ prefix, limit: ADMIN_CREATOR_LIST_KV_SCAN_MAX });
           if (kvListed && Array.isArray(kvListed.keys)) {
+            if (kvListed.list_complete === false) kvScanTruncated = true;
             for (const k of kvListed.keys) {
               const slug = k.name.slice(prefix.length);
               let data = null;
@@ -5169,6 +5187,9 @@
         orderCount,
         cursor: nextCursor,
         done,
+        // True when the KV scan hit its per-invocation bound, so the panel can
+        // say "this may not be all of them" rather than quietly implying it is.
+        kvScanTruncated: kvScanTruncated || undefined,
       }, 200, { "Cache-Control": "no-store" });
     }
 

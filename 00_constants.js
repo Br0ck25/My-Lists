@@ -452,6 +452,22 @@ const CREATOR_AUTH_VERIFY_PER_MINUTE = 60;
 // are never trusted to name an account.
 const LEGACY_UNVERIFIED_CONFIG_SHELVES = true;
 
+// --- Bound on /admin/api/creator-lists' KV fallback scan ---------------------
+//
+// That panel reads D1 (the real source) and then scans this creator's
+// `creatorlist:` prefix in KV to surface records D1 does not have. The scan was
+// list({ limit: 1000 }) with no cursor, followed by ONE get per key -- so a
+// single request could ask for 1,001 storage operations against Cloudflare's
+// 1,000-per-invocation cap and simply die, and anything past the first 1,000
+// keys was invisible whether it died or not.
+//
+// 250 keeps the whole request comfortably inside the cap alongside the D1
+// queries and the order-key read, and is far past any real account (the largest
+// pathological case on record was 129 records for 22 real lists). When the scan
+// does hit the bound the response says so, rather than implying it saw
+// everything.
+const ADMIN_CREATOR_LIST_KV_SCAN_MAX = 250;
+
 // --- Bound on /api/resolve's cross-deployment fallback -----------------------
 //
 // /api/resolve takes a `url` and, when the local config resolves to nothing,

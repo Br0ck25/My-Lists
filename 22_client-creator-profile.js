@@ -3826,6 +3826,14 @@ async function renderCreatorDashboard(options) {
         if (!slug || !Array.isArray(rowPayload.items) || !rowPayload.items.length) return;
         const sList = (data.lists || []).find(l => l && l.slug === slug);
         if (sList && rowPayload.items.length > (sList.items || []).length) {
+          // The dashboard is updated optimistically, so the save has to be
+          // checked -- it used to be .catch(() => {}) with no look at data.ok.
+          // A refusal the server states plainly (413 for a list over the size
+          // ceiling, 409 for a conflicting edit from another device) left the
+          // dashboard showing items the account does not have, indefinitely and
+          // with nothing said. Roll the optimistic change back and say so.
+          const previousItems = sList.items || [];
+          const previousCount = sList.itemCount;
           sList.items = rowPayload.items;
           sList.itemCount = rowPayload.items.length;
           fetch(ORIGIN + '/api/creator/lists/save', {
@@ -3840,7 +3848,19 @@ async function renderCreatorDashboard(options) {
               items: rowPayload.items,
               visibility: sList.visibility || 'private',
             })
-          }).catch(() => {});
+          }).then(async (res) => {
+            let saved = null;
+            try { saved = await res.json(); } catch (e) {}
+            if (saved && saved.ok) return;
+            sList.items = previousItems;
+            sList.itemCount = previousCount;
+            if (typeof showAddedToast === 'function') {
+              showAddedToast('Could not sync "' + (sList.name || slug) + '": ' + ((saved && saved.error) || 'please try again'));
+            }
+          }).catch(() => {
+            sList.items = previousItems;
+            sList.itemCount = previousCount;
+          });
         }
         if (localMapForCreator[slug] && rowPayload.items.length > (localMapForCreator[slug].items || []).length) {
           localMapForCreator[slug].items = rowPayload.items;

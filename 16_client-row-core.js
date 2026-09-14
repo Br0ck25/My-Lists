@@ -64,6 +64,22 @@ const CHART_SLUG_ENTRIES = ${jsonForScript(CHART_SLUG_ENTRIES)};
 // instead -- and guessed wrong for "true-crime-mystery", which is a series.
 const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
 
+// The Lists tab remembers which sub-tab you were last on, in localStorage, and
+// that value outlives the release that wrote it -- so it can name a panel this
+// build no longer renders. 'bulk' is exactly that: #listsSubBulk is gone from
+// the page, while the CSS that positioned it (09_page-shell.js) and the three
+// places that read it all stayed. switchListsSubmenu hides every panel before
+// showing the one it was asked for, so a browser still holding 'bulk' opened
+// the Lists tab to a blank page on every load, with no way back short of
+// clearing site data.
+//
+// Validated against the panels that actually exist rather than trusted.
+function normalizeListsSubmenu(raw) {
+  const known = { 'my-lists': 1, 'liked': 1, 'import': 1, 'create-list': 1 };
+  const v = String(raw || '');
+  return known[v] ? v : 'my-lists';
+}
+
 // escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
 // They used to be declared here too; since every client module shares one
 // script scope in the browser, that later declaration won, and this copy
@@ -93,7 +109,7 @@ const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
     if (subBulk) subBulk.style.display = (catSub === 'bulk') ? 'block' : 'none';
 
     // 2. Lists submenu early sync
-    var listSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+    var listSub = normalizeListsSubmenu(localStorage.getItem('myListAddon:listsSubmenu'));
     var listBar = document.getElementById('listsSubnavBar');
     if (listBar) {
       listBar.querySelectorAll('.subnav-pill').forEach(function(p) {
@@ -106,12 +122,10 @@ const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
     var subMyLists = document.getElementById('listsSubMyLists');
     var subLiked = document.getElementById('listsSubLiked');
     var subListImport = document.getElementById('listsSubImport');
-    var subListBulk = document.getElementById('listsSubBulk');
     var subCreate = document.getElementById('listsSubCreateList');
     if (subMyLists) subMyLists.style.display = (listSub === 'my-lists') ? 'block' : 'none';
     if (subLiked) subLiked.style.display = (listSub === 'liked') ? 'block' : 'none';
     if (subListImport) subListImport.style.display = (listSub === 'import') ? 'block' : 'none';
-    if (subListBulk) subListBulk.style.display = (listSub === 'bulk') ? 'block' : 'none';
     if (subCreate) subCreate.style.display = (listSub === 'create-list') ? 'block' : 'none';
 
     // 3. Channels submenu early sync
@@ -733,7 +747,7 @@ function switchTab(name) {
       window._listsInitializedOnce = true;
       let savedSub = 'my-lists';
       try {
-        savedSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+        savedSub = normalizeListsSubmenu(localStorage.getItem('myListAddon:listsSubmenu'));
       } catch (e) {}
       const pills = document.querySelectorAll('#listsSubnavBar .subnav-pill');
       let targetBtn = null;
@@ -1184,7 +1198,6 @@ function switchListsSubmenu(name, btn) {
   const subpanels = {
     'my-lists': 'listsSubMyLists',
     'liked': 'listsSubLiked',
-    'bulk': 'listsSubBulk',
     'create-list': 'listsSubCreateList',
     'import': 'listsSubImport'
   };

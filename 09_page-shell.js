@@ -152,6 +152,11 @@ ${seoHeadHtml}
       var catSub = localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
       document.documentElement.setAttribute('data-initial-catalogs-sub', catSub);
       var listSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+      // Must agree with normalizeListsSubmenu (16_client-row-core.js): the rule
+      // above hides every Lists panel and then un-hides the one this attribute
+      // names, so a stale value naming a panel that no longer exists leaves the
+      // tab blank from first paint.
+      if (['my-lists', 'liked', 'import', 'create-list'].indexOf(listSub) === -1) listSub = 'my-lists';
       document.documentElement.setAttribute('data-initial-lists-sub', listSub);
       var chSub = localStorage.getItem('myListAddon:channelsSubmenu') || 'my-channels';
       document.documentElement.setAttribute('data-initial-channels-sub', chSub);
@@ -527,7 +532,6 @@ ${seoHeadHtml}
   html[data-initial-lists-sub] #listsSubMyLists,
   html[data-initial-lists-sub] #listsSubLiked,
   html[data-initial-lists-sub] #listsSubImport,
-  html[data-initial-lists-sub] #listsSubBulk,
   html[data-initial-lists-sub] #listsSubCreateList {
     display: none !important;
   }
@@ -538,9 +542,6 @@ ${seoHeadHtml}
     display: block !important;
   }
   html[data-initial-lists-sub="import"] #listsSubImport {
-    display: block !important;
-  }
-  html[data-initial-lists-sub="bulk"] #listsSubBulk {
     display: block !important;
   }
   html[data-initial-lists-sub="create-list"] #listsSubCreateList {

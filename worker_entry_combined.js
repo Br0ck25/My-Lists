@@ -502,6 +502,22 @@ const CREATOR_AUTH_VERIFY_PER_MINUTE = 60;
 // are never trusted to name an account.
 const LEGACY_UNVERIFIED_CONFIG_SHELVES = true;
 
+// --- Bound on /admin/api/creator-lists' KV fallback scan ---------------------
+//
+// That panel reads D1 (the real source) and then scans this creator's
+// `creatorlist:` prefix in KV to surface records D1 does not have. The scan was
+// list({ limit: 1000 }) with no cursor, followed by ONE get per key -- so a
+// single request could ask for 1,001 storage operations against Cloudflare's
+// 1,000-per-invocation cap and simply die, and anything past the first 1,000
+// keys was invisible whether it died or not.
+//
+// 250 keeps the whole request comfortably inside the cap alongside the D1
+// queries and the order-key read, and is far past any real account (the largest
+// pathological case on record was 129 records for 22 real lists). When the scan
+// does hit the bound the response says so, rather than implying it saw
+// everything.
+const ADMIN_CREATOR_LIST_KV_SCAN_MAX = 250;
+
 // --- Bound on /api/resolve's cross-deployment fallback -----------------------
 //
 // /api/resolve takes a `url` and, when the local config resolves to nothing,
@@ -3994,6 +4010,25 @@ async function getOrCreateScrobbleToken(env, username, rotate = false) {
       ]);
     } catch (dbErr) {
       console.error("D1 write error (scrobble_tokens):", dbErr);
+      // A ROTATION that could not reach D1 must not be reported as one.
+      //
+      // The KV writes below would still run, and usernameForScrobbleToken
+      // consults D1 first: it would find the OLD token still recorded as this
+      // account's active one, reject the new token outright ("active.token !==
+      // t"), and keep honouring the old one. So the caller was handed a token
+      // that does not work while the token they were rotating AWAY from -- the
+      // one they believe they just revoked -- carried on authorising writes.
+      //
+      // Rotation is the only revocation control for a credential that lives in
+      // a webhook URL, i.e. in a media server's config and its logs. Failing
+      // open there is the wrong answer; the caller turns "" into a 500 and the
+      // person tries again with nothing changed.
+      //
+      // Only rotation. A FIRST mint that misses D1 is recoverable on its own --
+      // D1 has no row for the account, so nothing contradicts the new token and
+      // the lazy backfill in usernameForScrobbleToken repairs it -- and failing
+      // that would deny a working feature over a transient error.
+      if (rotate) return "";
     }
   }
   if (env && env.CONFIGS) {
@@ -10637,8 +10672,18 @@ function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
   if (shuffleShelves && active.length > 1) {
     active = deterministicDailyShuffle(active, `shelves:${configSeed || ''}`);
   }
-  const resources = ["catalog", { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "channel_"] }];
-  const idPrefixes = ["tt", "channel_"];
+  // "tmdb:" belongs here because this add-on actually serves those ids.
+  //
+  // A Watch History or Continue Watching entry for a title with no IMDb id is
+  // stored and returned as "tmdb:<id>" (see fetchAutoTrackedCatalog below), and
+  // the /meta route has always resolved them -- `id.startsWith("tt") ||
+  // id.startsWith("tmdb:")`. The manifest did not say so, and idPrefixes is how
+  // a Stremio-protocol client decides which add-on owns an id: undeclared, those
+  // tiles get filtered out of the row by strict clients and their detail pages
+  // are never routed back here by any client. This file's own placeholder tile
+  // already cites that behaviour ("some clients filter out anything else").
+  const resources = ["catalog", { name: "meta", types: ["movie", "series"], idPrefixes: ["tt", "tmdb:", "channel_"] }];
+  const idPrefixes = ["tt", "tmdb:", "channel_"];
   // Stremio/wako call every installed addon's subtitles resource the
   // instant ANY video starts playing (checking for subtitle tracks) --
   // regardless of which addon's catalog the video came from, or whether
@@ -16732,6 +16777,11 @@ ${seoHeadHtml}
       var catSub = localStorage.getItem('myListAddon:catalogsSubmenu') || 'all';
       document.documentElement.setAttribute('data-initial-catalogs-sub', catSub);
       var listSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+      // Must agree with normalizeListsSubmenu (16_client-row-core.js): the rule
+      // above hides every Lists panel and then un-hides the one this attribute
+      // names, so a stale value naming a panel that no longer exists leaves the
+      // tab blank from first paint.
+      if (['my-lists', 'liked', 'import', 'create-list'].indexOf(listSub) === -1) listSub = 'my-lists';
       document.documentElement.setAttribute('data-initial-lists-sub', listSub);
       var chSub = localStorage.getItem('myListAddon:channelsSubmenu') || 'my-channels';
       document.documentElement.setAttribute('data-initial-channels-sub', chSub);
@@ -17107,7 +17157,6 @@ ${seoHeadHtml}
   html[data-initial-lists-sub] #listsSubMyLists,
   html[data-initial-lists-sub] #listsSubLiked,
   html[data-initial-lists-sub] #listsSubImport,
-  html[data-initial-lists-sub] #listsSubBulk,
   html[data-initial-lists-sub] #listsSubCreateList {
     display: none !important;
   }
@@ -17118,9 +17167,6 @@ ${seoHeadHtml}
     display: block !important;
   }
   html[data-initial-lists-sub="import"] #listsSubImport {
-    display: block !important;
-  }
-  html[data-initial-lists-sub="bulk"] #listsSubBulk {
     display: block !important;
   }
   html[data-initial-lists-sub="create-list"] #listsSubCreateList {
@@ -21490,6 +21536,22 @@ const CHART_SLUG_ENTRIES = ${jsonForScript(CHART_SLUG_ENTRIES)};
 // instead -- and guessed wrong for "true-crime-mystery", which is a series.
 const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
 
+// The Lists tab remembers which sub-tab you were last on, in localStorage, and
+// that value outlives the release that wrote it -- so it can name a panel this
+// build no longer renders. 'bulk' is exactly that: #listsSubBulk is gone from
+// the page, while the CSS that positioned it (09_page-shell.js) and the three
+// places that read it all stayed. switchListsSubmenu hides every panel before
+// showing the one it was asked for, so a browser still holding 'bulk' opened
+// the Lists tab to a blank page on every load, with no way back short of
+// clearing site data.
+//
+// Validated against the panels that actually exist rather than trusted.
+function normalizeListsSubmenu(raw) {
+  const known = { 'my-lists': 1, 'liked': 1, 'import': 1, 'create-list': 1 };
+  const v = String(raw || '');
+  return known[v] ? v : 'my-lists';
+}
+
 // escapeHtml/escapeAttr are defined once, in 19_client-search-and-likes.js.
 // They used to be declared here too; since every client module shares one
 // script scope in the browser, that later declaration won, and this copy
@@ -21519,7 +21581,7 @@ const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
     if (subBulk) subBulk.style.display = (catSub === 'bulk') ? 'block' : 'none';
 
     // 2. Lists submenu early sync
-    var listSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+    var listSub = normalizeListsSubmenu(localStorage.getItem('myListAddon:listsSubmenu'));
     var listBar = document.getElementById('listsSubnavBar');
     if (listBar) {
       listBar.querySelectorAll('.subnav-pill').forEach(function(p) {
@@ -21532,12 +21594,10 @@ const CURATED_LIST_ENTRIES = ${jsonForScript(CURATED_LIST_ENTRIES)};
     var subMyLists = document.getElementById('listsSubMyLists');
     var subLiked = document.getElementById('listsSubLiked');
     var subListImport = document.getElementById('listsSubImport');
-    var subListBulk = document.getElementById('listsSubBulk');
     var subCreate = document.getElementById('listsSubCreateList');
     if (subMyLists) subMyLists.style.display = (listSub === 'my-lists') ? 'block' : 'none';
     if (subLiked) subLiked.style.display = (listSub === 'liked') ? 'block' : 'none';
     if (subListImport) subListImport.style.display = (listSub === 'import') ? 'block' : 'none';
-    if (subListBulk) subListBulk.style.display = (listSub === 'bulk') ? 'block' : 'none';
     if (subCreate) subCreate.style.display = (listSub === 'create-list') ? 'block' : 'none';
 
     // 3. Channels submenu early sync
@@ -22159,7 +22219,7 @@ function switchTab(name) {
       window._listsInitializedOnce = true;
       let savedSub = 'my-lists';
       try {
-        savedSub = localStorage.getItem('myListAddon:listsSubmenu') || 'my-lists';
+        savedSub = normalizeListsSubmenu(localStorage.getItem('myListAddon:listsSubmenu'));
       } catch (e) {}
       const pills = document.querySelectorAll('#listsSubnavBar .subnav-pill');
       let targetBtn = null;
@@ -22610,7 +22670,6 @@ function switchListsSubmenu(name, btn) {
   const subpanels = {
     'my-lists': 'listsSubMyLists',
     'liked': 'listsSubLiked',
-    'bulk': 'listsSubBulk',
     'create-list': 'listsSubCreateList',
     'import': 'listsSubImport'
   };
@@ -27156,172 +27215,19 @@ async function bulkResolveInChunks(items) {
   return out;
 }
 
-// --- Import from Trakt export --------------------------------------------
+// --- Trakt history row -> Watch History item ------------------------------
 //
-// Trakt VIP's own export (Settings > Data > Export on trakt.tv) is a .zip
-// of the account's data as JSON, one file (or numbered file series) per
-// category -- and every category turns out to be exactly the shape
-// Trakt's own REST API already returns (see mapTraktItems /
-// mapTraktHistoryItems), just dumped straight to disk rather than a
-// custom export schema. Parsed entirely client-side with fflate (loaded
-// in <head>) -- the zip never reaches this Worker, matching the rest of
-// this add-on's local-first approach to personal data.
-let traktExportZipEntries = null; // { filename: Uint8Array }, set once a zip is picked
-
-const TRAKT_EXPORT_CATEGORIES = [
-  // These patterns need DOUBLED backslashes in source (\\d, \\.) even
-  // though a real regex only wants a single backslash-d / backslash-dot --
-  // this whole block sits inside renderBuilder()'s giant outer template
-  // literal, so the outer literal's own escape parsing runs over this
-  // text once already (at Worker-render time) before it ever reaches the
-  // browser. A single backslash-d isn't a recognized JS string escape, so
-  // that pass silently drops the backslash and leaves a bare "d" -- which
-  // is exactly what shipped here originally and is why History (and half
-  // of Watched) never matched any files despite the filenames being right
-  // there. Same root cause as this codebase's documented newline-escaping
-  // trap, just hitting a regex instead of a literal newline. Verified
-  // post-render this time (extracted the actual rendered client script
-  // and confirmed the backslashes survive), not just eyeballed.
-  { key: 'history', label: 'Watch History', filePattern: /^watched-history-\\d+\\.json$/ },
-  { key: 'watched', label: 'Watched (all-time list)', filePattern: /^watched-(movies-\\d+|shows(-\\d+)?)\\.json$/ },
-  { key: 'watchlist', label: 'Watchlist', filePattern: /^lists-watchlist\\.json$/ },
-  { key: 'ratings', label: 'Ratings', filePattern: /^ratings-(movies|shows)\\.json$/ },
-];
-
-// Returns { items, matchedFiles, errors } rather than just an item array --
-// if a category's files exist in the zip but come back with zero items,
-// this lets the caller tell "nothing in the export" apart from "found the
-// files but couldn't parse them", and surface the real reason instead of
-// just silently omitting the category (which is what happened before this
-// -- see the debugging note below).
-function readTraktExportJsonFiles(pattern) {
-  const items = [];
-  const errors = [];
-  let matchedFiles = 0;
-  for (const filename in traktExportZipEntries) {
-    // Match on the basename only, not the full zip path -- Trakt's export
-    // structure isn't guaranteed stable release to release (this add-on
-    // has already seen it both flat and, apparently, occasionally folder-
-    // nested), and matching the full path against an anchored pattern
-    // would silently miss every file if a folder prefix shows up, with no
-    // visible error at all since a 0-match category isn't treated as a
-    // failure below.
-    const basename = filename.split('/').pop() || filename;
-    if (!pattern.test(basename)) continue;
-    matchedFiles++;
-    try {
-      const text = fflate.strFromU8(traktExportZipEntries[filename]);
-      const parsed = JSON.parse(text);
-      if (Array.isArray(parsed)) items.push.apply(items, parsed);
-    } catch (e) {
-      errors.push(filename + ': ' + (e && e.message ? e.message : String(e)));
-    }
-  }
-  return { items: items, matchedFiles: matchedFiles, errors: errors };
-}
-
-document.getElementById('traktExportFileInput')?.addEventListener('change', async (e) => {
-  const file = e.target.files && e.target.files[0];
-  const box = document.getElementById('traktExportImportResult');
-  if (!file || !box) return;
-  box.innerHTML = '<p style="margin-top:10px;"><small>Reading zip\u2026</small></p>';
-  try {
-    if (typeof fflate === 'undefined') {
-      throw new Error('the zip-reading library (fflate, loaded from a CDN) never loaded \u2014 check your network connection or an ad/script blocker, then reload the page and try again');
-    }
-    const buf = await file.arrayBuffer();
-    traktExportZipEntries = fflate.unzipSync(new Uint8Array(buf));
-    // Debug aid: if a category still doesn't show up as a checkbox below,
-    // open devtools and check this list against TRAKT_EXPORT_CATEGORIES'
-    // patterns above -- Trakt's export layout isn't guaranteed stable.
-    console.log('Trakt export zip contains:', Object.keys(traktExportZipEntries));
-  } catch (err) {
-    box.innerHTML = '<p class="testresult err">\u2717 Could not read that zip: ' + escapeHtml(err && err.message ? err.message : String(err)) + '</p>';
-    return;
-  }
-  const diagnostics = [];
-  const rowsHtml = TRAKT_EXPORT_CATEGORIES.map((cat) => {
-    const result = readTraktExportJsonFiles(cat.filePattern);
-    if (!result.matchedFiles) return ''; // this category's file(s) just aren't in this zip -- not an error
-    if (!result.items.length) {
-      // Files matched the expected name pattern but every one of them
-      // failed to parse -- surface exactly why instead of quietly
-      // dropping the category (this is the case James hit: the checkbox
-      // for a whole category just never appeared, with no explanation).
-      diagnostics.push(cat.label + ': found ' + result.matchedFiles + ' file(s) but couldn\u2019t read any of them \u2014 ' + result.errors.slice(0, 2).join('; '));
-      return '';
-    }
-    // History is the one category with episode-level rows (see
-    // mapTraktExportEntry) -- give it a Shows/Episodes choice right under
-    // its checkbox, same idea as the Copy to Custom List toggle for the
-    // live version of this same source. Every other category is already
-    // whole-title data, no such choice to make.
-    const historyToggle = cat.key === 'history'
-      ? '<div style="margin-left:24px; margin-top:4px;"><small>' +
-        '<label><input type="radio" name="traktExportHistoryMode" value="shows" checked> Shows only</label>' +
-        ' &nbsp; <label><input type="radio" name="traktExportHistoryMode" value="episodes"> Individual episodes</label>' +
-        '</small></div>' +
-        // Deliberately independent of the Shows/Episodes radio above --
-        // that radio only controls how the *Custom List* folds rows for
-        // display; Watch History always needs the real per-episode
-        // identifiers regardless, which mapTraktExportEntryToWatchHistoryItem
-        // reads straight off each raw row.
-        '<div style="margin-left:24px; margin-top:4px;"><small>' +
-        '<label><input type="checkbox" id="traktExportMarkWatchedCheck" checked> Also add these to Watch History &amp; Continue Watching (marks them watched)</label>' +
-        '</small></div>'
-      : '';
-    return '<div class="row searchresult-row" style="flex-direction:column; align-items:flex-start;">' +
-      '<div><label><input type="checkbox" class="traktExportCatCheck" value="' + cat.key + '" checked> <strong>' + cat.label + '</strong> \u2014 ' + result.items.length + ' entries</label></div>' +
-      historyToggle +
-      '</div>';
-  }).join('');
-  const diagnosticsHtml = diagnostics.length
-    ? '<p class="testresult err">\u2717 ' + diagnostics.map(escapeHtml).join('<br>') + '</p>'
-    : '';
-  if (!rowsHtml) {
-    box.innerHTML = diagnosticsHtml || '<p class="testresult err">\u2717 Didn\u2019t recognize any Trakt export files in that zip.</p>';
-    return;
-  }
-  box.innerHTML = '<p style="margin-top:10px;"><small>Found these categories \u2014 pick which to import (each becomes its own Custom List, split into Movies/Shows automatically, deduped so a rewatched title only appears once):</small></p>' +
-    rowsHtml + diagnosticsHtml +
-    '<div class="actions" style="flex-direction:row; width:auto; margin-top:8px;">' +
-    '<button type="button" class="secondary" id="traktExportImportBtn">Import selected</button>' +
-    '</div>';
-  const importBtn = document.getElementById('traktExportImportBtn');
-  if (importBtn) importBtn.addEventListener('click', runTraktExportImport);
-});
-
-// Maps one raw exported row (a history/watchlist/ratings entry) to the
-// {imdbId, title, year, type} shape needed before it becomes a Custom
-// List item. History's episode rows default to folding up to their parent
-// show (a Custom List is normally a flat title picker with no per-episode
-// concept), but historyMode === 'episodes' (from the radio under the
-// History checkbox) keeps each one as its own "Show S1E5 \u2014 Title" row
-// instead, same style mapTraktHistoryItems already uses for the live
-// version of this source -- carrying a dedupeKey scoped to the exact
-// episode rather than just the show, so a rewatched episode still
-// collapses to one row but distinct episodes of the same show don't.
-function mapTraktExportEntry(it, category, historyMode) {
-  if (category === 'history' && it.type === 'episode' && it.show && it.show.ids && it.show.ids.imdb) {
-    if (historyMode === 'episodes') {
-      const s = it.episode.season;
-      const e = it.episode.number;
-      const epTitle = it.episode.title ? ' \u2014 ' + it.episode.title : '';
-      return {
-        imdbId: it.show.ids.imdb,
-        title: it.show.title + ' S' + s + 'E' + e + epTitle,
-        year: it.show.year || '',
-        type: 'series',
-        dedupeKey: it.show.ids.imdb + ':' + s + ':' + e,
-      };
-    }
-    return { imdbId: it.show.ids.imdb, title: it.show.title, year: it.show.year || '', type: 'series' };
-  }
-  const obj = it.movie || it.show || null;
-  if (!obj || !obj.ids || !obj.ids.imdb) return null;
-  return { imdbId: obj.ids.imdb, title: obj.title, year: obj.year || '', type: it.movie ? 'movie' : 'series' };
-}
-
+// Used by the live Trakt history import above (readTraktHistoryRaw's own
+// mapping step). It used to live inside a Trakt-export-zip importer that this
+// build no longer renders: both that and its Letterboxd twin bound their file
+// inputs with
+//   document.getElementById('traktExportFileInput')?.addEventListener(...)
+// at script-evaluation time, and neither id exists in the page any more --
+// optional chaining meant they simply never attached, and ~530 lines behind
+// them, runTraktExportImport and runLetterboxdExportImport included, were
+// unreachable. The unified importer (onUnifiedImportFilesSelected, below)
+// replaced both and reads .zip itself. This mapper is the one piece of it that
+// something live still calls.
 // Maps one raw History row to the shape addItemsToWatchHistory expects --
 // used by the "Also add these to Watch History" checkbox. An episode row
 // needs a real TMDB episode id (the same id space Watch History uses
@@ -27370,359 +27276,6 @@ function mapTraktExportEntryToWatchHistoryItem(it) {
     watchedAt: watchedAtMs,
   };
 }
-
-async function runTraktExportImport() {
-  const btn = document.getElementById('traktExportImportBtn');
-  const catChecked = new Set(Array.from(document.querySelectorAll('.traktExportCatCheck:checked')).map((c) => c.value));
-  const historyModeEl = document.querySelector('input[name="traktExportHistoryMode"]:checked');
-  const historyMode = historyModeEl ? historyModeEl.value : 'shows';
-  const markWatchedEl = document.getElementById('traktExportMarkWatchedCheck');
-  const markWatched = !!(markWatchedEl && markWatchedEl.checked);
-  // A category is worth processing here if either its own "create a
-  // Custom List" checkbox is on, or (History only) "mark as watched" is on
-  // -- these are independent choices, not one gating the other, so
-  // someone can mark History as watched without also wanting a redundant
-  // "Trakt Watch History" Custom List cluttering their Custom Lists tab.
-  const relevantCats = TRAKT_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || (cat.key === 'history' && markWatched));
-  if (!relevantCats.length) {
-    if (typeof showAppAlert === 'function') showAppAlert('Selection Required', 'Pick at least one category first.', false);
-    else alert('Pick at least one category first.');
-    return;
-  }
-  if (btn) { btn.disabled = true; btn.textContent = 'Importing\u2026'; }
-
-  const created = [];
-  const failed = [];
-  let watchedAdded = 0;
-  let cwSucceeded = 0;
-  let cwTotal = 0;
-  for (const cat of relevantCats) {
-    const catKey = cat.key;
-    const rawItems = readTraktExportJsonFiles(cat.filePattern).items;
-
-    if (catChecked.has(catKey)) {
-      const byType = { movie: new Map(), series: new Map() };
-      rawItems.forEach((it) => {
-        const mapped = mapTraktExportEntry(it, cat.key, historyMode);
-        if (!mapped) return;
-        // Dedupe within each type -- unlike the live "Watch History" catalog
-        // row (which deliberately keeps every rewatch as its own tile), a
-        // Custom List is a browsable collection, not a rewatch log. Shows
-        // mode dedupes by show id (a title watched several times only
-        // appears once); Episodes mode dedupes by the finer-grained
-        // dedupeKey mapTraktExportEntry attaches instead, so distinct
-        // episodes of the same show still both appear.
-        byType[mapped.type].set(mapped.dedupeKey || mapped.imdbId, mapped);
-      });
-      for (const type of ['movie', 'series']) {
-        const items = Array.from(byType[type].values()).map((m) => ({
-          imdbId: m.imdbId,
-          title: m.title,
-          year: m.year,
-          // The export carries no poster art of its own -- same metahub
-          // fallback mapTraktItems already uses for every other Trakt source.
-          poster: 'https://images.metahub.space/poster/medium/' + m.imdbId + '/img',
-        }));
-        if (!items.length) continue;
-        const typeLabel = type === 'movie' ? 'Movies' : 'Shows';
-        const listName = 'Trakt ' + cat.label + ' (' + typeLabel + ')';
-        // Debug aid: if a list still silently doesn't appear after this,
-        // devtools console will show exactly which save call failed and why.
-        console.log('Trakt export import: saving', listName, '-', items.length, 'items\u2026');
-        const result = await saveItemsAsNewCustomList(listName, type, items, 'private');
-        console.log('Trakt export import: result for', listName, '->', result);
-        if (result.ok) {
-          created.push({ name: listName, count: items.length });
-        } else {
-          failed.push({ name: listName, error: result.error });
-        }
-      }
-    }
-
-    if (catKey === 'history' && markWatched) {
-      const whItems = [];
-      const seenIds = new Set();
-      rawItems.forEach((it) => {
-        const mapped = mapTraktExportEntryToWatchHistoryItem(it);
-        if (!mapped || seenIds.has(mapped.id)) return; // a rewatch logs one row per play -- Watch History only needs one entry per item
-        seenIds.add(mapped.id);
-        whItems.push(mapped);
-      });
-      if (whItems.length && typeof addItemsToWatchHistory === 'function') {
-        if (btn) btn.textContent = 'Checking Continue Watching for ' + new Set(whItems.filter((it) => it.showId).map((it) => it.showId)).size + ' show(s)\u2026';
-        const whResult = await addItemsToWatchHistory(whItems, true);
-        watchedAdded += whResult.added;
-        cwSucceeded += whResult.cwSucceeded || 0;
-        cwTotal += whResult.cwTotal || 0;
-      }
-    }
-  }
-
-  if (btn) { btn.disabled = false; btn.textContent = 'Import selected'; }
-  if (created.length) renderCreatorDashboard();
-
-  let msg = '';
-  if (created.length) {
-    msg += 'Created ' + created.map((c) => '"' + c.name + '" (' + c.count + ' item' + (c.count === 1 ? '' : 's') + ')').join(', ') +
-      ' in your Custom Lists \u2014 find them under the Custom Lists tab to add them to your lists.';
-  }
-  if (watchedAdded) {
-    msg += (msg ? '\\n\\n' : '') + 'Marked ' + watchedAdded + ' item' + (watchedAdded === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
-    if (cwTotal) {
-      msg += ' Continue Watching checked for ' + cwSucceeded + ' of ' + cwTotal + ' show' + (cwTotal === 1 ? '' : 's') +
-        (cwSucceeded < cwTotal ? ' \u2014 the rest hit a network hiccup or TMDB rate limit; reopening one of those shows will retry it, or just run this import again.' : '.');
-    }
-  }
-  if (failed.length) {
-    msg += (msg ? '\\n\\n' : '') + 'Could not create: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
-  }
-  if (!msg) msg = 'Nothing to import in the selected categories.';
-  if (typeof showAppAlert === 'function') {
-    showAppAlert(failed.length ? 'Import Finished with Warnings' : 'Import Complete', msg, !failed.length);
-  } else {
-    alert(msg);
-  }
-}
-
-// Turns a pasted list URL's last path segment into a readable starter name
-// (e.g. .../lists/user/best-of-2026 -> "Best Of 2026") -- just a starting
-// point, the person can rename the row afterward like any other.
-// --- Import from Letterboxd export --------------------------------------------
-
-let letterboxdExportZipEntries = null;
-
-const LETTERBOXD_EXPORT_CATEGORIES = [
-  { key: 'watched', label: 'Watched (all-time list)', filePattern: /^watched\.csv$/ },
-  { key: 'watchlist', label: 'Watchlist', filePattern: /^watchlist\.csv$/ },
-  { key: 'ratings', label: 'Ratings', filePattern: /^ratings\.csv$/ },
-  { key: 'diary', label: 'Diary', filePattern: /^diary\.csv$/ },
-];
-
-function parseLetterboxdCsv(csvText) {
-  const lines = [];
-  let row = [];
-  let inQuotes = false;
-  let val = '';
-  for (let i = 0; i < csvText.length; i++) {
-    const c = csvText[i];
-    const nextC = csvText[i + 1];
-    if (!inQuotes && c === ',') {
-      row.push(val);
-      val = '';
-    } else if (c === '"' && inQuotes && nextC === '"') {
-      val += '"';
-      i++; // skip next quote
-    } else if (c === '"') {
-      inQuotes = !inQuotes;
-    } else if (!inQuotes && (c === '\\n' || c === '\\r')) {
-      if (c === '\\r' && nextC === '\\n') i++;
-      row.push(val);
-      if (row.length > 0 || val) lines.push(row);
-      row = [];
-      val = '';
-    } else {
-      val += c;
-    }
-  }
-  if (val || row.length > 0) {
-    row.push(val);
-    lines.push(row);
-  }
-  return lines;
-}
-
-function readLetterboxdExportCsvFiles(pattern) {
-  const items = [];
-  const errors = [];
-  let matchedFiles = 0;
-  for (const filename in letterboxdExportZipEntries) {
-    const basename = filename.split('/').pop() || filename;
-    if (!pattern.test(basename)) continue;
-    matchedFiles++;
-    try {
-      const text = fflate.strFromU8(letterboxdExportZipEntries[filename]);
-      const csv = parseLetterboxdCsv(text);
-      if (csv.length > 1) {
-        const header = csv[0].map(h => h.trim());
-        const nameIdx = header.indexOf('Name');
-        const yearIdx = header.indexOf('Year');
-        const uriIdx = header.indexOf('Letterboxd URI');
-        
-        if (nameIdx === -1 || yearIdx === -1) {
-          throw new Error('CSV missing Name or Year column');
-        }
-        
-        for (let i = 1; i < csv.length; i++) {
-          const row = csv[i];
-          if (row.length <= Math.max(nameIdx, yearIdx)) continue;
-          items.push({
-            title: row[nameIdx],
-            year: row[yearIdx],
-            uri: uriIdx !== -1 ? row[uriIdx] : '',
-          });
-        }
-      }
-    } catch (e) {
-      errors.push(filename + ': ' + (e && e.message ? e.message : String(e)));
-    }
-  }
-  return { items: items, matchedFiles: matchedFiles, errors: errors };
-}
-
-document.getElementById('letterboxdExportFileInput')?.addEventListener('change', async (e) => {
-  const file = e.target.files && e.target.files[0];
-  const box = document.getElementById('letterboxdExportImportResult');
-  if (!file || !box) return;
-  box.innerHTML = '<p style="margin-top:10px;"><small>Reading zip\u2026</small></p>';
-  try {
-    if (typeof fflate === 'undefined') {
-      throw new Error('the zip-reading library (fflate) never loaded \u2014 check your network connection or an ad/script blocker, then reload the page and try again');
-    }
-    const buf = await file.arrayBuffer();
-    letterboxdExportZipEntries = fflate.unzipSync(new Uint8Array(buf));
-    console.log('Letterboxd export zip contains:', Object.keys(letterboxdExportZipEntries));
-  } catch (err) {
-    box.innerHTML = '<p class="testresult err">\u2717 Could not read that zip: ' + escapeHtml(err && err.message ? err.message : String(err)) + '</p>';
-    return;
-  }
-  
-  const diagnostics = [];
-  const rowsHtml = LETTERBOXD_EXPORT_CATEGORIES.map((cat) => {
-    const result = readLetterboxdExportCsvFiles(cat.filePattern);
-    if (!result.matchedFiles) return '';
-    if (!result.items.length) {
-      diagnostics.push(cat.label + ': found ' + result.matchedFiles + ' file(s) but couldn\u2019t read any entries \u2014 ' + result.errors.slice(0, 2).join('; '));
-      return '';
-    }
-    // "Watched" and "Diary" are the two categories that represent movies
-    // the person has actually seen (Watchlist is explicitly the opposite,
-    // and Ratings alone doesn't reliably imply a watch date/event) -- only
-    // those two get the option to also mark them watched in this add-on.
-    const markWatchedToggle = (cat.key === 'watched' || cat.key === 'diary')
-      ? '<div style="margin-left:24px; margin-top:4px;"><small>' +
-        '<label><input type="checkbox" class="letterboxdExportMarkWatchedCheck" value="' + cat.key + '" checked> Also add these to Watch History (marks them watched)</label>' +
-        '</small></div>'
-      : '';
-    return '<div class="row searchresult-row" style="flex-direction:column; align-items:flex-start;">' +
-      '<div><label><input type="checkbox" class="letterboxdExportCatCheck" value="' + cat.key + '" checked> <strong>' + cat.label + '</strong> \u2014 ' + result.items.length + ' entries</label></div>' +
-      markWatchedToggle +
-      '</div>';
-  }).join('');
-  
-  const diagnosticsHtml = diagnostics.length
-    ? '<p class="testresult err">\u2717 ' + diagnostics.map(escapeHtml).join('<br>') + '</p>'
-    : '';
-  if (!rowsHtml) {
-    box.innerHTML = diagnosticsHtml || '<p class="testresult err">\u2717 Didn\u2019t recognize any Letterboxd export files in that zip.</p>';
-    return;
-  }
-  box.innerHTML = diagnosticsHtml +
-    '<div class="catalog-list" style="margin-top:8px;">' + rowsHtml + '</div>' +
-    '<div style="margin-top:12px;"><button type="button" class="primary" id="letterboxdExportImportBtn" onclick="runLetterboxdExportImport()">Resolve and Import</button></div>' +
-    '<p style="margin-top:8px; font-size:0.85rem; color:var(--muted);" id="letterboxdImportProgress"></p>';
-});
-
-window.runLetterboxdExportImport = async function() {
-  const btn = document.getElementById('letterboxdExportImportBtn');
-  const progressLine = document.getElementById('letterboxdImportProgress');
-  const catChecked = new Set(Array.from(document.querySelectorAll('.letterboxdExportCatCheck:checked')).map((c) => c.value));
-  const markWatchedChecked = new Set(Array.from(document.querySelectorAll('.letterboxdExportMarkWatchedCheck:checked')).map((c) => c.value));
-  // Same independence as the Trakt Export importer -- a category matters
-  // here if either its own "create a Custom List" checkbox is on, or its
-  // "mark as watched" checkbox is on, not only when both are.
-  const relevantCats = LETTERBOXD_EXPORT_CATEGORIES.filter((cat) => catChecked.has(cat.key) || markWatchedChecked.has(cat.key));
-  if (!relevantCats.length) {
-    if (typeof showAppAlert === 'function') showAppAlert('Selection Required', 'Please select at least one category to import.', false);
-    else alert('Please select at least one category to import.');
-    return;
-  }
-  if (btn) { btn.disabled = true; btn.textContent = 'Importing\u2026'; }
-  
-  const created = [];
-  const failed = [];
-  let watchedAdded = 0;
-  
-  for (const cat of relevantCats) {
-    const result = readLetterboxdExportCsvFiles(cat.filePattern);
-    if (!result.items.length) continue;
-    
-    // Dedupe by title and year
-    const byKey = new Map();
-    result.items.forEach((it) => {
-      const key = (it.title + '|' + it.year).toLowerCase();
-      if (!byKey.has(key)) byKey.set(key, it);
-    });
-    const uniqueItems = Array.from(byKey.values());
-    
-    if (progressLine) progressLine.textContent = 'Resolving TMDB IDs for ' + cat.label + ' (' + uniqueItems.length + ' items)...';
-    
-    // Bulk resolve
-    const resolvedItems = [];
-    try {
-      const resolvedAll = await bulkResolveInChunks(uniqueItems);
-
-      for (const m of resolvedAll) {
-        if (!m.imdbId) continue;
-        resolvedItems.push({
-          imdbId: m.imdbId,
-          title: m.title,
-          year: m.year,
-          type: 'movie',
-          poster: 'https://images.metahub.space/poster/medium/' + m.imdbId + '/img',
-        });
-      }
-    } catch (err) {
-      console.error('Bulk resolve error:', err);
-      failed.push({ name: 'Letterboxd ' + cat.label, error: err.message || String(err) });
-      continue;
-    }
-    
-    if (!resolvedItems.length) {
-      failed.push({ name: 'Letterboxd ' + cat.label, error: 'Could not resolve any items.' });
-      continue;
-    }
-
-    if (catChecked.has(cat.key)) {
-      const listName = 'Letterboxd ' + cat.label;
-      if (progressLine) progressLine.textContent = 'Saving ' + listName + ' (' + resolvedItems.length + ' items)...';
-
-      const saveResult = await saveItemsAsNewCustomList(listName, 'movie', resolvedItems, 'private');
-      if (saveResult.ok) {
-        created.push({ name: listName, count: resolvedItems.length });
-      } else {
-        failed.push({ name: listName, error: saveResult.error });
-      }
-    }
-
-    if (markWatchedChecked.has(cat.key) && typeof addItemsToWatchHistory === 'function') {
-      if (progressLine) progressLine.textContent = 'Marking ' + cat.label + ' as watched...';
-      const whItems = resolvedItems.map((it) => ({ id: it.imdbId, type: 'movie', name: it.title, poster: it.poster }));
-      const whResult = await addItemsToWatchHistory(whItems, true);
-      watchedAdded += whResult.added;
-    }
-  }
-  
-  if (progressLine) progressLine.textContent = '';
-  if (btn) { btn.disabled = false; btn.textContent = 'Resolve and Import'; }
-  if (created.length) renderCreatorDashboard();
-  
-  let msg = '';
-  if (created.length) {
-    msg += 'Successfully created:\\n' + created.map((c) => c.name + ' (' + c.count + ' items)').join('\\n');
-  }
-  if (watchedAdded) {
-    msg += (msg ? '\\n\\n' : '') + 'Marked ' + watchedAdded + ' item' + (watchedAdded === 1 ? '' : 's') + ' as watched \u2014 find them under Watch History.';
-  }
-  if (failed.length) {
-    msg += (msg ? '\\n\\n' : '') + 'Could not create: ' + failed.map((f) => f.name + ' (' + f.error + ')').join(', ');
-  }
-  if (!msg) msg = 'Nothing to import in the selected categories.';
-  if (typeof showAppAlert === 'function') {
-    showAppAlert(failed.length ? 'Letterboxd Import Finished' : 'Letterboxd Import Complete', msg, !failed.length);
-  } else {
-    alert(msg);
-  }
-};
 
 // --- Unified Multi-Format List Importer -----------------------------------
 let unifiedImportSelectedFiles = [];
@@ -49288,6 +48841,14 @@ async function renderCreatorDashboard(options) {
         if (!slug || !Array.isArray(rowPayload.items) || !rowPayload.items.length) return;
         const sList = (data.lists || []).find(l => l && l.slug === slug);
         if (sList && rowPayload.items.length > (sList.items || []).length) {
+          // The dashboard is updated optimistically, so the save has to be
+          // checked -- it used to be .catch(() => {}) with no look at data.ok.
+          // A refusal the server states plainly (413 for a list over the size
+          // ceiling, 409 for a conflicting edit from another device) left the
+          // dashboard showing items the account does not have, indefinitely and
+          // with nothing said. Roll the optimistic change back and say so.
+          const previousItems = sList.items || [];
+          const previousCount = sList.itemCount;
           sList.items = rowPayload.items;
           sList.itemCount = rowPayload.items.length;
           fetch(ORIGIN + '/api/creator/lists/save', {
@@ -49302,7 +48863,19 @@ async function renderCreatorDashboard(options) {
               items: rowPayload.items,
               visibility: sList.visibility || 'private',
             })
-          }).catch(() => {});
+          }).then(async (res) => {
+            let saved = null;
+            try { saved = await res.json(); } catch (e) {}
+            if (saved && saved.ok) return;
+            sList.items = previousItems;
+            sList.itemCount = previousCount;
+            if (typeof showAddedToast === 'function') {
+              showAddedToast('Could not sync "' + (sList.name || slug) + '": ' + ((saved && saved.error) || 'please try again'));
+            }
+          }).catch(() => {
+            sList.items = previousItems;
+            sList.itemCount = previousCount;
+          });
         }
         if (localMapForCreator[slug] && rowPayload.items.length > (localMapForCreator[slug].items || []).length) {
           localMapForCreator[slug].items = rowPayload.items;
@@ -66734,15 +66307,23 @@ function generateSearchVariations(query) {
       await bumpCreatorListsStamp(env, auth.username);
 
       // Keep search index (lists_fts) in step with this save.
+      //
+      // FTS5 has no primary key, so "update" here is delete-then-insert -- and
+      // as two separate statements that is not one. Two concurrent saves of the
+      // same list could interleave into zero rows (both deletes, then both
+      // inserts is fine; delete/insert/delete is not) or two, and a failure
+      // between them left the list unsearchable with nothing to say so. One
+      // batch is one transaction, which is what this always meant.
       if (env.DB) {
         try {
           const ftsListId = `c:${auth.username}:${slug}`;
-          await env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(ftsListId).run();
+          const ftsStmts = [env.DB.prepare("DELETE FROM lists_fts WHERE list_id = ?").bind(ftsListId)];
           if (isPublicListVisibility(visibility)) {
-            await env.DB.prepare(
+            ftsStmts.push(env.DB.prepare(
               "INSERT INTO lists_fts (list_id, name, creator_name, username) VALUES (?, ?, ?, ?)"
-            ).bind(ftsListId, name, auth.displayName || auth.username, auth.username).run();
+            ).bind(ftsListId, name, auth.displayName || auth.username, auth.username));
           }
+          await env.DB.batch(ftsStmts);
         } catch (dbErr) {
           console.error("D1 write error (lists_fts save):", dbErr);
         }
@@ -69588,11 +69169,21 @@ function generateSearchVariations(query) {
         }
       }
 
+      let kvScanTruncated = false;
       if (env.CONFIGS) {
         const prefix = `creatorlist:${targetUsername}:`;
         try {
-          const kvListed = await env.CONFIGS.list({ prefix, limit: 1000 });
+          // Bounded, and honest about being bounded.
+          //
+          // This was list({ limit: 1000 }) with no cursor followed by one get
+          // per key, all inside one invocation -- so an account with a lot of
+          // lists could spend the whole 1,000-storage-operations budget here and
+          // the request would die, and anything past the first 1,000 keys was
+          // silently invisible either way. D1 above is the real source for this
+          // panel; this scan exists to surface records D1 does not have.
+          const kvListed = await env.CONFIGS.list({ prefix, limit: ADMIN_CREATOR_LIST_KV_SCAN_MAX });
           if (kvListed && Array.isArray(kvListed.keys)) {
+            if (kvListed.list_complete === false) kvScanTruncated = true;
             for (const k of kvListed.keys) {
               const slug = k.name.slice(prefix.length);
               let data = null;
@@ -69650,6 +69241,9 @@ function generateSearchVariations(query) {
         orderCount,
         cursor: nextCursor,
         done,
+        // True when the KV scan hit its per-invocation bound, so the panel can
+        // say "this may not be all of them" rather than quietly implying it is.
+        kvScanTruncated: kvScanTruncated || undefined,
       }, 200, { "Cache-Control": "no-store" });
     }
 

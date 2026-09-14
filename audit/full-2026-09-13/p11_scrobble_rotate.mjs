@@ -16,7 +16,12 @@ const newTok = r.body.token;
 console.log("rotate ->", r.status, JSON.stringify(r.body));
 env.DB.failWhen(null);
 
+if (!newTok) {
+  console.log("  rotation refused, so there is no new token to probe -- correct:");
+  console.log("  the old one must stay the only credential until a rotation actually lands.");
+}
 const probe = async (tok, label) => {
+  if (!tok) { console.log(`  ${label}: not issued`); return; }
   const res = await call(env, "/api/scrobble?st=" + encodeURIComponent(tok), { method: "POST",
     json: { event: "media.scrobble", Metadata: { type: "movie", title: "X", guid: "imdb://tt1" } } });
   console.log(`  ${label} (${tok.slice(0,8)}...) -> ${res.status} ${JSON.stringify(res.body).slice(0,80)}`);
