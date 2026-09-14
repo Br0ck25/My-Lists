@@ -1249,12 +1249,28 @@ function newOnStreamingWalkPath(kind, providerId, region, page, todayIso) {
 // The flat list of sweep units the rotating cursor walks: every provider, both
 // kinds, every page up to the walk depth. Built the same way every tick, so a
 // cursor stored by one tick means the same thing to the next.
+//
+// PAGE is the outermost loop, and that ordering is the whole design.
+//
+// Nested the other way -- provider outermost, which is how this shipped -- the
+// walk drains all 40 pages of Netflix movies before it looks at Netflix shows,
+// and all 80 of those before it reaches the second provider. Peacock is unit
+// 560 of 640: over four hours in. So for the first hours of a fresh database
+// the shelf is Netflix films and nothing else, and it has collected Netflix's
+// 800th-newest title before Hulu's newest. On a list whose entire premise is
+// "newest first", that is exactly backwards.
+//
+// Page-major instead: units 0..15 are page 1 of every provider and kind, so
+// roughly one tick fills the TOP of the shelf across all of them, and each
+// pass after that adds a page of depth everywhere at once. The pass still
+// takes the same total time; what changes is that the part a reader actually
+// sees is right from the first minutes rather than the last.
 function newOnStreamingUnits() {
   const units = [];
-  for (const region of NEW_ON_STREAMING_REGIONS) {
-    for (const provider of NEW_ON_STREAMING_PROVIDERS) {
-      for (const kind of ["movie", "tv"]) {
-        for (let page = 1; page <= NEW_ON_STREAMING_WALK_DEPTH_PAGES; page++) {
+  for (let page = 1; page <= NEW_ON_STREAMING_WALK_DEPTH_PAGES; page++) {
+    for (const region of NEW_ON_STREAMING_REGIONS) {
+      for (const provider of NEW_ON_STREAMING_PROVIDERS) {
+        for (const kind of ["movie", "tv"]) {
           units.push({ region, provider, kind, page });
         }
       }
@@ -1262,6 +1278,14 @@ function newOnStreamingUnits() {
   }
   return units;
 }
+
+// Bumped whenever newOnStreamingUnits() changes shape or order. The cursor is
+// an INDEX into that list, so a stored position from an older layout points at
+// a different unit entirely -- resuming on it would silently leave a band of
+// the catalog unswept until the next full pass. A mismatch restarts the pass
+// at unit 0 instead, which costs one repeat of ground already covered (a
+// no-op, since a re-seen title only refreshes its "still present" marker).
+const NEW_ON_STREAMING_CURSOR_LAYOUT = 2;
 
 // Reads the sweep cursor. `unit` is where in newOnStreamingUnits() the next
 // tick starts; `walk` counts completed passes over the whole list, and walk 0
@@ -1275,6 +1299,12 @@ async function readNewOnStreamingCursor(env) {
     const parsed = JSON.parse(raw);
     const unit = Number.isFinite(parsed && parsed.unit) && parsed.unit >= 0 ? Math.floor(parsed.unit) : 0;
     const walk = Number.isFinite(parsed && parsed.walk) && parsed.walk >= 0 ? Math.floor(parsed.walk) : 0;
+    // A position recorded against a different unit layout is not a position.
+    // The walk generation is kept: a database part-way through its seeding
+    // pass is still seeding, and promoting it to "observed" here would date
+    // every title it has yet to reach as an arrival that never happened.
+    const layout = Number.isFinite(parsed && parsed.layout) ? parsed.layout : 1;
+    if (layout !== NEW_ON_STREAMING_CURSOR_LAYOUT) return { unit: 0, walk };
     return { unit, walk };
   } catch (e) {
     console.warn("[Cron] could not read the New on Streaming cursor:", e && e.message ? e.message : e);
@@ -1512,7 +1542,7 @@ async function sweepNewOnStreaming(env, ctx, fetchBudget, maxUnits) {
   try {
     await env.CONFIGS.put(
       "cron:newonstreaming:cursor",
-      JSON.stringify({ unit: nextUnit, walk: wrapped ? cursor.walk + 1 : cursor.walk })
+      JSON.stringify({ unit: nextUnit, walk: wrapped ? cursor.walk + 1 : cursor.walk, layout: NEW_ON_STREAMING_CURSOR_LAYOUT })
     );
   } catch (e) {
     console.warn("[Cron] could not advance the New on Streaming cursor:", e && e.message ? e.message : e);

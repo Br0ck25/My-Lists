@@ -311,7 +311,7 @@ So the add-on observes it. Every cron tick walks a slice of each provider's cata
 - **It needs the cron trigger** from Step 7 above, and enough subrequest budget to run (see [Which Cloudflare plan do I need?](#which-cloudflare-plan-do-i-need)). On a free Worker the sweep skips itself with one log line, the same way chart pre-warming does.
 - **The first pass is seeded.** Every title is "new" the first time you look at a catalog, so the first full walk dates each title by its own release date instead of pretending it just arrived. Arrivals found after that are real. The admin dashboard shows the split as **seeded** versus **observed** -- while observed is zero, the ordering is still release dates.
 
-A full walk of every provider takes roughly five hours on the recommended `*/6` schedule, which is the detection latency for a back-catalog addition. A new release is found on the next tick, because the walk is sorted newest-first and a new release lands on page one.
+A full walk of every provider takes roughly five hours on the recommended `*/6` schedule, which is the detection latency for a back-catalog addition. That is not how long the shelf takes to look right: the walk is page-major, so the first couple of ticks -- about twelve minutes -- cover page one of every provider and both types, and the hours after that only add depth. A new release is found on the next tick either way, because the walk is sorted newest-first and a new release lands on page one.
 
 **Serving it costs nothing.** The title, poster and year are denormalised into the row, so rendering the shelf is one indexed D1 read and zero outbound requests -- it is the only catalog here that a provider outage cannot slow down or empty.
 

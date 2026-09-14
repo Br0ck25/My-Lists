@@ -312,8 +312,13 @@ const NEW_ON_STREAMING_WALK_DEPTH_PAGES = 40;
 // Sweep units (one provider + kind + page) per tick. 8 providers x 2 kinds x
 // 40 pages = 640 units, so at 12 a tick the walk comes all the way round about
 // every 53 ticks -- a little over five hours on the recommended */6 schedule.
-// That is the detection latency for a back-catalog arrival; a new release is
-// found on the next tick, since it lands on page 1.
+// That is the detection latency for a BACK-CATALOGUE arrival.
+//
+// It is not how long the shelf takes to look right, because the walk is
+// page-major (see newOnStreamingUnits): the first 16 units are page 1 of every
+// provider and kind, so two ticks -- about twelve minutes -- cover the newest
+// titles everywhere, and the hours after that only add depth. A new release is
+// found on the next tick either way, since it lands on page 1.
 const NEW_ON_STREAMING_PAGES_PER_TICK = 12;
 
 // Budget ceiling for one sweep unit: the discover page itself, plus an IMDb
