@@ -9,6 +9,38 @@ below has a runnable reproduction committed under `audit/full-2026-09-13/`.
 
 ---
 
+## 0. Remediation status (added 2026-09-14)
+
+This report is the record of what was **found**. Everything in it was subsequently fixed on this branch;
+the table below is the index, and each commit message explains the change in full.
+
+| Finding | Fixed in | Note |
+| --- | --- | --- |
+| SEC-001 | `115ca41` | Gate shared via `mayReadTrackedShelf`; `/api/save` now requires proof of ownership. Pre-release install links are honoured by `LEGACY_UNVERIFIED_CONFIG_SHELVES` — flip it off once users have regenerated links. |
+| DB-001, BE-001, DB-002, BE-002, BE-004 | `6a94371` | `ON CONFLICT` + server-side dedupe + upsert-then-prune; D1 failures reported; `trackingShowKey` replaces `split(':')[0]`; the cron owns only what it computes. |
+| BE-003, CF-001, DB-004, PROTO-001, FE-001, FE-002, FE-003 | `af71a4d` | FE-003 turned out to be a live bug, not dead code — see below. |
+| DB-003, CF-002, A11Y-001…004, PWA-001, API-001, INFO-03, and the config-key namespacing | `3fa38c9` | API-001 documented rather than implemented, by decision: provider tokens live in the install config, so refreshing is a storage-model change. |
+
+**Two corrections to this report, both in the direction of "worse than filed":**
+
+* **INFO-05 was badly understated.** It is filed below as "a 5.2 MB data backup is committed; confirm it
+  contains no real user data". On opening it, `my-lists-full-backup1.json` contains one account's **Creator
+  Key** and its live **Trakt, MDBList and Simkl OAuth access tokens**, in plain text, in a **public**
+  repository with a fork. That is a P0-class live credential exposure, not an Informational hygiene item.
+  The file is removed in `3fa38c9` and `.gitignore` refuses that shape — but removing it does not remove it
+  from history, so every credential in it must be rotated. I had not read the file when I filed it, which is
+  exactly the mistake rule 6 of the brief warns about.
+* **FE-003 was filed as inert.** `#listsSubBulk` is named in `localStorage` by browsers that used an older
+  build, and `switchListsSubmenu` hides every panel before showing the one it is asked for — so such a
+  browser opened the Lists tab **blank**, on every load, with no way back but clearing site data. That is a
+  live defect, not a vestigial read. The other six phantom ids were each checked individually and *are*
+  inert: all are null-guarded with working fallbacks.
+
+Test count went from 565 to 574 (573 pass, 1 skip — the same network-dependent one). `bash verify.sh` passes
+on every commit above.
+
+---
+
 ## 1. Executive summary
 
 ### Overall health
