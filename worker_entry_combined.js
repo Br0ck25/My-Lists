@@ -469,6 +469,39 @@ const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
 // invocation budget.
 const CREATOR_AUTH_VERIFY_PER_MINUTE = 60;
 
+// --- Personal shelves in install links minted before they were verified ------
+//
+// A Watch History / Continue Watching / Watchlist shelf in a Stremio config is
+// an `autotrack:<slug>:<type>:<username>` row, and reading it means reading the
+// account's private tracking record. /api/save now REFUSES to store a config
+// naming an account unless the request proved it owns that account (see the
+// ownership check there), so from this release on, a stored config that names
+// a creator is itself proof and its 12-character id (72 bits, unguessable) is
+// the bearer credential the README already describes.
+//
+// Configs saved BEFORE that check existed carry no proof, and there is no way
+// to tell an honestly-saved one from a forged one after the fact. Two choices,
+// and both cost something:
+//
+//   true  -- honour them. Every install link that works today keeps working.
+//            The residual is an attacker who forged a config id BEFORE this
+//            release and kept it; they retain read access to that one account's
+//            shelves until this is flipped.
+//   false -- refuse them. Fully closed, and every personal shelf in a link
+//            generated before this release goes empty in Stremio -- silently,
+//            because a catalog row has no way to explain itself -- until its
+//            owner opens Configure and presses Update.
+//
+// It ships `true` because the hole this release closes is the one anyone can
+// walk through today with a single GET, and that one is shut either way; the
+// residual requires an attacker who was already exploiting it. Flip this to
+// false once your users have had time to regenerate their links, and the last
+// of it is gone.
+//
+// This has no effect on base64 (no-KV) configs, which are caller-authored and
+// are never trusted to name an account.
+const LEGACY_UNVERIFIED_CONFIG_SHELVES = true;
+
 // --- Bound on /api/resolve's cross-deployment fallback -----------------------
 //
 // /api/resolve takes a `url` and, when the local config resolves to nothing,
@@ -2455,8 +2488,17 @@ function deterministicDailyShuffle(array, salt = "") {
 // Config is normally { entries, tmdbKey, mdblistKey } but older install
 // links encode a bare entries array — those still decode fine, just with
 // no personal keys attached.
+// A base64 config is written entirely by whoever pasted the URL -- there is no
+// stored record behind it and nothing this Worker wrote. So it can claim any
+// `trackCreatorName` it likes, and `trackOwner` is therefore always "": a
+// personal shelf named by one of these is served only if its owner opted that
+// shelf into being public. See mayReadTrackedShelf above.
+//
+// Nothing legitimate is lost. These configs are the fallback for a deployment
+// with no CONFIGS KV binding, and without KV there are no Creator Profiles for
+// a personal shelf to belong to.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -2486,6 +2528,7 @@ function decodeConfig(config) {
       track: !!(!Array.isArray(parsed) && parsed.track),
       trackCreatorName: (!Array.isArray(parsed) && parsed.trackCreatorName) || "",
       trackCreatorKey: (!Array.isArray(parsed) && parsed.trackCreatorKey) || "",
+      trackOwner: "",
       shuffleShelves: !!(!Array.isArray(parsed) && parsed.shuffleShelves),
       shuffleItems: !!(!Array.isArray(parsed) && parsed.shuffleItems),
       // Two-letter watch_region for streaming-availability catalogs
@@ -5341,6 +5384,119 @@ async function getCreator(env, username) {
 // kept offering a row that 404s the moment anyone opens it.
 //
 // The promise, not the result, goes in the map: both callers fan out over a
+// --- Personal-shelf read authorisation ---------------------------------------
+//
+// `creatorsynctracking:{username}` is an account's PRIVATE record: its Watch
+// History, Continue Watching, Watchlist and Airing Next. FOUR code paths read
+// it, and until now only ONE of them asked whether the caller was allowed to.
+//
+// /lists/:username/:slug (26_api-creator-and-admin-routes.js) consults the
+// opt-in flags /api/creator/sync/share-tracking writes, and its own comment
+// spells out why: "reading that blob here used to hand any anonymous caller
+// the complete viewing history of any account whose username they knew -- and
+// usernames are published by /lists/public.json for every shared list, so they
+// didn't even need guessing."
+//
+// The other three took the username straight out of a caller-supplied string
+// and answered: fetchAutoTrackedCatalog (05_catalog-core.js), which every
+// Stremio catalog request AND every /api/preview goes through, and resolveConfig
+// (04_config-resolution.js), whose arrays /api/resolve hands back wholesale.
+// So the whole of any account's viewing history was readable with one
+// unauthenticated GET to
+//   /api/preview?type=series&url=autotrack:watch-history:series:<username>
+// answered with Access-Control-Allow-Origin: *, which made it readable by
+// script on any origin. README.md states the opposite as a guarantee: "they
+// are private by default and nothing else can make them public."
+//
+// The gate existed; it was wired to one of the four doors. These helpers are
+// that gate at module scope, so every door uses the same one.
+//
+// Only three slugs have a share flag -- /api/creator/sync/share-tracking's
+// ALLOWED_SHARE_SLUGS -- so `airing-next` is owner-only, which is what "not
+// expressible as shared" has to mean if the default is private.
+const TRACKED_SHELF_SHARE_SLUGS = new Set(["watchlist", "watch-history", "continue-watching"]);
+
+// The opt-in flags: D1 first (authoritative), KV otherwise, {} on anything
+// unreadable. Deliberately the same read /lists/:username/:slug does, so the
+// two cannot answer differently for the same account.
+async function readCreatorShareFlags(env, username) {
+  let flags = null;
+  if (env && env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT share_json FROM creators WHERE username = ?"
+      ).bind(username).all();
+      if (results && results.length > 0 && results[0].share_json) {
+        flags = JSON.parse(results[0].share_json);
+      }
+    } catch (e) {
+      // Unreadable right now -- fall through to KV, and to {} if that fails
+      // too. Failing closed is the whole point of this function.
+    }
+  }
+  if (!flags && env && env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(`creatorshare:${username}`);
+      if (raw) flags = JSON.parse(raw);
+    } catch {
+      flags = null;
+    }
+  }
+  return (flags && typeof flags === "object" && !Array.isArray(flags)) ? flags : {};
+}
+
+// Strict === true: a truthy string or number left by a hand-edited or legacy
+// value must not be enough to expose someone's viewing history.
+function isTrackedShelfShared(flags, slug) {
+  return !!flags && flags[slug] === true;
+}
+
+// The gate. `verifiedOwner` is a username some caller has ALREADY proved --
+// see resolveConfig (which verifies a stored config's own trackCreatorKey) and
+// /api/preview (which authenticates the request itself). Nothing here verifies
+// a credential, on purpose: this runs inside the catalog fetchers, which have
+// no request and no IP to charge a throttle against, and a PBKDF2 run reachable
+// from an unauthenticated GET with no bound is exactly the cost
+// authenticateCreator's own throttle exists to prevent.
+async function mayReadTrackedShelf(env, username, slug, keys = {}) {
+  if (!env || !username) return false;
+  const verified = String((keys && keys.verifiedOwner) || "");
+  if (verified && verified === username) return true;
+  if (!TRACKED_SHELF_SHARE_SLUGS.has(slug)) return false;
+  return isTrackedShelfShared(await readCreatorShareFlags(env, username), slug);
+}
+
+// Proves a Creator Name + Creator Key pair, and answers with the username it
+// proves or "".
+//
+// This is authenticateCreator's check without the parts that need a request:
+// same tombstone, same record read, same PBKDF2-with-memo. It exists because
+// authenticateCreator lives inside handleFetch's closure and resolveConfig is
+// a module-scope function every catalog request goes through.
+//
+// The ONE caller is resolveConfig, and only for a STORED config -- i.e. a
+// credential this Worker itself wrote into KV, not one a caller just handed
+// over -- so there is no unbounded-PBKDF2 path here to throttle. A base64
+// config is caller-authored and is never given to this function.
+async function verifyShelfOwner(env, creatorName, creatorKey) {
+  if (!env || !env.CONFIGS || !creatorName || !creatorKey) return "";
+  const v = validateCreatorUsername(creatorName);
+  if (!v.ok) return "";
+  try {
+    const [tombstoned, raw] = await Promise.all([
+      isCreatorTombstoned(env, v.normalized),
+      getCreator(env, v.normalized),
+    ]);
+    if (tombstoned || !raw) return "";
+    const profile = JSON.parse(raw);
+    if (!profile || !profile.keyHash) return "";
+    const ok = await verifyCreatorKeyMemoized(String(creatorKey), profile.keyHash, v.normalized);
+    return ok ? v.normalized : "";
+  } catch {
+    return "";
+  }
+}
+
 // page of keys with Promise.all, so a hundred lists by one creator would
 // otherwise each start their own lookup.
 //
@@ -9848,8 +10004,40 @@ async function resolveConfig(configParam, env) {
             }
           }
         }
-        if (creatorName && env.CONFIGS) {
-          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${creatorName}`);
+        // Who, if anyone, this config PROVES it speaks for.
+        //
+        // `creatorName` above is a name lifted out of the stored payload -- and
+        // /api/save used to accept `trackCreatorName` (and an
+        // `autotrack:...:<username>` entry url) from anyone, unauthenticated, so
+        // it was a claim rather than a credential. Everything downstream treated
+        // it as one: the tracking read immediately below, and
+        // fetchAutoTrackedCatalog via keys.trackOwner. That is SEC-001 -- see
+        // mayReadTrackedShelf (02_http-and-creator-utils.js).
+        //
+        // Three ways a config can prove it now, in descending order of strength:
+        //   * it carries the account's own Creator Key (track-on links always
+        //     have, and /api/save now stores one whenever a personal shelf is
+        //     present) -- verified here, memoized, so it costs one PBKDF2 per
+        //     isolate per config rather than one per request;
+        //   * /api/save stamped `trackOwner` on it after verifying at save time,
+        //     so a later key rotation does not silently empty the shelf;
+        //   * it predates both, and LEGACY_UNVERIFIED_CONFIG_SHELVES says to
+        //     honour those -- see that constant for exactly what it costs.
+        let trackOwner = "";
+        if (creatorName) {
+          if (parsed.trackCreatorKey) {
+            trackOwner = await verifyShelfOwner(env, creatorName, parsed.trackCreatorKey);
+          }
+          if (!trackOwner && typeof parsed.trackOwner === "string" && parsed.trackOwner) {
+            const stamped = String(parsed.trackOwner).toLowerCase();
+            if (stamped === String(creatorName).toLowerCase()) trackOwner = stamped;
+          }
+          if (!trackOwner && LEGACY_UNVERIFIED_CONFIG_SHELVES && !parsed.trackCreatorKey && !parsed.trackOwner) {
+            trackOwner = String(creatorName).toLowerCase();
+          }
+        }
+        if (trackOwner && env.CONFIGS) {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${trackOwner}`);
           if (trackingRaw) {
             try {
               const tracking = JSON.parse(trackingRaw);
@@ -9886,6 +10074,10 @@ async function resolveConfig(configParam, env) {
           track: !!parsed.track,
           trackCreatorName: parsed.trackCreatorName || "",
           trackCreatorKey: parsed.trackCreatorKey || "",
+          // The verified username, or "". Every personal-shelf read downstream
+          // is gated on this rather than on trackCreatorName -- see the block
+          // above and mayReadTrackedShelf (02_http-and-creator-utils.js).
+          trackOwner,
           shuffleShelves: !!parsed.shuffleShelves,
           shuffleItems: !!parsed.shuffleItems,
           region: parsed.region || "US",
@@ -11478,15 +11670,36 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
     slug = (entry.id || "watch-history").toLowerCase().replace(/_/g, "-");
   }
 
-  if (!username && keys && keys.configParam) {
+  let verifiedOwner = String((keys && keys.verifiedOwner) || "");
+  if ((!username || !verifiedOwner) && keys && keys.configParam) {
     try {
       const resolved = await resolveConfig(keys.configParam, env);
-      if (resolved && resolved.trackCreatorName) username = resolved.trackCreatorName;
+      if (resolved) {
+        if (!username && resolved.trackCreatorName) username = resolved.trackCreatorName;
+        if (!verifiedOwner && resolved.trackOwner) verifiedOwner = resolved.trackOwner;
+      }
     } catch {}
   }
 
   if (!username) return [];
-  
+  username = String(username).toLowerCase();
+
+  // Whose shelf is this, and is the caller allowed to read it?
+  //
+  // `username` above came out of the entry URL -- a string anyone can write --
+  // so up to this point nothing has established that the caller has any claim
+  // to the account it names. Every way into this function funnels through
+  // fetchCatalog: the Stremio catalog route, /api/preview, and a merged row.
+  // Gating here rather than at each of those is the point, the same way
+  // authenticateCreator is the one place every creator route goes through: a
+  // caller added later inherits the check instead of having to remember it.
+  //
+  // See mayReadTrackedShelf (02_http-and-creator-utils.js) for what counts as
+  // proof and why this returns an empty shelf rather than an error -- a catalog
+  // row has no way to show a message, and "empty" is what an unauthorised
+  // reader should see either way.
+  if (!(await mayReadTrackedShelf(env, username, slug, { verifiedOwner }))) return [];
+
   try {
     let items;
     let airingItems;
@@ -25767,9 +25980,9 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
     if (keys.simklKey) body.simklKey = keys.simklKey;
     if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
     if (keys.simklUsername) body.simklUsername = keys.simklUsername;
-    if (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) {
-      body.creatorName = activeCreator.creatorName;
-    }
+    // creatorName AND the key: an autotrack: source is this account's private
+    // shelf and the server now requires proof rather than a claimed name.
+    Object.assign(body, previewCreatorAuth());
     const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -28040,7 +28253,7 @@ async function detectListType(url, mdblistKey) {
       const res = await fetch(ORIGIN + '/api/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url, type: type, mdblistKey: mdblistKey || '' }),
+        body: JSON.stringify(Object.assign({ url: url, type: type, mdblistKey: mdblistKey || '' }, previewCreatorAuth())),
         cache: 'no-store',
       });
       return await res.json();
@@ -28710,6 +28923,29 @@ window._listPreviewCache = window._listPreviewCache || new Map();
 // populateSearchResultPosters (its only caller before this) so
 // fetchListPreviewWithRetry, right below, and the per-card retry button it
 // backs can both reach it without duplicating the six external-key lookups.
+// The signed-in account's own credential, for a preview of one of ITS OWN
+// personal shelves.
+//
+// /api/preview can be asked for 'autotrack:<slug>:<type>:<username>', which
+// reads that account's private Watch History / Continue Watching / Watchlist.
+// The endpoint used to answer on the strength of the username in that string
+// alone, which made every account's viewing history readable by anyone who
+// knew a username. It now wants proof, and this is where the browser supplies
+// it: the same key every other authenticated call already sends.
+//
+// Returns {} when signed out, which is correct -- there is nothing to prove and
+// the server falls back to whatever the shelf's owner has shared publicly.
+function previewCreatorAuth() {
+  try {
+    if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return {};
+    const key = localStorage.getItem('myListAddon:creatorKey') || '';
+    if (!key) return { creatorName: activeCreator.creatorName };
+    return { creatorName: activeCreator.creatorName, creatorKey: key };
+  } catch (e) {
+    return {};
+  }
+}
+
 async function fetchListPreviewOnce(listUrl, type, sample) {
   const isAdultFilterOn = isAdultContentFilterEnabled();
   const cacheKey = String(listUrl) + '|' + String(type) + '|' + String(sample || 12) + (isAdultFilterOn ? '|safe' : '');
@@ -28718,6 +28954,7 @@ async function fetchListPreviewOnce(listUrl, type, sample) {
   }
 
   const payload = { url: listUrl, type: type, sample: sample || 12 };
+  Object.assign(payload, previewCreatorAuth());
   if (isAdultFilterOn) payload.adultContentFilter = true;
   const mkInput = document.getElementById('mdblistKeyInput');
   payload.mdblistKey = (mkInput && mkInput.value ? mkInput.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
@@ -51551,8 +51788,24 @@ function collectKeys() {
   };
   if (typeof activeCreator !== 'undefined' && activeCreator) {
     keys.creatorName = activeCreator.creatorName;
-    if (track) {
-      keys.track = true;
+    if (track) keys.track = true;
+    // The Creator Key travels with the config whenever the config actually
+    // contains one of this account's personal shelves -- not only when
+    // Auto-track Playback happens to be on.
+    //
+    // A Watch History / Continue Watching / Watchlist row is
+    // 'autotrack:<slug>:<type>:<username>', and reading it server-side means
+    // reading this account's private tracking record. /api/save now refuses to
+    // store a config naming an account unless the request proves it owns it, so
+    // without this a signed-in person with playback tracking switched off could
+    // no longer generate an install link containing their own shelves.
+    //
+    // Deliberately conditional rather than unconditional: an install link is a
+    // bearer credential (see README), and there is no reason to put an account
+    // key in one that carries nothing belonging to that account.
+    const hasPersonalShelf = [...document.querySelectorAll('#lists .entry .url')]
+      .some((el) => String(el.value || '').trim().startsWith('autotrack:'));
+    if (track || hasPersonalShelf) {
       keys.trackCreatorName = activeCreator.creatorName;
       keys.trackCreatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     }
@@ -58258,7 +58511,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, region, hideNonDigitalReleases, adultContentFilter, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
@@ -58276,7 +58529,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const staleKey = env && env.CONFIGS && !isAutoTrack && !isUserPersonal ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        // verifiedOwner, not trackCreatorName: a personal shelf is served only
+        // to a config that PROVED it belongs to that account. See resolveConfig
+        // (04_config-resolution.js) for how that is established and
+        // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
+        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
         if (staleKey && skip === 0 && metas.length > 0) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
@@ -58383,7 +58640,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
     // callers with a normal-sized url (a plain mdblist/trakt/tmdb list
     // link is never going to hit that limit).
     if (path === "/api/preview") {
-      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName, hideNonDigitalReleases, adultContentFilter, region;
+      let testUrl, type, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, sampleSize, skip, creatorName, creatorKey, hideNonDigitalReleases, adultContentFilter, region;
       if (request.method === "POST") {
         let reqBody;
         try {
@@ -58401,6 +58658,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         simklKey = reqBody.simklKey || "";
         simklAccessToken = reqBody.simklAccessToken || "";
         creatorName = reqBody.creatorName || "";
+        creatorKey = reqBody.creatorKey || "";
         region = reqBody.region || "";
         hideNonDigitalReleases = !!reqBody.hideNonDigitalReleases;
         adultContentFilter = !!reqBody.adultContentFilter;
@@ -58418,6 +58676,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         simklKey = url.searchParams.get("simklKey") || "";
         simklAccessToken = url.searchParams.get("simklAccessToken") || "";
         creatorName = url.searchParams.get("creatorName") || "";
+        creatorKey = url.searchParams.get("creatorKey") || "";
         region = url.searchParams.get("region") || "";
         hideNonDigitalReleases = url.searchParams.get("hideNonDigitalReleases") === "1";
         adultContentFilter = url.searchParams.get("adultContentFilter") === "1";
@@ -58445,9 +58704,26 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return json({ ok: false, error: "That URL isn't a supported list source." }, 400, { "Cache-Control": "no-store" });
       }
 
+      // An `autotrack:<slug>:<type>:<username>` source reads that account's
+      // private Watch History / Continue Watching / Watchlist. This endpoint is
+      // unauthenticated, so until the caller proves who it is, the username in
+      // that string is a claim and nothing more -- which is exactly how the
+      // whole of any account's viewing history became readable with one GET
+      // (SEC-001). authenticateCreator is used rather than a bare verify so the
+      // per-IP PBKDF2 throttle and the tombstone check both apply here too.
+      //
+      // A caller that sends nothing, or the wrong key, is not refused: it simply
+      // proves nothing, and mayReadTrackedShelf then falls back to whatever the
+      // owner has explicitly shared. Every other source type is unaffected.
+      let previewVerifiedOwner = "";
+      if (creatorName && creatorKey) {
+        const previewAuth = await authenticateCreator(creatorName, creatorKey);
+        if (previewAuth.ok) previewVerifiedOwner = previewAuth.username;
+      }
+
       let body;
       try {
-        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, hideNonDigitalReleases, adultContentFilter, region, env, ctx, origin: url.origin });
+        const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, verifiedOwner: previewVerifiedOwner, hideNonDigitalReleases, adultContentFilter, region, env, ctx, origin: url.origin });
         const totalItems = (typeof metas.totalItems === "number") ? metas.totalItems : (metas.length < PAGE_SIZE && skip === 0 ? metas.length : null);
         body = {
           ok: true,
@@ -63563,6 +63839,49 @@ function generateSearchVariations(query) {
       if (entries.length > SAVED_CONFIG_ENTRIES_MAX) {
         return json({ ok: false, error: "Too many lists in that configuration." }, 413);
       }
+      // A config that names a Creator Profile must prove it belongs to it.
+      //
+      // This endpoint is unauthenticated by design -- a config is just a list of
+      // catalog rows, and most of them belong to nobody. But two things in a
+      // config DO name an account: `trackCreatorName`, and an
+      // `autotrack:<slug>:<type>:<username>` entry url, which is a Watch History
+      // / Continue Watching / Watchlist shelf. Both were accepted from anyone,
+      // so anyone could mint a config naming any account and then read that
+      // account's private tracking record straight back out of /api/resolve or
+      // the catalog route. That is SEC-001; see mayReadTrackedShelf
+      // (02_http-and-creator-utils.js).
+      //
+      // Refused rather than silently stripped: a builder page that is signed in
+      // always has the key (see collectKeys, 23_client-list-management.js), so a
+      // save that cannot prove ownership is either a bug or a forgery, and
+      // quietly dropping the shelf from somebody's install link would be the
+      // same class of silent failure this codebase already refuses elsewhere.
+      const namedCreators = new Set();
+      if (body.trackCreatorName) namedCreators.add(String(body.trackCreatorName).toLowerCase().trim());
+      for (const e of entries) {
+        const eUrl = e && typeof e.url === "string" ? e.url : "";
+        if (!eUrl.startsWith("autotrack:")) continue;
+        const segs = eUrl.split(":");
+        if (segs.length >= 4 && segs[3]) namedCreators.add(String(segs[3]).toLowerCase().trim());
+      }
+      namedCreators.delete("");
+      let saveVerifiedOwner = "";
+      if (namedCreators.size) {
+        if (namedCreators.size > 1) {
+          return json({ ok: false, error: "A configuration can only carry personal shelves for one account." }, 400);
+        }
+        const claimed = [...namedCreators][0];
+        const saveAuth = await authenticateCreator(claimed, body.trackCreatorKey || "");
+        if (!saveAuth.ok) {
+          if (saveAuth.throttled) return authFailureResponse(saveAuth);
+          return json({
+            ok: false,
+            error: "Sign in to that Creator Profile before adding its Watch History, Continue Watching or Watchlist to an install link.",
+          }, 401);
+        }
+        saveVerifiedOwner = saveAuth.username;
+      }
+
       const payload = { entries };
       if (body.tmdbKey) payload.tmdbKey = body.tmdbKey;
       if (body.mdblistKey) payload.mdblistKey = body.mdblistKey;
@@ -63573,10 +63892,19 @@ function generateSearchVariations(query) {
       if (body.simklKey) payload.simklKey = body.simklKey;
       if (body.simklAccessToken) payload.simklAccessToken = body.simklAccessToken;
       if (body.simklUsername) payload.simklUsername = body.simklUsername;
-      if (body.track) {
-        payload.track = true;
-        payload.trackCreatorName = body.trackCreatorName || "";
-        payload.trackCreatorKey = body.trackCreatorKey || "";
+      // `track` (the Auto-track Playback flag, which is what makes the manifest
+      // declare a subtitles resource) and the account credential are now stored
+      // independently. They used to be one branch, so a config with a personal
+      // shelf but playback tracking switched OFF carried no credential at all --
+      // and that is the shape that has to keep working after the check above.
+      if (body.track) payload.track = true;
+      if (saveVerifiedOwner) {
+        payload.trackCreatorName = saveVerifiedOwner;
+        if (body.trackCreatorKey) payload.trackCreatorKey = body.trackCreatorKey;
+        // Stamped by the server after verifying, so the shelf keeps working
+        // through a later Creator Key rotation instead of going empty the
+        // moment the stored key stops matching. See resolveConfig.
+        payload.trackOwner = saveVerifiedOwner;
       }
       if (body.shuffleShelves) payload.shuffleShelves = true;
       if (body.shuffleItems) payload.shuffleItems = true;

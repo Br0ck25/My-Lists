@@ -419,6 +419,39 @@ const CREATOR_RESTORE_MAX_FAILURES_PER_DAY = 100;
 // invocation budget.
 const CREATOR_AUTH_VERIFY_PER_MINUTE = 60;
 
+// --- Personal shelves in install links minted before they were verified ------
+//
+// A Watch History / Continue Watching / Watchlist shelf in a Stremio config is
+// an `autotrack:<slug>:<type>:<username>` row, and reading it means reading the
+// account's private tracking record. /api/save now REFUSES to store a config
+// naming an account unless the request proved it owns that account (see the
+// ownership check there), so from this release on, a stored config that names
+// a creator is itself proof and its 12-character id (72 bits, unguessable) is
+// the bearer credential the README already describes.
+//
+// Configs saved BEFORE that check existed carry no proof, and there is no way
+// to tell an honestly-saved one from a forged one after the fact. Two choices,
+// and both cost something:
+//
+//   true  -- honour them. Every install link that works today keeps working.
+//            The residual is an attacker who forged a config id BEFORE this
+//            release and kept it; they retain read access to that one account's
+//            shelves until this is flipped.
+//   false -- refuse them. Fully closed, and every personal shelf in a link
+//            generated before this release goes empty in Stremio -- silently,
+//            because a catalog row has no way to explain itself -- until its
+//            owner opens Configure and presses Update.
+//
+// It ships `true` because the hole this release closes is the one anyone can
+// walk through today with a single GET, and that one is shut either way; the
+// residual requires an attacker who was already exploiting it. Flip this to
+// false once your users have had time to regenerate their links, and the last
+// of it is gone.
+//
+// This has no effect on base64 (no-KV) configs, which are caller-authored and
+// are never trusted to name an account.
+const LEGACY_UNVERIFIED_CONFIG_SHELVES = true;
+
 // --- Bound on /api/resolve's cross-deployment fallback -----------------------
 //
 // /api/resolve takes a `url` and, when the local config resolves to nothing,

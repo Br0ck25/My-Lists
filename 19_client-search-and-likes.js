@@ -56,7 +56,7 @@ async function detectListType(url, mdblistKey) {
       const res = await fetch(ORIGIN + '/api/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url, type: type, mdblistKey: mdblistKey || '' }),
+        body: JSON.stringify(Object.assign({ url: url, type: type, mdblistKey: mdblistKey || '' }, previewCreatorAuth())),
         cache: 'no-store',
       });
       return await res.json();
@@ -726,6 +726,29 @@ window._listPreviewCache = window._listPreviewCache || new Map();
 // populateSearchResultPosters (its only caller before this) so
 // fetchListPreviewWithRetry, right below, and the per-card retry button it
 // backs can both reach it without duplicating the six external-key lookups.
+// The signed-in account's own credential, for a preview of one of ITS OWN
+// personal shelves.
+//
+// /api/preview can be asked for 'autotrack:<slug>:<type>:<username>', which
+// reads that account's private Watch History / Continue Watching / Watchlist.
+// The endpoint used to answer on the strength of the username in that string
+// alone, which made every account's viewing history readable by anyone who
+// knew a username. It now wants proof, and this is where the browser supplies
+// it: the same key every other authenticated call already sends.
+//
+// Returns {} when signed out, which is correct -- there is nothing to prove and
+// the server falls back to whatever the shelf's owner has shared publicly.
+function previewCreatorAuth() {
+  try {
+    if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return {};
+    const key = localStorage.getItem('myListAddon:creatorKey') || '';
+    if (!key) return { creatorName: activeCreator.creatorName };
+    return { creatorName: activeCreator.creatorName, creatorKey: key };
+  } catch (e) {
+    return {};
+  }
+}
+
 async function fetchListPreviewOnce(listUrl, type, sample) {
   const isAdultFilterOn = isAdultContentFilterEnabled();
   const cacheKey = String(listUrl) + '|' + String(type) + '|' + String(sample || 12) + (isAdultFilterOn ? '|safe' : '');
@@ -734,6 +757,7 @@ async function fetchListPreviewOnce(listUrl, type, sample) {
   }
 
   const payload = { url: listUrl, type: type, sample: sample || 12 };
+  Object.assign(payload, previewCreatorAuth());
   if (isAdultFilterOn) payload.adultContentFilter = true;
   const mkInput = document.getElementById('mdblistKeyInput');
   payload.mdblistKey = (mkInput && mkInput.value ? mkInput.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';

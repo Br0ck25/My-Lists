@@ -391,7 +391,8 @@ node --test tests/*.test.mjs
 
 - **Your install link is a bearer credential. Treat it like one.** The configuration behind
   `/<config>/manifest.json` carries whichever provider keys and OAuth tokens you have entered — TMDB, MDBList,
-  Trakt, Simkl — and, if Auto-track Playback is on, your Creator Name and **Creator Key**. With KV bound that
+  Trakt, Simkl — and, if Auto-track Playback is on **or the link contains one of your personal shelves**
+  (Watch History, Continue Watching, Watchlist, Airing Next), your Creator Name and **Creator Key**. With KV bound that
   all sits behind a 12-character id (72 bits, not guessable); without KV it is base64 **in the URL itself**.
   Anyone you hand the link to can install your catalogs *and* can read those secrets back out of
   `/api/resolve`. Share it the way you would share a password, and if you have shared one you should not
@@ -404,9 +405,21 @@ node --test tests/*.test.mjs
 ### API-only endpoints
 
 `POST /api/creator/sync/share-tracking` is authenticated, supported, and has **no UI**. It is the only way to
-opt a Watchlist, Watch History or Continue Watching shelf into being visible at its public
-`/lists/:username/:slug` address — they are private by default and nothing else can make them public. Call it
-with `{ creatorName, creatorKey, slug, shared }`, or with no `slug` to read the current state back.
+opt a Watchlist, Watch History or Continue Watching shelf into being visible to anyone but you — they are
+private by default and nothing else can make them public. Call it with `{ creatorName, creatorKey, slug,
+shared }`, or with no `slug` to read the current state back.
+
+That applies to **every** way those shelves can be read, not just the public `/lists/:username/:slug` page:
+the Stremio catalog route, `/api/preview` and `/api/resolve` all ask the same question. A request reads one
+of your shelves only if it proves it is you — an install link that carries your Creator Key, or a signed-in
+builder page — or if you opted that specific shelf in above. Airing Next has no share flag at all, so it is
+always yours alone.
+
+For the same reason, `/api/save` refuses to store a configuration that names a Creator Profile unless the
+request proves it owns that profile. If you are signed in, the builder page does this for you. Install links
+generated **before** this behaviour existed are still honoured, so nothing you have already handed to Stremio
+stops working — see `LEGACY_UNVERIFIED_CONFIG_SHELVES` in `00_constants.js` for what that costs and how to
+turn it off once your links have been regenerated.
 
 ---
 

@@ -1203,15 +1203,36 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
     slug = (entry.id || "watch-history").toLowerCase().replace(/_/g, "-");
   }
 
-  if (!username && keys && keys.configParam) {
+  let verifiedOwner = String((keys && keys.verifiedOwner) || "");
+  if ((!username || !verifiedOwner) && keys && keys.configParam) {
     try {
       const resolved = await resolveConfig(keys.configParam, env);
-      if (resolved && resolved.trackCreatorName) username = resolved.trackCreatorName;
+      if (resolved) {
+        if (!username && resolved.trackCreatorName) username = resolved.trackCreatorName;
+        if (!verifiedOwner && resolved.trackOwner) verifiedOwner = resolved.trackOwner;
+      }
     } catch {}
   }
 
   if (!username) return [];
-  
+  username = String(username).toLowerCase();
+
+  // Whose shelf is this, and is the caller allowed to read it?
+  //
+  // `username` above came out of the entry URL -- a string anyone can write --
+  // so up to this point nothing has established that the caller has any claim
+  // to the account it names. Every way into this function funnels through
+  // fetchCatalog: the Stremio catalog route, /api/preview, and a merged row.
+  // Gating here rather than at each of those is the point, the same way
+  // authenticateCreator is the one place every creator route goes through: a
+  // caller added later inherits the check instead of having to remember it.
+  //
+  // See mayReadTrackedShelf (02_http-and-creator-utils.js) for what counts as
+  // proof and why this returns an empty shelf rather than an error -- a catalog
+  // row has no way to show a message, and "empty" is what an unauthorised
+  // reader should see either way.
+  if (!(await mayReadTrackedShelf(env, username, slug, { verifiedOwner }))) return [];
+
   try {
     let items;
     let airingItems;

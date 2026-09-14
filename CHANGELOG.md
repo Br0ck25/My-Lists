@@ -7,6 +7,36 @@ browser) and the fixes that came out of them, plus the multi-device sync and cou
 bugs reported from real use afterwards. Every finding from all four audits is closed;
 the reports now live in `docs/history/`.
 
+### 🔒 SEC-001 — personal shelves were readable by anyone who knew a username (2026-09-14)
+- **What was wrong**: `creatorsynctracking:{username}` holds an account's Watch History, Continue Watching,
+  Watchlist and Airing Next. Four code paths read it and only one asked whether the caller was allowed to.
+  `/lists/:username/:slug` consulted the opt-in flags `/api/creator/sync/share-tracking` writes;
+  `fetchAutoTrackedCatalog` (every Stremio catalog request **and** every `/api/preview`) and `resolveConfig`
+  (whose arrays `/api/resolve` returns wholesale) took the username straight out of a caller-supplied string.
+  A single unauthenticated
+  `GET /api/preview?type=series&url=autotrack:watch-history:series:<username>` returned the whole shelf, with
+  `Access-Control-Allow-Origin: *` so any web page could read it — and `/lists/public.json` publishes a
+  username for every public list, so nothing had to be guessed. README stated the opposite as a guarantee.
+- **The gate, now shared**: `mayReadTrackedShelf` (`02_http-and-creator-utils.js`) is the single place that
+  answers "may this caller read this shelf", and `fetchAutoTrackedCatalog` calls it — the one point every
+  route funnels through, so a caller added later inherits the check instead of having to remember it.
+  A shelf is served only to a request that proves it owns the account, or one the owner explicitly shared.
+  Airing Next has no share flag, so it is owner-only.
+- **Proof, not a claimed name**: `/api/save` now refuses to store a configuration naming a Creator Profile
+  (via `trackCreatorName` or an `autotrack:…:<username>` row) unless the request authenticates as it, and
+  stamps the verified owner on the stored payload. `resolveConfig` gates its tracking read on that proof.
+  A base64 (no-KV) config is caller-authored and can never claim an account.
+- **Nothing that works today stops working**: the Creator Key now travels with a config whenever the config
+  contains one of that account's personal shelves, not only when Auto-track Playback is on — that shape
+  previously carried no credential at all. `/api/preview` call sites send the signed-in account's key.
+  Install links minted before this release are still honoured; see `LEGACY_UNVERIFIED_CONFIG_SHELVES`
+  (`00_constants.js`) for exactly what that costs and how to close it.
+- **Tests**: a dedicated gate test in the Phase 4 suite (anonymous gets nothing for all four slugs, the owner
+  gets it, an opted-in shelf is public, a truthy-but-not-`true` flag is not consent), plus
+  `audit/full-2026-09-13/p12_sec001_positive.mjs` covering owner links with tracking on and off, legacy
+  configs, share and un-share. `loadSourceFunctions` now loads several sources into ONE sandbox, because
+  loading `05_` without `02_` is a different program from the concatenated Worker, not a smaller one.
+
 ### 🌌 Storylines, Sagas & Universes Watch Order in Item Details (2026-09-12)
 - **Chronological watch order display at bottom of Item Details**:
   - When clicking any poster to inspect details (`openItemDetailsModal`), the modal automatically detects whether the title belongs to any canon saga, trilogy, or franchise universe in `TV_CROSSOVER_EVENTS`.

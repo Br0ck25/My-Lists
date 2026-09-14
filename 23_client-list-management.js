@@ -555,8 +555,24 @@ function collectKeys() {
   };
   if (typeof activeCreator !== 'undefined' && activeCreator) {
     keys.creatorName = activeCreator.creatorName;
-    if (track) {
-      keys.track = true;
+    if (track) keys.track = true;
+    // The Creator Key travels with the config whenever the config actually
+    // contains one of this account's personal shelves -- not only when
+    // Auto-track Playback happens to be on.
+    //
+    // A Watch History / Continue Watching / Watchlist row is
+    // 'autotrack:<slug>:<type>:<username>', and reading it server-side means
+    // reading this account's private tracking record. /api/save now refuses to
+    // store a config naming an account unless the request proves it owns it, so
+    // without this a signed-in person with playback tracking switched off could
+    // no longer generate an install link containing their own shelves.
+    //
+    // Deliberately conditional rather than unconditional: an install link is a
+    // bearer credential (see README), and there is no reason to put an account
+    // key in one that carries nothing belonging to that account.
+    const hasPersonalShelf = [...document.querySelectorAll('#lists .entry .url')]
+      .some((el) => String(el.value || '').trim().startsWith('autotrack:'));
+    if (track || hasPersonalShelf) {
       keys.trackCreatorName = activeCreator.creatorName;
       keys.trackCreatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     }

@@ -349,8 +349,17 @@ function deterministicDailyShuffle(array, salt = "") {
 // Config is normally { entries, tmdbKey, mdblistKey } but older install
 // links encode a bare entries array — those still decode fine, just with
 // no personal keys attached.
+// A base64 config is written entirely by whoever pasted the URL -- there is no
+// stored record behind it and nothing this Worker wrote. So it can claim any
+// `trackCreatorName` it likes, and `trackOwner` is therefore always "": a
+// personal shelf named by one of these is served only if its owner opted that
+// shelf into being public. See mayReadTrackedShelf above.
+//
+// Nothing legitimate is lost. These configs are the fallback for a deployment
+// with no CONFIGS KV binding, and without KV there are no Creator Profiles for
+// a personal shelf to belong to.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -380,6 +389,7 @@ function decodeConfig(config) {
       track: !!(!Array.isArray(parsed) && parsed.track),
       trackCreatorName: (!Array.isArray(parsed) && parsed.trackCreatorName) || "",
       trackCreatorKey: (!Array.isArray(parsed) && parsed.trackCreatorKey) || "",
+      trackOwner: "",
       shuffleShelves: !!(!Array.isArray(parsed) && parsed.shuffleShelves),
       shuffleItems: !!(!Array.isArray(parsed) && parsed.shuffleItems),
       // Two-letter watch_region for streaming-availability catalogs
@@ -3235,6 +3245,119 @@ async function getCreator(env, username) {
 // kept offering a row that 404s the moment anyone opens it.
 //
 // The promise, not the result, goes in the map: both callers fan out over a
+// --- Personal-shelf read authorisation ---------------------------------------
+//
+// `creatorsynctracking:{username}` is an account's PRIVATE record: its Watch
+// History, Continue Watching, Watchlist and Airing Next. FOUR code paths read
+// it, and until now only ONE of them asked whether the caller was allowed to.
+//
+// /lists/:username/:slug (26_api-creator-and-admin-routes.js) consults the
+// opt-in flags /api/creator/sync/share-tracking writes, and its own comment
+// spells out why: "reading that blob here used to hand any anonymous caller
+// the complete viewing history of any account whose username they knew -- and
+// usernames are published by /lists/public.json for every shared list, so they
+// didn't even need guessing."
+//
+// The other three took the username straight out of a caller-supplied string
+// and answered: fetchAutoTrackedCatalog (05_catalog-core.js), which every
+// Stremio catalog request AND every /api/preview goes through, and resolveConfig
+// (04_config-resolution.js), whose arrays /api/resolve hands back wholesale.
+// So the whole of any account's viewing history was readable with one
+// unauthenticated GET to
+//   /api/preview?type=series&url=autotrack:watch-history:series:<username>
+// answered with Access-Control-Allow-Origin: *, which made it readable by
+// script on any origin. README.md states the opposite as a guarantee: "they
+// are private by default and nothing else can make them public."
+//
+// The gate existed; it was wired to one of the four doors. These helpers are
+// that gate at module scope, so every door uses the same one.
+//
+// Only three slugs have a share flag -- /api/creator/sync/share-tracking's
+// ALLOWED_SHARE_SLUGS -- so `airing-next` is owner-only, which is what "not
+// expressible as shared" has to mean if the default is private.
+const TRACKED_SHELF_SHARE_SLUGS = new Set(["watchlist", "watch-history", "continue-watching"]);
+
+// The opt-in flags: D1 first (authoritative), KV otherwise, {} on anything
+// unreadable. Deliberately the same read /lists/:username/:slug does, so the
+// two cannot answer differently for the same account.
+async function readCreatorShareFlags(env, username) {
+  let flags = null;
+  if (env && env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT share_json FROM creators WHERE username = ?"
+      ).bind(username).all();
+      if (results && results.length > 0 && results[0].share_json) {
+        flags = JSON.parse(results[0].share_json);
+      }
+    } catch (e) {
+      // Unreadable right now -- fall through to KV, and to {} if that fails
+      // too. Failing closed is the whole point of this function.
+    }
+  }
+  if (!flags && env && env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(`creatorshare:${username}`);
+      if (raw) flags = JSON.parse(raw);
+    } catch {
+      flags = null;
+    }
+  }
+  return (flags && typeof flags === "object" && !Array.isArray(flags)) ? flags : {};
+}
+
+// Strict === true: a truthy string or number left by a hand-edited or legacy
+// value must not be enough to expose someone's viewing history.
+function isTrackedShelfShared(flags, slug) {
+  return !!flags && flags[slug] === true;
+}
+
+// The gate. `verifiedOwner` is a username some caller has ALREADY proved --
+// see resolveConfig (which verifies a stored config's own trackCreatorKey) and
+// /api/preview (which authenticates the request itself). Nothing here verifies
+// a credential, on purpose: this runs inside the catalog fetchers, which have
+// no request and no IP to charge a throttle against, and a PBKDF2 run reachable
+// from an unauthenticated GET with no bound is exactly the cost
+// authenticateCreator's own throttle exists to prevent.
+async function mayReadTrackedShelf(env, username, slug, keys = {}) {
+  if (!env || !username) return false;
+  const verified = String((keys && keys.verifiedOwner) || "");
+  if (verified && verified === username) return true;
+  if (!TRACKED_SHELF_SHARE_SLUGS.has(slug)) return false;
+  return isTrackedShelfShared(await readCreatorShareFlags(env, username), slug);
+}
+
+// Proves a Creator Name + Creator Key pair, and answers with the username it
+// proves or "".
+//
+// This is authenticateCreator's check without the parts that need a request:
+// same tombstone, same record read, same PBKDF2-with-memo. It exists because
+// authenticateCreator lives inside handleFetch's closure and resolveConfig is
+// a module-scope function every catalog request goes through.
+//
+// The ONE caller is resolveConfig, and only for a STORED config -- i.e. a
+// credential this Worker itself wrote into KV, not one a caller just handed
+// over -- so there is no unbounded-PBKDF2 path here to throttle. A base64
+// config is caller-authored and is never given to this function.
+async function verifyShelfOwner(env, creatorName, creatorKey) {
+  if (!env || !env.CONFIGS || !creatorName || !creatorKey) return "";
+  const v = validateCreatorUsername(creatorName);
+  if (!v.ok) return "";
+  try {
+    const [tombstoned, raw] = await Promise.all([
+      isCreatorTombstoned(env, v.normalized),
+      getCreator(env, v.normalized),
+    ]);
+    if (tombstoned || !raw) return "";
+    const profile = JSON.parse(raw);
+    if (!profile || !profile.keyHash) return "";
+    const ok = await verifyCreatorKeyMemoized(String(creatorKey), profile.keyHash, v.normalized);
+    return ok ? v.normalized : "";
+  } catch {
+    return "";
+  }
+}
+
 // page of keys with Promise.all, so a hundred lists by one creator would
 // otherwise each start their own lookup.
 //

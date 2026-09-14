@@ -25,9 +25,9 @@ async function fetchAllItemsForList(listUrl, type, btn, progressLabel) {
     if (keys.simklKey) body.simklKey = keys.simklKey;
     if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
     if (keys.simklUsername) body.simklUsername = keys.simklUsername;
-    if (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) {
-      body.creatorName = activeCreator.creatorName;
-    }
+    // creatorName AND the key: an autotrack: source is this account's private
+    // shelf and the server now requires proof rather than a claimed name.
+    Object.assign(body, previewCreatorAuth());
     const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

@@ -31,12 +31,23 @@ async function adminCookie(env) {
 // for how 09-24 actually get syntax-checked (as the rendered page's
 // inline script, not as standalone files).
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-function loadSourceFunctions(relFile) {
-  const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
-  const sandbox = { console, URL, URLSearchParams, atob, btoa, Uint8Array, TextDecoder, TextEncoder };
+//
+// Variadic, and the files share ONE sandbox: a function in 05_ that calls one
+// declared in 02_ has to be able to see it, exactly as it does in the combined
+// Worker where all 27 sources are concatenated into a single scope. Loading 05_
+// alone gave fetchAutoTrackedCatalog a sandbox with no mayReadTrackedShelf in
+// it, which is not a smaller version of production -- it is a different program.
+function loadSourceFunctions(...relFiles) {
+  const sandbox = {
+    console, URL, URLSearchParams, atob, btoa, Uint8Array, TextDecoder, TextEncoder,
+    crypto: globalThis.crypto,
+  };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(src, sandbox, { filename: relFile });
+  for (const relFile of relFiles) {
+    const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
+    vm.runInContext(src, sandbox, { filename: relFile });
+  }
   return sandbox;
 }
 
@@ -8937,8 +8948,14 @@ describe("Phase 4: Split sync blobs into relational D1 tables", () => {
     readCreatorTrackingD1,
     saveCreatorUserListsD1,
     readCreatorUserListsD1,
-  } = loadSourceFunctions("02_http-and-creator-utils.js");
-  const { fetchAutoTrackedCatalog } = loadSourceFunctions("05_catalog-core.js");
+    fetchAutoTrackedCatalog,
+  } = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "05_catalog-core.js");
+
+  // A personal shelf is only served to a caller that has proved it owns the
+  // account -- see mayReadTrackedShelf (02_http-and-creator-utils.js). These
+  // tests are about what the D1 read returns, so they say who they are; the
+  // test right below is the one that checks what happens when they do not.
+  const asOwner = (u) => ({ verifiedOwner: u });
 
   it("saveCreatorTrackingD1 and readCreatorTrackingD1 round-trip relational tables", async () => {
     const db = makeD1();
@@ -9183,20 +9200,62 @@ describe("Phase 4: Split sync blobs into relational D1 tables", () => {
       u, "tt201", "tt201:1:3", "Ep 3", "D1 Series", 1, 3, "2026-12-01", 9100
     );
 
-    const whCat = await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env);
+    const whCat = await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env, asOwner(u));
     assert.equal(whCat.length, 1);
     assert.equal(whCat[0].id, "tt201");
     assert.equal(whCat[0].showTitle, "D1 Series");
 
-    const cwCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env);
+    const cwCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env, asOwner(u));
     assert.equal(cwCat.length, 1);
     assert.equal(cwCat[0].id, "tt201");
     assert.equal(cwCat[0].episodeNum, 2);
 
-    const anCat = await fetchAutoTrackedCatalog({ url: `autotrack:airing-next:series:${u}` }, env);
+    const anCat = await fetchAutoTrackedCatalog({ url: `autotrack:airing-next:series:${u}` }, env, asOwner(u));
     assert.equal(anCat.length, 1);
     assert.equal(anCat[0].id, "tt201");
     assert.equal(anCat[0].airDate, "2026-12-01");
+  });
+
+  // SEC-001. A personal shelf is named by a string in a catalog URL, and
+  // fetchAutoTrackedCatalog used to read it on the strength of that alone --
+  // so /api/preview?url=autotrack:watch-history:series:<username> handed any
+  // stranger the whole of that account's viewing history. The share flags
+  // /api/creator/sync/share-tracking writes are the opt-in, and they are the
+  // only thing that makes one of these public.
+  it("a personal shelf is not served to a caller that has proved nothing", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = "p4gateuser";
+    db.q(
+      `INSERT INTO watch_history (username, item_id, item_type, title, show_id, show_title, season_num, episode_num, watched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt301:1:1", "episode", "Pilot", "tt301", "Private Series", 1, 1, 9000
+    );
+
+    for (const slug of ["watch-history", "continue-watching", "watchlist", "airing-next"]) {
+      const anon = await fetchAutoTrackedCatalog({ url: `autotrack:${slug}:series:${u}` }, env, {});
+      // .length, not deepEqual: the sandbox is its own realm, so its [] has a
+      // different Array.prototype and deepStrictEqual compares prototypes.
+      assert.equal(anon.length, 0, `${slug} answered a caller with no proof of ownership`);
+    }
+
+    // The owner still gets it...
+    const owner = await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env, asOwner(u));
+    assert.equal(owner.length, 1);
+
+    // ...and so does anyone, once the owner opts that one shelf in.
+    kv._store.set(`creatorshare:${u}`, JSON.stringify({ "watch-history": true }));
+    const shared = await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env, {});
+    assert.equal(shared.length, 1, "an explicitly shared shelf must stay readable");
+
+    // Strictly === true: a truthy leftover is not consent, and a different
+    // slug is not covered by this one's flag.
+    kv._store.set(`creatorshare:${u}`, JSON.stringify({ "watch-history": "yes" }));
+    assert.equal(
+      (await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env, {})).length, 0,
+      "a truthy non-boolean share flag must not expose a shelf"
+    );
   });
 
   it("fetchAutoTrackedCatalog enriches continue-watching with airing_next metadata and Stremio applies badges", async () => {
@@ -9218,7 +9277,7 @@ describe("Phase 4: Split sync blobs into relational D1 tables", () => {
     );
 
     // Direct fetchAutoTrackedCatalog enrichment check
-    const cwCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env);
+    const cwCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env, asOwner(u));
     assert.equal(cwCat.length, 1);
     assert.equal(cwCat[0].id, "tt999");
     assert.equal(cwCat[0].airDate, "2027-02-15");
@@ -9377,7 +9436,7 @@ describe("Phase 4: Split sync blobs into relational D1 tables", () => {
     // 3. Request Movie catalog for continue-watching:
     // - Breaking Bad must NOT be in Movie catalog
     // - El Camino (companion movie) MUST be in Movie catalog
-    const movieCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:movie:${u}` }, env, { origin: "https://example.com" });
+    const movieCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:movie:${u}` }, env, { origin: "https://example.com", ...asOwner(u) });
     assert.equal(movieCat.length, 1, "Movie continue-watching must contain only El Camino");
     assert.equal(movieCat[0].id, "tt9243946");
     assert.equal(movieCat[0].name, "El Camino: A Breaking Bad Movie");
@@ -9388,7 +9447,7 @@ describe("Phase 4: Split sync blobs into relational D1 tables", () => {
     // 4. Request Series catalog for continue-watching:
     // - Breaking Bad must be excluded (fully watched)
     // - El Camino must be excluded (it's a movie!)
-    const seriesCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env, { origin: "https://example.com" });
+    const seriesCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env, { origin: "https://example.com", ...asOwner(u) });
     assert.equal(seriesCat.length, 0, "Series continue-watching must exclude fully watched shows and companion movies");
 
     // 5. Stremio call with badged poster:
@@ -9974,6 +10033,12 @@ describe("Anime Unpacking: restoring multi-season division for compressed anime 
         { id: "tt8360212:3:1", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 1, airDate: "2099-07-05", seasonFinaleAirDate: "2099-09-22" },
       ],
     }));
+    // A personal shelf is private unless its owner opted it in or the caller
+    // proves it owns the account -- see mayReadTrackedShelf
+    // (02_http-and-creator-utils.js). This test is about which FIELDS survive
+    // the mapping, so it takes the opt-in route; the gate itself is covered in
+    // "a personal shelf is not served to a caller that has proved nothing".
+    await env.CONFIGS.put("creatorshare:alice", JSON.stringify({ "continue-watching": true }));
 
     const res = await call(env, "/api/preview", {
       method: "POST",
@@ -10137,6 +10202,10 @@ describe("worker: adult content filter & safe poster generator", () => {
       ],
       airingNext: [],
     }));
+    // Personal shelves are private unless opted in -- see mayReadTrackedShelf
+    // (02_http-and-creator-utils.js). This test is about poster filtering, not
+    // about who may read the shelf.
+    await env.CONFIGS.put("creatorshare:alice", JSON.stringify({ "continue-watching": true }));
 
     // 1. Without adultContentFilter
     const resUnfiltered = await call(env, "/api/preview", {

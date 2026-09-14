@@ -23,8 +23,40 @@ async function resolveConfig(configParam, env) {
             }
           }
         }
-        if (creatorName && env.CONFIGS) {
-          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${creatorName}`);
+        // Who, if anyone, this config PROVES it speaks for.
+        //
+        // `creatorName` above is a name lifted out of the stored payload -- and
+        // /api/save used to accept `trackCreatorName` (and an
+        // `autotrack:...:<username>` entry url) from anyone, unauthenticated, so
+        // it was a claim rather than a credential. Everything downstream treated
+        // it as one: the tracking read immediately below, and
+        // fetchAutoTrackedCatalog via keys.trackOwner. That is SEC-001 -- see
+        // mayReadTrackedShelf (02_http-and-creator-utils.js).
+        //
+        // Three ways a config can prove it now, in descending order of strength:
+        //   * it carries the account's own Creator Key (track-on links always
+        //     have, and /api/save now stores one whenever a personal shelf is
+        //     present) -- verified here, memoized, so it costs one PBKDF2 per
+        //     isolate per config rather than one per request;
+        //   * /api/save stamped `trackOwner` on it after verifying at save time,
+        //     so a later key rotation does not silently empty the shelf;
+        //   * it predates both, and LEGACY_UNVERIFIED_CONFIG_SHELVES says to
+        //     honour those -- see that constant for exactly what it costs.
+        let trackOwner = "";
+        if (creatorName) {
+          if (parsed.trackCreatorKey) {
+            trackOwner = await verifyShelfOwner(env, creatorName, parsed.trackCreatorKey);
+          }
+          if (!trackOwner && typeof parsed.trackOwner === "string" && parsed.trackOwner) {
+            const stamped = String(parsed.trackOwner).toLowerCase();
+            if (stamped === String(creatorName).toLowerCase()) trackOwner = stamped;
+          }
+          if (!trackOwner && LEGACY_UNVERIFIED_CONFIG_SHELVES && !parsed.trackCreatorKey && !parsed.trackOwner) {
+            trackOwner = String(creatorName).toLowerCase();
+          }
+        }
+        if (trackOwner && env.CONFIGS) {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${trackOwner}`);
           if (trackingRaw) {
             try {
               const tracking = JSON.parse(trackingRaw);
@@ -61,6 +93,10 @@ async function resolveConfig(configParam, env) {
           track: !!parsed.track,
           trackCreatorName: parsed.trackCreatorName || "",
           trackCreatorKey: parsed.trackCreatorKey || "",
+          // The verified username, or "". Every personal-shelf read downstream
+          // is gated on this rather than on trackCreatorName -- see the block
+          // above and mayReadTrackedShelf (02_http-and-creator-utils.js).
+          trackOwner,
           shuffleShelves: !!parsed.shuffleShelves,
           shuffleItems: !!parsed.shuffleItems,
           region: parsed.region || "US",
