@@ -234,6 +234,34 @@ ${seoHeadHtml}
     --sb-thumb-hover:rgba(255,255,255,0.25);
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  /* A visible keyboard focus indicator, restored.
+     Seven rules in this stylesheet set 'outline: none' -- .header-icon-btn,
+     .theme-toggle-btn, .dark-mode-toggle, .channel-accordion summary,
+     .cw-remove-btn, .merge-add-channel-select, .detail-sort-select -- and
+     nothing put anything back. Against 97KB of CSS there were two :focus rules
+     in total and no :focus-visible at all, so tabbing to the theme toggle, any
+     header button, an accordion or a Continue Watching remove button gave no
+     indication of where you were (WCAG 2.4.7).
+     :focus-visible rather than :focus, so a mouse click does not draw a ring
+     the way the removed outlines used to; and last in the cascade with
+     !important because the rules that cleared it are more specific. */
+  :where(a[href], button, summary, select, input, textarea, [tabindex]):focus-visible {
+    outline: 2px solid var(--accent) !important;
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* The page has three @keyframes animations and 33 transitions and said
+     nothing about people who have asked their system not to animate. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
   /* scrollbar-gutter, because the page is a max-width block centred with
      'margin: 0 auto' and every tab is one panel swapped in for another. A
      panel whose content is shorter than the viewport takes the classic
@@ -3467,7 +3495,7 @@ ${seoHeadHtml}
              auto) past the screen edge instead of wrapping in place. -->
         <h1 id="detailTitle" style="min-width:0; overflow-wrap:anywhere;">List Title</h1>
         <div style="display:flex; gap:10px; align-items:center; margin-left:auto;">
-          <button type="button" class="lc-btn searchLikeExternalBtn" id="detailLikeBtn">&#9825;</button>
+          <button type="button" class="lc-btn searchLikeExternalBtn" id="detailLikeBtn" aria-label="Like this list">&#9825;</button>
           <button type="button" class="lc-btn primary" id="detailAddBtn">+ Add</button>
         </div>
       </div>
@@ -3513,11 +3541,11 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="createListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="createListModal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="Create a list" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 380px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);" id="createListModalTitle">Create List</h2>
-        <button type="button" class="modal-close-x" onclick="closeCreateListModal()">&#x2715;</button>
+        <button type="button" class="modal-close-x" aria-label="Close" onclick="closeCreateListModal()">&#x2715;</button>
       </div>
 
       <div style="margin-bottom: 12px;">
@@ -3566,7 +3594,7 @@ ${seoHeadHtml}
   </div>
 
   <!-- Add Catalog Modal -->
-  <div id="addShelfModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="addShelfModal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="Add a shelf" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 340px; padding: 22px; background: var(--bg); border-radius: 20px; box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Add Catalog</h2>
       
@@ -3594,14 +3622,14 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="selectListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="selectListModal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="Choose a list" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 480px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; max-height: 85vh;">
       <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
         <div>
           <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Add / Remove from Lists</h2>
           <p style="margin:4px 0 0; font-size:0.85rem; color:var(--muted);">Check to add, uncheck to remove.</p>
         </div>
-        <button type="button" class="modal-close-x" id="selectListModalCloseBtn">&#x2715;</button>
+        <button type="button" class="modal-close-x" aria-label="Close" id="selectListModalCloseBtn">&#x2715;</button>
       </div>
       <div id="selectListModalBody" style="display: flex; flex-direction: column; gap: 0; max-height: 55vh; overflow-y: auto; margin-bottom: 18px; padding-right: 4px;">
         <!-- Filled dynamically -->
@@ -3614,11 +3642,11 @@ ${seoHeadHtml}
   </div>
 
   <!-- Trakt Device Activation Modal -->
-  <div id="traktDeviceModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
+  <div id="traktDeviceModal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="Connect Trakt" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
     <div class="modal-card" style="width: 100%; max-width: 420px; padding: 24px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; text-align: center;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Connect Trakt</h2>
-        <button type="button" class="modal-close-x" onclick="closeTraktDeviceModal()">&#x2715;</button>
+        <button type="button" class="modal-close-x" aria-label="Close" onclick="closeTraktDeviceModal()">&#x2715;</button>
       </div>
       <p style="margin: 0 0 16px; color: var(--muted); font-size: 0.9rem;">To authorize your Trakt account without redirects or rate limits, enter the code below on Trakt:</p>
       

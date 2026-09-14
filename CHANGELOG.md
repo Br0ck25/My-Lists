@@ -108,6 +108,46 @@ the reports now live in `docs/history/`.
   with no way back but clearing site data. The saved value is validated against the panels that exist, in the
   bundle **and** in the pre-paint inline script, since the CSS hides panels before the bundle runs.
 
+### 🔑 A full backup with live credentials was committed to the repository (2026-09-14)
+- `my-lists-full-backup1.json` (added in `73f2dd8`) was an exported app backup containing one account's
+  **Creator Key** and its live **Trakt, MDBList and Simkl OAuth access tokens** in plain text, in a public
+  repository. The file is removed and `.gitignore` now refuses that shape.
+- **Removing it does not remove it from git history**, and the repository has a fork. Every credential in it
+  must be treated as compromised: reset the Creator Key in the account panel, and revoke the three provider
+  tokens at trakt.tv/oauth/applications, mdblist.com/preferences and Simkl's settings.
+
+### ⚡ Performance, hardening, accessibility and docs (2026-09-14)
+- **DB-003 — the directory read had no `LIMIT`**: `/lists/public.json` fetched every public list on the
+  deployment, running `json_array_length` over each one's `items_json` to count it, then kept 100. Page one
+  cost as much as the entire directory, and past a certain size the failure is a D1 response-size error
+  rather than a slow page. The page is asked for in SQL now (`LIMIT`/`OFFSET`), the total comes from two
+  cheap `COUNT`s, and one read is capped by `PUBLIC_INDEX_MAX_ROWS`.
+- **CF-002 — the page memo was keyed on the page**: `SPLIT_PAGE_MEMO` used the whole pre-split HTML string
+  (measured at 1,979,374 characters) as its Map key, with the rewritten page as the value, sixteen entries —
+  tens of megabytes pinned in an isolate that has 128MB for everything. Keyed on a cheap hash plus length now.
+- **Stored install configs are namespaced**: they were written at the bare 12-character id, which made
+  `resolveConfig` a read of an *arbitrary* short KV key. Nothing is exposed by that today — every other
+  namespace is prefixed and longer — but that is an accident of current key names, not a rule. New configs go
+  under `cfg:`; old ones are still read at their bare key, so no install URL changes.
+- **`/admin/logout` is POST-only** and the dashboard's control is a form rather than a link. The session
+  cookie is `SameSite=Strict`, so this was never reachable cross-site; it was protection by a property of the
+  cookie rather than by the method being right.
+- **A11Y-001 — keyboard focus was invisible**: seven rules set `outline: none` and nothing put anything back;
+  the whole 97KB stylesheet had two `:focus` rules and no `:focus-visible`. Tabbing to the theme toggle, any
+  header button, an accordion or a Continue Watching remove button showed nothing (WCAG 2.4.7). A
+  `:focus-visible` ring is defined once, last in the cascade.
+- **A11Y-002 / A11Y-004** — the 18 icon-only buttons (modal `✕`, the `♡` like button, the row and
+  source removers) have accessible names, and all five dialogs are named: the static four by `aria-label`,
+  the dynamic one by `aria-labelledby` pointing at the heading `showModal` already focuses.
+- **A11Y-003** — a `prefers-reduced-motion` block, against three `@keyframes` and 33 transitions.
+- **PWA-001 — the manifest lied about the icon**: two entries claimed 192×192 and 512×512 while
+  `/icon.png`'s IHDR says 256×256, so the splash and installed-app icons were upscaled from half the declared
+  resolution. Declared at its real size now. No `maskable` entry — that needs an icon drawn for the safe zone,
+  which is a design task, not a manifest edit.
+- **API-001 documented**: no refresh token is stored for any provider, so a Trakt connection lasts about three
+  months and then needs reconnecting. Written down in the README with why it is a storage-model change rather
+  than a fix.
+
 ### 🌌 Storylines, Sagas & Universes Watch Order in Item Details (2026-09-12)
 - **Chronological watch order display at bottom of Item Details**:
   - When clicking any poster to inspect details (`openItemDetailsModal`), the modal automatically detects whether the title belongs to any canon saga, trilogy, or franchise universe in `TV_CROSSOVER_EVENTS`.

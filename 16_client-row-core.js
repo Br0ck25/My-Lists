@@ -1085,9 +1085,15 @@ function showModal(innerHtml, extraClass) {
   const items = focusableInModal(overlay);
   const heading = overlay.querySelector('h2, h3');
   if (heading) {
+    // Names the dialog as well as receiving focus. role="dialog" with no
+    // accessible name announces as just "dialog"; the heading is already the
+    // thing that says what this one is.
+    if (!heading.id) heading.id = 'activeModalTitle';
+    overlay.setAttribute('aria-labelledby', heading.id);
     heading.setAttribute('tabindex', '-1');
     heading.focus();
   } else if (items.length) {
+    overlay.setAttribute('aria-label', 'Dialog');
     items[0].focus();
   }
 }
@@ -1120,7 +1126,7 @@ function showAppAlert(title, message, isSuccess = false) {
         '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
         escapeHtml(title) +
       '</h3>' +
-      '<button type="button" class="action-btn" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
+      '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
     '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
@@ -1139,7 +1145,7 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
         '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
         escapeHtml(title) +
       '</h3>' +
-      '<button type="button" class="action-btn" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
+      '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
     '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
@@ -1940,7 +1946,7 @@ function sourceRowHtml(u, readonly) {
   return '<div class="source-row">' +
     '<div class="row field-row">' +
     '<input type="text" placeholder="mdblist.com, trakt.tv, or themoviedb.org list URL" class="url" value="' + escapeAttr(u) + '" oninput="checkDuplicateUrl(this)">' +
-    '<button type="button" class="movebtn removebtn remove-source-btn" onclick="removeSourceRow(this)" style="display:none;">\u2715</button>' +
+    '<button type="button" class="movebtn removebtn remove-source-btn" aria-label="Remove this source" onclick="removeSourceRow(this)" style="display:none;">\u2715</button>' +
     '</div>' +
     '<small class="dup-warning" style="display:none;">\u26a0 Already added elsewhere in this list.</small>' +
     '<div class="testrow">' +
@@ -2201,7 +2207,7 @@ function addShelfModalAddLink() {
   div.style.marginBottom = '12px';
   div.innerHTML = 
     '<input type="url" class="addShelfModalLinkInput" placeholder="Additional URL" style="flex:1; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem;" oninput="onAddShelfModalLinkInput(this); validateAddShelfModal()">' +
-    '<button type="button" class="lc-btn secondary" style="padding: 12px;" onclick="this.closest(&quot;.add-shelf-link-row&quot;).remove(); validateAddShelfModal()">\u2715</button>';
+    '<button type="button" class="lc-btn secondary" aria-label="Remove this URL" style="padding: 12px;" onclick="this.closest(&quot;.add-shelf-link-row&quot;).remove(); validateAddShelfModal()">\u2715</button>';
   container.appendChild(div);
   validateAddShelfModal();
 }

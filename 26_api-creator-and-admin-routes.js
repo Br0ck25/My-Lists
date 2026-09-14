@@ -6173,6 +6173,14 @@
       });
     }
 
+    // POST only. A logout that answers a GET is a state change any page can
+    // trigger with an <img src>, and while the session cookie is SameSite=Strict
+    // (so this was never actually reachable cross-site) that is protection by a
+    // property of the cookie rather than by the method being right. The
+    // dashboard's own control already posts a form.
+    if (path === "/admin/logout" && request.method !== "POST") {
+      return new Response(null, { status: 405, headers: { "Allow": "POST", "Cache-Control": "no-store" } });
+    }
     if (path === "/admin/logout") {
       return new Response(null, {
         status: 302,

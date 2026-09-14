@@ -1955,6 +1955,17 @@ async function renderAdminDashboard(env) {
     max-height: 90vh; overflow-y: auto; box-shadow: var(--shadow-md);
     color: var(--text);
   }
+  button.linklike {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  button.linklike:hover { opacity: 0.85; }
+
   .modal-close-x {
     float: right; background: var(--bg); border: 1px solid var(--border-strong);
     color: var(--muted); font-size: 1rem; cursor: pointer;
@@ -2186,7 +2197,7 @@ async function renderAdminDashboard(env) {
     <div class="modal-card" style="max-width:500px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
         <h3 style="margin:0; font-size:1.15rem; font-weight:700; color:var(--text);">Edit Feedback</h3>
-        <button type="button" class="modal-close-x" onclick="closeEditFeedbackModal()">&#x2715;</button>
+        <button type="button" class="modal-close-x" aria-label="Close" onclick="closeEditFeedbackModal()">&#x2715;</button>
       </div>
       <input type="hidden" id="editFeedbackId">
       <label style="display:block; font-size:0.82rem; font-weight:600; color:var(--muted); margin-bottom:6px;">Category</label>
@@ -2316,7 +2327,11 @@ async function renderAdminDashboard(env) {
     </div>
   </div>
 
-  <p style="margin-top:24px;"><a href="/admin/logout">Log out</a></p>
+  <!-- A form, not a link: logging out is a state change, and /admin/logout
+       answers POST only now. See that route for why. -->
+  <form method="POST" action="/admin/logout" style="margin-top:24px;">
+    <button type="submit" class="linklike">Log out</button>
+  </form>
   <script>
     const categoryDefaults = {
       overview: 'last30',
@@ -3592,7 +3607,7 @@ async function renderAdminDashboard(env) {
             '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
             escapeHtmlAdmin(title) +
           '</h3>' +
-          '<button type="button" class="modal-close-x" onclick="closeAdminModal()">\u2715</button>' +
+          '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeAdminModal()">\u2715</button>' +
         '</div>' +
         '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
         '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
@@ -3611,7 +3626,7 @@ async function renderAdminDashboard(env) {
             '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
             escapeHtmlAdmin(title) +
           '</h3>' +
-          '<button type="button" class="modal-close-x" onclick="closeAdminModal()">\u2715</button>' +
+          '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeAdminModal()">\u2715</button>' +
         '</div>' +
         '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
         '<div style="display:flex; justify-content:flex-end; gap:10px;">' +

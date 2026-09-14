@@ -985,12 +985,35 @@ async function splitAppCss(html) {
   return { page, css: APP_CSS };
 }
 
-// Rewritten pages are remembered per distinct HTML string, so a repeat
-// request for the same page does not re-scan 1.6MB looking for the markers.
+// Rewritten pages are remembered so a repeat request for the same page does not
+// re-scan ~2MB looking for the markers.
+//
+// Keyed on a cheap hash of the page, NOT on the page itself. The key used to be
+// the whole pre-split HTML string -- measured at 1,979,374 characters -- with
+// the rewritten page (~580KB) as the value, sixteen of them. That is tens of
+// megabytes of strings pinned in an isolate that has 128MB for everything,
+// alongside APP_BUNDLE (~1.3MB), APP_CSS (~97KB) and PER_USER_CACHE_MAP's
+// thousand entries. Every distinct shared list URL, configure link and deep
+// link renders different HTML, so the cache genuinely does fill.
+//
+// A 32-bit FNV-1a over the string is not collision-proof, and does not need to
+// be: a collision would serve one visitor another visitor's PAGE, so the stored
+// length is checked too and the hash is only ever a key into this isolate's own
+// memory. Cheap enough that it costs less than the marker scan it avoids.
 const SPLIT_PAGE_MEMO = new Map();
 
+function splitPageMemoKey(html) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < html.length; i++) {
+    h ^= html.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36) + ":" + html.length;
+}
+
 async function pageWithExternalBundle(html) {
-  const memo = SPLIT_PAGE_MEMO.get(html);
+  const key = splitPageMemoKey(html);
+  const memo = SPLIT_PAGE_MEMO.get(key);
   if (memo) return memo;
   let page = html;
   try {
@@ -1004,7 +1027,7 @@ async function pageWithExternalBundle(html) {
     const oldest = SPLIT_PAGE_MEMO.keys().next().value;
     if (oldest !== undefined) SPLIT_PAGE_MEMO.delete(oldest);
   }
-  SPLIT_PAGE_MEMO.set(html, page);
+  SPLIT_PAGE_MEMO.set(key, page);
   return page;
 }
 
@@ -2467,7 +2490,19 @@ function normalizeExternalListUrl(rawUrl) {
 // and ordered by likes DESC, updated_at DESC.
 //
 // When D1 is not bound, falls back to scanning public lists from KV.
-async function getPublicListIndex(env, ctx) {
+async function getPublicListIndex(env, ctx, opts = {}) {
+  // `limit`/`offset` push the page into SQL. Without them this query had no
+  // LIMIT at all: /lists/public.json fetched EVERY public list -- running
+  // json_array_length over every one of their items_json blobs to do it -- and
+  // then threw all but 100 rows away in JavaScript. The cost of page 1 grew
+  // with the size of the whole directory, and the eventual failure mode is a
+  // D1 response-size error rather than a slow page.
+  //
+  // Callers that genuinely need the whole set (the search fallback) still get
+  // it, but bounded by PUBLIC_INDEX_MAX_ROWS instead of by nothing.
+  const wantsPage = Number.isFinite(opts.limit) && opts.limit > 0;
+  const pageLimit = wantsPage ? Math.min(Math.floor(opts.limit), PUBLIC_INDEX_MAX_ROWS) : PUBLIC_INDEX_MAX_ROWS;
+  const pageOffset = Number.isFinite(opts.offset) && opts.offset > 0 ? Math.floor(opts.offset) : 0;
   if (env && env.DB) {
     try {
       const query = `
@@ -2503,13 +2538,33 @@ async function getPublicListIndex(env, ctx) {
         WHERE pl.visibility = 'public'
 
         ORDER BY likes DESC, updatedAt DESC
+        LIMIT ? OFFSET ?
       `;
-      const res = await env.DB.prepare(query).all();
+      // The total is counted, not derived from the rows, now that the rows are
+      // a page: /lists/public.json reports it so a caller knows how far it can
+      // page. Two cheap COUNTs beat materialising the whole directory.
+      const countQuery = `
+        SELECT
+          (SELECT COUNT(*) FROM creator_lists WHERE visibility = 'public')
+          + (SELECT COUNT(*) FROM published_lists WHERE visibility = 'public') AS n
+      `;
+      const [res, countRes] = await Promise.all([
+        env.DB.prepare(query).bind(pageLimit, pageOffset).all(),
+        env.DB.prepare(countQuery).all().catch(() => null),
+      ]);
       const rows = (res && res.results) ? res.results : [];
-      return rows.map((r) => ({
+      const entries = rows.map((r) => ({
         ...r,
         isCreator: Boolean(r.isCreator),
       }));
+      const counted = countRes && countRes.results && countRes.results[0]
+        ? Number(countRes.results[0].n)
+        : null;
+      // Carried on the array rather than changing the return type, the same way
+      // fetchCatalog carries totalItems -- every existing caller keeps treating
+      // this as the list of entries it always was.
+      entries.total = Number.isFinite(counted) ? counted : pageOffset + entries.length;
+      return entries;
     } catch (e) {
       console.error("getPublicListIndex D1 query error:", e);
       return null;

@@ -1,8 +1,29 @@
 const SHORT_ID_LENGTH = 12;
 
+// Stored install configs live under a namespace like every other key.
+//
+// They used to be written at the bare id -- `CONFIGS.put(id, payload)` -- which
+// made this function a read of an ARBITRARY 12-character KV key: whatever
+// /:config/... is asked for is handed straight to CONFIGS.get. Nothing is
+// exposed by that today, because every other namespace in this Worker is
+// prefixed and longer than twelve characters, but that is an accident of
+// current key names rather than a rule, and the day something shorter is added
+// it becomes readable through /api/resolve with no further code change.
+//
+// Prefixing the STORAGE key fixes that without touching a single install URL:
+// the id in the link is unchanged, only where it is filed changes. Old configs
+// are still read at their bare key, because those links are in people's Stremio
+// installs and will be for years.
+const SAVED_CONFIG_KEY_PREFIX = "cfg:";
+
+function savedConfigKey(id) {
+  return SAVED_CONFIG_KEY_PREFIX + id;
+}
+
 async function resolveConfig(configParam, env) {
   if (configParam.length <= SHORT_ID_LENGTH && env && env.CONFIGS) {
-    const stored = await env.CONFIGS.get(configParam);
+    const stored = (await env.CONFIGS.get(savedConfigKey(configParam)))
+      || (await env.CONFIGS.get(configParam));
     if (stored) {
       try {
         const parsed = JSON.parse(stored);

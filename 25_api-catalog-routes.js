@@ -419,14 +419,16 @@ async function handleFetch(request, env, ctx) {
       // Preferred path: one KV read of the maintained index, no per-list
       // gets, no truncation at 150 keys. Falls back to the legacy bounded
       // scan below only while the index is being built for the first time.
-      const indexEntries = await getPublicListIndex(env, ctx);
+      const limitParam = parseInt(url.searchParams.get("limit") || "", 10);
+      const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+      // Default page stays 100 to match the previous response size;
+      // callers can page through the rest instead of silently losing it.
+      const pageSize = Math.min(Math.max(limitParam || 100, 1), 500);
+      // The page is asked for in SQL now rather than sliced out of the whole
+      // directory afterwards -- see getPublicListIndex.
+      const indexEntries = await getPublicListIndex(env, ctx, { limit: pageSize, offset });
       if (indexEntries) {
-        const limitParam = parseInt(url.searchParams.get("limit") || "", 10);
-        const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
-        // Default page stays 100 to match the previous response size;
-        // callers can page through the rest instead of silently losing it.
-        const pageSize = Math.min(Math.max(limitParam || 100, 1), 500);
-        const page = indexEntries.slice(offset, offset + pageSize);
+        const page = indexEntries;
         const lists = page.map((e) => {
           const cleanSlug = e.slug || slugifyServer(e.name) || "list";
           const username = e.isCreator ? e.username : "user";
@@ -443,7 +445,7 @@ async function handleFetch(request, env, ctx) {
           };
         });
         return json(
-          { ok: true, count: lists.length, total: indexEntries.length, offset, lists },
+          { ok: true, count: lists.length, total: Number(indexEntries.total) || lists.length, offset, lists },
           200,
           { "Cache-Control": "public, max-age=120", ...corsHeaders() }
         );
@@ -629,9 +631,21 @@ async function handleFetch(request, env, ctx) {
         display: "standalone",
         background_color: "#F2F2F7",
         theme_color: "#F2F2F7",
+        // One file, declared at the size it actually is.
+        //
+        // These two entries claimed 192x192 and 512x512 while /icon.png's own
+        // IHDR says 256x256 -- so the splash screen and the installed app icon
+        // were upscaled from a source half the declared resolution, and the
+        // 192 entry was downscaling for no reason. Chrome's installability
+        // check wants an icon of at least 192px, which 256 satisfies, so
+        // telling the truth costs nothing and stops the browser being lied to.
+        //
+        // No `purpose: "maskable"` entry: a maskable icon has to be DRAWN with
+        // the safe zone in mind (Android crops to a circle), and declaring this
+        // one maskable would crop its edges rather than fix anything. That is a
+        // design task, not a manifest edit.
         icons: [
-          { src: "/icon.png", sizes: "192x192", type: "image/png" },
-          { src: "/icon.png", sizes: "512x512", type: "image/png" }
+          { src: "/icon.png", sizes: "256x256", type: "image/png", purpose: "any" }
         ]
       };
       return new Response(JSON.stringify(manifest), {
@@ -6188,10 +6202,11 @@ function generateSearchVariations(query) {
       let id;
       for (let attempt = 0; attempt < 5; attempt++) {
         id = generateShortId();
-        const existing = await env.CONFIGS.get(id);
+        // Both shapes, so a fresh id cannot collide with a pre-prefix one.
+        const existing = (await env.CONFIGS.get(savedConfigKey(id))) || (await env.CONFIGS.get(id));
         if (!existing) break;
       }
-      await env.CONFIGS.put(id, savePayload);
+      await env.CONFIGS.put(savedConfigKey(id), savePayload);
       return json({ ok: true, id });
     }
 

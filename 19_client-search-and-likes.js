@@ -2042,7 +2042,7 @@ function openEpisodeDetails(epNum) {
     });
   }
   const innerHtml = 
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap; margin-top:20px;">' +
       '<div style="flex: 0 0 300px; max-width: 100%;">' +
         (still ? '<img src="' + still + '" style="width:100%; border-radius:8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">' : '') +

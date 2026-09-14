@@ -1315,7 +1315,7 @@ function switchCreatorProfile() {
 
 function openRestoreModal() {
   showModal(
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<h2>Login</h2>' +
     '<p class="modal-sub">Enter your Username and Account Key to login and sync your lists.</p>' +
     '<div class="row"><input type="text" id="restoreNameInput" placeholder="Username"></div>' +
@@ -1388,7 +1388,7 @@ async function submitRestoreProfile() {
 // person has fully proven who they are.
 function openForgotKeyModal() {
   showModal(
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<h2>Reset Your Key</h2>' +
     '<p class="modal-sub">Enter your Username and the recovery answer you set when you created your account.</p>' +
     '<div class="row"><input type="text" id="forgotKeyNameInput" placeholder="Username"></div>' +
@@ -2925,7 +2925,7 @@ function startSaveListFlow(btn) {
 
 function openCreateProfileModal() {
   showModal(
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<h2>Create a Free Account</h2>' +
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
     '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
@@ -3109,7 +3109,7 @@ function openVisibilityModal() {
   if (!ctx) return;
   showModal(
     '<div class="modal-body">' +
-      '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
       '<h2 class="panel-title" style="margin-top:0;">Save Custom List</h2>' +
       '<p style="margin:0 0 16px; font-size:0.88rem; color:var(--muted);">Choose visibility for <strong>' + escapeHtml(ctx.name || 'Custom List') + '</strong> on your Profile.</p>' +
       '<div class="visibility-choice" style="display:flex; flex-direction:column; gap:12px; margin: 16px 0 20px;">' +
@@ -3134,7 +3134,7 @@ function showSavedCustomListModal(listName, visibility, url) {
   const isPrivate = visibility === 'private';
   showModal(
     '<div class="modal-body">' +
-      '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
       '<h2 class="panel-title" style="margin-top:0;">\u2713 List Saved</h2>' +
       '<p style="margin:8px 0 16px; font-size:0.9rem; color:var(--text);">' +
         '<strong>' + escapeHtml(listName || 'Custom List') + '</strong> has been saved to your Profile as a <strong>' + (isPrivate ? 'private' : 'public') + '</strong> list.' +
@@ -3229,7 +3229,7 @@ async function confirmSaveAsCreator() {
 function showAppNoticeModal(title, message, isError) {
   showModal(
     '<div class="modal-body">' +
-      '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
       '<h2 class="panel-title" style="margin-top:0;' + (isError ? ' color:var(--danger);' : '') + '">' + escapeHtml(title || 'Notice') + '</h2>' +
       '<p style="margin:12px 0 20px; font-size:0.9rem; color:var(--text); line-height:1.4;">' + escapeHtml(message || '') + '</p>' +
       '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end;">' +

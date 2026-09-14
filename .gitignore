@@ -13,3 +13,10 @@ rendered.html
 test.html
 inner_*.js
 audit/**/*.png
+
+# Exported backups. A full backup from the app carries the account's Creator
+# Key and its Trakt / MDBList / Simkl OAuth access tokens in plain text --
+# my-lists-full-backup1.json was committed with live ones in it. Never commit
+# one; use a redacted fixture if a test needs this shape.
+my-lists-full-backup*.json
+*-full-backup*.json

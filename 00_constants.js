@@ -468,6 +468,18 @@ const LEGACY_UNVERIFIED_CONFIG_SHELVES = true;
 // everything.
 const ADMIN_CREATOR_LIST_KV_SCAN_MAX = 250;
 
+// --- Ceiling on one read of the public list directory ------------------------
+//
+// getPublicListIndex's D1 query had no LIMIT. /lists/public.json therefore
+// fetched every public list on the deployment -- evaluating json_array_length
+// over each one's items_json to count its entries -- and then kept 100 of them.
+// Page one cost as much as the whole directory, and the failure mode past a
+// certain size is a D1 response-size error, not a slow page.
+//
+// This is the ceiling for ONE read, which is also the cap on the search
+// fallback's whole-index scan. Paging is how a caller reaches past it.
+const PUBLIC_INDEX_MAX_ROWS = 1000;
+
 // --- Bound on /api/resolve's cross-deployment fallback -----------------------
 //
 // /api/resolve takes a `url` and, when the local config resolves to nothing,

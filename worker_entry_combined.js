@@ -518,6 +518,18 @@ const LEGACY_UNVERIFIED_CONFIG_SHELVES = true;
 // everything.
 const ADMIN_CREATOR_LIST_KV_SCAN_MAX = 250;
 
+// --- Ceiling on one read of the public list directory ------------------------
+//
+// getPublicListIndex's D1 query had no LIMIT. /lists/public.json therefore
+// fetched every public list on the deployment -- evaluating json_array_length
+// over each one's items_json to count its entries -- and then kept 100 of them.
+// Page one cost as much as the whole directory, and the failure mode past a
+// certain size is a D1 response-size error, not a slow page.
+//
+// This is the ceiling for ONE read, which is also the cap on the search
+// fallback's whole-index scan. Paging is how a caller reaches past it.
+const PUBLIC_INDEX_MAX_ROWS = 1000;
+
 // --- Bound on /api/resolve's cross-deployment fallback -----------------------
 //
 // /api/resolve takes a `url` and, when the local config resolves to nothing,
@@ -3140,12 +3152,35 @@ async function splitAppCss(html) {
   return { page, css: APP_CSS };
 }
 
-// Rewritten pages are remembered per distinct HTML string, so a repeat
-// request for the same page does not re-scan 1.6MB looking for the markers.
+// Rewritten pages are remembered so a repeat request for the same page does not
+// re-scan ~2MB looking for the markers.
+//
+// Keyed on a cheap hash of the page, NOT on the page itself. The key used to be
+// the whole pre-split HTML string -- measured at 1,979,374 characters -- with
+// the rewritten page (~580KB) as the value, sixteen of them. That is tens of
+// megabytes of strings pinned in an isolate that has 128MB for everything,
+// alongside APP_BUNDLE (~1.3MB), APP_CSS (~97KB) and PER_USER_CACHE_MAP's
+// thousand entries. Every distinct shared list URL, configure link and deep
+// link renders different HTML, so the cache genuinely does fill.
+//
+// A 32-bit FNV-1a over the string is not collision-proof, and does not need to
+// be: a collision would serve one visitor another visitor's PAGE, so the stored
+// length is checked too and the hash is only ever a key into this isolate's own
+// memory. Cheap enough that it costs less than the marker scan it avoids.
 const SPLIT_PAGE_MEMO = new Map();
 
+function splitPageMemoKey(html) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < html.length; i++) {
+    h ^= html.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36) + ":" + html.length;
+}
+
 async function pageWithExternalBundle(html) {
-  const memo = SPLIT_PAGE_MEMO.get(html);
+  const key = splitPageMemoKey(html);
+  const memo = SPLIT_PAGE_MEMO.get(key);
   if (memo) return memo;
   let page = html;
   try {
@@ -3159,7 +3194,7 @@ async function pageWithExternalBundle(html) {
     const oldest = SPLIT_PAGE_MEMO.keys().next().value;
     if (oldest !== undefined) SPLIT_PAGE_MEMO.delete(oldest);
   }
-  SPLIT_PAGE_MEMO.set(html, page);
+  SPLIT_PAGE_MEMO.set(key, page);
   return page;
 }
 
@@ -4622,7 +4657,19 @@ function normalizeExternalListUrl(rawUrl) {
 // and ordered by likes DESC, updated_at DESC.
 //
 // When D1 is not bound, falls back to scanning public lists from KV.
-async function getPublicListIndex(env, ctx) {
+async function getPublicListIndex(env, ctx, opts = {}) {
+  // `limit`/`offset` push the page into SQL. Without them this query had no
+  // LIMIT at all: /lists/public.json fetched EVERY public list -- running
+  // json_array_length over every one of their items_json blobs to do it -- and
+  // then threw all but 100 rows away in JavaScript. The cost of page 1 grew
+  // with the size of the whole directory, and the eventual failure mode is a
+  // D1 response-size error rather than a slow page.
+  //
+  // Callers that genuinely need the whole set (the search fallback) still get
+  // it, but bounded by PUBLIC_INDEX_MAX_ROWS instead of by nothing.
+  const wantsPage = Number.isFinite(opts.limit) && opts.limit > 0;
+  const pageLimit = wantsPage ? Math.min(Math.floor(opts.limit), PUBLIC_INDEX_MAX_ROWS) : PUBLIC_INDEX_MAX_ROWS;
+  const pageOffset = Number.isFinite(opts.offset) && opts.offset > 0 ? Math.floor(opts.offset) : 0;
   if (env && env.DB) {
     try {
       const query = `
@@ -4658,13 +4705,33 @@ async function getPublicListIndex(env, ctx) {
         WHERE pl.visibility = 'public'
 
         ORDER BY likes DESC, updatedAt DESC
+        LIMIT ? OFFSET ?
       `;
-      const res = await env.DB.prepare(query).all();
+      // The total is counted, not derived from the rows, now that the rows are
+      // a page: /lists/public.json reports it so a caller knows how far it can
+      // page. Two cheap COUNTs beat materialising the whole directory.
+      const countQuery = `
+        SELECT
+          (SELECT COUNT(*) FROM creator_lists WHERE visibility = 'public')
+          + (SELECT COUNT(*) FROM published_lists WHERE visibility = 'public') AS n
+      `;
+      const [res, countRes] = await Promise.all([
+        env.DB.prepare(query).bind(pageLimit, pageOffset).all(),
+        env.DB.prepare(countQuery).all().catch(() => null),
+      ]);
       const rows = (res && res.results) ? res.results : [];
-      return rows.map((r) => ({
+      const entries = rows.map((r) => ({
         ...r,
         isCreator: Boolean(r.isCreator),
       }));
+      const counted = countRes && countRes.results && countRes.results[0]
+        ? Number(countRes.results[0].n)
+        : null;
+      // Carried on the array rather than changing the return type, the same way
+      // fetchCatalog carries totalItems -- every existing caller keeps treating
+      // this as the list of entries it always was.
+      entries.total = Number.isFinite(counted) ? counted : pageOffset + entries.length;
+      return entries;
     } catch (e) {
       console.error("getPublicListIndex D1 query error:", e);
       return null;
@@ -8358,6 +8425,17 @@ async function renderAdminDashboard(env) {
     max-height: 90vh; overflow-y: auto; box-shadow: var(--shadow-md);
     color: var(--text);
   }
+  button.linklike {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  button.linklike:hover { opacity: 0.85; }
+
   .modal-close-x {
     float: right; background: var(--bg); border: 1px solid var(--border-strong);
     color: var(--muted); font-size: 1rem; cursor: pointer;
@@ -8589,7 +8667,7 @@ async function renderAdminDashboard(env) {
     <div class="modal-card" style="max-width:500px;">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
         <h3 style="margin:0; font-size:1.15rem; font-weight:700; color:var(--text);">Edit Feedback</h3>
-        <button type="button" class="modal-close-x" onclick="closeEditFeedbackModal()">&#x2715;</button>
+        <button type="button" class="modal-close-x" aria-label="Close" onclick="closeEditFeedbackModal()">&#x2715;</button>
       </div>
       <input type="hidden" id="editFeedbackId">
       <label style="display:block; font-size:0.82rem; font-weight:600; color:var(--muted); margin-bottom:6px;">Category</label>
@@ -8719,7 +8797,11 @@ async function renderAdminDashboard(env) {
     </div>
   </div>
 
-  <p style="margin-top:24px;"><a href="/admin/logout">Log out</a></p>
+  <!-- A form, not a link: logging out is a state change, and /admin/logout
+       answers POST only now. See that route for why. -->
+  <form method="POST" action="/admin/logout" style="margin-top:24px;">
+    <button type="submit" class="linklike">Log out</button>
+  </form>
   <script>
     const categoryDefaults = {
       overview: 'last30',
@@ -9995,7 +10077,7 @@ async function renderAdminDashboard(env) {
             '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
             escapeHtmlAdmin(title) +
           '</h3>' +
-          '<button type="button" class="modal-close-x" onclick="closeAdminModal()">\u2715</button>' +
+          '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeAdminModal()">\u2715</button>' +
         '</div>' +
         '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
         '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
@@ -10014,7 +10096,7 @@ async function renderAdminDashboard(env) {
             '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
             escapeHtmlAdmin(title) +
           '</h3>' +
-          '<button type="button" class="modal-close-x" onclick="closeAdminModal()">\u2715</button>' +
+          '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeAdminModal()">\u2715</button>' +
         '</div>' +
         '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
         '<div style="display:flex; justify-content:flex-end; gap:10px;">' +
@@ -10181,9 +10263,30 @@ async function renderAdminDashboard(env) {
 // tells the two apart without needing a prefix.
 const SHORT_ID_LENGTH = 12;
 
+// Stored install configs live under a namespace like every other key.
+//
+// They used to be written at the bare id -- `CONFIGS.put(id, payload)` -- which
+// made this function a read of an ARBITRARY 12-character KV key: whatever
+// /:config/... is asked for is handed straight to CONFIGS.get. Nothing is
+// exposed by that today, because every other namespace in this Worker is
+// prefixed and longer than twelve characters, but that is an accident of
+// current key names rather than a rule, and the day something shorter is added
+// it becomes readable through /api/resolve with no further code change.
+//
+// Prefixing the STORAGE key fixes that without touching a single install URL:
+// the id in the link is unchanged, only where it is filed changes. Old configs
+// are still read at their bare key, because those links are in people's Stremio
+// installs and will be for years.
+const SAVED_CONFIG_KEY_PREFIX = "cfg:";
+
+function savedConfigKey(id) {
+  return SAVED_CONFIG_KEY_PREFIX + id;
+}
+
 async function resolveConfig(configParam, env) {
   if (configParam.length <= SHORT_ID_LENGTH && env && env.CONFIGS) {
-    const stored = await env.CONFIGS.get(configParam);
+    const stored = (await env.CONFIGS.get(savedConfigKey(configParam)))
+      || (await env.CONFIGS.get(configParam));
     if (stored) {
       try {
         const parsed = JSON.parse(stored);
@@ -16859,6 +16962,34 @@ ${seoHeadHtml}
     --sb-thumb-hover:rgba(255,255,255,0.25);
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  /* A visible keyboard focus indicator, restored.
+     Seven rules in this stylesheet set 'outline: none' -- .header-icon-btn,
+     .theme-toggle-btn, .dark-mode-toggle, .channel-accordion summary,
+     .cw-remove-btn, .merge-add-channel-select, .detail-sort-select -- and
+     nothing put anything back. Against 97KB of CSS there were two :focus rules
+     in total and no :focus-visible at all, so tabbing to the theme toggle, any
+     header button, an accordion or a Continue Watching remove button gave no
+     indication of where you were (WCAG 2.4.7).
+     :focus-visible rather than :focus, so a mouse click does not draw a ring
+     the way the removed outlines used to; and last in the cascade with
+     !important because the rules that cleared it are more specific. */
+  :where(a[href], button, summary, select, input, textarea, [tabindex]):focus-visible {
+    outline: 2px solid var(--accent) !important;
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* The page has three @keyframes animations and 33 transitions and said
+     nothing about people who have asked their system not to animate. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
   /* scrollbar-gutter, because the page is a max-width block centred with
      'margin: 0 auto' and every tab is one panel swapped in for another. A
      panel whose content is shorter than the viewport takes the classic
@@ -20092,7 +20223,7 @@ ${seoHeadHtml}
              auto) past the screen edge instead of wrapping in place. -->
         <h1 id="detailTitle" style="min-width:0; overflow-wrap:anywhere;">List Title</h1>
         <div style="display:flex; gap:10px; align-items:center; margin-left:auto;">
-          <button type="button" class="lc-btn searchLikeExternalBtn" id="detailLikeBtn">&#9825;</button>
+          <button type="button" class="lc-btn searchLikeExternalBtn" id="detailLikeBtn" aria-label="Like this list">&#9825;</button>
           <button type="button" class="lc-btn primary" id="detailAddBtn">+ Add</button>
         </div>
       </div>
@@ -20138,11 +20269,11 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="createListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="createListModal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="Create a list" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 380px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);" id="createListModalTitle">Create List</h2>
-        <button type="button" class="modal-close-x" onclick="closeCreateListModal()">&#x2715;</button>
+        <button type="button" class="modal-close-x" aria-label="Close" onclick="closeCreateListModal()">&#x2715;</button>
       </div>
 
       <div style="margin-bottom: 12px;">
@@ -20191,7 +20322,7 @@ ${seoHeadHtml}
   </div>
 
   <!-- Add Catalog Modal -->
-  <div id="addShelfModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="addShelfModal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="Add a shelf" style="display:none; z-index: 10001; background: rgba(0,0,0,0.45); justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 340px; padding: 22px; background: var(--bg); border-radius: 20px; box-shadow: var(--shadow); display: flex; flex-direction: column;">
       <h2 style="margin-top:0; font-size:1.3rem; font-weight:600; color:var(--text);">Add Catalog</h2>
       
@@ -20219,14 +20350,14 @@ ${seoHeadHtml}
     </div>
   </div>
 
-  <div id="selectListModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
+  <div id="selectListModal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="Choose a list" style="display:none; z-index: 10001; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px;">
     <div class="modal-card" style="width: 100%; max-width: 480px; padding: 22px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; max-height: 85vh;">
       <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
         <div>
           <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Add / Remove from Lists</h2>
           <p style="margin:4px 0 0; font-size:0.85rem; color:var(--muted);">Check to add, uncheck to remove.</p>
         </div>
-        <button type="button" class="modal-close-x" id="selectListModalCloseBtn">&#x2715;</button>
+        <button type="button" class="modal-close-x" aria-label="Close" id="selectListModalCloseBtn">&#x2715;</button>
       </div>
       <div id="selectListModalBody" style="display: flex; flex-direction: column; gap: 0; max-height: 55vh; overflow-y: auto; margin-bottom: 18px; padding-right: 4px;">
         <!-- Filled dynamically -->
@@ -20239,11 +20370,11 @@ ${seoHeadHtml}
   </div>
 
   <!-- Trakt Device Activation Modal -->
-  <div id="traktDeviceModal" class="modal-overlay" role="dialog" aria-modal="true" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
+  <div id="traktDeviceModal" class="modal-overlay" role="dialog" aria-modal="true" aria-label="Connect Trakt" style="display:none; z-index: 10002; justify-content: center; align-items: center; position: fixed; inset: 0; padding: 16px; background: rgba(0,0,0,0.5);">
     <div class="modal-card" style="width: 100%; max-width: 420px; padding: 24px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); display: flex; flex-direction: column; text-align: center;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
         <h2 style="margin:0; font-size:1.25rem; font-weight:700; color:var(--text);">Connect Trakt</h2>
-        <button type="button" class="modal-close-x" onclick="closeTraktDeviceModal()">&#x2715;</button>
+        <button type="button" class="modal-close-x" aria-label="Close" onclick="closeTraktDeviceModal()">&#x2715;</button>
       </div>
       <p style="margin: 0 0 16px; color: var(--muted); font-size: 0.9rem;">To authorize your Trakt account without redirects or rate limits, enter the code below on Trakt:</p>
       
@@ -22557,9 +22688,15 @@ function showModal(innerHtml, extraClass) {
   const items = focusableInModal(overlay);
   const heading = overlay.querySelector('h2, h3');
   if (heading) {
+    // Names the dialog as well as receiving focus. role="dialog" with no
+    // accessible name announces as just "dialog"; the heading is already the
+    // thing that says what this one is.
+    if (!heading.id) heading.id = 'activeModalTitle';
+    overlay.setAttribute('aria-labelledby', heading.id);
     heading.setAttribute('tabindex', '-1');
     heading.focus();
   } else if (items.length) {
+    overlay.setAttribute('aria-label', 'Dialog');
     items[0].focus();
   }
 }
@@ -22592,7 +22729,7 @@ function showAppAlert(title, message, isSuccess = false) {
         '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
         escapeHtml(title) +
       '</h3>' +
-      '<button type="button" class="action-btn" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
+      '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
     '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
@@ -22611,7 +22748,7 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
         '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
         escapeHtml(title) +
       '</h3>' +
-      '<button type="button" class="action-btn" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
+      '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
     '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
@@ -23412,7 +23549,7 @@ function sourceRowHtml(u, readonly) {
   return '<div class="source-row">' +
     '<div class="row field-row">' +
     '<input type="text" placeholder="mdblist.com, trakt.tv, or themoviedb.org list URL" class="url" value="' + escapeAttr(u) + '" oninput="checkDuplicateUrl(this)">' +
-    '<button type="button" class="movebtn removebtn remove-source-btn" onclick="removeSourceRow(this)" style="display:none;">\u2715</button>' +
+    '<button type="button" class="movebtn removebtn remove-source-btn" aria-label="Remove this source" onclick="removeSourceRow(this)" style="display:none;">\u2715</button>' +
     '</div>' +
     '<small class="dup-warning" style="display:none;">\u26a0 Already added elsewhere in this list.</small>' +
     '<div class="testrow">' +
@@ -23673,7 +23810,7 @@ function addShelfModalAddLink() {
   div.style.marginBottom = '12px';
   div.innerHTML = 
     '<input type="url" class="addShelfModalLinkInput" placeholder="Additional URL" style="flex:1; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size:1rem;" oninput="onAddShelfModalLinkInput(this); validateAddShelfModal()">' +
-    '<button type="button" class="lc-btn secondary" style="padding: 12px;" onclick="this.closest(&quot;.add-shelf-link-row&quot;).remove(); validateAddShelfModal()">\u2715</button>';
+    '<button type="button" class="lc-btn secondary" aria-label="Remove this URL" style="padding: 12px;" onclick="this.closest(&quot;.add-shelf-link-row&quot;).remove(); validateAddShelfModal()">\u2715</button>';
   container.appendChild(div);
   validateAddShelfModal();
 }
@@ -29991,7 +30128,7 @@ function openEpisodeDetails(epNum) {
     });
   }
   const innerHtml = 
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap; margin-top:20px;">' +
       '<div style="flex: 0 0 300px; max-width: 100%;">' +
         (still ? '<img src="' + still + '" style="width:100%; border-radius:8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">' : '') +
@@ -46330,7 +46467,7 @@ function switchCreatorProfile() {
 
 function openRestoreModal() {
   showModal(
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<h2>Login</h2>' +
     '<p class="modal-sub">Enter your Username and Account Key to login and sync your lists.</p>' +
     '<div class="row"><input type="text" id="restoreNameInput" placeholder="Username"></div>' +
@@ -46403,7 +46540,7 @@ async function submitRestoreProfile() {
 // person has fully proven who they are.
 function openForgotKeyModal() {
   showModal(
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<h2>Reset Your Key</h2>' +
     '<p class="modal-sub">Enter your Username and the recovery answer you set when you created your account.</p>' +
     '<div class="row"><input type="text" id="forgotKeyNameInput" placeholder="Username"></div>' +
@@ -47940,7 +48077,7 @@ function startSaveListFlow(btn) {
 
 function openCreateProfileModal() {
   showModal(
-    '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<h2>Create a Free Account</h2>' +
     '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
     '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
@@ -48124,7 +48261,7 @@ function openVisibilityModal() {
   if (!ctx) return;
   showModal(
     '<div class="modal-body">' +
-      '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
       '<h2 class="panel-title" style="margin-top:0;">Save Custom List</h2>' +
       '<p style="margin:0 0 16px; font-size:0.88rem; color:var(--muted);">Choose visibility for <strong>' + escapeHtml(ctx.name || 'Custom List') + '</strong> on your Profile.</p>' +
       '<div class="visibility-choice" style="display:flex; flex-direction:column; gap:12px; margin: 16px 0 20px;">' +
@@ -48149,7 +48286,7 @@ function showSavedCustomListModal(listName, visibility, url) {
   const isPrivate = visibility === 'private';
   showModal(
     '<div class="modal-body">' +
-      '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
       '<h2 class="panel-title" style="margin-top:0;">\u2713 List Saved</h2>' +
       '<p style="margin:8px 0 16px; font-size:0.9rem; color:var(--text);">' +
         '<strong>' + escapeHtml(listName || 'Custom List') + '</strong> has been saved to your Profile as a <strong>' + (isPrivate ? 'private' : 'public') + '</strong> list.' +
@@ -48244,7 +48381,7 @@ async function confirmSaveAsCreator() {
 function showAppNoticeModal(title, message, isError) {
   showModal(
     '<div class="modal-body">' +
-      '<button type="button" class="modal-close-x" onclick="closeModal()">\u2715</button>' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
       '<h2 class="panel-title" style="margin-top:0;' + (isError ? ' color:var(--danger);' : '') + '">' + escapeHtml(title || 'Notice') + '</h2>' +
       '<p style="margin:12px 0 20px; font-size:0.9rem; color:var(--text); line-height:1.4;">' + escapeHtml(message || '') + '</p>' +
       '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end;">' +
@@ -57927,14 +58064,16 @@ async function handleFetch(request, env, ctx) {
       // Preferred path: one KV read of the maintained index, no per-list
       // gets, no truncation at 150 keys. Falls back to the legacy bounded
       // scan below only while the index is being built for the first time.
-      const indexEntries = await getPublicListIndex(env, ctx);
+      const limitParam = parseInt(url.searchParams.get("limit") || "", 10);
+      const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+      // Default page stays 100 to match the previous response size;
+      // callers can page through the rest instead of silently losing it.
+      const pageSize = Math.min(Math.max(limitParam || 100, 1), 500);
+      // The page is asked for in SQL now rather than sliced out of the whole
+      // directory afterwards -- see getPublicListIndex.
+      const indexEntries = await getPublicListIndex(env, ctx, { limit: pageSize, offset });
       if (indexEntries) {
-        const limitParam = parseInt(url.searchParams.get("limit") || "", 10);
-        const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
-        // Default page stays 100 to match the previous response size;
-        // callers can page through the rest instead of silently losing it.
-        const pageSize = Math.min(Math.max(limitParam || 100, 1), 500);
-        const page = indexEntries.slice(offset, offset + pageSize);
+        const page = indexEntries;
         const lists = page.map((e) => {
           const cleanSlug = e.slug || slugifyServer(e.name) || "list";
           const username = e.isCreator ? e.username : "user";
@@ -57951,7 +58090,7 @@ async function handleFetch(request, env, ctx) {
           };
         });
         return json(
-          { ok: true, count: lists.length, total: indexEntries.length, offset, lists },
+          { ok: true, count: lists.length, total: Number(indexEntries.total) || lists.length, offset, lists },
           200,
           { "Cache-Control": "public, max-age=120", ...corsHeaders() }
         );
@@ -58137,9 +58276,21 @@ async function handleFetch(request, env, ctx) {
         display: "standalone",
         background_color: "#F2F2F7",
         theme_color: "#F2F2F7",
+        // One file, declared at the size it actually is.
+        //
+        // These two entries claimed 192x192 and 512x512 while /icon.png's own
+        // IHDR says 256x256 -- so the splash screen and the installed app icon
+        // were upscaled from a source half the declared resolution, and the
+        // 192 entry was downscaling for no reason. Chrome's installability
+        // check wants an icon of at least 192px, which 256 satisfies, so
+        // telling the truth costs nothing and stops the browser being lied to.
+        //
+        // No `purpose: "maskable"` entry: a maskable icon has to be DRAWN with
+        // the safe zone in mind (Android crops to a circle), and declaring this
+        // one maskable would crop its edges rather than fix anything. That is a
+        // design task, not a manifest edit.
         icons: [
-          { src: "/icon.png", sizes: "192x192", type: "image/png" },
-          { src: "/icon.png", sizes: "512x512", type: "image/png" }
+          { src: "/icon.png", sizes: "256x256", type: "image/png", purpose: "any" }
         ]
       };
       return new Response(JSON.stringify(manifest), {
@@ -63696,10 +63847,11 @@ function generateSearchVariations(query) {
       let id;
       for (let attempt = 0; attempt < 5; attempt++) {
         id = generateShortId();
-        const existing = await env.CONFIGS.get(id);
+        // Both shapes, so a fresh id cannot collide with a pre-prefix one.
+        const existing = (await env.CONFIGS.get(savedConfigKey(id))) || (await env.CONFIGS.get(id));
         if (!existing) break;
       }
-      await env.CONFIGS.put(id, savePayload);
+      await env.CONFIGS.put(savedConfigKey(id), savePayload);
       return json({ ok: true, id });
     }
 
@@ -70227,6 +70379,14 @@ function generateSearchVariations(query) {
       });
     }
 
+    // POST only. A logout that answers a GET is a state change any page can
+    // trigger with an <img src>, and while the session cookie is SameSite=Strict
+    // (so this was never actually reachable cross-site) that is protection by a
+    // property of the cookie rather than by the method being right. The
+    // dashboard's own control already posts a form.
+    if (path === "/admin/logout" && request.method !== "POST") {
+      return new Response(null, { status: 405, headers: { "Allow": "POST", "Cache-Control": "no-store" } });
+    }
     if (path === "/admin/logout") {
       return new Response(null, {
         status: 302,

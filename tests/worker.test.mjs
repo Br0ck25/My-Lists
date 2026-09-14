@@ -5991,6 +5991,121 @@ describe("Tracking writes: a save that did not land must not report success", ()
   });
 });
 
+describe("Audit 2026-09-14 regressions", () => {
+  // SEC-001, at the route rather than at the fetcher: the end-to-end shape a
+  // stranger would actually use. /lists/:user/:slug has always been gated;
+  // /api/preview, the Stremio catalog route and /api/resolve were not.
+  it("a stranger cannot read a personal shelf through any route", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const v = await createUser(env, "sec001victim");
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      creatorName: "sec001victim", creatorKey: v.creatorKey,
+      watchHistory: [{ id: "tt77:9:9", showId: "tt77", showTitle: "Private", seasonNum: 9, episodeNum: 9, watchedAt: 1 }],
+      watchlist: [{ id: "tt78", name: "Also Private", type: "movie" }],
+    }});
+
+    // 1. /api/preview -- one unauthenticated GET, which is how this was found.
+    for (const [slug, type] of [["watch-history", "series"], ["watchlist", "movie"],
+                                ["continue-watching", "series"], ["airing-next", "series"]]) {
+      const r = await call(env, `/api/preview?type=${type}&url=` +
+        encodeURIComponent(`autotrack:${slug}:${type}:sec001victim`));
+      assert.equal(r.status, 200);
+      assert.equal((r.body.sample || []).length, 0, `/api/preview leaked ${slug}`);
+    }
+
+    // 2. A hand-made base64 config naming the victim, through the catalog route.
+    const b64 = Buffer.from(JSON.stringify({
+      entries: [{ id: "wh", name: "x", type: "series", url: "autotrack:watch-history:series:sec001victim" }],
+    }), "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const cat = await call(env, `/${b64}/catalog/series/wh.json`);
+    assert.equal((cat.body.metas || []).length, 0, "the catalog route leaked a personal shelf");
+
+    // 3. /api/save must refuse to mint a config that names someone else at all.
+    const forged = await call(env, "/api/save", { method: "POST", json: {
+      entries: [{ id: "wh", name: "x", type: "series", url: "autotrack:watch-history:series:sec001victim" }],
+      trackCreatorName: "sec001victim", trackCreatorKey: "MYL-NOPE-NOPE-NOPE",
+    }});
+    assert.equal(forged.status, 401, "/api/save minted a config naming an account it could not prove");
+  });
+
+  it("the owner's own install link still serves their shelves, with tracking on or off", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "sec001owner");
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      creatorName: "sec001owner", creatorKey: u.creatorKey,
+      watchHistory: [{ id: "tt90:1:1", showId: "tt90", showTitle: "Mine", seasonNum: 1, episodeNum: 1, watchedAt: 1 }],
+    }});
+    const rows = [{ id: "wh", name: "History", type: "series", url: "autotrack:watch-history:series:sec001owner" }];
+
+    // Auto-track Playback OFF is the shape that used to carry no credential.
+    for (const track of [false, true]) {
+      const saved = await call(env, "/api/save", { method: "POST", json: {
+        entries: rows, track, trackCreatorName: "sec001owner", trackCreatorKey: u.creatorKey,
+      }});
+      assert.equal(saved.status, 200, `save failed with track=${track}`);
+      const cat = await call(env, `/${saved.body.id}/catalog/series/wh.json`);
+      assert.equal((cat.body.metas || []).length, 1, `the owner lost their own shelf with track=${track}`);
+    }
+
+    // And an install link minted before any of this existed keeps working --
+    // see LEGACY_UNVERIFIED_CONFIG_SHELVES.
+    env.CONFIGS._store.set("cfg:legacyid0001", JSON.stringify({ entries: rows, trackCreatorName: "sec001owner" }));
+    const legacy = await call(env, "/legacyid0001/catalog/series/wh.json");
+    assert.equal((legacy.body.metas || []).length, 1, "a pre-release install link stopped working");
+  });
+
+  // BE-003. The KV writes used to run regardless, and usernameForScrobbleToken
+  // consults D1 first -- so the new token was rejected and the old one, the one
+  // being revoked, kept working.
+  it("a scrobble token rotation that cannot reach D1 fails closed", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "rotguard");
+    const cred = { creatorName: "rotguard", creatorKey: u.creatorKey };
+
+    const first = await call(env, "/api/creator/scrobble-token", { method: "POST", json: cred });
+    const oldToken = first.body.token;
+    assert.ok(oldToken);
+
+    env.DB.failWhen((sql) => /scrobble_tokens/.test(sql) && /DELETE|INSERT/i.test(sql));
+    const rotated = await call(env, "/api/creator/scrobble-token", { method: "POST", json: { ...cred, rotate: true } });
+    env.DB.failWhen(null);
+
+    assert.equal(rotated.status, 500, "a rotation that did not land answered 200 with a dead token");
+    assert.ok(!rotated.body.token);
+    // The old credential is still the only one, which is the honest outcome:
+    // nothing was revoked, and the caller was told so.
+    assert.equal(env.CONFIGS._store.get(`scrobbletoken:${oldToken}`), "rotguard");
+  });
+
+  // PROTO-001. idPrefixes is how a Stremio-protocol client decides which add-on
+  // owns an id, and these catalogs emit tmdb: ids that /meta has always served.
+  it("the manifest declares every id prefix the catalogs emit", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "prefixguard");
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      creatorName: "prefixguard", creatorKey: u.creatorKey,
+      watchHistory: [{ id: "tmdb:999:1:1", showId: "tmdb:999", showTitle: "TMDB Only", seasonNum: 1, episodeNum: 1, watchedAt: 1 }],
+    }});
+    const saved = await call(env, "/api/save", { method: "POST", json: {
+      entries: [{ id: "wh", name: "History", type: "series", url: "autotrack:watch-history:series:prefixguard" }],
+      trackCreatorName: "prefixguard", trackCreatorKey: u.creatorKey,
+    }});
+
+    const manifest = await call(env, `/${saved.body.id}/manifest.json`);
+    const declared = manifest.body.idPrefixes || [];
+    const metaRes = (manifest.body.resources || []).find((r) => r && r.name === "meta");
+
+    const cat = await call(env, `/${saved.body.id}/catalog/series/wh.json`);
+    for (const meta of (cat.body.metas || [])) {
+      const id = String(meta.id);
+      assert.ok(declared.some((p) => id.startsWith(p)),
+        `catalog returned ${id}, which no manifest idPrefix covers`);
+      assert.ok((metaRes.idPrefixes || []).some((p) => id.startsWith(p)),
+        `catalog returned ${id}, which the meta resource does not claim`);
+    }
+  });
+});
+
 describe("A15: a fresh schema.sql and a migrated database must be the same shape", () => {
   it("schema.sql declares every index the migrations create", async () => {
     const { DatabaseSync } = await import("node:sqlite");

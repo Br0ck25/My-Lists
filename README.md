@@ -402,6 +402,19 @@ node --test tests/*.test.mjs
   browser's copy and nothing else. If you believe a cookie has been captured, rotate `ADMIN_KEY`; that
   invalidates every issued session, including your own.
 
+### Connected accounts expire
+
+Trakt, MDBList and Simkl connections are OAuth access tokens, and this add-on stores no refresh token for
+any of them — so a connection lasts as long as its provider's token does (Trakt's is about **three months**)
+and then has to be reconnected in Settings. On the web UI that surfaces as a clear message on the affected
+list ("Your Trakt connection may have expired…"); inside Stremio the affected catalog row just goes empty,
+because a catalog row has no way to say anything.
+
+This is a deliberate limitation rather than an oversight. Provider tokens live inside your install config,
+not in a server-side account record, so refreshing one would mean this Worker rewriting stored configs on a
+schedule — a different storage model, not a bug fix. Reconnecting takes a few seconds and is the supported
+answer for now.
+
 ### API-only endpoints
 
 `POST /api/creator/sync/share-tracking` is authenticated, supported, and has **no UI**. It is the only way to
