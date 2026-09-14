@@ -31,6 +31,7 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 ### Discover & Quick Add Shelves
 - One-click catalog shortcuts for major streaming platforms (Netflix, Disney+, Prime Video, Apple TV+, Max, Hulu, Paramount+, Peacock, Anime, etc.).
 - Curated collections, award winners, box office hits, and trending lists built right into the configuration UI.
+- **New on Streaming** (admin-only for now): a catalog row of what actually *arrived* on each service, newest first, with a show pushed back to the top the day a new episode airs. Sorted by arrival, never by release date. See [New on Streaming](#new-on-streaming) below.
 
 ### Custom List Builder & Letterboxd Import
 - **Build from scratch**: Search movies and shows across TMDB to create custom catalogs.
@@ -44,7 +45,7 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 ### Continue Watching & Background Watch Sync
 - Automatically tracks watch progress and next unwatched episode per show.
 - Mark titles as watched/unwatched directly from the UI or scrobble integrations.
-- **Scheduled Cron Worker**: Automatically queries TMDB every 6 minutes via Cloudflare Cron Triggers (`*/6 * * * *`, cursor-paginated so it does not re-sweep every account on every tick) to find newly-aired episodes for caught-up shows and push them to Continue Watching, and to keep the shared provider charts pre-warmed in KV.
+- **Scheduled Cron Worker**: Automatically queries TMDB every 6 minutes via Cloudflare Cron Triggers (`*/6 * * * *`, cursor-paginated so it does not re-sweep every account on every tick) to find newly-aired episodes for caught-up shows and push them to Continue Watching, to record what has arrived on each streaming service for [New on Streaming](#new-on-streaming), and to keep the shared provider charts pre-warmed in KV.
 
 ### Creator Profiles & Cloud Sync
 - Free, passwordless account system secured by salted PBKDF2-SHA256 Creator Keys (`MYL-XXXX-XXXX-XXXX`).
@@ -55,6 +56,7 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 - Real-time telemetry: page views, installs, and live API usage counters for TMDB, Trakt, MDBList, and Simkl.
 - Catalog leaderboards and community feedback/issue tracking inbox (open/in-progress/closed).
 - Streaming provider lookup and Netflix catalog preview inspector.
+- **New on Streaming** panel: sweep state (cursor, walk generation, rows per service, seeded vs observed), a run-a-sweep-now button, and a preview that reads through the same code that serves the catalog to Stremio -- the test surface for the feature while it is still hidden from everyone else.
 - Moderation tools: rebuild the public list index, delete a creator's lists, and browse/delete lists published anonymously (those have no owner to ask, so the dashboard is the only way to remove one).
 - Database schema check: reports which files under `migrations/` the bound D1 database has not had run, and what each one silently breaks until it is applied.
 
@@ -101,6 +103,10 @@ Measured against those, on the free plan:
   two KV counters; with D1 bound the same page view costs **zero** KV writes, because the counters move into
   D1 entirely. After the 1,000-write budget is gone, *every* KV write in the app fails for the rest of the
   day: rate limiters, list saves, sync, feedback.
+- **New on Streaming does not run.** Its budget comes out of the episode sweep's unreachable reserve
+  (see [New on Streaming](#new-on-streaming)), and on a free Worker that reserve is small enough to be fully
+  used -- so the share is zero, and the sweep skips itself with one log line. It also needs D1, which a free
+  deployment often has not bound. Nothing else is affected.
 - **Chart pre-warming does not run, and the cron needs one variable set.** One chart warm is ~105 subrequests
   on its own — five paged TMDB reads and a detail call per item — so no free-plan budget can fit even one.
   Set `CRON_SUBREQUEST_BUDGET` to `48` (see [below](#the-three-subrequest-budgets)) and the tick skips the
@@ -290,6 +296,43 @@ To automatically pre-warm shared **Trakt**, **TMDB**, **Simkl**, and **MDBList**
 5. Click **Save** / **Deploy**.
 
 This same cron run also seeds the public list directory/search index (`/lists/public.json`, in-app search) the first time it finds one missing -- a fresh deployment, or the index having been lost some other way -- so a self-hoster with the cron trigger enabled never has to think about it. Without a cron trigger configured, the index instead seeds itself lazily on whichever visitor's request happens to find it missing first, which briefly serves a truncated (capped, oldest-first) directory/search result until that finishes. To seed it immediately and synchronously -- e.g. right after a fresh deploy, without waiting on either of those -- log into `/admin` and POST `/admin/api/rebuild-public-index`.
+
+---
+
+## New on Streaming
+
+A catalog row of what actually **arrived** on a streaming service, newest first -- and a show goes back to the top the day a new episode airs.
+
+**Why it needs a database and a cron trigger, when no other row does.** Nothing upstream publishes the date a title landed on a service. TMDB's `with_watch_providers` answers "is this on Netflix right now" and says nothing about yesterday; Trakt and Simkl do not model provider catalogs at all. The closest thing this add-on had before -- the `Stream Releases` genre row -- sorts by *release* date, which is why it shows theatrical-era titles and completely misses a 1998 film being added to Hulu this morning.
+
+So the add-on observes it. Every cron tick walks a slice of each provider's catalog; a title that is not in the `streaming_events` table already is an arrival, and the moment it was first seen is the date the shelf sorts on. That has three consequences worth knowing before you judge the list:
+
+- **It needs D1** (`migrations/0011_add_streaming_events.sql`). Unlike everything else in this add-on there is no KV fallback -- these dates are observed over time and cannot be refetched later, so a tick that runs without the table is history not collected, not a cache miss.
+- **It needs the cron trigger** from Step 7 above, and enough subrequest budget to run (see [Which Cloudflare plan do I need?](#which-cloudflare-plan-do-i-need)). On a free Worker the sweep skips itself with one log line, the same way chart pre-warming does.
+- **The first pass is seeded.** Every title is "new" the first time you look at a catalog, so the first full walk dates each title by its own release date instead of pretending it just arrived. Arrivals found after that are real. The admin dashboard shows the split as **seeded** versus **observed** -- while observed is zero, the ordering is still release dates.
+
+A full walk of every provider takes roughly five hours on the recommended `*/6` schedule, which is the detection latency for a back-catalog addition. A new release is found on the next tick, because the walk is sorted newest-first and a new release lands on page one.
+
+**Serving it costs nothing.** The title, poster and year are denormalised into the row, so rendering the shelf is one indexed D1 read and zero outbound requests -- it is the only catalog here that a provider outage cannot slow down or empty.
+
+### Trying it before it goes live
+
+It ships dark: `NEW_ON_STREAMING_IN_QUICK_ADD` in `00_constants.js` is `false`, so there is no Quick Add card and no Discover entry. The catalog itself is live from the moment you deploy, which is the point -- it can be judged against real data first.
+
+1. Apply `migrations/0011_add_streaming_events.sql`, deploy, and confirm the cron trigger is set.
+2. Open `/admin` &rarr; **Management & Tools** &rarr; **New on Streaming**. Use **Run a sweep now** to pull the first walk in by hand rather than waiting on the cron; it advances the same cursor, so it brings the walk forward instead of duplicating it.
+3. **Preview the catalog** reads through the same code that serves Stremio, so what you see there is what a client gets.
+4. To try it in Stremio or Nuvio for real while it is still hidden, add a catalog on the main site (**Catalogs** &rarr; **+ New Catalog**) with one of these as the URL:
+
+   | URL | Row |
+   |---|---|
+   | `tmdb:new-on-streaming` | Everything, across every service |
+   | `tmdb:new-on-streaming:netflix` | One service |
+   | `tmdb:new-on-streaming:netflix+hulu` | Any combination, `+`-separated |
+
+   Pick Movies or Shows with the type selector, exactly like any other row.
+
+**To turn it on for everyone**, set `NEW_ON_STREAMING_IN_QUICK_ADD = true` and rebuild. That one constant adds the Quick Add card, the Discover shelf, and the `/lists/New-on-Streaming` pages; nothing else about the feature changes.
 
 ---
 

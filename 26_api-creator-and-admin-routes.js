@@ -6103,6 +6103,99 @@
       }
     }
 
+    // --- New on Streaming (admin-only while the shelf ships dark) -----------
+    //
+    // tmdb:new-on-streaming is a real catalog the moment this deploys -- it
+    // resolves, installs into Stremio and pages like any other row -- but it
+    // has no Quick Add card and no Discover entry until
+    // NEW_ON_STREAMING_IN_QUICK_ADD is flipped (00_constants.js). These three
+    // routes are how it gets judged before that: what the sweep has actually
+    // collected, a way to push the walk along without waiting out the cron,
+    // and a preview that reads through the SAME fetchNewOnStreaming the
+    // add-on serves, so what the dashboard shows is what Stremio would get
+    // rather than a second implementation that can drift from it.
+
+    // /admin/api/new-on-streaming -> the sweep's own state: cursor position,
+    // walk generation, rows per service, and how much of it is seeded (dated
+    // by the title's release because the first walk had nothing to compare
+    // against) versus observed (a genuine arrival this add-on watched happen).
+    // The seeded/observed split is the one number that says whether the list
+    // is working yet: observed only starts growing after walk 0 completes.
+    if (path === "/admin/api/new-on-streaming" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      try {
+        const status = await newOnStreamingStatus(env);
+        return json({ ok: true, status }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/new-on-streaming/sweep -> runs sweep units right now, and
+    // optionally the episode re-bump with them.
+    //
+    // Bounded at 40 units because this runs inside a REQUEST, not the cron
+    // tick, so it spends the request's own subrequest allowance: 40 units is
+    // up to 840 outbound fetches against the paid plan's 10,000, and on a
+    // first walk (when every title needs an IMDb resolution) that ceiling is
+    // real rather than theoretical.
+    if (path === "/admin/api/new-on-streaming/sweep" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (e) {
+        body = {};
+      }
+      const requested = parseInt(body && body.units, 10);
+      const units = Number.isFinite(requested) ? Math.max(1, Math.min(40, requested)) : NEW_ON_STREAMING_PAGES_PER_TICK;
+      const withBump = body && body.bump === true;
+      try {
+        const sweep = await sweepNewOnStreaming(env, ctx, units * NEW_ON_STREAMING_SWEEP_FETCHES, units);
+        let bump = null;
+        if (withBump) bump = await bumpNewOnStreamingEpisodes(env, ctx, NEW_ON_STREAMING_SWEEP_FETCHES * 4);
+        // Counted the same way every other shared-key TMDB path is, so a
+        // dashboard sweep shows up in the API Usage tab rather than looking
+        // like the key spent itself.
+        const spent = (sweep && sweep.units ? sweep.units : 0) + (sweep && sweep.resolved ? sweep.resolved : 0);
+        if (spent > 0) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", spent));
+        return json({ ok: true, sweep, bump }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/new-on-streaming/preview?type=movie&services=netflix+hulu&skip=0
+    // -> exactly what a Stremio catalog request for this row returns, through
+    // fetchNewOnStreaming itself. `source` comes back so the url under test
+    // can be copied straight into a catalog row.
+    if (path === "/admin/api/new-on-streaming/preview" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      const type = url.searchParams.get("type") === "series" ? "series" : "movie";
+      const servicesParam = (url.searchParams.get("services") || "").trim();
+      const skipParam = parseInt(url.searchParams.get("skip"), 10);
+      const skip = Number.isFinite(skipParam) && skipParam > 0 ? skipParam : 0;
+      const region = (url.searchParams.get("region") || "US").trim().toUpperCase().slice(0, 2) || "US";
+      const source = servicesParam ? `tmdb:new-on-streaming:${servicesParam}` : "tmdb:new-on-streaming";
+      try {
+        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming" }, skip, { env, ctx, region });
+        return json({
+          ok: true,
+          source,
+          type,
+          region,
+          skip,
+          totalItems: items && items.totalItems != null ? items.totalItems : null,
+          items: (items || []).slice(0, 60),
+        }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
     if (path === "/admin/login" && request.method === "POST") {
       if (!env || !env.ADMIN_KEY) {
         return new Response(
@@ -6446,10 +6539,34 @@ export default {
     // they always were: neither issues outbound fetches, and holding the index
     // rebuild behind a TMDB sweep would delay it for no reason.
     const episodeSweep = guard("checkForNewEpisodes", checkForNewEpisodes(env, episodeBudget));
+    // New on Streaming is paid for out of the episode sweep's own unreachable
+    // reserve, NOT out of the pre-warm's share.
+    //
+    // episodeBudget is half the tick by CRON_EPISODE_CHECK_SHARE, but
+    // checkForNewEpisodes stops at CRON_EPISODE_CHECK_MAX shows at
+    // CRON_EPISODE_CHECK_FETCHES each -- 300 fetches against a 5,000 reserve
+    // on the default budget. Spending a quarter of the 4,700 nobody can reach
+    // leaves `cronBudget - episodeBudget` intact for the pre-warm, which is
+    // what keeps its own guarantee true: the whole chart list still fits in
+    // one tick, so no chart is deferred to the next one.
+    //
+    // Chained behind the episode sweep for the same reason the pre-warm is --
+    // the thing a person is actually waiting on has to be written first --
+    // and ahead of the pre-warm because it is far cheaper: a dozen pages
+    // against ~105 fetches for a single chart, so putting it last would mean
+    // it never ran on a tick that got cut short.
+    const episodeCeiling = Math.min(episodeBudget, CRON_EPISODE_CHECK_MAX * CRON_EPISODE_CHECK_FETCHES);
+    const newOnStreamingBudget = Math.floor((episodeBudget - episodeCeiling) * CRON_NEW_ON_STREAMING_SHARE);
+    const streamingSweep = guard(
+      "sweepNewOnStreaming",
+      episodeSweep.then(() => sweepNewOnStreaming(env, ctx, newOnStreamingBudget))
+    );
     ctx.waitUntil(
       Promise.all([
         episodeSweep,
-        guard("prewarmSharedCatalogs", episodeSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
+        streamingSweep,
+        guard("bumpNewOnStreamingEpisodes", streamingSweep.then(() => bumpNewOnStreamingEpisodes(env, ctx, newOnStreamingBudget))),
+        guard("prewarmSharedCatalogs", streamingSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
         // Cheap (one sqlite_master read per tick) and the only thing that puts
         // "you have not run migration N" somewhere an operator will see it
         // without going looking. The admin panel shows the same thing on

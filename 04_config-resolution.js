@@ -263,6 +263,11 @@ function detectSource(input) {
   if (s.startsWith("tmdb:kids:")) return "tmdb-kids";
   if (s.startsWith("tmdb:holiday:")) return "tmdb-holiday";
   if (s.startsWith("tmdb:genre:")) return "tmdb-genre";
+  // Bare, or with a "+"-separated service selection after a colon --
+  // "tmdb:new-on-streaming", "tmdb:new-on-streaming:netflix+hulu". Matched
+  // before nothing else because it shares no prefix with the entries above;
+  // it is listed here so the tmdb: family stays in one place.
+  if (s === "tmdb:new-on-streaming" || s.startsWith("tmdb:new-on-streaming:")) return "tmdb-new-on-streaming";
   if (s.startsWith("trakt:chart:")) return "trakt-chart";
   if (s.startsWith("simkl:chart:")) return "simkl-chart";
   if (s.startsWith("simkl:user:")) return "simkl-user";

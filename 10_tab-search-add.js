@@ -146,6 +146,10 @@
       ${streamingHtml}
     </div>
 
+    <!-- New on Streaming Shelf -- renders as an empty string, card and all,
+         until NEW_ON_STREAMING_IN_QUICK_ADD is turned on (00_constants.js). -->
+    ${newOnStreamingQuickAddCard}
+
     <!-- Kids Shelf -->
     <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
       <div class="shelf-header" style="margin-bottom:8px;">
