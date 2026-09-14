@@ -1,0 +1,6087 @@
+// --- Creator Profile system --------------------------------------------------
+//
+// No accounts, no email, no passwords -- see the matching server-side
+// comment above authenticateCreator for the security model. This is the
+// entry point every "Save List" click goes through: build the list first
+// (search/add/reorder/"Save as a List" above, all unchanged), then this
+// button is what actually persists it somewhere with a URL, either
+// activeCreator is declared globally at script start
+let pendingSaveListContext = null; // { sourceRow, urlInput, payload, name } while a save modal flow is in progress
+let editingCreatorListSlug = null; // set by editCreatorList() below while editing an existing Creator-owned list
+let editingLocalCustomListSlug = null; // set by editLocalCustomList() below while editing an existing browser-only list
+let lastLocalCustomListsData = null; // cached result of the last local-dashboard render, so Edit/Add-to-config don't need to re-read localStorage
+
+// --- Local (browser-only) Custom Lists ----------------------------------
+//
+// Saving a Custom List used to require a Creator Profile -- clicking "Save
+// as a List" without one popped up an explainer and blocked further
+// progress until an account existed. That's gone: anyone can build and
+// save Custom Lists now, signed in or not. The only real difference is
+// *where* the saved list lives afterward -- a Creator Profile's lists live
+// on the server (so they follow you to another browser/device); without
+// one, they live here in localStorage instead, and everything else about
+// the experience -- the dashboard showing your saved lists with
+// Edit/Delete/Add-to-your-lists, editing one back into the picker, all of
+// it -- works identically either way. There's deliberately no
+// Public/Private choice for a local list the way there is for a
+// Creator-owned one: without a server there's no shareable link for
+// "Public" to mean anything, so a local save just saves, no modal at all.
+const LOCAL_CUSTOM_LISTS_KEY = 'myListAddon:localCustomLists';
+
+let _memoryCustomListsString = null;
+let _memoryCustomListsObj = null;
+
+function compactCustomListItem(it) {
+  if (!it || typeof it !== 'object') return it;
+  const clean = {
+    id: it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : undefined),
+    type: it.type || it.mediatype || it.kind || 'movie',
+    name: it.name || it.title || 'Untitled',
+  };
+  if (it.year) clean.year = String(it.year).slice(0, 4);
+  if (it.poster) clean.poster = it.poster;
+  if (it.showPoster && it.showPoster !== it.poster) clean.showPoster = it.showPoster;
+  if (it.showId) clean.showId = it.showId;
+  if (it.showTitle) clean.showTitle = it.showTitle;
+  if (it.seasonNum != null) clean.seasonNum = Number(it.seasonNum);
+  if (it.episodeNum != null) clean.episodeNum = Number(it.episodeNum);
+  if (it.season != null && clean.seasonNum == null) clean.seasonNum = Number(it.season);
+  if (it.episode != null && clean.episodeNum == null) clean.episodeNum = Number(it.episode);
+  if (it.watchedAt) clean.watchedAt = it.watchedAt;
+  if (it.imdbId) clean.imdbId = it.imdbId;
+  if (it.tmdbId) clean.tmdbId = it.tmdbId;
+  if (it.airDate) clean.airDate = it.airDate;
+  if (it.isUnaired) clean.isUnaired = true;
+  if (it.seasonFinaleAirDate) clean.seasonFinaleAirDate = it.seasonFinaleAirDate;
+  if (it.isSeasonPremiere) clean.isSeasonPremiere = true;
+  if (it.isSeasonFinale) clean.isSeasonFinale = true;
+  if (it.isCompanion) clean.isCompanion = true;
+  if (it.companionType) clean.companionType = it.companionType;
+  if (it.companionNote) clean.companionNote = it.companionNote;
+  if (it.companionStoryline) clean.companionStoryline = it.companionStoryline;
+  if (it.precedingShowId) clean.precedingShowId = it.precedingShowId;
+  return clean;
+}
+
+// Told once per session, naming the lists and the count, because losing
+// items off the end of a list is not something a person can be expected to
+// notice on their own.
+let _trimNotified = false;
+function notifyListsTrimmed(trimmed) {
+  if (_trimNotified || !trimmed || !trimmed.length) return;
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (signedIn) return; // Guard: Never show this alert to a logged-in user
+  _trimNotified = true;
+  const detail = trimmed.slice(0, 4).map((t) => t.slug + ' (' + t.dropped + ')').join(', ');
+  const msg = 'Some lists are too large to store in this browser, so the oldest items were dropped to make them fit: ' +
+    detail + (trimmed.length > 4 ? ', and others' : '') +
+    '. Creating a Creator Profile stores your lists on your account instead, with no size limit.';
+  try {
+    if (typeof showAppAlert === 'function') showAppAlert('Some list items could not be kept', msg, false);
+    else console.warn(msg);
+  } catch (e) {}
+}
+window.notifyListsTrimmed = notifyListsTrimmed;
+
+// Lists trimmed by the most recent compaction pass -- see the note inside.
+let _lastCompactionTrimmed = [];
+
+function compactCustomListMap(map, maxItemsPerList) {
+  _lastCompactionTrimmed = [];
+  if (!map || typeof map !== 'object') return {};
+  const maxItems = maxItemsPerList || 1000;
+  const result = {};
+  for (const slug in map) {
+    const list = map[slug];
+    if (!list || typeof list !== 'object') continue;
+    const cleanList = {
+      slug: list.slug || slug,
+      name: list.name || 'Custom List',
+      type: list.type || 'mixed',
+      createdAt: list.createdAt,
+      updatedAt: list.updatedAt,
+      visibility: list.visibility || 'private',
+    };
+    if (list.localSlug) cleanList.localSlug = list.localSlug;
+    if (list.creatorSlug) cleanList.creatorSlug = list.creatorSlug;
+    if (list.isWatchlist) cleanList.isWatchlist = true;
+    if (list.isContinueWatching) cleanList.isContinueWatching = true;
+    if (list.isWatchHistory) cleanList.isWatchHistory = true;
+    if (list.sourceUrl) cleanList.sourceUrl = list.sourceUrl;
+    if (list.synced != null) cleanList.synced = !!list.synced;
+    if (list.lastSyncedAt != null) cleanList.lastSyncedAt = list.lastSyncedAt;
+    if (Array.isArray(list.baseItemIds)) cleanList.baseItemIds = list.baseItemIds;
+    if (Array.isArray(list.items)) {
+      // Truncation here is permanent: the trimmed map is what gets written
+      // AND what is held in memory afterwards, so anything cut is gone at
+      // the next save. A real account exported 1,157 watch-history items
+      // against a 1,000 cap -- the next successful save would have silently
+      // discarded 157 of them, and the 500-item retry path would have
+      // discarded 657. Record it so the caller can say so.
+      if (list.items.length > maxItems) {
+        _lastCompactionTrimmed.push({ slug: cleanList.slug, dropped: list.items.length - maxItems });
+      }
+      const trimmedItems = list.items.slice(0, maxItems);
+      cleanList.items = trimmedItems.map(compactCustomListItem);
+    } else {
+      cleanList.items = [];
+    }
+    result[slug] = cleanList;
+  }
+  return result;
+}
+
+function loadLocalCustomLists() {
+  try {
+    if (_memoryCustomListsObj && typeof _memoryCustomListsObj === 'object') return _memoryCustomListsObj;
+    let str = _memoryCustomListsString;
+    if (!str) {
+      try { str = sessionStorage.getItem(LOCAL_CUSTOM_LISTS_KEY); } catch(e) {}
+    }
+    if (!str) {
+      str = localStorage.getItem(LOCAL_CUSTOM_LISTS_KEY);
+    }
+    const map = JSON.parse(str || '{}');
+    if (map && typeof map === 'object') {
+      _memoryCustomListsString = str;
+      _memoryCustomListsObj = map;
+      return map;
+    }
+    return {};
+  } catch (e) {
+    return {};
+  }
+}
+
+// Shown once per session when local storage can no longer hold the custom
+// lists. Silence was the actual bug here -- the write failed, the UI said
+// nothing, and the loss only became visible much later.
+let _storageFullNotified = false;
+function notifyStorageFull(savedToAccount) {
+  if (_storageFullNotified) return;
+  _storageFullNotified = true;
+  const msg = savedToAccount
+    ? 'This browser has run out of local storage, so your lists are being saved to your account instead. Nothing has been lost. Removing a few very large lists or channels will restore offline access.'
+    : 'This browser has run out of local storage and your latest changes could NOT be saved. Create a Creator Profile to store your lists on your account, or remove a few very large lists or channels, then try again.';
+  try {
+    if (typeof showAppAlert === 'function') showAppAlert('Local storage is full', msg, false);
+    else console.warn(msg);
+  } catch (e) {}
+}
+window.notifyStorageFull = notifyStorageFull;
+
+function saveLocalCustomListsMap(map) {
+  if (!map || typeof map !== 'object') return false;
+  
+  // Compact items to strip bloated descriptions/cast/extra metadata.
+  //
+  // The per-list cap exists only to fit the browser's ~5MB ceiling. A
+  // signed-in account stores each list as its own server-side record with no
+  // such ceiling, so capping there is pure data loss for no benefit -- the
+  // limit is raised well clear of any realistic list. Signed out, the cap
+  // still applies (there is nowhere else for the data to go), but it is no
+  // longer silent.
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  const leanMap = compactCustomListMap(map, signedIn ? 100000 : 1000);
+  if (!signedIn && _lastCompactionTrimmed.length) {
+    notifyListsTrimmed(_lastCompactionTrimmed.slice());
+  }
+  _memoryCustomListsObj = leanMap;
+  
+  try {
+    const str = JSON.stringify(leanMap);
+    _memoryCustomListsString = str;
+    
+    // Always attempt to save to sessionStorage as a fast backup
+    try { sessionStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, str); } catch(e) {}
+    
+    localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, str);
+    return true;
+  } catch (e) {
+    if (signedIn) {
+      // For signed-in accounts, the server is the primary storage and has no 5MB quota.
+      // _memoryCustomListsObj MUST remain leanMap (with all items intact) so account sync pushes everything.
+      // We only attempt to write a smaller 500-item cache to localStorage as a best-effort offline fallback.
+      try {
+        const cacheMap = compactCustomListMap(map, 500);
+        const cacheStr = JSON.stringify(cacheMap);
+        try { sessionStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, cacheStr); } catch (err) {}
+        localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, cacheStr);
+      } catch (cacheErr) {
+        console.warn('saveLocalCustomListsMap: localStorage quota exceeded for signed-in user:', cacheErr.message || cacheErr);
+        window._localStorageFull = true;
+      }
+      try { if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ force: true }); } catch (err) {}
+      try { if (typeof pushCreatorSync === 'function') pushCreatorSync(); } catch (err) {}
+      notifyStorageFull(true);
+      return true;
+    }
+
+    // If quota exceeded and NOT signed in, try a tighter compression (500 items max per list)
+    try {
+      const ultraLeanMap = compactCustomListMap(map, 500);
+      if (_lastCompactionTrimmed.length) {
+        notifyListsTrimmed(_lastCompactionTrimmed.slice());
+      }
+      _memoryCustomListsObj = ultraLeanMap;
+      const ultraStr = JSON.stringify(ultraLeanMap);
+      _memoryCustomListsString = ultraStr;
+      try { sessionStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, ultraStr); } catch(e) {}
+      localStorage.setItem(LOCAL_CUSTOM_LISTS_KEY, ultraStr);
+      return true;
+    } catch (retryErr) {
+      // Both writes failed. This used to return true regardless, which meant
+      // every caller believed a save had happened when nothing had been
+      // written -- the data lived only in memory, and the next page load read
+      // whatever older copy localStorage still held. That is how one account
+      // lost 24 of its 51 custom lists with no error shown anywhere.
+      //
+      // It now reports the truth. For a signed-in account the data is pushed
+      // straight to the server instead, which has no such ceiling, and THAT
+      // is a real save -- so true is honest there. For everyone else it is a
+      // failure, and the caller (and the person) get told.
+      console.warn('saveLocalCustomListsMap: localStorage quota exceeded:', retryErr.message || retryErr);
+      window._localStorageFull = true;
+      notifyStorageFull(false);
+      return false;
+    }
+  }
+}
+
+// Saves (or re-saves, if this row already has a localSlug from a previous
+// save) a Custom List row to the local store, and stamps the row's own
+// payload with that slug so a later re-save or the row-level "Save List"
+// button targets the same local entry instead of creating a duplicate --
+// the same role creatorSlug plays for a Creator-owned list.
+function saveLocalCustomList(sourceRow, urlInput, payload, name) {
+  const map = loadLocalCustomLists();
+  let slug = payload.localSlug;
+  if (!slug || !map[slug]) {
+    const base = slugify(name) || 'list';
+    slug = base;
+    let n = 2;
+    while (map[slug]) {
+      slug = base + '-' + n;
+      n++;
+    }
+  }
+  const now = Date.now();
+  const existing = map[slug];
+  map[slug] = {
+    slug: slug,
+    name: name,
+    type: payload.type,
+    items: payload.items,
+    createdAt: existing ? existing.createdAt : now,
+    updatedAt: now,
+  };
+  saveLocalCustomListsMap(map);
+
+  const updatedPayload = Object.assign({}, payload, { localSlug: slug });
+  sourceRow.outerHTML = customListSourceRowHtml('customlist:v1:' + JSON.stringify(updatedPayload));
+  saveState();
+  renderCreatorDashboard();
+}
+
+// Runs once, right after a brand-new account is created -- uploads every
+// list from this browser's local store to the new account (as Public, the
+// same default the visibility picker itself defaults to) so nothing built
+// before signing up gets left behind. Any row in #lists that pointed at a
+// migrated local list gets repointed at the new server copy (creatorSlug
+// instead of localSlug) so a future edit or re-save targets the right
+// place. Best-effort per list -- one failing (e.g. a dropped connection
+// partway through) doesn't lose the others; anything that didn't migrate
+// stays in the local store rather than being deleted, so it isn't lost.
+async function migrateLocalCustomListsToAccount() {
+  if (!activeCreator) return;
+  const localMap = loadLocalCustomLists();
+  // Watch History and Continue Watching are auto-generated tracking data,
+  // not something anyone hand-built to share -- migrating them through
+  // here would silently turn private watch history into a public server
+  // list (see visibility: 'public' below) and then delete the local copy.
+  // They do still get synced to the account, just privately and through
+  // pushCreatorSync/loadCreatorSync's own blob instead of this endpoint --
+  // that already runs right after this function returns (see
+  // submitCreateProfile), so nothing here needs to push them itself.
+  const AUTO_TRACKED_SLUGS = ['watch-history', 'continue-watching'];
+  // The Watchlist migrates, but privately.
+  //
+  // It is not hand-built to share either -- it is a personal queue, filled by
+  // an add button the same way Watch History is -- and it was going up as
+  // visibility: 'public' with the rest. Measured: an anonymous user with two
+  // films in their Watchlist created an account, and both were published
+  // under their new username without being asked.
+  //
+  // Excluding it from the migration entirely would be wrong: the Watchlist IS
+  // expected to be a server list (removeWatchlistItemDirect looks it up in
+  // lastCreatorListsData), unlike the two auto-tracked slugs above, which
+  // travel in the sync blob instead. So it migrates -- just not published.
+  //
+  // Every other write of this list already defaults it to private
+  // (uploadMissingLocalListsToAccount, removeWatchlistItemDirect,
+  // 21_client-custom-list-builder.js). This was the one place that did not,
+  // which is why it reads as an oversight rather than a decision.
+  const isWatchlistSlug = (slug, list) => slug === 'watchlist'
+    || (list && (list.isWatchlist === true
+      || (typeof list.name === 'string' && list.name.toLowerCase() === 'watchlist')));
+  const slugs = Object.keys(localMap).filter((slug) => !AUTO_TRACKED_SLUGS.includes(slug));
+  if (!slugs.length) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  let migratedCount = 0;
+  let failedCount = 0;
+  for (const slug of slugs) {
+    const list = localMap[slug];
+    try {
+      const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          name: list.name,
+          type: list.type,
+          items: list.items,
+          visibility: isWatchlistSlug(slug, list) ? 'private' : 'public',
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        failedCount++;
+        continue;
+      }
+      migratedCount++;
+      delete localMap[slug];
+      // Repoint any row already in #lists that was built from this local
+      // list so it now saves/edits against the account instead.
+      document.querySelectorAll('#lists .url').forEach((urlInput) => {
+        const rowPayload = parseCustomListPayloadClient(urlInput.value);
+        if (!rowPayload || rowPayload.localSlug !== slug) return;
+        const updatedPayload = Object.assign({}, rowPayload, {
+          publishedUrl: data.url,
+          creatorSlug: data.slug,
+          creatorOwner: activeCreator.creatorName,
+          visibility: 'public',
+        });
+        delete updatedPayload.localSlug;
+        const sourceRow = urlInput.closest('.source-row');
+        if (sourceRow) sourceRow.outerHTML = customListSourceRowHtml('customlist:v1:' + JSON.stringify(updatedPayload));
+      });
+    } catch (e) {
+      failedCount++;
+    }
+  }
+  saveLocalCustomListsMap(localMap);
+  if (migratedCount) {
+    renumber();
+    checkAllDuplicateUrls();
+    saveState();
+    renderCreatorDashboard();
+  }
+  if (failedCount) {
+    alert(
+      migratedCount
+        ? migratedCount + ' list' + (migratedCount === 1 ? '' : 's') + " moved to your account, but " + failedCount + " couldn't be moved -- they're still saved locally, try again from this browser."
+        : "Could not move your local lists to your account -- they're still saved locally, try again from this browser."
+    );
+  }
+}
+
+let lastCreatorListsData = null; // cached result of the last dashboard fetch, so Edit/Share don't need a round-trip
+
+// showModal/closeModal live in 16_client-row-core.js. Byte-identical copies
+// were declared here too; in the browser's single shared script scope that
+// meant one silently overrode the other. Same behaviour either way, so
+// nothing changed by removing them -- but a future edit to one copy would
+// have appeared to do nothing at all.
+
+function renderCreatorProfileBar() {
+  const bar = document.getElementById('creatorProfileBar');
+  if (!bar) return;
+  if (activeCreator) {
+    bar.innerHTML =
+      '<div style="display:flex; align-items:center; gap:8px;">' +
+      '<button type="button" class="subnav-pill active" style="margin:0; font-size:0.85rem; padding:8px 14px; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:6px; border-radius:var(--radius-pill);" onclick="switchTab(&quot;account&quot;)">&#x1F464; ' + escapeHtml(activeCreator.displayName) + '</button>' +
+      '</div>';
+  } else {
+    bar.innerHTML =
+      '<div style="display:flex; align-items:center; gap:6px;">' +
+      '<button type="button" class="lc-btn primary" onclick="openRestoreModal()" style="padding:8px 16px; font-size:0.85rem; font-weight:700; border-radius:var(--radius-pill);">Login</button>' +
+      '</div>';
+  }
+}
+
+// Lives in Settings -> Keys & Account
+function renderAccountKeySection() {
+  const box = document.getElementById('accountKeySection');
+  if (!box) return;
+  if (!activeCreator) {
+    box.innerHTML =
+      '<p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Save and sync your lists, channels, presets, likes, and settings across all your devices automatically. No email or password needed &mdash; just a username and key.</p>' +
+      '<div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-top:12px;">' +
+      '<button type="button" class="primary" onclick="openCreateProfileModal()">Create Free Account</button>' +
+      '<button type="button" class="secondary" onclick="openRestoreModal()">Login</button>' +
+      '</div>';
+    return;
+  }
+  const key = localStorage.getItem('myListAddon:creatorKey') || '';
+  box.innerHTML =
+    '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; flex-wrap:wrap; gap:8px;">' +
+    '<div>' +
+    '<span style="font-size:0.75rem; text-transform:uppercase; letter-spacing:0.5px; color:var(--muted); font-weight:700;">Signed in as</span>' +
+    '<h3 style="margin:2px 0 0; font-size:1.1rem; font-weight:800; color:var(--text);">&#x1F464; ' + escapeHtml(activeCreator.displayName) + '</h3>' +
+    '</div>' +
+    '<button type="button" class="secondary lc-btn" onclick="switchCreatorProfile()">Sign Out / Switch</button>' +
+    '</div>' +
+    '<p style="margin:0 0 4px;"><small>Account Key</small></p>' +
+    '<div class="creator-key-display" id="accountKeyDisplay">' + '\u2022'.repeat(Math.max(8, key.length)) + '</div>' +
+    '<div class="actions" style="flex-direction:row; width:auto; gap:8px; flex-wrap:wrap; margin-top:10px;">' +
+    '<button type="button" class="secondary" id="accountKeyToggleBtn" onclick="toggleAccountKeyVisibility()">Show Key</button>' +
+    '<button type="button" class="secondary" onclick="copyAccountKey()">Copy Key</button>' +
+    '</div>' +
+    '<p style="margin-top:10px;"><small>Anyone with this key can sign in as you and edit your lists &mdash; keep it somewhere safe, and don&apos;t share it.</small></p>' +
+    '<div class="danger-zone" style="margin-top:20px; padding:14px 16px; border:1px solid rgba(255,149,0,0.35); border-radius:12px; background:rgba(255,149,0,0.06);">' +
+      '<div style="font-weight:700; font-size:0.9rem; color:#ff9500; margin-bottom:4px;">Reset Account</div>' +
+      '<p style="margin:0 0 10px; font-size:0.82rem; color:var(--muted);">Delete every list, channel, preset, watch history entry and catalog row on this account, returning it to how it was when you created it. Your account and key stay the same, and you stay signed in.</p>' +
+      '<button type="button" class="lc-btn" style="background:#ff9500; color:#fff; border:none; padding:7px 14px; font-weight:700; border-radius:8px; cursor:pointer;" onclick="openResetAccountModal()">Reset Account Data</button>' +
+    '</div>' +
+    '<div class="danger-zone" style="margin-top:12px; padding:14px 16px; border:1px solid rgba(255,59,48,0.3); border-radius:12px; background:rgba(255,59,48,0.05);">' +
+      '<div style="font-weight:700; font-size:0.9rem; color:var(--danger, #ff3b30); margin-bottom:4px;">Delete Account</div>' +
+      '<p style="margin:0 0 10px; font-size:0.82rem; color:var(--muted);">Permanently delete your account, all published lists, and all synced data from the server.</p>' +
+      '<button type="button" class="lc-btn" style="background:#ff3b30; color:#fff; border:none; padding:7px 14px; font-weight:700; border-radius:8px; cursor:pointer;" onclick="openDeleteAccountModal()">Delete Account &amp; All Data</button>' +
+    '</div>';
+}
+
+// Empties the account without deleting it: every list, channel, preset,
+// catalog row and tracking record goes, the account and its key stay, and
+// the person remains signed in on a blank slate.
+//
+// Local state is cleared FIRST and the server call made second, deliberately.
+// The reverse order leaves a window where the browser still holds the old
+// lists and any autosave, scrobble ping or background sync landing in that
+// window would push them straight back up to the account that was just
+// wiped. Clearing locally first means the worst case is a browser that has
+// forgotten data the server still holds -- recoverable by signing in again --
+// rather than a reset that silently undoes itself.
+async function openResetAccountModal() {
+  if (!activeCreator) return;
+  const confirmFn = typeof showAppConfirm === 'function'
+    ? showAppConfirm
+    : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  confirmFn(
+    'Reset Account Data',
+    'This deletes every list, channel, preset, catalog row and watch history entry on your account, on this device and on the server. Your account name and key stay the same and you will remain signed in. This cannot be undone.',
+    'Reset Everything',
+    async () => {
+      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+      const creatorName = activeCreator.creatorName;
+      const displayName = activeCreator.displayName;
+      if (!creatorKey) return;
+
+      // Stop anything in flight from re-uploading what we are about to clear.
+      window._suppressCreatorSync = true;
+      try {
+        if (typeof clearLocalAccountData === 'function') clearLocalAccountData();
+
+        const res = await fetch(ORIGIN + '/api/creator/account/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ creatorName: creatorName, creatorKey: creatorKey, confirm: 'RESET' }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          const msg = (data && data.error) || 'The reset could not be completed.';
+          if (typeof showAppAlert === 'function') showAppAlert('Reset Failed', msg + ' Your local data has been cleared; sign in again to restore it from your account.', false);
+          else alert(msg);
+          return;
+        }
+
+        // clearLocalAccountData signs the person out as a side effect, so put
+        // them back where they were -- on their own, now-empty account.
+        // The same three keys sign-in writes (see signInCreatorProfile) --
+        // not an 'activeCreator' blob, which nothing reads.
+        activeCreator = { creatorName: creatorName, displayName: displayName };
+        localStorage.setItem('myListAddon:creatorName', creatorName);
+        localStorage.setItem('myListAddon:creatorDisplayName', displayName || creatorName);
+        localStorage.setItem('myListAddon:creatorKey', creatorKey);
+        // Written AFTER clearLocalAccountData, which removes every myListAddon:
+        // key including this one. Without it this browser would meet its own
+        // reset on the next load and wipe itself a second time.
+        if (typeof rememberAccountResetAt === 'function') rememberAccountResetAt(data.resetAt);
+
+        if (typeof renderCreatorProfileBar === 'function') renderCreatorProfileBar();
+        if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
+        if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Account Reset', 'Your account is now empty and ready to start again.', true);
+        }
+      } catch (e) {
+        if (typeof showAppAlert === 'function') showAppAlert('Reset Failed', 'Could not reach the server. Your local data has been cleared; sign in again to restore it from your account.', false);
+      } finally {
+        window._suppressCreatorSync = false;
+      }
+    }
+  );
+}
+window.openResetAccountModal = openResetAccountModal;
+
+function openDeleteAccountModal() {
+  if (!activeCreator) return;
+  showModal(
+    '<div class="modal-body">' +
+      '<h2 class="panel-title" style="color:var(--danger, #ff3b30);">&#x26A0; Delete Account &amp; All Data</h2>' +
+      '<p style="margin:8px 0 14px; font-size:0.9rem;">Are you sure you want to delete your account <strong>' + escapeHtml(activeCreator.displayName) + '</strong>?</p>' +
+      '<div style="background:rgba(255,59,48,0.08); border:1px solid rgba(255,59,48,0.25); border-radius:8px; padding:12px; margin-bottom:14px; font-size:0.85rem; color:var(--text);">' +
+        '<p style="margin:0 0 6px; font-weight:700; color:var(--danger, #ff3b30);">&#x2717; This action is permanent and cannot be undone.</p>' +
+        '<ul style="margin:0; padding-left:18px; color:var(--muted);">' +
+          '<li>All your published lists will be deleted from the server.</li>' +
+          '<li>All synced backups, likes, and channel configurations will be erased.</li>' +
+          '<li>Your account key will become permanently invalid.</li>' +
+        '</ul>' +
+      '</div>' +
+      '<div id="deleteAccountStatus"></div>' +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end; gap:8px;">' +
+        '<button type="button" class="secondary" onclick="closeModal()">Cancel</button>' +
+        '<button type="button" id="confirmDeleteAccountBtn" class="primary" style="background:#ff3b30; border-color:#ff3b30; color:#fff;" onclick="handleDeleteAccount()">Permanently Delete Everything</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+async function handleDeleteAccount() {
+  if (!activeCreator) return;
+  const btn = document.getElementById('confirmDeleteAccountBtn');
+  const status = document.getElementById('deleteAccountStatus');
+  if (btn) btn.disabled = true;
+  if (status) status.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;">Deleting account and all data\u2026</p>';
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/delete-account', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      // The server requires confirm:"DELETE" on this specific irreversible
+      // action (see /api/creator/delete-account's own comment) -- the same
+      // pattern openResetAccountModal's own confirm:'RESET' already uses
+      // for the sibling account/reset endpoint. This call never sent it,
+      // so every delete attempt failed at the server with "Missing
+      // confirmation." no matter how the person confirmed in this modal.
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, confirm: 'DELETE' }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!data || !data.ok) {
+      if (status) status.innerHTML = '<p class="testresult err">&#x2717; ' + escapeHtml((data && data.error) || 'Failed to delete account.') + '</p>';
+      if (btn) btn.disabled = false;
+      return;
+    }
+    clearLocalAccountData();
+    closeModal();
+    showAddedToast('Your account and all data have been permanently deleted.');
+  } catch (err) {
+    if (status) status.innerHTML = '<p class="testresult err">&#x2717; Network error deleting account.</p>';
+    if (btn) btn.disabled = false;
+  }
+}
+
+function openShareListModal(listName, listUrl) {
+  showModal(
+    '<div class="modal-body">' +
+      '<h2 class="panel-title" style="margin-bottom:6px;">Share List</h2>' +
+      '<p style="margin:0 0 14px; font-size:0.88rem; color:var(--muted);">Share <strong>' + escapeHtml(listName || 'Custom List') + '</strong> with others or open it in your browser.</p>' +
+      '<div style="display:flex; gap:8px; align-items:center; margin-bottom:14px;">' +
+        '<input type="text" id="shareListUrlInput" value="' + escapeAttr(listUrl) + '" readonly style="flex:1; padding:10px 12px; font-size:0.9rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text);">' +
+        '<button type="button" class="lc-btn primary" id="shareListCopyBtn" onclick="copyShareListUrl()" style="white-space:nowrap; padding:10px 16px;">Copy Link</button>' +
+      '</div>' +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end; gap:8px;">' +
+        '<a href="' + escapeAttr(listUrl) + '" target="_blank" class="button secondary lc-btn" style="text-decoration:none; display:inline-flex; align-items:center;">Open Link &nearr;</a>' +
+        '<button type="button" class="secondary lc-btn" onclick="closeModal()">Close</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+function copyShareListUrl() {
+  const input = document.getElementById('shareListUrlInput');
+  const btn = document.getElementById('shareListCopyBtn');
+  if (!input) return;
+  input.select();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(input.value).then(() => {
+      if (btn) btn.textContent = 'Copied \u2713';
+      showAddedToast('Link copied to clipboard!');
+      setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+    }).catch(() => {
+      document.execCommand('copy');
+      if (btn) btn.textContent = 'Copied \u2713';
+      showAddedToast('Link copied to clipboard!');
+      setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+    });
+  } else {
+    document.execCommand('copy');
+    if (btn) btn.textContent = 'Copied \u2713';
+    showAddedToast('Link copied to clipboard!');
+    setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+  }
+}
+
+function toggleAccountKeyVisibility() {
+  const display = document.getElementById('accountKeyDisplay');
+  const btn = document.getElementById('accountKeyToggleBtn');
+  if (!display || !btn) return;
+  const key = localStorage.getItem('myListAddon:creatorKey') || '';
+  const isHidden = btn.textContent === 'Show Key';
+  if (isHidden) {
+    display.textContent = key;
+    btn.textContent = 'Hide Key';
+  } else {
+    display.textContent = '\u2022'.repeat(Math.max(8, key.length));
+    btn.textContent = 'Show Key';
+  }
+}
+
+// "Auto-track playback" panel on Settings -- see buildManifest's comment
+// (05_catalog-core.js) for the full mechanism this powers. Requires a
+// Creator Profile: a bare Stremio/wako request has no cookies and no
+// login of its own, so the only way the server-side handler for it knows
+// whose Watch History to update is whatever's baked into the install
+// link itself -- and a Creator Profile's Watch History is the only kind
+function renderWatchlistPreferencesSection() {
+  const box = document.getElementById('watchlistPreferencesSection');
+  if (!box) return;
+  let autoClean = true;
+  try {
+    const val = localStorage.getItem('myListAddon:removeWatchedFromWatchlist');
+    autoClean = val !== '0';
+  } catch (e) {}
+  box.innerHTML =
+    '<label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.92rem; user-select:none;">' +
+      '<input type="checkbox" id="removeWatchedFromWatchlistCheck" ' + (autoClean ? 'checked' : '') + ' onchange="onRemoveWatchedFromWatchlistToggle(this)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">' +
+      '<div>' +
+        '<span style="font-weight:600;">Automatically remove watched items from Watchlist</span>' +
+        '<p style="margin:4px 0 0; color:var(--muted); font-size:0.82rem;">Movies are removed once watched. TV shows are only removed after every episode has been watched.</p>' +
+      '</div>' +
+    '</label>';
+}
+
+function onRemoveWatchedFromWatchlistToggle(cb) {
+  try {
+    localStorage.setItem('myListAddon:removeWatchedFromWatchlist', cb.checked ? '1' : '0');
+  } catch (e) {}
+  if (cb.checked && typeof cleanWatchedFromWatchlists === 'function') {
+    cleanWatchedFromWatchlists();
+  }
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+}
+
+// "Hidden Lists" panel on Settings -- lets the person hide specific lists
+// (by identifier -- see setListHidden's own comment, 21_client-custom-
+// list-builder.js) from My Lists, the Airing Next dashboard card, and
+// Simkl Airing Next, without deleting or unsyncing anything underneath.
+//
+// Enumerates every list this browser currently knows about across every
+// source that can produce one -- local Custom Lists (via
+// loadLocalCustomLists, same store getOrCreateAiringNextList uses, so
+// Airing Next's synthetic 'airing-next' entry shows up here too), a
+// signed-in Creator Profile's server-side lists (lastCreatorListsData,
+// already fetched by renderCreatorDashboard -- this panel doesn't re-fetch
+// on its own), and whichever of MDBList/Trakt/TMDB/Simkl the person has
+// connected (window._myMdblistLists/_myTraktLists/_myTmdbLists/
+// _mySimklLists -- each already populated by that provider's own "My
+// Lists" panel render, so this can be empty here until that panel has
+// loaded at least once). A list already hidden is included too (checkbox
+// unchecked) so it can be found and re-shown -- this panel is the only
+// place a hidden list is still visible at all.
+function renderHiddenListsSettingsSection() {
+  const box = document.getElementById('hiddenListsSettingsSection');
+  if (!box) return;
+
+  const rows = []; // { id, name, source }
+  const seenIds = new Set();
+  function addRow(id, name, source) {
+    if (!id || seenIds.has(id)) return;
+    seenIds.add(id);
+    rows.push({ id: id, name: name || id, source: source });
+  }
+
+  // Local Custom Lists (keyed by slug) -- includes the synthetic
+  // 'airing-next' entry once it has any items, matching how the dashboard
+  // itself only ever shows that card once it's eligible.
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    Object.keys(map).forEach((slug) => {
+      const l = map[slug];
+      if (!l || !l.slug) return;
+      if (l.slug === 'airing-next') {
+        addRow('airing-next', 'Airing Next', 'Dashboard');
+      } else {
+        addRow(l.slug, l.name || l.slug, 'My Lists');
+      }
+    });
+  } catch (e) {}
+  if (typeof collectAiringNextCandidateShowIds === 'function' && collectAiringNextCandidateShowIds().size) {
+    addRow('airing-next', 'Airing Next', 'Dashboard');
+  }
+
+  // A signed-in Creator Profile's server-side lists -- already fetched by
+  // renderCreatorDashboard into lastCreatorListsData; not re-fetched here.
+  if (Array.isArray(lastCreatorListsData)) {
+    lastCreatorListsData.forEach((l) => {
+      if (l && l.slug) addRow(l.slug, l.name || l.slug, 'My Lists');
+    });
+  }
+
+  // Connected providers -- each keyed by url, matching the filter applied
+  // in that provider's own render function (17_client-my-lists-and-trakt-
+  // oauth.js). Simkl's own 'simkl:user:shows:airing-next' entry naturally
+  // lands under its own "Simkl Airing Next" label via the url check below.
+  const providerLists = [
+    { arr: window._myMdblistLists, label: 'MDBList' },
+    { arr: window._myTraktLists, label: 'Trakt' },
+    { arr: window._myTmdbLists, label: 'TMDB' },
+    { arr: window._mySimklLists, label: 'Simkl' },
+  ];
+  providerLists.forEach(({ arr, label }) => {
+    if (!Array.isArray(arr)) return;
+    arr.forEach((l) => {
+      if (!l || !l.url) return;
+      const isSimklAiringNext = l.url.includes(':airing-next');
+      addRow(l.url, l.name || l.url, isSimklAiringNext ? 'Simkl Airing Next' : label);
+    });
+  });
+
+  if (!rows.length && Object.keys(MY_LISTS_SECTION_PANEL_IDS || {}).length === 0) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No lists found yet -- visit My Lists (and connect any providers you use) first, then come back here to manage what\u2019s shown.</small></p>';
+    return;
+  }
+
+  rows.sort((a, b) => a.source.localeCompare(b.source) || a.name.localeCompare(b.name));
+
+  const hiddenIds = new Set(typeof getHiddenListIds === 'function' ? getHiddenListIds() : []);
+  const hiddenSections = new Set(typeof getHiddenMyListsSections === 'function' ? getHiddenMyListsSections() : []);
+
+  // Whole-section toggles first -- coarser than the per-list rows below,
+  // for someone who wants an entire provider's "Your X Lists" panel gone
+  // from My Lists rather than hiding each list inside it one at a time.
+  // Always a fixed set of 4 (see MY_LISTS_SECTION_PANEL_IDS, 21_client-
+  // custom-list-builder.js) regardless of whether that provider is
+  // connected yet -- hiding ahead of connecting is harmless and saves a
+  // trip back here after connecting.
+  const sectionLabels = { mdblist: 'Your MDBList Lists', trakt: 'Your Trakt Lists', tmdb: 'Your TMDB Lists', simkl: 'Your Simkl Lists' };
+  const sectionsHtml = Object.keys(sectionLabels).map((section) => {
+    const checked = hiddenSections.has(section);
+    return '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none; padding:6px 0; border-bottom:1px solid var(--border);">' +
+      '<input type="checkbox" ' + (checked ? 'checked' : '') + ' data-section-id="' + escapeAttr(section) + '" onchange="onHiddenSectionToggle(this)" style="cursor:pointer; width:16px; height:16px; flex-shrink:0;">' +
+      '<span style="font-weight:600;">' + escapeHtml(sectionLabels[section]) + '</span>' +
+    '</label>';
+  }).join('');
+
+  const rowsHtml = rows.length ? rows.map((r) => {
+    const checked = hiddenIds.has(String(r.id));
+    return '<label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none; padding:6px 0; border-bottom:1px solid var(--border);">' +
+      '<input type="checkbox" ' + (checked ? 'checked' : '') + ' data-list-id="' + escapeAttr(r.id) + '" onchange="onHiddenListToggle(this)" style="margin-top:2px; cursor:pointer; width:16px; height:16px; flex-shrink:0;">' +
+      '<div style="min-width:0;">' +
+        '<span style="font-weight:600; overflow-wrap:anywhere;">' + escapeHtml(r.name) + '</span>' +
+        '<div style="color:var(--muted); font-size:0.78rem; margin-top:2px;">' + escapeHtml(r.source) + '</div>' +
+      '</div>' +
+    '</label>';
+  }).join('') : '<p style="color:var(--muted); font-size:0.85rem; margin-top:8px;"><small>No individual lists found yet -- visit My Lists (and connect any providers you use) first.</small></p>';
+
+  box.innerHTML =
+    '<p style="margin:0 0 6px; font-weight:600; font-size:0.85rem;">Whole Sections</p>' +
+    sectionsHtml +
+    '<p style="margin:14px 0 6px; font-weight:600; font-size:0.85rem;">Individual Lists</p>' +
+    rowsHtml;
+}
+
+function onHiddenListToggle(cb) {
+  const id = cb && cb.dataset ? cb.dataset.listId : '';
+  if (!id) return;
+  // Checked = hidden, unchecked = visible -- matches the panel's own name
+  // ("Hidden Lists": check a box to hide that list).
+  if (typeof setListHidden === 'function') setListHidden(id, cb.checked);
+}
+
+function onHiddenSectionToggle(cb) {
+  const section = cb && cb.dataset ? cb.dataset.sectionId : '';
+  if (!section) return;
+  // Same checked = hidden convention as onHiddenListToggle above.
+  if (typeof setMyListsSectionHidden === 'function') setMyListsSectionHidden(section, cb.checked);
+}
+
+// that persists anywhere outside a single browser for that link to
+// point at in the first place.
+function renderTrackPlaybackSection() {
+  const box = document.getElementById('trackPlaybackSection');
+  if (!box) return;
+  if (!activeCreator) {
+    box.innerHTML = '<p><small>Sign in to a Profile above to enable automatic scrobbling \u2014 without one, there\u2019s no account on file to sync playback to.</small></p>';
+    return;
+  }
+  let enabled = false;
+  try { enabled = localStorage.getItem('myListAddon:trackPlayback') === '1'; } catch (e) {}
+
+  let filterUsers = false;
+  let allowedUsers = '';
+  let blockAnon = false;
+  try {
+    allowedUsers = localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '';
+    filterUsers = localStorage.getItem('myListAddon:scrobbleFilterUsers') === '1' || (allowedUsers.trim().length > 0);
+    blockAnon = localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1';
+  } catch (e) {}
+
+  box.innerHTML =
+    '<div style="margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--border);">' +
+      '<p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Streaming Apps &amp; Addon Players (Stremio, Nuvio, Wako, etc.)</p>' +
+      '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.9rem;">' +
+        '<input type="checkbox" id="trackPlaybackCheck" ' + (enabled ? 'checked' : '') + ' onchange="onTrackPlaybackToggle(this)">' +
+        '<span>Enable In-App Playback Auto-Tracking</span>' +
+      '</label>' +
+      '<p style="margin:6px 0 0; color:var(--muted); font-size:0.8rem;">Automatically marks movies and episodes as watched whenever playback starts in any supported streaming app or addon player (Stremio, Nuvio, Wako, etc.) via the built-in playback hook. Takes effect on your next install link.</p>' +
+    '</div>' +
+
+    '<div style="margin-bottom:14px; padding-bottom:14px; border-bottom:1px solid var(--border);">' +
+      '<p style="margin:0 0 6px; font-weight:700; font-size:0.92rem;">Home Media Servers (Plex, Jellyfin &amp; Emby Scrobbler)</p>' +
+      '<p style="margin:0 0 8px; color:var(--muted); font-size:0.82rem;">Automatically scrobble watched movies and TV episodes from your Plex, Jellyfin, or Emby media servers directly into your personal Watch History and Continue Watching lists.</p>' +
+      '<div class="webhook-input-group">' +
+        '<input type="text" readonly id="scrobbleWebhookInput" value="Loading\u2026" style="padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:rgba(0,0,0,0.3); color:var(--text); font-family:monospace; font-size:0.82rem;">' +
+        '<button type="button" class="secondary lc-btn" onclick="copyScrobbleWebhookUrl()" style="padding:8px 14px; font-size:0.84rem;">Copy Webhook URL</button>' +
+        '<button type="button" class="secondary lc-btn" onclick="regenerateScrobbleWebhookUrl()" title="Issues a new webhook URL and stops the old one working. Use this if the URL has been shared or logged somewhere it should not have been." style="padding:8px 14px; font-size:0.84rem;">Regenerate</button>' +
+      '</div>' +
+
+      '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border); box-sizing:border-box; width:100%; max-width:100%;">' +
+        '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 4px;">' +
+          '<input type="checkbox" id="scrobbleFilterUsersCb" ' + (filterUsers ? 'checked' : '') + ' onchange="onScrobbleFilterUsersToggle(this)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
+          '<span style="font-weight:600;">Enable Media Server User Filtering</span>' +
+        '</label>' +
+        '<p style="margin:0 0 8px; color:var(--muted); font-size:0.8rem;">When enabled, only selected or specified media server user profiles will scrobble into your lists. Unselected users will be ignored.</p>' +
+        '<div id="scrobbleFilterDetails" style="' + (filterUsers ? '' : 'display:none;') + ' margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.06);">' +
+          '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">' +
+            '<p style="margin:0; font-size:0.8rem; font-weight:600; color:var(--text);">Select Allowed Users:</p>' +
+            '<button type="button" class="secondary lc-btn" onclick="loadScrobbleSeenUsers()" style="padding:3px 8px; font-size:0.75rem;">Refresh Users</button>' +
+          '</div>' +
+          '<div id="scrobbleSeenUsersBox" style="font-size:0.82rem; color:var(--muted); margin-bottom:10px;"><small>Loading\u2026</small></div>' +
+          '<p style="margin:0 0 4px; font-size:0.8rem; color:var(--muted);">Additional / Manual Usernames (comma-separated):</p>' +
+          '<input type="text" id="scrobbleAllowedUsersInput" placeholder="e.g. James, Alice" value="' + escapeHtml(allowedUsers) + '" oninput="onScrobbleAllowedUsersChange()" style="width:100%; box-sizing:border-box; margin-bottom:8px; font-size:0.84rem;">' +
+          '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.84rem; user-select:none; margin:0;">' +
+            '<input type="checkbox" id="scrobbleBlockAnonCb" ' + (blockAnon ? 'checked' : '') + ' onchange="onScrobbleBlockAnonChange(this)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
+            '<span>Block scrobbles with no username in the payload</span>' +
+          '</label>' +
+        '</div>' +
+      '</div>' +
+
+      '<div style="margin:10px 0; padding:10px 12px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid var(--border); box-sizing:border-box; width:100%; max-width:100%;">' +
+        '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 8px;">' +
+          '<input type="checkbox" id="syncMediaServerHistoryCb" checked onchange="toggleMediaServerSync(this.checked)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
+          '<span style="font-weight:600;">Automatically sync media server scrobbles to your Watch History list</span>' +
+        '</label>' +
+        '<label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:0.86rem; user-select:none; margin:0 0 10px;">' +
+          '<input type="checkbox" id="forwardScrobbleToProvidersCb" checked onchange="toggleForwardScrobbles(this.checked)" style="width:16px; height:16px; margin-top:2px; cursor:pointer; flex:none;">' +
+          '<span style="font-weight:600;">Forward scrobbles to connected external accounts (Trakt, Simkl, MDBList)</span>' +
+        '</label>' +
+        '<div>' +
+          '<button type="button" class="secondary lc-btn" onclick="syncAllConnectedAccountsNow(this)" style="padding:8px 14px; font-size:0.82rem; white-space:normal; line-height:1.35; text-align:center; max-width:100%; width:100%; box-sizing:border-box;">Sync Current Watch History to Connected Accounts Now</button>' +
+        '</div>' +
+      '</div>' +
+
+      '<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 200px), 1fr)); gap:8px; margin-top:10px; width:100%; max-width:100%; box-sizing:border-box;">' +
+        '<details style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.82rem;">' +
+          '<summary style="cursor:pointer; font-weight:600; color:var(--accent-2);">Plex Webhook Setup</summary>' +
+          '<p style="margin:6px 0 4px; color:var(--muted);">1. Open <strong>Plex Web &rarr; Settings &rarr; Webhooks</strong>.<br>2. Click <strong>Add Webhook</strong> and paste the URL above.<br>3. Click <strong>Save Changes</strong>.</p>' +
+        '</details>' +
+        '<details style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.82rem;">' +
+          '<summary style="cursor:pointer; font-weight:600; color:var(--accent-2);">Jellyfin Webhook Setup</summary>' +
+          '<p style="margin:6px 0 4px; color:var(--muted);">1. In Jellyfin <strong>Dashboard &rarr; Plugins</strong>, install the <strong>Webhook</strong> plugin.<br>2. Go to Webhook settings &rarr; <strong>Add Generic Destination</strong>.<br>3. Paste the URL and check <strong>Playback</strong> events.</p>' +
+        '</details>' +
+        '<details style="background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:8px 10px; font-size:0.82rem;">' +
+          '<summary style="cursor:pointer; font-weight:600; color:var(--accent-2);">Emby Webhook Setup</summary>' +
+          '<p style="margin:6px 0 4px; color:var(--muted);">1. Open Emby Server <strong>Dashboard &rarr; Webhooks</strong>.<br>2. Click <strong>Add Webhook</strong> and paste the URL above.<br>3. Check <strong>Playback</strong> / <strong>Scrobble</strong> events.</p>' +
+        '</details>' +
+      '</div>' +
+    '</div>' +
+
+    '<div id="trackPlaybackStatus" style="margin-top:8px;"></div>';
+
+  refreshTrackPlaybackStatus();
+  loadScrobbleSeenUsers();
+  // Fills the webhook field in after the section is on screen. Deliberately
+  // not awaited: the URL now needs a round trip (it carries a scrobble token
+  // rather than the Creator Key), and the rest of the panel should not wait
+  // on it.
+  refreshScrobbleWebhookUrl(false);
+}
+
+// The webhook URL ends up pasted into Plex/Jellyfin/Emby, stored in their
+// configuration and written to their logs, so what it carries matters. It
+// used to carry the Creator Key -- the credential for the whole account,
+// with no expiry -- which meant anyone who read that URL out of a log had
+// everything, and the only remedy was rotating the key and re-signing in on
+// every device. It now carries a scrobble token: revocable on its own,
+// good for nothing but recording playback for this account.
+function buildScrobbleWebhookUrl(scrobbleToken) {
+  return ORIGIN + '/api/scrobble?st=' + encodeURIComponent(scrobbleToken || '');
+}
+
+// Fetches (and on first use mints) this account's scrobble token.
+// rotate === true issues a fresh one and revokes the old webhook URL.
+async function fetchScrobbleToken(rotate) {
+  if (!activeCreator || !activeCreator.creatorName) return '';
+  let creatorKey = '';
+  try { creatorKey = localStorage.getItem('myListAddon:creatorKey') || ''; } catch (e) {}
+  if (!creatorKey) return '';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/scrobble-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, rotate: rotate === true }),
+    });
+    const data = await res.json().catch(() => null);
+    return (data && data.ok && data.token) ? data.token : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// Fills the webhook field in. Kept out of the initial render so a dashboard
+// load does not block on it, and so a failure leaves a readable message in
+// the field rather than a half-built URL.
+async function refreshScrobbleWebhookUrl(rotate) {
+  const input = document.getElementById('scrobbleWebhookInput');
+  if (!input) return;
+  input.value = rotate ? 'Generating a new URL\u2026' : 'Loading\u2026';
+  const token = await fetchScrobbleToken(rotate);
+  const current = document.getElementById('scrobbleWebhookInput');
+  if (!current) return;
+  current.value = token
+    ? buildScrobbleWebhookUrl(token)
+    : 'Could not load your webhook URL \u2014 reload the page and try again.';
+  if (rotate && token && typeof showAddedToast === 'function') {
+    showAddedToast('New webhook URL generated \u2014 the old one no longer works \u2713');
+  }
+}
+
+async function regenerateScrobbleWebhookUrl() {
+  await refreshScrobbleWebhookUrl(true);
+}
+
+function onScrobbleFilterUsersToggle(cb) {
+  try { localStorage.setItem('myListAddon:scrobbleFilterUsers', cb.checked ? '1' : '0'); } catch (e) {}
+  const details = document.getElementById('scrobbleFilterDetails');
+  if (details) details.style.display = cb.checked ? '' : 'none';
+  if (cb.checked) {
+    syncScrobbleUserCheckboxes();
+  }
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+}
+
+function onScrobbleAllowedUsersChange() {
+  try {
+    const val = (document.getElementById('scrobbleAllowedUsersInput') || {}).value || '';
+    localStorage.setItem('myListAddon:scrobbleAllowedUsers', val);
+    const filterCb = document.getElementById('scrobbleFilterUsersCb');
+    if (filterCb && !filterCb.checked && val.trim().length > 0) {
+      filterCb.checked = true;
+      localStorage.setItem('myListAddon:scrobbleFilterUsers', '1');
+      const details = document.getElementById('scrobbleFilterDetails');
+      if (details) details.style.display = '';
+    }
+  } catch (e) {}
+  syncScrobbleUserCheckboxes();
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+}
+
+function onScrobbleBlockAnonChange(cb) {
+  try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', cb.checked ? '1' : '0'); } catch (e) {}
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+}
+
+
+
+function syncScrobbleUserCheckboxes() {
+  const allowed = (localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const checkboxes = document.querySelectorAll('.scrobble-user-cb');
+  checkboxes.forEach((cb) => {
+    cb.checked = allowed.includes(cb.value.toLowerCase());
+  });
+}
+
+function onScrobbleUserCheckboxToggle() {
+  try {
+    const currentAllowed = (localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const checkboxes = Array.from(document.querySelectorAll('.scrobble-user-cb'));
+    const detectedNames = checkboxes.map((cb) => cb.value.toLowerCase());
+    const manualKept = currentAllowed.filter((name) => !detectedNames.includes(name.toLowerCase()));
+    const checkedDetected = checkboxes.filter((cb) => cb.checked).map((cb) => cb.value);
+    const combined = [...manualKept, ...checkedDetected];
+    const val = combined.join(', ');
+    localStorage.setItem('myListAddon:scrobbleAllowedUsers', val);
+    const input = document.getElementById('scrobbleAllowedUsersInput');
+    if (input) input.value = val;
+    // When a checkbox is toggled, ensure user filter is enabled
+    localStorage.setItem('myListAddon:scrobbleFilterUsers', '1');
+    const filterCb = document.getElementById('scrobbleFilterUsersCb');
+    if (filterCb) filterCb.checked = true;
+    const details = document.getElementById('scrobbleFilterDetails');
+    if (details) details.style.display = '';
+  } catch (e) {}
+  if (typeof pushTrackingSync === 'function') pushTrackingSync();
+}
+
+async function loadScrobbleSeenUsers() {
+  const box = document.getElementById('scrobbleSeenUsersBox');
+  if (!box || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  box.innerHTML = '<span style="color:var(--muted); font-size:0.8rem;">Checking detected users\u2026</span>';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/scrobble-seen-users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey }),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.users || !Object.keys(data.users).length) {
+      box.innerHTML = '<span style="color:var(--muted); font-size:0.8rem;">No users detected yet. Once Plex, Jellyfin, or Emby sends a webhook event, detected user profiles will appear here as selectable checkboxes.</span>';
+      return;
+    }
+    const allowed = (localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+
+    let html = '<div style="display:flex; flex-direction:column; gap:4px; margin-top:4px;">';
+    for (const [username, info] of Object.entries(data.users)) {
+      const isChecked = allowed.includes(username.toLowerCase());
+      let timeStr = '';
+      if (info && info.lastSeen) {
+        const diff = Math.max(0, Date.now() - info.lastSeen);
+        const mins = Math.floor(diff / 60000);
+        if (mins < 1) timeStr = ' \u2014 seen just now';
+        else if (mins < 60) timeStr = ' \u2014 seen ' + mins + 'm ago';
+        else {
+          const hours = Math.floor(mins / 60);
+          if (hours < 24) timeStr = ' \u2014 seen ' + hours + 'h ago';
+          else timeStr = ' \u2014 seen ' + Math.floor(hours / 24) + 'd ago';
+        }
+      }
+      const serverName = (info && info.server) || 'Media Server';
+      html +=
+        '<label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.84rem; padding:3px 0;">' +
+          '<input type="checkbox" class="scrobble-user-cb" value="' + escapeHtml(username) + '" ' + (isChecked ? 'checked' : '') + ' onchange="onScrobbleUserCheckboxToggle()" style="width:15px; height:15px; cursor:pointer; flex:none;">' +
+          '<span><strong>' + escapeHtml(username) + '</strong> <span style="color:var(--muted); font-size:0.78rem;">(' + escapeHtml(serverName) + timeStr + ')</span></span>' +
+        '</label>';
+    }
+    html += '</div>';
+    box.innerHTML = html;
+  } catch (err) {
+    box.innerHTML = '<span style="color:var(--muted); font-size:0.8rem;">Could not load detected users right now.</span>';
+  }
+}
+
+function copyScrobbleWebhookUrl() {
+  const input = document.getElementById('scrobbleWebhookInput');
+  if (!input || !input.value) return;
+  navigator.clipboard.writeText(input.value).then(() => {
+    if (typeof showAddedToast === 'function') showAddedToast('Webhook URL copied to clipboard! \u2713');
+    else if (typeof showAppAlert === 'function') showAppAlert('Copied', 'Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.', true);
+    else alert('Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.');
+  }).catch(() => {
+    prompt('Copy your Scrobble Webhook URL:', input.value);
+  });
+}
+
+function toggleMediaServerSync(enabled) {
+  try { localStorage.setItem('myListAddon:syncMediaServerHistory', enabled ? 'true' : 'false'); } catch (e) {}
+  if (typeof saveState === 'function') saveState();
+}
+
+function toggleForwardScrobbles(enabled) {
+  try { localStorage.setItem('myListAddon:forwardScrobbleToProviders', enabled ? 'true' : 'false'); } catch (e) {}
+  if (typeof saveState === 'function') saveState();
+}
+
+function onTrackPlaybackToggle(cb) {
+  try { localStorage.setItem('myListAddon:trackPlayback', cb.checked ? '1' : '0'); } catch (e) {}
+  if (typeof saveState === 'function') saveState();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (cb.checked) {
+    refreshTrackPlaybackStatus();
+  }
+}
+
+async function refreshTrackPlaybackStatus() {
+  const statusBox = document.getElementById('trackPlaybackStatus');
+  if (!statusBox || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  statusBox.innerHTML = '<small style="color:var(--muted);">Checking scrobble status\u2026</small>';
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/track-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.lastPingAt) {
+      statusBox.innerHTML = '<div style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:rgba(255,255,255,0.03); border-radius:6px; font-size:0.83rem; color:var(--muted);"><span style="color:var(--muted);">&#x25CB;</span> <span>Ready for playback / scrobble events from Stremio, Plex, Jellyfin, or Emby.</span></div>';
+      return;
+    }
+    const when = new Date(data.lastPingAt).toLocaleString();
+    const serverLabel = data.lastServer ? '<strong>' + escapeHtml(data.lastServer) + '</strong>' : '<strong>In-App Streaming Player</strong>';
+    const userLabel = data.lastUser ? ' &bull; User: <strong>' + escapeHtml(data.lastUser) + '</strong>' : '';
+    const rawMatched = data.matched || data.lastPingId || 'OK';
+    const displayMatched = rawMatched.replace(/^(yes|no|error)\b/i, (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+    statusBox.innerHTML =
+      '<div style="padding:10px 12px; background:rgba(0,122,255,0.08); border:1px solid rgba(0,122,255,0.25); border-radius:8px; font-size:0.84rem;">' +
+        '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">' +
+          '<span style="color:var(--accent); font-weight:700;">\u2713 Last Scrobble Activity</span>' +
+          '<span style="color:var(--muted); font-size:0.78rem;">' + escapeHtml(when) + '</span>' +
+        '</div>' +
+        '<div style="color:var(--text);">' +
+          'Source: ' + serverLabel + userLabel + ' &bull; Matched: <code style="color:var(--accent-2);">' + escapeHtml(displayMatched) + '</code>' +
+        '</div>' +
+      '</div>';
+  } catch (e) {
+    statusBox.innerHTML = '<small style="color:var(--muted);">Could not check status right now.</small>';
+  }
+}
+
+function copyAccountKey() {
+  const key = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!key) return;
+  navigator.clipboard.writeText(key).then(() => {
+    if (typeof showAddedToast === 'function') showAddedToast('Key copied to clipboard! \u2713');
+    else alert('Key copied to your clipboard.');
+  }).catch(() => {
+    prompt('Copy your Key:', key);
+  });
+}
+
+function clearLocalAccountData() {
+  activeCreator = null;
+  editingCreatorListSlug = null;
+  lastCreatorListsData = null;
+  resetCreatorListsCache();
+
+  // Clear in-memory tokens and credentials
+  traktAccessToken = '';
+  if (typeof traktUsername !== 'undefined') traktUsername = '';
+  mdblistAccessToken = '';
+  if (typeof mdblistUsername !== 'undefined') mdblistUsername = '';
+  simklAccessToken = '';
+  if (typeof simklUsername !== 'undefined') simklUsername = '';
+  tmdbSessionId = '';
+  tmdbAccountId = '';
+  tmdbUsername = '';
+
+  // Clear personal list arrays & tracking sets
+  window._myTraktLists = [];
+  window._myPrivateTraktLists = [];
+  window._myTmdbLists = [];
+  window._mySimklLists = [];
+  window._myMdblistLists = [];
+  // Read everywhere else as a plain object (Object.keys(...), map lookups by
+  // show id), so resetting it to a Set left a value nothing could use.
+  window._dismissedContinueWatching = {};
+  window._fullyWatchedShowIds = new Set();
+  window._inProgressShowIds = new Set();
+
+  // The watch-badge index. Left in place, the previous account's watched
+  // ticks kept appearing on posters after signing out.
+  window._watchedItemIds = new Set();
+  window._rawWatchHistoryItems = [];
+  window._watchedIndexLength = 0;
+  window._currentItemDetails = null;
+  window._episodeDataCache = {};
+  window._currentListDetailsAllItems = [];
+
+  // Caches held by other modules that key off the same data.
+  if (typeof resetPresetsCache === 'function') resetPresetsCache();
+  if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+  if (typeof channelDraftItems !== 'undefined') channelDraftItems = [];
+  if (typeof channelDraftPoster !== 'undefined') channelDraftPoster = null;
+  if (typeof channelDraftBackdrop !== 'undefined') channelDraftBackdrop = null;
+  if (typeof editingChannelId !== 'undefined') editingChannelId = null;
+  if (typeof customListDraftItems !== 'undefined') customListDraftItems = [];
+  _memoryCustomListsString = null;
+  _memoryCustomListsObj = null;
+
+  // Clear all localStorage keys for account data, credentials, and custom lists
+  try {
+    const keysToRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k) {
+        if (
+          k.startsWith('myListAddon:') ||
+          k === 'localCustomLists' ||
+          k === 'localChannels' ||
+          k === 'localMergedChannels' ||
+          k === 'presets'
+        ) {
+          // Preserve persistent UI tab navigation if desired, wipe everything else
+          if (
+            k !== 'myListAddon:activeTab' &&
+            k !== 'myListAddon:settingsSubmenu' &&
+            k !== 'myListAddon:catalogsSubmenu' &&
+            k !== 'myListAddon:discoverSubmenu' &&
+            k !== 'myListAddon:channelsSubmenu' &&
+            k !== 'myListAddon:listsSubmenu'
+          ) {
+            keysToRemove.push(k);
+          }
+        }
+      }
+    }
+    keysToRemove.forEach((k) => localStorage.removeItem(k));
+  } catch (e) {}
+
+  // The reason signing out left Watch History, Continue Watching, Watchlist,
+  // Airing Next and every Custom List on screen: saveLocalCustomListsMap
+  // mirrors the map into sessionStorage as a fast backup, and
+  // loadLocalCustomLists reads sessionStorage BEFORE localStorage. Wiping
+  // only localStorage therefore cleared the slower copy and left the one
+  // that actually gets read, so the next render pulled the signed-out
+  // account's lists straight back.
+  try {
+    const sessionKeys = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (k && (k.indexOf('myListAddon:') === 0 || k === 'localCustomLists' || k === 'localChannels' || k === 'localMergedChannels' || k === 'presets')) {
+        sessionKeys.push(k);
+      }
+    }
+    sessionKeys.forEach((k) => sessionStorage.removeItem(k));
+  } catch (e) {}
+
+  // Clear form inputs
+  const inputIds = [
+    'tmdbKeyInput', 'mdblistKeyInput', 'traktKeyInput', 'traktUsernameInput', 'simklKeyInput',
+    'presetNameInput', 'channelNameInput', 'customListNameInput', 'bulkPasteBox', 'importLinkInput',
+    'configJsonBox', 'customListSearchInput', 'channelSearchInput'
+  ];
+  inputIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+
+  // Clear checkboxes
+  const checkboxIds = [
+    'syncTraktHistoryCheckbox', 'syncMdblistHistoryCheckbox', 'syncSimklHistoryCheckbox',
+    'syncMediaServerHistoryCheckbox', 'forwardScrobblesCheckbox', 'trackPlaybackCheck',
+    'removeWatchedFromWatchlistCheck', 'shuffleShelvesCheckbox', 'shuffleItemsCheckbox'
+  ];
+  checkboxIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = false;
+  });
+
+  // Clear rows and list containers
+  const listsEl = document.getElementById('lists');
+  if (listsEl) listsEl.innerHTML = '';
+
+  const resultContainerIds = [
+    'myTraktListsResult', 'myPrivateTraktListsResult', 'myTmdbListsResult',
+    'mySimklListsResult', 'myMdblistListsResult', 'channelDraftList', 'customListDraftList'
+  ];
+  resultContainerIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '';
+  });
+
+  // Re-render UI components into logged-out/empty state
+  if (typeof renderCreatorProfileBar === 'function') renderCreatorProfileBar();
+  if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
+  if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+  if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+  if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
+  if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
+  if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+  if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+  if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
+  if (typeof renderChannelsList === 'function') renderChannelsList();
+  if (typeof renderChannelMergeList === 'function') renderChannelMergeList();
+  if (typeof renderPresetsList === 'function') renderPresetsList();
+  if (typeof renumber === 'function') renumber();
+  if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+}
+
+function switchCreatorProfile() {
+  clearLocalAccountData();
+  if (typeof showAddedToast === 'function') {
+    showAddedToast('Signed out \u2713');
+  }
+}
+
+function openRestoreModal() {
+  showModal(
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+    '<h2>Login</h2>' +
+    '<p class="modal-sub">Enter your Username and Account Key to login and sync your lists.</p>' +
+    '<div class="row"><input type="text" id="restoreNameInput" placeholder="Username"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="restoreKeyInput" placeholder="Key (e.g. MYL-XXXX-XXXX-XXXX)"></div>' +
+    '<div id="restoreModalError"></div>' +
+    '<div class="actions" style="margin-top:14px;">' +
+    '<button type="button" class="primary" id="restoreSubmitBtn" onclick="submitRestoreProfile()">Login</button>' +
+    '<button type="button" class="secondary" onclick="closeModal(); openCreateProfileModal();">Need an account? Create one</button>' +
+    '</div>' +
+    '<p class="modal-sub" style="margin-top:14px;"><a href="#" onclick="event.preventDefault(); closeModal(); openForgotKeyModal();">Forgot your key?</a></p>'
+  );
+}
+
+async function submitRestoreProfile() {
+  const name = document.getElementById('restoreNameInput').value.trim();
+  const key = document.getElementById('restoreKeyInput').value.trim();
+  const errBox = document.getElementById('restoreModalError');
+  if (!name || !key) {
+    errBox.innerHTML = '<p class="testresult err">Enter both your Username and Key.</p>';
+    return;
+  }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('restoreProfile', '#restoreSubmitBtn', 'Signing in\u2026');
+  if (!endSubmit) return;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: name, creatorKey: key }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      errBox.innerHTML = '<p class="testresult err">' +
+        escapeHtml(data.error === 'no-kv' ? 'This Worker has no CONFIGS KV namespace bound.' : (data.error || 'Could not restore.')) + '</p>';
+      return;
+    }
+    // Clean any prior account state before loading restored account
+    clearLocalAccountData();
+    activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
+    localStorage.setItem('myListAddon:creatorName', data.creatorName);
+    localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
+    localStorage.setItem('myListAddon:creatorKey', key);
+    closeModal();
+    // Released here, not in the finally below: what follows is the sign-in
+    // tail, and loadCreatorSync can take as long as the network takes. Holding
+    // the guard across it would leave the Login button disabled for the whole
+    // of it and stop someone signing into a different account. Calling it twice
+    // is harmless.
+    endSubmit();
+    renderCreatorProfileBar();
+    renderAccountKeySection();
+    renderWatchlistPreferencesSection();
+    renderTrackPlaybackSection();
+    renderCreatorDashboard();
+    await loadCreatorSync();
+  } catch (e) {
+    errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
+  }
+}
+
+// Self-service key reset for anyone who set a recovery answer at signup
+// (see /api/creator/reset-key and its own comment). Reuses
+// showKeyRevealModal -- same one-time reveal UX as signup and the
+// admin-side reset -- and, once revealed, logs the new key straight in
+// the same way a successful restore would, since at that point the
+// person has fully proven who they are.
+function openForgotKeyModal() {
+  showModal(
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+    '<h2>Reset Your Key</h2>' +
+    '<p class="modal-sub">Enter your Username and the recovery answer you set when you created your account.</p>' +
+    '<div class="row"><input type="text" id="forgotKeyNameInput" placeholder="Username"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="forgotKeyAnswerInput" placeholder="Recovery Answer"></div>' +
+    '<div id="forgotKeyModalError"></div>' +
+    '<div class="actions" style="margin-top:14px;">' +
+    '<button type="button" class="primary" id="forgotKeySubmitBtn" onclick="submitForgotKey()">Reset Key</button>' +
+    '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Back to Login</button>' +
+    '</div>' +
+    '<p class="modal-sub" style="margin-top:14px;">Didn\\'t set a recovery answer, or don\\'t remember it? Reach out via Settings &gt; Feedback &amp; Support.</p>'
+  );
+}
+
+async function submitForgotKey() {
+  const name = document.getElementById('forgotKeyNameInput').value.trim();
+  const answer = document.getElementById('forgotKeyAnswerInput').value.trim();
+  const errBox = document.getElementById('forgotKeyModalError');
+  if (!name || !answer) {
+    errBox.innerHTML = '<p class="testresult err">Enter both your Username and Recovery Answer.</p>';
+    return;
+  }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('forgotKey', '#forgotKeySubmitBtn', 'Resetting\u2026');
+  if (!endSubmit) return;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/reset-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: name, recoveryAnswer: answer }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      errBox.innerHTML = '<p class="testresult err">' + escapeHtml(data.error || 'Could not reset your key.') + '</p>';
+      return;
+    }
+    clearLocalAccountData();
+    activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
+    localStorage.setItem('myListAddon:creatorName', data.creatorName);
+    localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
+    localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
+    closeModal();
+    // Released before the sign-in tail, same reasoning as
+    // submitRestoreProfile -- see there.
+    endSubmit();
+    showKeyRevealModal(data.displayName, data.creatorKey);
+    renderCreatorProfileBar();
+    renderAccountKeySection();
+    renderWatchlistPreferencesSection();
+    renderTrackPlaybackSection();
+    renderCreatorDashboard();
+    await loadCreatorSync();
+  } catch (e) {
+    errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
+  }
+}
+
+
+// (e.g. the profile was somehow deleted) just falls back to logged-out
+// rather than throwing an error at page load.
+async function tryAutoRestoreCreatorProfile() {
+  const name = localStorage.getItem('myListAddon:creatorName');
+  const key = localStorage.getItem('myListAddon:creatorKey');
+  if (!name || !key) return;
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: name, creatorKey: key }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
+      localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
+      renderCreatorProfileBar();
+      renderAccountKeySection();
+      renderWatchlistPreferencesSection();
+      renderTrackPlaybackSection();
+      renderCreatorDashboard();
+      loadCreatorSync();
+    }
+  } catch (e) {
+    // stay logged out
+  }
+}
+
+// --- Site-wide account sync --------------------------------------------
+//
+// Derives a stable key for a collapsible panel from its own <summary>
+// text rather than requiring every one of them to carry an explicit id --
+// there's about 20 of these across the page already, and titles like
+// "Custom Lists" or "Channels" are already unique and don't change, so
+// this avoids a large, purely-mechanical HTML edit for no behavioral
+// difference.
+function collapsiblePanelKey(details) {
+  const summary = details.querySelector('summary');
+  const text = summary ? summary.textContent.trim() : '';
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'panel';
+}
+function collectCollapsedPanelsState() {
+  const state = {};
+  document.querySelectorAll('details.panel.collapsible').forEach((d) => {
+    state[collapsiblePanelKey(d)] = d.open;
+  });
+  return state;
+}
+function applyCollapsedPanelsState(state) {
+  if (!state || typeof state !== 'object') return;
+  document.querySelectorAll('details.panel.collapsible').forEach((d) => {
+    const key = collapsiblePanelKey(d);
+    if (Object.prototype.hasOwnProperty.call(state, key)) d.open = !!state[key];
+  });
+}
+
+// --- Sync baselines that outlive the page -----------------------------------
+//
+// Every push in this file cites the version of the record its edits are built
+// on (expectedUpdatedAt), and the server answers 409 rather than let a stale
+// device overwrite a newer one. That guard is only armed while the browser
+// knows a baseline -- and every one of those baselines lived in a window.
+// variable, which is gone the moment the page is.
+//
+// On a desktop tab left open all day that is invisible. On a phone it is the
+// normal case: an installed PWA is re-launched rather than resumed, so it
+// started every session with no baseline at all, sent expectedUpdatedAt:
+// undefined, and the server -- which reads a missing baseline as "an older
+// client with no opinion" and falls back to last-write-wins -- let it win. A
+// change made on the desktop minutes earlier was overwritten by the phone's
+// own stale copy, and the phone then showed the resurrected state back as if
+// it were current.
+//
+// Persisting them per account is what arms the guard on a cold start: the
+// first push of a session now cites the version this browser last actually
+// saw, so a push built on stale state is refused and pulled instead.
+const SYNC_BASELINE_KEY = 'myListAddon:syncBaselines';
+
+function currentSyncAccountName() {
+  if (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName) {
+    return activeCreator.creatorName;
+  }
+  try { return localStorage.getItem('myListAddon:creatorName') || ''; } catch (e) { return ''; }
+}
+
+// --- "this account was emptied" ----------------------------------------------
+//
+// /api/creator/account/reset empties an account but keeps the identity, so this
+// browser stays signed in and every OTHER browser signed into the same account
+// keeps its full local copy. What those browsers do next is the bug: an empty
+// account is indistinguishable from one that has never been saved to, and the
+// documented behaviour for the latter is to adopt local state and push it up.
+// loadCreatorSync's presets branch says so in as many words -- "Server presets
+// are empty: keep local presets and push them up" -- and renderCreatorDashboard
+// re-uploads every local list the account is missing. So a reset undid itself
+// as soon as another device woke up.
+//
+// The server now stamps the reset and hands it back on /sync/load and
+// /sync/meta. This is the device's side: the last reset it has SEEN. A stamp
+// newer than this one means the account was emptied while this browser was not
+// looking, and its copy is the thing to discard rather than the thing to save.
+function loadSeenAccountResetAt() {
+  try {
+    const n = parseInt(localStorage.getItem('myListAddon:accountResetAt') || '0', 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+function rememberAccountResetAt(at) {
+  const n = Number(at) || 0;
+  if (!n) return;
+  try { localStorage.setItem('myListAddon:accountResetAt', String(n)); } catch (e) {}
+}
+
+// True when serverResetAt describes a reset this browser has not yet applied.
+// Writes the stamp before returning, so the wipe below happens exactly once
+// however many times a load or a poll reports the same reset.
+function shouldApplyAccountReset(serverResetAt) {
+  const at = Number(serverResetAt) || 0;
+  if (!at) return false;
+  if (at <= loadSeenAccountResetAt()) return false;
+  rememberAccountResetAt(at);
+  return true;
+}
+
+// Discards this browser's copy of an account that was emptied elsewhere, and
+// leaves the person signed in on the now-blank account -- which is what they
+// asked for on the device where they pressed the button.
+//
+// clearLocalAccountData signs them out as a side effect and wipes every
+// myListAddon: key, the reset stamp included, so the three sign-in keys and the
+// stamp are written back afterwards. Same shape openResetAccountModal uses.
+function applyRemoteAccountReset(serverResetAt) {
+  if (!activeCreator) return;
+  const creatorName = activeCreator.creatorName;
+  const displayName = activeCreator.displayName;
+  let creatorKey = '';
+  try { creatorKey = localStorage.getItem('myListAddon:creatorKey') || ''; } catch (e) {}
+  if (!creatorKey) return;
+
+  window._suppressCreatorSync = true;
+  try {
+    if (typeof clearLocalAccountData === 'function') clearLocalAccountData();
+    activeCreator = { creatorName: creatorName, displayName: displayName };
+    try {
+      localStorage.setItem('myListAddon:creatorName', creatorName);
+      localStorage.setItem('myListAddon:creatorDisplayName', displayName || creatorName);
+      localStorage.setItem('myListAddon:creatorKey', creatorKey);
+    } catch (e) {}
+    rememberAccountResetAt(serverResetAt);
+    if (typeof renderCreatorProfileBar === 'function') renderCreatorProfileBar();
+    if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+    if (typeof showAddedToast === 'function') {
+      showAddedToast('This account was reset on another device \u2014 local data cleared');
+    }
+  } finally {
+    window._suppressCreatorSync = false;
+  }
+}
+
+function loadSyncBaselines() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SYNC_BASELINE_KEY) || 'null');
+    if (!raw || typeof raw !== 'object') return null;
+    // Stamped with the account they describe. Signing out clears every
+    // myListAddon: key anyway (clearLocalAccountData), so this is the
+    // belt-and-braces half: citing one account's version while saving
+    // another's data would 409 forever rather than merely be wrong once.
+    if (!raw.account || raw.account !== currentSyncAccountName()) return null;
+    return raw;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Writes only the fields named, so a save that knows one stamp cannot blank
+// the others.
+function saveSyncBaselines(patch) {
+  const account = currentSyncAccountName();
+  if (!account || !patch) return;
+  try {
+    const current = loadSyncBaselines() || {};
+    const next = { account: account };
+    ['config', 'tracking', 'trackingClient', 'presets', 'channels'].forEach((k) => {
+      // A field the caller has no number for keeps whatever was stored --
+      // "I don't know this one" must not read as "forget it".
+      const offered = Object.prototype.hasOwnProperty.call(patch, k) ? patch[k] : undefined;
+      const v = Number.isFinite(Number(offered)) && offered !== null && offered !== '' ? offered : current[k];
+      if (Number.isFinite(Number(v))) next[k] = Number(v);
+    });
+    localStorage.setItem(SYNC_BASELINE_KEY, JSON.stringify(next));
+  } catch (e) {
+    // Non-critical: without it this browser is exactly as unguarded as it was
+    // before the key existed, never worse.
+  }
+}
+
+// Called once at load, and again from the sign-in paths, so the very first
+// push of a session is guarded. Deliberately does NOT invent a baseline it
+// cannot support: an account with no stored stamps stays undefined, which is
+// the old last-write-wins behaviour rather than a fabricated version the
+// server would compare against.
+function restoreSyncBaselines() {
+  const stored = loadSyncBaselines();
+  if (!stored) return;
+  if (typeof window._serverSyncUpdatedAt === 'undefined' && Number.isFinite(stored.config)) {
+    window._serverSyncUpdatedAt = stored.config;
+  }
+  if (typeof window._serverTrackingUpdatedAt === 'undefined' && Number.isFinite(stored.tracking)) {
+    window._serverTrackingUpdatedAt = stored.tracking;
+  }
+  if (typeof window._serverTrackingClientVersion === 'undefined' && Number.isFinite(stored.trackingClient)) {
+    window._serverTrackingClientVersion = stored.trackingClient;
+  }
+  if (typeof window._serverPresetsUpdatedAt === 'undefined' && Number.isFinite(stored.presets)) {
+    window._serverPresetsUpdatedAt = stored.presets;
+  }
+  if (typeof window._serverChannelsUpdatedAt === 'undefined' && Number.isFinite(stored.channels)) {
+    window._serverChannelsUpdatedAt = stored.channels;
+  }
+}
+restoreSyncBaselines();
+
+// --- Nothing goes up before this browser has asked what is already there ----
+//
+// activeCreator is set the moment /api/creator/restore answers, and the first
+// /api/creator/sync/load is a second round trip behind it -- but the page's
+// own start-up work waits for neither. refreshAiringNext runs 600ms after
+// load and backfillWatchHistoryEpisodeStills at 1400ms, and both end in
+// scheduleTrackingSync (300ms debounce); every autosave path does the same
+// for the config blob. So on a cold start -- which, for an installed PWA, is
+// every time it is opened -- this browser routinely pushed its entire stale
+// Watch History, Continue Watching and config to the account BEFORE the load
+// that would have told it what the account actually holds.
+//
+// save-tracking and sync/save are both full overwrites by design, so an item
+// removed on the desktop an hour earlier came straight back, and the load
+// that followed a moment later handed the resurrected copy back to the person
+// as the current state. That is the bug this gate closes: while a sign-in is
+// known but its first load has not been applied, a push is remembered rather
+// than sent, and flushed once the load lands. Nothing is at risk in the
+// meantime -- everything being pushed is sitting in localStorage throughout --
+// and it then goes up against the right baseline instead of over the top of
+// whatever it was built without seeing.
+let _creatorSyncLoadedFor = null;
+let _pendingSyncPushes = null;
+let _creatorSyncGateTimer = null;
+// If the first load never lands (offline, a Worker error), the gate cannot
+// stay shut forever or this browser would stop syncing entirely for as long
+// as the page is open. It opens anyway after this long -- by which point the
+// persisted baselines above are what stands between a stale push and someone
+// else's data, which is exactly the protection they exist to provide.
+const CREATOR_SYNC_GATE_FAILSAFE_MS = 20000;
+
+function creatorSyncGateOpen() {
+  if (typeof activeCreator === 'undefined' || !activeCreator) return true;
+  return _creatorSyncLoadedFor === activeCreator.creatorName;
+}
+
+// Remembers that a push was wanted. Which kind is all that needs keeping --
+// every push reads the current state out of localStorage/the DOM when it
+// runs, so one deferred push covers any number of changes made while the gate
+// was shut.
+function deferSyncPush(kind, opts) {
+  if (!_pendingSyncPushes) _pendingSyncPushes = {};
+  _pendingSyncPushes[kind] = true;
+  // Armed here rather than only on a failed load, so that no push can be held
+  // indefinitely by a sign-in path that never got as far as loading -- the
+  // gate is a safety measure, and one that can strand a person's edits is not.
+  if (!_creatorSyncGateTimer) armCreatorSyncGateFailsafe();
+  // An intentional removal must stay one: it is the flag that tells
+  // save-tracking to trust a SHORTER array (see pushTrackingSync), and
+  // losing it across the gate would let the scrobble rescue undo a delete.
+  if (kind === 'tracking' && opts && opts.intentionalRemoval) {
+    _pendingSyncPushes.trackingIntentional = true;
+  }
+}
+
+function flushDeferredSyncPushes() {
+  const pending = _pendingSyncPushes;
+  _pendingSyncPushes = null;
+  if (!pending) return;
+  if (pending.config && typeof pushCreatorSync === 'function') pushCreatorSync();
+  if (pending.channels && typeof pushChannelsSync === 'function') pushChannelsSync();
+  if (pending.presets) {
+    const fn = (typeof pushPresetsDirectly === 'function') ? pushPresetsDirectly : (window.pushPresetsDirectly || null);
+    const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+    if (fn) fn(getMapFn());
+  }
+  if (pending.tracking && typeof pushTrackingSync === 'function') {
+    pushTrackingSync({ intentionalRemoval: !!pending.trackingIntentional });
+  }
+}
+
+// Called by loadCreatorSync once the account's state has been applied -- and
+// by the failsafe above if it never can be.
+function markCreatorSyncLoaded() {
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  if (_creatorSyncGateTimer) { clearTimeout(_creatorSyncGateTimer); _creatorSyncGateTimer = null; }
+  _creatorSyncLoadedFor = activeCreator.creatorName;
+  flushDeferredSyncPushes();
+}
+window.markCreatorSyncLoaded = markCreatorSyncLoaded;
+
+function armCreatorSyncGateFailsafe() {
+  if (_creatorSyncGateTimer) clearTimeout(_creatorSyncGateTimer);
+  _creatorSyncGateTimer = setTimeout(() => {
+    _creatorSyncGateTimer = null;
+    markCreatorSyncLoaded();
+  }, CREATOR_SYNC_GATE_FAILSAFE_MS);
+}
+
+// --- What this device has of its own, and what is merely stale --------------
+//
+// loadCreatorSync unions any local-only tracking items back into what the
+// server just sent, so an item added here and not yet pushed is not lost. The
+// same union also re-adds anything this device is merely STALE about -- an
+// item another device removed -- and the wrong read of the two silently undid
+// the other device's change.
+//
+// Telling them apart needs to know whether THIS device has touched the list
+// since it was last level with the account. The server's tracking stamp
+// cannot answer that on its own: the merge stamps localList.updatedAt =
+// Date.now() every time it runs, which lands a moment AFTER the server
+// version it just adopted, so a freshly-synced list always looks newer than
+// the baseline it was built from -- and every cold start read "keep
+// everything" again.
+//
+// So the baseline recorded here is the local list's own updatedAt at the last
+// moment this browser and the account are known to have agreed: after a load
+// that kept nothing local-only, and after a successful push. Unequal means
+// this device has edited the list since; equal means it has not, and the
+// server's copy is simply newer.
+const TRACKING_LOCAL_BASELINE_KEY = 'myListAddon:trackingLocalBaseline';
+
+function loadTrackingLocalBaseline() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(TRACKING_LOCAL_BASELINE_KEY) || 'null');
+    if (!raw || typeof raw !== 'object') return null;
+    if (!raw.account || raw.account !== currentSyncAccountName()) return null;
+    return raw;
+  } catch (e) {
+    return null;
+  }
+}
+
+// stamps: { 'watch-history': <the updatedAt that is now agreed>, ... }
+function recordTrackingLocalBaseline(stamps) {
+  const account = currentSyncAccountName();
+  if (!account || !stamps) return;
+  try {
+    const current = loadTrackingLocalBaseline() || {};
+    const next = { account: account };
+    ['watch-history', 'continue-watching', 'watchlist'].forEach((k) => {
+      const offered = Object.prototype.hasOwnProperty.call(stamps, k) ? stamps[k] : undefined;
+      const v = Number.isFinite(Number(offered)) && offered !== null && offered !== '' ? offered : current[k];
+      if (Number.isFinite(Number(v))) next[k] = Number(v);
+    });
+    localStorage.setItem(TRACKING_LOCAL_BASELINE_KEY, JSON.stringify(next));
+  } catch (e) {
+    // Same as the sync baselines: without it this is the old behaviour.
+  }
+}
+
+let creatorSyncSaveTimer = null;
+// Debounced -- reordering a list of rows, toggling several panels, or
+// typing into a preset name can all fire this repeatedly in quick
+// succession, and there's no need to push a request for every single one
+// of those when only the last matters.
+function scheduleCreatorSyncSave(opts) {
+  if (!activeCreator) return;
+  if (creatorSyncSaveTimer) clearTimeout(creatorSyncSaveTimer);
+  creatorSyncSaveTimer = setTimeout(pushCreatorSync, 1200);
+  // Tracking data (Watch History/Continue Watching/etc) is split into its
+  // own sync call now -- see pushTrackingSync's own comment -- so anything
+  // that already calls this general scheduler also gets tracking synced
+  // in lockstep, rather than auditing every individual call site for
+  // whether it happens to touch tracking data too.
+  scheduleTrackingSync(opts);
+}
+
+// Debounced sibling of scheduleCreatorSyncSave, just for presets -- call
+// this (not scheduleCreatorSyncSave) after any change to presets
+// specifically (add/delete/upload -- see saveCurrentAsPreset,
+// deletePreset, uploadPresetFile below). Presets travel to the server
+// through pushPresetsDirectly/save-presets exclusively now; see that
+// function's comment for why they were split out of the routine autosave.
+let presetsSyncTimer = null;
+function schedulePresetsSync() {
+  if (!activeCreator) return;
+  if (presetsSyncTimer) clearTimeout(presetsSyncTimer);
+  presetsSyncTimer = setTimeout(() => {
+    const fn = (typeof pushPresetsDirectly === 'function') ? pushPresetsDirectly : (window.pushPresetsDirectly || null);
+    const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+    if (fn) fn(getMapFn());
+  }, 1200);
+}
+
+// Debounced sibling of scheduleCreatorSyncSave, just for TV Channels --
+// syncs the user's saved local channels to the server so they roam across
+// browsers seamlessly when signed in.
+let channelsSyncTimer = null;
+function scheduleChannelsSync() {
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  if (channelsSyncTimer) clearTimeout(channelsSyncTimer);
+  channelsSyncTimer = setTimeout(pushChannelsSync, 1200);
+}
+
+async function pushChannelsSync() {
+  // A reset has just cleared this browser on purpose; an autosave or
+  // scrobble landing now would push the old state straight back up to
+  // the account that was just emptied.
+  if (window._suppressCreatorSync) return;
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+  // Not until this browser has seen what the account holds -- see
+  // creatorSyncGateOpen.
+  if (!creatorSyncGateOpen()) { deferSyncPush('channels'); return; }
+  try {
+    const localChannels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+    const localMerged = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
+    const res = await fetch(ORIGIN + '/api/creator/sync/save-channels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        channels: localChannels,
+        mergedChannels: localMerged,
+        // Same conflict guard the main config blob has carried for a while,
+        // now that the server enforces one here too. A Channel's url is its
+        // entire episode list, so a second device autosaving a stale copy
+        // was the most expensive silent overwrite this app had.
+        expectedUpdatedAt: window._serverChannelsUpdatedAt,
+      }),
+    });
+    if (res.status === 409) {
+      // Another device saved first. Pull instead of clobbering; whatever is
+      // pending here is still in localStorage and goes up next time against
+      // the right baseline.
+      if (typeof loadCreatorSync === 'function') loadCreatorSync({ background: true });
+      return;
+    }
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && typeof data.updatedAt === 'number') {
+      window._serverChannelsUpdatedAt = data.updatedAt;
+      saveSyncBaselines({ channels: data.updatedAt });
+    }
+  } catch (e) {
+    // silently fail, it's a background sync
+  }
+}
+
+// Debounced sibling of scheduleCreatorSyncSave, just for Watch History/
+// Continue Watching tracking data -- split out for the same reason
+// presets were: watchHistory in particular can grow into the thousands of
+// items (e.g. a bulk "mark as watched" import), and bundling it into every
+// routine autosave meant every single config change re-sent and
+// re-processed the whole thing, which risked the same free-plan CPU
+// budget problem presets did -- and, worse, meant a large watchHistory
+// that failed to save left Stremio/wako's Watch History/Continue Watching
+// catalog rows showing "No items found" even though the browser's own
+// local copy looked complete.
+let trackingSyncTimer = null;
+let _pendingIntentionalRemoval = false;
+// See pushTrackingSync's 409 handler.
+let _trackingConflictRetryInFlight = false;
+function scheduleTrackingSync(opts) {
+  if (!activeCreator) return;
+  if (trackingSyncTimer) clearTimeout(trackingSyncTimer);
+  if (opts && opts.intentionalRemoval) {
+    _pendingIntentionalRemoval = true;
+    try { localStorage.setItem('myListAddon:lastIntentionalRemoval', Date.now()); } catch(e) {}
+  }
+  trackingSyncTimer = setTimeout(() => {
+    const flag = _pendingIntentionalRemoval;
+    _pendingIntentionalRemoval = false;
+    pushTrackingSync({ intentionalRemoval: flag });
+  }, 300);
+}
+
+async function pushCreatorSync() {
+  // A reset has just cleared this browser on purpose; an autosave or
+  // scrobble landing now would push the old state straight back up to
+  // the account that was just emptied.
+  if (window._suppressCreatorSync) return;
+  if (!activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+  // Not until this browser has seen what the account holds -- see
+  // creatorSyncGateOpen. This is the config blob: the catalog rows, which is
+  // where "my list rows came back after opening the phone" came from.
+  if (!creatorSyncGateOpen()) { deferSyncPush('config'); return; }
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/sync/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        config: collectEntries(),
+        keys: (typeof collectKeys === 'function') ? collectKeys() : {},
+        // Presets and tracking data (watchHistory/continueWatching/etc)
+        // deliberately NOT included here -- both are pieces of this state
+        // that can genuinely grow large, while everything else in this
+        // payload changes far more often but stays small. See
+        // pushPresetsDirectly/schedulePresetsSync and
+        // pushTrackingSync/scheduleTrackingSync, which now handle those on
+        // their own, only when they actually change.
+        collapsedPanels: collectCollapsedPanelsState(),
+        likedLists: [...getLikedListsSet()],
+        hiddenLists: (function() {
+          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch (e) { return []; }
+        })(),
+        hiddenMyListsSections: (function() {
+          try { return JSON.parse(localStorage.getItem('myListAddon:hiddenMyListsSections') || '[]'); } catch (e) { return []; }
+        })(),
+        // The updatedAt this browser last actually saw (from a prior
+        // /sync/load or /sync/save), i.e. the version these edits are
+        // built on top of -- lets the server tell whether another device
+        // saved in between instead of silently overwriting it. See
+        // /api/creator/sync/save's own comment.
+        expectedUpdatedAt: window._serverSyncUpdatedAt,
+      }),
+    });
+    if (res.status === 409) {
+      // Another device saved more recently than what this browser last
+      // saw. Don't clobber that write -- pull the latest instead. Any
+      // edit still pending in this tab hasn't gone anywhere (it's still
+      // sitting in the DOM/localStorage) and goes up on the next autosave,
+      // now against the correct baseline.
+      if (typeof loadCreatorSync === 'function') loadCreatorSync({ background: true });
+      return;
+    }
+    const data = await res.json().catch(() => null);
+    if (data && data.ok && typeof data.updatedAt === 'number') {
+      window._serverSyncUpdatedAt = data.updatedAt;
+      saveSyncBaselines({ config: data.updatedAt });
+    }
+    window._lastCreatorSyncPushedAt = Date.now();
+  } catch (e) {
+    // silently fail, it's a background sync
+  }
+}
+
+// Cheap fingerprint of everything pushTrackingSync would send, used to
+// skip the request entirely when none of it has actually changed.
+//
+// scheduleCreatorSyncSave calls scheduleTrackingSync in lockstep on
+// purpose (see its own comment -- it avoids auditing every call site for
+// whether it happens to touch tracking data), but the consequence was
+// that collapsing a panel, reordering a row, or renaming a preset each
+// re-uploaded a watchHistory that can run to thousands of items, and made
+// the server re-read, merge and rewrite the whole record for nothing.
+// Keeping the lockstep call but making the push itself a no-op when
+// nothing tracking-related moved gets the same safety with none of the
+// cost.
+//
+// Deliberately NOT a hash of the full payload -- building that string is
+// most of the work being avoided. Length plus the first and last id plus
+// the newest watchedAt of each list catches every real mutation (add,
+// remove, reorder, re-watch), and anything it somehow missed is corrected
+// by the heartbeat below rather than lost.
+// --- Discover recommendations snapshot --------------------------------------
+//
+// The Discover tab's Recommended Movies/Recommended Shows cards are built
+// in the browser from this account's whole picture: Continue Watching,
+// Watch History, Watchlist and every other custom list. The catalog row
+// those cards add (custom:curated:recommended-movies) is served by
+// fetchCuratedCatalog (05_catalog-core.js), which can only see whatever
+// tracking data reached the server -- so left to re-derive, it produced a
+// different set of items, and a different number of them, from the card
+// that advertised the list. Carrying the rendered list up with the rest of
+// the tracking data is the same approach Airing Next already takes, and
+// for the same reason.
+const CURATED_RECS_KEY = 'myListAddon:curatedRecommendations';
+
+function loadCuratedRecommendations() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CURATED_RECS_KEY) || 'null');
+    if (!raw || typeof raw !== 'object') return null;
+    return {
+      movies: Array.isArray(raw.movies) ? raw.movies : [],
+      shows: Array.isArray(raw.shows) ? raw.shows : [],
+      updatedAt: Number(raw.updatedAt) || 0,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Same cheap-fingerprint idea as trackingSyncSignature's own listSig --
+// length plus the first and last id of each side. Enough to notice the
+// recommendations actually changing without stringifying eighty items on
+// every autosave.
+function curatedRecsSignature(blob) {
+  if (!blob) return '0';
+  var m = Array.isArray(blob.movies) ? blob.movies : [];
+  var s = Array.isArray(blob.shows) ? blob.shows : [];
+  function ends(arr) {
+    if (!arr.length) return '0';
+    return arr.length + '/' + ((arr[0] && arr[0].id) || '') + '/' + ((arr[arr.length - 1] && arr[arr.length - 1].id) || '');
+  }
+  return ends(m) + '|' + ends(s);
+}
+
+// Called by the Discover tab every time it renders those two cards (see
+// 19_client-search-and-likes.js). Writing unconditionally would bump
+// updatedAt on every visit and make the tracking signature look changed,
+// forcing a pointless full push each time -- so an unchanged list is a
+// no-op.
+function persistCuratedRecommendations(movies, shows) {
+  const blob = {
+    movies: Array.isArray(movies) ? movies : [],
+    shows: Array.isArray(shows) ? shows : [],
+    updatedAt: Date.now(),
+  };
+  if (!blob.movies.length && !blob.shows.length) return;
+  const existing = loadCuratedRecommendations();
+  if (existing && curatedRecsSignature(existing) === curatedRecsSignature(blob)) return;
+  try {
+    localStorage.setItem(CURATED_RECS_KEY, JSON.stringify(blob));
+  } catch (e) {}
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+}
+window.persistCuratedRecommendations = persistCuratedRecommendations;
+
+function trackingSyncSignature(localMap) {
+  function listSig(items) {
+    if (!Array.isArray(items) || !items.length) return '0';
+    var first = items[0] || {};
+    var last = items[items.length - 1] || {};
+    var newest = 0;
+    for (var i = 0; i < items.length; i++) {
+      var w = (items[i] && items[i].watchedAt) || 0;
+      if (w > newest) newest = w;
+    }
+    return items.length + '/' + (first.id || first.imdbId || first.showId || '') +
+      '/' + (last.id || last.imdbId || last.showId || '') + '/' + newest;
+  }
+  var wl = localMap['watchlist'] || {};
+  return [
+    listSig((localMap['watch-history'] || {}).items),
+    listSig((localMap['continue-watching'] || {}).items),
+    listSig((localMap['airing-next'] || {}).items),
+    curatedRecsSignature(loadCuratedRecommendations()),
+    listSig(wl.items),
+    Number(wl.updatedAt) || 0,
+    (window._fullyWatchedShowIds ? window._fullyWatchedShowIds.size || [...window._fullyWatchedShowIds].length : 0),
+    Object.keys(window._dismissedContinueWatching || {}).length,
+    localStorage.getItem('myListAddon:trackPlayback') === '1' ? 1 : 0,
+    localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0' ? 1 : 0,
+    localStorage.getItem('myListAddon:scrobbleFilterUsers') === '1' ? 1 : 0,
+    localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '',
+    localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1' ? 1 : 0,
+  ].join('|');
+}
+
+// Even with an unchanged signature, push at least this often. A scrobble
+// landing server-side is rescued by save-tracking's own merge, so this is
+// purely a self-healing floor: if the signature ever failed to notice
+// something, the account is at most this far out of date rather than
+// permanently stale.
+var TRACKING_SYNC_HEARTBEAT_MS = 10 * 60 * 1000;
+
+// Pushes Watch History/Continue Watching tracking data straight to the
+// account's dedicated tracking record (see /api/creator/sync/save-
+// tracking) -- the ONLY path this data travels to the server through now.
+async function pushTrackingSync(opts) {
+  // A reset has just cleared this browser on purpose; an autosave or
+  // scrobble landing now would push the old state straight back up to
+  // the account that was just emptied.
+  if (window._suppressCreatorSync) return;
+  if (!activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+  // Not until this browser has seen what the account holds. This endpoint
+  // replaces Watch History and Continue Watching wholesale, and the timers
+  // that start the page (refreshAiringNext at 600ms,
+  // backfillWatchHistoryEpisodeStills at 1400ms) reach it long before the
+  // first load answers -- see creatorSyncGateOpen for the whole story.
+  if (!creatorSyncGateOpen()) { deferSyncPush('tracking', opts); return; }
+  try {
+    const localMap = loadLocalCustomLists();
+    // An intentional removal must always reach the server -- it is the one
+    // push whose whole purpose is to make the stored list shorter, and
+    // save-tracking treats it specially (it skips the scrobble rescue).
+    const isIntentional = !!(opts && opts.intentionalRemoval);
+    const sig = trackingSyncSignature(localMap);
+    const sinceLast = Date.now() - (window._lastTrackingSyncPushedAt || 0);
+    if (!isIntentional && sig === window._lastTrackingSig && sinceLast < TRACKING_SYNC_HEARTBEAT_MS) {
+      return;
+    }
+    const wl = localMap['watchlist'] || {};
+    const wlItems = Array.isArray(wl.items) ? wl.items : [];
+    const wlUpdatedAt = Number(wl.updatedAt) || Date.now();
+    // Read before the request, not after: an edit landing while it is in
+    // flight must leave the list looking dirty on the next load, or that
+    // edit would be judged already-agreed and dropped. See
+    // recordTrackingLocalBaseline.
+    const sentStamps = {
+      'watch-history': Number((localMap['watch-history'] || {}).updatedAt) || 0,
+      'continue-watching': Number((localMap['continue-watching'] || {}).updatedAt) || 0,
+      'watchlist': wlUpdatedAt,
+    };
+    const res = await fetch(ORIGIN + '/api/creator/sync/save-tracking', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        // Always the full current list, same overwrite-the-blob approach
+        // as everything else synced here -- see loadCreatorSync's comment
+        // for why signing in replaces local state wholesale rather than
+        // merging. The one exception is a scrobble ping landing between
+        // this browser's last load and this push -- see save-tracking's
+        // own comment for the narrow rescue that covers that, and
+        // intentionalRemoval below for why a deliberate delete skips it.
+        watchHistory: (localMap['watch-history'] && localMap['watch-history'].items) || [],
+        continueWatching: (localMap['continue-watching'] && localMap['continue-watching'].items) || [],
+        airingNext: (localMap['airing-next'] && localMap['airing-next'].items) || [],
+        curatedRecommendations: loadCuratedRecommendations(),
+        watchlist: wlItems,
+        watchlistUpdatedAt: wlUpdatedAt,
+        trackPlayback: localStorage.getItem('myListAddon:trackPlayback') === '1',
+        removeWatchedFromWatchlist: localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0',
+        scrobbleFilterUsers: localStorage.getItem('myListAddon:scrobbleFilterUsers') === '1',
+        scrobbleAllowedUsers: localStorage.getItem('myListAddon:scrobbleAllowedUsers') || '',
+        scrobbleBlockAnonymous: localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1',
+        fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
+        dismissedContinueWatching: window._dismissedContinueWatching || {},
+        // Set only by flows that are deliberately shrinking Watch History
+        // (Clear Watch History, removing a single item) -- tells the
+        // server to trust this array exactly as sent instead of rescuing
+        // any item a recent scrobble might have added that isn't in it,
+        // so an intentional delete can never be silently undone by that
+        // rescue on the very next autosave.
+        intentionalRemoval: !!(opts && opts.intentionalRemoval),
+        // The version of the account's tracking record this push is built on
+        // -- the server refuses rather than overwrite a newer one. See
+        // save-tracking's own comment for why this is a dedicated version
+        // rather than updatedAt (a scrobble moves updatedAt and must not
+        // start a conflict).
+        expectedClientVersion: window._serverTrackingClientVersion,
+      }),
+    });
+    if (res && res.status === 409) {
+      // Another browser saved after the version this push cites. Pull that
+      // state, then send this device's changes once, now against the right
+      // baseline. Bounded to one retry: a second conflict means yet another
+      // writer, and the next scheduled push carries the newer baseline
+      // anyway -- what must not happen is this browser looping, or giving up
+      // silently on an intentional removal.
+      if (!(opts && opts.isConflictRetry) && !_trackingConflictRetryInFlight && typeof loadCreatorSync === 'function') {
+        // One conflict cycle at a time across the whole page, not just down
+        // this call stack: the load below can itself start a push (it does,
+        // when it finds local-only items), and that push can conflict too --
+        // which without this is a load/push loop rather than a retry.
+        _trackingConflictRetryInFlight = true;
+        try {
+          await loadCreatorSync({ background: true });
+          return await pushTrackingSync(Object.assign({}, opts || {}, { isConflictRetry: true }));
+        } finally {
+          _trackingConflictRetryInFlight = false;
+        }
+      }
+      return;
+    }
+    const data = res ? await res.json().catch(() => null) : null;
+    if (data && data.ok) {
+      if (Number.isFinite(Number(data.clientVersion))) {
+        window._serverTrackingClientVersion = Number(data.clientVersion);
+        saveSyncBaselines({ trackingClient: Number(data.clientVersion) });
+      }
+      // This device and the account now agree on what was sent, so a later
+      // load can tell a genuine local edit from a stale copy of something
+      // removed elsewhere.
+      recordTrackingLocalBaseline(sentStamps);
+    }
+    window._lastTrackingSyncPushedAt = Date.now();
+    window._lastTrackingSig = sig;
+  } catch (e) {
+    // silently fail, it's a background sync
+  }
+}
+
+// Decides whether loadCreatorSync's watch-history/continue-watching/
+// watchlist merges should union this device's local-only items back into
+// what the server just sent, or drop them and trust the server outright.
+//
+// The merge exists for a real case: an item added on this device that
+// hasn't reached the server yet (offline, or a push still in flight)
+// should not vanish just because this load's response doesn't have it.
+// But the same union also re-adds anything this device's local copy is
+// merely STALE about -- most sharply, an item another device removed
+// (unwatched an episode, dismissed a finished show from Continue
+// Watching) after this device's last sync. That removal reaches the
+// server as a shorter array with nothing marking what's now missing, so
+// "not in the server response" reads exactly like "added here and not
+// pushed yet" -- and the wrong read wins the merge, silently undoes the
+// other device's change, then a push a few lines down carries the
+// undone-removal straight back to the server. That is the bug: change
+// something on desktop, open the phone, and the change is gone.
+//
+// The two cases are told apart by timing instead: localList.updatedAt is
+// stamped on every genuine local mutation (toggleWatchStatus,
+// updateContinueWatching, etc. -- never by this merge itself, since the
+// caller reads it before overwriting the field). priorTrackingUpdatedAt
+// is the tracking stamp this device was already level with BEFORE this
+// load. If the local list has not changed since then, this device has
+// nothing of its own to protect -- the server is strictly newer, and any
+// item missing from it was removed there, not added here. Only a local
+// edit that lands AFTER that baseline is genuinely unpushed and worth
+// keeping. On this device's very first sync ever (no prior baseline to
+// compare against), there is no way to tell -- so it keeps the old,
+// preserve-everything behavior rather than risk dropping real data.
+//
+// The persisted per-list baseline (recordTrackingLocalBaseline, above) is the
+// answer where there is one, and it is what makes this work at all on a phone:
+// the timestamp comparison below can only ever compare against a stamp held in
+// a window. variable, so a re-launched PWA had no baseline, took the
+// first-sync branch, and re-added everything the desktop had removed --
+// every single time it was opened.
+function shouldKeepLocalOnlyTracking(localList, priorTrackingUpdatedAt, listKey) {
+  const localUpdatedAt = Number(localList && localList.updatedAt) || 0;
+  const baseline = listKey ? loadTrackingLocalBaseline() : null;
+  if (baseline && Object.prototype.hasOwnProperty.call(baseline, listKey)) {
+    // This device has edited the list since the last time the two sides were
+    // known to agree -- and only then is "missing from the server's answer"
+    // something this device might legitimately be holding.
+    return localUpdatedAt !== Number(baseline[listKey]);
+  }
+  if (typeof priorTrackingUpdatedAt === 'undefined') return true;
+  return localUpdatedAt > priorTrackingUpdatedAt;
+}
+
+// Called right after sign-in (fresh restore, auto-restore, or a brand new
+// profile). A null 'data' means this account has never synced from any
+// device before, so rather than wiping out whatever's already on this
+// browser, that current state is adopted as-is and pushed up as the
+// account's first save. A real 'data' means the opposite: signing in
+// replaces this browser's local state with the account's, the same way
+// signing into any other synced account would.
+async function loadCreatorSync(opts) {
+  const isBackgroundResume = !!(opts && opts.background);
+  if (!activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+  // Who this load is for. Checked again after the await, because signing in as
+  // someone else calls clearLocalAccountData() and then starts a fresh load --
+  // and this one is still in flight. Measured: signing in as alice and then
+  // immediately as bob left alice's catalog rows and liked lists rendered under
+  // bob's name, because her slower response was simply the last writer and
+  // nothing told it that it had been superseded.
+  //
+  // The account itself was never contaminated -- the next push cited alice's
+  // updatedAt, the server answered 409 and the 409 handler pulled bob's state
+  // back. But that is the server catching it, and what was on screen in the
+  // meantime was another account's data.
+  const loadingFor = activeCreator.creatorName;
+  const isStale = () => !activeCreator || activeCreator.creatorName !== loadingFor;
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/sync/load', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+    });
+    if (isStale()) return;
+    const data = await res.json();
+    if (isStale()) return;
+    if (!data.ok) {
+      // Answered, but not with state this browser can adopt (a rejected key,
+      // a storage error). Same failsafe as the catch below: the gate must
+      // not hold pushes forever on a load that is never going to arrive.
+      armCreatorSyncGateFailsafe();
+      return;
+    }
+    window._lastCreatorSyncLoadedAt = Date.now();
+    // Before anything below adopts local state or pushes it up: was this
+    // account emptied while this browser was asleep? If so its copy is stale by
+    // definition, and uploading it is exactly how a reset used to undo itself.
+    if (shouldApplyAccountReset(data.resetAt)) {
+      markCreatorSyncLoaded();
+      applyRemoteAccountReset(data.resetAt);
+      return;
+    }
+    if (!data.data) {
+      // This account has nothing stored, so there is nothing to be stale
+      // against and this browser's state becomes its first save -- open the
+      // gate first, or the pushes below would defer against themselves.
+      markCreatorSyncLoaded();
+      pushCreatorSync();
+      const localPresets = loadPresetsMap();
+      if (localPresets && Object.keys(localPresets).length) pushPresetsDirectly(localPresets);
+      const localChannels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+      const localMerged = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
+      if ((localChannels && Object.keys(localChannels).length) || (localMerged && Object.keys(localMerged).length)) {
+        pushChannelsSync();
+      }
+      pushTrackingSync();
+      return;
+    }
+    const synced = data.data;
+    // Snapshot of the four blob stamps this browser is now level with. The
+    // background poll compares /api/creator/sync/meta against exactly
+    // these and skips the full load when none of them has moved -- see
+    // handleForegroundResumeSync below. meta returns a fifth, "lists", which
+    // this load cannot fill in (it describes the creatorlist: records, not
+    // the sync blob); handleForegroundResumeSync adopts that one itself once
+    // it has refreshed the dashboard.
+    window._syncMetaStamps = {
+      config: Number(synced.updatedAt) || 0,
+      tracking: Number(synced.trackingUpdatedAt) || 0,
+      presets: Number(synced.presetsUpdatedAt) || 0,
+      channels: Number(synced.channelsUpdatedAt) || 0,
+    };
+    // The same stamps, kept where the next cold start can find them. Without
+    // this the first push of every new page session cites nothing and the
+    // server's conflict guard cannot fire -- see loadSyncBaselines.
+    saveSyncBaselines({
+      config: Number(synced.updatedAt) || 0,
+      tracking: Number(synced.trackingUpdatedAt) || 0,
+      presets: Number(synced.presetsUpdatedAt) || 0,
+      channels: Number(synced.channelsUpdatedAt) || 0,
+      trackingClient: Number.isFinite(Number(synced.trackingClientVersion))
+        ? Number(synced.trackingClientVersion)
+        : undefined,
+    });
+    if (Number.isFinite(Number(synced.trackingClientVersion))) {
+      window._serverTrackingClientVersion = Number(synced.trackingClientVersion);
+    }
+    const timeChanged = typeof window._serverSyncUpdatedAt === 'undefined' || (synced.updatedAt && synced.updatedAt > window._serverSyncUpdatedAt);
+    if (synced.updatedAt !== undefined) window._serverSyncUpdatedAt = synced.updatedAt;
+    // The baselines the presets and channels pushes build on, adopted from
+    // the same load that adopts their data -- see pushPresetsDirectly and
+    // pushChannelsSync.
+    if (synced.presetsUpdatedAt !== undefined) window._serverPresetsUpdatedAt = Number(synced.presetsUpdatedAt) || 0;
+    if (synced.channelsUpdatedAt !== undefined) window._serverChannelsUpdatedAt = Number(synced.channelsUpdatedAt) || 0;
+    
+    const currentConfigStr = JSON.stringify(synced.config || []);
+    const configDataChanged = currentConfigStr !== window._lastConfigStr;
+    window._lastConfigStr = currentConfigStr;
+    
+    const configChanged = timeChanged && configDataChanged;
+
+    const trackingChanged = typeof window._serverTrackingUpdatedAt === 'undefined' || (synced.trackingUpdatedAt && synced.trackingUpdatedAt > window._serverTrackingUpdatedAt);
+    // The baseline this device was level with BEFORE this load -- captured
+    // ahead of the reassignment below so the merge blocks further down can
+    // tell "an edit this device made since it last talked to the server"
+    // (keep it) apart from "a stale local copy of something removed
+    // elsewhere since" (drop it). See shouldKeepLocalOnlyTracking's own
+    // comment for why that distinction matters.
+    const priorServerTrackingUpdatedAt = window._serverTrackingUpdatedAt;
+    if (synced.trackingUpdatedAt !== undefined) window._serverTrackingUpdatedAt = synced.trackingUpdatedAt;
+
+    // Only rebuild lists table DOM if the list config actually changed or it's a full initial load
+    if (!isBackgroundResume || configChanged) {
+      suppressSave = true;
+      document.getElementById('lists').innerHTML = '';
+      if (Array.isArray(synced.config)) {
+        synced.config.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+      }
+      renumber();
+      suppressSave = false;
+
+      // Re-trigger live preview if catalogs tab has already been visited
+      if (window._catalogsInitializedOnce && typeof renderLivePreview === 'function') {
+        renderLivePreview();
+      }
+    }
+
+    // Restore hidden lists state from sync so the selections survive
+    // cross-browser logins. Both keys live only in localStorage locally;
+    // the server blob now carries them so this browser can adopt them.
+    if (Array.isArray(synced.hiddenLists)) {
+      try { localStorage.setItem('myListAddon:hiddenLists', JSON.stringify(synced.hiddenLists)); } catch (e) {}
+    }
+    if (Array.isArray(synced.hiddenMyListsSections)) {
+      try { localStorage.setItem('myListAddon:hiddenMyListsSections', JSON.stringify(synced.hiddenMyListsSections)); } catch (e) {}
+      if (typeof applyHiddenMyListsSections === 'function') applyHiddenMyListsSections();
+    }
+
+    if (synced.channels && typeof synced.channels === 'object') {
+      if (typeof saveLocalChannelsMap === 'function') {
+        saveLocalChannelsMap(synced.channels);
+      }
+    }
+    if (synced.mergedChannels && typeof synced.mergedChannels === 'object') {
+      if (typeof saveLocalMergedChannelsMap === 'function') {
+        saveLocalMergedChannelsMap(synced.mergedChannels);
+      }
+    }
+    if (typeof renderMyCreatedChannelsList === 'function') renderMyCreatedChannelsList();
+    if (typeof renderChannelMergeList === 'function') renderChannelMergeList();
+    
+    if (synced.presetsB64) {
+      decompressBase64ToJson(synced.presetsB64).then(parsedPresets => {
+        const normFn = (typeof extractNormalizedPresetsMap === 'function') ? extractNormalizedPresetsMap : (window.extractNormalizedPresetsMap || (x => x));
+        const normalized = normFn(parsedPresets);
+        if (normalized && typeof normalized === 'object' && Object.keys(normalized).length > 0) {
+          const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+          const saveMapFn = (typeof savePresetsMap === 'function') ? savePresetsMap : (window.savePresetsMap || (() => {}));
+          const renderFn = (typeof renderPresetsList === 'function') ? renderPresetsList : (window.renderPresetsList || (() => {}));
+          const localMap = getMapFn();
+          const merged = { ...localMap, ...normalized };
+          saveMapFn(merged);
+          renderFn();
+        }
+      }).catch(() => {});
+    } else if (synced.presets && typeof synced.presets === 'object' && Object.keys(synced.presets).length > 0) {
+      const normFn = (typeof extractNormalizedPresetsMap === 'function') ? extractNormalizedPresetsMap : (window.extractNormalizedPresetsMap || (x => x));
+      const normalized = normFn(synced.presets);
+      const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+      const saveMapFn = (typeof savePresetsMap === 'function') ? savePresetsMap : (window.savePresetsMap || (() => {}));
+      const renderFn = (typeof renderPresetsList === 'function') ? renderPresetsList : (window.renderPresetsList || (() => {}));
+      const localMap = getMapFn();
+      const merged = { ...localMap, ...normalized };
+      saveMapFn(merged);
+      renderFn();
+    } else {
+      // Server presets are empty: keep local presets and push them up to sync so they are preserved in Cloudflare KV
+      const getMapFn = (typeof loadPresetsMap === 'function') ? loadPresetsMap : (window.loadPresetsMap || (() => ({})));
+      const pushFn = (typeof pushPresetsDirectly === 'function') ? pushPresetsDirectly : (window.pushPresetsDirectly || null);
+      const renderFn = (typeof renderPresetsList === 'function') ? renderPresetsList : (window.renderPresetsList || (() => {}));
+      const localMap = getMapFn();
+      if (localMap && Object.keys(localMap).length > 0) {
+        if (pushFn) pushFn(localMap);
+      }
+      renderFn();
+    }
+    
+    applyCollapsedPanelsState(synced.collapsedPanels);
+    if (typeof synced.trackPlayback === 'boolean') {
+      try { localStorage.setItem('myListAddon:trackPlayback', synced.trackPlayback ? '1' : '0'); } catch (e) {}
+      if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
+    }
+    if (typeof synced.removeWatchedFromWatchlist === 'boolean') {
+      try { localStorage.setItem('myListAddon:removeWatchedFromWatchlist', synced.removeWatchedFromWatchlist ? '1' : '0'); } catch (e) {}
+      if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
+    }
+    if (typeof synced.scrobbleFilterUsers === 'boolean') {
+      try { localStorage.setItem('myListAddon:scrobbleFilterUsers', synced.scrobbleFilterUsers ? '1' : '0'); } catch (e) {}
+    }
+    if (typeof synced.scrobbleAllowedUsers === 'string') {
+      try { localStorage.setItem('myListAddon:scrobbleAllowedUsers', synced.scrobbleAllowedUsers); } catch (e) {}
+    }
+    if (typeof synced.scrobbleBlockAnonymous === 'boolean') {
+      try { localStorage.setItem('myListAddon:scrobbleBlockAnonymous', synced.scrobbleBlockAnonymous ? '1' : '0'); } catch (e) {}
+    }
+    if (synced.scrobbleFilterUsers !== undefined || synced.scrobbleAllowedUsers !== undefined || synced.scrobbleBlockAnonymous !== undefined) {
+      if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
+    }
+    if (Array.isArray(synced.likedLists)) {
+      try {
+        // Strings only -- see getLikedListsSet. sync/save coerces with
+        // .map(String) server-side, so this is belt and braces for a record
+        // written before it did.
+        localStorage.setItem('myListAddon:likedLists',
+          JSON.stringify(synced.likedLists.filter((v) => typeof v === 'string' && v)));
+      } catch (e) {
+        // non-critical, see rememberLikedList's own comment
+      }
+    }
+
+    if (synced.keys && typeof synced.keys === 'object') {
+      try {
+        const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+        const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+        const traktDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+        const simklDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+        let needPushSync = false;
+
+        if (synced.keys.tmdbKey && !tmdbDisc) {
+          localStorage.setItem('myListAddon:tmdbKey', synced.keys.tmdbKey);
+          const el = document.getElementById('tmdbKeyInput');
+          if (el) el.value = synced.keys.tmdbKey;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbKey');
+          const el = document.getElementById('tmdbKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:tmdbKey')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.tmdbSessionId && !tmdbDisc) {
+          localStorage.setItem('myListAddon:tmdbSessionId', synced.keys.tmdbSessionId);
+          window.tmdbSessionId = synced.keys.tmdbSessionId;
+          tmdbSessionId = synced.keys.tmdbSessionId;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbSessionId');
+          window.tmdbSessionId = '';
+          tmdbSessionId = '';
+        } else if (localStorage.getItem('myListAddon:tmdbSessionId')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.tmdbAccountId && !tmdbDisc) {
+          localStorage.setItem('myListAddon:tmdbAccountId', synced.keys.tmdbAccountId);
+          window.tmdbAccountId = synced.keys.tmdbAccountId;
+          tmdbAccountId = synced.keys.tmdbAccountId;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbAccountId');
+          window.tmdbAccountId = '';
+          tmdbAccountId = '';
+        } else if (localStorage.getItem('myListAddon:tmdbAccountId')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.tmdbUsername && !tmdbDisc) {
+          localStorage.setItem('myListAddon:tmdbUsername', synced.keys.tmdbUsername);
+          window.tmdbUsername = synced.keys.tmdbUsername;
+          tmdbUsername = synced.keys.tmdbUsername;
+        } else if (tmdbDisc) {
+          localStorage.removeItem('myListAddon:tmdbUsername');
+          window.tmdbUsername = '';
+          tmdbUsername = '';
+        } else if (localStorage.getItem('myListAddon:tmdbUsername')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.mdblistKey && !mdblistDisc) {
+          localStorage.setItem('myListAddon:mdblistKey', synced.keys.mdblistKey);
+          const el = document.getElementById('mdblistKeyInput');
+          if (el) el.value = synced.keys.mdblistKey;
+        } else if (mdblistDisc) {
+          localStorage.removeItem('myListAddon:mdblistKey');
+          const el = document.getElementById('mdblistKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:mdblistKey')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.mdblistAccessToken && !mdblistDisc) {
+          localStorage.setItem('myListAddon:mdblistAccessToken', synced.keys.mdblistAccessToken);
+          window.mdblistAccessToken = synced.keys.mdblistAccessToken;
+          mdblistAccessToken = synced.keys.mdblistAccessToken;
+        } else if (mdblistDisc) {
+          localStorage.removeItem('myListAddon:mdblistAccessToken');
+          window.mdblistAccessToken = '';
+          mdblistAccessToken = '';
+        } else if (localStorage.getItem('myListAddon:mdblistAccessToken')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.mdblistUsername && !mdblistDisc) {
+          localStorage.setItem('myListAddon:mdblistUsername', synced.keys.mdblistUsername);
+          window.mdblistUsername = synced.keys.mdblistUsername;
+          mdblistUsername = synced.keys.mdblistUsername;
+        } else if (mdblistDisc) {
+          localStorage.removeItem('myListAddon:mdblistUsername');
+          window.mdblistUsername = '';
+          mdblistUsername = '';
+        } else if (localStorage.getItem('myListAddon:mdblistUsername')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.traktKey && !traktDisc) {
+          localStorage.setItem('myListAddon:traktKey', synced.keys.traktKey);
+          const el = document.getElementById('traktKeyInput');
+          if (el) el.value = synced.keys.traktKey;
+        } else if (traktDisc) {
+          localStorage.removeItem('myListAddon:traktKey');
+          const el = document.getElementById('traktKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:traktKey')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.traktUsername && !traktDisc) {
+          localStorage.setItem('myListAddon:traktUsername', synced.keys.traktUsername);
+          const el = document.getElementById('traktUsernameInput');
+          if (el) el.value = synced.keys.traktUsername;
+          traktUsername = synced.keys.traktUsername;
+        } else if (traktDisc) {
+          localStorage.removeItem('myListAddon:traktUsername');
+          const el = document.getElementById('traktUsernameInput');
+          if (el) el.value = '';
+          traktUsername = '';
+        } else if (localStorage.getItem('myListAddon:traktUsername')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.traktAccessToken && !traktDisc) {
+          localStorage.setItem('myListAddon:traktAccessToken', synced.keys.traktAccessToken);
+          window.traktAccessToken = synced.keys.traktAccessToken;
+          traktAccessToken = synced.keys.traktAccessToken;
+        } else if (traktDisc) {
+          localStorage.removeItem('myListAddon:traktAccessToken');
+          window.traktAccessToken = '';
+          traktAccessToken = '';
+        } else if (localStorage.getItem('myListAddon:traktAccessToken')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.simklKey && !simklDisc) {
+          localStorage.setItem('myListAddon:simklKey', synced.keys.simklKey);
+          const el = document.getElementById('simklKeyInput');
+          if (el) el.value = synced.keys.simklKey;
+        } else if (simklDisc) {
+          localStorage.removeItem('myListAddon:simklKey');
+          const el = document.getElementById('simklKeyInput');
+          if (el) el.value = '';
+        } else if (localStorage.getItem('myListAddon:simklKey')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.simklAccessToken && !simklDisc) {
+          localStorage.setItem('myListAddon:simklAccessToken', synced.keys.simklAccessToken);
+          window.simklAccessToken = synced.keys.simklAccessToken;
+          simklAccessToken = synced.keys.simklAccessToken;
+        } else if (simklDisc) {
+          localStorage.removeItem('myListAddon:simklAccessToken');
+          window.simklAccessToken = '';
+          simklAccessToken = '';
+        } else if (localStorage.getItem('myListAddon:simklAccessToken')) {
+          needPushSync = true;
+        }
+
+        if (synced.keys.simklUsername && !simklDisc) {
+          localStorage.setItem('myListAddon:simklUsername', synced.keys.simklUsername);
+          window.simklUsername = synced.keys.simklUsername;
+          simklUsername = synced.keys.simklUsername;
+        } else if (simklDisc) {
+          localStorage.removeItem('myListAddon:simklUsername');
+          window.simklUsername = '';
+          simklUsername = '';
+        } else if (localStorage.getItem('myListAddon:simklUsername')) {
+          needPushSync = true;
+        }
+
+        if (typeof synced.keys.syncTraktHistory === 'boolean') {
+          localStorage.setItem('myListAddon:syncTraktHistory', synced.keys.syncTraktHistory ? 'true' : 'false');
+        }
+        if (typeof synced.keys.syncMdblistHistory === 'boolean') {
+          localStorage.setItem('myListAddon:syncMdblistHistory', synced.keys.syncMdblistHistory ? 'true' : 'false');
+        }
+        if (typeof synced.keys.syncSimklHistory === 'boolean') {
+          localStorage.setItem('myListAddon:syncSimklHistory', synced.keys.syncSimklHistory ? 'true' : 'false');
+        }
+        if (typeof updateConnectionStatusBadges === 'function') updateConnectionStatusBadges();
+        if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
+        if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+        if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+        if (!isBackgroundResume) {
+          if (typeof scheduleMyTmdbListsRefresh === 'function') scheduleMyTmdbListsRefresh();
+          if (typeof scheduleMyMdblistListsRefresh === 'function') scheduleMyMdblistListsRefresh();
+          if (typeof scheduleMyTraktListsRefresh === 'function') scheduleMyTraktListsRefresh();
+          if (typeof scheduleMySimklListsRefresh === 'function') scheduleMySimklListsRefresh();
+        }
+        if (needPushSync && typeof pushCreatorSync === 'function') pushCreatorSync();
+      } catch (e) {}
+    }
+
+    // Restore UI settings from synced.keys -- these are sent by collectKeys()
+    // on every pushCreatorSync but were never applied back to the DOM on load,
+    // so signing in from a different browser left them at their defaults.
+    if (synced.keys && typeof synced.keys === 'object') {
+      if (typeof synced.keys.hideNonDigitalReleases === 'boolean') {
+        const cb = document.getElementById('hideNonDigitalReleasesCheckbox');
+        if (cb) cb.checked = synced.keys.hideNonDigitalReleases;
+        try { localStorage.setItem('myListAddon:hideNonDigitalReleases', synced.keys.hideNonDigitalReleases ? '1' : '0'); } catch (e) {}
+      }
+      if (typeof synced.keys.adultContentFilter === 'boolean') {
+        const cb = document.getElementById('adultContentFilterCheckbox');
+        if (cb) cb.checked = synced.keys.adultContentFilter;
+        try { localStorage.setItem('myListAddon:adultContentFilter', synced.keys.adultContentFilter ? '1' : '0'); } catch (e) {}
+      }
+      if (typeof synced.keys.shuffleShelves === 'boolean') {
+        const el = document.getElementById('shuffleShelvesCheckbox');
+        if (el) el.checked = synced.keys.shuffleShelves;
+      }
+      if (typeof synced.keys.shuffleItems === 'boolean') {
+        const el = document.getElementById('shuffleItemsCheckbox');
+        if (el) el.checked = synced.keys.shuffleItems;
+      }
+      if (synced.keys.region) {
+        const el = document.getElementById('regionSelect');
+        if (el) el.value = synced.keys.region;
+        try { localStorage.setItem('myListAddon:region', synced.keys.region); } catch (e) {}
+      }
+      const badgeKeys = [
+        { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
+        { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+        { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
+        { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
+        { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+        { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
+        { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
+        { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
+        { key: 'showBadgeSeasonPremiere', id: 'badgeSeasonPremiereCheckbox' },
+        { key: 'showBadgeSeasonFinale', id: 'badgeSeasonFinaleCheckbox' },
+        { key: 'showBadgeSeasonFinaleDate', id: 'badgeSeasonFinaleDateCheckbox' },
+        { key: 'showBadgeRating', id: 'badgeRatingCheckbox' },
+        { key: 'showBadgeWatched', id: 'badgeWatchedCheckbox' },
+      ];
+      badgeKeys.forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'boolean') {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key] ? '1' : '0'); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.checked = synced.keys[key];
+        }
+      });
+    }
+
+    // Watch History / Continue Watching -- merge server tracking items with
+    // any local-only items so server scrobbles take immediate precedence without
+    // losing un-pushed local edits.
+    let touchedTracking = false;
+    if (!isBackgroundResume || trackingChanged) {
+      let isRecentRemoval = false;
+      try {
+        const lastRemovalStr = localStorage.getItem('myListAddon:lastIntentionalRemoval');
+        if (lastRemovalStr && Date.now() - parseInt(lastRemovalStr, 10) < 30000) {
+          isRecentRemoval = true;
+        }
+      } catch(e) {}
+
+      if (Array.isArray(synced.watchHistory)) {
+        const serverItems = synced.watchHistory;
+        const localWH = loadLocalCustomLists()['watch-history'];
+        const localWHItems = (localWH && Array.isArray(localWH.items)) ? localWH.items : [];
+        const serverIds = new Set(serverItems.map((it) => String(it && (it.id || it.imdbId))));
+        const keepLocalOnlyWH = shouldKeepLocalOnlyTracking(localWH, priorServerTrackingUpdatedAt, 'watch-history');
+        const localOnlyWH = keepLocalOnlyWH
+          ? localWHItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)))
+          : [];
+
+        let mergedWH = [...serverItems, ...localOnlyWH];
+        if (isRecentRemoval) {
+          mergedWH = localWHItems;
+        }
+
+        const wh = getOrCreateWatchHistoryList();
+        wh.items = mergedWH;
+        wh.updatedAt = Date.now();
+        const map = loadLocalCustomLists();
+        map['watch-history'] = wh;
+        saveLocalCustomListsMap(map);
+        const watchedIds = new Set();
+        mergedWH.forEach((it) => {
+          if (!it) return;
+          if (it.id) watchedIds.add(String(it.id));
+          if (it.imdbId) watchedIds.add(String(it.imdbId));
+          if (it.tmdbId) {
+            watchedIds.add(String(it.tmdbId));
+            watchedIds.add('tmdb:' + it.tmdbId);
+          }
+          if (it.type === 'episode' && it.seasonNum != null && it.episodeNum != null) {
+            if (it.showId) watchedIds.add(String(it.showId) + ':' + it.seasonNum + ':' + it.episodeNum);
+            if (it.showTitle) watchedIds.add(String(it.showTitle) + ':' + it.seasonNum + ':' + it.episodeNum);
+          }
+        });
+        window._watchedItemIds = watchedIds;
+        window._rawWatchHistoryItems = mergedWH;
+
+        if (localOnlyWH.length > 0 && typeof scheduleTrackingSync === 'function') {
+          scheduleTrackingSync();
+        } else if (!isRecentRemoval) {
+          // Nothing of this device's own was folded in, so what is on disk is
+          // exactly what the account holds: record that agreement, so the
+          // next load can tell a real local edit from a stale copy. Recorded
+          // only here, never when local items were kept -- those still have
+          // to reach the server before the two sides agree about them.
+          recordTrackingLocalBaseline({ 'watch-history': wh.updatedAt });
+        }
+        touchedTracking = true;
+      }
+      if (Array.isArray(synced.continueWatching)) {
+        const serverCW = dedupeContinueWatchingItems(synced.continueWatching);
+        const localCW = loadLocalCustomLists()['continue-watching'];
+        const localCWItems = (localCW && Array.isArray(localCW.items)) ? localCW.items : [];
+        const serverShowIds = new Set(serverCW.map((it) => String(it && it.showId)).filter(Boolean));
+        const keepLocalOnlyCW = shouldKeepLocalOnlyTracking(localCW, priorServerTrackingUpdatedAt, 'continue-watching');
+        const localOnlyCW = keepLocalOnlyCW
+          ? localCWItems.filter((it) => it && (!it.showId || !serverShowIds.has(String(it.showId))))
+          : [];
+        let mergedCW = dedupeContinueWatchingItems([...serverCW, ...localOnlyCW]);
+        if (isRecentRemoval) {
+          mergedCW = localCWItems;
+        }
+
+        const cw = getOrCreateContinueWatchingList();
+        cw.items = mergedCW;
+        cw.updatedAt = Date.now();
+        const map = loadLocalCustomLists();
+        map['continue-watching'] = cw;
+        saveLocalCustomListsMap(map);
+        window._inProgressShowIds = new Set(mergedCW.map((it) => String(it && it.showId)).filter(Boolean));
+
+        if (localOnlyCW.length > 0 && typeof scheduleTrackingSync === 'function') {
+          scheduleTrackingSync();
+        } else if (!isRecentRemoval) {
+          recordTrackingLocalBaseline({ 'continue-watching': cw.updatedAt });
+        }
+        touchedTracking = true;
+      }
+      if (Array.isArray(synced.watchlist)) {
+        const map = loadLocalCustomLists();
+        backfillAutoTrackedListSlugs(map);
+        const localWL = map['watchlist'] || { items: [], updatedAt: 0 };
+        const serverItems = synced.watchlist;
+        const localItems = (localWL && Array.isArray(localWL.items)) ? localWL.items : [];
+
+        const serverIds = new Set(serverItems.map((it) => String(it && (it.id || it.imdbId))));
+        const keepLocalOnlyWL = shouldKeepLocalOnlyTracking(localWL, priorServerTrackingUpdatedAt, 'watchlist');
+        const localOnly = keepLocalOnlyWL
+          ? localItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)))
+          : [];
+        const mergedWL = [...serverItems, ...localOnly];
+
+        map['watchlist'].items = mergedWL;
+        map['watchlist'].updatedAt = Date.now();
+        saveLocalCustomListsMap(map);
+
+        if (localOnly.length > 0 && typeof pushTrackingSync === 'function') {
+          pushTrackingSync();
+        } else if (!isRecentRemoval) {
+          recordTrackingLocalBaseline({ 'watchlist': map['watchlist'].updatedAt });
+        }
+        touchedTracking = true;
+      }
+      // Adopted only when this browser has nothing of its own. The
+      // server copy is whatever some browser last rendered; if this one
+      // has already rendered its own, that is the fresher of the two and
+      // opening Discover will push it back up anyway.
+      if (synced.curatedRecommendations && typeof synced.curatedRecommendations === 'object') {
+        const serverRecs = synced.curatedRecommendations;
+        const localRecs = loadCuratedRecommendations();
+        const serverHas = (Array.isArray(serverRecs.movies) && serverRecs.movies.length) ||
+          (Array.isArray(serverRecs.shows) && serverRecs.shows.length);
+        const localHas = !!(localRecs && (((localRecs.movies || []).length) || ((localRecs.shows || []).length)));
+        if (serverHas && !localHas) {
+          try {
+            localStorage.setItem(CURATED_RECS_KEY, JSON.stringify(serverRecs));
+          } catch (e) {}
+        }
+      }
+      if (Array.isArray(synced.airingNext)) {
+        const map = loadLocalCustomLists();
+        const currentAN = map['airing-next'] || { slug: 'airing-next', name: 'Airing Next', type: 'series', items: [] };
+        const localAiringCount = Array.isArray(currentAN.items) ? currentAN.items.length : 0;
+        if (synced.airingNext.length || !localAiringCount) {
+          currentAN.items = synced.airingNext;
+          currentAN.updatedAt = Date.now();
+          map['airing-next'] = currentAN;
+          saveLocalCustomListsMap(map);
+          touchedTracking = true;
+        } else {
+          // The account has no Airing Next but this browser has computed
+          // one, so this browser's copy is the only one that exists --
+          // send it up rather than taking the empty one.
+          //
+          // This is also the one reliable moment to do it. Airing Next is
+          // only ever pushed by the refresh that builds it, and that
+          // refresh runs on a load timer that routinely wins the race
+          // against sign-in restoring activeCreator -- pushTrackingSync
+          // bails when it is not set yet, and the list is left cached
+          // locally as fresh, so every later load short-circuits the
+          // refresh and never pushes either. The account stayed empty
+          // indefinitely while this browser's own dashboard card looked
+          // fine, which is exactly what made the autotrack:airing-next
+          // row (and the Live Preview of it) report no items while the
+          // signed-out snapshot version of the same list worked. Here
+          // activeCreator is set by definition, so the push lands.
+          if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+        }
+      }
+      if (Array.isArray(synced.fullyWatchedShowIds)) {
+        window._fullyWatchedShowIds = new Set(synced.fullyWatchedShowIds.map(String));
+        try {
+          localStorage.setItem('myListAddon:fullyWatchedShows', JSON.stringify(synced.fullyWatchedShowIds));
+        } catch (e) {}
+      }
+      if (!isRecentRemoval && synced.dismissedContinueWatching && typeof synced.dismissedContinueWatching === 'object') {
+        window._dismissedContinueWatching = synced.dismissedContinueWatching;
+        try {
+          localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(synced.dismissedContinueWatching));
+        } catch (e) {}
+      }
+      if (Array.isArray(synced.dashboardListOrder) && synced.dashboardListOrder.length) {
+        try {
+          localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(synced.dashboardListOrder));
+        } catch (e) {}
+        touchedTracking = true;
+      }
+    }
+    if (touchedTracking) {
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof renderMyCustomListsList === 'function') renderMyCustomListsList();
+      if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+      if (typeof renderContinueWatchingGrid === 'function') renderContinueWatchingGrid();
+    }
+    try { if (typeof cleanWatchedFromWatchlists === 'function') cleanWatchedFromWatchlists(); } catch (e) {}
+
+    suppressSave = true;
+    saveState();
+    suppressSave = false;
+
+    // The account's state is applied, so anything this browser wants to send
+    // is now built on it rather than on nothing. Releases whatever was held
+    // back while this load was in flight -- see creatorSyncGateOpen.
+    markCreatorSyncLoaded();
+  } catch (e) {
+    // Network hiccup -- stay with whatever's already on this browser
+    // rather than blocking on a retry.
+    //
+    // The gate cannot stay shut on a failure, or a browser that opened
+    // offline would never sync again for as long as the page stayed open.
+    // It opens on a timer instead, by which point a push is guarded by the
+    // persisted baseline rather than by having seen the load.
+    armCreatorSyncGateFailsafe();
+  }
+}
+
+// Shared entry point into the save flow -- used both by the row-level
+// "Save List" button (startSaveListFlow below) and directly by Save as a
+// List, so a freshly-built list goes straight into saving instead of
+// needing a separate trip down to the row below and a second click.
+// Signed in -> asks Public/Private, then saves to the Creator Profile.
+// Not signed in -> saves straight to this browser's local Custom Lists
+// store, no modal at all (see saveLocalCustomList's own comment for why
+// there's no equivalent Public/Private step for a local save).
+function beginSaveListFlow(sourceRow, urlInput, name) {
+  const payload = parseCustomListPayloadClient(urlInput.value);
+  if (!payload) {
+    alert('Could not read this list.');
+    return;
+  }
+  if (activeCreator) {
+    pendingSaveListContext = { sourceRow, urlInput, payload, name };
+    openVisibilityModal();
+  } else {
+    saveLocalCustomList(sourceRow, urlInput, payload, name);
+  }
+}
+
+// Entry point for the row-level "Save List" button (still here for lists
+// that already exist as a row but haven't been through the save flow yet
+// -- e.g. one loaded from a shared/backed-up config).
+function startSaveListFlow(btn) {
+  const sourceRow = btn.closest('.source-row');
+  const urlInput = sourceRow && sourceRow.querySelector('.url');
+  if (!urlInput) {
+    alert('Could not read this list.');
+    return;
+  }
+  const rowDiv = urlInput.closest('.entry');
+  const name = rowDiv && rowDiv.querySelector('.name') ? rowDiv.querySelector('.name').value.trim() : '';
+  if (!name) {
+    alert('Name this list first (in the row above), then try again.');
+    return;
+  }
+  beginSaveListFlow(sourceRow, urlInput, name);
+}
+
+function openCreateProfileModal() {
+  showModal(
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+    '<h2>Create a Free Account</h2>' +
+    '<p class="modal-sub">Save and sync your custom lists, presets, and channels from any device.<br>No email. No password. Just a username and key.</p>' +
+    '<div class="row"><input type="text" id="createProfileNameInput" placeholder="Choose a Username" maxlength="25"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileDisplayInput" placeholder="Display name (optional)" maxlength="40"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="createProfileRecoveryInput" placeholder="Recovery Answer (optional, 8+ characters)" minlength="8"></div>' +
+    '<p class="modal-sub" style="font-size:0.78rem; margin-top:4px;">If you ever lose your key, this is the only way back in besides contacting us. It can reset your key on its own, so treat it like a password: at least 8 characters, something only you know -- not a public username or anything someone could look up.</p>' +
+    '<div id="createProfileError"></div>' +
+    '<div class="actions" style="margin-top:14px;">' +
+    '<button type="button" class="primary" id="createProfileSubmitBtn" onclick="submitCreateProfile()">Create Account</button>' +
+    '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Already have one? Login</button>' +
+    '</div>'
+  );
+}
+
+// One credential request in flight at a time.
+//
+// Measured: two clicks on "Create Account" sent two POST /api/creator/create.
+// Both succeeded and returned DIFFERENT keys. KV keeps the last one; D1's
+// INSERT violates the primary key on the second and is swallowed as non-fatal,
+// so D1 keeps the FIRST; and reads prefer D1. The browser stores whichever
+// response lands last, so 6 out of 6 double-clicks produced an account whose
+// key does not authenticate -- with that dead key shown in the "save this
+// somewhere safe" modal and every later request 401ing.
+//
+// KV-only this was harmless: the last write won in the one store there was, so
+// the stored key was always the valid one. Adding D1 is what turned a missing
+// guard into a broken account, which is why something that was never needed
+// before is needed now.
+//
+// Keyed by name rather than held on the button, because these modals rebuild
+// their own markup -- a disabled button does not survive a re-render, the flag
+// does. The button is disabled too, for the person doing the clicking.
+const _submitsInFlight = new Set();
+
+function beginSubmit(key, btnSelector, busyLabel) {
+  if (_submitsInFlight.has(key)) return null;
+  _submitsInFlight.add(key);
+  const btn = btnSelector ? document.querySelector(btnSelector) : null;
+  const label = btn ? btn.textContent : null;
+  if (btn) {
+    btn.disabled = true;
+    if (busyLabel) btn.textContent = busyLabel;
+  }
+  return function endSubmit() {
+    _submitsInFlight.delete(key);
+    if (btn) {
+      btn.disabled = false;
+      if (label !== null) btn.textContent = label;
+    }
+  };
+}
+
+async function submitCreateProfile() {
+  const name = document.getElementById('createProfileNameInput').value.trim();
+  const displayInput = document.getElementById('createProfileDisplayInput');
+  const displayName = displayInput ? displayInput.value.trim() : '';
+  const recoveryAnswer = document.getElementById('createProfileRecoveryInput').value.trim();
+  const errBox = document.getElementById('createProfileError');
+  if (!name) {
+    errBox.innerHTML = '<p class="testresult err">Enter a username.</p>';
+    return;
+  }
+  // Mirrors the server's RECOVERY_ANSWER_MIN_LENGTH check so a too-short
+  // answer is caught here, next to the field, instead of coming back as a
+  // server error after the round trip. The server still enforces it -- this
+  // is the message, not the guard.
+  if (recoveryAnswer && recoveryAnswer.length < 8) {
+    errBox.innerHTML = '<p class="testresult err">Recovery Answer must be at least 8 characters &mdash; it can reset your key, so treat it like a password.</p>';
+    return;
+  }
+  // One at a time -- see beginSubmit. Armed after the validation returns
+  // above so a rejected form does not leave the guard latched.
+  const endSubmit = beginSubmit('createProfile', '#createProfileSubmitBtn', 'Creating\u2026');
+  if (!endSubmit) return;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorName: name, displayName: displayName || undefined, recoveryAnswer: recoveryAnswer || undefined }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      errBox.innerHTML = '<p class="testresult err">' +
+        escapeHtml(data.error === 'no-kv' ? 'This Worker has no CONFIGS KV namespace bound.' : (data.error || 'Could not create profile.')) + '</p>';
+      return;
+    }
+    // Sign the previous account out first if there was one, exactly as
+    // submitRestoreProfile does.
+    //
+    // migrateLocalCustomListsToAccount below exists for the anonymous case --
+    // someone builds lists without an account, then makes one, and their work
+    // comes with them. Reached while ALREADY signed in, the same call uploads
+    // the previous account's lists into the new one, and the first thing it
+    // does with them is publish them (visibility: 'public'). Measured: signed
+    // in as alice, creating "bob" put "Alice's Private Picks" into bob's
+    // account as a public list.
+    //
+    // Every button that opens this modal sits inside an "if (!activeCreator)"
+    // branch, so a correctly-rendered page does not offer it -- but that is
+    // protection by rendering, and any path that sets activeCreator without
+    // re-rendering the profile bar leaves those buttons on screen and live.
+    // The consequence is one person's private list published under another
+    // person's name, which is too sharp to leave resting on a render.
+    //
+    // Clearing here rather than at the top of the function so a failed
+    // creation does not sign anyone out; nothing has been uploaded yet.
+    if (activeCreator) clearLocalAccountData();
+    activeCreator = { creatorName: data.creatorName, displayName: data.displayName };
+    localStorage.setItem('myListAddon:creatorName', data.creatorName);
+    localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
+    localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
+    renderCreatorProfileBar();
+    renderAccountKeySection();
+    renderWatchlistPreferencesSection();
+    renderTrackPlaybackSection();
+    showKeyRevealModal(data.displayName, data.creatorKey);
+    loadCreatorSync();
+    migrateLocalCustomListsToAccount();
+  } catch (e) {
+    errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
+  }
+}
+
+// The Key is shown here in full the moment it's created -- it was never
+// stored anywhere server-side (only its hash was), so this is the only
+// time it's ever handed back in full without the person having to reveal
+// it themselves. It can still be viewed again later from Settings (see
+// renderKeyRevealSettingsSection), just hidden behind a click there rather
+// than shown outright, so this isn't the one and only chance at it the
+// way it used to be. Whether or not there's a list still waiting to be
+// saved (pendingSaveListContext), "Continue" leads into the same
+// visibility step next.
+function showKeyRevealModal(displayName, creatorKey) {
+  showModal(
+    '<h2>Profile Created</h2>' +
+    '<p class="modal-sub" style="margin-bottom:4px;">Username</p>' +
+    '<p style="margin:0 0 14px; font-weight:600;">' + escapeHtml(displayName) + '</p>' +
+    '<p class="modal-sub" style="margin-bottom:4px;">Key</p>' +
+    '<div class="creator-key-display" id="revealedCreatorKey">' + escapeHtml(creatorKey) + '</div>' +
+    '<p class="modal-sub">Save this key somewhere safe. You\\'ll need it to edit your lists from another browser. You can view it again later from Settings.</p>' +
+    '<div class="actions">' +
+    '<button type="button" class="secondary" id="copyRevealedKeyBtn" onclick="copyRevealedCreatorKey()">Copy Key</button>' +
+    '<button type="button" onclick="continueAfterKeyReveal()">Continue</button>' +
+    '</div>'
+  );
+}
+
+function copyRevealedCreatorKey() {
+  const text = document.getElementById('revealedCreatorKey').textContent;
+  const btn = document.getElementById('copyRevealedKeyBtn');
+  // Same feedback pattern copyShareListUrl uses -- the button's own label
+  // flips to a checkmark and a toast confirms it, instead of a native
+  // alert() popping a plain OS dialog on top of this app's own styled
+  // "Profile Created" modal.
+  const onCopied = () => {
+    if (btn) btn.textContent = 'Copied ✓';
+    if (typeof showAddedToast === 'function') showAddedToast('Key copied to clipboard!');
+    setTimeout(() => { if (btn) btn.textContent = 'Copy Key'; }, 2000);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(onCopied).catch(() => prompt('Copy this key:', text));
+  } else {
+    prompt('Copy this key:', text);
+  }
+}
+
+function continueAfterKeyReveal() {
+  closeModal();
+  if (pendingSaveListContext) {
+    openVisibilityModal();
+  } else {
+    renderCreatorDashboard();
+  }
+}
+
+function openVisibilityModal() {
+  const ctx = pendingSaveListContext;
+  if (!ctx) return;
+  showModal(
+    '<div class="modal-body">' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+      '<h2 class="panel-title" style="margin-top:0;">Save Custom List</h2>' +
+      '<p style="margin:0 0 16px; font-size:0.88rem; color:var(--muted);">Choose visibility for <strong>' + escapeHtml(ctx.name || 'Custom List') + '</strong> on your Profile.</p>' +
+      '<div class="visibility-choice" style="display:flex; flex-direction:column; gap:12px; margin: 16px 0 20px;">' +
+        '<label style="display:flex; align-items:flex-start; gap:12px; cursor:pointer; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--bg);">' +
+          '<input type="radio" name="listVisibility" value="public" checked style="margin-top:3px; accent-color:var(--brand);">' +
+          '<span style="flex:1;"><strong style="color:var(--text); font-size:0.92rem;">Public</strong><br><small style="color:var(--muted);">Anyone with the link can view, like, and add this list to their catalogs.</small></span>' +
+        '</label>' +
+        '<label style="display:flex; align-items:flex-start; gap:12px; cursor:pointer; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--bg);">' +
+          '<input type="radio" name="listVisibility" value="private" style="margin-top:3px; accent-color:var(--brand);">' +
+          '<span style="flex:1;"><strong style="color:var(--text); font-size:0.92rem;">Private</strong><br><small style="color:var(--muted);">Only you can view and edit this list when logged into your account.</small></span>' +
+        '</label>' +
+      '</div>' +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end; gap:8px;">' +
+        '<button type="button" class="secondary lc-btn" onclick="closeModal()">Cancel</button>' +
+        '<button type="button" class="primary lc-btn" onclick="confirmSaveAsCreator()">Save List</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+function showSavedCustomListModal(listName, visibility, url) {
+  const isPrivate = visibility === 'private';
+  showModal(
+    '<div class="modal-body">' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+      '<h2 class="panel-title" style="margin-top:0;">\u2713 List Saved</h2>' +
+      '<p style="margin:8px 0 16px; font-size:0.9rem; color:var(--text);">' +
+        '<strong>' + escapeHtml(listName || 'Custom List') + '</strong> has been saved to your Profile as a <strong>' + (isPrivate ? 'private' : 'public') + '</strong> list.' +
+      '</p>' +
+      (isPrivate
+        ? '<div style="padding:12px 14px; background:rgba(0,122,255,0.08); border:1px solid rgba(0,122,255,0.2); border-radius:10px; margin-bottom:16px;">' +
+            '<p style="margin:0; font-size:0.84rem; color:var(--text);">Only you can see this list from your profile when logged in.</p>' +
+          '</div>'
+        : '<div style="margin-bottom:16px;">' +
+            '<p style="margin:0 0 8px; font-size:0.84rem; color:var(--muted);">Public share link:</p>' +
+            '<div style="display:flex; gap:8px; align-items:center;">' +
+              '<input type="text" id="savedListUrlInput" value="' + escapeAttr(url || '') + '" readonly style="flex:1; padding:10px 12px; font-size:0.88rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text);">' +
+              '<button type="button" class="lc-btn primary" id="savedListCopyBtn" onclick="copyShareUrlById(&quot;savedListUrlInput&quot;, this)" style="white-space:nowrap; padding:10px 14px;">Copy Link</button>' +
+            '</div>' +
+          '</div>'
+      ) +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end; gap:8px;">' +
+        (!isPrivate && url ? '<a href="' + escapeAttr(url) + '" target="_blank" class="button secondary lc-btn" style="text-decoration:none; display:inline-flex; align-items:center;">Open Link &nearr;</a>' : '') +
+        '<button type="button" class="primary lc-btn" onclick="closeModal()">Done</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+function copyShareUrlById(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  input.select();
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(input.value).then(() => {
+      if (btn) btn.textContent = 'Copied \u2713';
+      showAddedToast('Link copied to clipboard!');
+      setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+    }).catch(() => {
+      document.execCommand('copy');
+      if (btn) btn.textContent = 'Copied \u2713';
+      showAddedToast('Link copied to clipboard!');
+      setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+    });
+  } else {
+    document.execCommand('copy');
+    if (btn) btn.textContent = 'Copied \u2713';
+    showAddedToast('Link copied to clipboard!');
+    setTimeout(() => { if (btn) btn.textContent = 'Copy Link'; }, 2000);
+  }
+}
+
+async function confirmSaveAsCreator() {
+  const ctx = pendingSaveListContext;
+  if (!ctx || !activeCreator) return;
+  const checked = document.querySelector('input[name="listVisibility"]:checked');
+  const visibility = checked ? checked.value : 'public';
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  closeModal();
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        slug: ctx.payload.creatorSlug || undefined,
+        name: ctx.name,
+        type: ctx.payload.type,
+        items: ctx.payload.items,
+        visibility: visibility,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      showAppNoticeModal('Could Not Save List', data.error || 'Unknown error occurred.', true);
+      return;
+    }
+    const updatedPayload = Object.assign({}, ctx.payload, {
+      listName: ctx.name,
+      publishedUrl: visibility === 'public' ? data.url : undefined,
+      creatorSlug: data.slug,
+      creatorOwner: activeCreator.creatorName,
+      visibility: visibility,
+    });
+    ctx.sourceRow.outerHTML = customListSourceRowHtml('customlist:v1:' + JSON.stringify(updatedPayload));
+    saveState();
+    showSavedCustomListModal(ctx.name, visibility, data.url);
+    renderCreatorDashboard();
+  } catch (e) {
+    showAppNoticeModal('Network Error', 'A network error occurred while saving. Please try again.', true);
+  } finally {
+    pendingSaveListContext = null;
+  }
+}
+
+function showAppNoticeModal(title, message, isError) {
+  showModal(
+    '<div class="modal-body">' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+      '<h2 class="panel-title" style="margin-top:0;' + (isError ? ' color:var(--danger);' : '') + '">' + escapeHtml(title || 'Notice') + '</h2>' +
+      '<p style="margin:12px 0 20px; font-size:0.9rem; color:var(--text); line-height:1.4;">' + escapeHtml(message || '') + '</p>' +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end;">' +
+        '<button type="button" class="primary lc-btn" onclick="closeModal()">OK</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
+// --- Creator Dashboard ---------------------------------------------------------
+
+// Joins an already-in-flight /api/creator/lists request instead of starting
+// a second one.
+//
+// renderCreatorDashboard is routinely invoked twice in immediate succession
+// -- sign-in and restore both call it and then call loadCreatorSync, which
+// calls it again itself -- and each invocation was its own POST. That
+// endpoint returns the FULL items array for every list the account owns, so
+// for anyone with large Custom Lists the duplicate was megabytes of
+// identical data plus a second key verification, every time.
+//
+// Deliberately in-flight only, with no time-based cache. A request that
+// begins after the previous one has finished always goes to the network, so
+// this can never serve a stale list -- which matters because saving,
+// deleting or reordering a list re-renders the dashboard immediately
+// afterwards and must see the change. It only ever collapses calls that
+// genuinely overlap, where the second was going to receive the same bytes
+// as the first regardless.
+let _creatorListsInFlight = null;
+// The last full response, kept so an unchanged reply can be answered from
+// memory. Nothing mutates lastCreatorListsData in place -- every consumer
+// only reads it (find/forEach) -- so handing back the same object is safe
+// rather than a shared-mutable-state trap.
+let _lastCreatorListsResponse = null;
+// One entry per page: { version, page }. The endpoint pages now (an account
+// past ~990 lists spent more KV operations than Cloudflare allows in one
+// invocation, and the dashboard 500'd forever), so the conditional-response
+// version is per page too. Almost every account is one page, where this
+// behaves exactly as the single-version cache did.
+let _creatorListsPages = [];
+// slug -> { updatedAt, itemCount, items }. /api/creator/lists no longer sends
+// the items arrays (15.08 MB at 1,200 lists, re-sent after every save, delete
+// and tab switch); it sends itemCount and updatedAt, and the contents come from
+// /api/creator/lists/items for the slugs this map does not already hold at
+// that version. After a one-list edit that is one list's items instead of
+// every list's.
+//
+// Keyed on the server's own updatedAt rather than on a local timestamp, so a
+// change made on another device invalidates the entry here too. A record with
+// no updatedAt (a legacy one, written before the conflict guard existed) is
+// treated as always stale -- correct, just not cached.
+let _creatorListItemsCache = new Map();
+
+// Cleared whenever the cached lists are dropped, so the browser can never
+// claim to hold a version it no longer has.
+function resetCreatorListsCache() {
+  _lastCreatorListsResponse = null;
+  _creatorListsPages = [];
+  _creatorListItemsCache = new Map();
+}
+
+// Fills in the item contents /api/creator/lists no longer sends.
+//
+// Returns true when every list in the response ended up with a real items
+// array, false when it could not finish. False is not "carry on with what we
+// have": a dashboard that renders a list as empty because a fetch failed is
+// worse than one that transfers too much, so the caller re-asks for the whole
+// thing with includeItems -- which is exactly the shape this endpoint
+// answered with before the split.
+async function hydrateCreatorListItems(data, creatorKey) {
+  const lists = (data && Array.isArray(data.lists)) ? data.lists : null;
+  if (!lists) return true;
+
+  const stale = [];
+  for (const l of lists) {
+    if (!l || !l.slug) continue;
+    if (Array.isArray(l.items)) {
+      // Already carries its contents -- either a reused page from a previous
+      // render, or an includeItems reply. Record the version so the next
+      // render can skip it.
+      _creatorListItemsCache.set(l.slug, { updatedAt: l.updatedAt, itemCount: l.items.length, items: l.items });
+      continue;
+    }
+    const hit = _creatorListItemsCache.get(l.slug);
+    // itemCount is checked as well as updatedAt, so a cache entry can only be
+    // reused when it agrees with the server on BOTH the version and the size.
+    // A legacy record with no updatedAt fails Number.isFinite and is refetched
+    // every time rather than being served from a key that cannot change.
+    if (hit && Number.isFinite(l.updatedAt) && hit.updatedAt === l.updatedAt && hit.itemCount === l.itemCount) {
+      l.items = hit.items;
+      continue;
+    }
+    stale.push(l.slug);
+  }
+
+  if (stale.length) {
+    const fetched = new Map();
+    try {
+      for (let i = 0; i < stale.length; i += ${CREATOR_LIST_ITEMS_BATCH_MAX}) {
+        const slice = stale.slice(i, i + ${CREATOR_LIST_ITEMS_BATCH_MAX});
+        const res = await fetch(ORIGIN + '/api/creator/lists/items', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            slugs: slice,
+          }),
+        });
+        const d = await res.json();
+        if (!d || !d.ok || !Array.isArray(d.lists)) return false;
+        for (const e of d.lists) {
+          if (e && e.slug && Array.isArray(e.items)) fetched.set(e.slug, e);
+        }
+      }
+    } catch (e) {
+      return false;
+    }
+    for (const l of lists) {
+      if (!l || !l.slug || Array.isArray(l.items)) continue;
+      const got = fetched.get(l.slug);
+      if (!got) {
+        // A slug the paged endpoint listed and this one did not return. That
+        // is a record that disappeared between the two calls, or a shape this
+        // client does not understand; either way it is not something to paper
+        // over with an empty array.
+        return false;
+      }
+      l.items = got.items;
+      _creatorListItemsCache.set(l.slug, { updatedAt: l.updatedAt, itemCount: got.items.length, items: got.items });
+    }
+  }
+
+  // Drop cache entries for slugs the account no longer has, so this cannot
+  // grow without bound across a long session of creating and deleting lists.
+  if (_creatorListItemsCache.size > lists.length) {
+    const live = new Set(lists.map((l) => l && l.slug).filter(Boolean));
+    for (const slug of [..._creatorListItemsCache.keys()]) {
+      if (!live.has(slug)) _creatorListItemsCache.delete(slug);
+    }
+  }
+  return true;
+}
+
+async function fetchCreatorListsOnce(creatorKey) {
+  if (_creatorListsInFlight) return await _creatorListsInFlight;
+  const p = (async () => {
+    const askFor = async (offset, knownVersion, includeItems) => {
+      const res = await fetch(ORIGIN + '/api/creator/lists', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          offset: offset,
+          limit: ${CREATOR_LISTS_PAGE_DEFAULT},
+          knownVersion: knownVersion || '',
+          includeItems: !!includeItems,
+        }),
+      });
+      return await res.json();
+    };
+
+    // The paging loop, factored out so the includeItems fallback below can run
+    // exactly the same walk rather than a second, subtly different one.
+    const loadPages = async (includeItems) => {
+      // Only claim a version if the data that version describes is still
+      // here; otherwise an "unchanged" reply would leave nothing to render.
+      // The fallback pass never claims one -- it is asking for a different
+      // shape than the version it holds describes.
+      const canReuse = !includeItems && !!(_creatorListsPages.length && _lastCreatorListsResponse && Array.isArray(lastCreatorListsData));
+      const pages = [];
+      let combined = null;
+      for (let i = 0; i < ${CREATOR_LISTS_MAX_PAGES}; i++) {
+        const cached = canReuse ? _creatorListsPages[i] : null;
+        let data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, cached ? cached.version : '', includeItems);
+        if (data && data.ok && data.unchanged) {
+          if (cached && cached.page) {
+            // Nothing changed on this page -- reuse the copy already in memory.
+            pages.push({ version: data.version || cached.version, page: cached.page });
+            if (!data.hasMore) break;
+            continue;
+          }
+          // Should be unreachable (a version is only sent when reusable), but
+          // if it ever happens, ask again without one rather than assembling a
+          // response with a page missing from it.
+          data = await askFor(i * ${CREATOR_LISTS_PAGE_DEFAULT}, '', includeItems);
+        }
+        if (!data || !data.ok) {
+          resetCreatorListsCache();
+          return { failed: data };
+        }
+        pages.push({ version: data.version || '', page: data });
+        if (!combined) combined = data;
+        if (!data.hasMore) break;
+      }
+      if (!pages.length) {
+        resetCreatorListsCache();
+        return { failed: combined };
+      }
+
+      // One page is the overwhelmingly common case and is handed back as-is,
+      // so nothing downstream sees a synthesised object where it used to see
+      // the server's own response.
+      let out;
+      if (pages.length === 1) {
+        out = pages[0].page;
+      } else {
+        const first = pages[0].page;
+        const lists = [];
+        const deleted = [];
+        const seenDeleted = new Set();
+        for (const p2 of pages) {
+          const pg = p2.page || {};
+          if (Array.isArray(pg.lists)) lists.push.apply(lists, pg.lists);
+          for (const s of (pg.deletedSlugs || [])) {
+            if (!seenDeleted.has(s)) { seenDeleted.add(s); deleted.push(s); }
+          }
+        }
+        out = {
+          ok: true,
+          displayName: first.displayName,
+          lists: lists,
+          order: first.order || [],
+          deletedSlugs: deleted,
+          total: first.total,
+          version: pages.map((x) => x.version).join('.'),
+        };
+      }
+      return { out: out, pages: pages };
+    };
+
+    let res = await loadPages(false);
+    if (!res.out) return res.failed;
+    if (!(await hydrateCreatorListItems(res.out, creatorKey))) {
+      // The delta fetch could not complete. Fall back to the shape this
+      // endpoint answered with before the split -- slower, and correct.
+      resetCreatorListsCache();
+      res = await loadPages(true);
+      if (!res.out) return res.failed;
+      await hydrateCreatorListItems(res.out, creatorKey);
+    }
+    _lastCreatorListsResponse = res.out;
+    _creatorListsPages = res.pages;
+    return res.out;
+  })();
+  _creatorListsInFlight = p;
+  try {
+    return await p;
+  } finally {
+    _creatorListsInFlight = null;
+  }
+}
+
+// --- Recovering lists the browser lost --------------------------------------
+// A signed-in account keeps every Custom List as its own server-side record
+// (creatorlist:<user>:<slug>), and since the quota fix those records are
+// written even when localStorage refuses. But nothing ever wrote them BACK.
+// The reconciliation further down only ever flowed row -> server and
+// row -> local, and it is driven by iterating the rows currently in the
+// page, so a list that had disappeared from localStorage entirely was never
+// even considered -- the dashboard would render it from the server response
+// while the local map, which is what catalog rows, See All and editing all
+// read, stayed empty.
+//
+// That is the whole remaining gap, and it is why this is a backfill rather
+// than the much larger change of making the server authoritative at runtime.
+// The data is already in the response the dashboard just fetched; it costs
+// nothing to put it back.
+const DELETED_CREATOR_LISTS_KEY = 'myListAddon:deletedCreatorLists';
+const DELETED_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function loadDeletedCreatorLists() {
+  try {
+    const raw = localStorage.getItem(DELETED_CREATOR_LISTS_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    if (!map || typeof map !== 'object') return {};
+    // Tombstones expire. Keeping them forever would mean a list deleted a
+    // year ago could never be recovered from the account if the browser
+    // cache were later lost for an unrelated reason.
+    const now = Date.now();
+    let changed = false;
+    Object.keys(map).forEach((k) => {
+      if (!(now - (Number(map[k]) || 0) < DELETED_TOMBSTONE_TTL_MS)) { delete map[k]; changed = true; }
+    });
+    if (changed) { try { localStorage.setItem(DELETED_CREATOR_LISTS_KEY, JSON.stringify(map)); } catch (e) {} }
+    return map;
+  } catch (e) {
+    return {};
+  }
+}
+
+// Called when a list is deleted, BEFORE the server confirms.
+//
+// One of the two delete paths removes the list locally and then fires the
+// server delete without waiting for it (.catch(() => {})). If that request
+// never lands, the list survives on the server while being gone locally --
+// which is exactly the shape the backfill below would read as "lost" and
+// helpfully restore. Resurrecting a list somebody deliberately deleted is a
+// bug this project has already had once, so the tombstone is recorded at
+// request time rather than on success.
+function recordCreatorListDeletion(slug) {
+  if (!slug) return;
+  try {
+    const map = loadDeletedCreatorLists();
+    map[String(slug)] = Date.now();
+    localStorage.setItem(DELETED_CREATOR_LISTS_KEY, JSON.stringify(map));
+  } catch (e) {}
+}
+window.recordCreatorListDeletion = recordCreatorListDeletion;
+
+// Matches the way the delete paths look a list up: a local entry can be
+// keyed by its map key while carrying the slug under any of several fields.
+function localMapHasList(map, slug) {
+  if (!map || !slug) return false;
+  if (map[slug]) return true;
+  return Object.keys(map).some((k) => {
+    const l = map[k];
+    return !!l && (l.slug === slug || l.creatorSlug === slug || l.localSlug === slug || l.listSlug === slug);
+  });
+}
+
+// The auto-tracked lists are generated locally from watch state, not owned by
+// the account in the same way. Writing a server copy over them would fight
+// the tracking code for control of the same slug.
+const BACKFILL_SKIP_SLUGS = new Set(['watchlist', 'watch-history', 'continue-watching', 'airing-next']);
+
+// Restores lists that exist on the account but are missing from this
+// browser. Deliberately narrow: it only ever ADDS a list that is entirely
+// absent. It never merges items into a list that already exists locally,
+// because a local copy may legitimately be ahead of the server (an edit made
+// while offline), and picking a winner there is a different problem with a
+// different right answer.
+function backfillCreatorListsIntoLocalMap(serverLists) {
+  if (!Array.isArray(serverLists) || !serverLists.length) return 0;
+  if (typeof loadLocalCustomLists !== 'function' || typeof saveLocalCustomListsMap !== 'function') return 0;
+  const map = loadLocalCustomLists();
+  const tombstones = loadDeletedCreatorLists();
+  const restored = [];
+  serverLists.forEach((l) => {
+    if (!l || !l.slug) return;
+    if (BACKFILL_SKIP_SLUGS.has(l.slug)) return;
+    if (tombstones[l.slug]) return;
+    if (localMapHasList(map, l.slug)) return;
+    if (!Array.isArray(l.items)) return;
+    map[l.slug] = {
+      slug: l.slug,
+      creatorSlug: l.slug,
+      name: l.name || l.slug,
+      type: l.type || 'mixed',
+      items: l.items,
+      visibility: l.visibility || 'private',
+      createdAt: l.createdAt || Date.now(),
+      updatedAt: Date.now(),
+    };
+    if (l.sourceUrl) map[l.slug].sourceUrl = l.sourceUrl;
+    if (l.synced != null) map[l.slug].synced = l.synced;
+    if (l.lastSyncedAt != null) map[l.slug].lastSyncedAt = l.lastSyncedAt;
+    if (l.baseItemIds) map[l.slug].baseItemIds = l.baseItemIds;
+    restored.push(l.slug);
+  });
+  if (!restored.length) return 0;
+  saveLocalCustomListsMap(map);
+  console.info('Restored ' + restored.length + ' list(s) from your account that were missing from this browser:', restored.join(', '));
+  return restored.length;
+}
+window.backfillCreatorListsIntoLocalMap = backfillCreatorListsIntoLocalMap;
+
+// Lists the ACCOUNT says were deleted, from /api/creator/lists.
+//
+// A local tombstone (recordCreatorListDeletion above) is what stops the
+// deleting browser restoring its own delete. It says nothing to any other
+// browser -- and to another browser, an account that no longer has a list is
+// indistinguishable from an account that never received it, which is the case
+// uploadMissingLocalListsToAccount exists to repair. So a list deleted on the
+// desktop was faithfully re-uploaded by the phone the next time it opened,
+// generally within a minute of the person deleting it.
+//
+// The account now records its own deletions (readCreatorListDeletions,
+// 02_http-and-creator-utils.js) and hands them back here. Applying one is the
+// same three steps the deleting browser already takes: tombstone it so the
+// backfill leaves it alone, drop it from this browser's local map, and remove
+// any catalog row still pointing at it.
+//
+// Deliberately not a delete request of its own -- the list is already gone
+// from the account; this is one browser catching up with that.
+function applyServerListDeletions(deletedSlugs) {
+  if (!Array.isArray(deletedSlugs) || !deletedSlugs.length) return 0;
+  if (typeof loadLocalCustomLists !== 'function' || typeof saveLocalCustomListsMap !== 'function') return 0;
+  const map = loadLocalCustomLists();
+  let removed = 0;
+  let rowsPruned = false;
+  deletedSlugs.forEach((raw) => {
+    const slug = String(raw || '');
+    // Never the auto-tracked slugs: those are generated from watch state and
+    // are not the account's to delete out from under this browser.
+    if (!slug || BACKFILL_SKIP_SLUGS.has(slug)) return;
+    // Recorded even when this browser has no copy -- a response that arrives
+    // before some other tab writes one still has to win.
+    recordCreatorListDeletion(slug);
+    Object.keys(map).forEach((k) => {
+      const l = map[k];
+      if (k === slug || (l && (l.slug === slug || l.creatorSlug === slug || l.localSlug === slug || l.listSlug === slug))) {
+        delete map[k];
+        removed++;
+      }
+    });
+    if (typeof document !== 'undefined' && typeof parseCustomListPayloadClient === 'function') {
+      document.querySelectorAll('#lists .url').forEach((urlInput) => {
+        const rowPayload = parseCustomListPayloadClient(urlInput.value);
+        if (!rowPayload) return;
+        if (rowPayload.creatorSlug === slug || rowPayload.localSlug === slug || rowPayload.slug === slug || rowPayload.listSlug === slug) {
+          const entry = urlInput.closest('.entry');
+          if (entry) { entry.remove(); rowsPruned = true; }
+        }
+      });
+    }
+  });
+  if (removed) saveLocalCustomListsMap(map);
+  if (rowsPruned && typeof saveState === 'function') saveState();
+  return removed;
+}
+window.applyServerListDeletions = applyServerListDeletions;
+
+// Uploads local lists the account does not have yet, and -- the part that
+// matters -- writes the slug the server actually used back into the local
+// store.
+//
+// The previous version was a forEach firing an unawaited fetch per list with
+// .catch(() => {}) and no .then, from a block that runs on EVERY dashboard
+// render. Three things went wrong at once:
+//
+//   1. The reply was thrown away, so the local copy never learned which slug
+//      the account now holds. The test that decides whether to upload could
+//      therefore never start passing on its own.
+//   2. Every list went out simultaneously, and each save rewrites the single
+//      creatorlistorder: key read-modify-write. KV has no compare-and-swap,
+//      so 22 concurrent saves left 1 order entry standing and lost 21.
+//   3. Losing an order entry made that list invisible to /api/creator/lists,
+//      which is where serverSlugs comes from -- so the next render uploaded
+//      it again. The account gained one visible list per render and a fresh
+//      duplicate record for every other one, forever.
+//
+// One account ended up with 129 list records for 22 real lists: 44 copies of
+// the same 462-item list (coming-of-age-3 .. coming-of-age-53), 29 of another.
+//
+// So: one list at a time, awaited, the returned slug recorded, and one run at
+// a time across the whole page. The server side is fixed too (it now honours
+// the slug asked for instead of silently minting a new one, and no longer
+// treats the order key as the last word on what exists) -- either half alone
+// stops the runaway; both together also make it self-correcting.
+let _uploadingMissingLists = false;
+// Bounded so that a server which somehow never reports a list back can cost a
+// handful of rounds rather than spinning for as long as the tab is open. The
+// fixes above mean one round is enough; this is the backstop, not the plan.
+let _missingListUploadRounds = 0;
+const MISSING_LIST_UPLOAD_MAX_ROUNDS = 5;
+async function uploadMissingLocalListsToAccount(lists, creatorKey) {
+  if (_uploadingMissingLists || !activeCreator || !creatorKey || !lists || !lists.length) return 0;
+  if (_missingListUploadRounds >= MISSING_LIST_UPLOAD_MAX_ROUNDS) return 0;
+  _uploadingMissingLists = true;
+  _missingListUploadRounds++;
+  const assigned = [];
+  try {
+    for (const l of lists) {
+      try {
+        const uploadBody = {
+          creatorName: activeCreator.creatorName,
+          creatorKey: creatorKey,
+          slug: l.creatorSlug || l.slug,
+          name: l.name || l.slug,
+          type: l.type || 'movie',
+          items: l.items || [],
+          visibility: l.visibility || 'private',
+        };
+        if (l.sourceUrl) uploadBody.sourceUrl = l.sourceUrl;
+        if (l.synced != null) uploadBody.synced = l.synced;
+        if (l.lastSyncedAt != null) uploadBody.lastSyncedAt = l.lastSyncedAt;
+        if (l.baseItemIds) uploadBody.baseItemIds = l.baseItemIds;
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(uploadBody),
+        });
+        const data = await res.json();
+        if (!data || !data.ok || !data.slug) continue;
+        l.creatorSlug = data.slug;
+        assigned.push({ localSlug: l.slug, creatorSlug: data.slug });
+      } catch (e) {
+        // One list failing (a dropped connection, say) must not abandon the
+        // rest, and must not retry here -- a persistent failure retried in
+        // place is the same runaway by another route. The next render tries
+        // again, and the save is idempotent now, so that costs nothing.
+      }
+    }
+  } finally {
+    _uploadingMissingLists = false;
+  }
+  // One write at the end rather than one per list: these maps run to
+  // megabytes and each save is a full JSON.stringify on the main thread. An
+  // interrupted run simply re-uploads next time, which is harmless now that
+  // asking for the same slug twice yields the same list.
+  if (assigned.length) {
+    try {
+      const map = loadLocalCustomLists();
+      let touched = false;
+      assigned.forEach((a) => {
+        const entry = map[a.localSlug];
+        if (entry && entry.creatorSlug !== a.creatorSlug) { entry.creatorSlug = a.creatorSlug; touched = true; }
+      });
+      if (touched) saveLocalCustomListsMap(map);
+    } catch (e) {}
+    renderCreatorDashboard({ silent: true });
+  }
+  return assigned.length;
+}
+window.uploadMissingLocalListsToAccount = uploadMissingLocalListsToAccount;
+
+// The saved dashboard order, as the thing both readers assume it is.
+//
+// Both used to JSON.parse inside a try/catch -- which covers malformed JSON --
+// and then test savedOrder && savedOrder.length before calling .map on it.
+// A STRING passes that test ("nope".length is 4) and then throws
+// "savedOrder.map is not a function", taking the whole dashboard render with
+// it. Same family as the likedLists bug: the container type was checked and
+// the element type was not.
+//
+// Every writer is Array.isArray-guarded today, so this needs storage edited by
+// hand to reach -- but the cost of being wrong is the entire My Lists tab, and
+// the guard is one line.
+function readDashboardListOrder() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]');
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((s) => typeof s === 'string' && s);
+  } catch (e) {
+    return [];
+  }
+}
+
+async function renderCreatorDashboard(options) {
+  const silent = !!(options && options.silent);
+  const box = document.getElementById('creatorDashboard');
+  if (!box) return;
+  if (!activeCreator) {
+    renderLocalCustomListsDashboard(box, silent);
+    return;
+  }
+  const hasExistingContent = !!(box.querySelector('#creatorListRows') || (box.children && box.children.length > 0 && !box.querySelector('.testresult')));
+  if (!hasExistingContent && !silent) {
+    box.innerHTML = '<p><small>Loading your lists\u2026</small></p>';
+  }
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  try {
+    const data = await fetchCreatorListsOnce(creatorKey);
+    if (!data.ok) {
+      if (!hasExistingContent) {
+        box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your lists.') + '</p>';
+      }
+      return;
+    }
+    lastCreatorListsData = data.lists;
+
+    // Deletions made on another device, applied before anything below reads
+    // the local map -- needUploading is computed from it further down, and
+    // uploading a list this account has just deleted is precisely the bug
+    // this response's deletedSlugs exists to stop.
+    try { applyServerListDeletions(data.deletedSlugs); } catch (e) {}
+    
+    // Prune any config rows that reference a creatorSlug no longer on the server
+    // (these are ghost rows left behind by previously deleted lists)
+    {
+      const validSlugs = new Set((data.lists || []).map(l => l.slug));
+      let pruned = false;
+      document.querySelectorAll('#lists .url').forEach((urlInput) => {
+        const rowPayload = parseCustomListPayloadClient(urlInput.value);
+        if (rowPayload && rowPayload.creatorSlug && !validSlugs.has(rowPayload.creatorSlug)) {
+          const entry = urlInput.closest('.entry');
+          if (entry) { entry.remove(); pruned = true; }
+        }
+      });
+      if (pruned && typeof saveState === 'function') saveState();
+    }
+
+    // Sync items from live Catalog rows if the row contains more items
+    let hasLocalUpdates = false;
+    const localMapForCreator = loadLocalCustomLists();
+    document.querySelectorAll('#lists .entry').forEach((entry) => {
+      const urlInput = entry.querySelector('.url');
+      if (!urlInput || !urlInput.value.startsWith('customlist:v1:')) return;
+      try {
+        const rowPayload = JSON.parse(urlInput.value.slice('customlist:v1:'.length));
+        const slug = rowPayload.creatorSlug || rowPayload.localSlug || rowPayload.listSlug;
+        if (!slug || !Array.isArray(rowPayload.items) || !rowPayload.items.length) return;
+        const sList = (data.lists || []).find(l => l && l.slug === slug);
+        if (sList && rowPayload.items.length > (sList.items || []).length) {
+          // The dashboard is updated optimistically, so the save has to be
+          // checked -- it used to be .catch(() => {}) with no look at data.ok.
+          // A refusal the server states plainly (413 for a list over the size
+          // ceiling, 409 for a conflicting edit from another device) left the
+          // dashboard showing items the account does not have, indefinitely and
+          // with nothing said. Roll the optimistic change back and say so.
+          const previousItems = sList.items || [];
+          const previousCount = sList.itemCount;
+          sList.items = rowPayload.items;
+          sList.itemCount = rowPayload.items.length;
+          fetch(ORIGIN + '/api/creator/lists/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              creatorName: activeCreator.creatorName,
+              creatorKey: creatorKey,
+              slug: slug,
+              name: sList.name,
+              type: sList.type || rowPayload.type || 'movie',
+              items: rowPayload.items,
+              visibility: sList.visibility || 'private',
+            })
+          }).then(async (res) => {
+            let saved = null;
+            try { saved = await res.json(); } catch (e) {}
+            if (saved && saved.ok) return;
+            sList.items = previousItems;
+            sList.itemCount = previousCount;
+            if (typeof showAddedToast === 'function') {
+              showAddedToast('Could not sync "' + (sList.name || slug) + '": ' + ((saved && saved.error) || 'please try again'));
+            }
+          }).catch(() => {
+            sList.items = previousItems;
+            sList.itemCount = previousCount;
+          });
+        }
+        if (localMapForCreator[slug] && rowPayload.items.length > (localMapForCreator[slug].items || []).length) {
+          localMapForCreator[slug].items = rowPayload.items;
+          localMapForCreator[slug].updatedAt = Date.now();
+          hasLocalUpdates = true;
+        }
+      } catch (e) {}
+    });
+    if (hasLocalUpdates) saveLocalCustomListsMap(localMapForCreator);
+
+    // ...and the other direction: anything the account has that this browser
+    // has lost. See backfillCreatorListsIntoLocalMap for why this is an
+    // add-only operation.
+    try { backfillCreatorListsIntoLocalMap(data.lists || []); } catch (e) {}
+    
+    const autoTracked = renderAutoTrackedListsHtml();
+    lastLocalCustomListsData = autoTracked.lists;
+
+    function buildServerListCardHtml(l) {
+      if (!l) return '';
+      const shareBtn = l.visibility === 'private'
+        ? ''
+        : '<button type="button" class="lc-btn secondary creatorListShareBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '">Share</button>';
+      const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && String(l.name).toLowerCase() === 'watchlist');
+      const deleteBtnHtml = isWatchlist ? '' : '<button type="button" class="lc-btn secondary creatorListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>';
+      
+      const matchingRow = document.querySelector('#lists .entry .url[value*="' + l.slug + '"]');
+      if (matchingRow && matchingRow.value.startsWith('customlist:v1:')) {
+        try {
+          const rp = JSON.parse(matchingRow.value.slice('customlist:v1:'.length));
+          if (Array.isArray(rp.items) && rp.items.length > (l.items || []).length) {
+            l.items = rp.items;
+            l.itemCount = rp.items.length;
+          }
+        } catch (e) {}
+      }
+
+      const resolveItemPoster = (it) => {
+        if (!it) return '';
+        let p = it.poster || it.showPoster;
+        if (!p) {
+          const epId = String(it.id || '');
+          const sId = it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (it.imdbId || it.id));
+          if (sId && String(sId).startsWith('tt')) {
+            p = 'https://images.metahub.space/poster/medium/' + sId + '/img';
+          }
+        }
+        if (typeof resolveClientPoster === 'function') {
+          return resolveClientPoster(it, p || '');
+        }
+        return p || '';
+      };
+      const allPosters = (l.items || []).slice(0, 9).filter((it) => it && resolveItemPoster(it));
+      const totalCount = l.itemCount || (l.items || []).length || allPosters.length;
+      const posterThumbs = allPosters.map((it, i) => {
+        const isMobileEnd = (i === 2 && allPosters.length > 3);
+        const isDesktopEnd = (i === allPosters.length - 1 && allPosters.length >= 4);
+        let overlays = '';
+        if (isMobileEnd) {
+          overlays += '<div class="list-card-count-overlay mobile-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+        }
+        if (isDesktopEnd) {
+          overlays += '<div class="list-card-count-overlay desktop-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+        }
+        const removeBtn = isWatchlist
+          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
+          : '';
+        const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
+        const itemPoster = resolveItemPoster(it);
+        const label = formatWatchItemLabel(it);
+        const posterEl = itemPoster
+          ? '<img src="' + escapeAttr(itemPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : '')) + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+          : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1" style="width:100%;height:100%;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+        return '<div class="list-card-mini-poster-tile" data-id="' + escapeAttr(it.showId || it.imdbId || it.id || '') + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '">' +
+          '<div class="list-card-mini-poster-img-wrap">' +
+            posterEl +
+            removeBtn +
+            overlays +
+          '</div>' +
+          '<div class="list-card-mini-poster-name">' + escapeHtml(label.title || it.title || it.name || '') + '</div>' +
+          (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
+          (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
+        '</div>';
+      }).join('');
+      const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, l.type, l.slug) : false;
+      const isSynced = !!(l.synced && l.sourceUrl);
+      const syncBtnHtml = isSynced
+        ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
+        : '';
+      return '<div class="list-card creator-list-row" draggable="true" data-slug="' + escapeAttr(l.slug) + '">' +
+        '<div class="list-card-header">' +
+          '<div class="list-card-body creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' +
+            '<div class="list-card-title">' +
+              '<span class="drag-handle-list" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
+              escapeHtml(l.name) +
+            '</div>' +
+            '<div class="list-card-meta">' +
+              '<span>' + (l.visibility === 'private' ? 'Private' : 'Public') + '</span>' +
+              '<span class="list-card-meta-sep">&middot;</span>' +
+              '<span>' + (l.type === 'series' ? 'Shows' : (l.type === 'mixed' ? 'Mixed' : 'Movies')) + '</span>' +
+              '<span class="list-card-meta-sep">&middot;</span>' +
+              '<span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
+              (isSynced ? ('<span class="list-card-meta-sep">&middot;</span><span>Synced</span>') : '') +
+              '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' +
+            '</div>' +
+          '</div>' +
+          '<div class="list-card-actions">' +
+            '<button type="button" class="lc-btn secondary creatorListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
+            syncBtnHtml +
+            deleteBtnHtml +
+            shareBtn +
+            '<button type="button" class="lc-btn ' + (isAdded ? 'secondary creatorListAddToConfigBtn is-added' : 'primary creatorListAddToConfigBtn') + '" ' +
+              (isAdded ? 'style="color:var(--danger);"' : '') +
+              ' data-slug="' + escapeAttr(l.slug) + '">' +
+              (isAdded ? 'Remove' : '+ Add') +
+            '</button>' +
+          '</div>' +
+        '</div>' +
+        (posterThumbs ? '<div class="list-card-posters poster-preview-static creatorListViewTrigger" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + posterThumbs + '</div>' : '') +
+      '</div>';
+    }
+
+    const serverCustomLists = (data.lists || []).filter((l) => l && l.slug !== 'watchlist' && l.slug !== 'watch-history' && l.slug !== 'continue-watching');
+    const serverWatchlist = (data.lists || []).find((l) => l && (l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist')));
+    if (serverWatchlist) {
+      const localMap = loadLocalCustomLists();
+      if (localMap['watchlist']) {
+        if (serverWatchlist.visibility) localMap['watchlist'].visibility = serverWatchlist.visibility;
+        if (serverWatchlist.likes != null) localMap['watchlist'].likes = serverWatchlist.likes;
+        if (serverWatchlist.url) localMap['watchlist'].url = serverWatchlist.url;
+        saveLocalCustomListsMap(localMap);
+      }
+    }
+
+    // Merge any local/restored custom lists that are not yet on the server
+    const serverSlugs = new Set((data.lists || []).map(l => l.slug));
+    const localRestoredCustomLists = [];
+    const needUploading = [];
+    // Read once for the whole pass rather than per list -- this parses a
+    // localStorage record, and an account can hold hundreds of lists.
+    const listTombstones = loadDeletedCreatorLists();
+    Object.keys(localMapForCreator || {}).forEach((k) => {
+      if (k === 'watchlist' || k === 'watch-history' || k === 'continue-watching' || k === 'airing-next') return;
+      const l = localMapForCreator[k];
+      if (!l) return;
+      if (!l.slug) l.slug = k;
+      // Test against the slug the SERVER gave this list last time, when we
+      // know it, not the local key. The two are usually the same and the
+      // fallback keeps that case working -- but when they differ, comparing
+      // the local key is what made this block think an uploaded list was
+      // still missing and upload it all over again.
+      if (!serverSlugs.has(l.creatorSlug || l.slug)) {
+        // Not if the account says it was deleted. applyServerListDeletions
+        // above has normally already removed it from the local map; this is
+        // the belt-and-braces half, for the case where that write failed (a
+        // full localStorage) -- a failed tidy-up must not turn into a list
+        // being re-created on the account.
+        if (listTombstones[l.creatorSlug || l.slug] || listTombstones[k]) return;
+        localRestoredCustomLists.push(l);
+        if (activeCreator && creatorKey) needUploading.push(l);
+      }
+    });
+    // A render that finds everything already on the account is the signal
+    // that the two sides agree again -- give the round budget back, so a
+    // later genuine upload is not blocked by an earlier bad patch.
+    if (!needUploading.length) _missingListUploadRounds = 0;
+    else uploadMissingLocalListsToAccount(needUploading, creatorKey);
+
+    const allDashboardLists = [
+      ...serverCustomLists.map((l) => ({ isServer: true, list: l })),
+      ...localRestoredCustomLists.map((l) => ({ isServer: false, list: l })),
+      ...(autoTracked.lists || []).map((l) => ({ isServer: false, list: l })),
+    ];
+    // Airing Next is local-only (see its own comment, 21_client-custom-
+    // list-builder.js) -- folded into the same array (rather than its own
+    // separate card type) purely so it sorts and drags alongside every
+    // other card via the shared savedOrder/persistCreatorListOrderFromDom
+    // machinery below; buildAiringNextCardHtml (unlike buildServerListCardHtml/
+    // buildLocalListCardHtml) takes no arguments, so "list" here is just a
+    if (typeof collectAiringNextCandidateShowIds === 'function' && collectAiringNextCandidateShowIds().size && typeof buildAiringNextCardHtml === 'function') {
+      allDashboardLists.push({ isAiringNext: true, list: { slug: 'airing-next' } });
+    }
+
+    const visibleDashboardLists = (typeof isListHidden === 'function') ? allDashboardLists.filter((item) => !isListHidden(item.list && item.list.slug)) : allDashboardLists;
+
+    const localOrder = readDashboardListOrder();
+    let savedOrder = [];
+    if (Array.isArray(data.order) && data.order.length) {
+      if (localOrder.length) {
+        const serverSlugs = new Set(data.order);
+        savedOrder = localOrder.filter((s) => serverSlugs.has(s) || ['continue-watching', 'watch-history', 'watchlist', 'airing-next'].includes(s));
+        data.order.forEach((s) => {
+          if (!savedOrder.includes(s)) savedOrder.push(s);
+        });
+      } else {
+        savedOrder = data.order;
+      }
+      try {
+        localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(savedOrder));
+      } catch (e) {}
+    } else {
+      savedOrder = localOrder;
+    }
+    if (savedOrder.length) {
+      const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
+      visibleDashboardLists.sort((a, b) => {
+        const slugA = (a && a.list && a.list.slug) || '';
+        const slugB = (b && b.list && b.list.slug) || '';
+        const posA = (slugA && orderMap.has(slugA)) ? orderMap.get(slugA) : 9999;
+        const posB = (slugB && orderMap.has(slugB)) ? orderMap.get(slugB) : 9999;
+        return posA - posB;
+      });
+    }
+
+    const rowsHtml = visibleDashboardLists.length
+      ? visibleDashboardLists.map((item) => {
+          if (!item) return '';
+          if (item.isAiringNext) return (typeof buildAiringNextCardHtml === 'function' ? buildAiringNextCardHtml() : '');
+          if (item.isServer) return buildServerListCardHtml(item.list);
+          return buildLocalListCardHtml(item.list);
+        }).filter(Boolean).join('')
+      : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
+
+    const prevScrollTop = box.scrollTop;
+    box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
+    if (prevScrollTop) box.scrollTop = prevScrollTop;
+    document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
+    if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+
+    // Auto-sync check for lists linked to external URLs if >24 hours stale
+    try {
+      checkAndAutoSyncExternalLists(visibleDashboardLists);
+    } catch (e) {}
+  } catch (e) {
+    console.error('renderCreatorDashboard error:', e);
+    if (!hasExistingContent) {
+      box.innerHTML = '<p class="testresult err">\u2717 Network error loading your lists.</p>';
+    }
+  }
+}
+
+let _autoSyncRunning = false;
+async function checkAndAutoSyncExternalLists(dashboardItems) {
+  if (_autoSyncRunning || !Array.isArray(dashboardItems) || !dashboardItems.length) return;
+  if (typeof syncCustomListWithExternalSource !== 'function') return;
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const staleSlugs = [];
+
+  dashboardItems.forEach((it) => {
+    const l = it && it.list;
+    if (!l || !l.slug || !l.synced || !l.sourceUrl) return;
+    const lastSync = Number(l.lastSyncedAt) || 0;
+    if (now - lastSync > ONE_DAY_MS) {
+      staleSlugs.push(l.slug);
+    }
+  });
+
+  if (!staleSlugs.length) return;
+  _autoSyncRunning = true;
+  try {
+    for (const slug of staleSlugs) {
+      try {
+        await syncCustomListWithExternalSource(slug, null, { silent: true });
+      } catch (e) {
+        console.warn('Auto-sync failed for ' + slug, e);
+      }
+    }
+  } finally {
+    _autoSyncRunning = false;
+  }
+}
+window.checkAndAutoSyncExternalLists = checkAndAutoSyncExternalLists;
+
+function formatWatchItemLabel(it) {
+  if (!it) return { title: '', subtitle: '' };
+  const epTitle = it.name || it.episodeTitle || (it.title !== it.showTitle ? it.title : '') || ((it.isSeasonPremiere && it.seasonNum != null && it.seasonNum > 1) ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')) || '';
+  if (it.showTitle && it.seasonNum != null && it.episodeNum != null) {
+    const s = String(it.seasonNum).padStart(2, '0');
+    const e = String(it.episodeNum).padStart(2, '0');
+    return { title: it.showTitle + ' S' + s + 'E' + e, subtitle: epTitle };
+  }
+  if (it.showTitle) {
+    return { title: it.showTitle, subtitle: epTitle };
+  }
+  return { title: it.title || it.name || '', subtitle: '' };
+}
+
+function buildLocalListCardHtml(l) {
+  if (!l) return '';
+  const isAutoTracked = l.slug === 'watch-history' || l.slug === 'continue-watching';
+  const isWatchlist = l.slug === 'watchlist' || l.isWatchlist || (l.name && String(l.name).toLowerCase() === 'watchlist');
+  const liveMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : null;
+  const liveEntry = (liveMap && l.slug) ? liveMap[l.slug] : null;
+  if (liveEntry) {
+    if (Array.isArray(liveEntry.items)) l.items = liveEntry.items;
+    if (liveEntry.visibility) l.visibility = liveEntry.visibility;
+    if (liveEntry.type && !l.type) l.type = liveEntry.type;
+    if (liveEntry.sourceUrl) l.sourceUrl = liveEntry.sourceUrl;
+    if (liveEntry.synced != null) l.synced = liveEntry.synced;
+    if (liveEntry.lastSyncedAt != null) l.lastSyncedAt = liveEntry.lastSyncedAt;
+    if (liveEntry.baseItemIds) l.baseItemIds = liveEntry.baseItemIds;
+  }
+  const resolveItemPoster = (it) => {
+    if (!it) return '';
+    let p = l.slug === 'continue-watching' ? (it.showPoster || it.poster) : (it.poster || it.showPoster);
+    if (!p) {
+      const epId = String(it.id || '');
+      const sId = it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (it.imdbId || it.id));
+      if (sId && String(sId).startsWith('tt')) {
+        p = 'https://images.metahub.space/poster/medium/' + sId + '/img';
+      }
+    }
+    if (typeof resolveClientPoster === 'function') {
+      return resolveClientPoster(it, p || '');
+    }
+    return p || '';
+  };
+  const itemCount = (l.items || []).length;
+  const allPosters = (l.items || []).slice(0, 9).filter((it) => it && resolveItemPoster(it));
+  const totalCount = itemCount || allPosters.length;
+  const posterThumbs = allPosters.map((it, i) => {
+    if (!it) return '';
+    const isMobileEnd = (i === 2 && allPosters.length > 3);
+    const isDesktopEnd = (i === allPosters.length - 1 && allPosters.length >= 4);
+    let overlays = '';
+    if (isMobileEnd) {
+      overlays += '<div class="list-card-count-overlay mobile-only localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    }
+    if (isDesktopEnd) {
+        overlays += '<div class="list-card-count-overlay desktop-only localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+    }
+    const posterId = it.showId || it.imdbId || it.id || '';
+    const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
+    const label = formatWatchItemLabel(it);
+    let removeBtn = '';
+    const cwRemoveId = it.showId || it.imdbId || it.id;
+    if (l.slug === 'continue-watching' && cwRemoveId) {
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+    } else if (isWatchlist) {
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
+    } else if (l.slug === 'watch-history') {
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeJsAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
+    }
+    const itemPoster = resolveItemPoster(it);
+    const isAiringList = l.slug === 'airing-next' || l.statusKey === 'airing-next';
+    const isCwList = l.slug === 'continue-watching' || l.statusKey === 'continue-watching';
+    const showLocationBadges = typeof getBadgeSetting === 'function'
+      ? (isAiringList ? getBadgeSetting('showBadgesAiringNext') : (isCwList ? getBadgeSetting('showBadgesContinueWatching') : getBadgeSetting('showBadgesCatalogs')))
+      : true;
+    const showAirDate = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
+    const showPremiere = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
+    const showFinale = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
+    const showFinaleDate = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
+
+    const airingList = (isCwList && typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+    const airingMatch = airingList.find((a) => {
+      if (!a) return false;
+      const aShowId = String(a.showId || a.id || '').split(':')[0];
+      const itShowId = String(it.showId || it.id || posterId || '').split(':')[0];
+      if (a.showId && (a.showId === it.showId || a.showId === posterId || a.showId === it.id)) return true;
+      if (aShowId && itShowId && aShowId === itShowId) return true;
+      if (a.canonicalTmdbId && it.canonicalTmdbId && a.canonicalTmdbId === it.canonicalTmdbId) return true;
+      if (a.tmdbId && it.tmdbId && String(a.tmdbId) === String(it.tmdbId)) return true;
+      if (a.imdbId && it.imdbId && a.imdbId === it.imdbId) return true;
+      const aTitle = String(a.showTitle || a.title || a.name || '').toLowerCase().trim();
+      const itTitle = String(it.showTitle || it.title || it.name || '').toLowerCase().trim();
+      if (aTitle && itTitle && aTitle === itTitle) return true;
+      return false;
+    });
+    const effectiveSeasonNum = it.seasonNum != null ? it.seasonNum : (it.season != null ? it.season : null);
+    const effectiveEpisodeNum = it.episodeNum != null ? it.episodeNum : (it.episode != null ? it.episode : null);
+
+    const itSeason = effectiveSeasonNum != null ? effectiveSeasonNum : (!isCwList && airingMatch ? airingMatch.seasonNum : null);
+    const itEpisode = effectiveEpisodeNum != null ? effectiveEpisodeNum : (!isCwList && airingMatch ? airingMatch.episodeNum : null);
+    
+    // Check if this show is on an older past season (not the newest season)
+    const isOlderSeason = isCwList && !!(airingMatch && airingMatch.seasonNum != null && effectiveSeasonNum != null && effectiveSeasonNum < airingMatch.seasonNum);
+
+    let dateBadge = '';
+    let bottomBadge = '';
+
+    if (showLocationBadges && !isOlderSeason) {
+      const isSameSeason = !!(airingMatch && (!itSeason || !airingMatch.seasonNum || itSeason === airingMatch.seasonNum));
+      const isSameEpisode = isSameSeason && (!itEpisode || !airingMatch.episodeNum || itEpisode === airingMatch.episodeNum);
+      const effectiveAirDate = it.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
+      const currentEpNum = itEpisode != null ? itEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
+      const hasLaterAiringEp = !!(isSameSeason && airingMatch && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
+      const hasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false);
+      const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(it.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
+
+      if (showAirDate && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
+        const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
+        if (badgeText) {
+          dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(effectiveAirDate) + '">' + escapeHtml(badgeText) + '</div>';
+        }
+      }
+
+      const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (it.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
+      const isSeasonFinale = !!(it.isSeasonFinale || (isSameEpisode && airingMatch && airingMatch.isSeasonFinale) || (airingMatch && airingMatch.seasonFinaleEpisodeNumber && currentEpNum != null && currentEpNum === airingMatch.seasonFinaleEpisodeNumber));
+      const seasonFinaleAirDate = it.seasonFinaleAirDate || (airingMatch ? (airingMatch.seasonFinaleAirDate || (airingMatch.isSeasonFinale ? airingMatch.airDate : null)) : null);
+      const isFinaleUnaired = seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(seasonFinaleAirDate) : !!seasonFinaleAirDate;
+
+      if (it.isCompanion) {
+        const compLabel = it.companionType === 'bridge_movie' ? 'Bridge Movie' : (it.companionType === 'sequel_movie' ? 'Sequel Film' : 'Storyline');
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-companion" title="' + escapeAttr(it.companionNote || it.companionStoryline || 'Next in Storyline') + '">' + escapeHtml(compLabel) + '</div>';
+      } else if (showPremiere && isSeasonPremiere && isUnairedEp) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(effectiveAirDate || '') + '">Season Premiere</div>';
+      } else if (showFinale && isSeasonFinale) {
+        bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(effectiveAirDate || seasonFinaleAirDate || '') + '">Season Finale</div>';
+      } else if (showFinaleDate && seasonFinaleAirDate && isFinaleUnaired && (!isSeasonPremiere || !isUnairedEp || currentEpNum >= 2)) {
+        const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(seasonFinaleAirDate) : '';
+        if (finaleText) {
+          bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+        }
+      }
+    }
+
+    const posterEl = itemPoster
+      ? '<img src="' + escapeAttr(itemPoster) + '" class="clickable-poster" data-id="' + escapeAttr(posterId) + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+      : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1" style="width:100%;height:100%;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+    return '<div class="list-card-mini-poster-tile" data-id="' + escapeAttr(posterId) + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '">' +
+      '<div class="list-card-mini-poster-img-wrap">' +
+        posterEl +
+        dateBadge +
+        bottomBadge +
+        removeBtn +
+        overlays +
+      '</div>' +
+      '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
+      (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
+      (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
+    '</div>';
+  }).join('');
+  const typeLabel = l.type === 'series' ? 'Shows' : l.type === 'movie' ? 'Movies' : 'Mixed';
+  const cardClass = 'creator-list-row list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : (l.slug === 'continue-watching' ? ' continue-watching-card is-continue-watching-shelf' : (l.slug === 'airing-next' ? ' airing-next-card is-airing-next-shelf' : '')));
+  const isPublic = l.visibility === 'public';
+  const shareUrl = l.url || ((typeof activeCreator !== 'undefined' && activeCreator)
+    ? (location.origin + '/lists/' + activeCreator.creatorName + '/' + (l.slug || 'watchlist'))
+    : (location.origin + '/lists/' + (l.slug === 'watchlist' ? 'watchlist' : ('custom/' + l.slug))));
+  const shareBtn = isPublic
+    ? '<button type="button" class="lc-btn secondary creatorListShareBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(shareUrl) + '">Share</button>'
+    : '';
+
+  let isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, l.type, l.slug) : false;
+  if (!isAdded && isAutoTracked) {
+    const entries = document.querySelectorAll('#lists .entry');
+    for (const entry of entries) {
+      const nameInput = entry.querySelector('.name');
+      const urlInput = entry.querySelector('.url');
+      if (urlInput && (urlInput.value.indexOf('autotrack:' + l.slug) !== -1 || (urlInput.value.indexOf(l.slug) !== -1 && urlInput.value.startsWith('customlist:v1:')))) {
+        isAdded = true;
+        break;
+      }
+      if (nameInput && nameInput.value.trim().toLowerCase().startsWith(l.name.toLowerCase())) {
+        isAdded = true;
+        break;
+      }
+    }
+  }
+
+  const addBtnHtml = '<button type="button" class="lc-btn ' + (isAdded ? 'secondary localListAddToConfigBtn is-added' : 'primary localListAddToConfigBtn') + '" ' +
+    (isAdded ? 'style="color:var(--danger);"' : '') +
+    ' data-slug="' + escapeAttr(l.slug) + '">' +
+    (isAdded ? 'Remove' : '+ Add') +
+  '</button>';
+
+  const deleteBtnHtml = (isAutoTracked || isWatchlist)
+    ? ''
+    : '<button type="button" class="lc-btn secondary localListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>';
+
+  const isSynced = !isAutoTracked && !!(l.synced && l.sourceUrl);
+  const syncBtnHtml = isSynced
+    ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
+    : '';
+
+  return '<div class="' + cardClass + '" draggable="true" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
+    '<div class="list-card-header">' +
+      '<div class="list-card-body localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type || 'movie') + '" style="cursor:pointer;">' +
+        '<div class="list-card-title">' +
+          '<span class="drag-handle-list" draggable="true" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
+          escapeHtml(l.name) +
+        '</div>' +
+        '<div class="list-card-meta">' +
+          (!isAutoTracked ? ('<span>' + (isPublic ? 'Public' : 'Private') + '</span><span class="list-card-meta-sep">&middot;</span>') : '') +
+          '<span>' + typeLabel + '</span>' +
+          '<span class="list-card-meta-sep">&middot;</span>' +
+          '<span>' + totalCount + ' item' + (totalCount === 1 ? '' : 's') + '</span>' +
+          (isSynced ? ('<span class="list-card-meta-sep">&middot;</span><span>Synced</span>') : '') +
+          (!isAutoTracked && l.slug !== 'watchlist' ? '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' : '') +
+        '</div>' +
+      '</div>' +
+      (isAutoTracked
+        ? '<div class="list-card-actions">' +
+            '<span style="font-size:0.78rem; color:var(--muted); white-space:nowrap; margin-right:8px;">Auto-tracked</span>' +
+            addBtnHtml +
+          '</div>'
+        : '<div class="list-card-actions">' +
+            '<button type="button" class="lc-btn secondary localListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
+            syncBtnHtml +
+            deleteBtnHtml +
+            shareBtn +
+            addBtnHtml +
+          '</div>') +
+    '</div>' +
+    (posterThumbs ? '<div class="list-card-posters poster-preview-static localListViewTrigger" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type || 'movie') + '" style="cursor:pointer;">' + posterThumbs + '</div>' : '') +
+  '</div>';
+}
+
+// list first.
+function backfillAutoTrackedListSlugs(map) {
+  let patched = false;
+  ['watch-history', 'continue-watching'].forEach((key) => {
+    if (map[key] && !map[key].slug) {
+      map[key].slug = key;
+      patched = true;
+    }
+  });
+  // Auto-create mixed Watchlist if not present
+  const hasWatchlist = Object.values(map).some(
+    (l) => l && (l.slug === 'watchlist' || (l.name && l.name.toLowerCase() === 'watchlist') || l.isWatchlist)
+  );
+  if (!hasWatchlist) {
+    map['watchlist'] = {
+      slug: 'watchlist',
+      name: 'Watchlist',
+      type: 'mixed',
+      isWatchlist: true,
+      items: [],
+      createdAt: 0,
+      updatedAt: 0,
+    };
+    patched = true;
+  }
+  if (patched) saveLocalCustomListsMap(map);
+}
+
+// Watch History and Continue Watching are always local -- generated by
+// this browser as you watch things, and deliberately never uploaded to a
+// Creator Profile the way an ordinary saved Custom List is (turning your
+// private watch history into a public server list on sign-up would be a
+// bad surprise). That means the signed-in dashboard below, which replaces
+// this panel with server data, would otherwise make them disappear the
+// moment someone signs in -- this renders them from localStorage
+// regardless of sign-in state so they can be appended alongside whatever
+// else the panel is showing.
+function renderAutoTrackedListsHtml() {
+  const map = loadLocalCustomLists();
+  backfillAutoTrackedListSlugs(map);
+  const keys = ['watch-history', 'continue-watching', 'watchlist'];
+  const lists = keys.map((key) => map[key]).filter(Boolean);
+  return { html: lists.map(buildLocalListCardHtml).join(''), lists: lists };
+}
+
+function renderLocalCustomListsDashboard(box, silent) {
+  const map = loadLocalCustomLists();
+  backfillAutoTrackedListSlugs(map);
+
+  // Sync items from any live DOM rows in Catalogs if the DOM row has more items
+  let hasLocalUpdates = false;
+  document.querySelectorAll('#lists .entry').forEach((entry) => {
+    const urlInput = entry.querySelector('.url');
+    if (!urlInput || !urlInput.value.startsWith('customlist:v1:')) return;
+    try {
+      const rowPayload = JSON.parse(urlInput.value.slice('customlist:v1:'.length));
+      const slug = rowPayload.localSlug || rowPayload.creatorSlug || rowPayload.listSlug;
+      if (!slug || !Array.isArray(rowPayload.items) || !rowPayload.items.length) return;
+      if (map[slug]) {
+        if (rowPayload.items.length > (map[slug].items || []).length) {
+          map[slug].items = rowPayload.items;
+          map[slug].updatedAt = Date.now();
+          hasLocalUpdates = true;
+        }
+      }
+    } catch (e) {}
+  });
+  if (hasLocalUpdates) saveLocalCustomListsMap(map);
+
+  // Airing Next lives in this same map (getOrCreateAiringNextList uses the
+  // same store) but needs its own render path (buildAiringNextCardHtml,
+  // no args) rather than the generic buildLocalListCardHtml -- filtered
+  // out of the plain loop below and re-added as a stub so it still
+  // participates in the shared saved-order sort/drag exactly like every
+  // other card (see the matching comment in renderCreatorDashboard above).
+  const lists = Object.keys(map).map((k) => map[k]).filter((l) => l && l.slug !== 'airing-next');
+  const airingNextEligible = typeof collectAiringNextCandidateShowIds === 'function' && collectAiringNextCandidateShowIds().size && typeof buildAiringNextCardHtml === 'function';
+  if (airingNextEligible) {
+    lists.push({ slug: 'airing-next', isAiringNext: true, updatedAt: (map['airing-next'] && map['airing-next'].updatedAt) || Date.now() });
+  }
+
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.slug)) : lists;
+
+  const savedOrder = readDashboardListOrder();
+  if (savedOrder.length) {
+    const orderMap = new Map(savedOrder.map((s, idx) => [s, idx]));
+    visibleLists.sort((a, b) => {
+      const posA = orderMap.has(a.slug) ? orderMap.get(a.slug) : 9999;
+      const posB = orderMap.has(b.slug) ? orderMap.get(b.slug) : 9999;
+      if (posA !== posB) return posA - posB;
+      return (b.updatedAt || 0) - (a.updatedAt || 0);
+    });
+  } else {
+    visibleLists.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  }
+  lastLocalCustomListsData = visibleLists;
+  const rowsHtml = visibleLists.length
+    ? visibleLists.map((l) => l.isAiringNext ? buildAiringNextCardHtml() : buildLocalListCardHtml(l)).join('')
+    : '<p><small>No lists yet \u2014 build one under Create List to get started.</small></p>';
+  const prevScrollTop = box ? box.scrollTop : 0;
+  box.innerHTML = '<div id="creatorListRows" style="margin-bottom:14px;">' + rowsHtml + '</div>';
+  if (prevScrollTop) box.scrollTop = prevScrollTop;
+  document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+}
+
+
+const _creatorDashEl = document.getElementById('creatorDashboard');
+if (_creatorDashEl) {
+  _creatorDashEl.addEventListener('click', async (e) => {
+    if (e.target.closest('.clickable-poster')) return;
+    const airingViewBtn = e.target.closest('.airingNextViewBtn');
+    if (airingViewBtn) {
+      if (typeof openAiringNextDetailsPage === 'function') openAiringNextDetailsPage();
+      return;
+    }
+    const airingAddBtn = e.target.closest('.airingNextAddToConfigBtn');
+    if (airingAddBtn) {
+      const list = (typeof getOrCreateAiringNextList === 'function') ? getOrCreateAiringNextList() : { items: [] };
+      let isAdded = airingAddBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, 'series', 'airing-next'));
+      if (isAdded) {
+        if (typeof removeListFromConfig === 'function') removeListFromConfig(null, 'series', 'airing-next');
+        if (typeof renumber === 'function') renumber();
+        if (typeof saveState === 'function') saveState();
+        airingAddBtn.classList.remove('is-added', 'secondary');
+        airingAddBtn.classList.add('primary');
+        airingAddBtn.textContent = '+ Add';
+        airingAddBtn.style.color = '';
+        if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+        if (typeof showAddedToast === 'function') showAddedToast('Removed "Airing Next" from your Catalogs.');
+        return;
+      }
+      // Signed-in Creator account: a live catalog reading server-side
+      // tracking data (see fetchAutoTrackedCatalog, 05_catalog-core.js).
+      // Local-only browser: a snapshot of today's items, same as Watch
+      // History/Continue Watching fall back to for local-only users --
+      // it'll go stale as the schedule moves and needs a manual Configure
+      // -> Update to refresh (see this repo's README).
+      const url = (typeof activeCreator !== 'undefined' && activeCreator)
+        ? 'autotrack:airing-next:series:' + activeCreator.creatorName
+        : 'customlist:v1:' + JSON.stringify({
+            listId: (typeof generateChannelId === 'function') ? generateChannelId() : String(Date.now()),
+            localSlug: 'airing-next',
+            type: 'series',
+            items: (list.items || []).map((it) => ({ imdbId: it.showId, title: it.showTitle, poster: it.showPoster })),
+            shuffle: false,
+          });
+      if (typeof addRow === 'function') addRow('Airing Next', url, 'series', true, 'My Lists');
+      airingAddBtn.classList.add('is-added', 'secondary');
+      airingAddBtn.classList.remove('primary');
+      airingAddBtn.textContent = 'Remove';
+      airingAddBtn.style.color = 'var(--danger)';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof showAddedToast === 'function') showAddedToast('Added "Airing Next" to your Catalogs.');
+      return;
+    }
+    const viewBtn = e.target.closest('.creatorListViewBtn, .localListViewBtn, .creatorListViewTrigger, .localListViewTrigger');
+  if (viewBtn) {
+    const slug = viewBtn.dataset.slug;
+    const pool = (viewBtn.classList.contains('localListViewBtn') || viewBtn.classList.contains('localListViewTrigger')) ? lastLocalCustomListsData : lastCreatorListsData;
+    let list = (pool || []).find((l) => l && l.slug === slug);
+    if (!list) {
+      const localMap = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      list = (slug && localMap[slug]) || Object.values(localMap).find((l) => l && (l.slug === slug || l.name === viewBtn.dataset.name)) || (typeof lastCreatorListsData !== 'undefined' && (lastCreatorListsData || []).find((l) => l && (l.slug === slug || l.name === viewBtn.dataset.name))) || (typeof lastLocalCustomListsData !== 'undefined' && (lastLocalCustomListsData || []).find((l) => l && (l.slug === slug || l.name === viewBtn.dataset.name)));
+    }
+    const isCw = list && list.slug === 'continue-watching';
+    const isWatchlist = list && (list.slug === 'watchlist' || list.isWatchlist || (list.name && list.name.toLowerCase() === 'watchlist'));
+    const isHistory = list && (list.slug === 'watch-history' || (list.name && list.name.toLowerCase() === 'watch history'));
+    const rawListItems = isCw ? (typeof dedupeContinueWatchingItems === 'function' ? dedupeContinueWatchingItems(list.items || []) : (list.items || [])) : (list ? (list.items || []) : []);
+    const sample = rawListItems.map((it) => {
+      const label = formatWatchItemLabel(it);
+      const isShow = (it.type === 'series' || it.type === 'tv' || it.type === 'show' || it.kind === 'series' || it.kind === 'tv' || !!it.showId || it.seasonNum != null);
+      const itemType = isShow ? 'series' : ((it.type === 'movie' || it.kind === 'movie') ? 'movie' : (it.type === 'episode' ? 'episode' : (list && list.type && list.type !== 'mixed' ? list.type : (viewBtn.dataset.type || 'movie'))));
+      const epId = String(it.id || '');
+      const showId = isCw ? (it.showId || (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : (epId.startsWith('tmdb:') && epId.includes(':') ? epId.split(':')[0] + ':' + epId.split(':')[1] : (it.imdbId || it.id)))) : (it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : null));
+      const showPoster = isCw ? (it.showPoster || (showId && String(showId).startsWith('tt') ? ('https://images.metahub.space/poster/medium/' + showId + '/img') : it.poster)) : (it.poster || it.showPoster);
+      return {
+        id: showId,
+        // Gated on isShow -- a plain movie has no real showId, so the
+        // fallback chain above lands on its own imdbId, which would read as
+        // a truthy showId here and pull it into the Shows tab's !!it.showId
+        // filter right alongside actual shows.
+        showId: isShow ? showId : null,
+        seasonNum: it.seasonNum,
+        episodeNum: it.episodeNum,
+        type: itemType,
+        name: label.title || it.title || it.name || 'Untitled',
+        subtitle: label.subtitle || '',
+        poster: typeof resolveClientPoster === 'function' ? resolveClientPoster(it, showPoster) : showPoster,
+        isAdult: typeof isAdultOrNsfw === 'function' ? isAdultOrNsfw(it) : !!it.adult,
+        isAdultPosterFiltered: typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled() && (it.isAdult || (typeof isAdultOrNsfw === 'function' && isAdultOrNsfw(it))),
+        year: it.year,
+        airDate: it.airDate,
+        isUnaired: it.isUnaired,
+        seasonFinaleAirDate: it.seasonFinaleAirDate,
+        isSeasonPremiere: it.isSeasonPremiere,
+        isSeasonFinale: it.isSeasonFinale,
+        removeShowId: isCw ? (it.showId || it.id) : null,
+        removeWatchlistId: isWatchlist ? (it.imdbId || it.id) : null,
+        removeHistoryId: isHistory ? (it.id || it.imdbId) : null,
+        removeCustomListSlug: (!isCw && !isWatchlist && !isHistory) ? list.slug : null,
+      };
+    });
+    const listSlug = (list && (list.slug || list.localSlug)) || (isCw ? 'continue-watching' : (isHistory ? 'watch-history' : (isWatchlist ? 'watchlist' : slug)));
+    const listUrl = listSlug ? ('custom:' + listSlug) : '';
+    const listType = (viewBtn.dataset.type && viewBtn.dataset.type !== 'undefined') ? viewBtn.dataset.type : ((list && list.type) || (isCw ? 'series' : (isWatchlist ? 'mixed' : 'movie')));
+    openListDetailsPage(viewBtn.dataset.name || (list && list.name) || 'Custom List', listType, listUrl, { sample: sample, count: sample.length, maybeMore: false });
+    return;
+  }
+  const shareBtn = e.target.closest('.creatorListShareBtn');
+  if (shareBtn) {
+    const listUrl = shareBtn.dataset.url;
+    const listName = shareBtn.dataset.name || 'Custom List';
+    openShareListModal(listName, listUrl);
+    return;
+  }
+  const deleteBtn = e.target.closest('.creatorListDeleteBtn');
+  if (deleteBtn) {
+    const slug = deleteBtn.dataset.slug;
+    if (slug === 'watchlist') return;
+    const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+    confirmFn("Delete List", "Delete this list? This cannot be undone.", "Delete", async () => {
+      const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+      recordCreatorListDeletion(slug);
+      try {
+        const res = await fetch(ORIGIN + '/api/creator/lists/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, slug: slug }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          if (typeof showAppAlert === 'function') {
+            showAppAlert('Error', 'Could not delete: ' + (data.error || 'unknown error'), false);
+          } else {
+            alert('Could not delete: ' + (data.error || 'unknown error'));
+          }
+          return;
+        }
+        
+        // Remove from local storage map so it doesn't get resurrected
+        const map = loadLocalCustomLists();
+        delete map[slug];
+        Object.keys(map).forEach((k) => {
+          if (map[k] && (map[k].slug === slug || map[k].creatorSlug === slug || map[k].localSlug === slug || map[k].listSlug === slug)) {
+            delete map[k];
+          }
+        });
+        saveLocalCustomListsMap(map);
+        
+        // Remove from main lists config if present
+        document.querySelectorAll('#lists .url').forEach((urlInput) => {
+          const rowPayload = parseCustomListPayloadClient(urlInput.value);
+          if (rowPayload && (rowPayload.creatorSlug === slug || rowPayload.slug === slug || rowPayload.localSlug === slug || rowPayload.listSlug === slug)) {
+            const entry = urlInput.closest('.entry');
+            if (entry) {
+              entry.remove();
+            }
+          }
+        });
+        if (typeof saveState === 'function') saveState();
+        if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+        if (typeof pushCreatorSync === 'function') pushCreatorSync();
+        
+        renderCreatorDashboard();
+      } catch (err) {
+        if (typeof showAppAlert === 'function') {
+          showAppAlert('Network Error', 'Network error while deleting.', false);
+        } else {
+          alert('Network error while deleting.');
+        }
+      }
+    }, true);
+    return;
+  }
+  const syncBtn = e.target.closest('.customListSyncBtn');
+  if (syncBtn) {
+    const slug = syncBtn.dataset.slug;
+    if (slug && typeof syncCustomListWithExternalSource === 'function') {
+      syncCustomListWithExternalSource(slug, syncBtn);
+    }
+    return;
+  }
+  const editBtn = e.target.closest('.creatorListEditBtn');
+  if (editBtn) {
+    editCreatorList(editBtn.dataset.slug);
+    return;
+  }
+  const addToConfigBtn = e.target.closest('.creatorListAddToConfigBtn');
+  if (addToConfigBtn) {
+    const slug = addToConfigBtn.dataset.slug;
+    const listMeta = (lastCreatorListsData || []).find((l) => l.slug === slug);
+    if (!listMeta) {
+      alert('Could not find that list -- try refreshing.');
+      return;
+    }
+    const isAdded = addToConfigBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, listMeta.type, slug));
+    if (isAdded) {
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(null, listMeta.type, slug);
+        removeListFromConfig(null, 'movie', slug);
+        removeListFromConfig(null, 'series', slug);
+      }
+      addToConfigBtn.classList.remove('is-added', 'secondary');
+      addToConfigBtn.classList.add('primary');
+      addToConfigBtn.textContent = '+ Add';
+      addToConfigBtn.style.color = '';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      showAddedToast('Removed "' + listMeta.name + '" from your Catalogs.');
+    } else {
+      if (listMeta.type === 'mixed') {
+        const items = listMeta.items || [];
+        const movies = items.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+        const series = items.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+        const mPayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: listMeta.creatorName || (activeCreator ? activeCreator.creatorName : undefined), type: 'movie', items: movies, shuffle: false, publishedUrl: listMeta.url || undefined };
+        addRow(listMeta.name + ' (Movies)', 'customlist:v1:' + JSON.stringify(mPayload), 'movie', true, 'Custom Lists');
+        const sPayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: listMeta.creatorName || (activeCreator ? activeCreator.creatorName : undefined), type: 'series', items: series, shuffle: false, publishedUrl: listMeta.url || undefined };
+        addRow(listMeta.name + ' (Shows)', 'customlist:v1:' + JSON.stringify(sPayload), 'series', true, 'Custom Lists');
+      } else {
+        const payload = { listId: generateChannelId(), listSlug: slug, type: listMeta.type, items: listMeta.items || [], shuffle: false };
+        addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type, true, 'Custom Lists');
+      }
+      addToConfigBtn.classList.add('is-added', 'secondary');
+      addToConfigBtn.classList.remove('primary');
+      addToConfigBtn.textContent = 'Remove';
+      addToConfigBtn.style.color = 'var(--danger)';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
+    }
+    return;
+  }
+  const localEditBtn = e.target.closest('.localListEditBtn');
+  if (localEditBtn) {
+    const editSlug = localEditBtn.dataset.slug;
+    // Defense in depth -- these buttons no longer render for Watch
+    // History/Continue Watching (see buildLocalListCardHtml), but guard
+    // here too in case anything else ever calls this. Editing one by hand
+    // would desync it from _watchedItemIds, since nothing would tell the
+    // "watched" badge system an item was removed.
+    if (editSlug === 'watch-history' || editSlug === 'continue-watching') return;
+    editLocalCustomList(editSlug);
+    return;
+  }
+  const localDeleteBtn = e.target.closest('.localListDeleteBtn');
+  if (localDeleteBtn) {
+    const slug = localDeleteBtn.dataset.slug;
+    // Same as above -- deleting either of these doesn't just clear this
+    // browser, it also wipes them from every signed-in device on the next
+    // background account sync (a full overwrite, not a merge).
+    if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') return;
+    const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+    confirmFn("Delete List", "Delete this list? This cannot be undone.", "Delete", () => {
+      const map = loadLocalCustomLists();
+      delete map[slug];
+      Object.keys(map).forEach((k) => {
+        if (map[k] && (map[k].slug === slug || map[k].creatorSlug === slug || map[k].localSlug === slug || map[k].listSlug === slug)) {
+          delete map[k];
+        }
+      });
+      saveLocalCustomListsMap(map);
+      
+      // If signed into creator, also delete from server if it exists
+      if (activeCreator) {
+        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+        if (creatorKey) {
+          // Fire-and-forget: if this never lands the list survives on the
+          // account while being gone locally, which is precisely what the
+          // backfill must not undo.
+          recordCreatorListDeletion(slug);
+          fetch(ORIGIN + '/api/creator/lists/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, slug: slug }),
+          }).catch(() => {});
+        }
+      }
+      
+      // Remove from main lists config if present
+      document.querySelectorAll('#lists .url').forEach((urlInput) => {
+        const rowPayload = parseCustomListPayloadClient(urlInput.value);
+        if (rowPayload && (rowPayload.localSlug === slug || rowPayload.creatorSlug === slug || rowPayload.slug === slug || rowPayload.listSlug === slug)) {
+          const entry = urlInput.closest('.entry');
+          if (entry) entry.remove();
+        }
+      });
+      if (typeof saveState === 'function') saveState();
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof pushCreatorSync === 'function') pushCreatorSync();
+      
+      renderCreatorDashboard();
+    }, true);
+    return;
+  }
+  const localAddToConfigBtn = e.target.closest('.localListAddToConfigBtn');
+  if (localAddToConfigBtn) {
+    const slug = localAddToConfigBtn.dataset.slug;
+    const listMeta = (lastLocalCustomListsData || []).find((l) => l.slug === slug);
+    if (!listMeta) {
+      alert('Could not find that list -- try refreshing.');
+      return;
+    }
+    
+    let isAdded = localAddToConfigBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, listMeta.type, slug));
+    if (!isAdded && (slug === 'watch-history' || slug === 'continue-watching')) {
+      const entries = document.querySelectorAll('#lists .entry');
+      for (const entry of entries) {
+        const nameInput = entry.querySelector('.name');
+        const urlInput = entry.querySelector('.url');
+        if (urlInput && (urlInput.value.indexOf('autotrack:' + slug) !== -1 || (urlInput.value.indexOf(slug) !== -1 && urlInput.value.startsWith('customlist:v1:')))) {
+          isAdded = true;
+          break;
+        }
+        if (nameInput && nameInput.value.trim().toLowerCase().startsWith(listMeta.name.toLowerCase())) {
+          isAdded = true;
+          break;
+        }
+      }
+    }
+
+    if (isAdded) {
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(null, listMeta.type, slug);
+        removeListFromConfig(null, 'movie', slug);
+        removeListFromConfig(null, 'series', slug);
+      }
+      document.querySelectorAll('#lists .url').forEach((urlInput) => {
+        const rowPayload = parseCustomListPayloadClient(urlInput.value);
+        if (rowPayload && rowPayload.localSlug === slug) {
+          const entry = urlInput.closest('.entry');
+          if (entry) entry.remove();
+        } else if (urlInput.value.indexOf('autotrack:' + slug) !== -1) {
+          const entry = urlInput.closest('.entry');
+          if (entry) entry.remove();
+        }
+      });
+      if (slug === 'watch-history' || slug === 'continue-watching') {
+        document.querySelectorAll('#lists .entry').forEach((entry) => {
+          const nameInput = entry.querySelector('.name');
+          if (nameInput && nameInput.value.trim().toLowerCase().startsWith(listMeta.name.toLowerCase())) {
+            entry.remove();
+          }
+        });
+      }
+      if (typeof renumber === 'function') renumber();
+      if (typeof saveState === 'function') saveState();
+      localAddToConfigBtn.classList.remove('is-added', 'secondary');
+      localAddToConfigBtn.classList.add('primary');
+      localAddToConfigBtn.textContent = '+ Add';
+      localAddToConfigBtn.style.color = '';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      showAddedToast('Removed "' + listMeta.name + '" from your Catalogs.');
+      return;
+    }
+
+    const items = normalizeSnapshotItemsForCatalog(listMeta.items || []);
+    
+    if (listMeta.type === 'mixed' || slug === 'watch-history' || slug === 'continue-watching') {
+      const movies = [];
+      const series = [];
+      
+      items.forEach(it => {
+        const isMovie = it.kind === 'movie' || it.type === 'movie';
+        const mapped = {
+          imdbId: isMovie ? (it.imdbId || it.id) : (it.showId || it.imdbId || it.id),
+          title: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
+          poster: isMovie ? it.poster : (it.showPoster || it.poster),
+          year: it.year
+        };
+        
+        if (isMovie) {
+          movies.push(mapped);
+        } else {
+          // Keep only one entry per show in the catalog
+          if (!series.some(s => s.imdbId === mapped.imdbId)) {
+            series.push(mapped);
+          }
+        }
+      });
+      
+      const movieUrl = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
+        ? 'autotrack:' + slug + ':movie:' + activeCreator.creatorName
+        : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'movie', items: movies, shuffle: false });
+      addRow(listMeta.name + ' (Movies)', movieUrl, 'movie', true, 'My Lists');
+      const showUrl = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
+        ? 'autotrack:' + slug + ':series:' + activeCreator.creatorName
+        : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'series', items: series, shuffle: false });
+      addRow(listMeta.name + ' (Shows)', showUrl, 'series', true, 'My Lists');
+    } else {
+      const payload = { listId: generateChannelId(), localSlug: slug, type: listMeta.type, items: items, shuffle: false };
+      addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type, true, 'My Lists');
+    }
+    
+    localAddToConfigBtn.classList.add('is-added', 'secondary');
+    localAddToConfigBtn.classList.remove('primary');
+    localAddToConfigBtn.textContent = 'Remove';
+    localAddToConfigBtn.style.color = 'var(--danger)';
+    if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+    showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
+  }
+});
+}
+
+// A customlist:v1: snapshot is read back by fetchCustomListCatalog
+// (05_catalog-core.js), which drops any item without an imdbId. Ordinary
+// custom-list picks always have one. Auto-tracked and derived lists do
+// not: an Airing Next entry is keyed by showId, a Watch History episode
+// by its own episode id with the series in showId. Passing those through
+// untouched produced a snapshot every item of which was filtered out
+// server-side -- a row that embedded real data and still rendered "No
+// items found".
+//
+// This fills in the missing identifier without disturbing anything that
+// already has one, so a normal custom list round-trips byte-identically
+// (kind/type in particular are preserved -- fetchCustomListCatalog reads
+// them to decide whether an item belongs in a movie or a series row).
+function normalizeSnapshotItemsForCatalog(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((it) => {
+    if (!it || it.imdbId) return it;
+    const derivedId = it.showId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : '');
+    if (!derivedId) return it;
+    return Object.assign({}, it, {
+      imdbId: derivedId,
+      title: it.title || it.showTitle || it.name || '',
+      poster: it.poster || it.showPoster || '',
+    });
+  });
+}
+
+function editCreatorList(slug) {
+  const listMeta = (lastCreatorListsData || []).find((l) => l.slug === slug);
+  if (!listMeta) {
+    alert('Could not find that list -- try refreshing.');
+    return;
+  }
+  const isWatchlist = slug === 'watchlist' || listMeta.isWatchlist || (listMeta.name && listMeta.name.toLowerCase() === 'watchlist');
+  customListDraftItems = (listMeta.items || []).slice();
+  customListDraftType = isWatchlist ? 'mixed' : (listMeta.type || 'mixed');
+  editingCreatorListSlug = slug;
+  editingCustomListUrlInput = null;
+  document.getElementById('customListNameInput').value = listMeta.name;
+  const stEl1 = document.getElementById('customListSearchType');
+  if (stEl1) stEl1.value = customListDraftType === 'series' ? 'tv' : 'movie';
+  if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
+  const visSelect = document.getElementById('customListVisibilitySelect');
+  if (visSelect) visSelect.value = listMeta.visibility === 'private' ? 'private' : 'public';
+  renderCustomListDraftList();
+  updateCustomListSaveButtonLabel();
+  switchTab('lists');
+  // Create List has no pill of its own in #listsSubnavBar (it's only ever
+  // reached via a list's Edit button, not a tab click), so there's no
+  // correct button to highlight here -- passing none leaves every pill
+  // unhighlighted instead of the wrong one lighting up. Previously this
+  // grabbed whichever pill happened to be 5th, which meant "Find Lists"
+  // would light up while looking at the Create List panel instead of Find
+  // Lists as soon as anything else got added to the pill bar and shifted
+  // that position.
+  if (typeof switchListsSubmenu === 'function') switchListsSubmenu('create-list');
+  const panel = document.getElementById('listsSubCreateList');
+  if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// Local equivalent of editCreatorList above.
+function editLocalCustomList(slug) {
+  const map = loadLocalCustomLists();
+  const listMeta = map[slug];
+  if (!listMeta) {
+    alert('Could not find that list -- try refreshing.');
+    return;
+  }
+  const isWatchlist = slug === 'watchlist' || listMeta.isWatchlist || (listMeta.name && listMeta.name.toLowerCase() === 'watchlist');
+  customListDraftItems = (listMeta.items || []).slice();
+  customListDraftType = isWatchlist ? 'mixed' : (listMeta.type || 'mixed');
+  editingLocalCustomListSlug = slug;
+  editingCreatorListSlug = null;
+  editingCustomListUrlInput = null;
+  document.getElementById('customListNameInput').value = listMeta.name;
+  const stEl2 = document.getElementById('customListSearchType');
+  if (stEl2) stEl2.value = customListDraftType === 'series' ? 'tv' : 'movie';
+  if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
+  const visSelect = document.getElementById('customListVisibilitySelect');
+  if (visSelect) visSelect.value = (listMeta.visibility === 'public') ? 'public' : 'private';
+  renderCustomListDraftList();
+  updateCustomListSaveButtonLabel();
+  switchTab('lists');
+  // Same reasoning as editCreatorList above -- Create List has no pill of
+  // its own to correctly highlight.
+  if (typeof switchListsSubmenu === 'function') switchListsSubmenu('create-list');
+  const panel = document.getElementById('listsSubCreateList');
+  if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// Drag-to-reorder for the Dashboard's own list of lists -- same live-DOM-
+// reorder-then-persist technique used for the picks draft above, just
+// keyed by data-slug instead of a data-idx into a local array, since the
+// "array" here is the server's own persisted order.
+let creatorListDragRow = null;
+
+function getCreatorListDragAfterElement(container, y) {
+  const els = [...container.querySelectorAll('.creator-list-row:not(.dragging)')];
+  return els.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
+    return closest;
+  }, { offset: -Infinity, element: null }).element;
+}
+
+async function persistCreatorListOrderFromDom() {
+  const container = document.getElementById('creatorListRows');
+  if (!container) return;
+  const order = [...container.querySelectorAll('.creator-list-row')].map((row) => row.dataset.slug).filter(Boolean);
+  if (!order.length) return;
+  try {
+    localStorage.setItem('myListAddon:dashboardListOrder', JSON.stringify(order));
+  } catch (e) {}
+  if (typeof resetCreatorListsCache === 'function') {
+    resetCreatorListsCache();
+  }
+  if (activeCreator) {
+    const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+    try {
+      await fetch(ORIGIN + '/api/creator/lists/reorder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey, order: order }),
+      });
+    } catch (e) {
+      // A failed reorder save just means it reverts to server order next
+      // load -- not worth interrupting with an error for a drag-and-drop.
+    }
+  }
+}
+
+function initCreatorListTouchDrag(handle) {
+  if (!handle) return;
+  handle.setAttribute('draggable', 'true');
+  handle.addEventListener('dragstart', (e) => {
+    creatorListDragRow = handle.closest('.creator-list-row');
+    if (creatorListDragRow) {
+      creatorListDragRow.classList.add('dragging');
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', creatorListDragRow.dataset.slug || '');
+      }
+    }
+  });
+  handle.addEventListener('dragend', () => {
+    if (creatorListDragRow) creatorListDragRow.classList.remove('dragging');
+    creatorListDragRow = null;
+    persistCreatorListOrderFromDom();
+  });
+  handle.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
+    e.preventDefault();
+    creatorListDragRow = handle.closest('.creator-list-row');
+    if (!creatorListDragRow) return;
+    creatorListDragRow.classList.add('dragging');
+    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+    const move = (ev) => {
+      const container = document.getElementById('creatorListRows');
+      if (!container || !creatorListDragRow) return;
+      const afterEl = getCreatorListDragAfterElement(container, ev.clientY);
+      if (afterEl == null) container.appendChild(creatorListDragRow);
+      else if (afterEl !== creatorListDragRow) container.insertBefore(creatorListDragRow, afterEl);
+    };
+    const end = () => {
+      document.removeEventListener('pointermove', move);
+      if (creatorListDragRow) creatorListDragRow.classList.remove('dragging');
+      creatorListDragRow = null;
+      persistCreatorListOrderFromDom();
+    };
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', end, { once: true });
+    document.addEventListener('pointercancel', end, { once: true });
+  });
+}
+
+document.addEventListener('dragover', (e) => {
+  if (!creatorListDragRow) return;
+  const container = document.getElementById('creatorListRows');
+  if (!container) return;
+  e.preventDefault();
+  const afterEl = getCreatorListDragAfterElement(container, e.clientY);
+  if (afterEl == null) container.appendChild(creatorListDragRow);
+  else if (afterEl !== creatorListDragRow) container.insertBefore(creatorListDragRow, afterEl);
+});
+
+document.addEventListener('drop', (e) => {
+  if (!creatorListDragRow) return;
+  e.preventDefault();
+  if (creatorListDragRow) creatorListDragRow.classList.remove('dragging');
+  creatorListDragRow = null;
+  persistCreatorListOrderFromDom();
+});
+
+// Editing a row's name/url/type or toggling its checkbox doesn't go through
+// addRow/renumber, so save on those too via delegation instead of wiring up
+// a listener on every individual field.
+document.getElementById('lists').addEventListener('input', saveState);
+document.getElementById('lists').addEventListener('change', saveState);
+
+// Keeps a row's Live Preview shelf title (".shelf-title-text", set once at
+// addRow time -- see its own comment there) in sync with the Name field and
+// Movies/Shows selector above it. Without this, renaming a list left the
+// old name showing on its Live Preview shelf and See All page until the
+// whole preview was rebuilt (Refresh Preview, or reloading the page) --
+// editing the field did nothing visible where the person could actually see
+// it. Delegated the same way saveState is above, rather than a listener per
+// row: renumber()/addRow() never touch this element, so nothing else keeps
+// it current.
+document.getElementById('lists').addEventListener('input', (e) => {
+  if (!e.target.classList.contains('name')) return;
+  updateShelfTitleText(e.target.closest('.entry'));
+});
+document.getElementById('lists').addEventListener('change', (e) => {
+  if (!e.target.classList.contains('type')) return;
+  updateShelfTitleText(e.target.closest('.entry'));
+});
+function updateShelfTitleText(entryDOM) {
+  if (!entryDOM) return;
+  const titleEl = entryDOM.querySelector('.shelf-title-text');
+  if (!titleEl) return;
+  const nameInput = entryDOM.querySelector('.name');
+  const typeSelect = entryDOM.querySelector('.type');
+  const name = (nameInput && nameInput.value.trim()) || 'Unnamed';
+  const type = typeSelect ? typeSelect.value : 'movie';
+  titleEl.textContent = name + ' - ' + (type === 'series' ? 'Series' : 'Movies');
+}
+
+// The createListModal counterpart of closeSelectListModal. Its X and Cancel
+// buttons hid the modal and released nothing, which was the other half of the
+// latched scroll lock.
+function closeCreateListModal() {
+  const modal = document.getElementById('createListModal');
+  if (!modal || modal.style.display === 'none') return;
+  modal.style.display = 'none';
+  if (typeof lockBackgroundScroll === 'function') lockBackgroundScroll(false);
+}
+window.closeCreateListModal = closeCreateListModal;
+
+function openCreateListModal(presetDestination) {
+  const destEl = document.getElementById('createListModalDestination');
+  if (destEl) {
+    const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+    const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+    const tmdbAcc = (typeof tmdbAccountId !== 'undefined' && tmdbAccountId) || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+    const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+    const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+    const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+
+    let optsHtml = '<option value="custom">Custom List (Local / Creator)</option>';
+    if (traktToken) optsHtml += '<option value="trakt">Trakt List</option>';
+    if (tmdbSess || tmdbAcc) optsHtml += '<option value="tmdb">TMDB List</option>';
+    if (mdbToken || mdbKey) optsHtml += '<option value="mdblist">MDBList List</option>';
+    if (simklToken) optsHtml += '<option value="simkl">Simkl List</option>';
+    destEl.innerHTML = optsHtml;
+
+    if (presetDestination && destEl.querySelector('option[value="' + presetDestination + '"]')) {
+      destEl.value = presetDestination;
+    } else {
+      destEl.value = 'custom';
+    }
+  }
+
+  const nameEl = document.getElementById('createListModalName');
+  if (nameEl) nameEl.value = '';
+  const descEl = document.getElementById('createListModalDesc');
+  if (descEl) descEl.value = '';
+  const typeEl = document.getElementById('createListModalType');
+  if (typeEl) typeEl.value = 'movie';
+  const pubEl = document.getElementById('createListModalPublic');
+  if (pubEl) pubEl.checked = true;
+  
+  if (typeof onChangeCreateListDestination === 'function') onChangeCreateListDestination();
+
+  const btn = document.getElementById('createListModalBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+    btn.innerText = 'Create';
+  }
+  const modal = document.getElementById('createListModal');
+  // See openSelectListModal: lock only on a real closed -> open transition,
+  // because closeCreateListModal early-returns when already hidden and so
+  // never unlocks twice. Two opens and one close used to leave the page
+  // scroll-locked for good.
+  const wasOpen = !!modal && modal.style.display && modal.style.display !== 'none';
+  if (modal) modal.style.display = 'flex';
+  if (!wasOpen && typeof lockBackgroundScroll === 'function') lockBackgroundScroll(true);
+  if (nameEl) nameEl.focus();
+}
+
+function onChangeCreateListDestination() {
+  const pubWrap = document.getElementById('createListModalPublicWrap');
+  if (pubWrap) {
+    pubWrap.style.display = 'flex';
+  }
+}
+
+async function submitCreateListModal() {
+  const name = document.getElementById('createListModalName').value.trim();
+  if (!name) return;
+  const desc = document.getElementById('createListModalDesc') ? document.getElementById('createListModalDesc').value.trim() : '';
+  const destEl = document.getElementById('createListModalDestination');
+  const dest = destEl ? destEl.value : 'custom';
+  const isPublic = document.getElementById('createListModalPublic') ? document.getElementById('createListModalPublic').checked : true;
+  const visibility = isPublic ? 'public' : 'private';
+  const typeEl = document.getElementById('createListModalType');
+  const type = typeEl ? typeEl.value : 'movie';
+  
+  const currentPendingItem = window._selectListModalCurrentItem;
+  let initialItems = [];
+  
+  const btn = document.getElementById('createListModalBtn');
+  btn.innerText = 'Creating...';
+  btn.disabled = true;
+
+  try {
+    let finalImdbId = '';
+    let cleanTmdbId = '';
+    if (currentPendingItem && currentPendingItem.title) {
+      finalImdbId = currentPendingItem.id;
+      if (finalImdbId && !String(finalImdbId).startsWith('tt')) {
+        cleanTmdbId = String(finalImdbId).replace(/^tmdb:/, '');
+        const endpoint = currentPendingItem.type === 'movie' ? '/api/resolve-movie?tmdbId=' : '/api/resolve-show?tmdbId=';
+        try {
+          const res = await fetch(ORIGIN + endpoint + encodeURIComponent(cleanTmdbId));
+          const data = await res.json();
+          if (data.ok && data.imdbId) finalImdbId = data.imdbId;
+        } catch(e) {}
+      } else if (finalImdbId && String(finalImdbId).startsWith('tt')) {
+        const apiKeyTmdb = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+        if (apiKeyTmdb) {
+          try {
+            const findRes = await fetch('https://api.themoviedb.org/3/find/' + encodeURIComponent(finalImdbId) + '?api_key=' + encodeURIComponent(apiKeyTmdb) + '&external_source=imdb_id');
+            const findData = await findRes.json();
+            const hit = (findData.movie_results && findData.movie_results[0]) || (findData.tv_results && findData.tv_results[0]);
+            if (hit && hit.id) cleanTmdbId = String(hit.id);
+          } catch(e) {}
+        }
+      }
+
+      initialItems.push({
+        imdbId: finalImdbId || currentPendingItem.id,
+        type: currentPendingItem.type || (type === 'series' ? 'series' : 'movie'),
+        title: currentPendingItem.title,
+        poster: currentPendingItem.poster || undefined
+      });
+    }
+
+    if (dest === 'custom') {
+      const payload = { listId: generateChannelId(), type: type, items: initialItems, shuffle: false };
+      if (activeCreator) {
+        const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+        const res = await fetch(ORIGIN + '/api/creator/lists/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creatorName: activeCreator.creatorName,
+            creatorKey: creatorKey,
+            name: name,
+            type: type,
+            items: initialItems,
+            visibility: visibility
+          })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          showAppNoticeModal('Could Not Save List', data.error || 'Unknown error occurred.', true);
+          btn.innerText = 'Create';
+          btn.disabled = false;
+          return;
+        }
+        const updatedPayload = Object.assign({}, payload, {
+          listName: name,
+          publishedUrl: visibility === 'public' ? data.url : undefined,
+          creatorSlug: data.slug,
+          listSlug: data.slug,
+          creatorOwner: activeCreator.creatorName,
+          visibility: visibility
+        });
+        if (type === 'mixed') {
+          const movies = initialItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+          const series = initialItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+          const mPayload = Object.assign({}, updatedPayload, { listId: generateChannelId(), type: 'movie', items: movies });
+          addRow(name + ' (Movies)', 'customlist:v1:' + JSON.stringify(mPayload), 'movie', true, 'Custom Lists');
+          const sPayload = Object.assign({}, updatedPayload, { listId: generateChannelId(), type: 'series', items: series });
+          addRow(name + ' (Shows)', 'customlist:v1:' + JSON.stringify(sPayload), 'series', true, 'Custom Lists');
+        } else {
+          addRow(name, 'customlist:v1:' + JSON.stringify(updatedPayload), type, true, 'Custom Lists');
+        }
+      } else {
+        const base = slugify(name) || 'list';
+        let slug = base;
+        const map = loadLocalCustomLists();
+        let n = 2;
+        while (map[slug]) {
+          slug = base + '-' + n;
+          n++;
+        }
+        payload.localSlug = slug;
+        payload.listSlug = slug;
+        map[slug] = {
+          slug: slug,
+          name: name,
+          type: type,
+          items: initialItems,
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        };
+        saveLocalCustomListsMap(map);
+        if (type === 'mixed') {
+          const movies = initialItems.filter(it => (it.kind === 'movie' || it.type === 'movie' || (!it.kind && !it.type && !it.showId)));
+          const series = initialItems.filter(it => (it.kind === 'series' || it.type === 'series' || it.type === 'tv' || it.showId));
+          const mPayload = Object.assign({}, payload, { listId: generateChannelId(), type: 'movie', items: movies });
+          addRow(name + ' (Movies)', 'customlist:v1:' + JSON.stringify(mPayload), 'movie', true, 'Custom Lists');
+          const sPayload = Object.assign({}, payload, { listId: generateChannelId(), type: 'series', items: series });
+          addRow(name + ' (Shows)', 'customlist:v1:' + JSON.stringify(sPayload), 'series', true, 'Custom Lists');
+        } else {
+          addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
+        }
+      }
+    } else {
+      // External Provider Creation (Trakt, TMDB, MDBList)
+      const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+      const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+      const traktUser = (typeof traktUsername !== 'undefined' && traktUsername) || localStorage.getItem('myListAddon:traktUsername') || '';
+      const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+      const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+      const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+      const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+      const mdbUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
+      const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+      const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+
+      const res = await fetch(ORIGIN + '/api/external-list/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: dest,
+          name: name,
+          description: desc,
+          privacy: visibility,
+          type: type,
+          traktAccessToken: traktToken,
+          traktKey: traktKey,
+          traktUsername: traktUser,
+          tmdbSessionId: tmdbSess,
+          tmdbKey: tmdbKey,
+          mdblistAccessToken: mdbToken,
+          mdblistKey: mdbKey,
+          mdblistUsername: mdbUser,
+          simklAccessToken: simklToken,
+          simklKey: simklKey
+        })
+      });
+      const data = await res.json();
+      if (!data.ok || !data.list) {
+        showAppNoticeModal('Could Not Create List', data.error || 'Failed to create list on ' + dest.toUpperCase() + '.', true);
+        btn.innerText = 'Create';
+        btn.disabled = false;
+        return;
+      }
+
+      const createdList = data.list;
+      const groupLabel = dest === 'trakt' ? 'Trakt' : (dest === 'tmdb' ? 'TMDB' : (dest === 'simkl' ? 'Simkl' : 'MDBList'));
+      addRow(name, createdList.url, type, true, groupLabel);
+
+      // If pending item, add it to the newly created list
+      if (currentPendingItem && currentPendingItem.id) {
+        if (typeof setExternalListMembership === 'function' && typeof makeExternalKey === 'function') {
+          const newKey = makeExternalKey(dest, 'custom', createdList.id || createdList.slug, currentPendingItem.id);
+          setExternalListMembership(newKey, true);
+          if (finalImdbId) setExternalListMembership(makeExternalKey(dest, 'custom', createdList.id || createdList.slug, finalImdbId), true);
+          if (cleanTmdbId) setExternalListMembership(makeExternalKey(dest, 'custom', createdList.id || createdList.slug, cleanTmdbId), true);
+        }
+
+        fetch(ORIGIN + '/api/external-list/item-mutate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'add',
+            provider: dest,
+            target: 'custom',
+            listId: createdList.id || createdList.slug,
+            id: currentPendingItem.id,
+            imdbId: finalImdbId,
+            tmdbId: cleanTmdbId,
+            type: currentPendingItem.type || type,
+            title: currentPendingItem.title,
+            poster: currentPendingItem.poster,
+            traktAccessToken: traktToken,
+            traktKey: traktKey,
+            traktUsername: traktUser,
+            tmdbSessionId: tmdbSess,
+            tmdbKey: tmdbKey,
+            mdblistAccessToken: mdbToken,
+            mdblistKey: mdbKey,
+            simklAccessToken: simklToken,
+            simklKey: simklKey
+          })
+        }).catch(() => {});
+      }
+
+      // Refresh list caches
+      if (dest === 'trakt' && typeof loadMyTraktLists === 'function') loadMyTraktLists();
+      if (dest === 'tmdb' && typeof loadMyTmdbLists === 'function') loadMyTmdbLists();
+      if (dest === 'mdblist' && typeof loadMyMdblistLists === 'function') loadMyMdblistLists();
+      if (dest === 'simkl' && typeof loadMySimklLists === 'function') loadMySimklLists();
+    }
+
+    saveState();
+    closeCreateListModal();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
+
+    if (currentPendingItem && currentPendingItem.title) {
+      showAddedToast('Created list "' + name + '" and added "' + currentPendingItem.title + '".');
+      window._selectListModalCurrentItem = null;
+    } else {
+      showAddedToast('Created list "' + name + '" on ' + (dest === 'custom' ? 'Custom Lists' : dest.toUpperCase()) + '.');
+      switchTab('lists');
+    }
+  } catch (err) {
+    showAppNoticeModal('Network Error', 'A network error occurred while creating your list. Please check your connection and try again.', true);
+  } finally {
+    btn.innerText = 'Create';
+    btn.disabled = false;
+  }
+}
+
+function deleteExternalListDirect(provider, listId, listName, btn) {
+  if (!provider || !listId) return;
+  const providerLabel = provider === 'trakt' ? 'Trakt' : (provider === 'tmdb' ? 'TMDB' : (provider === 'mdblist' ? 'MDBList' : provider));
+  
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  
+  confirmFn(
+    'Delete List',
+    'Are you sure you want to permanently delete the list "' + (listName || 'Custom List') + '" from your ' + providerLabel + ' account? This action cannot be undone.',
+    'Delete Permanently',
+    async () => {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Deleting...';
+      }
+
+      const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+      const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+      const tmdbSess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+      const tmdbKey = (document.getElementById('tmdbKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:tmdbKey') || '';
+      const mdbToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+      const mdbKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+
+      try {
+        const res = await fetch(ORIGIN + '/api/external-list/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider: provider,
+            listId: listId,
+            traktAccessToken: traktToken,
+            traktKey: traktKey,
+            tmdbSessionId: tmdbSess,
+            tmdbKey: tmdbKey,
+            mdblistAccessToken: mdbToken,
+            mdblistKey: mdbKey
+          })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          showAppNoticeModal('Could Not Delete List', data.error || 'Failed to delete list from ' + providerLabel + '.', true);
+          if (btn) { btn.disabled = false; btn.textContent = 'Delete'; }
+          return;
+        }
+
+        // Animate card removal if present
+        const card = btn ? btn.closest('.list-card, .creator-list-row') : null;
+        if (card) {
+          card.style.opacity = '0';
+          card.style.transform = 'scale(0.9)';
+          card.style.transition = 'all 0.2s ease';
+          setTimeout(() => { if (card && card.parentNode) card.parentNode.removeChild(card); }, 200);
+        }
+
+        // Remove row entries from #lists
+        let removedFromConfig = false;
+        document.querySelectorAll('#lists .entry').forEach(row => {
+          const u = row.querySelector('.url')?.value || '';
+          if (u && (u.includes(listId) || (provider === 'trakt' && u.includes('/lists/' + listId)))) {
+            row.remove();
+            removedFromConfig = true;
+          }
+        });
+        if (removedFromConfig) {
+          renumber();
+          saveState();
+        }
+
+        // If currently in list-details view of this list, go back
+        const detailsPanel = document.getElementById('content-list-details');
+        if (detailsPanel && !detailsPanel.hidden) {
+          navigateBackFromDetail();
+        }
+
+        // Refresh caches
+        if (provider === 'trakt' && typeof loadMyTraktLists === 'function') loadMyTraktLists();
+        if (provider === 'tmdb' && typeof loadMyTmdbLists === 'function') loadMyTmdbLists();
+        if (provider === 'mdblist' && typeof loadMyMdblistLists === 'function') loadMyMdblistLists();
+
+        showAddedToast('Deleted list "' + (listName || 'List') + '" from ' + providerLabel + '.');
+      } catch (err) {
+        showAppNoticeModal('Network Error', 'A network error occurred while deleting the list. Please check your connection and try again.', true);
+        if (btn) { btn.disabled = false; btn.textContent = 'Delete'; }
+      }
+    },
+    true
+  );
+}
+
+
+// Save an edit to a server-hosted list without silently overwriting another
+// device's edit to the same list.
+//
+// The server grew the guard for this first (/api/creator/lists/save answers
+// 409 when the stored version is newer than the baseline the caller cites),
+// and nothing armed it: no client sent expectedUpdatedAt, and /api/creator/
+// lists did not return an updatedAt for one to send. Both halves exist now,
+// and this is the piece that uses them.
+//
+// removeItem(items) is the EDIT, not the result of it -- it takes a list of
+// items and returns the list with this change applied. That distinction is the
+// whole point. On a conflict the right answer is not "keep mine" or "keep
+// theirs" but "apply my change to theirs": re-running the removal against the
+// copy the other device just saved keeps both changes, where re-sending the
+// array computed from the stale copy would silently undo whatever they did.
+//
+// Retried once. A second conflict means a third device is writing to the same
+// list in the same instant; the edit is dropped rather than looping, and the
+// dashboard reload below shows what actually landed.
+//
+// Pass removeItem = null when the edit CANNOT be re-applied -- a whole-list
+// replacement built in the builder is not a delta, and re-running it against
+// the other device's copy would erase exactly what the guard exists to
+// protect. Those callers get the conflict back and tell the person, since
+// only they can say which version they want.
+//
+// Returns the outcome rather than swallowing it: { ok, status, conflict, url,
+// updatedAt, error, networkError }. The two background remove-one-item callers
+// ignore it, as they did before; the callers that show the person a "saved"
+// modal must not (a false success is its own finding).
+async function saveCreatorListWithBaseline(list, removeItem, toastMessage) {
+  if (!list || typeof activeCreator === 'undefined' || !activeCreator) {
+    return { ok: false, skipped: true };
+  }
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  const send = async (target) => {
+    const body = {
+      creatorName: activeCreator.creatorName,
+      creatorKey: creatorKey,
+      slug: target.slug,
+      name: target.name,
+      type: target.type || 'mixed',
+      items: target.items,
+      visibility: target.visibility || 'private',
+    };
+    if (target.sourceUrl) body.sourceUrl = target.sourceUrl;
+    if (target.synced != null) body.synced = target.synced;
+    if (target.lastSyncedAt != null) body.lastSyncedAt = target.lastSyncedAt;
+    if (target.baseItemIds) body.baseItemIds = target.baseItemIds;
+    // Only cite a baseline the server actually gave us. A legacy record has
+    // no updatedAt, and inventing one (0, Date.now()) would either reject
+    // every save or assert a version this browser never saw.
+    if (Number.isFinite(target.updatedAt)) body.expectedUpdatedAt = target.updatedAt;
+    return await fetch(ORIGIN + '/api/creator/lists/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  };
+
+  try {
+    let res = await send(list);
+    if (res.status === 409) {
+      // Whatever this browser holds is now stale either way, so the cached
+      // dashboard copy has to go before anything reads it again.
+      if (typeof resetCreatorListsCache === 'function') resetCreatorListsCache();
+      // No re-appliable edit -- a whole-list replacement. Re-running it
+      // against the other device's copy is exactly the overwrite the guard
+      // just prevented, so hand the conflict back and let the caller tell
+      // the person.
+      if (typeof removeItem !== 'function') return { ok: false, status: 409, conflict: true };
+      // Someone else saved in between. Pull what they saved, re-apply this
+      // removal on top of it, and try once more.
+      let fresh = null;
+      try {
+        const data = await fetchCreatorListsOnce(creatorKey);
+        fresh = ((data && data.lists) || []).find((l) => l && l.slug === list.slug) || null;
+      } catch (e) {
+        fresh = null;
+      }
+      if (!fresh) return { ok: false, status: 409, conflict: true };
+      fresh.items = removeItem(Array.isArray(fresh.items) ? fresh.items : []);
+      // Keep the in-memory copy in step with what is about to be saved, so
+      // the dashboard does not re-render the pre-merge list.
+      list.items = fresh.items;
+      list.updatedAt = fresh.updatedAt;
+      res = await send(fresh);
+      if (res.status === 409) return { ok: false, status: 409, conflict: true };
+    }
+    const data = await res.json().catch(() => null);
+    // Advance the baseline, or the next edit in this session cites a version
+    // that is now stale and 409s against a write this browser made itself.
+    if (data && data.ok && Number.isFinite(data.updatedAt)) list.updatedAt = data.updatedAt;
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    if (data && data.ok && toastMessage && typeof showAddedToast === 'function') showAddedToast(toastMessage);
+    return {
+      ok: !!(data && data.ok),
+      status: res.status,
+      conflict: !!(data && data.conflict),
+      url: (data && data.url) || null,
+      updatedAt: (data && Number.isFinite(data.updatedAt)) ? data.updatedAt : null,
+      error: (data && data.error) || (data && data.ok ? null : 'The server rejected the save.'),
+    };
+  } catch (e) {
+    // Background save, same as before -- the edit is still in the DOM and in
+    // the local map, and the next load reconciles. Callers that told the
+    // person something read networkError and correct themselves.
+    return { ok: false, networkError: true, error: 'A network error occurred while saving.' };
+  }
+}
+
+function removeWatchlistItemDirect(id, btn) {
+  if (!id) return;
+  if (btn) {
+    const tile = btn.closest('.list-card-mini-poster-tile, .live-preview-poster-card');
+    if (tile) {
+      tile.style.opacity = '0';
+      tile.style.transform = 'scale(0.85)';
+      tile.style.transition = 'all 0.2s ease';
+      setTimeout(() => {
+        if (tile && tile.parentNode) tile.parentNode.removeChild(tile);
+      }, 200);
+    }
+  }
+  const targetId = String(id);
+  // The edit itself, as a function, so saveCreatorListWithBaseline can re-apply it to
+  // whatever another device saved instead of re-sending a stale array.
+  const removeMatching = (items) => (items || []).filter(
+    (it) => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId
+  );
+  const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  let changed = false;
+  Object.keys(map).forEach(key => {
+    const list = map[key];
+    if (list && (list.slug === 'watchlist' || list.isWatchlist || (list.name && list.name.toLowerCase() === 'watchlist'))) {
+      const initialLen = (list.items || []).length;
+      list.items = (list.items || []).filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+      if (list.items.length !== initialLen) {
+        list.updatedAt = Date.now();
+        changed = true;
+      }
+    }
+  });
+  if (changed) {
+    if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+    if (typeof pushTrackingSync === 'function') pushTrackingSync({ intentionalRemoval: true });
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    if (typeof syncCustomListToCatalogRows === 'function') {
+      syncCustomListToCatalogRows('watchlist', (map['watchlist'] ? map['watchlist'].items : []), 'Watchlist', 'mixed');
+    }
+    if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watchlist.');
+  }
+  if (typeof activeCreator !== 'undefined' && activeCreator && Array.isArray(lastCreatorListsData)) {
+    const creatorWatchlist = lastCreatorListsData.find(l => l && (l.slug === 'watchlist' || l.isWatchlist || (l.name && l.name.toLowerCase() === 'watchlist')));
+    if (creatorWatchlist && Array.isArray(creatorWatchlist.items)) {
+      const initialLen = creatorWatchlist.items.length;
+      creatorWatchlist.items = removeMatching(creatorWatchlist.items);
+      if (creatorWatchlist.items.length !== initialLen) {
+        if (typeof syncCustomListToCatalogRows === 'function') {
+          syncCustomListToCatalogRows(creatorWatchlist.slug, creatorWatchlist.items, creatorWatchlist.name, creatorWatchlist.type || 'mixed');
+        }
+        saveCreatorListWithBaseline(creatorWatchlist, removeMatching, 'Removed item from Watchlist.');
+      }
+    }
+  }
+}
+
+function removeWatchHistoryItemDirect(id, btn) {
+  if (!id) return;
+  if (btn) {
+    const tile = btn.closest('.list-card-mini-poster-tile, .live-preview-poster-card');
+    if (tile) {
+      tile.style.opacity = '0';
+      tile.style.transform = 'scale(0.85)';
+      tile.style.transition = 'all 0.2s ease';
+      setTimeout(() => {
+        if (tile && tile.parentNode) tile.parentNode.removeChild(tile);
+      }, 200);
+    }
+  }
+  const targetId = String(id);
+  const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  if (map['watch-history'] && Array.isArray(map['watch-history'].items)) {
+    const initialLen = map['watch-history'].items.length;
+    map['watch-history'].items = map['watch-history'].items.filter(it => String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+    if (map['watch-history'].items.length !== initialLen) {
+      if (window._watchedItemIds) window._watchedItemIds.delete(targetId);
+      map['watch-history'].updatedAt = Date.now();
+      if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave({ intentionalRemoval: true });
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof showAddedToast === 'function') showAddedToast('Removed item from Watch History.');
+      // Removing the last watched episode of a show drops it from Airing
+      // Next's candidate set -- see syncAiringNextWatchState's own
+      // comment (21_client-custom-list-builder.js).
+      if (typeof syncAiringNextWatchState === 'function') syncAiringNextWatchState();
+    }
+  }
+  if (window._rawWatchHistoryItems && Array.isArray(window._rawWatchHistoryItems)) {
+    window._rawWatchHistoryItems = window._rawWatchHistoryItems.filter(it => String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+    if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
+      // Update the open See All page in place. Rebuilding it -- which is what
+      // renderWatchHistoryGrid does, starting from innerHTML = '' -- blanked
+      // the grid, re-requested every poster and scrolled back to the top on
+      // every single removal. The full render stays as the fallback for the
+      // one case that really does need re-laying out (grouped by show).
+      const handled = (typeof updateWatchHistoryGridAfterRemoval === 'function') && updateWatchHistoryGridAfterRemoval();
+      if (!handled && typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+    }
+  }
+}
+
+function removeCustomListItemDirect(id, slug, btn) {
+  if (!id || !slug) return;
+  if (btn) {
+    const tile = btn.closest('.list-card-mini-poster-tile, .live-preview-poster-card');
+    if (tile) {
+      tile.style.opacity = '0';
+      tile.style.transform = 'scale(0.85)';
+      tile.style.transition = 'all 0.2s ease';
+      setTimeout(() => {
+        if (tile && tile.parentNode) tile.parentNode.removeChild(tile);
+      }, 200);
+    }
+  }
+  const targetId = String(id);
+  // The edit itself, as a function, so saveCreatorListWithBaseline can re-apply it to
+  // whatever another device saved instead of re-sending a stale array.
+  const removeMatching = (items) => (items || []).filter(
+    (it) => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId
+  );
+  const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+  if (map[slug] && Array.isArray(map[slug].items)) {
+    const initialLen = map[slug].items.length;
+    map[slug].items = removeMatching(map[slug].items);
+    if (map[slug].items.length !== initialLen) {
+      map[slug].updatedAt = Date.now();
+      if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof syncCustomListToCatalogRows === 'function') {
+        syncCustomListToCatalogRows(slug, map[slug].items, map[slug].name, map[slug].type);
+      }
+      if (typeof showAddedToast === 'function') showAddedToast('Removed item from list.');
+    }
+  }
+  // Signed-in Creator Profile: this list may actually be server-hosted
+  // rather than (or in addition to) sitting in the local map above -- the
+  // See All view renders creator-owned and local-only lists through the
+  // exact same card/remove-button markup (see the shared click handler
+  // this function is called from), so a signed-in user's "xyz" custom
+  // list is often a lastCreatorListsData entry, not a loadLocalCustomLists()
+  // one. Without this block the tile still fades out (it's removed
+  // unconditionally above) but nothing is ever actually deleted server
+  // side, so the item is back the moment the list reloads -- same shape
+  // of fix as removeWatchlistItemDirect just above already has.
+  if (typeof activeCreator !== 'undefined' && activeCreator && Array.isArray(lastCreatorListsData)) {
+    const creatorList = lastCreatorListsData.find(l => l && l.slug === slug);
+    if (creatorList && Array.isArray(creatorList.items)) {
+      const initialLen = creatorList.items.length;
+      creatorList.items = removeMatching(creatorList.items);
+      if (creatorList.items.length !== initialLen) {
+        if (typeof syncCustomListToCatalogRows === 'function') {
+          syncCustomListToCatalogRows(creatorList.slug, creatorList.items, creatorList.name, creatorList.type);
+        }
+        saveCreatorListWithBaseline(creatorList, removeMatching, 'Removed item from list.');
+      }
+    }
+  }
+}
+
+function clearWatchHistoryAll() {
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  confirmFn(
+    'Clear Watch History',
+    'Are you sure you want to remove all items from your Watch History? This will reset your watched history and cannot be undone.',
+    'Clear All',
+    () => {
+      const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      if (map['watch-history']) {
+        map['watch-history'].items = [];
+        map['watch-history'].updatedAt = Date.now();
+        if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+      }
+      window._watchedItemIds = new Set();
+      window._rawWatchHistoryItems = [];
+      window._fullyWatchedShowIds = new Set();
+      try {
+        localStorage.removeItem('myListAddon:fullyWatchedShows');
+      } catch (e) {}
+
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave({ intentionalRemoval: true });
+      if (typeof pushTrackingSync === 'function') pushTrackingSync({ intentionalRemoval: true });
+
+      // Refresh list details view if currently visible
+      if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
+        const params = window._currentListDetailsParams;
+        if (params && (params.name.toLowerCase().includes('watch history') || params.listUrl === 'autotrack:watch-history' || params.listUrl === 'custom:watch-history')) {
+          if (typeof renderWatchHistoryGrid === 'function') renderWatchHistoryGrid();
+          if (typeof _updateListDetailsItemCount === 'function') _updateListDetailsItemCount(0);
+        }
+      }
+
+      // Refresh dashboard if visible
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof renderLocalCustomListsDashboard === 'function') {
+        const box = document.getElementById('localCustomListsDashboard');
+        if (box) renderLocalCustomListsDashboard(box, true);
+      }
+
+      if (typeof showAddedToast === 'function') showAddedToast('Watch History cleared \u2713');
+    },
+    true
+  );
+}
+window.clearWatchHistoryAll = clearWatchHistoryAll;
+
+function clearContinueWatchingAll() {
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  confirmFn(
+    'Clear Continue Watching',
+    'Are you sure you want to remove all items from Continue Watching? This will reset your in-progress movies and shows.',
+    'Clear All',
+    () => {
+      const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+      if (map['continue-watching']) {
+        map['continue-watching'].items = [];
+        map['continue-watching'].updatedAt = Date.now();
+        if (typeof saveLocalCustomListsMap === 'function') saveLocalCustomListsMap(map);
+      }
+      window._currentListDetailsAllItems = [];
+
+      if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave({ intentionalRemoval: true });
+      if (typeof pushTrackingSync === 'function') pushTrackingSync({ intentionalRemoval: true });
+
+      // Refresh list details view if currently visible
+      if (document.getElementById('content-list-details') && !document.getElementById('content-list-details').hidden) {
+        const params = window._currentListDetailsParams;
+        if (params && (params.name.toLowerCase().includes('continue watching') || params.listUrl === 'autotrack:continue-watching' || params.listUrl === 'custom:continue-watching' || (params.listUrl && params.listUrl.includes('continue-watching')))) {
+          const gridEl = document.getElementById('detailGrid');
+          const statusEl = document.getElementById('detailStatus');
+          const subEl = document.getElementById('detailSubtitle');
+          if (gridEl) gridEl.innerHTML = '';
+          if (statusEl) statusEl.innerHTML = '<small>No items in continue watching.</small>';
+          if (subEl) subEl.textContent = '0 items';
+          if (typeof _updateListDetailsItemCount === 'function') _updateListDetailsItemCount(0);
+        }
+      }
+
+      // Refresh dashboard if visible
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof renderLocalCustomListsDashboard === 'function') {
+        const box = document.getElementById('localCustomListsDashboard');
+        if (box) renderLocalCustomListsDashboard(box, true);
+      }
+
+      if (typeof showAddedToast === 'function') showAddedToast('Continue Watching cleared \u2713');
+    },
+    true
+  );
+}
+window.clearContinueWatchingAll = clearContinueWatchingAll;
+
+// --- Multi-Device Background Sync & Foreground Resume -----------------------
+let _lastForegroundSyncCheck = 0;
+const FOREGROUND_SYNC_COOLDOWN_MS = 5000; // 5 seconds cooldown
+let _foregroundSyncTimer = null;
+let _isSyncingForeground = false;
+
+async function handleForegroundResumeSync() {
+  if (typeof document !== 'undefined' && document.visibilityState && document.visibilityState !== 'visible') {
+    return;
+  }
+  const now = Date.now();
+  if (now - _lastForegroundSyncCheck < FOREGROUND_SYNC_COOLDOWN_MS || _isSyncingForeground) {
+    return;
+  }
+  _lastForegroundSyncCheck = now;
+
+  if (typeof activeCreator === 'undefined' || !activeCreator) return;
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) return;
+
+  // Defer slightly so tab switch and UI clicks are completely instant and smooth
+  if (_foregroundSyncTimer) clearTimeout(_foregroundSyncTimer);
+  _foregroundSyncTimer = setTimeout(async () => {
+    _isSyncingForeground = true;
+    try {
+      // Ask the cheap endpoint first. sync/load reads six KV keys and sends
+      // back the entire watchHistory -- which for an active account is
+      // megabytes, and on a poll like this one is almost always identical
+      // to what this browser already has. sync/meta answers the only
+      // question that matters here (has anything moved?) in a few dozen
+      // bytes, so the expensive call happens on real change instead of on
+      // a timer. See the endpoint's own comment,
+      // 26_api-creator-and-admin-routes.js.
+      let needsFullLoad = true;
+      // Custom lists are not part of the sync blob -- they are their own
+      // records, behind /api/creator/lists -- so they need their own answer
+      // from the same poll. Before the "lists" stamp existed, a list edited
+      // on another device moved none of the four stamps below, this function
+      // concluded "nothing changed", and the browser went on rendering the
+      // old copy indefinitely (FE-17).
+      let listsChanged = false;
+      let metaLists = null;
+      const known = window._syncMetaStamps;
+      if (known) {
+        try {
+          const metaRes = await fetch(ORIGIN + '/api/creator/sync/meta', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ creatorName: activeCreator.creatorName, creatorKey: creatorKey }),
+          });
+          const meta = await metaRes.json();
+          if (meta && meta.ok) {
+            needsFullLoad =
+              (Number(meta.config) || 0) > (known.config || 0) ||
+              (Number(meta.tracking) || 0) > (known.tracking || 0) ||
+              (Number(meta.presets) || 0) > (known.presets || 0) ||
+              (Number(meta.channels) || 0) > (known.channels || 0);
+            // An account reset moves every stamp above the OTHER way -- to 0 --
+            // and "0 > what I had" is false for all four, so this poll used to
+            // conclude nothing had changed and leave the browser holding a full
+            // copy of an account that had just been emptied. The next local
+            // edit then pushed all of it back. resetAt is the one signal here
+            // that counts down rather than up, so it is checked on its own.
+            if ((Number(meta.resetAt) || 0) > loadSeenAccountResetAt()) needsFullLoad = true;
+            const rawLists = Number(meta.lists);
+            if (Number.isFinite(rawLists)) {
+              metaLists = rawLists;
+              // known.lists is undefined on the first poll after a full
+              // load, which snapshots the four blob stamps and knows nothing
+              // of this one. Treating that as 0 spends one conditional
+              // /api/creator/lists -- which answers "unchanged" and costs
+              // almost nothing -- rather than adopting the server's number
+              // untested and risking a miss for a change that landed while
+              // that load was in flight.
+              listsChanged = metaLists > (Number(known.lists) || 0);
+            } else {
+              // An older worker, or a response without the field: refresh
+              // rather than assume, for the same reason the four above fall
+              // back to a full load.
+              listsChanged = true;
+            }
+          }
+          // Anything other than a clean ok:true response leaves
+          // needsFullLoad true, so a failed or unrecognised meta check
+          // degrades into exactly the old behaviour rather than into a
+          // browser that quietly stops syncing.
+        } catch (e) {
+          needsFullLoad = true;
+        }
+      }
+      if (needsFullLoad && typeof loadCreatorSync === 'function') {
+        // Refetches the dashboard itself, so it covers the lists too.
+        await loadCreatorSync({ background: true });
+      } else if (listsChanged && typeof renderCreatorDashboard === 'function') {
+        // Only the lists moved: refresh those alone rather than pulling the
+        // whole sync blob for them. fetchCreatorListsOnce sends the version it
+        // holds, so this is one small request when nothing has really changed.
+        await renderCreatorDashboard({ silent: true });
+      }
+      // Adopt the stamp only after the refresh it triggered has finished --
+      // recording it earlier would mark this browser level with a version it
+      // had not actually loaded. Set after a full load too, since
+      // loadCreatorSync's own snapshot cannot include this stamp.
+      if (metaLists !== null && window._syncMetaStamps) {
+        window._syncMetaStamps.lists = metaLists;
+      }
+    } catch (e) {
+      // Silent background sync
+    } finally {
+      _isSyncingForeground = false;
+    }
+  }, 250);
+}
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      handleForegroundResumeSync();
+    }
+  });
+  // Periodic background check while the dashboard is open. This used to run
+  // every 15 seconds and call sync/load outright; it now runs a quarter as
+  // often and asks sync/meta first, so an idle open tab costs one tiny
+  // request a minute instead of four full state downloads. Returning to the
+  // tab still syncs immediately via the visibilitychange/focus handlers
+  // below, which is where responsiveness actually comes from.
+  setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      handleForegroundResumeSync();
+    }
+  }, 60000);
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('focus', () => {
+    handleForegroundResumeSync();
+  });
+  window.addEventListener('pageshow', () => {
+    handleForegroundResumeSync();
+  });
+}

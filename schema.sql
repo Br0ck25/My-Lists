@@ -1,0 +1,252 @@
+-- schema.sql
+-- Run it (README.md's D1 section has the full walkthrough):
+--   Dashboard: create a D1 database under Storage & Databases, open its
+--   Console tab, paste this file's contents, and click Run.
+--   Wrangler:  npx wrangler d1 execute my-lists-db --file=./schema.sql
+--
+-- WARNING: this file DROPs every table before creating it. It provisions a
+-- BLANK database and will destroy all existing data. Do NOT run it against a
+-- database that is already live. To change the shape of a deployed database,
+-- add a file under migrations/ instead.
+
+DROP TABLE IF EXISTS creators;
+CREATE TABLE creators (
+    username TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    recovery_answer_hash TEXT,
+    created_at INTEGER NOT NULL,
+    last_active INTEGER,
+    share_json TEXT,
+    lists_stamp INTEGER
+);
+
+DROP TABLE IF EXISTS creator_lists;
+CREATE TABLE creator_lists (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL,
+    visibility TEXT NOT NULL DEFAULT 'private',
+    items_json TEXT NOT NULL DEFAULT '[]',
+    likes INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    sort_order INTEGER,
+    FOREIGN KEY (username) REFERENCES creators(username) ON DELETE CASCADE
+);
+
+DROP TABLE IF EXISTS source_groups;
+CREATE TABLE source_groups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    install_count INTEGER NOT NULL DEFAULT 0
+);
+
+DROP TABLE IF EXISTS stats;
+CREATE TABLE stats (
+    -- 'pageviews', 'installs', 'apiuse:tmdb', 'list_copy:top-ten', ...
+    -- i.e. the same {kind} that used to sit inside a stats:{kind}:{bucket}
+    -- KV key name.
+    kind TEXT NOT NULL,
+    -- 'YYYY-MM-DD' (Eastern calendar day, see easternDateKey) for a daily
+    -- bucket, or the literal 'total' for the all-time one. Same two shapes
+    -- the KV keys always had.
+    day  TEXT NOT NULL,
+    n    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, day)
+);
+
+-- A strongly-consistent "this account was deleted" marker -- see
+-- migrations/0004 for why a missing `creators` row cannot serve as one.
+DROP TABLE IF EXISTS creator_tombstones;
+CREATE TABLE creator_tombstones (
+    username TEXT PRIMARY KEY,
+    until    INTEGER NOT NULL
+);
+
+-- Indexes for fast querying.
+--
+-- These have to match what migrations/0001, 0002 and 0003 leave behind, or a
+-- database provisioned the documented way (run this file) ends up a different
+-- shape from one that grew through the migrations. idx_creator_lists_likes
+-- existed only in 0001, so a fresh deployment did not have it; there is a test
+-- that now diffs the two provisioning paths and fails on any such drift.
+CREATE INDEX idx_creator_lists_username ON creator_lists(username);
+CREATE INDEX idx_creator_lists_visibility ON creator_lists(visibility);
+CREATE INDEX idx_creator_lists_likes ON creator_lists(likes);
+
+-- The two the admin dashboard's own queries actually need -- see
+-- migrations/0003 for the query plans. Without the first, listing accounts is
+-- a full scan of `creators` plus an in-memory sort on every dashboard load;
+-- without the second, the Community Lists panel reads roughly half of
+-- `creator_lists` and sorts it to return 200 rows.
+CREATE INDEX idx_creators_last_active ON creators(last_active DESC, created_at DESC);
+CREATE INDEX idx_creator_lists_vis_likes ON creator_lists(visibility, likes DESC, updated_at DESC);
+
+-- The dashboard's counter panels: WHERE day = 'total' AND kind LIKE ?
+-- ORDER BY n DESC. The (kind, day) primary key cannot serve that, so it was a
+-- full scan plus a sort -- over a table whose `kind` dimension is unbounded,
+-- because list_copy:{slug} mints one per list. See migrations/0005.
+CREATE INDEX idx_stats_day_totals ON stats(day, n DESC, kind);
+
+DROP TABLE IF EXISTS published_lists;
+CREATE TABLE published_lists (
+    slug        TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    visibility  TEXT NOT NULL DEFAULT 'private',
+    items_json  TEXT NOT NULL DEFAULT '[]',
+    likes       INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_published_vis_likes ON published_lists(visibility, likes DESC, updated_at DESC);
+
+DROP TABLE IF EXISTS lists_fts;
+CREATE VIRTUAL TABLE lists_fts USING fts5(
+    list_id UNINDEXED,
+    name,
+    creator_name,
+    username,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+DROP TABLE IF EXISTS list_tombstones;
+CREATE TABLE list_tombstones (
+    username TEXT NOT NULL,
+    slug     TEXT NOT NULL,
+    until    INTEGER NOT NULL,
+    PRIMARY KEY (username, slug)
+);
+CREATE INDEX idx_list_tombstones_user_until ON list_tombstones(username, until);
+
+DROP TABLE IF EXISTS list_likes;
+CREATE TABLE list_likes (
+    list_id    TEXT NOT NULL,
+    voter_id   TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (list_id, voter_id)
+);
+CREATE INDEX idx_list_likes_voter ON list_likes(voter_id);
+
+DROP TABLE IF EXISTS feedback;
+CREATE TABLE feedback (
+    id         TEXT PRIMARY KEY,
+    status     TEXT NOT NULL DEFAULT 'open',
+    subject    TEXT,
+    body_json  TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX idx_feedback_status_updated ON feedback(status, updated_at DESC);
+
+DROP TABLE IF EXISTS scrobble_tokens;
+CREATE TABLE scrobble_tokens (
+    token      TEXT PRIMARY KEY,
+    username   TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_scrobble_tokens_user ON scrobble_tokens(username);
+
+DROP TABLE IF EXISTS event_meta;
+CREATE TABLE event_meta (
+    event_type TEXT NOT NULL,
+    item_id    TEXT NOT NULL,
+    title      TEXT,
+    media_type TEXT,
+    last_seen  INTEGER NOT NULL,
+    PRIMARY KEY (event_type, item_id)
+);
+
+DROP TABLE IF EXISTS watch_history;
+CREATE TABLE watch_history (
+    username    TEXT NOT NULL,
+    item_id     TEXT NOT NULL,
+    item_type   TEXT NOT NULL,
+    title       TEXT,
+    poster      TEXT,
+    show_id     TEXT,
+    show_title  TEXT,
+    show_poster TEXT,
+    season_num  INTEGER,
+    episode_num INTEGER,
+    year        TEXT,
+    air_date    TEXT,
+    watched_at  INTEGER NOT NULL,
+    PRIMARY KEY (username, item_id)
+);
+CREATE INDEX idx_watch_history_user_watched ON watch_history(username, watched_at DESC);
+
+DROP TABLE IF EXISTS continue_watching;
+CREATE TABLE continue_watching (
+    username    TEXT NOT NULL,
+    show_id     TEXT NOT NULL,
+    item_id     TEXT NOT NULL,
+    name        TEXT,
+    poster      TEXT,
+    show_title  TEXT,
+    show_poster TEXT,
+    season_num  INTEGER,
+    episode_num INTEGER,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (username, show_id)
+);
+CREATE INDEX idx_continue_watching_user_updated ON continue_watching(username, updated_at DESC);
+
+DROP TABLE IF EXISTS airing_next;
+CREATE TABLE airing_next (
+    username                     TEXT NOT NULL,
+    show_id                      TEXT NOT NULL,
+    item_id                      TEXT NOT NULL,
+    name                         TEXT,
+    poster                       TEXT,
+    show_title                   TEXT,
+    show_poster                  TEXT,
+    season_num                   INTEGER,
+    episode_num                  INTEGER,
+    air_date                     TEXT,
+    is_season_premiere           INTEGER DEFAULT 0,
+    is_season_finale             INTEGER DEFAULT 0,
+    season_finale_air_date       TEXT,
+    season_finale_episode_number INTEGER,
+    updated_at                   INTEGER NOT NULL,
+    PRIMARY KEY (username, show_id)
+);
+CREATE INDEX idx_airing_next_user ON airing_next(username, air_date ASC);
+
+DROP TABLE IF EXISTS creator_user_lists;
+CREATE TABLE creator_user_lists (
+    username    TEXT NOT NULL,
+    list_id     TEXT NOT NULL,
+    list_type   TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (username, list_id, list_type)
+);
+CREATE INDEX idx_creator_user_lists_lookup ON creator_user_lists(username, list_type);
+
+DROP TABLE IF EXISTS creator_show_states;
+CREATE TABLE creator_show_states (
+    username           TEXT NOT NULL,
+    show_id            TEXT NOT NULL,
+    is_fully_watched   INTEGER DEFAULT 0,
+    dismissed_season   INTEGER,
+    dismissed_episode  INTEGER,
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY (username, show_id)
+);
+CREATE INDEX idx_creator_show_states_fw ON creator_show_states(username, is_fully_watched);
+
+DROP TABLE IF EXISTS creator_tracking_meta;
+CREATE TABLE creator_tracking_meta (
+    username                   TEXT PRIMARY KEY,
+    track_playback             INTEGER NOT NULL DEFAULT 0,
+    remove_watched_watchlist   INTEGER NOT NULL DEFAULT 1,
+    scrobble_filter_users      INTEGER NOT NULL DEFAULT 0,
+    scrobble_allowed_users     TEXT NOT NULL DEFAULT '',
+    scrobble_block_anonymous   INTEGER NOT NULL DEFAULT 0,
+    curated_recommendations    TEXT,
+    client_version             INTEGER NOT NULL DEFAULT 0,
+    updated_at                 INTEGER NOT NULL
+);
+

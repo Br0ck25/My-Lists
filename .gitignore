@@ -1,0 +1,22 @@
+node_modules/
+package.json
+package-lock.json
+.wrangler/
+wrangler.local.toml
+wrangler.d1test.toml
+
+# Transient output of render_check.js / html_checks.py / extract_html.py
+# (see verify.sh and .github/workflows/ci.yml) -- generated snapshots of
+# the rendered builder page, not source. A stale committed copy of one of
+# these (test_inner.js) is exactly the kind of drift this ignores.
+rendered.html
+test.html
+inner_*.js
+audit/**/*.png
+
+# Exported backups. A full backup from the app carries the account's Creator
+# Key and its Trakt / MDBList / Simkl OAuth access tokens in plain text --
+# my-lists-full-backup1.json was committed with live ones in it. Never commit
+# one; use a redacted fixture if a test needs this shape.
+my-lists-full-backup*.json
+*-full-backup*.json

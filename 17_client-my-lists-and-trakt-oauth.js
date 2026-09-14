@@ -1,0 +1,2200 @@
+// --- "Your MDBList/Trakt Lists" ----------------------------------------------
+//
+// Once a key (and, for Trakt, a username) is entered above, shows every
+// list that account actually owns -- not just the one built-in watchlist
+// shortcut above. Debounced (fires a bit after typing stops, not on every
+// keystroke) since it's a real network call.
+let myMdblistListsTimer = null;
+function scheduleMyMdblistListsRefresh() {
+  clearTimeout(myMdblistListsTimer);
+  myMdblistListsTimer = setTimeout(runMyMdblistLists, 600);
+}
+
+let myTraktListsTimer = null;
+function scheduleMyTraktListsRefresh() {
+  clearTimeout(myTraktListsTimer);
+  myTraktListsTimer = setTimeout(runMyTraktLists, 600);
+}
+
+async function runMyMdblistLists() {
+  const box = document.getElementById('myMdblistListsResult');
+  if (!box) return;
+  const isDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const keyInput = document.getElementById('mdblistKeyInput');
+  const manualKey = keyInput ? keyInput.value.trim() : '';
+  const token = isDisc ? '' : (mdblistAccessToken || localStorage.getItem('myListAddon:mdblistAccessToken') || '');
+  const key = isDisc ? '' : (manualKey || token || localStorage.getItem('myListAddon:mdblistKey') || '');
+  if (!key) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your MDBList account in Settings or click <strong>Connect MDBList</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
+    return;
+  }
+  box.innerHTML = '<p style="margin-top:10px;"><small>Loading your MDBList lists\u2026</small></p>';
+  try {
+    const url = token
+      ? ORIGIN + '/api/mdblist-my-lists?accessToken=' + encodeURIComponent(token)
+      : ORIGIN + '/api/mdblist-my-lists?apikey=' + encodeURIComponent(manualKey || key);
+    const res = await fetch(url, { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your MDBList lists.') + '</p>';
+      return;
+    }
+    if (data.username) {
+      mdblistUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:mdblistUsername', mdblistUsername);
+        localStorage.removeItem('myListAddon:mdblistDisconnected');
+      } catch (e) {}
+      renderMdblistConnectStatus();
+      if (typeof pushCreatorSync === 'function') pushCreatorSync();
+    }
+    renderMyMdblistLists(data.lists);
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">\u2717 Network error loading your MDBList lists.</p>';
+  }
+}
+
+let _mdblistAiringNextEnriching = false;
+let _mdblistAiringNextEnrichedAt = 0;
+async function enrichMdblistAiringNextDates(list) {
+  if (!list || !Array.isArray(list.items) || !list.items.length) return;
+  const hasExpired = (list.items || []).some((it) => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
+  if (!hasExpired && _mdblistAiringNextEnrichedAt && (Date.now() - _mdblistAiringNextEnrichedAt < 300000)) return;
+  _mdblistAiringNextEnriching = true;
+
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+  try {
+    const rawCandidates = (window._mdblistRawAiringCandidates && window._mdblistRawAiringCandidates.length)
+      ? window._mdblistRawAiringCandidates
+      : (list.items || []);
+    const candidates = rawCandidates.slice(0, 80);
+    const enriched = [];
+    const concurrency = 5;
+    for (let i = 0; i < candidates.length; i += concurrency) {
+      const chunk = candidates.slice(i, i + concurrency);
+      await Promise.all(chunk.map(async (it) => {
+        try {
+          const showId = it.imdbId || (it.id && String(it.id).startsWith('tt') ? it.id : '') || (it.tmdbId ? 'tmdb:' + it.tmdbId : (it.id ? (String(it.id).startsWith('tmdb:') ? it.id : 'tmdb:' + it.id) : ''));
+          if (!showId) return;
+          const bypass = hasExpired ? '&fresh=1&_t=' + Date.now() : '';
+          const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
+          const data = await res.json();
+          const d = data && data.ok ? data.details : null;
+          if (d && d.nextEpisodeAirDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(d.nextEpisodeAirDate))) {
+            it.airDate = d.nextEpisodeAirDate;
+            it.seasonNum = d.nextEpisodeSeasonNumber;
+            it.episodeNum = d.nextEpisodeNumber;
+            it.isSeasonPremiere = (typeof d.isSeasonPremiere === 'boolean') ? d.isSeasonPremiere : (d.nextEpisodeNumber === 1);
+            it.isSeasonFinale = !!d.isSeasonFinale;
+            it.seasonFinaleAirDate = d.seasonFinaleAirDate || null;
+            it.seasonFinaleEpisodeNumber = d.seasonFinaleEpisodeNumber || null;
+            it.isUnaired = true;
+            it.episodeTitle = d.nextEpisodeName || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : ('Episode ' + d.nextEpisodeNumber)));
+            enriched.push(it);
+          }
+        } catch (e) {}
+      }));
+    }
+    if (enriched.length) {
+      enriched.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
+      list.items = enriched;
+      list.itemCount = enriched.length;
+      try {
+        localStorage.setItem('myListAddon:mdblistAiringNextCache', JSON.stringify(enriched));
+      } catch (e) {}
+      _mdblistAiringNextEnrichedAt = Date.now();
+      renderMyMdblistLists(window._myMdblistLists);
+    }
+  } finally {
+    _mdblistAiringNextEnriching = false;
+  }
+}
+
+function openMdblistAiringNextDetailsPage() {
+  const list = (window._myMdblistLists || []).find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (!list) return;
+  const filtered = (list.items || []).filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+  const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+  const sample = filtered.map((it) => {
+    const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+    const isPremiere = (typeof it.isSeasonPremiere === 'boolean') ? it.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (it.episodeNum === 1));
+    const isFinale = !!(it.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+    const finaleAirDate = it.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+
+    const label = (typeof formatWatchItemLabel === 'function')
+      ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: isPremiere })
+      : {
+          title: it.name + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
+          subtitle: it.episodeTitle || (isPremiere ? 'Season Premiere' : (isFinale ? 'Season Finale' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')))
+        };
+    return {
+      id: it.id,
+      type: 'series',
+      name: label.title,
+      subtitle: label.subtitle,
+      poster: it.poster,
+      airDate: it.airDate,
+      isUnaired: true,
+      isSeasonPremiere: isPremiere,
+      isSeasonFinale: isFinale,
+      seasonFinaleAirDate: finaleAirDate,
+    };
+  });
+  openListDetailsPage('MDBList Airing Next', 'series', 'mdblist:user:shows:airing-next', { sample: sample, count: sample.length, maybeMore: false });
+}
+
+// Renders the list cards into #myMdblistListsResult once /api/mdblist-my-lists
+// returns.
+function renderMyMdblistLists(lists) {
+  window._myMdblistLists = lists || [];
+  const box = document.getElementById('myMdblistListsResult');
+  if (!lists || !lists.length) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No lists found on your MDBList account.</small></p>';
+    return;
+  }
+
+  const airingNextList = lists.find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (airingNextList && Array.isArray(airingNextList.items) && airingNextList.items.length) {
+    if (!window._mdblistRawAiringCandidates || !window._mdblistRawAiringCandidates.length) {
+      window._mdblistRawAiringCandidates = airingNextList.items.map(it => ({ ...it }));
+    }
+    const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+    if (!airingNextList._cachedApplied) {
+      try {
+        const cached = JSON.parse(localStorage.getItem('myListAddon:mdblistAiringNextCache') || '[]');
+        if (Array.isArray(cached) && cached.length) {
+          const cacheMap = new Map(cached.map((c) => [c.id || c.imdbId || (c.tmdbId ? 'tmdb:' + c.tmdbId : ''), c]));
+          airingNextList.items.forEach((it) => {
+            const c = cacheMap.get(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : ''));
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+            if (c) {
+              it.airDate = c.airDate;
+              it.seasonNum = c.seasonNum;
+              it.episodeNum = c.episodeNum;
+              it.isSeasonPremiere = (typeof c.isSeasonPremiere === 'boolean') ? c.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (c.episodeNum === 1));
+              it.isSeasonFinale = !!(c.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+              it.seasonFinaleAirDate = c.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+              it.seasonFinaleEpisodeNumber = c.seasonFinaleEpisodeNumber || null;
+              it.isUnaired = true;
+              it.episodeTitle = c.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : (c.episodeNum != null ? ('Episode ' + c.episodeNum) : '')));
+            } else if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
+            }
+          });
+        } else if (localAiringList.length) {
+          airingNextList.items.forEach((it) => {
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+            if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
+            }
+          });
+        }
+      } catch (e) {}
+      airingNextList._cachedApplied = true;
+    }
+    const hasExpired = (airingNextList.items || []).some((it) => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
+    if (!_mdblistAiringNextEnriching && (hasExpired || !_mdblistAiringNextEnrichedAt || Date.now() - _mdblistAiringNextEnrichedAt >= 120000)) {
+      enrichMdblistAiringNextDates(airingNextList).catch(() => {});
+    }
+  }
+
+  const alreadyAdded = new Set();
+  document.querySelectorAll('#lists .entry').forEach(function(entry) {
+    const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
+    entry.querySelectorAll('.url').forEach(function(el) {
+      alreadyAdded.add(el.value.trim() + '|' + t);
+    });
+  });
+
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
+    const isAiringNext = l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'));
+    const isHistory = !isAiringNext && (l.slug === 'history' || l.url === 'mdblist:history' || String(l.url || '').indexOf('mdblist:history') !== -1 || String(l.url || '').indexOf('/history/') !== -1);
+    const isWatchlist = !isAiringNext && (l.slug === 'watchlist' || l.url === 'mdblist:watchlist');
+    const isSingleType = isAiringNext || (!isHistory && !isWatchlist && (l.contentType === 'movie' || l.contentType === 'series'));
+    const type = (isAiringNext || l.contentType === 'series') ? 'series' : 'movie';
+    const typeLabel = isAiringNext ? 'Shows' : (isHistory ? 'Watch History' : (isWatchlist ? 'Watchlist' : (l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed'))));
+    const viewType = isSingleType ? type : 'mixed';
+
+    let filteredItems = l.items || [];
+    if (isAiringNext) {
+      filteredItems = filteredItems.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+    }
+    const totalCount = isAiringNext ? filteredItems.length : (l.items && typeof l.items === 'number' ? l.items : (Array.isArray(l.items) ? l.items.length : (l.itemCount || 0)));
+
+    const copyBtn = isHistory
+      ? '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="mixed">Copy</button>' +
+        '<button type="button" class="lc-btn secondary" onclick="markMdblistHistoryAllWatched(this)">Mark all as Watched</button>'
+      : (isAiringNext
+          ? '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">Copy</button>'
+          : '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '">Copy</button>');
+
+    let addBtns = '';
+    if (isSingleType) {
+      const added = alreadyAdded.has(l.url + '|' + type);
+      addBtns = '<button type="button" class="lc-btn primary myListAddBtn" ' + (added ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? '&#10003; Added' : '+ Add') + '</button>';
+    } else {
+      const addedMovie = alreadyAdded.has(l.url + '|movie');
+      const addedSeries = alreadyAdded.has(l.url + '|series');
+      addBtns = '<button type="button" class="lc-btn primary myListAddBtn" ' + (addedMovie ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="movie">' + (addedMovie ? '&#10003;' : '+ Movies') + '</button>' +
+        '<button type="button" class="lc-btn primary myListAddBtn" ' + (addedSeries ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' + (addedSeries ? '&#10003;' : '+ Shows') + '</button>';
+    }
+
+    const isCustomUserList = !isHistory && !isWatchlist && !isAiringNext && !l.dynamic;
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="mdblist" data-list-id="' + escapeAttr(l.id || l.slug) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
+
+    let postersHtml = '';
+    if (isAiringNext) {
+      const previewItems = filteredItems.slice(0, 9);
+      if (previewItems.length) {
+        postersHtml = '<div class="list-card-posters poster-preview-static">' +
+          previewItems.map((it, i) => {
+            const isMobileEnd = (i === 2 && previewItems.length > 3);
+            const isDesktopEnd = (i === previewItems.length - 1 && previewItems.length >= 4);
+            let overlays = '';
+            if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); openMdblistAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+            if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); openMdblistAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+
+            const showAiringBadges = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgesAiringNext') : true;
+            const showAirDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
+            const showPremiere = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
+            const showFinale = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
+            const showFinaleDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
+
+            const hasAired = it.airDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(it.airDate) : false;
+            const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
+            let dateBadge = '';
+            if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
+              const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+              if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+            }
+            const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
+            const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
+            let bottomBadge = '';
+            if (isUnairedEp) {
+              if (showPremiere && isSeasonPremiere) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>';
+              } else if (showFinale && it.isSeasonFinale) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Finale</div>';
+              } else if (showFinaleDate && it.seasonFinaleAirDate && isFinaleUnaired) {
+                const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.seasonFinaleAirDate) : '';
+                if (finaleText) {
+                  bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(it.seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+                }
+              }
+            }
+            const label = (typeof formatWatchItemLabel === 'function')
+              ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: it.isSeasonPremiere })
+              : {
+                  title: it.name + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
+                  subtitle: it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
+                };
+
+            const mdbPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster) : it.poster;
+            return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">' +
+              '<div class="list-card-mini-poster-img-wrap">' +
+                (mdbPoster ? '<img src="' + escapeAttr(mdbPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(mdbPoster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+                (dateBadge + bottomBadge) +
+                overlays +
+              '</div>' +
+              '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
+              (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
+            '</div>';
+          }).join('') +
+        '</div>';
+      } else if (_mdblistAiringNextEnriching) {
+        postersHtml = '<p style="margin-top:8px; color:var(--muted); font-size:0.85rem;"><span style="display:inline-block; width:12px; height:12px; border:2px solid var(--accent); border-top-color:transparent; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle; margin-right:6px;"></span>Checking upcoming air dates&hellip;</p>';
+      } else {
+        postersHtml = '<p style="margin-top:8px; color:var(--muted);"><small>Nothing scheduled yet.</small></p>';
+      }
+    } else {
+      postersHtml = '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + (isSingleType ? type : 'mixed') + '"></div>';
+    }
+
+    const titleClick = isAiringNext ? 'onclick="openMdblistAiringNextDetailsPage()"' : '';
+
+    return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
+      '<div class="list-card-header">' +
+        '<div class="list-card-body">' +
+          '<div class="list-card-title" ' + titleClick + ' style="' + (isAiringNext ? 'cursor:pointer;' : '') + '">' + escapeHtml(l.name) + (l.private && !isWatchlist && !isHistory && !isAiringNext ? ' <span class="badge">Private</span>' : '') + '</div>' +
+          '<div class="list-card-meta">' +
+            '<span>' + typeLabel + '</span>' +
+            '<span class="list-card-meta-sep">&middot;</span><span>' + totalCount + ' items</span>' +
+            (!isHistory && !isWatchlist && !isAiringNext ? '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' : '') +
+          '</div>' +
+        '</div>' +
+        '<div class="list-card-actions">' +
+          copyBtn +
+          addBtns +
+          deleteBtn +
+        '</div>' +
+      '</div>' +
+      postersHtml +
+    '</div>';
+  }).join('');
+
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+  if (typeof populateSearchResultPosters === 'function') populateSearchResultPosters();
+}
+
+document.getElementById('myMdblistListsResult').addEventListener('click', (e) => {
+  const addBtn = e.target.closest('.myListAddBtn');
+  if (addBtn && !addBtn.disabled) {
+    addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
+    addBtn.textContent = 'Added \u2713';
+    addBtn.disabled = true;
+    return;
+  }
+  const copyBtn = e.target.closest('.myListCopyToCustomBtn');
+  if (copyBtn) {
+    copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn, copyBtn.dataset.historyMode);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
+  }
+});
+
+async function runMyTraktLists() {
+  const box = document.getElementById('myTraktListsResult');
+  const isDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const token = isDisc ? '' : (traktAccessToken || localStorage.getItem('myListAddon:traktAccessToken') || '');
+  const username = isDisc ? '' : ((document.getElementById('traktUsernameInput') ? document.getElementById('traktUsernameInput').value.trim() : '') || localStorage.getItem('myListAddon:traktUsername') || '');
+  const traktKey = isDisc ? '' : ((document.getElementById('traktKeyInput') ? document.getElementById('traktKeyInput').value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '');
+
+  if (token) {
+    if (box) box.innerHTML = '';
+    return runMyPrivateTraktLists();
+  }
+
+  if (!username) {
+    if (box) box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your Trakt account in Settings or click <strong>Connect Trakt</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
+    return;
+  }
+  if (box) box.innerHTML = '<p style="margin-top:10px;"><small>Loading your Trakt lists\u2026</small></p>';
+  try {
+    const params = 'username=' + encodeURIComponent(username) + (traktKey ? '&traktKey=' + encodeURIComponent(traktKey) : '');
+    const res = await fetch(ORIGIN + '/api/trakt-my-lists?' + params, { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok) {
+      if (box) box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your Trakt lists.') + '</p>';
+      return;
+    }
+    renderMyTraktLists(data.lists);
+  } catch (e) {
+    if (box) box.innerHTML = '<p class="testresult err">\u2717 Network error loading your Trakt lists.</p>';
+  }
+}
+
+function renderMyTraktLists(lists) {
+  renderMyPrivateTraktLists(lists);
+}
+
+document.getElementById('myTraktListsResult').addEventListener('click', (e) => {
+  const addBtn = e.target.closest('.myListAddBtn');
+  if (addBtn && !addBtn.disabled) {
+    addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
+    addBtn.textContent = 'Added \u2713';
+    addBtn.disabled = true;
+    return;
+  }
+  const copyBtn = e.target.closest('.myListCopyToCustomBtn');
+  if (copyBtn) {
+    copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
+  }
+});
+
+// --- MDBList OAuth (Connect MDBList) --------------------------------------
+function startMdblistConnect() {
+  try { localStorage.removeItem('myListAddon:mdblistDisconnected'); } catch (e) {}
+  window.location.href = ORIGIN + '/api/mdblist/oauth/start';
+}
+
+function disconnectMdblist() {
+  const input = document.getElementById('mdblistKeyInput');
+  if (input) input.value = '';
+  mdblistAccessToken = '';
+  try { window.mdblistAccessToken = ''; } catch (e) {}
+  try {
+    localStorage.removeItem('myListAddon:mdblistAccessToken');
+    localStorage.removeItem('myListAddon:mdblistUsername');
+    localStorage.removeItem('myListAddon:mdblistKey');
+    localStorage.setItem('myListAddon:mdblistDisconnected', 'true');
+  } catch (e) {}
+  saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
+  renderMdblistConnectStatus();
+  scheduleMyMdblistListsRefresh();
+}
+
+function toggleListsMdblistConnection() {
+  const isDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const token = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken');
+  if (token && !isDisc) {
+    disconnectMdblist();
+  } else {
+    startMdblistConnect();
+  }
+}
+
+function renderMdblistConnectStatus() {
+  const input = document.getElementById('mdblistKeyInput');
+  const statusEl = document.getElementById('mdblistConnectStatus');
+  const connectBtn = document.getElementById('mdblistConnectBtn');
+  const disconnectBtn = document.getElementById('mdblistDisconnectBtn');
+  const listsBtn = document.getElementById('listsMdblistConnectBtn');
+  const isDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
+  const token = isDisc ? '' : ((typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '');
+  if (!isDisc && token) mdblistAccessToken = token;
+  const user = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || (isDisc ? '' : (localStorage.getItem('myListAddon:mdblistUsername') || ''));
+  const key = (input ? input.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:mdblistKey') || ''));
+  const isAccountConnected = !isDisc && !!token;
+  const hasKey = !isDisc && !!key;
+
+  if (listsBtn) {
+    listsBtn.innerText = isAccountConnected ? 'Disconnect' : 'Connect MDBList';
+  }
+
+  if (statusEl) {
+    if (token && user) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
+    } else if (token) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to MDBList</span>';
+      if (!window._mdblistResolvingUser) {
+        window._mdblistResolvingUser = true;
+        setTimeout(() => {
+          window._mdblistResolvingUser = false;
+          if (typeof runMyMdblistLists === 'function') runMyMdblistLists();
+        }, 100);
+      }
+    } else if (hasKey) {
+      statusEl.innerHTML = '<span style="color:var(--text-2); font-weight:600;">Custom MDBList API Key configured</span>';
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
+    }
+  }
+  if (connectBtn) connectBtn.textContent = token ? 'Re-connect MDBList' : (key ? 'Update Key' : 'Connect MDBList Account');
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
+
+  const syncCb = document.getElementById('syncMdblistHistoryCheckbox');
+  if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncMdblistHistory') === 'true';
+  const syncWrap = document.getElementById('mdblistSyncHistoryWrap');
+  if (syncWrap) syncWrap.style.display = (isAccountConnected || hasKey) ? '' : 'none';
+
+  if (!isAccountConnected && !hasKey) {
+    const box = document.getElementById('myMdblistListsResult');
+    if (box) box.innerHTML = '';
+  }
+}
+
+function pickUpMdblistTokenFromUrl() {
+  const hash = window.location.hash || '';
+  const match = /(?:^|[#&])mdblist_token=([^&]+)/.exec(hash);
+  if (match) {
+    mdblistAccessToken = decodeURIComponent(match[1]);
+    try {
+      localStorage.removeItem('myListAddon:mdblistDisconnected');
+    } catch (e) {}
+    const userMatch = /(?:^|[#&])mdblist_username=([^&]+)/.exec(hash);
+    if (userMatch) {
+      mdblistUsername = decodeURIComponent(userMatch[1]);
+      try {
+        localStorage.setItem('myListAddon:mdblistUsername', mdblistUsername);
+      } catch (e) {}
+    }
+    try {
+      localStorage.setItem('myListAddon:mdblistAccessToken', mdblistAccessToken);
+    } catch (e) {}
+    saveState();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('MDBList Connected', 'Connected to MDBList.', true);
+    } else {
+      alert('Connected to MDBList.');
+    }
+    renderMdblistConnectStatus();
+    scheduleMyMdblistListsRefresh();
+  }
+  const params = new URLSearchParams(window.location.search);
+  const err = params.get('mdblist_error');
+  if (err) {
+    const detail = params.get('mdblist_error_detail') || '';
+    const messages = {
+      not_configured: 'MDBList OAuth (MDBLIST_CLIENT_ID / MDBLIST_CLIENT_SECRET) is not configured in Cloudflare Secrets yet.',
+      no_code: 'MDBList did not return an authorization code.',
+      exchange_failed: 'Failed to exchange authorization code for an MDBList token.',
+      access_denied: 'MDBList sign-in was cancelled.',
+      state_mismatch: 'MDBList sign-in state mismatch. Please try again.',
+      no_token: 'MDBList did not return an access token.',
+      network: 'Network error connecting to MDBList.',
+    };
+    const msg = messages[err] || ('Could not connect to MDBList (' + err + (detail ? ': ' + detail : '') + ').');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('MDBList Connection Error', msg + (detail ? '\\n\\nDetails: ' + detail : ''), false);
+    } else {
+      alert(msg + (detail ? '\\n' + detail : ''));
+    }
+    params.delete('mdblist_error');
+    params.delete('mdblist_error_detail');
+    const qs = params.toString();
+    history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+  }
+}
+
+// --- Trakt OAuth (private lists) -----------------------------------------
+//
+// A full-page redirect (not a popup) -- Trakt's own login page doesn't
+// need any special embedding, and a popup would need postMessage plumbing
+// back to this window for no real benefit. /api/trakt/oauth/callback
+// redirects back here with the resulting token in the URL fragment; see
+// pickUpTraktTokenFromUrl below, called once from this page's own init.
+function startTraktConnect() {
+  try { localStorage.removeItem('myListAddon:traktDisconnected'); } catch (e) {}
+  window.location.href = ORIGIN + '/api/trakt/oauth/start';
+}
+
+function disconnectTrakt() {
+  const keyInput = document.getElementById('traktKeyInput');
+  if (keyInput) keyInput.value = '';
+  const userInput = document.getElementById('traktUsernameInput');
+  if (userInput) userInput.value = '';
+  traktAccessToken = '';
+  try { window.traktAccessToken = ''; } catch (e) {}
+  if (typeof activeTraktToken !== 'undefined') activeTraktToken = null;
+  try {
+    localStorage.removeItem('myListAddon:traktAccessToken');
+    localStorage.removeItem('myListAddon:traktUsername');
+    localStorage.removeItem('myListAddon:traktKey');
+    localStorage.setItem('myListAddon:traktDisconnected', 'true');
+  } catch (e) {}
+  saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
+  renderTraktConnectStatus();
+  const box = document.getElementById('myPrivateTraktListsResult');
+  if (box) box.innerHTML = '';
+}
+
+function toggleListsTraktConnection() {
+  const isDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const token = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken');
+  if (token && !isDisc) {
+    disconnectTrakt();
+  } else {
+    startTraktConnect();
+  }
+}
+
+function renderTraktConnectStatus() {
+  const keyInput = document.getElementById('traktKeyInput');
+  const userInput = document.getElementById('traktUsernameInput');
+  const statusEl = document.getElementById('traktConnectStatus');
+  const connectBtn = document.getElementById('traktConnectBtn');
+  const disconnectBtn = document.getElementById('traktDisconnectBtn');
+  const listsBtn = document.getElementById('listsTraktConnectBtn');
+  const isDisc = localStorage.getItem('myListAddon:traktDisconnected') === 'true';
+  const token = isDisc ? '' : ((typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '');
+  if (!isDisc && token) traktAccessToken = token;
+  const user = (userInput ? userInput.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:traktUsername') || ''));
+  const key = (keyInput ? keyInput.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:traktKey') || ''));
+  const isAccountConnected = !isDisc && !!token;
+  const hasKey = !isDisc && !!(key || user);
+  
+  if (listsBtn) {
+    listsBtn.innerText = isAccountConnected ? 'Disconnect' : 'Connect Trakt';
+  }
+  
+  if (statusEl) {
+    if (token && user) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
+    } else if (token) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to Trakt</span>';
+    } else if (hasKey) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Custom Trakt Client ID configured' + (user ? ' (@' + escapeHtml(user) + ')' : '') + '</span>';
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
+    }
+  }
+  if (connectBtn) connectBtn.textContent = token ? 'Re-connect Trakt' : (key ? 'Update Client ID' : 'Connect Trakt Account');
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
+
+  const syncCb = document.getElementById('syncTraktHistoryCheckbox');
+  if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncTraktHistory') === 'true';
+  const syncWrap = document.getElementById('traktSyncHistoryWrap');
+  if (syncWrap) syncWrap.style.display = (isAccountConnected || hasKey) ? '' : 'none';
+
+  const box = document.getElementById('myPrivateTraktListsResult');
+  const pubBox = document.getElementById('myTraktListsResult');
+  if (!isAccountConnected && !hasKey) {
+    if (box) box.innerHTML = '';
+    if (pubBox) pubBox.innerHTML = '';
+  }
+}
+
+// Reads the token handed back in the URL fragment right after
+// /api/trakt/oauth/callback redirects here (#trakt_token=...) -- a
+// fragment, not a query param, since fragments never reach any server on
+// subsequent requests. Also surfaces a plain message for ?trakt_error=...,
+// the callback's own failure path. Either way, strips whatever it found
+// from the address bar immediately so a page refresh or a copied/shared
+// URL never carries it forward.
+function pickUpTraktTokenFromUrl() {
+  const hash = window.location.hash || '';
+  const match = /(?:^|[#&])trakt_token=([^&]+)/.exec(hash);
+  if (match) {
+    traktAccessToken = decodeURIComponent(match[1]);
+    try {
+      localStorage.setItem('myListAddon:traktAccessToken', traktAccessToken);
+      localStorage.removeItem('myListAddon:traktDisconnected');
+    } catch (e) {}
+    const userMatch = /(?:^|[#&])trakt_username=([^&]+)/.exec(hash);
+    if (userMatch) {
+      const user = decodeURIComponent(userMatch[1]);
+      try {
+        localStorage.setItem('myListAddon:traktUsername', user);
+      } catch (e) {}
+      const uInput = document.getElementById('traktUsernameInput');
+      if (uInput) uInput.value = user;
+    }
+    saveState();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Trakt Connected', 'Connected to Trakt.', true);
+    } else {
+      alert('Connected to Trakt.');
+    }
+    renderTraktConnectStatus();
+    scheduleMyTraktListsRefresh();
+  }
+  const params = new URLSearchParams(window.location.search);
+  const err = params.get('trakt_error');
+  if (err) {
+    const detail = params.get('trakt_error_detail') || '';
+    const messages = {
+      no_client_id: 'Trakt OAuth Client ID is not configured on this server.',
+      no_code: 'Trakt did not return an authorization code.',
+      token_exchange_failed: 'Failed to exchange authorization code for a Trakt token.',
+      access_denied: 'Trakt sign-in was cancelled.',
+    };
+    const isRateLimit = detail.includes('1015') || detail.includes('429') || err === 'exchange_failed';
+    const msg = isRateLimit 
+      ? 'Trakt web redirect was rate-limited by Cloudflare (1015). Opening direct PIN code activation instead...'
+      : (messages[err] || ('Could not connect to Trakt (' + err + (detail ? ': ' + detail : '') + ').'));
+
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Trakt Connection', msg, !isRateLimit);
+    } else {
+      alert(msg);
+    }
+    params.delete('trakt_error');
+    params.delete('trakt_error_detail');
+    const qs = params.toString();
+    history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+
+    if (isRateLimit) {
+      setTimeout(() => {
+        startTraktDeviceLogin();
+      }, 500);
+    }
+  }
+}
+
+let _traktDevicePollTimer = null;
+
+function closeTraktDeviceModal() {
+  if (_traktDevicePollTimer) {
+    clearInterval(_traktDevicePollTimer);
+    _traktDevicePollTimer = null;
+  }
+  const modal = document.getElementById('traktDeviceModal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function startTraktDeviceLogin() {
+  const modal = document.getElementById('traktDeviceModal');
+  const codeEl = document.getElementById('traktDeviceUserCode');
+  const statusEl = document.getElementById('traktDevicePollingStatus');
+  const linkEl = document.getElementById('traktDeviceActivateLink');
+  const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+  
+  if (modal) modal.style.display = 'flex';
+  if (codeEl) codeEl.innerText = 'LOADING...';
+  if (statusEl) statusEl.innerText = 'Requesting activation code from Trakt...';
+
+  try {
+    const res = await fetch(ORIGIN + '/api/trakt/device/code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ traktKey: traktKey }),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.user_code) {
+      if (codeEl) codeEl.innerText = 'ERROR';
+      if (statusEl) {
+        statusEl.innerHTML = '<span style="color:var(--danger);">' + escapeHtml(data.error || 'Could not get device code.') + '</span> <button type="button" class="lc-btn secondary" style="margin-left:8px; padding:3px 8px; font-size:0.75rem;" onclick="startTraktDeviceLogin()">Try Again</button>';
+      }
+      return;
+    }
+
+    if (codeEl) codeEl.innerText = data.user_code;
+    if (linkEl) {
+      linkEl.href = data.verification_url || 'https://trakt.tv/activate';
+    }
+    if (statusEl) {
+      statusEl.innerHTML = '<span style="color:var(--accent); font-weight:600;">Code ready!</span> Enter code at trakt.tv/activate &bull; Waiting for approval...';
+    }
+
+    const deviceCode = data.device_code;
+    const intervalSec = Math.max(4, data.interval || 5);
+    const expiresAt = Date.now() + ((data.expires_in || 600) * 1000);
+
+    if (_traktDevicePollTimer) clearInterval(_traktDevicePollTimer);
+
+    _traktDevicePollTimer = setInterval(async () => {
+      if (Date.now() > expiresAt) {
+        clearInterval(_traktDevicePollTimer);
+        _traktDevicePollTimer = null;
+        if (statusEl) statusEl.innerHTML = 'Activation code expired. <button type="button" class="lc-btn secondary" style="margin-left:8px; padding:3px 8px; font-size:0.75rem;" onclick="startTraktDeviceLogin()">Get New Code</button>';
+        return;
+      }
+
+      try {
+        const pollRes = await fetch(ORIGIN + '/api/trakt/device/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: deviceCode, traktKey: traktKey }),
+        });
+        const pollData = await pollRes.json();
+
+        if (pollData.ok && pollData.access_token) {
+          clearInterval(_traktDevicePollTimer);
+          _traktDevicePollTimer = null;
+          traktAccessToken = pollData.access_token;
+          try {
+            localStorage.setItem('myListAddon:traktAccessToken', traktAccessToken);
+          } catch(e) {}
+          if (pollData.username) {
+            try {
+              localStorage.setItem('myListAddon:traktUsername', pollData.username);
+            } catch(e) {}
+            const uInput = document.getElementById('traktUsernameInput');
+            if (uInput) uInput.value = pollData.username;
+          }
+          saveState();
+          if (typeof pushCreatorSync === 'function') pushCreatorSync();
+          closeTraktDeviceModal();
+          if (typeof showAppAlert === 'function') {
+            showAppAlert('Trakt Connected', 'Successfully connected to Trakt' + (pollData.username ? ' as @' + pollData.username : '') + '.', true);
+          }
+          renderTraktConnectStatus();
+          scheduleMyTraktListsRefresh();
+        } else if (pollData.pending) {
+          // Still waiting for user confirmation
+        } else if (pollData.slowDown) {
+          // Slow down polling
+        } else if (pollData.error && !pollData.pending) {
+          clearInterval(_traktDevicePollTimer);
+          _traktDevicePollTimer = null;
+          if (statusEl) statusEl.innerText = pollData.error;
+        }
+      } catch (e) {}
+    }, intervalSec * 1000);
+
+  } catch (err) {
+    if (codeEl) codeEl.innerText = 'ERROR';
+    if (statusEl) statusEl.innerHTML = 'Network error requesting device code. <button type="button" class="lc-btn secondary" style="margin-left:8px; padding:3px 8px; font-size:0.75rem;" onclick="startTraktDeviceLogin()">Try Again</button>';
+  }
+}
+
+let myPrivateTraktListsTimer = null;
+async function runMyPrivateTraktLists() {
+  const box = document.getElementById('myPrivateTraktListsResult');
+  if (!box) return;
+  if (!traktAccessToken) {
+    box.innerHTML = '';
+    return;
+  }
+  box.innerHTML = '<p style="margin-top:10px;"><small>Loading your Trakt lists\u2026</small></p>';
+  try {
+    const res = await fetch(ORIGIN + '/api/trakt-my-private-lists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accessToken: traktAccessToken }),
+      cache: 'no-store',
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your Trakt lists.') + '</p>';
+      return;
+    }
+    if (data.username) {
+      traktUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:traktUsername', traktUsername);
+        localStorage.removeItem('myListAddon:traktDisconnected');
+      } catch (e) {}
+      const uInput = document.getElementById('traktUsernameInput');
+      if (uInput && !uInput.value) uInput.value = traktUsername;
+      renderTraktConnectStatus();
+    }
+    renderMyPrivateTraktLists(data.lists);
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">\u2717 Network error loading your Trakt lists.</p>';
+  }
+}
+
+let _traktAiringNextEnriching = false;
+let _traktAiringNextEnrichedAt = 0;
+async function enrichTraktAiringNextDates(list) {
+  if (!list || !Array.isArray(list.items) || !list.items.length) return;
+  const hasExpired = (list.items || []).some((it) => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
+  if (!hasExpired && _traktAiringNextEnrichedAt && (Date.now() - _traktAiringNextEnrichedAt < 300000)) return;
+  _traktAiringNextEnriching = true;
+
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+  try {
+    const rawCandidates = (window._traktRawAiringCandidates && window._traktRawAiringCandidates.length)
+      ? window._traktRawAiringCandidates
+      : (list.items || []);
+    const candidates = rawCandidates.slice(0, 80);
+    const enriched = [];
+    const concurrency = 5;
+    for (let i = 0; i < candidates.length; i += concurrency) {
+      const chunk = candidates.slice(i, i + concurrency);
+      await Promise.all(chunk.map(async (it) => {
+        try {
+          const showId = it.imdbId || (it.id && String(it.id).startsWith('tt') ? it.id : '') || (it.tmdbId ? 'tmdb:' + it.tmdbId : (it.id ? (String(it.id).startsWith('tmdb:') ? it.id : 'tmdb:' + it.id) : ''));
+          if (!showId) return;
+          const bypass = hasExpired ? '&fresh=1&_t=' + Date.now() : '';
+          const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
+          const data = await res.json();
+          const d = data && data.ok ? data.details : null;
+          if (d && d.nextEpisodeAirDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(d.nextEpisodeAirDate))) {
+            it.airDate = d.nextEpisodeAirDate;
+            it.seasonNum = d.nextEpisodeSeasonNumber;
+            it.episodeNum = d.nextEpisodeNumber;
+            it.isSeasonPremiere = (typeof d.isSeasonPremiere === 'boolean') ? d.isSeasonPremiere : (d.nextEpisodeNumber === 1);
+            it.isSeasonFinale = !!d.isSeasonFinale;
+            it.seasonFinaleAirDate = d.seasonFinaleAirDate || null;
+            it.seasonFinaleEpisodeNumber = d.seasonFinaleEpisodeNumber || null;
+            it.isUnaired = true;
+            it.episodeTitle = d.nextEpisodeName || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : ('Episode ' + d.nextEpisodeNumber)));
+            enriched.push(it);
+          }
+        } catch (e) {}
+      }));
+    }
+    if (enriched.length) {
+      enriched.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
+      list.items = enriched;
+      list.itemCount = enriched.length;
+      try {
+        localStorage.setItem('myListAddon:traktAiringNextCache', JSON.stringify(enriched));
+      } catch (e) {}
+      _traktAiringNextEnrichedAt = Date.now();
+      renderMyPrivateTraktLists(window._myPrivateTraktLists || window._myTraktLists);
+    }
+  } finally {
+    _traktAiringNextEnriching = false;
+  }
+}
+
+function openTraktAiringNextDetailsPage() {
+  const lists = window._myPrivateTraktLists || window._myTraktLists || [];
+  const list = lists.find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (!list) return;
+  const filtered = (list.items || []).filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+  const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+  const sample = filtered.map((it) => {
+    const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+    const isPremiere = (typeof it.isSeasonPremiere === 'boolean') ? it.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (it.episodeNum === 1));
+    const isFinale = !!(it.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+    const finaleAirDate = it.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+
+    const label = (typeof formatWatchItemLabel === 'function')
+      ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: isPremiere })
+      : {
+          title: it.name + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
+          subtitle: it.episodeTitle || (isPremiere ? 'Season Premiere' : (isFinale ? 'Season Finale' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')))
+        };
+    return {
+      id: it.id,
+      type: 'series',
+      name: label.title,
+      subtitle: label.subtitle,
+      poster: it.poster,
+      airDate: it.airDate,
+      isUnaired: true,
+      isSeasonPremiere: isPremiere,
+      isSeasonFinale: isFinale,
+      seasonFinaleAirDate: finaleAirDate,
+    };
+  });
+  openListDetailsPage('Trakt Airing Next', 'series', 'trakt:user:shows:airing-next', { sample: sample, count: sample.length, maybeMore: false });
+}
+
+// Every row here -- public or private -- becomes a perfectly normal
+// trakt.tv list URL once added (see collectEntries/fetchTrakt): the
+// connected access token travels with every Trakt fetch this config makes
+// from here on (see the dispatch in fetchCatalog), not just ones added
+// from this specific panel, so a private list keeps resolving correctly
+// wherever it's referenced.
+function renderMyPrivateTraktLists(lists) {
+  window._myPrivateTraktLists = lists || [];
+  const box = document.getElementById('myPrivateTraktListsResult');
+  if (!lists || !lists.length) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No lists found on your Trakt account.</small></p>';
+    return;
+  }
+
+  const airingNextList = lists.find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (airingNextList && Array.isArray(airingNextList.items) && airingNextList.items.length) {
+    if (!window._traktRawAiringCandidates || !window._traktRawAiringCandidates.length) {
+      window._traktRawAiringCandidates = airingNextList.items.map(it => ({ ...it }));
+    }
+    const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+    if (!airingNextList._cachedApplied) {
+      try {
+        const cached = JSON.parse(localStorage.getItem('myListAddon:traktAiringNextCache') || '[]');
+        if (Array.isArray(cached) && cached.length) {
+          const cacheMap = new Map(cached.map((c) => [c.id || c.imdbId || (c.tmdbId ? 'tmdb:' + c.tmdbId : ''), c]));
+          airingNextList.items.forEach((it) => {
+            const c = cacheMap.get(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : ''));
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+            if (c) {
+              it.airDate = c.airDate;
+              it.seasonNum = c.seasonNum;
+              it.episodeNum = c.episodeNum;
+              it.isSeasonPremiere = (typeof c.isSeasonPremiere === 'boolean') ? c.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (c.episodeNum === 1));
+              it.isSeasonFinale = !!(c.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+              it.seasonFinaleAirDate = c.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+              it.seasonFinaleEpisodeNumber = c.seasonFinaleEpisodeNumber || null;
+              it.isUnaired = true;
+              it.episodeTitle = c.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : (c.episodeNum != null ? ('Episode ' + c.episodeNum) : '')));
+            } else if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
+            }
+          });
+        } else if (localAiringList.length) {
+          airingNextList.items.forEach((it) => {
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+            if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
+            }
+          });
+        }
+      } catch (e) {}
+      airingNextList._cachedApplied = true;
+    }
+    const hasExpired = (airingNextList.items || []).some((it) => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
+    if (!_traktAiringNextEnriching && (hasExpired || !_traktAiringNextEnrichedAt || Date.now() - _traktAiringNextEnrichedAt >= 120000)) {
+      enrichTraktAiringNextDates(airingNextList).catch(() => {});
+    }
+  }
+
+  const alreadyAdded = new Set();
+  document.querySelectorAll('#lists .entry').forEach(function(entry) {
+    const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
+    entry.querySelectorAll('.url').forEach(function(el) {
+      alreadyAdded.add(el.value.trim() + '|' + t);
+    });
+  });
+
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
+    const isAiringNext = l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'));
+    const isHistory = !isAiringNext && (l.url === 'trakt:history' || l.slug === 'history');
+    const isWatchlist = !isAiringNext && (l.url === 'trakt:watchlist' || l.slug === 'watchlist');
+    const isSingleType = isAiringNext || (l.contentType === 'movie' || l.contentType === 'series');
+    const type = (isAiringNext || l.contentType === 'series') ? 'series' : 'movie';
+    const typeLabel = isAiringNext ? 'Shows' : (isHistory ? 'Watch History' : (isWatchlist ? 'Watchlist' : (l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed'))));
+    const viewType = isSingleType ? type : 'mixed';
+
+    let filteredItems = l.items || [];
+    if (isAiringNext) {
+      filteredItems = filteredItems.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+    }
+    const totalCount = isAiringNext ? filteredItems.length : (l.items && typeof l.items === 'number' ? l.items : (Array.isArray(l.items) ? l.items.length : (l.itemCount || 0)));
+
+    const copyBtn = isHistory
+      ? '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="mixed">Copy</button>' +
+        '<button type="button" class="lc-btn secondary" onclick="markTraktHistoryAllWatched(this)">Mark all as Watched</button>'
+      : (isAiringNext
+          ? '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">Copy</button>'
+          : '<button type="button" class="lc-btn secondary myPrivateListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'unknown') + '">Copy</button>');
+
+    let addBtns = '';
+    if (isSingleType) {
+      const added = alreadyAdded.has(l.url + '|' + type);
+      addBtns = '<button type="button" class="lc-btn primary myPrivateListAddBtn" ' + (added ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? '&#10003; Added' : '+ Add') + '</button>';
+    } else {
+      const addedMovie = alreadyAdded.has(l.url + '|movie');
+      const addedSeries = alreadyAdded.has(l.url + '|series');
+      addBtns = '<button type="button" class="lc-btn primary myPrivateListAddBtn" ' + (addedMovie ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="movie">' + (addedMovie ? '&#10003;' : '+ Movies') + '</button>' +
+        '<button type="button" class="lc-btn primary myPrivateListAddBtn" ' + (addedSeries ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' + (addedSeries ? '&#10003;' : '+ Shows') + '</button>';
+    }
+
+    const isCustomUserList = !isHistory && !isWatchlist && !isAiringNext;
+    const traktListId = (l.ids && l.ids.trakt) || l.id || l.slug || '';
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="trakt" data-list-id="' + escapeAttr(traktListId) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
+
+    let postersHtml = '';
+    if (isAiringNext) {
+      const previewItems = filteredItems.slice(0, 9);
+      if (previewItems.length) {
+        postersHtml = '<div class="list-card-posters poster-preview-static">' +
+          previewItems.map((it, i) => {
+            const isMobileEnd = (i === 2 && previewItems.length > 3);
+            const isDesktopEnd = (i === previewItems.length - 1 && previewItems.length >= 4);
+            let overlays = '';
+            if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); openTraktAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+            if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); openTraktAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+
+            const showAiringBadges = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgesAiringNext') : true;
+            const showAirDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
+            const showPremiere = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
+            const showFinale = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
+            const showFinaleDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
+
+            const hasAired = it.airDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(it.airDate) : false;
+            const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
+            let dateBadge = '';
+            if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
+              const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+              if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+            }
+            const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
+            const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
+            let bottomBadge = '';
+            if (isUnairedEp) {
+              if (showPremiere && isSeasonPremiere) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>';
+              } else if (showFinale && it.isSeasonFinale) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Finale</div>';
+              } else if (showFinaleDate && it.seasonFinaleAirDate && isFinaleUnaired) {
+                const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.seasonFinaleAirDate) : '';
+                if (finaleText) {
+                  bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(it.seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+                }
+              }
+            }
+            const label = (typeof formatWatchItemLabel === 'function')
+              ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: it.isSeasonPremiere })
+              : {
+                  title: it.name + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
+                  subtitle: it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
+                };
+
+            const traktPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster) : it.poster;
+            return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">' +
+              '<div class="list-card-mini-poster-img-wrap">' +
+                (traktPoster ? '<img src="' + escapeAttr(traktPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(traktPoster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+                (dateBadge + bottomBadge) +
+                overlays +
+              '</div>' +
+              '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
+              (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
+            '</div>';
+          }).join('') +
+        '</div>';
+      } else if (_traktAiringNextEnriching) {
+        postersHtml = '<p style="margin-top:8px; color:var(--muted); font-size:0.85rem;"><span style="display:inline-block; width:12px; height:12px; border:2px solid var(--accent); border-top-color:transparent; border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle; margin-right:6px;"></span>Checking upcoming air dates&hellip;</p>';
+      } else {
+        postersHtml = '<p style="margin-top:8px; color:var(--muted);"><small>Nothing scheduled yet.</small></p>';
+      }
+    } else {
+      postersHtml = '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + viewType + '"></div>';
+    }
+
+    const titleClick = isAiringNext ? 'onclick="openTraktAiringNextDetailsPage()"' : '';
+
+    return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
+      '<div class="list-card-header">' +
+        '<div class="list-card-body">' +
+          '<div class="list-card-title" ' + titleClick + ' style="' + (isAiringNext ? 'cursor:pointer;' : '') + '">' + escapeHtml(l.name) + (l.private && !isWatchlist && !isHistory && !isAiringNext ? ' <span class="badge">Private</span>' : '') + '</div>' +
+          '<div class="list-card-meta">' +
+            '<span>' + typeLabel + '</span>' +
+            '<span class="list-card-meta-sep">&middot;</span><span>' + totalCount + ' items</span>' +
+            (!isHistory && !isWatchlist && !isAiringNext ? '<span class="list-card-meta-sep">&middot;</span><span>&#9829; ' + (l.likes || 0) + '</span>' : '') +
+          '</div>' +
+        '</div>' +
+        '<div class="list-card-actions">' +
+          copyBtn +
+          addBtns +
+          deleteBtn +
+        '</div>' +
+      '</div>' +
+      postersHtml +
+    '</div>';
+  }).join('');
+
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+  if (typeof populateSearchResultPosters === 'function') populateSearchResultPosters();
+}
+
+document.getElementById('myPrivateTraktListsResult').addEventListener('click', (e) => {
+  const addBtn = e.target.closest('.myPrivateListAddBtn');
+  if (addBtn && !addBtn.disabled) {
+    addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
+    addBtn.textContent = 'Added \u2713';
+    addBtn.disabled = true;
+    return;
+  }
+  const copyBtn = e.target.closest('.myPrivateListCopyToCustomBtn');
+  if (copyBtn) {
+    copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn, copyBtn.dataset.historyMode);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
+  }
+});
+
+// --- TMDB Account / API Key Connection -----------------------------------
+let tmdbSessionId = '';
+let tmdbAccountId = '';
+let tmdbUsername = '';
+
+function onTmdbKeyInputChanged() {
+  const input = document.getElementById('tmdbKeyInput');
+  const val = input ? input.value.trim() : '';
+  if (val) {
+    localStorage.setItem('myListAddon:tmdbKey', val);
+  } else {
+    localStorage.removeItem('myListAddon:tmdbKey');
+  }
+  renderTmdbConnectStatus();
+  scheduleMyTmdbListsRefresh();
+}
+
+function startTmdbConnect() {
+  try { localStorage.removeItem('myListAddon:tmdbDisconnected'); } catch (e) {}
+  window.location.href = ORIGIN + '/api/tmdb/oauth/start';
+}
+
+function toggleListsTmdbConnection() {
+  const isDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const sess = (typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId');
+  if (sess && !isDisc) {
+    disconnectTmdb();
+  } else {
+    startTmdbConnect();
+  }
+}
+
+function disconnectTmdb() {
+  const input = document.getElementById('tmdbKeyInput');
+  if (input) input.value = '';
+  tmdbSessionId = '';
+  try { window.tmdbSessionId = ''; } catch (e) {}
+  tmdbAccountId = '';
+  try { window.tmdbAccountId = ''; } catch (e) {}
+  tmdbUsername = '';
+  try { window.tmdbUsername = ''; } catch (e) {}
+  try {
+    localStorage.removeItem('myListAddon:tmdbKey');
+    localStorage.removeItem('myListAddon:tmdbSessionId');
+    localStorage.removeItem('myListAddon:tmdbAccountId');
+    localStorage.removeItem('myListAddon:tmdbUsername');
+    localStorage.setItem('myListAddon:tmdbDisconnected', 'true');
+  } catch (e) {}
+  saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
+  renderTmdbConnectStatus();
+  scheduleMyTmdbListsRefresh();
+}
+
+function pickUpTmdbTokenFromUrl() {
+  const hash = window.location.hash || '';
+  if (hash.startsWith('#') && hash.includes('tmdb_session=')) {
+    const params = new URLSearchParams(hash.slice(1));
+    const sess = params.get('tmdb_session');
+    const acc = params.get('tmdb_account');
+    const user = params.get('tmdb_user');
+    if (sess) {
+      tmdbSessionId = sess;
+      tmdbAccountId = acc || '';
+      tmdbUsername = user || '';
+      try {
+        localStorage.removeItem('myListAddon:tmdbDisconnected');
+        localStorage.setItem('myListAddon:tmdbSessionId', tmdbSessionId);
+        if (tmdbAccountId) localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountId);
+        if (tmdbUsername) localStorage.setItem('myListAddon:tmdbUsername', tmdbUsername);
+      } catch (e) {}
+      saveState();
+      if (typeof pushCreatorSync === 'function') pushCreatorSync();
+      params.delete('tmdb_session');
+      params.delete('tmdb_account');
+      params.delete('tmdb_user');
+      const rem = params.toString();
+      history.replaceState(null, '', window.location.pathname + window.location.search + (rem ? '#' + rem : ''));
+      renderTmdbConnectStatus();
+      scheduleMyTmdbListsRefresh();
+    }
+  }
+
+  const search = new URLSearchParams(window.location.search);
+  const err = search.get('tmdb_error');
+  if (err) {
+    const detail = search.get('tmdb_error_detail') || '';
+    const msg = 'Could not connect to TMDB (' + err + (detail ? ': ' + detail : '') + ').';
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('TMDB Connection Error', msg, false);
+    } else {
+      alert(msg);
+    }
+    search.delete('tmdb_error');
+    search.delete('tmdb_error_detail');
+    const qs = search.toString();
+    history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : '') + window.location.hash);
+  }
+}
+
+function renderTmdbConnectStatus() {
+  const input = document.getElementById('tmdbKeyInput');
+  const statusEl = document.getElementById('tmdbConnectStatus');
+  const connectBtn = document.getElementById('tmdbConnectBtn');
+  const disconnectBtn = document.getElementById('tmdbDisconnectBtn');
+  const listsConnectBtn = document.getElementById('listsTmdbConnectBtn');
+
+  const isDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
+  const sess = isDisc ? '' : (tmdbSessionId || localStorage.getItem('myListAddon:tmdbSessionId') || '');
+  const user = isDisc ? '' : (tmdbUsername || localStorage.getItem('myListAddon:tmdbUsername') || '');
+  const key = (input ? input.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:tmdbKey') || ''));
+  const isAccountConnected = !isDisc && !!sess;
+  const hasKey = !isDisc && !!key;
+
+  if (statusEl) {
+    if (sess && user) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
+    } else if (sess) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 TMDB Account Connected</span>';
+    } else if (hasKey) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6;">\u2713 Custom TMDB Key configured</span>';
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--muted);">Not connected</span>';
+    }
+  }
+
+  if (connectBtn) connectBtn.textContent = sess ? 'Re-connect TMDB' : (key ? 'Update Key' : 'Connect TMDB Account');
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
+  if (listsConnectBtn) listsConnectBtn.textContent = isAccountConnected ? 'Disconnect' : 'Connect TMDB';
+
+  if (!isAccountConnected && !hasKey) {
+    const box = document.getElementById('myTmdbListsResult');
+    if (box) box.innerHTML = '';
+  }
+}
+
+let myTmdbListsTimer = null;
+function scheduleMyTmdbListsRefresh() {
+  clearTimeout(myTmdbListsTimer);
+  myTmdbListsTimer = setTimeout(runMyTmdbLists, 600);
+}
+
+async function runMyTmdbLists() {
+  const box = document.getElementById('myTmdbListsResult');
+  if (!box) return;
+  const sess = tmdbSessionId || localStorage.getItem('myListAddon:tmdbSessionId') || '';
+  const acc = tmdbAccountId || localStorage.getItem('myListAddon:tmdbAccountId') || '';
+  const input = document.getElementById('tmdbKeyInput');
+  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+  if (!sess && !acc) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your TMDB account in Settings or click <strong>Connect TMDB</strong> above to see your personal lists, watchlist, and favorites here.</small></p>';
+    return;
+  }
+
+  box.innerHTML = '<p style="margin-top:10px;"><small>Loading your TMDB lists\u2026</small></p>';
+  try {
+    const params = new URLSearchParams();
+    if (sess) params.set('sessionId', sess);
+    if (acc) params.set('accountId', acc);
+    if (key) params.set('tmdbKey', key);
+
+    const res = await fetch(ORIGIN + '/api/tmdb-my-lists?' + params.toString(), { cache: 'no-store' });
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      data = { ok: false, error: 'Server returned HTTP ' + res.status };
+    }
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your TMDB lists.') + '</p>';
+      return;
+    }
+    if (data.username) {
+      tmdbUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:tmdbUsername', tmdbUsername);
+        if (data.accountId) {
+          tmdbAccountId = String(data.accountId);
+          localStorage.setItem('myListAddon:tmdbAccountId', tmdbAccountId);
+        }
+        localStorage.removeItem('myListAddon:tmdbDisconnected');
+      } catch (e) {}
+      renderTmdbConnectStatus();
+    }
+    renderMyTmdbLists(data.lists);
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">\u2717 Network error loading your TMDB lists: ' + escapeHtml(e && e.message ? e.message : String(e)) + '</p>';
+  }
+}
+
+function renderMyTmdbLists(lists) {
+  window._myTmdbLists = lists || [];
+  const box = document.getElementById('myTmdbListsResult');
+  if (!box) return;
+  if (!lists || !lists.length) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No lists found on your TMDB account.</small></p>';
+    return;
+  }
+
+  const alreadyAdded = new Set();
+  document.querySelectorAll('#lists .entry').forEach(function(entry) {
+    const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
+    entry.querySelectorAll('.url').forEach(function(el) {
+      alreadyAdded.add(el.value.trim() + '|' + t);
+    });
+  });
+
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
+    const listIdStr = String(l.id || '');
+    const listUrlStr = String(l.url || '');
+    const isWatchlist = listIdStr.includes('watchlist') || listUrlStr.includes('watchlist');
+    const isFavorites = listIdStr.includes('favorites') || listUrlStr.includes('favorites');
+    const isSingleType = l.contentType === 'movie' || l.contentType === 'series';
+    const type = l.contentType === 'series' ? 'series' : 'movie';
+    const typeLabel = isWatchlist ? 'Watchlist' : (isFavorites ? 'Favorites' : (l.contentType === 'series' ? 'Shows' : (l.contentType === 'movie' ? 'Movies' : 'Mixed')));
+
+    const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(l.contentType || 'mixed') + '">Copy</button>';
+
+    let addBtns = '';
+    if (isSingleType) {
+      const added = alreadyAdded.has(l.url + '|' + type);
+      addBtns = '<button type="button" class="lc-btn primary myListAddBtn" ' + (added ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? '&#10003; Added' : '+ Add') + '</button>';
+    } else {
+      const addedMovie = alreadyAdded.has(l.url + '|movie');
+      const addedSeries = alreadyAdded.has(l.url + '|series');
+      addBtns = '<button type="button" class="lc-btn primary myListAddBtn" ' + (addedMovie ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="movie">' + (addedMovie ? '&#10003;' : '+ Movies') + '</button>' +
+        '<button type="button" class="lc-btn primary myListAddBtn" ' + (addedSeries ? 'disabled' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="series">' + (addedSeries ? '&#10003;' : '+ Shows') + '</button>';
+    }
+
+    const previewItems = (l.previewItems || []).filter(it => it.poster);
+    let posterThumbs = '';
+    if (previewItems.length) {
+      const totalCount = l.items || previewItems.length;
+      posterThumbs = '<div class="list-card-posters poster-preview-static">' +
+        previewItems.map((it, i) => {
+          const isMobileEnd = (i === 2 && previewItems.length > 3);
+          const isDesktopEnd = (i === previewItems.length - 1 && previewItems.length >= 4);
+          let overlays = '';
+          if (isMobileEnd) {
+            overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:default;">' + totalCount + ' &rsaquo;</div>';
+          }
+          if (isDesktopEnd) {
+            overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:default;">' + totalCount + ' &rsaquo;</div>';
+          }
+          const posterType = it.type || (l.contentType === 'series' ? 'series' : 'movie');
+          const tmdbTarget = isWatchlist ? 'watchlist' : (isFavorites ? 'favorite' : 'custom');
+          const tmdbListId = isWatchlist ? 'watchlist' : (isFavorites ? 'favorite' : listIdStr);
+          const removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="tmdb" data-target="' + tmdbTarget + '" data-list-id="' + escapeAttr(tmdbListId) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(posterType) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from TMDB">&times;</button>';
+          const tmdbPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster) : it.poster;
+          return '<div class="list-card-mini-poster-tile">' +
+            '<div class="list-card-mini-poster-img-wrap">' +
+              '<img src="' + escapeAttr(tmdbPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(posterType) + '" alt="" loading="lazy">' +
+              removeBtn +
+              overlays +
+            '</div>' +
+            '<div class="list-card-mini-poster-name">' + escapeHtml(it.title || '') + '</div>' +
+            (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
+          '</div>';
+        }).join('') +
+      '</div>';
+    }
+
+    const isCustomUserList = !isWatchlist && !isFavorites;
+    const deleteBtn = isCustomUserList ? '<button type="button" class="lc-btn secondary myListDeleteBtn" style="color:var(--danger); border-color:var(--danger);" data-provider="tmdb" data-list-id="' + escapeAttr(listIdStr) + '" data-name="' + escapeAttr(l.name) + '">Delete</button>' : '';
+
+    return '<div class="list-card" data-list-type="' + (isSingleType ? type : 'mixed') + '">' +
+      '<div class="list-card-header">' +
+        '<div class="list-card-body">' +
+          '<div class="list-card-title">' + escapeHtml(l.name) + (l.private ? ' <span class="badge">Private</span>' : '') + '</div>' +
+          '<div class="list-card-meta">' +
+            '<span>' + typeLabel + '</span>' +
+            (l.items ? '<span class="list-card-meta-sep">&middot;</span><span>' + l.items + ' items</span>' : '') +
+          '</div>' +
+        '</div>' +
+        '<div class="list-card-actions">' +
+          copyBtn +
+          addBtns +
+          deleteBtn +
+        '</div>' +
+      '</div>' +
+      posterThumbs +
+    '</div>';
+  }).join('');
+
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+  if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+}
+
+document.getElementById('myTmdbListsResult')?.addEventListener('click', (e) => {
+  const addBtn = e.target.closest('.myListAddBtn');
+  if (addBtn && !addBtn.disabled) {
+    addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
+    addBtn.textContent = 'Added \u2713';
+    addBtn.disabled = true;
+    return;
+  }
+  const copyBtn = e.target.closest('.myListCopyToCustomBtn');
+  if (copyBtn) {
+    copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn);
+    return;
+  }
+  const deleteBtn = e.target.closest('.myListDeleteBtn');
+  if (deleteBtn && !deleteBtn.disabled && typeof deleteExternalListDirect === 'function') {
+    deleteExternalListDirect(deleteBtn.dataset.provider, deleteBtn.dataset.listId, deleteBtn.dataset.name, deleteBtn);
+    return;
+  }
+});
+// --- Simkl OAuth & Personal Lists -----------------------------------------
+function startSimklConnect() {
+  try { localStorage.removeItem('myListAddon:simklDisconnected'); } catch (e) {}
+  window.location.href = ORIGIN + '/api/simkl/oauth/start';
+}
+
+function disconnectSimkl() {
+  const input = document.getElementById('simklKeyInput');
+  if (input) input.value = '';
+  simklAccessToken = '';
+  try { window.simklAccessToken = ''; } catch (e) {}
+  simklUsername = '';
+  try { window.simklUsername = ''; } catch (e) {}
+  window._mySimklLists = [];
+  try {
+    localStorage.removeItem('myListAddon:simklAccessToken');
+    localStorage.removeItem('myListAddon:simklUsername');
+    localStorage.removeItem('myListAddon:simklKey');
+    localStorage.setItem('myListAddon:simklDisconnected', 'true');
+  } catch (e) {}
+  saveState();
+  if (typeof pushCreatorSync === 'function') pushCreatorSync();
+  renderSimklConnectStatus();
+  scheduleMySimklListsRefresh();
+}
+
+function toggleListsSimklConnection() {
+  const isDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+  const token = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken');
+  if (token && !isDisc) {
+    disconnectSimkl();
+  } else {
+    startSimklConnect();
+  }
+}
+
+function pickUpSimklTokenFromUrl() {
+  const hash = window.location.hash || '';
+  const match = /(?:^|[#&])simkl_token=([^&]+)/.exec(hash);
+  if (match) {
+    simklAccessToken = decodeURIComponent(match[1]);
+    try {
+      localStorage.removeItem('myListAddon:simklDisconnected');
+      localStorage.setItem('myListAddon:simklAccessToken', simklAccessToken);
+    } catch (e) {}
+    const userMatch = /(?:^|[#&])simkl_username=([^&]+)/.exec(hash);
+    if (userMatch) {
+      simklUsername = decodeURIComponent(userMatch[1]);
+      try {
+        localStorage.setItem('myListAddon:simklUsername', simklUsername);
+      } catch (e) {}
+    }
+    saveState();
+    if (typeof pushCreatorSync === 'function') pushCreatorSync();
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Simkl Connected', 'Your Simkl account was successfully connected.', true);
+    } else {
+      alert('Connected to Simkl.');
+    }
+    renderSimklConnectStatus();
+    scheduleMySimklListsRefresh();
+  }
+  const params = new URLSearchParams(window.location.search);
+  const err = params.get('simkl_error');
+  if (err) {
+    const detail = params.get('simkl_error_detail') || '';
+    const messages = {
+      not_configured: 'Simkl OAuth is not configured on this Worker.',
+      no_code: 'Simkl did not return an authorization code.',
+      exchange_failed: 'Failed to exchange authorization code for a Simkl token.',
+      access_denied: 'Simkl sign-in was cancelled.',
+      state_mismatch: 'Simkl sign-in state mismatch. Please try again.',
+      no_token: 'Simkl did not return an access token.',
+      network: 'Network error connecting to Simkl.',
+    };
+    const msg = messages[err] || ('Could not connect to Simkl (' + err + (detail ? ': ' + detail : '') + ').');
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Simkl Connection Error', msg + (detail ? '\\n\\nDetails: ' + detail : ''), false);
+    } else {
+      alert(msg + (detail ? '\\n' + detail : ''));
+    }
+    params.delete('simkl_error');
+    params.delete('simkl_error_detail');
+    const qs = params.toString();
+    history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+  }
+}
+
+function renderSimklConnectStatus() {
+  const input = document.getElementById('simklKeyInput');
+  const statusEl = document.getElementById('simklConnectStatus');
+  const connectBtn = document.getElementById('simklConnectBtn');
+  const disconnectBtn = document.getElementById('simklDisconnectBtn');
+  const listsBtn = document.getElementById('listsSimklConnectBtn');
+
+  const isDisc = localStorage.getItem('myListAddon:simklDisconnected') === 'true';
+  const token = isDisc ? '' : ((typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '');
+  if (!isDisc && token) simklAccessToken = token;
+  const user = (typeof simklUsername !== 'undefined' && simklUsername) || (isDisc ? '' : (localStorage.getItem('myListAddon:simklUsername') || ''));
+  const key = (input ? input.value.trim() : '') || (isDisc ? '' : (localStorage.getItem('myListAddon:simklKey') || ''));
+  const isAccountConnected = !isDisc && !!token;
+  const hasKey = !isDisc && !!key;
+
+  if (listsBtn) {
+    listsBtn.innerText = isAccountConnected ? 'Disconnect' : 'Connect Simkl';
+  }
+
+  if (statusEl) {
+    if (token && user) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected as @' + escapeHtml(user) + '</span>';
+    } else if (token) {
+      statusEl.innerHTML = '<span style="color:#7ce7b6; font-weight:600;">\u2713 Connected to Simkl</span>';
+    } else if (hasKey) {
+      statusEl.innerHTML = '<span style="color:var(--text-2); font-weight:600;">Custom Simkl Client ID configured</span> <small style="color:var(--muted);">(Account not connected)</small>';
+    } else {
+      statusEl.innerHTML = '<span style="color:var(--muted);">Not connected.</span>';
+    }
+  }
+
+  if (connectBtn) connectBtn.textContent = token ? 'Re-connect Simkl' : (key ? 'Update Client ID' : 'Connect Simkl Account');
+  if (disconnectBtn) disconnectBtn.style.display = (isAccountConnected || hasKey) ? '' : 'none';
+
+  const syncCb = document.getElementById('syncSimklHistoryCheckbox');
+  if (syncCb) syncCb.checked = localStorage.getItem('myListAddon:syncSimklHistory') === 'true';
+  const syncWrap = document.getElementById('simklSyncHistoryWrap');
+  if (syncWrap) syncWrap.style.display = (isAccountConnected || hasKey) ? '' : 'none';
+
+  if (!isAccountConnected && !hasKey) {
+    const box = document.getElementById('mySimklListsResult');
+    if (box) box.innerHTML = '';
+  }
+}
+
+let mySimklListsTimer = null;
+function scheduleMySimklListsRefresh() {
+  clearTimeout(mySimklListsTimer);
+  mySimklListsTimer = setTimeout(runMySimklLists, 600);
+}
+
+async function runMySimklLists() {
+  const box = document.getElementById('mySimklListsResult');
+  if (!box) return;
+  const token = simklAccessToken || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const input = document.getElementById('simklKeyInput');
+  const key = (input ? input.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
+
+  if (!token && !key) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>Connect your Simkl account in Settings or click <strong>Connect Simkl</strong> above to see your personal lists, watchlist, and watch history here.</small></p>';
+    return;
+  }
+
+  box.innerHTML = '<p style="margin-top:10px;"><small>Loading your Simkl lists\u2026</small></p>';
+  try {
+    const res = await fetch(ORIGIN + '/api/simkl/my-lists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: token, simklKey: key }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not load your Simkl lists.') + '</p>';
+      return;
+    }
+    if (data.username) {
+      simklUsername = data.username;
+      try {
+        localStorage.setItem('myListAddon:simklUsername', simklUsername);
+        localStorage.removeItem('myListAddon:simklDisconnected');
+      } catch (e) {}
+      renderSimklConnectStatus();
+    }
+    renderMySimklLists(data.lists);
+  } catch (e) {
+    console.error('Simkl lists load error:', e);
+    box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml((e && e.message) ? e.message : 'Network error loading your Simkl lists.') + '</p>';
+  }
+}
+
+let _simklAiringNextEnriching = false;
+let _simklAiringNextEnrichedAt = 0;
+async function enrichSimklAiringNextDates(list) {
+  if (!list || !Array.isArray(list.items) || !list.items.length) return;
+  const hasExpiredSimkl = (list.items || []).some((it) => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
+  if (!hasExpiredSimkl && _simklAiringNextEnrichedAt && (Date.now() - _simklAiringNextEnrichedAt < 300000)) return;
+  _simklAiringNextEnriching = true;
+
+  const tkInput = document.getElementById('tmdbKeyInput');
+  const tmdbKey = (tkInput && tkInput.value ? tkInput.value.trim() : '') || localStorage.getItem('myListAddon:tmdbKey') || '';
+
+  try {
+    const rawCandidates = (window._simklRawAiringCandidates && window._simklRawAiringCandidates.length)
+      ? window._simklRawAiringCandidates
+      : (list.items || []);
+    const candidates = rawCandidates.slice(0, 80);
+    const enriched = [];
+    const concurrency = 5;
+    for (let i = 0; i < candidates.length; i += concurrency) {
+      const chunk = candidates.slice(i, i + concurrency);
+      await Promise.all(chunk.map(async (it) => {
+        try {
+          const showId = it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : '');
+          if (!showId) return;
+          const bypass = hasExpiredSimkl ? '&fresh=1&_t=' + Date.now() : '';
+          const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(showId) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
+          const data = await res.json();
+          const d = data && data.ok ? data.details : null;
+          // Only include shows with a real future air date (excludes ended shows with no upcoming episode)
+          if (d && d.nextEpisodeAirDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(d.nextEpisodeAirDate))) {
+            it.airDate = d.nextEpisodeAirDate;
+            it.seasonNum = d.nextEpisodeSeasonNumber;
+            it.episodeNum = d.nextEpisodeNumber;
+            it.isSeasonPremiere = (typeof d.isSeasonPremiere === 'boolean') ? d.isSeasonPremiere : (d.nextEpisodeNumber === 1);
+            it.isSeasonFinale = !!d.isSeasonFinale;
+            it.seasonFinaleAirDate = d.seasonFinaleAirDate || null;
+            it.seasonFinaleEpisodeNumber = d.seasonFinaleEpisodeNumber || null;
+            it.isUnaired = true;
+            it.episodeTitle = d.nextEpisodeName || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : ('Episode ' + d.nextEpisodeNumber)));
+            enriched.push(it);
+          }
+          // Shows with no nextEpisodeAirDate are silently dropped (ended, no renewal announced)
+        } catch (e) {}
+      }));
+    }
+    if (enriched.length) {
+      enriched.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
+      list.items = enriched;
+      list.itemCount = enriched.length;
+      try {
+        localStorage.setItem('myListAddon:simklAiringNextCache', JSON.stringify(enriched));
+      } catch (e) {}
+      _simklAiringNextEnrichedAt = Date.now();
+      renderMySimklLists(window._mySimklLists);
+    }
+  } finally {
+    _simklAiringNextEnriching = false;
+  }
+}
+
+function openSimklAiringNextDetailsPage() {
+  const list = (window._mySimklLists || []).find((l) => l && (l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (!list) return;
+  const filtered = (list.items || []).filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+  const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+  const sample = filtered.map((it) => {
+    const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+    const isPremiere = (typeof it.isSeasonPremiere === 'boolean') ? it.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (it.episodeNum === 1));
+    const isFinale = !!(it.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+    const finaleAirDate = it.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+
+    const label = (typeof formatWatchItemLabel === 'function')
+      ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: isPremiere })
+      : {
+          title: it.name + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
+          subtitle: it.episodeTitle || (isPremiere ? 'Season Premiere' : (isFinale ? 'Season Finale' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : '')))
+        };
+    return {
+      id: it.id,
+      type: 'series',
+      name: label.title,
+      subtitle: label.subtitle,
+      poster: it.poster,
+      airDate: it.airDate,
+      isUnaired: true,
+      isSeasonPremiere: isPremiere,
+      isSeasonFinale: isFinale,
+      seasonFinaleAirDate: finaleAirDate,
+    };
+  });
+  openListDetailsPage('Simkl Airing Next', 'series', 'simkl:user:shows:airing-next', { sample: sample, count: sample.length, maybeMore: false });
+}
+
+function renderMySimklLists(lists) {
+  window._mySimklLists = lists || [];
+  const box = document.getElementById('mySimklListsResult');
+  if (!box) return;
+  if (!lists || !lists.length) {
+    box.innerHTML = '<p style="margin-top:10px; color:var(--muted);"><small>No items found on your Simkl account.</small></p>';
+    return;
+  }
+
+  const airingNextList = lists.find((l) => l && (l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+  if (airingNextList && Array.isArray(airingNextList.items) && airingNextList.items.length) {
+    if (!window._simklRawAiringCandidates || !window._simklRawAiringCandidates.length) {
+      window._simklRawAiringCandidates = airingNextList.items.map(it => ({ ...it }));
+    }
+    const localAiringList = (typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+    if (!airingNextList._cachedApplied) {
+      try {
+        const cached = JSON.parse(localStorage.getItem('myListAddon:simklAiringNextCache') || '[]');
+        if (Array.isArray(cached) && cached.length) {
+          const cacheMap = new Map(cached.map((c) => [c.id || c.imdbId || (c.tmdbId ? 'tmdb:' + c.tmdbId : ''), c]));
+          airingNextList.items.forEach((it) => {
+            const c = cacheMap.get(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : ''));
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+            if (c) {
+              it.airDate = c.airDate;
+              it.seasonNum = c.seasonNum;
+              it.episodeNum = c.episodeNum;
+              it.isSeasonPremiere = (typeof c.isSeasonPremiere === 'boolean') ? c.isSeasonPremiere : (localMatch ? localMatch.isSeasonPremiere : (c.episodeNum === 1));
+              it.isSeasonFinale = !!(c.isSeasonFinale || (localMatch && localMatch.isSeasonFinale));
+              it.seasonFinaleAirDate = c.seasonFinaleAirDate || (localMatch && localMatch.seasonFinaleAirDate) || null;
+              it.seasonFinaleEpisodeNumber = c.seasonFinaleEpisodeNumber || null;
+              it.isUnaired = true;
+              it.episodeTitle = c.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.isSeasonFinale ? 'Season Finale' : (c.episodeNum != null ? ('Episode ' + c.episodeNum) : '')));
+            } else if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
+            }
+          });
+        } else if (localAiringList.length) {
+          airingNextList.items.forEach((it) => {
+            const localMatch = localAiringList.find((a) => a && (a.showId === it.id || a.showId === it.imdbId || (it.tmdbId && a.showId === 'tmdb:' + it.tmdbId)));
+            if (localMatch) {
+              it.isSeasonPremiere = !!localMatch.isSeasonPremiere;
+              it.isSeasonFinale = !!localMatch.isSeasonFinale;
+              it.seasonFinaleAirDate = localMatch.seasonFinaleAirDate || null;
+            }
+          });
+        }
+      } catch (e) {}
+      airingNextList._cachedApplied = true;
+    }
+    const hasExpiredSimkl = (airingNextList.items || []).some((it) => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
+    if (!_simklAiringNextEnriching && (hasExpiredSimkl || !_simklAiringNextEnrichedAt || Date.now() - _simklAiringNextEnrichedAt >= 120000)) {
+      enrichSimklAiringNextDates(airingNextList).catch(() => {});
+    }
+  }
+
+  const alreadyAdded = new Set();
+  document.querySelectorAll('#lists .entry').forEach(function(entry) {
+    const t = entry.querySelector('.type') ? entry.querySelector('.type').value : '';
+    entry.querySelectorAll('.url').forEach(function(el) {
+      alreadyAdded.add(el.value.trim() + '|' + t);
+    });
+  });
+
+  window._simklListsMap = window._simklListsMap || {};
+  lists.forEach(function(l) {
+    if (l && l.url) window._simklListsMap[l.url] = l;
+  });
+
+  const visibleLists = (typeof isListHidden === 'function') ? lists.filter((l) => !isListHidden(l && l.url)) : lists;
+
+  const cardsHtml = visibleLists.map((l) => {
+    const type = l.type === 'series' ? 'series' : 'movie';
+    const typeLabel = l.type === 'series' ? 'Shows' : 'Movies';
+    const isAiringNext = l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'));
+
+    let filteredItems = l.items || [];
+    if (isAiringNext) {
+      filteredItems = filteredItems.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+    }
+
+    const totalCount = isAiringNext ? filteredItems.length : (l.itemCount || (l.items || []).length);
+    const added = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(l.url, type) || isListAddedToConfig(null, type, l.url)) : alreadyAdded.has(l.url + '|' + type);
+
+    const isCompleted = (l.name && l.name.toLowerCase().includes('completed')) || (l.url && l.url.includes(':completed')) || l.statusKey === 'completed';
+    const copyBtn = '<button type="button" class="lc-btn secondary myListCopyToCustomBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '">Copy</button>';
+
+    const markWatchedBtn = isCompleted
+      ? '<button type="button" class="lc-btn secondary" data-url="' + escapeAttr(l.url) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(type) + '" onclick="markSimklListAllWatched(this)">Mark all as Watched</button>'
+      : '';
+    const addBtn = '<button type="button" class="lc-btn ' + (added ? 'secondary is-added' : 'primary') + ' myListAddBtn" ' + (added ? 'style="color:var(--danger);"' : '') + ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + type + '">' + (added ? 'Remove' : '+ Add') + '</button>';
+
+    const previewItems = filteredItems.slice(0, 9);
+    let posterThumbs = '';
+    if (previewItems.length) {
+      posterThumbs = '<div class="list-card-posters poster-preview-static">' +
+        previewItems.map((it, i) => {
+          const isMobileEnd = (i === 2 && previewItems.length > 3);
+          const isDesktopEnd = (i === previewItems.length - 1 && previewItems.length >= 4);
+          let overlays = '';
+          if (isAiringNext) {
+            if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only simklAiringNextViewBtn" style="cursor:pointer;" onclick="event.stopPropagation(); openSimklAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+            if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only simklAiringNextViewBtn" style="cursor:pointer;" onclick="event.stopPropagation(); openSimklAiringNextDetailsPage();">' + totalCount + ' &rsaquo;</div>';
+          } else {
+            if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+            if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only searchViewListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
+          }
+          const simklStatus = l.statusKey || (l.url ? l.url.split(':')[3] : 'plantowatch');
+          const removeBtn = isAiringNext
+            ? ''
+            : '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="simkl" data-target="status" data-list-id="' + escapeAttr(simklStatus) + '" data-remove-id="' + escapeAttr(it.id) + '" data-media-type="' + escapeAttr(it.type || type) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Simkl">&times;</button>';
+          const showAiringBadges = typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgesAiringNext') : true;
+          const showAirDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
+          const showPremiere = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
+          const showFinale = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
+          const showFinaleDate = showAiringBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
+
+          const hasAired = it.airDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(it.airDate) : false;
+          const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
+          let dateBadge = '';
+          if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
+            const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
+            if (badgeText) {
+              dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+            }
+          }
+          const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
+          const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
+          let bottomBadge = '';
+          if (isUnairedEp) {
+            if (showPremiere && isSeasonPremiere) {
+              bottomBadge = '<div class="cw-date-badge cw-date-badge-premiere" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Premiere</div>';
+            } else if (showFinale && it.isSeasonFinale) {
+              bottomBadge = '<div class="cw-date-badge cw-date-badge-finale" title="Airs on ' + escapeAttr(it.airDate || '') + '">Season Finale</div>';
+            } else if (showFinaleDate && it.seasonFinaleAirDate && isFinaleUnaired) {
+              const finaleText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.seasonFinaleAirDate) : '';
+              if (finaleText) {
+                bottomBadge = '<div class="cw-date-badge cw-date-badge-finale-date" title="Season finale airs on ' + escapeAttr(it.seasonFinaleAirDate) + '">Finale: ' + escapeHtml(finaleText) + '</div>';
+              }
+            }
+          }
+          const label = (typeof formatWatchItemLabel === 'function')
+            ? formatWatchItemLabel({ showTitle: it.name, seasonNum: it.seasonNum, episodeNum: it.episodeNum, title: it.episodeTitle || '', isSeasonPremiere: it.isSeasonPremiere })
+            : {
+                title: it.name + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
+                subtitle: it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
+              };
+
+          const smkPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster) : it.poster;
+          return '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
+            '<div class="list-card-mini-poster-img-wrap">' +
+              (smkPoster ? '<img src="' + escapeAttr(smkPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.id) + '" data-type="' + escapeAttr(it.type || type) + '" data-title="' + escapeAttr(it.name || '') + '" data-poster="' + escapeAttr(smkPoster || '') + '" alt="" loading="lazy">' : '<div style="width:100%;height:100%;background:var(--bg-card);"></div>') +
+              (isAiringNext ? (dateBadge + bottomBadge) : '') +
+              removeBtn +
+              overlays +
+            '</div>' +
+            '<div class="list-card-mini-poster-name">' + escapeHtml(isAiringNext ? label.title : (it.name || '')) + '</div>' +
+            ((isAiringNext ? label.subtitle : (it.year ? String(it.year) : '')) ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(isAiringNext ? label.subtitle : String(it.year)) + '</div>' : '') +
+          '</div>';
+        }).join('') +
+      '</div>';
+    } else if (isAiringNext) {
+      posterThumbs = '<p style="margin-top:8px; color:var(--muted);"><small>Nothing scheduled yet.</small></p>';
+    }
+
+    const titleClick = isAiringNext ? 'onclick="openSimklAiringNextDetailsPage()"' : '';
+
+    return '<div class="list-card" data-list-type="' + type + '" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url) + '" data-type="' + escapeAttr(type) + '" data-items="' + escapeAttr(totalCount) + '">' +
+      '<div class="list-card-header">' +
+        '<div class="list-card-body">' +
+          '<div class="list-card-title" ' + titleClick + ' style="cursor:pointer;">' + escapeHtml(l.name) + '</div>' +
+          '<div class="list-card-meta">' +
+            '<span>' + typeLabel + '</span>' +
+            '<span class="list-card-meta-sep">&middot;</span><span>' + totalCount + ' items</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="list-card-actions">' +
+          copyBtn +
+          markWatchedBtn +
+          addBtn +
+        '</div>' +
+      '</div>' +
+      posterThumbs +
+    '</div>';
+  }).join('');
+
+  box.innerHTML = cardsHtml || '<p style="margin-top:10px; color:var(--muted);"><small>All lists here are hidden. Manage visibility under Settings &rarr; Watchlist Preferences.</small></p>';
+}
+
+document.getElementById('mySimklListsResult')?.addEventListener('click', (e) => {
+  const addBtn = e.target.closest('.myListAddBtn');
+  if (addBtn) {
+    const isAdded = addBtn.classList.contains('is-added');
+    if (isAdded) {
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(addBtn.dataset.url, addBtn.dataset.type);
+        removeListFromConfig(null, addBtn.dataset.type, addBtn.dataset.url);
+      }
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof showAddedToast === 'function') showAddedToast('Removed "' + (addBtn.dataset.name || 'List') + '" from your Catalogs.');
+    } else {
+      addRow(addBtn.dataset.name, addBtn.dataset.url, addBtn.dataset.type, true, 'Custom');
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
+      if (typeof showAddedToast === 'function') showAddedToast('Added "' + (addBtn.dataset.name || 'List') + '" to your Catalogs.');
+    }
+    return;
+  }
+  const copyBtn = e.target.closest('.myListCopyToCustomBtn');
+  if (copyBtn) {
+    copyListToCustomList(copyBtn.dataset.name, copyBtn.dataset.url, copyBtn.dataset.type, copyBtn);
+    return;
+  }
+});
+
+function updateConnectionStatusBadges() {
+  if (typeof renderTmdbConnectStatus === 'function') renderTmdbConnectStatus();
+  if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
+  if (typeof renderMdblistConnectStatus === 'function') renderMdblistConnectStatus();
+  if (typeof renderSimklConnectStatus === 'function') renderSimklConnectStatus();
+}
+
+function toggleProviderHistorySync(provider, enabled) {
+  const cap = provider.charAt(0).toUpperCase() + provider.slice(1);
+  try {
+    localStorage.setItem('myListAddon:sync' + cap + 'History', enabled ? 'true' : 'false');
+  } catch (e) {}
+  saveState();
+  if (provider === 'trakt') renderTraktConnectStatus();
+  if (provider === 'mdblist') renderMdblistConnectStatus();
+  if (provider === 'simkl') renderSimklConnectStatus();
+  if (typeof pushCreatorSync === 'function' && activeCreator) {
+    pushCreatorSync();
+  }
+}
+
+async function syncWatchHistoryToProviderNow(provider, btn) {
+  const cap = provider.charAt(0).toUpperCase() + provider.slice(1);
+  const localMap = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
+  const historyList = localMap['watch-history'];
+  const items = (historyList && Array.isArray(historyList.items)) ? historyList.items : [];
+  
+  if (!items.length) {
+    if (typeof showAppAlert === 'function') showAppAlert('Empty Watch History', 'Your Watch History is currently empty.', false);
+    else alert('Your Watch History is currently empty.');
+    return;
+  }
+
+  const origText = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Syncing ' + items.length + ' items\u2026';
+  }
+
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const traktKey = (document.getElementById('traktKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:traktKey') || '';
+  const mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const mdblistKey = (document.getElementById('mdblistKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:mdblistKey') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const simklKey = (document.getElementById('simklKeyInput')?.value.trim()) || localStorage.getItem('myListAddon:simklKey') || '';
+
+  try {
+    const res = await fetch(ORIGIN + '/api/external-sync/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: provider,
+        items: items,
+        traktAccessToken: traktToken,
+        traktKey: traktKey,
+        mdblistAccessToken: mdblistToken,
+        mdblistKey: mdblistKey,
+        simklAccessToken: simklToken,
+        simklKey: simklKey,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+    if (!res.ok || !data.ok) {
+      const err = data.error || 'Unknown error';
+      if (typeof showAppAlert === 'function') showAppAlert(cap + ' Sync Failed', 'Failed to sync to ' + cap + ': ' + err, false);
+      else alert('Failed to sync to ' + cap + ': ' + err);
+      return;
+    }
+    const count = data.syncedCount != null ? data.syncedCount : items.length;
+    const msg = 'Successfully synced ' + count + ' item' + (count === 1 ? '' : 's') + ' to ' + cap + ' Watch History.';
+    if (typeof showAppAlert === 'function') showAppAlert(cap + ' Sync Complete', msg, true);
+    else alert(msg);
+  } catch (err) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+    if (typeof showAppAlert === 'function') showAppAlert(cap + ' Sync Failed', 'Network error syncing to ' + cap + '.', false);
+    else alert('Network error syncing to ' + cap + '.');
+  }
+}
+
+async function syncAllConnectedAccountsNow(btn) {
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+
+  const connectedProviders = [];
+  if (traktToken) connectedProviders.push('trakt');
+  if (mdblistToken) connectedProviders.push('mdblist');
+  if (simklToken) connectedProviders.push('simkl');
+
+  if (!connectedProviders.length) {
+    const msg = 'No external accounts (Trakt, MDBList, Simkl) are connected yet. Connect them under Settings \u2192 External Accounts & API Keys.';
+    if (typeof showAppAlert === 'function') showAppAlert('No Accounts Connected', msg, false);
+    else alert(msg);
+    return;
+  }
+
+  for (const p of connectedProviders) {
+    await syncWatchHistoryToProviderNow(p, btn);
+  }
+}
+
+async function syncSingleItemToConnectedProviders(item, action) {
+  if (!item) return;
+  const act = action || 'add';
+  const traktSync = localStorage.getItem('myListAddon:syncTraktHistory') === 'true';
+  const mdblistSync = localStorage.getItem('myListAddon:syncMdblistHistory') === 'true';
+  const simklSync = localStorage.getItem('myListAddon:syncSimklHistory') === 'true';
+
+  const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
+  const traktKeyEl = document.getElementById('traktKeyInput');
+  const traktKey = (traktKeyEl ? traktKeyEl.value.trim() : '') || localStorage.getItem('myListAddon:traktKey') || '';
+  const mdblistToken = (typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || '';
+  const mdblistKeyEl = document.getElementById('mdblistKeyInput');
+  const mdblistKey = (mdblistKeyEl ? mdblistKeyEl.value.trim() : '') || localStorage.getItem('myListAddon:mdblistKey') || '';
+  const simklToken = (typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || '';
+  const simklKeyEl = document.getElementById('simklKeyInput');
+  const simklKey = (simklKeyEl ? simklKeyEl.value.trim() : '') || localStorage.getItem('myListAddon:simklKey') || '';
+
+  const isMovie = item.type === 'movie' || item.kind === 'movie';
+  const mediaType = isMovie ? 'movie' : 'series';
+  const rootId = item.showId || item.id || item.imdbId;
+  const imdbId = item.showId && item.showId.startsWith('tt') ? item.showId : (item.imdbId || (String(item.id || '').startsWith('tt') ? item.id : ''));
+  const seasonNum = item.seasonNum != null ? item.seasonNum : (item.season != null ? item.season : null);
+  const episodeNum = item.episodeNum != null ? item.episodeNum : (item.episode != null ? item.episode : null);
+  const title = item.showTitle || item.title || item.name || '';
+
+  const promises = [];
+  // Each of these mirrors a local change out to a connected provider. They
+  // used to be fired and forgotten, so an expired Trakt/Simkl/MDBList token
+  // meant "syncing to your connected accounts" silently stopped working and
+  // nothing ever said so. The local change is the user's own action and is
+  // kept either way -- this only makes the failure visible.
+  const mirrorFailures = [];
+  const noteMirror = (provider) => (res) => externalMutateError(res)
+    .then((err) => { if (err) mirrorFailures.push(provider.toUpperCase() + ': ' + err); })
+    .catch(() => {});
+
+  if (traktSync && traktToken) {
+    promises.push(
+      fetch(ORIGIN + '/api/external-list/item-mutate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'trakt',
+          target: 'history',
+          action: act,
+          traktAccessToken: traktToken,
+          traktKey: traktKey,
+          id: rootId,
+          imdbId: imdbId,
+          tmdbId: item.tmdbId,
+          mediaType: mediaType,
+          season: seasonNum,
+          episode: episodeNum,
+          title: title,
+        }),
+      }).then(noteMirror('trakt')).catch(() => {})
+    );
+  }
+
+  if (mdblistSync && (mdblistToken || mdblistKey)) {
+    promises.push(
+      fetch(ORIGIN + '/api/external-list/item-mutate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'mdblist',
+          target: 'history',
+          action: act,
+          mdblistAccessToken: mdblistToken,
+          mdblistKey: mdblistKey,
+          id: rootId,
+          imdbId: imdbId,
+          tmdbId: item.tmdbId,
+          mediaType: mediaType,
+          season: seasonNum,
+          episode: episodeNum,
+          title: title,
+        }),
+      }).then(noteMirror('mdblist')).catch(() => {})
+    );
+  }
+
+  if (simklSync && simklToken) {
+    promises.push(
+      fetch(ORIGIN + '/api/external-list/item-mutate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'simkl',
+          target: 'history',
+          action: act,
+          simklAccessToken: simklToken,
+          simklKey: simklKey,
+          id: rootId,
+          imdbId: imdbId,
+          tmdbId: item.tmdbId,
+          mediaType: mediaType,
+          season: seasonNum,
+          episode: episodeNum,
+          title: title,
+        }),
+      }).then(noteMirror('simkl')).catch(() => {})
+    );
+  }
+
+  if (promises.length) {
+    await Promise.allSettled(promises);
+    if (mirrorFailures.length && typeof showAppAlert === 'function') {
+      showAppAlert('Not Synced To Every Account', mirrorFailures.join('\\n'), false);
+    }
+  }
+}
+
+
+

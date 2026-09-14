@@ -1,0 +1,10677 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import vm from "node:vm";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { call, createUser, freshIsolate, hasPublicIndex, isPublicIndexKey, lapseCreatorTombstone, makeD1, makeEnv, makeKv, nextIp, publicIndexEntries, publicIndexSnapshot, runScheduledTick, seedAnonPublishedList, worker } from "./harness.mjs";
+
+// The slug the removed publish route derived from a name, for the tests that
+// used to let it do that for them.
+function slugifyForTest(name) {
+  return String(name).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+async function adminCookie(env) {
+  const r = await call(env, "/admin/login", { method: "POST", form: { key: env.ADMIN_KEY } });
+  const setCookie = r.headers.get("set-cookie") || "";
+  const match = setCookie.match(/^([^=]+=[^;]+)/);
+  return match ? match[1] : "";
+}
+
+// Evaluates one numbered source file on its own, in an isolated vm
+// context, and returns its top-level declarations -- for testing a pure
+// helper function directly without needing the whole Worker/KV/D1
+// environment. Only works for a file whose top-level code is real,
+// standalone JS (00-08, 25-26); files 09-24 are raw string content
+// embedded inside 09_page-shell.js's own giant template literal (the
+// served page's inline <script>) and reference client-only globals
+// (window, document, ...) at their own top level, so they throw here --
+// see loadOneClientFunction below for those instead, and render_check.js
+// for how 09-24 actually get syntax-checked (as the rendered page's
+// inline script, not as standalone files).
+const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+//
+// Variadic, and the files share ONE sandbox: a function in 05_ that calls one
+// declared in 02_ has to be able to see it, exactly as it does in the combined
+// Worker where all 27 sources are concatenated into a single scope. Loading 05_
+// alone gave fetchAutoTrackedCatalog a sandbox with no mayReadTrackedShelf in
+// it, which is not a smaller version of production -- it is a different program.
+function loadSourceFunctions(...relFiles) {
+  const sandbox = {
+    console, URL, URLSearchParams, atob, btoa, Uint8Array, TextDecoder, TextEncoder,
+    crypto: globalThis.crypto,
+  };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  for (const relFile of relFiles) {
+    const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
+    vm.runInContext(src, sandbox, { filename: relFile });
+  }
+  return sandbox;
+}
+
+// Files 09-24's own text is embedded as STRING CONTENT inside
+// 09_page-shell.js's outer template literal (renderBuilder's giant
+// backtick string -- see that file's own build-time concatenation
+// comment), so by the time a real browser parses any of this code, it
+// has already passed through one round of template-literal string-escape
+// cooking: \\ -> \, \n/\t/\r/\b/\f/\v/\0/`/$ -> their real characters,
+// \xHH and \uHHHH/\u{H...} -> the character they encode, and a backslash
+// before anything else is simply dropped (\d -> d, \s -> s, \. -> .,
+// \b\w -> a real word-boundary + word-char only if written \\b\\w in the
+// source, since a single \b is ITS OWN recognized escape -- a backspace
+// character -- eating that backslash a layer early). A regex literal
+// that needs a real backslash-escape to survive into the browser has to
+// be double-escaped in these files' own source for exactly that reason.
+// loadOneClientFunction/loadInlineItemMapper below read the raw source
+// file directly and hand it straight to vm, skipping that cooking pass
+// entirely -- so without reproducing it here, a correctly double-escaped
+// regex (the one that actually works in production) would test as its
+// naive, uncooked, WRONG meaning instead (e.g. \\b\\w as vm sees it
+// literally matches the 4-character text "\b\w", not a word boundary).
+function cookTemplateLiteralEscapes(text) {
+  return text.replace(/\\(?:x([0-9a-fA-F]{2})|u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|(\r\n|[\s\S]))/g, (_m, hex2, hexBrace, hex4, other) => {
+    if (hex2 !== undefined) return String.fromCharCode(parseInt(hex2, 16));
+    if (hexBrace !== undefined) return String.fromCodePoint(parseInt(hexBrace, 16));
+    if (hex4 !== undefined) return String.fromCharCode(parseInt(hex4, 16));
+    switch (other) {
+      case "\\": return "\\";
+      case "n": return "\n";
+      case "t": return "\t";
+      case "r": return "\r";
+      case "b": return "\b";
+      case "f": return "\f";
+      case "v": return "\v";
+      case "0": return "\0";
+      case "`": return "`";
+      case "$": return "$";
+      case "\n": return "";
+      case "\r\n": return "";
+      default: return other;
+    }
+  });
+}
+
+// Extracts and evaluates exactly one top-level `function name(...) {...}`
+// declaration out of a 09-24 client file, brace-balanced so it works
+// regardless of nested blocks inside the function body -- for a
+// self-contained (no calls to other not-yet-defined helpers) pure
+// function, without needing to stand up the whole client bundle's
+// window/document/DOM environment just to reach it.
+// `extraGlobals` seeds anything the extracted function references as a
+// free variable (other client globals, DOM stand-ins, a fetch mock, ...)
+// -- it becomes part of the same sandbox object the function runs in, so
+// a mock passed in here can still be inspected/asserted on after calling
+// the returned function (they share the live object, not a copy).
+function loadOneClientFunction(relFile, fnName, extraGlobals = {}) {
+  const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
+  const start = src.search(new RegExp(`(?:async\\s+)?function\\s+${fnName}\\s*\\([^)]*\\)\\s*\\{`));
+  if (start === -1) throw new Error(`${fnName} not found in ${relFile}`);
+  let depth = 0, end = -1;
+  for (let i = start; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") {
+      depth--;
+      if (depth === 0) { end = i + 1; break; }
+    }
+  }
+  if (end === -1) throw new Error(`could not find end of ${fnName} in ${relFile}`);
+  const sandbox = { console, ...extraGlobals };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(cookTemplateLiteralEscapes(src.slice(start, end)), sandbox, { filename: `${relFile}#${fnName}` });
+  return sandbox[fnName];
+}
+
+// Extracts one `it => {...}` item-mapper body that isn't a named top-level
+// function -- it's inline inside a much larger click-delegate handler (the
+// "View"/"See All" buttons for a Custom List), so loadOneClientFunction
+// above can't grab it by name. `mapOpenSnippet` must be an exact substring
+// ending in the arrow's opening "{" (e.g. "...map((it) => {"); `occurrence`
+// picks which match when the same snippet appears more than once in the
+// file. Brace-balanced from there, same technique as loadOneClientFunction.
+// `extraGlobals` supplies whatever free variables (isCw, formatWatchItemLabel,
+// ...) the surrounding function would normally have closed over.
+function loadInlineItemMapper(relFile, mapOpenSnippet, occurrence, extraGlobals = {}) {
+  const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8").replace(/\r\n/g, "\n");
+  let searchFrom = 0, mapStart = -1;
+  for (let n = 0; n <= occurrence; n++) {
+    mapStart = src.indexOf(mapOpenSnippet, searchFrom);
+    if (mapStart === -1) throw new Error(`occurrence ${n} of "${mapOpenSnippet}" not found in ${relFile}`);
+    searchFrom = mapStart + 1;
+  }
+  const braceStart = mapStart + mapOpenSnippet.length - 1;
+  let depth = 0, end = -1;
+  for (let i = braceStart; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") {
+      depth--;
+      if (depth === 0) { end = i + 1; break; }
+    }
+  }
+  if (end === -1) throw new Error(`could not find end of mapper body in ${relFile}`);
+  const body = cookTemplateLiteralEscapes(src.slice(braceStart, end));
+  const sandbox = { console, ...extraGlobals };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  return vm.runInContext(`(function(it) ${body})`, sandbox, { filename: `${relFile}#mapper@${mapStart}` });
+}
+
+const CREATOR_POSTS = [
+  "/api/creator/lists",
+  "/api/creator/lists/save",
+  "/api/creator/lists/delete",
+  "/api/creator/lists/reorder",
+  "/api/creator/account/reset",
+  "/api/creator/delete-account",
+  "/api/creator/sync/save",
+  "/api/creator/sync/save-tracking",
+  "/api/creator/sync/save-presets",
+  "/api/creator/sync/save-channels",
+  "/api/creator/sync/meta",
+  "/api/creator/sync/load",
+  "/api/creator/sync/like",
+  "/api/creator/sync/share-tracking",
+  "/api/creator/track-status",
+  "/api/creator/scrobble-seen-users",
+];
+
+const ADMIN_GETS = [
+  "/admin/api/creator-lists",
+  "/admin/api/leaderboard",
+  "/admin/api/feedback",
+  "/admin/api/analytics",
+  "/admin/api/apiusage",
+  "/admin/api/netflix-preview",
+  "/admin/api/provider-lookup",
+];
+
+const ADMIN_POSTS = [
+  "/admin/api/reset-creator-key",
+  "/admin/api/backfill-trending",
+  "/admin/api/migrate-d1",
+  "/admin/api/migrate-day-counts",
+  "/admin/api/feedback/reply",
+  "/admin/api/feedback/status",
+  "/admin/api/feedback/edit",
+  "/admin/api/feedback/delete",
+  "/admin/api/rebuild-public-index",
+];
+
+describe("authorization matrix", () => {
+  it("creator POSTs reject missing credentials with 401", async () => {
+    const env = makeEnv();
+    for (const path of CREATOR_POSTS) {
+      const r = await call(env, path, { method: "POST", json: {} });
+      assert.equal(r.status, 401, `${path} expected 401, got ${r.status} ${JSON.stringify(r.body)}`);
+      assert.equal(r.body.ok, false);
+    }
+  });
+
+  it("creator POSTs reject the wrong key with 401", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "aliceauth");
+    for (const path of CREATOR_POSTS) {
+      const r = await call(env, path, {
+        method: "POST",
+        json: { creatorName: alice.creatorName, creatorKey: "MYL-AAAA-AAAA-AAAA" },
+      });
+      assert.equal(r.status, 401, `${path} wrong key expected 401, got ${r.status}`);
+    }
+  });
+
+  it("sync/save wrong key is 401 not 200", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicesync");
+    const r = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: "MYL-WRONG-KEY1-KEY2", config: [] },
+    });
+    assert.equal(r.status, 401);
+    assert.equal(r.body.ok, false);
+  });
+
+  it("admin API routes reject missing cookie with 401", async () => {
+    const env = makeEnv();
+    for (const path of ADMIN_GETS) {
+      const r = await call(env, path, { method: "GET" });
+      assert.equal(r.status, 401, `${path} expected 401, got ${r.status}`);
+    }
+    for (const path of ADMIN_POSTS) {
+      const r = await call(env, path, { method: "POST", json: {} });
+      assert.equal(r.status, 401, `${path} expected 401, got ${r.status}`);
+    }
+  });
+
+  it("feedback/threads by name without a key is 401", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/api/feedback/threads?creatorName=victim", { method: "GET" });
+    assert.equal(r.status, 401);
+    assert.equal(r.body.ok, false);
+  });
+
+  it("create/restore/reset-key/feedback reject a missing CF-Connecting-IP", async () => {
+    const env = makeEnv();
+    const missing = { ip: "" };
+    const create = await call(env, "/api/creator/create", { method: "POST", json: { creatorName: "noipuser" }, ...missing });
+    assert.equal(create.status, 400);
+    const restore = await call(env, "/api/creator/restore", { method: "POST", json: { creatorName: "x", creatorKey: "y" }, ...missing });
+    assert.equal(restore.status, 400);
+    const reset = await call(env, "/api/creator/reset-key", { method: "POST", json: { username: "x", recoveryAnswer: "y" }, ...missing });
+    assert.equal(reset.status, 400);
+    const fb = await call(env, "/api/feedback", { method: "POST", json: { message: "hello" }, ...missing });
+    assert.equal(fb.status, 400);
+  });
+});
+
+describe("private tracking IDOR", () => {
+  it("watch-history / watchlist / continue-watching 404 until the owner opts in", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicehist");
+    const save = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        watchHistory: [{ id: "tt0111161", name: "Shawshank PRIVATE", type: "movie" }],
+        watchlist: [{ id: "tt0068646", name: "Godfather SECRET", type: "movie" }],
+        continueWatching: [{ id: "tt0944947", name: "Thrones SECRET", type: "series", showId: "tt0944947" }],
+      },
+    });
+    assert.equal(save.status, 200);
+    assert.equal(save.body.ok, true);
+
+    for (const slug of ["watch-history", "watchlist", "continue-watching"]) {
+      const closed = await call(env, `/lists/${alice.creatorName}/${slug}.json`);
+      assert.equal(closed.status, 404, `${slug} should be private by default`);
+    }
+
+    for (const slug of ["watch-history", "watchlist", "continue-watching"]) {
+      const share = await call(env, "/api/creator/sync/share-tracking", {
+        method: "POST",
+        json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, slug, shared: true },
+      });
+      assert.equal(share.body.ok, true, `share ${slug}`);
+      const open = await call(env, `/lists/${alice.creatorName}/${slug}.json`);
+      assert.equal(open.status, 200, `${slug} after opt-in`);
+      assert.ok(Array.isArray(open.body) && open.body.length >= 1, `${slug} should return items`);
+    }
+  });
+});
+
+describe("feedback threads", () => {
+  it("name lookup needs the key; anonymous threadIds still work", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicefb");
+    // The key is required to ATTRIBUTE a thread to an account: /api/feedback
+    // proves any claimed creatorName before storing it, and silently drops a
+    // claim it cannot verify (an unverifiable claim must not close the
+    // support channel -- see that endpoint's own comment). Without the key
+    // here the thread would be filed anonymously and the by-name lookup
+    // below would correctly not find it.
+    const posted = await call(env, "/api/feedback", {
+      method: "POST",
+      json: {
+        message: "secret report",
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        contact: "me@example.com",
+      },
+    });
+    assert.equal(posted.body.ok, true);
+    const threadId = posted.body.entry.id;
+
+    const noKey = await call(env, "/api/feedback/threads", {
+      method: "POST",
+      json: { creatorName: alice.creatorName },
+    });
+    assert.equal(noKey.status, 401);
+
+    const wrong = await call(env, "/api/feedback/threads", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: "MYL-NOPE-NOPE-NOPE" },
+    });
+    assert.equal(wrong.status, 401);
+
+    const ok = await call(env, "/api/feedback/threads", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.ok, true);
+    assert.ok(ok.body.threads.some((t) => t.id === threadId));
+
+    const anon = await call(env, "/api/feedback/threads", {
+      method: "POST",
+      json: { threadIds: [threadId] },
+    });
+    assert.equal(anon.status, 200);
+    assert.ok(anon.body.threads.some((t) => t.id === threadId));
+  });
+
+  // KV list() on "feedback:" returns oldest-first. The by-name scan used to
+  // be one unpaginated list({limit:200}) -- once total feedback volume grew
+  // past 200, that window only ever covered the 200 OLDEST entries
+  // system-wide, so a real creator's own recent thread would silently stop
+  // being found no matter how many times they asked. Seed past that old
+  // fixed window and assert the newest entry -- created last, so it sorts
+  // last -- is still returned.
+  it("by-name lookup still finds a creator's newest thread once feedback volume passes the old 200-key window", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicefbvol");
+    for (let i = 0; i < 250; i++) {
+      const id = `${1000000000000 + i}:filler${i}`;
+      await env.CONFIGS.put(`feedback:${id}`, JSON.stringify({
+        id, category: "other", message: `filler ${i}`, contact: null,
+        creatorName: "someoneelse", createdAt: 1000000000000 + i, updatedAt: 1000000000000 + i,
+        completed: false, status: "open", messages: [], userAgent: "",
+      }));
+    }
+    // Sorts after all 250 filler keys (larger timestamp), i.e. newest.
+    const newest = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, message: "my recent report" },
+    });
+    assert.equal(newest.body.ok, true);
+    const threadId = newest.body.entry.id;
+
+    const found = await call(env, "/api/feedback/threads", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(found.status, 200);
+    assert.ok(found.body.threads.some((t) => t.id === threadId), "newest thread should still be found past the old 200-key window");
+  });
+
+  // The server correctly requires creatorKey once creatorName is present
+  // (that's the fix for the IDOR where anyone could read any user's
+  // support threads by name alone) -- but the client's own caller was
+  // never updated to send it, so every signed-in visitor's own request
+  // 401'd and silently came back with zero threads, including their
+  // anonymous threadIds ones, since the creatorName check runs first and
+  // returns before threadIds are even looked up. Guard against sending
+  // creatorName without creatorKey creeping back into the shipped bundle.
+  it("served bundle sends creatorKey alongside creatorName when loading feedback threads", async () => {
+    const env = makeEnv();
+    const bundle = await call(env, "/app.js");
+    assert.equal(bundle.status, 200);
+    const start = bundle.text.indexOf("function loadUserFeedbackThreads");
+    assert.notEqual(start, -1, "loadUserFeedbackThreads should be present in the served bundle");
+    const body = bundle.text.slice(start, start + 1200);
+    assert.ok(/creatorKey\s*:\s*creatorKey/.test(body), "loadUserFeedbackThreads must send creatorKey, not just creatorName");
+  });
+});
+
+// A support thread holds free-text messages plus the contact address the
+// feedback form asks for, and /api/feedback/threads hands the whole thing to
+// anyone presenting the thread id -- deliberately, so anonymous reporters can
+// follow up. That makes the id a capability, and it was minted with
+// Math.random(): ~31 bits from a PRNG whose state is recoverable from a few
+// outputs. Worse, the id alone let a stranger APPEND to any thread, choosing
+// the display name the admin panel renders as the sender.
+describe("audit fix: support threads are capabilities, not open mailboxes", () => {
+  it("mints thread ids from the CSPRNG, not Math.random", async () => {
+    const env = makeEnv();
+    const ids = [];
+    for (let i = 0; i < 5; i++) {
+      const r = await call(env, "/api/feedback", { method: "POST", json: { message: `report ${i}` } });
+      ids.push(r.body.entry.id);
+    }
+    for (const id of ids) {
+      const random = id.split(":")[1] || "";
+      // generateShortId is 9 random bytes base64url-encoded -> 12 chars.
+      // Math.random().toString(36).slice(2, 8) was 6.
+      assert.equal(random.length, 12, `thread id "${id}" does not carry a 12-char random part`);
+      assert.match(random, /^[A-Za-z0-9_-]{12}$/);
+    }
+    assert.equal(new Set(ids).size, ids.length, "thread ids collided");
+    // The timestamp prefix has to stay: /admin/api/feedback relies on these
+    // keys sorting chronologically.
+    assert.match(ids[0], /^\d{10,}:/);
+  });
+
+  it("will not let a stranger append to a thread that belongs to an account", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicethread");
+    const posted = await call(env, "/api/feedback", {
+      method: "POST",
+      json: {
+        message: "my private bug report",
+        contact: "victim@example.com",
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+      },
+    });
+    const threadId = posted.body.entry.id;
+    assert.equal(posted.body.entry.creatorName, alice.creatorName);
+
+    const stranger = await call(env, "/api/feedback", {
+      method: "POST", ip: nextIp(),
+      json: { threadId, message: "injected by stranger", creatorName: "Developer" },
+    });
+    assert.equal(stranger.status, 403, "a stranger holding the id could still write into an owned thread");
+    assert.equal(stranger.body.ok, false);
+
+    // The owner themselves is of course still fine.
+    const owner = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { threadId, message: "following up", creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(owner.body.ok, true, owner.body.error);
+    assert.equal(owner.body.entry.messages.length, 2);
+  });
+
+  it("keeps anonymous threads reachable by id, but not the sender name", async () => {
+    // The id-as-capability model is the point for someone with no account,
+    // so this must keep working -- what must not is choosing who the message
+    // appears to be from.
+    const env = makeEnv();
+    const anon = await call(env, "/api/feedback", { method: "POST", json: { message: "anonymous report" } });
+    const threadId = anon.body.entry.id;
+
+    const reply = await call(env, "/api/feedback", {
+      method: "POST", ip: nextIp(),
+      json: { threadId, message: "a follow-up", creatorName: "Developer" },
+    });
+    assert.equal(reply.body.ok, true, "anonymous follow-up by thread id must still work");
+    const names = reply.body.entry.messages.map((m) => m.senderName);
+    assert.ok(!names.includes("Developer"), `sender name was taken from the request body: ${names.join(", ")}`);
+    assert.ok(reply.body.entry.messages.every((m) => m.sender === "user"));
+  });
+
+  it("drops an identity claim it cannot prove instead of storing it", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicevictim");
+    const impersonation = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { message: "impersonation attempt", creatorName: alice.creatorName },
+    });
+    // The message still goes through -- this is the support channel, and
+    // someone whose key has stopped working is exactly who needs it -- but
+    // the unproven name is not recorded.
+    assert.equal(impersonation.body.ok, true, "an unverifiable claim must not close the support channel");
+    assert.equal(impersonation.body.entry.creatorName, null, "an unproven creatorName was stored");
+    assert.equal(impersonation.body.entry.messages[0].senderName, "User");
+
+    // ...and it must not show up in the real account's thread list.
+    const mine = await call(env, "/api/feedback/threads", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(mine.body.threads.some((t) => t.id === impersonation.body.entry.id), false);
+  });
+
+  it("leaves the admin panel's own self-logging and replies working", async () => {
+    // submitAdminFeedback posts creatorName:"admin" with fromAdminPanel:true
+    // and no key -- "admin" is a marker feedbackCardHtml keys off, not a
+    // Creator Profile, so it must not be run through creator auth.
+    const env = makeEnv();
+    const alice = await createUser(env, "aliceadminfb");
+    const owned = await call(env, "/api/feedback", {
+      method: "POST",
+      json: { message: "user report", creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    const cookie = await adminCookie(env);
+
+    const selfLog = await call(env, "/api/feedback", {
+      method: "POST", cookie,
+      json: { category: "bug", message: "logged by admin", creatorName: "admin", fromAdminPanel: true },
+    });
+    assert.equal(selfLog.body.ok, true, selfLog.body.error);
+    assert.equal(selfLog.body.entry.creatorName, "admin", "the admin self-log marker was stripped");
+
+    // And the admin must still be able to answer a thread they do not own.
+    const reply = await call(env, "/api/feedback", {
+      method: "POST", cookie,
+      json: { threadId: owned.body.entry.id, message: "admin here", fromAdminPanel: true },
+    });
+    assert.equal(reply.body.ok, true, reply.body.error);
+    assert.equal(reply.body.entry.messages.slice(-1)[0].senderName, "Developer");
+  });
+});
+
+// /api/channel-logo fetches a TMDB image and base64-encodes it into an SVG.
+// It is unauthenticated, took any path at all, buffered whatever the upstream
+// returned, and answered no-store -- so every request repeated the whole
+// fetch-and-encode for output that cannot change.
+describe("audit fix: the channel image endpoints are bounded and cacheable", () => {
+  function stubUpstream(sizes = {}) {
+    const seen = [];
+    globalThis.fetch = async (u) => {
+      const href = typeof u === "string" ? u : u.url;
+      seen.push(href);
+      for (const [marker, size] of Object.entries(sizes)) {
+        if (href.includes(marker)) {
+          const headers = { "content-type": "image/png" };
+          if (size.declare !== false) headers["content-length"] = String(size.bytes);
+          return new Response(new Uint8Array(size.bytes), { status: 200, headers });
+        }
+      }
+      return new Response(new Uint8Array([137, 80, 78, 71]), {
+        status: 200, headers: { "content-type": "image/png" },
+      });
+    };
+    return seen;
+  }
+
+  it("serves real TMDB logo paths, cached rather than no-store", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      stubUpstream();
+      const env = makeEnv();
+      for (const p of ["/wLqRr0YLAqmWKAHYFhkQBQFCDLL.jpg", "wLqRr0YLAqmWKAHYFhkQBQFCDLL.png", "/abc123.webp"]) {
+        const r = await call(env, "/api/channel-logo?path=" + encodeURIComponent(p));
+        assert.equal(r.status, 200, `real path rejected: ${p}`);
+        assert.match(r.headers.get("cache-control") || "", /max-age=\d{4,}/, "output is deterministic and must be cacheable");
+      }
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it("rejects anything not shaped like a TMDB image path, without calling upstream", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      const seen = stubUpstream();
+      const env = makeEnv();
+      for (const p of ["/../../etc/passwd", "/t/p/original/anything", "/justsomepath", "/a.png?x=1"]) {
+        const before = seen.length;
+        const r = await call(env, "/api/channel-logo?path=" + encodeURIComponent(p));
+        assert.equal(r.status, 400, `should have been rejected: ${p}`);
+        assert.equal(seen.length, before, `rejected path still hit the upstream: ${p}`);
+      }
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it("refuses an oversized image, with or without a content-length header", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      stubUpstream({
+        huge: { bytes: 3 * 1024 * 1024 },
+        nolen: { bytes: 3 * 1024 * 1024, declare: false },
+      });
+      const env = makeEnv();
+      const declared = await call(env, "/api/channel-logo?path=" + encodeURIComponent("/huge0000000.png"));
+      assert.equal(declared.status, 413);
+      // A missing or dishonest content-length must not get past the cap.
+      const undeclared = await call(env, "/api/channel-logo?path=" + encodeURIComponent("/nolen000000.png"));
+      assert.equal(undeclared.status, 413);
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it("bounds and escapes the channel-poster name, and caches the result", async () => {
+    const env = makeEnv();
+    const huge = await call(env, "/api/channel-poster?name=" + encodeURIComponent("A".repeat(5000)));
+    assert.equal(huge.status, 200);
+    assert.ok(huge.text.length < 10000, `a 5000-char name produced ${huge.text.length} bytes of SVG`);
+    assert.match(huge.headers.get("cache-control") || "", /max-age=\d{4,}/);
+
+    const injected = await call(env, "/api/channel-poster?name=" +
+      encodeURIComponent("</text><script>alert(1)</script>"));
+    assert.equal(injected.status, 200);
+    // Served as image/svg+xml from this origin, so raw markup here would run.
+    assert.ok(!injected.text.includes("<script>"), "channel name was not escaped into the SVG");
+  });
+});
+
+// The 60-second per-IP buckets on /admin/login and /api/creator/restore bound
+// a burst, but they are KV counters -- edge-cached reads, no atomic increment
+// -- and they reset every minute, so across rolling windows they placed no
+// bound at all on how many guesses one address could make in a day. Both now
+// also carry a daily failure budget, spent only on failures and atomic
+// wherever D1 is bound.
+describe("audit fix: credential endpoints bound guesses across rolling windows", () => {
+  // Deleting the 60s key is what a real attacker gets for free by waiting:
+  // the short window rolls over, and only the daily budget accumulates.
+  async function rollWindow(env, key) { await env.CONFIGS.delete(key); }
+
+  for (const [label, makeStores] of [
+    ["KV only", () => ({ CONFIGS: makeKv() })],
+    ["D1 bound", () => ({ CONFIGS: makeKv(), DB: makeD1() })],
+  ]) {
+    it(`bounds admin-login guessing across rolling 60s windows (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      const ip = nextIp();
+      let attempted = 0;
+      let blocked = false;
+      for (let round = 0; round < 15 && !blocked; round++) {
+        await rollWindow(env, `ratelimit:adminlogin:${ip}`);
+        for (let i = 0; i < 9; i++) {
+          const r = await call(env, "/admin/login", { method: "POST", ip, form: { key: "wrong-key" } });
+          attempted++;
+          if (r.status === 429) { blocked = true; break; }
+        }
+      }
+      assert.equal(blocked, true, `made ${attempted} wrong-key attempts from one IP without ever being blocked`);
+    });
+
+    it(`never spends the admin budget on a correct key (${label})`, async () => {
+      // A budget that successes consume would lock out the one person who
+      // can fix it.
+      const env = makeEnv(makeStores());
+      const ip = nextIp();
+      for (let i = 0; i < 60; i++) {
+        await rollWindow(env, `ratelimit:adminlogin:${ip}`);
+        const r = await call(env, "/admin/login", { method: "POST", ip, form: { key: env.ADMIN_KEY } });
+        assert.equal(r.status, 302, `login ${i + 1} was refused -- successes are spending the budget`);
+      }
+    });
+  }
+
+  it("bounds creator-restore guessing, and leaves the real key working", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const alice = await createUser(env, "alicerestorecap");
+    const ip = nextIp();
+    let attempted = 0;
+    let blocked = false;
+    for (let round = 0; round < 20 && !blocked; round++) {
+      await rollWindow(env, `ratelimit:creatorrestore:${ip}`);
+      for (let i = 0; i < 19; i++) {
+        const r = await call(env, "/api/creator/restore", {
+          method: "POST", ip,
+          json: { creatorName: alice.creatorName, creatorKey: "MYL-BAD0-BAD0-BAD0" },
+        });
+        attempted++;
+        if (r.status === 429) { blocked = true; break; }
+      }
+    }
+    assert.equal(blocked, true, `made ${attempted} wrong-key attempts from one IP without ever being blocked`);
+
+    const good = await call(env, "/api/creator/restore", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(good.body.ok, true, `the real key stopped working: ${good.body.error}`);
+  });
+});
+
+// Both list-saving endpoints allocated a slug by trying baseSlug, then
+// baseSlug-2, -3 ... up to 500, and then USING WHATEVER THE LOOP EXITED ON.
+// Past the bound that is a slug which is taken, and the write went straight
+// over the existing list.
+describe("audit fix: slug allocation never lands on a taken slug", () => {
+  // The anonymous half of this used to be driven through /api/publish-list,
+  // which 1.5.3 removed. pickFreeSlug is shared, so the creator route below
+  // covers the same allocator -- what these two keep is the cost property and
+  // the tidy-numbering property, which nothing else asserts.
+  it("allocates a slug in constant KV reads however crowded the name is", async () => {
+    // Each numbered attempt used to be its own KV read, so one save of a
+    // heavily-collided name cost ~501 KV operations -- half of Cloudflare's
+    // per-invocation budget, in a state anyone could manufacture by saving
+    // the same name repeatedly.
+    async function readsForSave(existing) {
+      const env = makeEnv();
+      const u = await createUser(env, "slugcost" + existing);
+      const order = ["movies"];
+      await env.CONFIGS.put(`creatorlist:${u.creatorName}:movies`, "{}");
+      for (let i = 2; i <= existing; i++) {
+        order.push(`movies-${i}`);
+        await env.CONFIGS.put(`creatorlist:${u.creatorName}:movies-${i}`, "{}");
+      }
+      await env.CONFIGS.put(`creatorlistorder:${u.creatorName}`, JSON.stringify({ order }));
+      let reads = 0;
+      const realGet = env.CONFIGS.get.bind(env.CONFIGS);
+      env.CONFIGS.get = async (...a) => { reads++; return realGet(...a); };
+      const r = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: u.creatorName, creatorKey: u.creatorKey,
+          name: "Movies", type: "movie", items: [{ id: "tt1" }], visibility: "public",
+        },
+      });
+      assert.equal(r.body.ok, true, r.body.error);
+      return reads;
+    }
+    const few = await readsForSave(1);
+    const many = await readsForSave(499);
+    assert.ok(many <= few + 20, `499 collisions cost ${many} KV reads vs ${few} for one -- the scan is still linear`);
+    assert.ok(many < 100, `one save spent ${many} KV reads`);
+  });
+
+  it("keeps tidy numbered slugs for the ordinary case", async () => {
+    // The random suffix is the fallback, not the default: a second list of
+    // the same name should still get "-2", not a token.
+    const env = makeEnv();
+    const u = await createUser(env, "slugtidy");
+    const save = (items) => call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        name: "Movies", type: "movie", items, visibility: "public",
+      },
+    });
+    const first = await save([{ id: "tt1" }]);
+    const second = await save([{ id: "tt2" }]);
+    assert.equal(first.body.slug, "movies");
+    assert.equal(second.body.slug, "movies-2");
+  });
+
+  it("does not overwrite a creator's own list once their numbered range fills", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "aliceslug");
+    // 500 lists all called "Movies" in this creator's own namespace.
+    const order = ["movies"];
+    for (let i = 2; i <= 500; i++) order.push(`movies-${i}`);
+    await env.CONFIGS.put(`creatorlistorder:${alice.creatorName}`, JSON.stringify({ order }));
+    await env.CONFIGS.put(`creatorlist:${alice.creatorName}:movies-500`, JSON.stringify({
+      name: "Movies", slug: "movies-500", type: "movie", visibility: "public",
+      items: [{ id: "tt-EXISTING" }], likes: 3, createdAt: 1, updatedAt: 1,
+    }));
+    const before = await env.CONFIGS.get(`creatorlist:${alice.creatorName}:movies-500`);
+
+    const r = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "Movies", type: "movie", visibility: "public", items: [{ id: "tt-MINE" }],
+      },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.equal(await env.CONFIGS.get(`creatorlist:${alice.creatorName}:movies-500`), before,
+      "saving over a full numbered range destroyed the creator's own list");
+  });
+});
+
+// A media-server webhook URL has to carry its credential in the query string
+// -- Plex, Jellyfin and Emby accept a URL and nothing else -- so it ends up in
+// their configuration and their logs. It used to carry the Creator Key: the
+// credential for the whole account, with no expiry, whose only remedy on
+// exposure was a rotation that signs the owner out everywhere.
+describe("audit fix: the scrobble webhook carries a revocable token, not the Creator Key", () => {
+  const scrobblePayload = { event: "media.scrobble", Metadata: { type: "movie", title: "X", year: 2000 } };
+  const scrobble = (env, qs) => call(env, "/api/scrobble?" + qs, { method: "POST", ip: nextIp(), json: scrobblePayload });
+  const mint = async (env, auth, rotate) => (await call(env, "/api/creator/scrobble-token", {
+    method: "POST", ip: nextIp(), json: { ...auth, rotate },
+  })).body;
+
+  it("issues one stable token per account, and only to the key holder", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetok");
+    const auth = { creatorName: alice.creatorName, creatorKey: alice.creatorKey };
+
+    const first = await mint(env, auth, false);
+    assert.equal(first.ok, true, first.error);
+    assert.ok(first.token && first.token.length >= 16, "token is too short to be a credential");
+    // Re-asking must not mint a second one, or every dashboard load would
+    // orphan a live credential.
+    const again = await mint(env, auth, false);
+    assert.equal(again.token, first.token);
+
+    const wrongKey = await call(env, "/api/creator/scrobble-token", {
+      method: "POST", json: { creatorName: alice.creatorName, creatorKey: "MYL-BAD0-BAD0-BAD0" },
+    });
+    assert.equal(wrongKey.status, 401);
+  });
+
+  it("accepts the token on the webhook, and rejects a junk or missing one", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetokuse");
+    const { token } = await mint(env, { creatorName: alice.creatorName, creatorKey: alice.creatorKey }, false);
+
+    assert.equal((await scrobble(env, "st=" + token)).status, 200);
+    assert.equal((await scrobble(env, "st=deadbeefdeadbeef")).status, 401);
+    assert.equal((await scrobble(env, "")).status, 401);
+  });
+
+  it("regenerating revokes the previous webhook URL", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetokrot");
+    const auth = { creatorName: alice.creatorName, creatorKey: alice.creatorKey };
+    const before = (await mint(env, auth, false)).token;
+    const after = (await mint(env, auth, true)).token;
+
+    assert.notEqual(after, before, "rotate returned the same token");
+    assert.equal((await scrobble(env, "st=" + before)).status, 401, "the old webhook URL still works");
+    assert.equal((await scrobble(env, "st=" + after)).status, 200);
+  });
+
+  it("keeps pre-existing creator+key webhook URLs working", async () => {
+    // Those URLs are sitting in people's media servers. Breaking them would
+    // silently stop their history syncing with no error anyone would see.
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetoklegacy");
+    const legacy = `creator=${encodeURIComponent(alice.creatorName)}&key=${encodeURIComponent(alice.creatorKey)}`;
+    assert.equal((await scrobble(env, legacy)).status, 200);
+  });
+
+  it("revokes the token when the account is deleted", async () => {
+    // The token is keyed BY TOKEN, so it cannot be reached from a username
+    // prefix sweep -- miss it and a deleted account leaves behind a live
+    // credential that still authorises writes for it.
+    const env = makeEnv();
+    const alice = await createUser(env, "alicetokdel");
+    const auth = { creatorName: alice.creatorName, creatorKey: alice.creatorKey };
+    const { token } = await mint(env, auth, false);
+    assert.equal((await scrobble(env, "st=" + token)).status, 200);
+
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST", json: { ...auth, confirm: "DELETE" },
+    });
+    assert.equal(del.body.ok, true, del.body.error);
+
+    assert.equal(await env.CONFIGS.get(`scrobbletoken:${token}`), null, "the token key outlived the account");
+    assert.equal(await env.CONFIGS.get(`creatorscrobbletoken:${alice.creatorName}`), null, "the reverse index outlived the account");
+    assert.equal((await scrobble(env, "st=" + token)).status, 401, "a deleted account's webhook still authorises writes");
+  });
+
+  it("no longer builds a webhook URL out of the Creator Key", async () => {
+    // The panel's markup is assembled client-side, and the client bundle is
+    // served from /app.js rather than inlined into the shell at "/" -- so
+    // this checks the shipped bundle. The URL builder must take a token, and
+    // the old key-bearing construction must be gone entirely.
+    const env = makeEnv();
+    const bundle = await call(env, "/app.js");
+    assert.equal(bundle.status, 200);
+    assert.match(bundle.text, /\/api\/scrobble\?st=/, "the webhook URL builder should use the token parameter");
+    assert.ok(
+      !/scrobble\?creator=['"]\s*\+\s*encodeURIComponent/.test(bundle.text),
+      "the client still builds a webhook URL containing creator+key"
+    );
+    assert.ok(
+      !/buildScrobbleWebhookUrl\(\s*activeCreator\.creatorName/.test(bundle.text),
+      "buildScrobbleWebhookUrl is still being called with a creator name and key"
+    );
+  });
+});
+
+// The env-backed API key globals (TMDB_API_KEY and friends) are the names
+// ~36 call sites across 03_, 05_, 06_ and 07_ reference directly. Only the
+// fetch handler used to point them at env, so on an isolate whose first
+// event was a cron tick they were all "". Nothing was broken in practice --
+// both cron functions happen to read env.X and thread it down -- but the
+// first cron-reachable helper that used a bare global would have run with an
+// empty key: no crash, no error, a provider quietly returning nothing.
+describe("audit fix: the cron connects the API key globals too", () => {
+  it("populates them on an isolate whose first event is a cron tick", async () => {
+    // A real fresh isolate: the built Worker evaluated in its own vm context,
+    // with scheduled() as the only thing that ever runs.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "worker_entry_combined.js"), "utf8");
+    const cut = src.lastIndexOf("export default");
+    assert.notEqual(cut, -1);
+
+    const sandbox = {
+      console, Date, Math, JSON, TextEncoder, TextDecoder, URL, URLSearchParams,
+      Response, Request, Headers, AbortController, AbortSignal, Promise, Map, Set,
+      Array, Object, String, Number, Error, RegExp, structuredClone,
+      crypto: globalThis.crypto,
+      atob: (v) => Buffer.from(v, "base64").toString("binary"),
+      btoa: (v) => Buffer.from(v, "binary").toString("base64"),
+      setTimeout, clearTimeout, setInterval, clearInterval,
+      caches: { default: { match: async () => null, put: async () => {} } },
+      fetch: async () => new Response("[]", { status: 200, headers: { "content-type": "application/json" } }),
+    };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    // `let` at the top level of a vm script is script-scoped rather than a
+    // property of the sandbox, so the readout has to be defined in the SAME
+    // script to close over those bindings.
+    vm.runInContext(
+      src.slice(0, cut) +
+      "\nglobalThis.__exp = " + src.slice(cut).replace(/^export default/, "") +
+      "\nglobalThis.__keys = () => ({ TMDB_API_KEY, TRAKT_CLIENT_ID, SIMKL_CLIENT_ID, MDBLIST_API_KEY });",
+      sandbox, { filename: "worker_entry_combined.js" }
+    );
+
+    assert.equal(sandbox.__keys().TMDB_API_KEY, "", "globals should start empty");
+
+    const env = {
+      CONFIGS: {
+        get: async () => null, put: async () => {}, delete: async () => {},
+        list: async () => ({ keys: [], list_complete: true }),
+      },
+      TMDB_API_KEY: "REAL_TMDB", TRAKT_CLIENT_ID: "REAL_TRAKT",
+      SIMKL_CLIENT_ID: "REAL_SIMKL", MDBLIST_API_KEY: "REAL_MDBLIST",
+    };
+    await sandbox.__exp.scheduled({}, env, { waitUntil: () => {} });
+
+    const keys = sandbox.__keys();
+    assert.equal(keys.TMDB_API_KEY, "REAL_TMDB");
+    assert.equal(keys.TRAKT_CLIENT_ID, "REAL_TRAKT");
+    assert.equal(keys.SIMKL_CLIENT_ID, "REAL_SIMKL");
+    assert.equal(keys.MDBLIST_API_KEY, "REAL_MDBLIST");
+  });
+});
+
+// A 24/7 channel is a flat list of EPISODES, but every episode carries the
+// imdbId/showId of the show it came from. Both places that built a channel's
+// "See All" items used that show id as the item id, and the list-details grid
+// dedupes by id (appendItems -- there to stop a provider that ignores its skip
+// parameter from rendering the same page twice). So a channel collapsed to one
+// poster per distinct show, and adding episodes changed nothing.
+describe("bug: My Channels See All showed one item per show, not per episode", () => {
+  const channelItemId = loadOneClientFunction("20_client-channel-builder.js", "channelItemId");
+
+  // Exactly how appendItems (23_client-list-management.js) dedupes.
+  function afterGridDedupe(items) {
+    const seen = new Set();
+    const kept = [];
+    items.forEach((it) => {
+      const key = it && (it.id != null ? String(it.id) : null);
+      if (key === null || !seen.has(key)) {
+        if (key !== null) seen.add(key);
+        kept.push(it);
+      }
+    });
+    return kept;
+  }
+
+  function buildChannel(shows, seasons, episodes) {
+    const items = [];
+    shows.forEach((show) => {
+      for (let s = 1; s <= seasons; s++) {
+        for (let e = 1; e <= episodes; e++) {
+          items.push({ imdbId: show.imdbId, showName: show.name, season: s, episode: e, kind: "series" });
+        }
+      }
+    });
+    return items;
+  }
+
+  it("keeps every episode of a multi-show channel", () => {
+    const shows = [
+      { name: "The Office", imdbId: "tt0386676" },
+      { name: "Parks and Rec", imdbId: "tt1266020" },
+      { name: "Brooklyn Nine-Nine", imdbId: "tt2467372" },
+    ];
+    const channelItems = buildChannel(shows, 4, 10); // 120 episodes, 3 shows
+    const sample = channelItems.map((it, idx) => ({ id: channelItemId(it, idx) }));
+
+    assert.equal(sample.length, 120);
+    assert.equal(new Set(sample.map((x) => x.id)).size, 120, "episode ids are not unique");
+    // The actual regression: this used to be 3.
+    assert.equal(afterGridDedupe(sample).length, 120, "the grid still collapses episodes to one per show");
+  });
+
+  it("uses the show:season:episode shape every other consumer already expects", () => {
+    const id = channelItemId({ imdbId: "tt0386676", showName: "The Office", season: 2, episode: 7 }, 0);
+    assert.equal(id, "tt0386676:2:7");
+    // The poster click handler (19_client-search-and-likes.js) and
+    // openItemDetailsModal (23_) both recover the show by splitting on the
+    // first colon -- for tt-prefixed and numeric TMDB ids alike.
+    assert.equal(id.split(":")[0], "tt0386676");
+    const numeric = channelItemId({ showId: "1418", showName: "Big Bang", season: 3, episode: 1 }, 0);
+    assert.equal(numeric, "1418:3:1");
+    assert.equal(numeric.split(":")[0], "1418");
+  });
+
+  it("leaves items that carry no episode numbering alone", () => {
+    // A movie-saga channel (MCU, Star Wars): each item is a distinct film and
+    // its own id is already unique, so it must not gain a suffix.
+    const films = [
+      { imdbId: "tt0371746", showName: "Iron Man" },
+      { imdbId: "tt0800080", showName: "The Incredible Hulk" },
+      { imdbId: "tt1228705", showName: "Iron Man 2" },
+    ];
+    const sample = films.map((it, idx) => ({ id: channelItemId(it, idx) }));
+    assert.deepEqual(sample.map((x) => x.id), ["tt0371746", "tt0800080", "tt1228705"]);
+    assert.equal(afterGridDedupe(sample).length, 3);
+  });
+
+  it("still yields distinct ids when an item has no id at all", () => {
+    const nameless = [{ showName: "Mystery" }, { showName: "Mystery" }];
+    const sample = nameless.map((it, idx) => ({ id: channelItemId(it, idx) }));
+    assert.equal(new Set(sample.map((x) => x.id)).size, 2, "id-less items collapsed together");
+  });
+});
+
+// Discover's popular-lists feed types each entry, and that type is what the
+// poster preview and See All are fetched with. /api/trakt-popular-lists used
+// to answer "movie" for every single list, and to build the list URL from
+// Trakt's DISPLAY username rather than the API-addressable slug.
+describe("bug: Trakt popular lists were all typed movie, with display-name URLs", () => {
+  // Trakt's /lists/popular payload, shaped the way their API really returns it.
+  const traktPopularPayload = [
+    { list: { name: "IMDB: Top Rated TV Shows", ids: { slug: "imdb-top-rated-tv-shows" }, item_count: 245, likes: 4350,
+              user: { username: "justin", ids: { slug: "justin" } } } },
+    { list: { name: "Shut Up, And Watch", ids: { slug: "shut-up-and-watch" }, item_count: 132, likes: 1538,
+              user: { username: "CanConfirm", ids: { slug: "canconfirm" } } } },
+    { list: { name: "A24", ids: { slug: "a24" }, item_count: 216, likes: 1420,
+              user: { username: "Fidel.cb", ids: { slug: "fidel-cb" } } } },
+    { list: { name: "Great Popular Shows", ids: { slug: "great-popular-shows" }, item_count: 534, likes: 1221,
+              user: { username: "Spell3ound", ids: { slug: "spell3ound" } } } },
+    { list: { name: "Best Movies of 2024", ids: { slug: "best-movies-2024" }, item_count: 50, likes: 900,
+              user: { username: "someone", ids: { slug: "someone" } } } },
+  ];
+
+  async function popularLists() {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      if (String(typeof u === "string" ? u : u.url).includes("/lists/popular")) {
+        return new Response(JSON.stringify(traktPopularPayload), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      // makeEnv only carries CONFIGS/ADMIN_KEY/DB through, so the provider key
+      // has to be set on the env object itself or the route short-circuits to
+      // { ok: false } before it ever calls Trakt.
+      const env = { ...makeEnv(), TRAKT_CLIENT_ID: "test-trakt-key" };
+      const r = await call(env, "/api/trakt-popular-lists");
+      assert.equal(r.body.ok, true, "route returned no lists -- is the Trakt key set on env?");
+      return r.body.lists;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("does not report every popular list as movies", async () => {
+    const lists = await popularLists();
+    const byName = Object.fromEntries(lists.map((l) => [l.name, l]));
+    // A shows-only list previewed as movies returns zero items, which is why
+    // these rendered with no posters and a "No items found" See All.
+    assert.equal(byName["IMDB: Top Rated TV Shows"].type, "series");
+    assert.equal(byName["Great Popular Shows"].type, "series");
+    assert.equal(byName["Best Movies of 2024"].type, "movie");
+    // Ambiguous names must not be guessed at: "mixed" makes the client fetch
+    // movies AND series and merge them, the same thing it already does for an
+    // ambiguous search result.
+    assert.equal(byName["Shut Up, And Watch"].type, "mixed");
+    assert.equal(byName["A24"].type, "mixed");
+    assert.ok(!lists.every((l) => l.type === "movie"), "every list is still typed movie");
+  });
+
+  it("addresses users by their API slug, not their display name", async () => {
+    const lists = await popularLists();
+    const a24 = lists.find((l) => l.name === "A24");
+    // "Fidel.cb" is the display name; Trakt's API needs "fidel-cb". Building
+    // the URL from the display name made this list fail to load entirely.
+    assert.equal(a24.url, "https://trakt.tv/users/fidel-cb/lists/a24");
+    assert.equal(a24.user, "Fidel.cb", "the display name should still be shown to the reader");
+
+    for (const l of lists) {
+      const userPart = l.url.split("/users/")[1].split("/")[0];
+      assert.ok(!userPart.includes("."), `list URL still carries a display name: ${l.url}`);
+    }
+  });
+
+  it("carries contentType so the search path agrees with the feed", async () => {
+    // renderListSearchResults reads contentType first; without it a popular
+    // list fell back to the same hardcoded type the feed had.
+    const lists = await popularLists();
+    assert.equal(lists.find((l) => l.name === "Great Popular Shows").contentType, "series");
+    assert.equal(lists.find((l) => l.name === "Best Movies of 2024").contentType, "movie");
+    assert.equal(lists.find((l) => l.name === "A24").contentType, "unknown");
+  });
+});
+
+// The public index is a derived cache maintained by a read-modify-write on a
+// single key, so a burst of updates loses some of them. Nothing used to repair
+// that: a rebuild only ever ran when the index was MISSING, never when it was
+// merely wrong. A live bulk delete left 76 entries advertising item counts for
+// records that no longer existed, and they stayed there indefinitely.
+describe("bug: a stale public index never repaired itself", () => {
+  it("drops entries whose record is gone without retaining phantom entries", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const alice = await createUser(env, "someone");
+    for (const [slug, n] of [["hgtv", 79], ["travel", 47]]) {
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: alice.creatorName,
+          creatorKey: alice.creatorKey,
+          name: slug,
+          slug,
+          type: "series",
+          visibility: "public",
+          items: Array.from({ length: n }, (_, i) => ({ id: "tt" + i })),
+        },
+      });
+    }
+
+    const before = await call(env, "/lists/public.json?limit=500");
+    assert.equal(before.body.total, 2);
+    assert.deepEqual((before.body.lists || []).map((l) => l.slug).sort(), ["hgtv", "travel"]);
+
+    // Deleting a list immediately removes it from the public directory
+    await call(env, "/api/creator/lists/delete", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, slug: "travel" },
+    });
+
+    const after = await call(env, "/lists/public.json?limit=500");
+    assert.equal(after.body.total, 1);
+    assert.equal(after.body.lists[0].slug, "hgtv");
+    assert.equal(after.body.lists[0].itemCount, 79);
+  });
+
+  it("scheduled() no longer runs public index rebuild", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await runScheduledTick(env);
+    assert.equal(env.CONFIGS._store.has("index:publiclists:build"), false);
+  });
+});
+
+describe("admin: deleting a creator's lists", () => {
+  async function setup(phantoms = 2) {
+    const kv = makeKv();
+    kv._store.set("creator:someone", JSON.stringify({ displayName: "someone", keyHash: "pbkdf2:1:00:00" }));
+    const entries = [];
+    const order = [];
+    for (const slug of ["keepme", "deleteme"]) {
+      kv._store.set(`creatorlist:someone:${slug}`, JSON.stringify({
+        name: slug, slug, type: "series", visibility: "public",
+        items: [{ id: "tt1" }], likes: 2, updatedAt: 1,
+      }));
+      kv._store.set(`listlikevoters:someone:${slug}`, JSON.stringify(["a:one", "a:two"]));
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "series", itemCount: 1, likes: 2, updatedAt: 1 });
+      order.push(slug);
+    }
+    for (let i = 0; i < phantoms; i++) {
+      const slug = `ghost-${i}`;
+      entries.push({ id: `c:someone:${slug}`, isCreator: true, username: "someone", creatorName: "someone",
+                     slug, name: slug, type: "movie", itemCount: 462, likes: 0, updatedAt: 1 });
+      order.push(slug);
+    }
+    kv._store.set("creatorlistorder:someone", JSON.stringify({ order }));
+    kv._store.set("index:publiclists", JSON.stringify({ updatedAt: Date.now(), entries }));
+    const env = makeEnv({ CONFIGS: kv });
+    return { kv, env, cookie: await adminCookie(env) };
+  }
+
+  it("requires admin auth", async () => {
+    const { env } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", json: { username: "someone", slugs: ["deleteme"] },
+    });
+    assert.equal(r.status, 401);
+    assert.notEqual(await env.CONFIGS.get("creatorlist:someone:deleteme"), null, "the list was deleted anyway");
+  });
+
+  it("removes the list, its likes, its order entry and its directory entry", async () => {
+    const { kv, env, cookie } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "someone", slugs: ["deleteme"] },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.deepEqual(r.body.deleted, ["deleteme"]);
+
+    assert.equal(await env.CONFIGS.get("creatorlist:someone:deleteme"), null, "record left behind");
+    // A stranded ledger means whoever next takes that slug inherits its likes.
+    assert.equal(await env.CONFIGS.get("listlikevoters:someone:deleteme"), null, "like ledger left behind");
+    assert.equal(JSON.parse(kv._store.get("creatorlistorder:someone")).order.includes("deleteme"), false);
+
+    const dir = await call(env, "/lists/public.json?limit=500");
+    assert.equal((dir.body.lists || []).some((l) => l.slug === "deleteme"), false, "still in the directory");
+    // ...and the untouched list is untouched.
+    assert.notEqual(await env.CONFIGS.get("creatorlist:someone:keepme"), null);
+    assert.notEqual(await env.CONFIGS.get("listlikevoters:someone:keepme"), null);
+  });
+
+  it("clears a phantom entry whose record is already gone", async () => {
+    // The whole reason an admin reaches for this: an entry that advertises an
+    // item count and then opens empty. It is reported as missing, not failed.
+    const { env, cookie } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "someone", slugs: ["ghost-0", "ghost-1"] },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.deepEqual(r.body.deleted, []);
+    assert.deepEqual(r.body.missing.sort(), ["ghost-0", "ghost-1"]);
+    const dir = await call(env, "/lists/public.json?limit=500");
+    assert.equal((dir.body.lists || []).some((l) => String(l.slug).startsWith("ghost-")), false);
+  });
+
+  it("bounds how many lists one call may delete", async () => {
+    const { env, cookie } = await setup();
+    const r = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie,
+      json: { username: "someone", slugs: Array.from({ length: 60 }, (_, i) => "x" + i) },
+    });
+    assert.equal(r.status, 413);
+    assert.equal(r.body.ok, false);
+  });
+
+  it("rejects a bad username or an empty slug list", async () => {
+    const { env, cookie } = await setup();
+    assert.equal((await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "", slugs: ["x"] } })).status, 400);
+    assert.equal((await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "someone", slugs: [] } })).status, 400);
+  });
+
+  it("the creator's own delete route cleans up the same way", async () => {
+    // Both go through deleteCreatorLists so an admin deletion and an owner
+    // deletion cannot clean up differently -- the like ledger in particular
+    // used to survive the owner's own delete.
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedel2");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+              name: "Temp", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    const slug = saved.body.slug;
+    await env.CONFIGS.put(`listlikevoters:${alice.creatorName}:${slug}`, JSON.stringify(["a:one"]));
+
+    const del = await call(env, "/api/creator/lists/delete", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, slug },
+    });
+    assert.equal(del.body.ok, true);
+    assert.equal(await env.CONFIGS.get(`creatorlist:${alice.creatorName}:${slug}`), null);
+    assert.equal(await env.CONFIGS.get(`listlikevoters:${alice.creatorName}:${slug}`), null,
+      "the owner's own delete still leaves the like ledger behind");
+  });
+});
+
+describe("data isolation", () => {
+  it("one creator cannot read or delete another creator's lists", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "aliceiso");
+    const bob = await createUser(env, "bobiso");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        name: "Alice Private",
+        type: "movie",
+        visibility: "private",
+        items: [{ id: "tt0111161", name: "Secret" }],
+      },
+    });
+    assert.equal(saved.body.ok, true);
+    const slug = saved.body.slug;
+
+    const bobLists = await call(env, "/api/creator/lists", {
+      method: "POST",
+      json: { creatorName: bob.creatorName, creatorKey: bob.creatorKey },
+    });
+    assert.equal(bobLists.status, 200);
+    assert.ok(!(bobLists.body.lists || []).some((l) => l.slug === slug && l.name === "Alice Private"));
+
+    const steal = await call(env, "/api/creator/lists/delete", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: bob.creatorKey, slug },
+    });
+    assert.equal(steal.status, 401);
+
+    const publicGet = await call(env, `/lists/${alice.creatorName}/${slug}.json`);
+    assert.equal(publicGet.status, 404);
+  });
+});
+
+describe("account lifecycle", () => {
+  it("delete-account purges identity so the old key dies and the name can be reused", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedel", { recoveryAnswer: "blue terrier" });
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        watchHistory: [{ id: "tt1", name: "Gone" }],
+      },
+    });
+    const missingConfirm = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(missingConfirm.status, 400);
+
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE" },
+    });
+    assert.equal(del.status, 200);
+    assert.equal(del.body.ok, true);
+
+    const lists = await call(env, "/api/creator/lists", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(lists.status, 401);
+
+    const hist = await call(env, `/lists/${alice.creatorName}/watch-history.json`);
+    assert.equal(hist.status, 404);
+
+    // The name is HELD for a few minutes, not released instantly.
+    //
+    // A purge is a sweep, so a request that authenticated just before it can
+    // land just after it and put its key back -- and `creatorsync:{u}` carries
+    // the account's own provider API keys. Holding the username until any such
+    // straggler has finished is what stops the next registrant inheriting it.
+    // See the tombstone comment in 02_http-and-creator-utils.js.
+    const tooSoon = await call(env, "/api/creator/create", {
+      method: "POST",
+      json: { creatorName: "alicedel" },
+    });
+    assert.equal(tooSoon.body.ok, false, "the name must not be re-registerable immediately after deletion");
+    assert.ok(env.CONFIGS._store.has("creatordeleted:alicedel"), "a deletion tombstone should be holding it");
+
+    // Once the tombstone lapses the name is free again, and the new account
+    // inherits nothing.
+    lapseCreatorTombstone(env, "alicedel");
+    const again = await createUser(env, "alicedel");
+    assert.equal(again.ok, true);
+    assert.notEqual(again.creatorKey, alice.creatorKey);
+    const freshSync = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: "alicedel", creatorKey: again.creatorKey },
+    });
+    assert.deepEqual(freshSync.body.data.watchHistory || [], [], "a reclaimed name must not inherit watch history");
+  });
+});
+
+describe("key rotation", () => {
+  it("rotates KV even when D1 is bound and has no row", async () => {
+    const kv = makeKv();
+    const envNoDb = makeEnv({ CONFIGS: kv, DB: undefined });
+    const alice = await createUser(envNoDb, "alicerot", { recoveryAnswer: "green lantern" });
+
+    const db = makeD1();
+    const envDb = makeEnv({ CONFIGS: kv, DB: db });
+    assert.equal(db._creators.size, 0);
+
+    const rotated = await call(envDb, "/api/creator/reset-key", {
+      method: "POST",
+      json: { username: alice.creatorName, recoveryAnswer: "green lantern" },
+    });
+    assert.equal(rotated.status, 200, JSON.stringify(rotated.body));
+    assert.equal(rotated.body.ok, true);
+    assert.ok(rotated.body.creatorKey);
+    assert.notEqual(rotated.body.creatorKey, alice.creatorKey);
+
+    const oldKey = await call(envDb, "/api/creator/restore", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(oldKey.status, 401);
+
+    const newKey = await call(envDb, "/api/creator/restore", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: rotated.body.creatorKey },
+    });
+    assert.equal(newKey.status, 200);
+    assert.equal(newKey.body.ok, true);
+  });
+
+  it("rotates both stores when the D1 row exists", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const alice = await createUser(env, "aliced1", { recoveryAnswer: "red balloon" });
+    assert.ok(db._creators.has("aliced1"));
+    const rotated = await call(env, "/api/creator/reset-key", {
+      method: "POST",
+      json: { username: alice.creatorName, recoveryAnswer: "red balloon" },
+    });
+    assert.equal(rotated.body.ok, true);
+    const oldKey = await call(env, "/api/creator/restore", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(oldKey.status, 401);
+    const newKey = await call(env, "/api/creator/restore", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: rotated.body.creatorKey },
+    });
+    assert.equal(newKey.status, 200);
+  });
+});
+
+describe("curated shelves resolve from one shared table", () => {
+  // /lists/curated/<slug> read `isShow`, which was declared nowhere, so the
+  // route threw a ReferenceError and answered HTTP 500 on EVERY request --
+  // and getListCleanPath puts exactly that path in the address bar whenever
+  // one of these shelves is opened, so reloading or sharing one landed on an
+  // error. A regex on the slug would have fixed the crash and still got
+  // "true-crime-mystery" wrong, which is why the type is looked up.
+  const BROWSER = {
+    Accept: "text/html",
+    "User-Agent": "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+  };
+  const deepLink = (html) => {
+    const m = /const SERVER_DEEP_LINK_LIST = ([^\n]+);/.exec(html);
+    if (!m) return null;
+    try { return JSON.parse(m[1]); } catch { return null; }
+  };
+
+  it("serves every curated slug with the right name, type and url", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const expected = [
+      ["recommended-movies", "Recommended Movies", "movie"],
+      ["recommended-shows", "Recommended Shows", "series"],
+      ["hidden-gems", "Curated: Hidden Gems", "movie"],
+      ["binge-worthy-series", "Curated: Binge-Worthy Series", "series"],
+      // The one a slug regex gets wrong: a series whose slug says neither.
+      ["true-crime-mystery", "Curated: True Crime & Mystery", "series"],
+    ];
+    for (const [slug, name, type] of expected) {
+      const r = await call(env, `/lists/curated/${slug}`, { headers: BROWSER });
+      assert.equal(r.status, 200, `${slug} should render, got ${r.status}`);
+      const d = deepLink(r.text);
+      assert.ok(d, `${slug} should carry a deep link`);
+      assert.equal(d.name, name, `${slug} name`);
+      assert.equal(d.type, type, `${slug} type`);
+      assert.equal(d.url, `custom:curated:${slug}`, `${slug} url`);
+    }
+  });
+
+  it("lands an unknown curated slug in the app rather than on an error", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const r = await call(env, "/lists/curated/not-a-real-shelf", { headers: BROWSER });
+    assert.equal(r.status, 200);
+    assert.equal(deepLink(r.text), null, "an unknown slug must not fabricate a deep link");
+  });
+});
+
+describe("the cold-index directory advertises reachable urls", () => {
+  // The index path and /api/search-published-lists both built an anonymous
+  // list's url from the "user" key namespace; this fallback built it from the
+  // display label instead, so every anonymous list in the directory advertised
+  // /lists/Anonymous/<slug>, which 404s. The fallback is not an edge case: it
+  // runs on a fresh deployment and for the whole of the first index rebuild.
+  it("points an anonymous list at /lists/user/<slug>, and that url resolves", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    // Seeded straight into KV: /api/publish-list was removed in 1.5.3, but
+    // every read path still serves the records it left behind, which is what
+    // this test is about. See seedAnonPublishedList.
+    const pub = seedAnonPublishedList(env, "anon-list", { name: "Anon List", items: [{ id: "tt0111161" }] });
+    // Drop the index so the legacy scan is what answers.
+    for (const k of [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("index:"))) {
+      env.CONFIGS._store.delete(k);
+    }
+    env.CONFIGS._store.set("index:publiclists:lock", "1");
+
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists.length, 1);
+    const entry = dir.body.lists[0];
+    assert.equal(entry.creator, "Anonymous", "the display label stays Anonymous");
+    assert.ok(entry.url.endsWith(`/lists/user/${pub.slug}`), `url was ${entry.url}`);
+    assert.ok(entry.updatedAt, "an anonymous list stores publishedAt, which the fallback must read");
+
+    const followed = await call(env, new URL(entry.url).pathname + ".json");
+    assert.equal(followed.status, 200, "the advertised url must actually resolve");
+  });
+});
+
+describe("a list whose creator is gone is not servable", () => {
+  // A save that authenticated a millisecond before its owner deleted the
+  // account keeps running, and its KV put lands after both of
+  // purgeCreatorData's sweeps. Measured before the fix: 6 of 10 plain
+  // concurrent delete+save runs left a public record behind, and because the
+  // record is genuinely `public` it stayed readable, stayed in the directory,
+  // and could never be removed -- every authenticated route answers 401 for
+  // that username. A sweep can only narrow that window, so the read side is
+  // what closes it.
+
+  it("404s a creator list with no creator record, and keeps it out of the directory", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    // Exactly the state the race produces: the list record, no account.
+    await kv.put("creatorlist:ghost:orphaned", JSON.stringify({
+      name: "Orphaned", slug: "orphaned", type: "movie", visibility: "public",
+      items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
+    }));
+
+    const page = await call(env, "/lists/ghost/orphaned.json");
+    assert.equal(page.status, 404, "an ownerless list must not be served");
+
+    const dir = await call(env, "/lists/public.json");
+    assert.deepEqual(dir.body.lists, [], "an ownerless list must not be advertised");
+
+    const search = await call(env, "/api/search-published-lists?q=orphaned");
+    assert.deepEqual(search.body.lists, [], "an ownerless list must not be searchable");
+  });
+
+  it("still serves an identical list whose creator does exist", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    await kv.put("creator:realowner", JSON.stringify({
+      displayName: "Real Owner", keyHash: "pbkdf2:1:aa:bb", createdAt: 1,
+    }));
+    await kv.put("creatorlist:realowner:orphaned", JSON.stringify({
+      name: "Orphaned", slug: "orphaned", type: "movie", visibility: "public",
+      items: [{ id: "tt0111161", name: "Item" }], likes: 0, createdAt: 1, updatedAt: 1,
+    }));
+
+    const page = await call(env, "/lists/realowner/orphaned.json");
+    assert.equal(page.status, 200, "a list with a live owner must still serve");
+
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists.length, 1);
+    assert.equal(dir.body.lists[0].creator, "realowner");
+  });
+
+  // The remaining half of this fix -- updatePublicListIndex refusing an ADD
+  // for an account whose deletion tombstone is already written -- cannot be
+  // reached from a route, because authenticateCreator rejects a tombstoned
+  // account before any handler runs. It only happens to a request that
+  // authenticated BEFORE the tombstone existed, which is a real race rather
+  // than a state a test can construct through the public surface. It is
+  // covered end to end by audit/adversarial-III-2026-09-08/p26_ghostpublic.mjs
+  // and p27_ghostnatural.mjs, which hold a save open across a real deletion.
+});
+
+describe("directory pagination", () => {
+  it("public.json reports every seeded list after the index rebuilds", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const n = 180;
+    // A creator list is only reachable through authenticateCreator, so a
+    // creatorlist: record cannot exist in production without its creator:
+    // record -- and the directory now refuses to advertise one that does,
+    // because that combination means the account was deleted while a save was
+    // in flight (see makeCreatorExistsMemo). Seeding the accounts keeps these
+    // fixtures honest about that; without them these tests were exercising a
+    // state the app cannot produce.
+    for (let u = 0; u < 20; u++) {
+      await kv.put(`creator:user${String(u).padStart(2, "0")}`, JSON.stringify({
+        displayName: `user${String(u).padStart(2, "0")}`, keyHash: "pbkdf2:1:aa:bb", createdAt: 1,
+      }));
+    }
+    for (let i = 0; i < n; i++) {
+      const slug = `list-${String(i).padStart(4, "0")}`;
+      const username = `user${String(i % 20).padStart(2, "0")}`;
+      await kv.put(`creatorlist:${username}:${slug}`, JSON.stringify({
+        name: `List ${i}`,
+        slug,
+        type: "movie",
+        visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }],
+        likes: 0,
+        createdAt: 1,
+        updatedAt: 1,
+      }));
+    }
+    const first = await call(env, "/lists/public.json?limit=500");
+    assert.equal(first.status, 200);
+    const second = await call(env, "/lists/public.json?limit=500");
+    assert.equal(second.body.ok, true);
+    assert.equal(second.body.total, n, `expected total ${n}, got ${second.body.total}`);
+    assert.equal(second.body.lists.length, n);
+  });
+
+  it("/admin/api/rebuild-public-index rebuilds search index in D1", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const n = 12;
+    const alice = await createUser(env, "idxuser");
+    for (let i = 0; i < n; i++) {
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: alice.creatorName,
+          creatorKey: alice.creatorKey,
+          name: `List ${i}`,
+          slug: `list-${i}`,
+          type: "movie",
+          visibility: "public",
+          items: [{ id: "tt0111161", name: "Item" }],
+        },
+      });
+    }
+
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.count, n);
+
+    // Searchable via lists_fts
+    const search = await call(env, "/api/search-published-lists?q=List");
+    assert.equal(search.body.ok, true);
+    assert.equal(search.body.lists.length, n);
+
+    // Served straight from the D1 query
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n);
+  });
+
+  it("serves public lists without needing any cron action", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const n = 7;
+    const alice = await createUser(env, "cronuser");
+    for (let i = 0; i < n; i++) {
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: alice.creatorName,
+          creatorKey: alice.creatorKey,
+          name: `List ${i}`,
+          slug: `list-${i}`,
+          type: "movie",
+          visibility: "public",
+          items: [{ id: "tt0111161", name: "Item" }],
+        },
+      });
+    }
+
+    // Direct D1 query serves lists immediately, no scheduled tick needed
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n);
+  });
+});
+
+describe("Phase 1: the public list directory and search scale with D1", () => {
+  it("indexes and serves public lists at scale in D1", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const n = 250;
+    for (let i = 0; i < n; i++) {
+      const username = `u${i}`;
+      db.prepare("INSERT INTO creators (username, display_name, key_hash, created_at, last_active) VALUES (?, ?, 'hash', 1, 1)")
+        .bind(username, username).run();
+      db.prepare("INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, 'movie', 'public', '[{\"id\":\"tt1\"}]', ?, 1, 1)")
+        .bind(`${username}:list-${i}`, username, `List ${i}`, i % 7).run();
+    }
+    const cookie = await adminCookie(env);
+    const rebuild = await call(env, "/admin/api/rebuild-search-index", { method: "POST", cookie });
+    assert.equal(rebuild.body.ok, true);
+    assert.equal(rebuild.body.count, n);
+
+    const listing = await call(env, "/lists/public.json?limit=500");
+    assert.equal(listing.body.total, n);
+
+    const search = await call(env, "/api/search-published-lists?q=List");
+    assert.equal(search.body.ok, true);
+    assert.ok(search.body.lists.length > 0);
+  });
+
+  it("survives private records without indexing them in lists_fts", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    db.prepare("INSERT INTO creators (username, display_name, key_hash, created_at, last_active) VALUES ('alice', 'Alice', 'hash', 1, 1)").run();
+    db.prepare("INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, 'movie', 'public', '[{\"id\":\"tt1\"}]', 0, 1, 1)")
+      .bind("alice:pub", "alice", "Public List").run();
+    db.prepare("INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at) VALUES (?, ?, ?, 'movie', 'private', '[{\"id\":\"tt1\"}]', 0, 1, 1)")
+      .bind("alice:priv", "alice", "Private Secret List").run();
+
+    const cookie = await adminCookie(env);
+    const rebuild = await call(env, "/admin/api/rebuild-search-index", { method: "POST", cookie });
+    assert.equal(rebuild.body.ok, true);
+    assert.equal(rebuild.body.count, 1);
+
+    const searchPriv = await call(env, "/api/search-published-lists?q=Secret");
+    assert.deepEqual(searchPriv.body.lists, []);
+
+    const searchPub = await call(env, "/api/search-published-lists?q=Public");
+    assert.equal(searchPub.body.lists.length, 1);
+  });
+});
+
+// /api/creator/reset-key hands back a brand-new working Creator Key on a
+// correct recovery answer, so that answer is a second credential for full
+// account takeover -- and unlike the ~60-bit key it is free text a human
+// picked, lowercased before hashing. It was throttled per IP only, which
+// throttles the wrong dimension entirely: rotating source addresses is free,
+// the account being attacked cannot be swapped out. Rotating IPs took over a
+// test account in five guesses.
+describe("audit fix: recovery answers are throttled per account, not just per IP", () => {
+  // The attack verbatim: a new source IP on every single guess.
+  async function guessWithRotatingIps(env, username, answers) {
+    for (let i = 0; i < answers.length; i++) {
+      const r = await call(env, "/api/creator/reset-key", {
+        method: "POST",
+        ip: nextIp(),
+        json: { username, recoveryAnswer: answers[i] },
+      });
+      if (r.body && r.body.ok) return { tookOver: true, atGuess: i + 1 };
+    }
+    return { tookOver: false };
+  }
+  const wrongThenRight = (correct, wrongCount) =>
+    Array.from({ length: wrongCount }, (_, i) => `wrong-answer-${i}`).concat([correct]);
+
+  // Run against both stores. The D1 path is not redundant: it takes a
+  // different code path (an atomic upsert instead of a KV read-modify-write),
+  // and the first version of this throttle counted nothing at all there
+  // while passing on KV, because its hand-written INSERT used a statement
+  // shape d1BumpStat does not.
+  for (const [label, makeStores] of [
+    ["KV only", () => ({ CONFIGS: makeKv() })],
+    ["D1 bound", () => ({ CONFIGS: makeKv(), DB: makeD1() })],
+  ]) {
+    it(`blocks a rotating-IP takeover (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      await createUser(env, "victimacct", { recoveryAnswer: "fluffy-the-cat" });
+      const res = await guessWithRotatingIps(env, "victimacct", wrongThenRight("fluffy-the-cat", 20));
+      assert.equal(res.tookOver, false, `account taken over on guess #${res.atGuess} despite the per-account budget`);
+    });
+
+    it(`still lets the real owner in, before and after honest typos (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      await createUser(env, "goodacct", { recoveryAnswer: "correct-horse-battery" });
+      const first = await call(env, "/api/creator/reset-key", {
+        method: "POST", ip: nextIp(),
+        json: { username: "goodacct", recoveryAnswer: "correct-horse-battery" },
+      });
+      assert.equal(first.body.ok, true, "a correct answer must work first time");
+
+      // A few genuine typos must not lock the owner out, and succeeding must
+      // not spend the budget that protects them.
+      const env2 = makeEnv(makeStores());
+      await createUser(env2, "typoacct", { recoveryAnswer: "correct-horse-battery" });
+      await guessWithRotatingIps(env2, "typoacct", ["nope-one", "nope-two", "nope-three"]);
+      const late = await call(env2, "/api/creator/reset-key", {
+        method: "POST", ip: nextIp(),
+        json: { username: "typoacct", recoveryAnswer: "correct-horse-battery" },
+      });
+      assert.equal(late.body.ok, true, `locked out after honest typos: ${late.body.error}`);
+    });
+  }
+
+  it("one account's budget cannot be spent by guesses at another", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await createUser(env, "targetacct", { recoveryAnswer: "correct-horse-battery" });
+    await createUser(env, "bystanderacct", { recoveryAnswer: "different-answer-here" });
+    await guessWithRotatingIps(env, "targetacct", wrongThenRight("nope", 12));
+    // Exhausting one account must leave every other account untouched...
+    const other = await call(env, "/api/creator/reset-key", {
+      method: "POST", ip: nextIp(),
+      json: { username: "bystanderacct", recoveryAnswer: "different-answer-here" },
+    });
+    assert.equal(other.body.ok, true, "an unrelated account was locked out too");
+  });
+
+  it("guesses at a username that does not exist never mint a budget", async () => {
+    // Unknown names must not create per-account counters -- otherwise anyone
+    // can grow that keyspace for free by guessing at names at random.
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    for (let i = 0; i < 8; i++) {
+      const r = await call(env, "/api/creator/reset-key", {
+        method: "POST", ip: nextIp(),
+        json: { username: `ghostacct${i}`, recoveryAnswer: "whatever-here" },
+      });
+      assert.equal(r.body.ok, false);
+    }
+    const minted = [...kv._store.keys()].filter((k) => k.startsWith("authfail:"));
+    assert.deepEqual(minted, [], `unknown usernames minted counters: ${minted.join(", ")}`);
+  });
+
+  it("requires a recovery answer long enough to be worth having", async () => {
+    const env = makeEnv();
+    const short = await call(env, "/api/creator/create", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: "shortanswer", recoveryAnswer: "cat" },
+    });
+    assert.equal(short.body.ok, false, "a 3-character recovery answer was accepted");
+    assert.equal(short.status, 400);
+
+    const long = await call(env, "/api/creator/create", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: "longanswer", recoveryAnswer: "my-first-pet-was-rex" },
+    });
+    assert.equal(long.body.ok, true, long.body.error);
+
+    // It stays optional -- this must not become a required field.
+    const none = await call(env, "/api/creator/create", {
+      method: "POST", ip: nextIp(),
+      json: { creatorName: "noanswer" },
+    });
+    assert.equal(none.body.ok, true, none.body.error);
+  });
+});
+
+// The page loads fflate from a CDN that the CSP's script-src allows, so
+// whatever that URL returns runs with full page privileges -- and this page
+// keeps myListAddon:creatorKey, the MDBList/Simkl access tokens and the
+// provider API keys in localStorage, all readable by any script in it.
+// Pinning the version is not integrity checking.
+describe("audit fix: the CDN script is integrity-pinned", () => {
+  it("carries an SRI hash and crossorigin on every external script", async () => {
+    const env = makeEnv();
+    const page = await call(env, "/");
+    const externals = [...page.text.matchAll(/<script\b[^>]*\bsrc="(https?:[^"]+)"[^>]*>/g)];
+    assert.ok(externals.length > 0, "expected at least one external script tag");
+    for (const [tag, src] of externals) {
+      assert.match(tag, /\bintegrity="sha(256|384|512)-[A-Za-z0-9+/=]+"/, `no SRI hash on ${src}`);
+      // Required for SRI to be enforced on a cross-origin script.
+      assert.match(tag, /\bcrossorigin="anonymous"/, `no crossorigin on ${src}`);
+      // A hash only means anything against a pinned version.
+      assert.match(src, /@\d+\.\d+\.\d+\//, `unpinned version in ${src}`);
+    }
+  });
+
+  it("pins a hash that matches the bytes the CDN actually serves", { skip: !process.env.NETWORK_TESTS }, async () => {
+    // Opt-in (NETWORK_TESTS=1): the rest of the suite is hermetic, and CI
+    // should not fail because a CDN is briefly unreachable. Run this when
+    // changing the script URL or bumping its version.
+    const env = makeEnv();
+    const page = await call(env, "/");
+    const m = page.text.match(/<script\b[^>]*\bsrc="(https:[^"]+)"[^>]*\bintegrity="sha384-([A-Za-z0-9+/=]+)"/);
+    assert.ok(m, "no integrity-pinned external script found");
+    const [, src, pinned] = m;
+    const res = await fetch(src);
+    assert.equal(res.status, 200);
+    const digest = await crypto.subtle.digest("SHA-384", await res.arrayBuffer());
+    const actual = Buffer.from(digest).toString("base64");
+    assert.equal(actual, pinned, `SRI hash does not match what ${src} serves -- regenerate it`);
+  });
+});
+
+describe("likes and preview guards", () => {
+  it("rejects like-external URLs off the provider allowlist", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/api/lists/like-external", {
+      method: "POST",
+      json: { url: "https://evil.example/x" },
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.ok, false);
+  });
+
+  it("accepts one of this add-on's own shared chart sentinels (Discover page \"See All\" like)", async () => {
+    const env = makeEnv();
+    // Before the fix, every one of this add-on's own built-in Discover
+    // charts (which use a sentinel like "tmdb:chart:popular" instead of a
+    // real URL) 400'd here with "That URL can't be liked" -- the one
+    // thing this feature could never actually be used on.
+    const r = await call(env, "/api/lists/like-external", {
+      method: "POST",
+      json: { url: "tmdb:chart:popular" },
+    });
+    assert.equal(r.body.ok, true, `expected ok, got ${JSON.stringify(r.body)}`);
+    assert.equal(r.body.likes, 1);
+    // Session/account-relative sentinels stay rejected -- there's no one
+    // shared list a like against "my watchlist" could mean.
+    const rejected = await call(env, "/api/lists/like-external", {
+      method: "POST",
+      json: { url: "trakt:watchlist" },
+    });
+    assert.equal(rejected.status, 400);
+  });
+
+  it("double-like is idempotent", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicelike");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        name: "Likeable",
+        type: "movie",
+        visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }],
+      },
+    });
+    const slug = saved.body.slug;
+    const ip = nextIp();
+    const first = await call(env, "/api/lists/like", {
+      method: "POST",
+      ip,
+      json: { username: alice.creatorName, slug },
+    });
+    assert.equal(first.body.ok, true);
+    assert.equal(first.body.likes, 1);
+    const second = await call(env, "/api/lists/like", {
+      method: "POST",
+      ip,
+      json: { username: alice.creatorName, slug },
+    });
+    assert.equal(second.body.likes, 1);
+  });
+
+  it("preview rejects a non-allowlisted URL without fetching it", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/api/preview", {
+      method: "POST",
+      json: { url: "http://127.0.0.1/secret", type: "movie" },
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.ok, false);
+  });
+
+  it("poster-badge rejects a non-allowlisted poster host (was an open redirect / SSRF)", async () => {
+    const env = makeEnv();
+    // No badge params: used to be Response.redirect(posterUrl) -- an open
+    // redirect off this domain to whatever host the caller named.
+    const redirectCase = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://evil.example/phish"));
+    assert.equal(redirectCase.status, 404);
+    // A badge param present: used to fetch(posterUrl) server-side and
+    // embed the response in the SVG returned -- an SSRF/open image proxy.
+    const fetchCase = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://evil.example/x") + "&airDate=2099-01-01");
+    assert.equal(fetchCase.status, 404);
+  });
+
+  // The companion to the race test below. Retrying whenever a vote is not
+  // visible in the read-back treats every stale read as contention, and KV
+  // reads are edge-cached, so on an otherwise idle list that spent a second
+  // write against a key KV limits to one write per second. The retry is now
+  // gated on evidence of another writer -- an id present that was not in our
+  // own pre-write snapshot -- which a stale read cannot produce.
+  it("does not re-write the ledger when KV merely serves a stale read", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicestale");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "StaleList", type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }],
+      },
+    });
+    const ledgerKey = `listlikevoters:${alice.creatorName}:${saved.body.slug}`;
+
+    const realPut = env.CONFIGS.put.bind(env.CONFIGS);
+    const realGet = env.CONFIGS.get.bind(env.CONFIGS);
+    let ledgerWrites = 0;
+    let previous = null;
+    let havePrevious = false; // a first write's previous value is legitimately null
+    let servedStale = 0;
+    env.CONFIGS.put = async (key, value) => {
+      if (key === ledgerKey) { previous = await realGet(key); havePrevious = true; ledgerWrites++; }
+      return realPut(key, value);
+    };
+    // Edge caching does not clear within one request, so serve the pre-write
+    // value for several reads rather than just one.
+    env.CONFIGS.get = async (key, type) => {
+      if (key === ledgerKey && havePrevious && servedStale < 6) { servedStale++; return previous; }
+      return realGet(key, type);
+    };
+
+    const r = await call(env, "/api/lists/like", {
+      method: "POST",
+      json: { username: alice.creatorName, slug: saved.body.slug },
+    });
+    assert.equal(r.body.ok, true);
+    assert.ok(servedStale > 0, "the stale-read condition never triggered");
+    assert.equal(ledgerWrites, 1, `a stale read caused ${ledgerWrites} writes to a 1-write/sec key`);
+
+    const stored = JSON.parse(await realGet(ledgerKey));
+    assert.equal(stored.length, 1);
+    assert.equal(r.body.likes, stored.length, "reported count does not match storage");
+  });
+
+  it("a vote survives a concurrent write racing its own PUT (applyLikeVote retry)", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicerace");
+    const saved = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName,
+        creatorKey: alice.creatorKey,
+        name: "RaceList",
+        type: "movie",
+        visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }],
+      },
+    });
+    const slug = saved.body.slug;
+    const ledgerKey = `listlikevoters:${alice.creatorName}:${slug}`;
+
+    // Simulate another request's write landing between this vote's PUT and
+    // its verification read: the very first time applyLikeVote writes to
+    // this ledger key, immediately clobber it with a snapshot that does
+    // NOT include this voter -- exactly the lost-update race a plain
+    // read-modify-write would silently lose to.
+    let injected = false;
+    const realPut = env.CONFIGS.put.bind(env.CONFIGS);
+    env.CONFIGS.put = async (key, value) => {
+      await realPut(key, value);
+      if (key === ledgerKey && !injected) {
+        injected = true;
+        await realPut(key, JSON.stringify(["a:racing-voter"]));
+      }
+    };
+
+    const r = await call(env, "/api/lists/like", {
+      method: "POST",
+      json: { username: alice.creatorName, slug },
+    });
+    assert.equal(injected, true);
+    assert.equal(r.body.ok, true);
+    // Both this vote and the "racing" one must be reflected -- not just
+    // whichever write happened to land last.
+    assert.equal(r.body.likes, 2);
+    const finalVoters = JSON.parse(await env.CONFIGS.get(ledgerKey));
+    assert.equal(finalVoters.length, 2);
+    assert.ok(finalVoters.includes("a:racing-voter"));
+  });
+});
+
+describe("admin login", () => {
+  it("rate-limits repeated wrong-key attempts from the same IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let last;
+    for (let i = 0; i < 11; i++) {
+      last = await call(env, "/admin/login", { method: "POST", ip, form: { key: "wrong-key" } });
+    }
+    assert.equal(last.status, 429);
+  });
+
+  it("does not share the rate-limit bucket across different IPs", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: "wrong-key" } });
+    assert.equal(r.status, 401);
+  });
+
+  it("renders the Maintenance tab with dashboard-clickable D1/index tools", async () => {
+    const env = makeEnv();
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin", { method: "GET", cookie });
+    assert.equal(r.status, 200);
+    assert.match(r.text, /id="migrateD1Btn"/);
+    assert.match(r.text, /id="rebuildIndexBtn"/);
+    // No env.DB bound in this test env -- the D1 action should render
+    // visibly disabled rather than silently doing nothing if clicked.
+    assert.match(r.text, /id="migrateD1Btn"[^>]*disabled/);
+  });
+
+  it("enables the D1 migration button once a D1 database is actually bound", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin", { method: "GET", cookie });
+    assert.equal(r.status, 200);
+    assert.doesNotMatch(r.text, /id="migrateD1Btn"[^>]*disabled/);
+  });
+});
+
+describe("sync conflict guard", () => {
+  it("rejects a stale expectedUpdatedAt instead of silently overwriting a newer save", async () => {
+    const env = makeEnv();
+    const bob = await createUser(env, "bobsync");
+
+    const first = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: bob.creatorName, creatorKey: bob.creatorKey, config: [{ id: "a", name: "A", url: "https://x" }] },
+    });
+    assert.equal(first.body.ok, true);
+    assert.equal(typeof first.body.updatedAt, "number");
+    const firstUpdatedAt = first.body.updatedAt;
+
+    // Force the clock forward a tick so the "second device" gets a
+    // strictly later updatedAt than the first save.
+    await new Promise((r) => setTimeout(r, 2));
+
+    // "Device B" saves, built on top of the same baseline as device A.
+    const second = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: {
+        creatorName: bob.creatorName,
+        creatorKey: bob.creatorKey,
+        config: [{ id: "b", name: "B", url: "https://y" }],
+        expectedUpdatedAt: firstUpdatedAt,
+      },
+    });
+    assert.equal(second.body.ok, true);
+    const secondUpdatedAt = second.body.updatedAt;
+    assert.ok(secondUpdatedAt > firstUpdatedAt);
+
+    // "Device A", still holding the stale baseline, tries to save next --
+    // must not clobber device B's newer write.
+    const staleAttempt = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: {
+        creatorName: bob.creatorName,
+        creatorKey: bob.creatorKey,
+        config: [{ id: "a-edited", name: "A edited", url: "https://x" }],
+        expectedUpdatedAt: firstUpdatedAt,
+      },
+    });
+    assert.equal(staleAttempt.status, 409);
+    assert.equal(staleAttempt.body.ok, false);
+    assert.equal(staleAttempt.body.conflict, true);
+
+    const loaded = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: bob.creatorName, creatorKey: bob.creatorKey },
+    });
+    assert.equal(loaded.body.data.config[0].id, "b");
+    assert.equal(loaded.body.data.updatedAt, secondUpdatedAt);
+  });
+
+  it("a save with no expectedUpdatedAt (older client) keeps the previous last-write-wins behavior", async () => {
+    const env = makeEnv();
+    const carol = await createUser(env, "carolsync");
+    await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: carol.creatorName, creatorKey: carol.creatorKey, config: [{ id: "x", name: "X", url: "https://x" }] },
+    });
+    const overwrite = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: { creatorName: carol.creatorName, creatorKey: carol.creatorKey, config: [{ id: "y", name: "Y", url: "https://y" }] },
+    });
+    assert.equal(overwrite.body.ok, true);
+    const loaded = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: carol.creatorName, creatorKey: carol.creatorKey },
+    });
+    assert.equal(loaded.body.data.config[0].id, "y");
+  });
+});
+
+describe("displayName", () => {
+  it("stores the submitted display name when it is valid", async () => {
+    const env = makeEnv();
+    const r = await createUser(env, "alicecap", { displayName: "Alice Cap" });
+    assert.equal(r.displayName, "Alice Cap");
+    const long = await call(env, "/api/creator/create", {
+      method: "POST",
+      json: { creatorName: "toolongnameok", displayName: "A".repeat(41) },
+    });
+    assert.equal(long.status, 400);
+  });
+});
+
+describe("list URL query-string handling", () => {
+  // detectSource, mdblistJsonUrl, and guessNameFromUrl are pure functions
+  // with no dependency on the Worker's KV/D1/fetch environment, so they're
+  // evaluated directly out of the real source file in an isolated vm
+  // context rather than routed through the HTTP harness -- a route-level
+  // test can't tell "correctly detected, then failed for an unrelated
+  // reason" apart from "misdetected", since /api/preview collapses every
+  // failure to one generic error message before it reaches the client.
+  const configFns = loadSourceFunctions("04_config-resolution.js");
+  const guessNameFromUrl = loadOneClientFunction("19_client-search-and-likes.js", "guessNameFromUrl");
+
+  it("guessNameFromUrl strips a trailing query string instead of using it as the guessed name", () => {
+    // The exact reported bug: a trailing slash before the "?" put the
+    // query string in its own "/"-separated segment, so it became the
+    // *entire* guessed name.
+    assert.equal(guessNameFromUrl("https://mdblist.com/lists/someone/my-list/?Mode=Show"), "My List");
+    assert.equal(guessNameFromUrl("https://mdblist.com/lists/someone/my-list?Mode=Show"), "My List");
+    assert.equal(guessNameFromUrl("https://trakt.tv/users/someone/lists/best-of-2024"), "Best Of 2024");
+  });
+
+  it("guessNameFromUrl uppercases known acronyms instead of just their first letter", () => {
+    // The exact reported bug: plain per-word title-casing turns "imdb" into
+    // "Imdb", not the "IMDB" a person would actually type by hand.
+    assert.equal(
+      guessNameFromUrl("https://app.trakt.tv/users/justin/lists/imdb-top-rated-movies"),
+      "IMDB Top Rated Movies"
+    );
+    assert.equal(
+      guessNameFromUrl("https://mdblist.com/lists/garycrawfordgc/latest-tv-shows"),
+      "Latest TV Shows"
+    );
+    // Not so aggressive that it mangles a word that just happens to start
+    // the same way as an acronym.
+    assert.equal(guessNameFromUrl("https://mdblist.com/lists/someone/television-classics"), "Television Classics");
+  });
+
+  it("guessNameFromUrl's title-case regex must stay double-escaped (\\\\b\\\\w) to survive being embedded in 09_page-shell.js's own template literal", () => {
+    // This is the actual reported bug behind "it names it like this imdb
+    // top rated movies" resurfacing later as "HD documentary movies 1980
+    // to today" (only the acronym step ran; every other word stayed
+    // lowercase). A PAST fix here ("Previously /\\b\\w/g... this never
+    // actually matched anything") swapped a correctly *double*-escaped
+    // regex for a single-escaped one, believing the double escaping was
+    // the bug. It wasn't: this file's own text is embedded as string
+    // content inside 09_page-shell.js's outer template literal, so it
+    // passes through one round of backslash escape-cooking (see
+    // cookTemplateLiteralEscapes's own comment above) before a browser
+    // ever parses it as code. A single \b\w survives that pass as a
+    // regex matching a literal backspace byte + "w" (matches nothing,
+    // silently no-ops, exactly the bug this reintroduced); \\b\\w
+    // survives it as the real word-boundary + word-character regex this
+    // is supposed to be. (Proven directly against a git checkout of the
+    // single-escaped version during development -- see this fix's PR --
+    // rather than re-deriving that here on every run.)
+    assert.equal(
+      guessNameFromUrl("https://mdblist.com/lists/hdlists/hd-documentary-movies-1980-to-today"),
+      "HD Documentary Movies 1980 To Today"
+    );
+  });
+
+  it("parseListSearchIntent's source-prefix detection needs the same double-escaping (found while fixing the above)", () => {
+    // Same root cause, same file, a few lines up: \b\s escapes here were
+    // also single-escaped, so every one of these regexes matched nothing
+    // at all -- typing "mdblist trending movies" in Lists > Search never
+    // detected MDBList as the source or stripped it from the search term.
+    // Compared field-by-field rather than via deepEqual on the whole
+    // object -- it's built inside a separate vm realm, whose Object
+    // prototype differs from this test file's own, which trips
+    // deepStrictEqual's own-realm check even when every field matches.
+    const parseListSearchIntent = loadOneClientFunction("19_client-search-and-likes.js", "parseListSearchIntent");
+    const mdb = parseListSearchIntent("mdblist trending movies");
+    assert.equal(mdb.term, "trending movies");
+    assert.equal(mdb.source, "MDBList");
+    assert.equal(mdb.isSourceOnly, false);
+    const trakt = parseListSearchIntent("trakt top picks");
+    assert.equal(trakt.term, "top picks");
+    assert.equal(trakt.source, "Trakt");
+    assert.equal(parseListSearchIntent("just a plain search").source, null);
+  });
+
+  it("detectSource recognizes Trakt watchlist/history URLs even with a trailing query string", () => {
+    assert.equal(configFns.detectSource("https://trakt.tv/users/someone/watchlist?Mode=Show"), "trakt-watchlist");
+    assert.equal(configFns.detectSource("https://trakt.tv/users/someone/history?Mode=Show"), "trakt-history");
+    // Also covers the separate pre-existing gap this fix closed alongside
+    // it: app.trakt.tv was an allowed host (isAllowedCatalogSourceUrl)
+    // but wasn't in this regex's own subdomain match.
+    assert.equal(configFns.detectSource("https://app.trakt.tv/users/someone/watchlist"), "trakt-watchlist");
+    // Still falls through to the generic "trakt" case for an ordinary
+    // list URL -- this fix must not widen the watchlist/history match.
+    assert.equal(configFns.detectSource("https://trakt.tv/users/someone/lists/best-of-2024"), "trakt");
+  });
+
+  it("mdblistJsonUrl strips a trailing query string instead of folding it into the list slug", () => {
+    assert.equal(
+      configFns.mdblistJsonUrl("https://mdblist.com/lists/someone/my-list/?Mode=Show", ""),
+      "https://mdblist.com/lists/someone/my-list/json/?append_to_response=poster"
+    );
+    assert.equal(
+      configFns.mdblistJsonUrl("https://mdblist.com/lists/someone/my-list?Mode=Show", ""),
+      "https://mdblist.com/lists/someone/my-list/json/?append_to_response=poster"
+    );
+  });
+
+  it("mdblistJsonUrl's fix holds end-to-end through /api/preview (HTTP level)", async () => {
+    const env = makeEnv();
+    const realFetch = globalThis.fetch;
+    let requestedUrl = null;
+    globalThis.fetch = async (input) => {
+      requestedUrl = typeof input === "string" ? input : input && input.url;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ movies: [{ title: "A Movie", year: 2020, ids: { imdb: "tt0000001" } }] }),
+      };
+    };
+    try {
+      const r = await call(env, "/api/preview", {
+        method: "POST",
+        json: { url: "https://mdblist.com/lists/someone/my-list/?Mode=Show", type: "movie", skip: 0, sample: 10 },
+      });
+      assert.equal(r.body.ok, true, `expected ok, got ${JSON.stringify(r.body)}`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.ok(requestedUrl, "expected a fetch to have been made");
+    assert.ok(!requestedUrl.includes("Mode"), `fetch URL leaked the query string into the slug: ${requestedUrl}`);
+    assert.equal(requestedUrl, "https://mdblist.com/lists/someone/my-list/json/?append_to_response=poster");
+  });
+});
+
+describe("custom list catalog pagination (imported list See All)", () => {
+  // The reported bug: importing a 250-item list via "Import list from a
+  // link" and adding it to Live Preview & Editor's Catalogs, then clicking
+  // See All, only ever showed 200 items (100 real ones, duplicated) --
+  // because fetchCustomListCatalog ignored `skip` entirely and returned the
+  // whole list on every page request. Live Preview's See All (unlike Your
+  // Custom Lists' own See All, which embeds the full array up front) pages
+  // a Custom List through /api/preview with an advancing skip, so this is
+  // a plain server-side pagination bug, testable directly against the real
+  // source file (00-08 is real standalone JS, see loadSourceFunctions).
+  const catalogFns = loadSourceFunctions("05_catalog-core.js");
+
+  function makeMovieItems(n) {
+    const items = [];
+    for (let i = 0; i < n; i++) {
+      items.push({ imdbId: "tt" + String(1000000 + i), title: "Movie " + i, type: "movie", year: 2000 + (i % 20) });
+    }
+    return items;
+  }
+
+  it("fetchCustomListCatalog advances with skip instead of returning the same page every time", async () => {
+    const entry = { url: "customlist:v1:" + JSON.stringify({ items: makeMovieItems(250), listId: "x" }), type: "movie" };
+    const page0 = await catalogFns.fetchCustomListCatalog(entry, 0, {});
+    const page1 = await catalogFns.fetchCustomListCatalog(entry, 100, {});
+    const page2 = await catalogFns.fetchCustomListCatalog(entry, 200, {});
+
+    assert.equal(page0.length, 100);
+    assert.equal(page1.length, 100);
+    assert.equal(page2.length, 50);
+    assert.notEqual(page1[0].id, page0[0].id, "the page at skip=100 must not repeat page 0's first item");
+
+    const allIds = [...page0, ...page1, ...page2].map((m) => m.id);
+    assert.equal(new Set(allIds).size, 250, "all 250 items across pages must be unique -- no duplicates, none missing");
+  });
+
+  it("fetchCustomListCatalog reports totalItems/maybeMore so /api/preview's pagination actually stops at the end", async () => {
+    const entry = { url: "customlist:v1:" + JSON.stringify({ items: makeMovieItems(250), listId: "x" }), type: "movie" };
+    const lastPage = await catalogFns.fetchCustomListCatalog(entry, 200, {});
+    assert.equal(lastPage.totalItems, 250);
+    const pastEnd = await catalogFns.fetchCustomListCatalog(entry, 250, {});
+    assert.equal(pastEnd.length, 0);
+  });
+
+  it("end-to-end through /api/preview: three successive pages cover all 250 items with no duplicates (HTTP level)", async () => {
+    const env = makeEnv();
+    const url = "customlist:v1:" + JSON.stringify({ items: makeMovieItems(250), listId: "x" });
+    const seen = new Set();
+    let skip = 0;
+    let maybeMore = true;
+    let pages = 0;
+    while (maybeMore && pages < 5) {
+      const r = await call(env, "/api/preview", { method: "POST", json: { url, type: "movie", skip, sample: 100 } });
+      assert.equal(r.body.ok, true, `expected ok, got ${JSON.stringify(r.body)}`);
+      r.body.sample.forEach((it) => seen.add(it.id));
+      skip += r.body.sample.length;
+      maybeMore = r.body.maybeMore;
+      pages++;
+    }
+    assert.equal(seen.size, 250, `expected all 250 unique items across pages, got ${seen.size}`);
+    assert.equal(pages, 3, `expected exactly 3 pages (100+100+50), got ${pages}`);
+  });
+});
+
+describe("a catalog row never keeps a raw URL as its own name", () => {
+  // Reported bug: a row added with the pasted URL also sitting in the
+  // "name" field (however that happened) showed that raw URL as both the
+  // Live Preview shelf's title and its See All page's title -- and on
+  // mobile, a long unbroken URL forced the See All header's like/+Add
+  // buttons off the edge of the screen, since they share a flex row with
+  // the title (see #detailTitle's own min-width: 0 fix in
+  // 09_page-shell.js). addRow now falls back to guessNameFromUrl for a
+  // URL-shaped name so a raw URL never reaches the DOM as a "name" at all.
+  function makeMockDiv() {
+    return { className: "", dataset: {}, classList: { add: () => {} }, innerHTML: "", querySelector: () => null };
+  }
+
+  it("addRow substitutes a humanized name when the given name is itself a URL", () => {
+    const guessNameFromUrl = loadOneClientFunction("19_client-search-and-likes.js", "guessNameFromUrl");
+    let createdDiv = null;
+    const addRow = loadOneClientFunction("16_client-row-core.js", "addRow", {
+      guessNameFromUrl,
+      escapeHtml: (s) => String(s == null ? "" : s),
+      escapeAttr: (s) => String(s == null ? "" : s),
+      entryAvatarColor: () => "#000",
+      sourceRowHtml: () => "<div></div>",
+      updateSourceRemoveButtons: () => {},
+      relocateAddSourceBtn: () => {},
+      initTouchDrag: () => {},
+      checkAllDuplicateUrls: () => {},
+      renumber: () => {},
+      showAddedToast: () => {},
+      suppressSave: false,
+      document: {
+        getElementById: () => ({ appendChild: () => {} }),
+        createElement: () => { createdDiv = makeMockDiv(); return createdDiv; },
+      },
+    });
+
+    const rawUrl = "https://mdblist.com/lists/hdlists/hd-documentary-movies-1980-to-today";
+    addRow(rawUrl, rawUrl, "movie", true, "Custom");
+
+    assert.ok(createdDiv, "expected addRow to create the row element");
+    assert.ok(!createdDiv.innerHTML.includes(rawUrl), "the raw URL must not end up anywhere in the row's own markup");
+    assert.ok(
+      createdDiv.innerHTML.includes('value="HD Documentary Movies 1980 To Today"'),
+      `expected the .name input to carry the humanized name, got: ${createdDiv.innerHTML.slice(0, 400)}`
+    );
+    assert.ok(
+      createdDiv.innerHTML.includes("HD Documentary Movies 1980 To Today - Movies"),
+      "expected the Live Preview shelf title to carry the humanized name too"
+    );
+  });
+
+  it("addRow leaves an already-real name untouched", () => {
+    const guessNameFromUrl = loadOneClientFunction("19_client-search-and-likes.js", "guessNameFromUrl");
+    let createdDiv = null;
+    const addRow = loadOneClientFunction("16_client-row-core.js", "addRow", {
+      guessNameFromUrl,
+      escapeHtml: (s) => String(s == null ? "" : s),
+      escapeAttr: (s) => String(s == null ? "" : s),
+      entryAvatarColor: () => "#000",
+      sourceRowHtml: () => "<div></div>",
+      updateSourceRemoveButtons: () => {},
+      relocateAddSourceBtn: () => {},
+      initTouchDrag: () => {},
+      checkAllDuplicateUrls: () => {},
+      renumber: () => {},
+      showAddedToast: () => {},
+      suppressSave: false,
+      document: {
+        getElementById: () => ({ appendChild: () => {} }),
+        createElement: () => { createdDiv = makeMockDiv(); return createdDiv; },
+      },
+    });
+
+    addRow("My Favorite Movies", "https://mdblist.com/lists/hdlists/hd-documentary-movies-1980-to-today", "movie", true, "Custom");
+    assert.ok(createdDiv.innerHTML.includes('value="My Favorite Movies"'));
+  });
+});
+
+describe("custom list Movies/Shows tab filtering (imported list See All)", () => {
+  // The reported bug: a plain movie item's mapped `showId` fell all the way
+  // back to its own imdbId (the fallback chain's last resort, since a movie
+  // has no real showId), so it came out truthy just like a genuine show's
+  // would -- and the Shows tab's filter (!!it.showId) then matched every
+  // movie right alongside actual shows, making Movies/Shows/All all show
+  // the same items. Three call sites shared this exact fallback; this
+  // covers the two most user-reachable ones (Your Custom Lists' own View
+  // button, and the internal customlist:v1: preloaded-item derivation).
+  const movieItem = { imdbId: "tt1000000", title: "Some Movie", type: "movie", year: 2020 };
+  const formatWatchItemLabel = (it) => ({ title: it.title, subtitle: "" });
+
+  it("Your Custom Lists' View button: a plain movie gets no showId (22_client-creator-profile.js)", () => {
+    const mapper = loadInlineItemMapper(
+      "22_client-creator-profile.js",
+      "const sample = rawListItems.map((it) => {",
+      0,
+      {
+        formatWatchItemLabel,
+        isCw: false,
+        isWatchlist: false,
+        isHistory: false,
+        list: { slug: "imdb-top-rated-movies", type: "movie" },
+        viewBtn: { dataset: { type: "movie" } },
+      }
+    );
+    const mapped = mapper(movieItem);
+    assert.equal(mapped.type, "movie");
+    assert.equal(mapped.showId, null, "a plain movie must not get a truthy showId");
+  });
+
+  it("openListDetailsPage's customlist:v1: derivation: a plain movie gets no showId (23_client-list-management.js)", () => {
+    const mapper = loadInlineItemMapper(
+      "23_client-list-management.js",
+      "const itemsToProcess = isCw ? (typeof dedupeContinueWatchingItems === 'function' ? dedupeContinueWatchingItems(rawItems) : rawItems) : rawItems;\n          const sample = itemsToProcess.map((it) => {",
+      0,
+      {
+        formatWatchItemLabel,
+        isCw: false,
+        isWatchlist: false,
+        isHistory: false,
+        match: { slug: "imdb-top-rated-movies", type: "movie" },
+        type: "movie",
+      }
+    );
+    const mapped = mapper(movieItem);
+    assert.equal(mapped.type, "movie");
+    assert.equal(mapped.showId, null, "a plain movie must not get a truthy showId");
+  });
+
+  it("a genuine show item still keeps its showId (both call sites)", () => {
+    const showItem = { showId: "tt2000000", showTitle: "Some Show", type: "series", id: "tt2000000:1:1" };
+    const creatorMapper = loadInlineItemMapper(
+      "22_client-creator-profile.js",
+      "const sample = rawListItems.map((it) => {",
+      0,
+      {
+        formatWatchItemLabel,
+        isCw: false,
+        isWatchlist: false,
+        isHistory: false,
+        list: { slug: "some-shows", type: "series" },
+        viewBtn: { dataset: { type: "series" } },
+      }
+    );
+    const mapped = creatorMapper(showItem);
+    assert.equal(mapped.type, "series");
+    assert.equal(mapped.showId, "tt2000000");
+  });
+});
+
+describe("list-details grid never renders a duplicate page (defense in depth)", () => {
+  // Second layer for the same 200-vs-250 bug: even with fetchCustomListCatalog
+  // now paginating correctly, appendItems should never let a page that
+  // repeats already-seen ids double up the rendered grid -- the dedup
+  // check right above it already knew those items weren't new (newCount),
+  // it just didn't act on that before concatenating them in.
+  it("a page that repeats already-seen ids is not concatenated into the grid a second time", () => {
+    const seenItemIds = new Set();
+    const winState = { _currentListDetailsAllItems: [] };
+    const appendItems = loadOneClientFunction("23_client-list-management.js", "appendItems", {
+      seenItemIds,
+      window: winState,
+      annotatePersonalItem: (it) => it,
+      listUrl: "customlist:v1:...",
+      name: "Test List",
+      renderPosterGridChunked: () => {},
+      appendPosterGridItems: () => {},
+      gridEl: {},
+    });
+    const page1 = [{ id: "tt1" }, { id: "tt2" }];
+    const newCount1 = appendItems(page1);
+    // A source that doesn't actually honor skip repeats the same page.
+    const newCount2 = appendItems(page1);
+
+    assert.equal(newCount1, 2);
+    assert.equal(newCount2, 0, "the repeated page must be detected as contributing nothing new");
+    assert.equal(
+      winState._currentListDetailsAllItems.length,
+      2,
+      "the repeated page's items must not be rendered a second time"
+    );
+  });
+});
+
+describe("list-details See All scrolls smoothly through a large multi-page list", () => {
+  // The reported bug: scrolling through a large (100-200+ item) list's See
+  // All from Live Preview & Editor was janky/jumpy, unlike Your Custom
+  // Lists' own See All (which embeds the whole list up front and never
+  // re-renders). Root cause: every new page appendItems received got
+  // rendered by handing the WHOLE accumulated item list to
+  // renderPosterGridChunked, which clears the grid (innerHTML = '') and
+  // rebuilds it from scratch -- tearing down and re-inserting every
+  // already-loaded poster card (discarding its already-decoded image)
+  // on every single page as the user scrolled. Fixed by only ever
+  // appending each new page's own items via appendPosterGridItems, which
+  // never clears the grid.
+  it("appendItems appends only each new page's own items, and never rebuilds the whole grid", () => {
+    const renderCalls = [];
+    const appendCalls = [];
+    const winState = {};
+    const appendItems = loadOneClientFunction("23_client-list-management.js", "appendItems", {
+      seenItemIds: new Set(),
+      window: winState,
+      annotatePersonalItem: (it) => it,
+      listUrl: "https://trakt.tv/users/someone/lists/big-list",
+      name: "Big List",
+      gridEl: { isConnected: true },
+      renderPosterGridChunked: (_grid, items) => { renderCalls.push(items.length); },
+      appendPosterGridItems: (_grid, items) => { appendCalls.push(items.length); },
+    });
+
+    const page1 = Array.from({ length: 100 }, (_, i) => ({ id: "tt" + i, type: "movie" }));
+    const page2 = Array.from({ length: 100 }, (_, i) => ({ id: "tt" + (100 + i), type: "movie" }));
+    const page3 = Array.from({ length: 50 }, (_, i) => ({ id: "tt" + (200 + i), type: "movie" }));
+    appendItems(page1);
+    appendItems(page2);
+    appendItems(page3);
+
+    assert.deepEqual(renderCalls, [], "appendItems must never call the full-rebuild renderer (that stays reserved for switching Movies/Shows/All tabs)");
+    assert.deepEqual(appendCalls, [100, 100, 50], "each page must append only its own new items, not the whole accumulated list");
+  });
+});
+
+describe("liked lists feed: this add-on's own lists", () => {
+  it("fetches real name/creator/type/count/likes for an own-platform liked list, and gives it a real fetchable URL for posters (unit)", async () => {
+    let renderedLists = null;
+    const fetchedUrls = [];
+    const makeContainer = () => ({ innerHTML: "", dataset: {}, children: [], innerText: "" });
+    const renderLikedListsFeed = loadOneClientFunction("19_client-search-and-likes.js", "renderLikedListsFeed", {
+      ORIGIN: "https://example.test",
+      document: { getElementById: (id) => (id === "likedListsFeed" ? makeContainer() : null) },
+      getLikedListsSet: () => new Set(["alice/my-list"]),
+      ensureMdblistPopularLoaded: async () => [],
+      guessNameFromUrl: (u) => "Guessed " + u,
+      render5PosterListsFeed: (_container, lists) => { renderedLists = lists; },
+      fetch: async (url) => {
+        fetchedUrls.push(url);
+        return {
+          json: async () => ({ ok: true, name: "Alice's Real List", creator: "alice", type: "movie", itemCount: 42, likes: 7 }),
+        };
+      },
+    });
+    await renderLikedListsFeed();
+
+    assert.ok(fetchedUrls.some((u) => u === "https://example.test/lists/alice/my-list.json?format=object"), `expected the real list-detail endpoint to be fetched, got: ${JSON.stringify(fetchedUrls)}`);
+    assert.ok(renderedLists, "expected render5PosterListsFeed to have been called");
+    const own = renderedLists.find((l) => l.kind === "own");
+    assert.ok(own, "expected an own-platform entry");
+    assert.equal(own.usernameSlug, "alice/my-list");
+    // The bug: this used to always be a generic "Community" placeholder
+    // with a hardcoded item/like count and no poster field at all.
+    assert.equal(own.name, "Alice's Real List");
+    assert.equal(own.user, "alice");
+    assert.equal(own.items, 42);
+    assert.equal(own.likes, 7);
+    // A real, fetchable URL -- what lets the existing poster-preview
+    // mechanism (populateSearchResultPosters, keyed off .url) show real
+    // posters instead of none.
+    assert.equal(own.url, "https://example.test/lists/alice/my-list");
+  });
+
+  it("falls back gracefully when the liked list was deleted/unpublished since (unit)", async () => {
+    let renderedLists = null;
+    const makeContainer = () => ({ innerHTML: "", dataset: {}, children: [], innerText: "" });
+    const renderLikedListsFeed = loadOneClientFunction("19_client-search-and-likes.js", "renderLikedListsFeed", {
+      ORIGIN: "https://example.test",
+      document: { getElementById: (id) => (id === "likedListsFeed" ? makeContainer() : null) },
+      getLikedListsSet: () => new Set(["alice/gone-list"]),
+      ensureMdblistPopularLoaded: async () => [],
+      guessNameFromUrl: (u) => "Guessed " + u,
+      render5PosterListsFeed: (_container, lists) => { renderedLists = lists; },
+      fetch: async () => ({ json: async () => ({ ok: false, error: "No list found at that address." }) }),
+    });
+    await renderLikedListsFeed();
+    const own = renderedLists.find((l) => l.kind === "own");
+    assert.ok(own, "expected an own-platform entry even when the real fetch fails");
+    assert.equal(own.usernameSlug, "alice/gone-list");
+    assert.equal(own.url, "");
+  });
+});
+
+describe("delete-account confirmation", () => {
+  it("client sends the confirm:'DELETE' the server requires (unit)", async () => {
+    let capturedBody = null;
+    const handleDeleteAccount = loadOneClientFunction("22_client-creator-profile.js", "handleDeleteAccount", {
+      ORIGIN: "https://example.test",
+      activeCreator: { creatorName: "alicedelete", displayName: "Alice" },
+      document: { getElementById: () => null },
+      localStorage: { getItem: () => "MYL-TEST-KEY1-KEY2" },
+      fetch: async (_url, opts) => {
+        capturedBody = JSON.parse(opts.body);
+        return { json: async () => ({ ok: true }) };
+      },
+      clearLocalAccountData: () => {},
+      closeModal: () => {},
+      showAddedToast: () => {},
+    });
+    await handleDeleteAccount();
+    assert.ok(capturedBody, "expected handleDeleteAccount to have called fetch");
+    // The actual bug: this call never sent `confirm` at all, so the
+    // server's own check (see the next test) rejected every real delete
+    // attempt with "Missing confirmation." no matter how the person
+    // confirmed in the modal.
+    assert.equal(capturedBody.confirm, "DELETE");
+    assert.equal(capturedBody.creatorName, "alicedelete");
+  });
+
+  it("server rejects a delete-account request with no confirm field (HTTP level)", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedelnoconfirm");
+    const r = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(r.status, 400);
+    assert.match(r.body.error || "", /confirmation/i);
+  });
+
+  it("server accepts and completes a delete-account request with confirm:'DELETE' (HTTP level)", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicedelconfirm");
+    const r = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE" },
+    });
+    assert.equal(r.body.ok, true, `expected ok, got ${JSON.stringify(r.body)}`);
+    // The identity itself is gone -- the same key no longer authenticates.
+    const restore = await call(env, "/api/creator/restore", {
+      method: "POST",
+      json: { creatorName: alice.creatorName, creatorKey: alice.creatorKey },
+    });
+    assert.equal(restore.status, 401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Audit 2026-09-05 -- regression tests for the four production blockers.
+// Each test fails against the code as it was before the corresponding fix.
+// ---------------------------------------------------------------------------
+
+describe("audit fix 1: /api/track-event cannot mint unbounded KV keys", () => {
+  it("ignores list-copy ids that are not one of this add-on's own list URLs", async () => {
+    const env = makeEnv();
+    const events = [];
+    for (let i = 0; i < 40; i++) {
+      events.push({ eventType: "list-copy", id: "SPAM-<img src=x onerror=alert(1)>-" + i });
+    }
+    // External provider URLs are legitimate input but are not lists this
+    // dashboard can show a copy count for -- they must not mint keys either.
+    events.push({ eventType: "list-copy", id: "https://mdblist.com/lists/someone/their-list" });
+    const r = await call(env, "/api/track-event", { method: "POST", json: { events } });
+    assert.equal(r.status, 200);
+    const minted = [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("stats:list_copy:"));
+    assert.deepEqual(minted, [], `expected no keys, got ${JSON.stringify(minted.slice(0, 3))}`);
+  });
+
+  it("still records a copy of one of this add-on's own lists, keyed by its slug", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/api/track-event", {
+      method: "POST",
+      json: { events: [{ eventType: "list-copy", id: "https://example.test/lists/alice/top-ten" }] },
+    });
+    assert.equal(r.status, 200);
+    // Keyed by slug alone -- which is what computeCatalogAndCommunityLeaderboards
+    // looks up (copiesBySlug.get(data.slug)), so the count is now actually readable.
+    assert.equal(env.CONFIGS._store.get("stats:list_copy:top-ten:total"), "1");
+  });
+
+  it("rejects watched/list-add ids that are not real title-id shapes", async () => {
+    const env = makeEnv();
+    await call(env, "/api/track-event", {
+      method: "POST",
+      json: { events: [{ eventType: "watched", id: "<script>alert(1)</script>", title: "x" }] },
+    });
+    const minted = [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("evtcount:") || k.startsWith("evtmeta:"));
+    assert.deepEqual(minted, []);
+
+    // A genuine id still works.
+    await call(env, "/api/track-event", {
+      method: "POST",
+      json: { events: [{ eventType: "watched", id: "tt1234567", title: "Real Movie" }] },
+    });
+    assert.ok([...env.CONFIGS._store.keys()].some((k) => k.startsWith("evtcount:watched:tt1234567:")));
+  });
+
+  it("rate-limits repeated anonymous beacons from one IP", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    for (let i = 0; i < 40; i++) {
+      await call(env, "/api/track-event", {
+        method: "POST",
+        ip,
+        json: { events: [{ eventType: "watched", id: "tt" + i }] },
+      });
+    }
+    const minted = [...env.CONFIGS._store.keys()].filter((k) => k.startsWith("evtmeta:watched:"));
+    assert.ok(minted.length <= 30, `expected the per-IP cap to stop this at 30, got ${minted.length}`);
+  });
+
+  it("admin catalogs/lists panel stays within a bounded subrequest budget", async () => {
+    const env = makeEnv();
+    // Far more keys than any real deployment, as an attacker would have left behind.
+    for (let i = 0; i < 3000; i++) await env.CONFIGS.put(`stats:list_copy:spam-${i}:total`, "1");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+
+    let ops = 0;
+    const origGet = env.CONFIGS.get.bind(env.CONFIGS);
+    const origList = env.CONFIGS.list.bind(env.CONFIGS);
+    env.CONFIGS.get = async (...a) => { ops++; return origGet(...a); };
+    env.CONFIGS.list = async (...a) => { ops++; return origList(...a); };
+
+    const r = await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    assert.equal(r.status, 200, "panel must still render, not throw");
+    // Cloudflare allows 1,000 subrequests per invocation. Before the caps this
+    // was 1:1 with the key count (3,000 here) and the panel broke permanently.
+    assert.ok(ops < 1000, `expected a bounded subrequest count, got ${ops}`);
+  });
+});
+
+describe("audit fix 2: a like cannot revert a concurrent list save", () => {
+  it("keeps the creator's newer items when a like lands mid-save", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alicelikerace");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "Race List", type: "movie", visibility: "public",
+        items: [{ id: "tt1" }, { id: "tt2" }],
+      },
+    });
+    const listKey = [...env.CONFIGS._store.keys()].find((k) => k.startsWith("creatorlist:alicelikerace:"));
+
+    // Park the like immediately after it reads the list record, which is
+    // the exact window applyLikeVote's KV round-trips used to leave open.
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let reads = 0;
+    const origGet = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (k, t) => {
+      const v = await origGet(k, t);
+      if (k === listKey && ++reads === 1) await gate;
+      return v;
+    };
+
+    const likeP = call(env, "/api/lists/like", {
+      method: "POST",
+      json: { username: "alicelikerace", slug: "race-list", action: "like" },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey, slug: "race-list",
+        name: "Race List", type: "movie", visibility: "public",
+        items: [{ id: "tt1" }, { id: "tt2" }, { id: "tt3" }, { id: "tt4" }, { id: "tt5" }],
+      },
+    });
+    release();
+    await likeP;
+
+    const stored = JSON.parse(env.CONFIGS._store.get(listKey));
+    assert.equal(stored.items.length, 5, "the like must not write back its pre-vote snapshot");
+    assert.equal(stored.likes, 1, "and the like itself must still be recorded");
+  });
+});
+
+describe("audit fix 4: unauthenticated permanent writes are bounded", () => {
+  // The three anonymous-publish cases that used to open this block went with
+  // /api/publish-list itself in 1.5.3 -- an unbounded write is not something to
+  // keep bounding once nothing can reach it. /api/save is the only
+  // unauthenticated permanent write left, and the route's absence is pinned
+  // below ("the removed anonymous publish route").
+
+  it("rejects an oversized install config instead of storing it", async () => {
+    const env = makeEnv();
+    const entries = Array.from({ length: 900 }, (_, i) => ({ name: "row " + i, url: "https://mdblist.com/lists/x/y" }));
+    const r = await call(env, "/api/save", { method: "POST", json: { entries } });
+    assert.equal(r.status, 413);
+  });
+
+  it("still saves a normal install config", async () => {
+    const env = makeEnv();
+    const entries = Array.from({ length: 30 }, (_, i) => ({ name: "row " + i, url: "https://mdblist.com/lists/x/y" }));
+    const r = await call(env, "/api/save", { method: "POST", json: { entries } });
+    assert.equal(r.body.ok, true);
+    assert.ok(r.body.id);
+  });
+
+  it("saves large install configs with custom lists over 1MB", async () => {
+    const env = makeEnv();
+    const largeListItems = Array.from({ length: 500 }, (_, i) => ({
+      id: "tt" + (1000000 + i),
+      title: "Movie Title " + i,
+      year: "2020",
+      type: "movie",
+    }));
+    const customUrl = "customlist:v1:" + JSON.stringify({ listSlug: "large-custom", items: largeListItems });
+    const entries = Array.from({ length: 15 }, (_, i) => ({ name: "Custom " + i, url: customUrl, type: "movie" }));
+    const r = await call(env, "/api/save", { method: "POST", json: { entries } });
+    assert.equal(r.body.ok, true);
+    assert.ok(r.body.id);
+  });
+});
+
+describe("audit fix 3: the Continue Watching cron cannot revert a concurrent save", () => {
+  it("keeps watch history a user saved while the cron sweep was mid-flight", async () => {
+    const env = makeEnv();
+    env.TMDB_API_KEY = "test-tmdb-key";
+    const bob = await createUser(env, "bobcronrace");
+    const TKEY = "creatorsynctracking:bobcronrace";
+    await env.CONFIGS.put(TKEY, JSON.stringify({
+      watchHistory: [{ id: "tt9:1:2", type: "episode", showId: "tt9", seasonNum: 1, episodeNum: 2, showTitle: "Show", watchedAt: 1000 }],
+      continueWatching: [], fullyWatchedShowIds: ["tt9"], updatedAt: 1000,
+    }));
+
+    // Minimal TMDB stub: resolve tt9 -> 55, and report an unwatched S1E3 so
+    // the sweep actually has a Continue Watching update to write.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      const url = String(u);
+      const J = (o) => new Response(JSON.stringify(o), { headers: { "content-type": "application/json" } });
+      if (url.includes("/find/")) return J({ tv_results: [{ id: 55 }] });
+      if (/\/tv\/55\/season\/1\b/.test(url)) {
+        return J({ episodes: [
+          { id: 990, episode_number: 2, name: "Ep2", air_date: "2020-01-01" },
+          { id: 991, episode_number: 3, name: "Brand New Ep", air_date: "2020-01-08" },
+        ]});
+      }
+      return J({ episodes: [] });
+    };
+
+    // Park the cron right after ITS OWN read of the tracking blob (the
+    // second read of that key -- the first belongs to ensureTrackingMigrated),
+    // which stands in for the TMDB round-trips that make this window seconds wide.
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    let reads = 0;
+    let cronPhase = true;
+    const origGet = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (k, t) => {
+      const v = await origGet(k, t);
+      if (k === TKEY && cronPhase && ++reads === 2) await gate;
+      return v;
+    };
+
+    try {
+      const pending = [];
+      worker.scheduled({}, env, { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) });
+      await new Promise((r) => setTimeout(r, 40));
+
+      cronPhase = false;
+      await call(env, "/api/creator/sync/save-tracking", {
+        method: "POST",
+        json: {
+          creatorName: bob.creatorName, creatorKey: bob.creatorKey,
+          fullyWatchedShowIds: ["tt9"], continueWatching: [],
+          watchHistory: [
+            { id: "tt9:1:2", type: "episode", showId: "tt9", seasonNum: 1, episodeNum: 2, showTitle: "Show", watchedAt: 1000 },
+            { id: "tt7", type: "movie", title: "Just Watched This", watchedAt: Date.now() },
+          ],
+        },
+      });
+
+      release();
+      await Promise.all(pending);
+      await new Promise((r) => setTimeout(r, 50));
+
+      const stored = JSON.parse(env.CONFIGS._store.get(TKEY));
+      assert.ok(
+        stored.watchHistory.some((i) => i.id === "tt7"),
+        "the cron must not write its stale snapshot over what the user just saved"
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
+describe("audit fix 8: handlePosterImgError works for every call site's markup", () => {
+  // Minimal DOM stand-ins -- enough for the placeholder logic, no jsdom.
+  function makeEl(tag, className = "") {
+    const el = {
+      tagName: tag.toUpperCase(),
+      className,
+      style: {},
+      dataset: {},
+      children: [],
+      parentElement: null,
+      innerHTML: "",
+      get classList() {
+        const self = this;
+        return { contains: (c) => String(self.className).split(/\s+/).includes(c) };
+      },
+      get nextElementSibling() {
+        if (!this.parentElement) return null;
+        const sibs = this.parentElement.children;
+        return sibs[sibs.indexOf(this) + 1] || null;
+      },
+      appendChild(child) { child.parentElement = this; this.children.push(child); return child; },
+      closest() { return null; },
+      querySelector(sel) {
+        const want = sel.replace(":scope > ", "").replace(".", "");
+        return this.children.find((c) => String(c.className).split(/\s+/).includes(want)) || null;
+      },
+    };
+    return el;
+  }
+  function load() {
+    const doc = { createElement: (t) => makeEl(t) };
+    return loadOneClientFunction("23_client-list-management.js", "handlePosterImgError", {
+      document: doc,
+      ORIGIN: "https://example.test",
+      fetch: () => Promise.reject(new Error("no network")),
+      showPosterPlaceholderFor: loadOneClientFunction(
+        "23_client-list-management.js", "showPosterPlaceholderFor", { document: doc }
+      ),
+    });
+  }
+
+  it("reveals the existing placeholder when the markup provides one as the next sibling", () => {
+    const handle = load();
+    const wrap = makeEl("div");
+    const img = wrap.appendChild(makeEl("img", "live-preview-poster"));
+    const ph = wrap.appendChild(makeEl("div", "live-preview-poster live-preview-poster-placeholder"));
+    ph.style.display = "none";
+    img.dataset.hasFailedFallback = "1";
+
+    handle(img);
+    assert.equal(img.style.display, "none");
+    assert.equal(ph.style.display, "flex", "the provided placeholder should be shown");
+    assert.equal(wrap.children.length, 2, "and no second placeholder should be created");
+  });
+
+  it("creates a placeholder when the markup has no placeholder sibling", () => {
+    const handle = load();
+    // The list-card mini tile shape: img, then a remove button, then a
+    // breakpoint-scoped count badge. Neither is a placeholder.
+    const wrap = makeEl("div", "list-card-mini-poster-img-wrap");
+    const img = wrap.appendChild(makeEl("img"));
+    const removeBtn = wrap.appendChild(makeEl("button", "cw-remove-btn"));
+    const countBadge = wrap.appendChild(makeEl("div", "list-card-count-overlay desktop-only"));
+    img.dataset.hasFailedFallback = "1";
+
+    handle(img);
+    assert.equal(img.style.display, "none");
+    // The actual regression: the old code set display:flex on whatever sat
+    // next to the img. On the count badge that overrode the media query
+    // that hides it at the other breakpoint, and no placeholder ever
+    // appeared -- just an empty gap.
+    assert.equal(removeBtn.style.display, undefined, "must not touch the remove button");
+    assert.equal(countBadge.style.display, undefined, "must not override the badge's breakpoint CSS");
+    const created = wrap.children.find((c) => String(c.className).includes("live-preview-poster-placeholder"));
+    assert.ok(created, "a 'No poster' placeholder should have been created");
+    assert.equal(created.style.display, "flex");
+    assert.match(created.innerHTML, /No poster/);
+  });
+
+  it("does not stack placeholders when called twice", () => {
+    const handle = load();
+    const wrap = makeEl("div");
+    const img = wrap.appendChild(makeEl("img"));
+    img.dataset.hasFailedFallback = "1";
+    handle(img);
+    handle(img);
+    const phs = wrap.children.filter((c) => String(c.className).includes("live-preview-poster-placeholder"));
+    assert.equal(phs.length, 1);
+  });
+
+  it("handles an img with no sibling at all (the swapped-in fallback image)", () => {
+    const handle = load();
+    const wrap = makeEl("div");
+    const img = wrap.appendChild(makeEl("img", "live-preview-poster"));
+    img.dataset.hasFailedFallback = "1";
+    handle(img);
+    assert.ok(wrap.children.some((c) => String(c.className).includes("live-preview-poster-placeholder")));
+  });
+});
+
+// /api/bulk-resolve issues up to two TMDB calls per title. Left unstubbed the
+// tests below make those calls for real: 5,000 of them for the rate-limit test
+// alone, against api.themoviedb.org with a bogus key. Locally that is 30
+// seconds of pure network wait (3 seconds of CPU); on a CI runner with real
+// internet it is slow enough to look like a hung job, which is exactly what it
+// did. Stubbed, the same tests run in milliseconds and assert the same things.
+function stubTmdbSearch() {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (u) => {
+    calls++;
+    const href = typeof u === "string" ? u : (u && u.url) || "";
+    const body = href.includes("/external_ids")
+      ? { imdb_id: "tt0000001" }
+      : { results: [{ id: 1, title: "A Film", release_date: "2001-01-01" }] };
+    return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  return { restore: () => { globalThis.fetch = realFetch; }, count: () => calls };
+}
+
+describe("audit fix 5: shared-key fan-out endpoints are bounded", () => {
+  it("rejects a bulk-resolve request larger than the server's fan-out cap", async () => {
+    const env = makeEnv();
+    const items = Array.from({ length: 500 }, (_, i) => ({ title: "Film " + i, year: 2000 }));
+    const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items } });
+    // Two TMDB calls per item: 500 items would have been ~1,000 subrequests,
+    // past Cloudflare's per-invocation limit, on the owner's shared key.
+    assert.equal(r.status, 413);
+  });
+
+  it("rate-limits bulk-resolve by titles, not by requests, from one IP", async () => {
+    // The bucket is charged in TITLES. It used to be charged per request,
+    // which was 4,000 titles a minute while a request carried 200 of them --
+    // and would have silently become 480 once the subrequest budget started
+    // splitting one request across several invocations. Counting the thing
+    // the endpoint actually spends (the owner's TMDB quota) keeps the ceiling
+    // where it was however the work is divided up.
+    // A paid-plan budget, so one request really does process its whole
+    // 200-title batch -- which also pins the env override. On the default
+    // free-safe budget the same 30 requests would only be charged for the 24
+    // titles each one actually gets through, which is the point: the bucket
+    // follows the TMDB quota spent, not the number of HTTP calls made.
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv({ BULK_RESOLVE_SUBREQUEST_BUDGET: "400" });
+      const ip = nextIp();
+      const batch = Array.from({ length: 200 }, (_, i) => ({ title: "X" + i, year: 2000 }));
+      let limited = 0;
+      for (let i = 0; i < 25; i++) {
+        const r = await call(env, "/api/bulk-resolve", { method: "POST", ip, json: { items: batch } });
+        if (r.status === 429) limited++;
+      }
+      assert.ok(limited > 0, "5,000 titles from one IP in a minute must not all be served");
+
+      // ...and a handful of small lookups is nowhere near the ceiling, where
+      // per-request counting would have thrown them away after 20.
+      const env2 = makeEnv();
+      const ip2 = nextIp();
+      let ok = 0;
+      for (let i = 0; i < 25; i++) {
+        const r = await call(env2, "/api/bulk-resolve", {
+          method: "POST", ip: ip2, json: { items: [{ title: "X", year: 2000 }] },
+        });
+        if (r.status !== 429) ok++;
+      }
+      assert.equal(ok, 25, "25 single-title lookups is 25 titles, not 25 units of the old budget");
+    } finally { tmdb.restore(); }
+  });
+
+  // This test used to assert that a caller supplying their own tmdbKey "must
+  // never be rate-limited". That was the wrong property, and it was the
+  // vulnerability: bringing your own key means you are spending your own
+  // TMDB quota, but it never meant you were spending your own subrequests,
+  // and the field was never validated. Any non-empty string therefore
+  // unlocked an unlimited 60-id fan-out against this Worker's budget.
+  // The correct property is a HIGHER ceiling, not the absence of one.
+  it("gives bring-your-own-key callers more headroom on /api/details/batch, not an exemption", async () => {
+    // Charged in IDS since 1.5.3, not requests. The ceilings were 60 and 240
+    // REQUESTS a minute while one request carried up to 60 ids; now that the
+    // subrequest budget can split a refresh across invocations, counting
+    // requests would have cut the real ceiling by the number of chunks. 3,600
+    // and 14,400 ids are the same ceilings in the unit the endpoint spends.
+    const env = makeEnv();
+    const spend = async (used, extra = {}) => {
+      const ip = nextIp();
+      await env.CONFIGS.put(`ratelimit:detailsbatch:${ip}`, String(used));
+      return call(env, "/api/details/batch", { method: "POST", ip, json: { ids: ["tt1"], ...extra } });
+    };
+
+    assert.notEqual((await spend(3599)).status, 429, "under the shared ceiling must still be served");
+    assert.equal((await spend(3600)).status, 429, "shared-key callers should hit the limit");
+
+    // The headroom the old exemption existed to give is preserved: a caller
+    // with their own key sails past the shared-key ceiling.
+    assert.notEqual((await spend(3600, { tmdbKey: "user-own-key" })).status, 429,
+      "a caller with their own key should still clear the shared-key ceiling");
+
+    // ...but it is a ceiling, not an exemption. Bringing your own key means
+    // you are spending your own TMDB quota; it never meant you were spending
+    // your own subrequests.
+    assert.equal((await spend(14400, { tmdbKey: "anything-at-all" })).status, 429,
+      "any non-empty tmdbKey still bought unlimited fan-out");
+  });
+
+  it("gives bring-your-own-key callers more headroom on /api/recommendations, not an exemption", async () => {
+    // Up to ~72 outbound subrequests per call, so this is the bigger
+    // amplifier of the two.
+    const env = makeEnv();
+    const sharedIp = nextIp();
+    let sharedLimited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: sharedIp, json: { movieIds: [], showIds: [] },
+      });
+      if (r.status === 429) sharedLimited++;
+    }
+    assert.ok(sharedLimited > 0, "shared-key callers should hit the limit");
+
+    const ownKeyIp = nextIp();
+    let ownKeyLimited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: ownKeyIp, json: { movieIds: [], showIds: [], tmdbKey: "user-own-key" },
+      });
+      if (r.status === 429) ownKeyLimited++;
+    }
+    assert.equal(ownKeyLimited, 0, "a caller with their own key should still clear the shared-key ceiling");
+
+    const floodIp = nextIp();
+    let floodLimited = 0;
+    for (let i = 0; i < 140; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: floodIp, json: { movieIds: [], showIds: [], tmdbKey: "x" },
+      });
+      if (r.status === 429) floodLimited++;
+    }
+    assert.ok(floodLimited > 0, "any non-empty tmdbKey still bought unlimited fan-out");
+  });
+
+  it("rate-limits /api/recommendations only when it falls back to the shared TMDB key", async () => {
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", { method: "POST", ip, json: { movieIds: [] } });
+      if (r.status === 429) limited++;
+    }
+    assert.ok(limited > 0, "shared-key callers should hit the limit");
+
+    const ownKeyIp = nextIp();
+    let ownKeyLimited = 0;
+    for (let i = 0; i < 40; i++) {
+      const r = await call(env, "/api/recommendations", {
+        method: "POST", ip: ownKeyIp, json: { movieIds: [], tmdbKey: "user-own-key" },
+      });
+      if (r.status === 429) ownKeyLimited++;
+    }
+    assert.equal(ownKeyLimited, 0);
+  });
+
+  it("client chunks bulk-resolve to exactly the size the server accepts", () => {
+    // The chunk size is interpolated from the same server constant the
+    // route validates against, so the two cannot drift apart.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "18_client-copy-and-trakt-export.js"), "utf8");
+    assert.match(src, /const CHUNK = \$\{BULK_RESOLVE_ITEMS_MAX\};/,
+      "the client chunk size must come from BULK_RESOLVE_ITEMS_MAX, not a hardcoded number");
+    const constants = fs.readFileSync(path.join(REPO_ROOT, "00_constants.js"), "utf8");
+    const m = constants.match(/const BULK_RESOLVE_ITEMS_MAX = (\d+);/);
+    assert.ok(m, "BULK_RESOLVE_ITEMS_MAX should be defined in 00_constants.js");
+    // ~2 TMDB calls per item must stay well inside Cloudflare's 1,000
+    // subrequests per invocation.
+    assert.ok(Number(m[1]) * 2 < 900, "the cap must leave subrequest headroom");
+  });
+
+  it("leaves caller-credentialed provider endpoints unthrottled", async () => {
+    // These spend the CALLER's provider quota (they 400 without a token),
+    // so a limit here would only break large legitimate history syncs.
+    const env = makeEnv();
+    const ip = nextIp();
+    let limited = 0;
+    for (let i = 0; i < 30; i++) {
+      const r = await call(env, "/api/trakt-history-raw", {
+        method: "POST", ip, json: { accessToken: "" },
+      });
+      if (r.status === 429) limited++;
+    }
+    assert.equal(limited, 0);
+  });
+});
+
+describe("audit fix 10: admin Community Lists ranks by likes, not by key order", () => {
+  async function seed(env, count) {
+    const alice = await createUser(env, "rankuser");
+    for (let i = 0; i < count; i++) {
+      await call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+        name: "List " + String(i).padStart(3, "0"), type: "movie",
+        visibility: "public", items: [{ id: "tt1" }],
+      }});
+    }
+    // The genuinely most-liked list sorts LAST alphabetically.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+      name: "ZZZ Most Liked", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    for (let i = 0; i < 5; i++) {
+      await call(env, "/api/lists/like", { method: "POST", json: { username: "rankuser", slug: "zzz-most-liked", action: "like" } });
+    }
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    return (login.headers.get("set-cookie") || "").split(";")[0];
+  }
+
+  it("shows lists at all (the record has no creatorName field to filter on)", async () => {
+    const env = makeEnv();
+    const cookie = await seed(env, 2);
+    const r = await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    // /api/creator/lists/save writes { name, slug, type, items, visibility,
+    // likes, createdAt, updatedAt } -- no creatorName; the creator is in the
+    // KEY. The old code required data.creatorName and so dropped every
+    // single list, leaving this panel permanently empty without D1.
+    assert.ok((r.body.communityLists || []).length > 0, "the panel must not be empty");
+    assert.ok(r.body.communityLists.every((l) => l.creator), "every row needs a creator");
+  });
+
+  it("ranks the genuinely most-liked list first, past the 100-row cap", async () => {
+    const env = makeEnv();
+    const cookie = await seed(env, 119);
+    // First load warms the index (rebuilt in the background), same as
+    // /api/search-published-lists.
+    await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    const r = await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    const lists = r.body.communityLists || [];
+    assert.equal(lists[0].name, "ZZZ Most Liked", "top row must be the most-liked list");
+    assert.equal(lists[0].likes, 5);
+  });
+
+  it("reads the panel from one KV get instead of one per candidate", async () => {
+    const env = makeEnv();
+    const cookie = await seed(env, 119);
+    await call(env, "/admin/api/analytics?section=catalogs_lists", { cookie });
+    let gets = 0;
+    const og = env.CONFIGS.get.bind(env.CONFIGS);
+    env.CONFIGS.get = async (...a) => { gets++; return og(...a); };
+    // The directory index is 32 shards since 1.5.3, so reading it costs 32
+    // gets. What this test is about is that the panel does NOT spend one get
+    // per candidate list: 119 candidates, a bound well under that.
+    assert.ok(gets < 40, `expected the index read and little else, got ${gets}`);
+    assert.ok(gets < 119, "the panel is reading one key per candidate again");
+  });
+});
+
+// Catalogs -> Quick Add used to be ten bare headings on the page background,
+// while Channels -> Quick Add put its heading, its explanatory line and its
+// buttons inside one card. These pin the two on the same shape -- the risk is
+// not that a card looks wrong, it is that a section added later quietly goes
+// back to a naked heading and nobody notices until it is live.
+// Marking a feedback item done answered 500 with "Could not save that change.
+// Please try again." whatever had actually gone wrong, and wrote nothing to the
+// log -- so neither the admin looking at the toast nor anyone reading the logs
+// afterwards could tell a exhausted KV write budget from a transient blip.
+// All four feedback writes bound the caught error and dropped it.
+describe("admin feedback: a failed write says what failed", () => {
+  const entry = {
+    id: "1757380000000:abc123def456",
+    message: "Something is broken",
+    category: "bug",
+    createdAt: 1757380000000,
+    completed: false,
+    messages: [{ id: "m1", sender: "user", senderName: "User", text: "Something is broken", timestamp: 1757380000000 }],
+  };
+
+  // Reads keep working while writes throw -- which is what an exhausted KV
+  // write budget looks like from inside a Worker, and is the shape of the
+  // report: the inbox lists fine, marking one done 500s.
+  async function withFailingWrite(pathname, body, failure) {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, ADMIN_KEY: "test-admin-key" });
+    kv._store.set("feedback:" + entry.id, JSON.stringify(entry));
+    const cookie = await adminCookie(env);
+    const realPut = kv.put.bind(kv);
+    kv.put = async (k, ...rest) => {
+      if (String(k).startsWith("feedback:")) throw failure;
+      return realPut(k, ...rest);
+    };
+    const logged = [];
+    const realErr = console.error;
+    console.error = (...a) => logged.push(a.map(String).join(" "));
+    try {
+      const r = await call(env, pathname, { method: "POST", cookie, json: body });
+      return { status: r.status, error: r.body && r.body.error, logged };
+    } finally {
+      console.error = realErr;
+    }
+  }
+
+  const budgetGone = () => new Error("KV PUT failed: 429 Too Many Requests - daily request limit exceeded");
+
+  it("tells the admin what went wrong instead of a fixed 'try again'", async () => {
+    const r = await withFailingWrite("/admin/api/feedback/status", { id: entry.id, completed: true }, budgetGone());
+    assert.equal(r.status, 500);
+    assert.match(r.error, /daily request limit exceeded/,
+      "the operator has to be able to tell a spent write budget from a blip");
+  });
+
+  it("writes the real error to the log as well", async () => {
+    const r = await withFailingWrite("/admin/api/feedback/status", { id: entry.id, completed: true }, budgetGone());
+    assert.ok(r.logged.some((l) => /daily request limit exceeded/.test(l)),
+      "nothing reached the log at all before this, so a report of it was unanswerable");
+  });
+
+  it("keeps the old wording when the error carries no message of its own", async () => {
+    const r = await withFailingWrite("/admin/api/feedback/status", { id: entry.id, completed: true }, new Error(""));
+    assert.equal(r.error, "Could not save that change. Please try again.",
+      "an empty error must not surface as a blank or as the literal word Error");
+  });
+
+  it("redacts a url or a credential out of what it shows", async () => {
+    const r = await withFailingWrite("/admin/api/feedback/status", { id: entry.id, completed: true },
+      // Deliberately not shaped like any real provider's key: long enough to
+      // trip safeErrorMessage's bare-credential rule ([A-Za-z0-9_-]{32,}) and
+      // its labelled token= rule, without imitating a live key well enough for
+      // GitHub's push protection to reject the commit carrying it.
+      new Error("PUT https://kv.example/ns failed, token=EXAMPLE-NOT-A-REAL-CREDENTIAL-0123456789"));
+    assert.doesNotMatch(r.error, /EXAMPLE-NOT-A-REAL-CREDENTIAL/, "a credential must not come back in the response");
+    assert.doesNotMatch(r.error, /https:\/\/kv\.example/);
+    assert.ok(r.logged.some((l) => /EXAMPLE-NOT-A-REAL-CREDENTIAL/.test(l)),
+      "but the raw error still has to reach the log");
+  });
+
+  it("does the same for the reply and edit writes", async () => {
+    const reply = await withFailingWrite("/admin/api/feedback/reply", { id: entry.id, message: "on it" }, budgetGone());
+    assert.match(reply.error, /daily request limit exceeded/);
+    const edit = await withFailingWrite("/admin/api/feedback/edit", { id: entry.id, message: "reworded" }, budgetGone());
+    assert.match(edit.error, /daily request limit exceeded/);
+  });
+
+  it("does not turn a failed reply into a duplicate thread", async () => {
+    // The fifth swallowed catch, and the one that lost data rather than just
+    // context: it was `catch (e) {}`, and falling out of that block carries on
+    // into the New Thread path below it. A reply whose write failed was filed
+    // as its own fresh report, detached from the conversation it answered --
+    // sender told it went through, admin left with an orphan.
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    kv._store.set("feedback:" + entry.id, JSON.stringify(entry));
+    const realPut = kv.put.bind(kv);
+    kv.put = async (k, ...rest) => {
+      if (String(k).startsWith("feedback:")) throw new Error("KV PUT failed: daily request limit exceeded");
+      return realPut(k, ...rest);
+    };
+    const realErr = console.error;
+    console.error = () => {};
+    let r;
+    try {
+      r = await call(env, "/api/feedback", {
+        method: "POST", ip: nextIp(),
+        json: { message: "any progress on this?", threadId: entry.id },
+      });
+    } finally {
+      console.error = realErr;
+    }
+    assert.equal(r.status, 500, "a reply that could not be saved must say so");
+    assert.notEqual(r.body.ok, true);
+    const threads = [...kv._store.keys()].filter((k) => k.startsWith("feedback:"));
+    assert.deepEqual(threads, ["feedback:" + entry.id],
+      `a failed reply minted a second thread: ${JSON.stringify(threads)}`);
+  });
+
+  it("still falls through to a new thread when the id is simply unknown", async () => {
+    // The fallthrough the empty catch was sitting next to is legitimate and
+    // has to survive: an unknown thread id never enters that block at all.
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const r = await call(env, "/api/feedback", {
+      method: "POST", ip: nextIp(),
+      json: { message: "first report", threadId: "1700000000000:doesnotexist" },
+    });
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+    const threads = [...kv._store.keys()].filter((k) => k.startsWith("feedback:"));
+    assert.equal(threads.length, 1, "an unknown thread id still files a new report");
+    assert.notEqual(threads[0], "feedback:1700000000000:doesnotexist",
+      "and it gets its own id rather than adopting the one it was handed");
+  });
+
+  it("leaves no feedback write that drops the error it caught", () => {
+    // The defect was structural: four catches that bound `e` and never used
+    // it. This is what stops a fifth being added the same way.
+    const sources = ["25_api-catalog-routes.js", "26_api-creator-and-admin-routes.js"];
+    for (const rel of sources) {
+      const src = fs.readFileSync(path.join(REPO_ROOT, rel), "utf8");
+      let from = 0;
+      for (;;) {
+        const at = src.indexOf("await putFeedbackThread(", from);
+        if (at === -1) break;
+        from = at + 1;
+        // The catch belonging to this write, up to the end of its block.
+        const after = src.slice(at, at + 1600);
+        const catchAt = after.indexOf("} catch");
+        assert.notEqual(catchAt, -1, `${rel}: a putFeedbackThread with no catch at all`);
+        const block = after.slice(catchAt, after.indexOf("}", after.indexOf("return", catchAt)) + 1);
+        assert.match(block, /safeErrorMessage\(/,
+          `${rel}: a putFeedbackThread failure is being swallowed again:\n${block}`);
+      }
+    }
+  });
+});
+
+// Lists -> Liked showed nothing until the Refresh button was pressed, and a
+// browser reload put it straight back to empty.
+//
+// #likedListsFeed is the one feed container that ships with a child in the
+// markup -- the "No liked lists yet" placeholder -- and switchListsSubmenu
+// used the same "children.length > 0" test as the five genuinely-empty
+// containers beside it to decide whether the feed had already loaded. That
+// test was true from the first paint, so the loader never ran.
+describe("Lists -> Liked: the feed loads without being asked twice", () => {
+  const markup = fs.readFileSync(path.join(REPO_ROOT, "12_tab-custom-lists.js"), "utf8");
+  const core = fs.readFileSync(path.join(REPO_ROOT, "16_client-row-core.js"), "utf8");
+  // Anchored inside switchListsSubmenu specifically: switchTab earlier in the
+  // same file has its own `if (name === ...)` chain, so an unanchored search
+  // finds that one and silently tests nothing.
+  const switcher = core.slice(core.indexOf("function switchListsSubmenu"));
+  // Comments stripped: the branch carries an explanation of this very bug,
+  // which names both #likedListsFeed and children.length. Asserting over the
+  // raw text would fail on the prose describing the fix rather than on the
+  // code, and would push the next person to delete the explanation.
+  const likedBranch = switcher
+    .slice(switcher.indexOf("if (name === 'liked')"), switcher.indexOf("\n}"))
+    .replace(/^\s*\/\/.*$/gm, "");
+
+  it("never decides the feed has loaded by looking at the placeholder", () => {
+    // The bug itself. #likedListsFeed carries a child before anything has
+    // loaded, so nothing may read its children to answer "is it loaded".
+    assert.ok(!/likedListsFeed/.test(likedBranch),
+      "switchListsSubmenu must not inspect #likedListsFeed to decide whether to load it");
+    assert.ok(!/children\.length/.test(likedBranch),
+      "a has-content guard here is what stopped the feed loading at all");
+    assert.match(likedBranch, /renderLikedListsFeed\(\)/,
+      "switching to Liked must call the loader");
+  });
+
+  it("leaves the load-or-skip decision to the one function that does it right", () => {
+    // renderLikedListsFeed returns early when the liked count it last
+    // rendered still matches and the container is not mid-load. The caller's
+    // job is to call it, not to second-guess it.
+    const feed = fs.readFileSync(path.join(REPO_ROOT, "19_client-search-and-likes.js"), "utf8");
+    const fn = feed.slice(feed.indexOf("async function renderLikedListsFeed"));
+    assert.match(fn.slice(0, 1200), /if \(!forceRefresh && container\.dataset\.likedCount === String\(likedUrls\.length\)/,
+      "the loader's own guard is what makes the unconditional call cheap");
+  });
+
+  it("gives Refresh something to do", () => {
+    // Without the argument the button hit the loader's early return the
+    // moment the feed had rendered once, so it refreshed nothing -- the same
+    // shape as Discover's own Refresh buttons, which pass true.
+    assert.match(markup, /onclick="renderLikedListsFeed\(true\)"/,
+      "the Refresh button must force a refresh");
+  });
+
+  it("puts the panel in a card like every other Lists sub-panel", () => {
+    const liked = markup.slice(markup.indexOf('id="listsSubLiked"'), markup.indexOf('id="listsSubCreateList"'));
+    assert.match(liked, /<div class="panel">/, "Lists -> Liked must be a card");
+    assert.match(liked, /class="shelf-title">Lists You Liked</);
+    assert.match(liked, /<p style="margin:0 0 10px; color:var\(--muted\)/,
+      "and carry the same one-line description its siblings do");
+    // The card has to close after the feed, not before it.
+    assert.ok(liked.indexOf('id="likedListsFeed"') < liked.lastIndexOf("</div>"),
+      "the feed must be inside the card");
+  });
+});
+
+describe("Catalogs -> Quick Add: every section is a card with a subtitle", () => {
+  const catalogs = fs.readFileSync(path.join(REPO_ROOT, "10_tab-search-add.js"), "utf8");
+  const channels = fs.readFileSync(path.join(REPO_ROOT, "13_tab-channels.js"), "utf8");
+  const shell = fs.readFileSync(path.join(REPO_ROOT, "09_page-shell.js"), "utf8");
+  const count = (src, re) => (src.match(re) || []).length;
+
+  it("gives every section a card, a title and a subtitle -- one of each", () => {
+    // The "+ Add all" button is the thing that makes a section a section, so
+    // it is what the other three are counted against. A new section added
+    // without a card or without its subtitle fails here rather than shipping.
+    const sections = count(catalogs, /qa-add-all-btn/g);
+    assert.ok(sections >= 10, `expected the Quick Add sections, found ${sections}`);
+    assert.equal(count(catalogs, /class="shelf-section discover-shelf panel qa-shelf-card"/g), sections,
+      "every Quick Add section must be a card");
+    assert.equal(count(catalogs, /class="qa-shelf-sub"/g), sections,
+      "every Quick Add section must carry the line explaining what it adds");
+    // Not counted against `sections`: this file also holds the My Catalogs
+    // sub-panel, whose "Live Preview & Editor" is a shelf-title outside Quick
+    // Add entirely. That each card has its own title is checked below, where
+    // the scope is one card rather than the whole file.
+  });
+
+  it("keeps the header, the subtitle and the grid INSIDE the card", () => {
+    // The whole point of the change. A card that closes before its grid would
+    // render as a header strip with the shelf loose underneath it.
+    const blocks = catalogs.split('<div class="shelf-section discover-shelf panel qa-shelf-card"').slice(1);
+    assert.ok(blocks.length >= 10);
+    for (const block of blocks) {
+      const body = block.slice(0, block.indexOf("\n    </div>"));
+      assert.match(body, /class="shelf-title"/, "the title must be inside the card");
+      assert.match(body, /qa-add-all-btn/, "the Add all button must be inside the card");
+      assert.match(body, /class="qa-shelf-sub"/, "the subtitle must be inside the card");
+      assert.match(body, /\$\{\w+Html\}/, "the shelf grid must be inside the card");
+    }
+  });
+
+  it("shares one subtitle class with Channels -> Quick Add", () => {
+    // This is where the pattern came from. Two copies of the same inline style
+    // is how the two drift apart.
+    assert.match(channels, /<p class="qa-shelf-sub">Instant 1-click TV channels/);
+    assert.match(shell, /\.qa-shelf-sub\s*\{/, "the shared class must be defined in the stylesheet");
+    assert.match(shell, /\.qa-shelf-card\s*\{/);
+  });
+});
+
+describe("audit fix 14: every env var the code requires is documented", () => {
+  it("names MDBLIST_CLIENT_SECRET in both README.md and wrangler.toml", () => {
+    const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+    const wrangler = fs.readFileSync(path.join(REPO_ROOT, "wrangler.toml"), "utf8");
+    assert.match(readme, /MDBLIST_CLIENT_SECRET/);
+    assert.match(wrangler, /MDBLIST_CLIENT_SECRET/);
+  });
+
+  it("documents every env var the Worker actually reads", () => {
+    // Guards the whole class: an operator following the setup docs exactly
+    // should never hit a feature that reports itself "not configured".
+    const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+    const wrangler = fs.readFileSync(path.join(REPO_ROOT, "wrangler.toml"), "utf8");
+    const docs = readme + "\n" + wrangler;
+    const used = new Set();
+    for (const f of fs.readdirSync(REPO_ROOT).filter((n) => /^\d\d_.*\.js$/.test(n))) {
+      const src = fs.readFileSync(path.join(REPO_ROOT, f), "utf8");
+      for (const m of src.matchAll(/\benv\.([A-Z][A-Z0-9_]+)/g)) used.add(m[1]);
+    }
+    const undocumented = [...used].filter((name) => !docs.includes(name)).sort();
+    assert.deepEqual(undocumented, [], `undocumented env vars: ${undocumented.join(", ")}`);
+  });
+});
+
+
+describe("audit fix 9: stat counters are atomic when D1 is bound", () => {
+  it("records every one of 20 concurrent page views (the KV path records ~1)", async () => {
+    const kvOnly = makeEnv();
+    await Promise.all(Array.from({ length: 20 }, () => call(kvOnly, "/")));
+    const kvCount = parseInt(kvOnly.CONFIGS._store.get("stats:pageviews:total") || "0", 10);
+
+    const withD1 = makeEnv({ DB: makeD1() });
+    await Promise.all(Array.from({ length: 20 }, () => call(withD1, "/")));
+    const d1Count = withD1.DB._stat("pageviews", "total") || 0;
+
+    // The KV read-modify-write loses almost all of them: every concurrent
+    // request reads the same value and writes the same value+1.
+    assert.ok(kvCount < 20, `KV path is expected to lose updates, got ${kvCount}`);
+    // The D1 upsert increments inside the statement, so none are lost.
+    assert.equal(d1Count, 20, `D1 path must record all 20, got ${d1Count}`);
+  });
+
+  it("writes both the all-time and the per-day bucket", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    await call(env, "/");
+    const buckets = env.DB._statBuckets("pageviews");
+    assert.equal(buckets.length, 2);
+    assert.ok(buckets.includes("total"));
+    assert.ok(buckets.some((b) => /^\d{4}-\d{2}-\d{2}$/.test(b)), "expected a YYYY-MM-DD day bucket");
+  });
+
+  it("the admin dashboard treats D1 as authoritative over a stale KV copy", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    for (let i = 0; i < 7; i++) await call(env, "/");
+    // A leftover KV value from before D1 was bound must NOT win: it is the
+    // undercounted one, and reading it is what this fix exists to stop.
+    await env.CONFIGS.put("stats:pageviews:total", "3");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+    const r = await call(env, "/admin", { cookie });
+    assert.match(r.text, /<div class="stat-value">7<\/div>/, "expected the D1 count (7), not the stale KV copy (3)");
+    assert.doesNotMatch(r.text, /<div class="stat-value">3<\/div>\s*<div class="stat-label">Total page views<\/div>/);
+  });
+
+  it("falls back to the KV count when D1 has no row yet (not migrated)", async () => {
+    // Binding D1 must not make an existing dashboard's history vanish
+    // before the operator presses "Migrate KV -> D1".
+    const env = makeEnv({ DB: makeD1() });
+    await env.CONFIGS.put("stats:pageviews:total", "4242");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+    const r = await call(env, "/admin", { cookie });
+    assert.match(r.text, /<div class="stat-value">4242<\/div>/);
+  });
+
+  it("migrate-d1 copies KV counters across, and is safe to run twice", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    await env.CONFIGS.put("stats:pageviews:total", "100");
+    await env.CONFIGS.put("stats:pageviews:2026-09-01", "40");
+    // Non-counter stats keys must not be dragged into an integer column.
+    await env.CONFIGS.put("stats:genres:alltime", JSON.stringify({ Drama: 3 }));
+    await env.CONFIGS.put("stats:genredecade:migrated", "1");
+
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+
+    const first = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    assert.equal(first.body.ok, true);
+    assert.equal(env.DB._stat("pageviews", "total"), 100);
+    assert.equal(env.DB._stat("pageviews", "2026-09-01"), 40);
+    assert.equal(env.DB._stat("genres", "alltime"), undefined, "JSON blobs must not be migrated as counters");
+
+    // Re-running must not double the counts (DO NOTHING, not n = n + ...).
+    await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    assert.equal(env.DB._stat("pageviews", "total"), 100, "a second migration must not double counts");
+  });
+
+  // migrate-d1 spends a KV read plus a D1 statement per key, both of which
+  // count against Cloudflare's 1,000-subrequest cap. As a single unbounded
+  // pass it therefore aborted partway through on exactly the sites big
+  // enough to need it, backfilling a prefix of the accounts and reporting
+  // ok -- and an account left in KV but missing from D1 is the case the
+  // key-rotation endpoints get wrong, because a D1 UPDATE matching zero
+  // rows still reports success.
+  it("migrate-d1 backfills every account at a scale that used to abort it", async () => {
+    const n = 900;
+    // A KV that enforces the real per-invocation limit, and a D1 whose
+    // statements are charged against the same budget, as they really are.
+    const inner = makeKv();
+    let spentThisInvocation = 0;
+    let peak = 0;
+    const charge = () => {
+      spentThisInvocation += 1;
+      if (spentThisInvocation > peak) peak = spentThisInvocation;
+      if (spentThisInvocation > 1000) throw new Error("Too many subrequests.");
+    };
+    const kv = {
+      _store: inner._store,
+      async get(...a) { charge(); return inner.get(...a); },
+      async put(...a) { charge(); return inner.put(...a); },
+      async delete(...a) { charge(); return inner.delete(...a); },
+      async list(...a) { charge(); return inner.list(...a); },
+    };
+    const realDb = makeD1();
+    const db = {
+      _creators: realDb._creators,
+      _lists: realDb._lists,
+      _stat: realDb._stat,
+      prepare(sql) {
+        const st = realDb.prepare(sql);
+        const chargedRun = (target) => async () => { charge(); return target.run(); };
+        const chargedAll = (target) => async () => { charge(); return target.all(); };
+        return {
+          bind(...a) {
+            const b = st.bind(...a);
+            return { run: chargedRun(b), all: chargedAll(b) };
+          },
+          run: chargedRun(st),
+          all: chargedAll(st),
+        };
+      },
+      batch: realDb.batch,
+    };
+
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    for (let i = 0; i < n; i++) {
+      const username = `user${String(i).padStart(5, "0")}`;
+      inner._store.set(`creator:${username}`, JSON.stringify({
+        displayName: `Real ${username}`, keyHash: `hash-${i}`, createdAt: 1,
+      }));
+      inner._store.set(`creatorlist:${username}:list-${i}`, JSON.stringify({
+        name: `List ${i}`, slug: `list-${i}`, type: "movie", visibility: "public",
+        items: [{ id: "tt0111161", name: "Item" }], likes: i % 5, createdAt: 1, updatedAt: 1,
+      }));
+    }
+
+    const cookie = await adminCookie(env);
+    let calls = 0;
+    let last;
+    do {
+      calls += 1;
+      spentThisInvocation = 0; // a new call is a new invocation, with a new budget
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+      assert.equal(last.body.ok, true, `call ${calls} failed: ${last.body.error}`);
+    } while (!last.body.done && calls < 200);
+
+    assert.equal(last.body.done, true, "migration never reported done");
+    assert.ok(peak <= 1000, `one invocation spent ${peak} subrequests, over the limit`);
+    // The point of the whole endpoint: no account may be left behind.
+    assert.equal(db._creators.size, n, `only ${db._creators.size} of ${n} creators reached D1`);
+    assert.equal(db._lists.size, n, `only ${db._lists.size} of ${n} lists reached D1`);
+    assert.equal(last.body.results.creators, n);
+  });
+
+  it("migrate-d1 restarts cleanly from unparseable resume state", async () => {
+    const env = makeEnv({ DB: makeD1() });
+    await env.CONFIGS.put("stats:pageviews:total", "77");
+    await env.CONFIGS.put("migrated1:state", "{not json");
+    const cookie = await adminCookie(env);
+    let calls = 0;
+    let last;
+    do {
+      calls += 1;
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    } while (!last.body.done && calls < 50);
+    assert.equal(last.body.done, true);
+    assert.equal(env.DB._stat("pageviews", "total"), 77);
+    // Resume state must not outlive the run that used it.
+    assert.equal(await env.CONFIGS.get("migrated1:state"), null, "resume state leaked");
+  });
+
+  it("keeps counting correctly in KV-only deployments", async () => {
+    // D1 is optional here; nothing above may break the no-DB path.
+    const env = makeEnv();
+    await call(env, "/");
+    assert.equal(env.CONFIGS._store.get("stats:pageviews:total"), "1");
+    const login = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+    const r = await call(env, "/admin", { cookie });
+    assert.match(r.text, /<div class="stat-value">1<\/div>/);
+  });
+});
+
+
+describe("audit fix 13: outbound requests are bounded by a timeout", () => {
+  it("wires a timeout signal into the shared fetch helper", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    let sawSignal = false;
+    sandbox.fetch = async (_url, opts) => { sawSignal = !!(opts && opts.signal); return { status: 200 }; };
+    sandbox.AbortSignal = { timeout: (ms) => ({ __timeoutMs: ms }) };
+    await sandbox.fetchTraktWithRetry("https://api.trakt.tv/x", {});
+    assert.equal(sawSignal, true, "fetchTraktWithRetry must pass an abort signal");
+  });
+
+  it("leaves a caller's own signal alone", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    const mine = { mine: true };
+    let seen = null;
+    sandbox.fetch = async (_url, opts) => { seen = opts.signal; return { status: 200 }; };
+    sandbox.AbortSignal = { timeout: () => ({ __timeout: true }) };
+    await sandbox.fetchWithTimeout("https://x/", { signal: mine });
+    assert.equal(seen, mine);
+  });
+
+  it("still works where AbortSignal.timeout is unavailable", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    let called = false;
+    sandbox.fetch = async () => { called = true; return { status: 200 }; };
+    // No AbortSignal in this sandbox at all -- the capability is probed,
+    // not assumed (render_check.js's sandbox omits it).
+    await sandbox.fetchWithTimeout("https://x/", {});
+    assert.equal(called, true);
+  });
+
+  it("turns a hung upstream into a rejection so the stale fallback can serve", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    // loadSourceFunctions' sandbox is deliberately minimal; the Workers
+    // runtime provides these.
+    sandbox.setTimeout = setTimeout;
+    sandbox.clearTimeout = clearTimeout;
+    const hang = new Promise(() => {});          // never settles
+    await assert.rejects(
+      () => sandbox.withTimeout(hang, 20, "TMDB"),
+      /TMDB did not respond within 20ms/
+    );
+  });
+
+  it("passes a value straight through when it settles in time", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    sandbox.setTimeout = setTimeout;
+    sandbox.clearTimeout = clearTimeout;
+    assert.equal(await sandbox.withTimeout(Promise.resolve("ok"), 1000, "TMDB"), "ok");
+  });
+});
+
+describe("audit fix 11: a playback ping does not read every list the creator owns", () => {
+  it("reads the watchlist directly instead of scanning", async () => {
+    // The property that matters is that a ping costs a CONSTANT number of KV
+    // reads, not one per list the creator owns -- before the fix this was a
+    // list() plus a get() per list, so an account with 200 lists paid 200
+    // reads on every single play. Asserting a magic threshold only ever
+    // approximated that (and had to be nudged whenever an unrelated constant
+    // read was added), so this measures the same ping against two very
+    // different list counts and requires the cost not to move.
+    async function pingCost(listCount, username) {
+      const env = makeEnv();
+      const alice = await createUser(env, username);
+      await env.CONFIGS.put(`creatorlist:${username}:watchlist`, JSON.stringify({
+        slug: "watchlist", name: "Watchlist", type: "movie", visibility: "private",
+        items: [{ id: "tt111" }, { id: "tt222" }],
+      }));
+      for (let i = 0; i < listCount; i++) {
+        await env.CONFIGS.put(`creatorlist:${username}:other-${i}`, JSON.stringify({
+          slug: `other-${i}`, name: "Other " + i, type: "movie", visibility: "private", items: [{ id: "tt999" }],
+        }));
+      }
+
+      let gets = 0;
+      const og = env.CONFIGS.get.bind(env.CONFIGS);
+      env.CONFIGS.get = async (...a) => { gets++; return og(...a); };
+
+      const config = Buffer.from(JSON.stringify({
+        entries: [], track: true, trackCreatorName: alice.creatorName, trackCreatorKey: alice.creatorKey,
+      })).toString("base64url");
+      await call(env, `/${config}/subtitles/movie/tt111.json`);
+      return { gets, env };
+    }
+
+    const small = await pingCost(40, "pinguser");
+    const large = await pingCost(200, "pinguserbig");
+    assert.equal(
+      small.gets, large.gets,
+      `a ping must cost the same whether the account has 40 lists (${small.gets} reads) or 200 (${large.gets})`,
+    );
+    // Still a loose absolute ceiling, so an O(1) cost that quietly grew by an
+    // order of magnitude would also be caught.
+    assert.ok(small.gets < 25, `expected a handful of KV reads per ping, got ${small.gets}`);
+
+    const wl = JSON.parse(small.env.CONFIGS._store.get("creatorlist:pinguser:watchlist"));
+    assert.deepEqual(wl.items.map((i) => i.id), ["tt222"], "the watched item should still be removed");
+  });
+});
+
+describe("audit fix 12: deleting an account leaves nothing behind", () => {
+  it("removes the like ledger and the scrobble seen-user set", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "purgeuser");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+      name: "Fav Films", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    await call(env, "/api/lists/like", { method: "POST", json: { username: "purgeuser", slug: "fav-films", action: "like" } });
+    await env.CONFIGS.put("scrobbleseenusers:purgeuser", JSON.stringify(["someone"]));
+    await env.CONFIGS.put("creatortrack:purgeuser", JSON.stringify({ lastPingAt: 1 }));
+    assert.ok(env.CONFIGS._store.has("listlikevoters:purgeuser:fav-films"), "precondition: ledger exists");
+
+    const r = await call(env, "/api/creator/delete-account", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE",
+    }});
+    assert.equal(r.body.ok, true);
+
+    // The tombstone is the one key that legitimately still names the account:
+    // it is a marker saying "this username is not available yet", not account
+    // data, and it expires on its own. Everything else must be gone.
+    const leftovers = [...env.CONFIGS._store.keys()]
+      .filter((k) => k.includes("purgeuser") && k !== "creatordeleted:purgeuser");
+    assert.deepEqual(leftovers, [], `nothing should reference the deleted account, found: ${leftovers.join(", ")}`);
+    assert.ok(env.CONFIGS._store.has("creatordeleted:purgeuser"), "the username should be tombstoned");
+  });
+
+  it("does not let a recycled username inherit the old like count", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "recycled");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey,
+      name: "Shared Slug", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    for (let i = 0; i < 3; i++) {
+      await call(env, "/api/lists/like", { method: "POST", json: { username: "recycled", slug: "shared-slug", action: "like" } });
+    }
+    await call(env, "/api/creator/delete-account", { method: "POST", json: {
+      creatorName: alice.creatorName, creatorKey: alice.creatorKey, confirm: "DELETE",
+    }});
+
+    // Someone else claims the username once the deletion tombstone lapses,
+    // and happens to pick the same slug.
+    lapseCreatorTombstone(env, "recycled");
+    const bob = await createUser(env, "recycled");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: bob.creatorName, creatorKey: bob.creatorKey,
+      name: "Shared Slug", type: "movie", visibility: "public", items: [{ id: "tt9" }],
+    }});
+    const like = await call(env, "/api/lists/like", { method: "POST", json: { username: "recycled", slug: "shared-slug", action: "like" } });
+    assert.equal(like.body.likes, 1, "a brand-new list must start from zero, not inherit the old ledger");
+  });
+});
+
+
+describe("audit fix 7: error messages are useful but cannot carry a secret", () => {
+  const load = () => loadSourceFunctions("02_http-and-creator-utils.js").safeErrorMessage;
+
+  it("keeps the genuinely useful upstream message", () => {
+    const safeErrorMessage = load();
+    // This is how someone learns their own API key is wrong -- blanking it
+    // would be a product regression, not a security win.
+    assert.equal(safeErrorMessage(new Error("Trakt request failed (HTTP 401).")),
+      "Trakt request failed (HTTP 401).");
+  });
+
+  it("strips a URL that a future careless throw might include", () => {
+    const safeErrorMessage = load();
+    const msg = safeErrorMessage(new Error("fetch failed for https://api.themoviedb.org/3/movie/1?api_key=abcdef123456"));
+    assert.doesNotMatch(msg, /themoviedb\.org/);
+    assert.doesNotMatch(msg, /abcdef123456/);
+    assert.match(msg, /\[url\]/);
+  });
+
+  it("redacts a labelled key or token even without a URL", () => {
+    const safeErrorMessage = load();
+    for (const raw of [
+      "bad request: api_key=sk_live_9f8e7d6c5b4a3210",
+      "auth failed, access_token: ya29.aVeryLongOpaqueTokenValue",
+      "client_secret=hunter2hunter2hunter2",
+    ]) {
+      const msg = safeErrorMessage(new Error(raw));
+      assert.match(msg, /\[redacted\]/, `expected redaction in: ${msg}`);
+      assert.doesNotMatch(msg, /sk_live|ya29\.|hunter2/);
+    }
+  });
+
+  it("redacts a long unlabelled opaque token", () => {
+    const safeErrorMessage = load();
+    const token = "A".repeat(40);
+    assert.doesNotMatch(safeErrorMessage(new Error("upstream said " + token)), /AAAA/);
+  });
+
+  it("falls back to a generic message when there is nothing safe to say", () => {
+    const safeErrorMessage = load();
+    assert.match(safeErrorMessage(null), /Something went wrong/);
+    assert.match(safeErrorMessage(new Error("")), /Something went wrong/);
+  });
+
+  it("bounds the length so a huge message cannot be echoed back", () => {
+    const safeErrorMessage = load();
+    assert.ok(safeErrorMessage(new Error("x".repeat(5000))).length <= 201);
+  });
+
+  it("no route still returns a raw exception message", () => {
+    for (const f of ["25_api-catalog-routes.js", "26_api-creator-and-admin-routes.js"]) {
+      const src = fs.readFileSync(path.join(REPO_ROOT, f), "utf8");
+      assert.doesNotMatch(src, /String\((?:err|e)\.message \|\| (?:err|e)\)/,
+        `${f} still returns a raw exception message; use safeErrorMessage()`);
+    }
+  });
+});
+
+// The duplicate-list bug: an account reached 129 list records for 22 real
+// lists -- 44 copies of the same 462-item list, coming-of-age-3 through
+// coming-of-age-53, every copy with an identical item count. Three defects
+// compounded; each of these covers one, plus one covering the whole loop.
+describe("duplicate lists: a save asked for a slug gets that slug", () => {
+  it("honours an explicit slug instead of silently minting a different one", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "slugowner");
+    // Occupy the slug this list's NAME would produce, so the old code had a
+    // collision to route around.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "other" }], visibility: "public",
+    }});
+    const r = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      slug: "my-own-slug", name: "Coming of Age", type: "movie",
+      items: [{ id: "tt1" }], visibility: "public",
+    }});
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.slug, "my-own-slug",
+      "a save that names a slug must store it under that slug, not report ok:true for a different one");
+  });
+
+  it("is idempotent: asking for the same slug six times yields one list, not six", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "idem");
+    // The precondition the runaway needs: the slug this list's NAME produces
+    // belongs to a different list, so the old code had to route around it and
+    // routed somewhere new every single time.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "someone-elses" }], visibility: "public",
+    }});
+    const save = () => call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      slug: "coming-of-age-mine", name: "Coming of Age", type: "movie",
+      items: [{ id: "tt1" }], visibility: "public",
+    }});
+    for (let i = 0; i < 6; i++) {
+      const r = await save();
+      assert.equal(r.body.slug, "coming-of-age-mine", `save ${i + 1} drifted to ${r.body.slug}`);
+    }
+    const keys = (await env.CONFIGS.list({ prefix: "creatorlist:idem:" })).keys;
+    assert.equal(keys.length, 2,
+      `six identical saves of one list left ${keys.length} records: ${keys.map((k) => k.name).join(", ")}`);
+  });
+
+  it("sanitises the slug it is handed -- it now reaches a KV key and a URL", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "sanitise");
+    const r = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      slug: "../../creator:someone-else", name: "Nice List", type: "movie",
+      items: [], visibility: "public",
+    }});
+    assert.equal(r.body.ok, true);
+    assert.match(r.body.slug, /^[a-z0-9-]+$/, `unsanitised slug stored: ${r.body.slug}`);
+    const keys = (await env.CONFIGS.list({ prefix: "creatorlist:" })).keys.map((k) => k.name);
+    assert.ok(keys.every((k) => k.startsWith("creatorlist:sanitise:")),
+      `a slug escaped its own namespace: ${keys.join(", ")}`);
+  });
+});
+
+describe("duplicate lists: creatorlistorder: is not the last word on what exists", () => {
+  it("a list whose order entry was lost still appears on the dashboard", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "lostorder");
+    for (const name of ["Coming of Age", "Food Network", "HGTV"]) {
+      await call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        name, type: "movie", items: [{ id: "tt1" }], visibility: "public",
+      }});
+    }
+    // What a clobbered read-modify-write leaves behind: the records are all
+    // there, the order key remembers one of them.
+    await env.CONFIGS.put("creatorlistorder:lostorder", JSON.stringify({ order: ["coming-of-age"] }));
+
+    const r = await call(env, "/api/creator/lists", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+    }});
+    const slugs = (r.body.lists || []).map((l) => l.slug).sort();
+    assert.deepEqual(slugs, ["coming-of-age", "food-network", "hgtv"],
+      "records with no order entry were dropped from the dashboard, which is what made the client re-upload them");
+    const recovered = (r.body.lists || []).find((l) => l.slug === "hgtv");
+    // itemCount, not items: the route no longer ships the contents (see
+    // CREATOR_LIST_ITEMS_BATCH_MAX). What the recovery has to prove is that
+    // the record was READ, not that its bytes came down the wire -- and an
+    // empty shell would report 0 here.
+    assert.equal(recovered.itemCount, 1, "a recovered list must come back with its items, not as an empty shell");
+  });
+
+  it("repairs the order key so the drift does not persist", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "repairorder");
+    for (const name of ["One", "Two"]) {
+      await call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        name, type: "movie", items: [], visibility: "public",
+      }});
+    }
+    await env.CONFIGS.put("creatorlistorder:repairorder", JSON.stringify({ order: [] }));
+    await call(env, "/api/creator/lists", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+    }});
+    const order = JSON.parse(await env.CONFIGS.get("creatorlistorder:repairorder")).order.sort();
+    assert.deepEqual(order, ["one", "two"], "order was left broken after the read path had already found the records");
+  });
+
+  it("allocating a new slug checks KV, not just order, so it cannot land on a live record", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "noclobber");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "original" }], visibility: "public",
+    }});
+    // Order forgets it; the record is still live.
+    await env.CONFIGS.put("creatorlistorder:noclobber", JSON.stringify({ order: [] }));
+    const r = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: u.creatorName, creatorKey: u.creatorKey,
+      name: "Coming of Age", type: "movie", items: [{ id: "different" }], visibility: "public",
+    }});
+    assert.notEqual(r.body.slug, "coming-of-age",
+      "a new list was allocated a slug whose record already existed, writing over it");
+    const original = JSON.parse(await env.CONFIGS.get("creatorlist:noclobber:coming-of-age"));
+    assert.equal(original.items[0].id, "original", "the existing list was overwritten");
+  });
+});
+
+describe("duplicate lists: the dashboard upload loop terminates", () => {
+  // Drives the shape of renderCreatorDashboard's "merge any local list not
+  // yet on the server" block against the real routes: read the account, save
+  // whatever the local store has that the account does not, repeat. Before
+  // the fix this gained one visible list per round and a duplicate record for
+  // every other one; it must now settle after a single round.
+  it("22 local lists converge to 22 records and stay there", async () => {
+    const env = makeEnv();
+    const u = await createUser(env, "converge");
+    // Give KV a real await boundary between read and write. The mock is
+    // otherwise fast enough to serialise every handler, which hides the whole
+    // problem: nothing about the read-modify-write on creatorlistorder: is
+    // atomic, and on a real edge these saves overlap.
+    const rawGet = env.CONFIGS.get.bind(env.CONFIGS);
+    const rawPut = env.CONFIGS.put.bind(env.CONFIGS);
+    const tick = () => new Promise((r) => setTimeout(r, 1));
+    env.CONFIGS.get = async (...a) => { await tick(); return rawGet(...a); };
+    env.CONFIGS.put = async (...a) => { await tick(); return rawPut(...a); };
+    const names = ["Coming of Age", "Food Network", "HGTV", "Oxygen", "Acorn TV", "Britbox",
+      "Travel", "Christmas", "Miniseries", "Discovery ID", "Animal Planet", "Nordic Noir",
+      "Chick Flicks", "TV", "Currently Watching", "Movies Watchlist", "National Geographic",
+      "Music Docs", "Mystery Documentary", "Documentary Reality TV", "TV Shows Horror",
+      "Hallmark Movies"];
+    const local = names.map((n) => ({ slug: n.toLowerCase().replace(/[^a-z0-9]+/g, "-"), name: n }));
+
+    for (let round = 0; round < 4; round++) {
+      const listsRes = await call(env, "/api/creator/lists", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+      }});
+      const have = new Set((listsRes.body.lists || []).map((l) => l.slug));
+      const missing = local.filter((l) => !have.has(l.creatorSlug || l.slug));
+      if (round > 0) {
+        assert.equal(missing.length, 0,
+          `round ${round + 1} still thought ${missing.length} lists were missing -- the loop does not terminate`);
+      }
+      // Deliberately the OLD client shape: all at once, replies discarded.
+      // The server side has to survive this on its own, because a browser
+      // running a cached copy of the page will keep doing exactly this.
+      await Promise.all(missing.map((l) => call(env, "/api/creator/lists/save", { method: "POST", json: {
+        creatorName: u.creatorName, creatorKey: u.creatorKey,
+        slug: l.creatorSlug || l.slug, name: l.name, type: "movie",
+        items: [{ id: "tt1" }], visibility: "public",
+      }})));
+    }
+    const keys = (await env.CONFIGS.list({ prefix: "creatorlist:converge:" })).keys;
+    assert.equal(keys.length, 22, `4 dashboard rounds left ${keys.length} records for 22 lists`);
+    assert.equal(keys.filter((k) => /-\d+$/.test(k.name)).length, 0,
+      "numbered duplicate slugs were minted: " + keys.map((k) => k.name).join(", "));
+  });
+});
+
+// Removing one item from Watch History's See All page used to call
+// renderWatchHistoryGrid(), which starts with gridEl.innerHTML = '' and
+// rebuilds every tile -- so deleting one thing blanked the grid, re-requested
+// every poster and scrolled back to the top. It now updates in place.
+describe("watch history See All: removing an item does not rebuild the grid", () => {
+  function makeCard(removeId) {
+    const card = { style: {}, parentNode: null };
+    const btn = {
+      dataset: { removeType: "history", removeId: String(removeId) },
+      closest: (sel) => (sel.includes("live-preview-poster-card") ? card : null),
+    };
+    card.btn = btn;
+    return card;
+  }
+  function makeDom(cards, opts = {}) {
+    const grid = {
+      innerHTML: "<!-- rendered once -->",
+      cards: cards.slice(),
+      querySelectorAll() { return this.cards.map((c) => c.btn); },
+    };
+    grid.cards.forEach((c) => {
+      c.parentNode = { removeChild: (x) => { grid.cards = grid.cards.filter((k) => k !== x); x.parentNode = null; } };
+    });
+    const sub = { textContent: "" };
+    const status = { innerHTML: "" };
+    const tab = { hasAttribute: (a) => (a === "hidden" ? !!opts.hidden : false) };
+    return {
+      grid, sub, status,
+      document: { getElementById: (id) => ({
+        detailGrid: grid, detailSubtitle: sub, detailStatus: status, "content-list-details": tab,
+      }[id] || null) },
+    };
+  }
+  function load(dom, win, grouped) {
+    return loadOneClientFunction("23_client-list-management.js", "updateWatchHistoryGridAfterRemoval", {
+      document: dom.document,
+      window: win,
+      localStorage: { getItem: (k) => (k === "myListAddon:watchHistoryGroupShows" ? (grouped ? "true" : "false") : null) },
+      watchHistoryTileCount: loadOneClientFunction("23_client-list-management.js", "watchHistoryTileCount", {
+        watchHistoryPassesFilter: loadOneClientFunction("23_client-list-management.js", "watchHistoryPassesFilter", {
+          watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+        }),
+      }),
+    });
+  }
+
+  it("leaves the surviving tiles and the grid markup untouched", () => {
+    const cards = [makeCard("tt1"), makeCard("tt2"), makeCard("tt3")];
+    const dom = makeDom(cards);
+    const before = dom.grid.innerHTML;
+    // The person removed tt2; the raw list has already dropped it and its own
+    // handler is fading its tile out.
+    cards[1].style.opacity = "0";
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "tt1" }, { id: "tt3" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true, "should report that it handled the update itself");
+    assert.equal(dom.grid.innerHTML, before, "the grid was rebuilt -- that is the reload the person sees");
+    assert.equal(dom.grid.cards.length, 3, "the fading tile must be left to its own animation, not yanked");
+    assert.equal(dom.sub.textContent, "2 items");
+  });
+
+  it("drops any other tile the removal took with it, without a rebuild", () => {
+    const cards = [makeCard("tt1"), makeCard("s1:1:1"), makeCard("s1:1:2")];
+    const dom = makeDom(cards);
+    const before = dom.grid.innerHTML;
+    cards[1].style.opacity = "0";
+    // Removing a show clears every episode of it from the raw list.
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "tt1" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.grid.innerHTML, before, "the grid must not be rebuilt to drop a stale tile");
+    assert.deepEqual(dom.grid.cards.map((c) => c.btn.dataset.removeId), ["tt1", "s1:1:1"],
+      "the stale episode tile should be gone; the fading one left alone");
+    assert.equal(dom.sub.textContent, "1 item");
+  });
+
+  it("counts against the active filter pill, not the whole history", () => {
+    const dom = makeDom([makeCard("tt1"), makeCard("s1:1:1")]);
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "tt1", type: "movie" }, { id: "s1:1:1", showId: "s1" }],
+      _watchHistoryFilter: "movie",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.sub.textContent, "1 item");
+    assert.equal(dom.status.innerHTML, "");
+  });
+
+  it("says so, rather than guessing, when the last item goes", () => {
+    const cards = [makeCard("tt1")];
+    const dom = makeDom(cards);
+    cards[0].style.opacity = "0";
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.sub.textContent, "0 items");
+    assert.match(dom.status.innerHTML, /No matching items/);
+  });
+
+  it("keeps a grouped show tile while any episode of it remains", () => {
+    const cards = [makeCard("s1"), makeCard("s2")];
+    const dom = makeDom(cards);
+    const before = dom.grid.innerHTML;
+    const win = {
+      // s1 still has an episode; every episode of s2 has gone.
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [{ id: "s1:1:2", showId: "s1" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win, true)(), true);
+    assert.equal(dom.grid.innerHTML, before, "grouped mode must not rebuild either");
+    assert.deepEqual(dom.grid.cards.map((c) => c.btn.dataset.removeId), ["s1"]);
+    assert.equal(dom.sub.textContent, "1 item", "grouped counts tiles, not raw items");
+  });
+
+  it("counts grouped tiles, not the episodes behind them", () => {
+    const dom = makeDom([makeCard("s1"), makeCard("tt9")]);
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: [
+        { id: "s1:1:1", showId: "s1" }, { id: "s1:1:2", showId: "s1" }, { id: "s1:2:1", showId: "s1" },
+        { id: "tt9", type: "movie" },
+      ],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win, true)(), true);
+    assert.equal(dom.sub.textContent, "2 items", "3 episodes of one show plus a movie is 2 tiles");
+  });
+
+  it("falls back to the full render when there is no item list to reconcile against", () => {
+    const dom = makeDom([makeCard("tt1")]);
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), false);
+  });
+
+  it("does nothing to a See All page showing some other list", () => {
+    const cards = [makeCard("tt1"), makeCard("tt2")];
+    const dom = makeDom(cards);
+    const win = {
+      _currentListDetailsParams: { listUrl: "trakt:history", name: "Trakt History" },
+      _rawWatchHistoryItems: [{ id: "tt1" }],
+      _watchHistoryFilter: "all",
+    };
+    assert.equal(load(dom, win)(), true);
+    assert.equal(dom.grid.cards.length, 2, "another list's tiles must not be touched");
+    assert.equal(dom.sub.textContent, "", "nor its subtitle rewritten");
+  });
+});
+
+describe("watch history See All: the remove handler stops rebuilding the grid", () => {
+  // The one that reproduces the reported behaviour rather than covering the
+  // new helper: removeWatchHistoryItemDirect used to call renderWatchHistoryGrid
+  // unconditionally whenever the See All page was open.
+  function run({ grouped = false } = {}) {
+    const calls = { fullRender: 0, inPlace: 0 };
+    const map = { "watch-history": { items: [{ id: "tt1" }, { id: "tt2" }] } };
+    const win = {};
+    const detailTab = { hidden: false };
+    const remove = loadOneClientFunction("22_client-creator-profile.js", "removeWatchHistoryItemDirect", {
+      window: win,
+      document: { getElementById: (id) => (id === "content-list-details" ? detailTab : null) },
+      loadLocalCustomLists: () => map,
+      saveLocalCustomListsMap: () => true,
+      scheduleCreatorSyncSave: () => {},
+      renderCreatorDashboard: () => {},
+      showAddedToast: () => {},
+      syncAiringNextWatchState: () => {},
+      renderWatchHistoryGrid: () => { calls.fullRender++; },
+      updateWatchHistoryGridAfterRemoval: () => { calls.inPlace++; return !grouped; },
+    });
+    win._rawWatchHistoryItems = [{ id: "tt1" }, { id: "tt2" }];
+    remove("tt2", null);
+    return { calls, win, map };
+  }
+
+  it("updates in place instead of re-rendering every tile", () => {
+    const { calls, win, map } = run();
+    assert.equal(calls.inPlace, 1, "the in-place update should be attempted");
+    assert.equal(calls.fullRender, 0,
+      "the grid was rebuilt from scratch -- that is the whole list reloading on a single removal");
+    assert.deepEqual(win._rawWatchHistoryItems.map((i) => i.id), ["tt1"], "the item must still actually be removed");
+    assert.deepEqual(map["watch-history"].items.map((i) => i.id), ["tt1"]);
+  });
+
+  it("still falls back to the full render when the in-place update cannot cope", () => {
+    const { calls } = run({ grouped: true });
+    assert.equal(calls.inPlace, 1);
+    assert.equal(calls.fullRender, 1, "grouped-by-show needs the layout recomputing and must not be left stale");
+  });
+});
+
+// In grouped-by-show mode the grid built its show tiles with removeShowId.
+// livePreviewPosterHtml reads that field as "this is a Continue Watching
+// tile" -- it tests for it before removeHistoryId, and isCwItem keys off it
+// too -- so the x on a grouped Watch History show was labelled "Remove from
+// Continue Watching", dispatched to dismissContinueWatchingShow, left the
+// watch history untouched, and picked up Continue Watching's poster badges.
+describe("watch history: grouped show tiles remove from Watch History", () => {
+  function renderGrouped(rawItems, opts = {}) {
+    let captured = null;
+    const sub = { textContent: "" };
+    const status = { innerHTML: "" };
+    const els = {
+      detailGrid: { innerHTML: "" },
+      detailSubtitle: sub,
+      detailStatus: status,
+      "content-list-details": { hasAttribute: () => false },
+    };
+    const win = {
+      _currentListDetailsParams: { listUrl: "watch-history", name: "Watch History" },
+      _rawWatchHistoryItems: rawItems,
+      _watchHistoryFilter: opts.filter || "all",
+      _watchHistorySort: "recent",
+    };
+    const render = loadOneClientFunction("23_client-list-management.js", "renderWatchHistoryGrid", {
+      document: { getElementById: (id) => els[id] || null },
+      window: win,
+      localStorage: { getItem: (k) => (k === "myListAddon:watchHistoryGroupShows" ? (opts.grouped ? "true" : "false") : null) },
+      formatWatchItemLabel: (it) => ({ title: it.title || it.name || "", subtitle: "" }),
+      watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+      renderPosterGridChunked: (_grid, items) => { captured = items; },
+    });
+    render();
+    return { tiles: captured, sub, status };
+  }
+
+  const HISTORY = [
+    { id: "s1:1:1", showId: "s1", showTitle: "A Show", type: "episode", watchedAt: 3 },
+    { id: "s1:1:2", showId: "s1", showTitle: "A Show", type: "episode", watchedAt: 2 },
+    { id: "tt9", title: "A Movie", type: "movie", watchedAt: 1 },
+  ];
+
+  it("builds the show tile with a history remove target, not a Continue Watching one", () => {
+    const { tiles } = renderGrouped(HISTORY, { grouped: true });
+    const show = tiles.find((t) => t.type === "series");
+    assert.ok(show, "expected a grouped show tile");
+    assert.equal(show.removeShowId, undefined,
+      "removeShowId makes livePreviewPosterHtml render a Continue Watching button and treat the tile as a CW item");
+    assert.equal(show.removeHistoryId, "s1", "the tile should remove the show from Watch History");
+  });
+
+  it("removing that tile clears every watched episode of the show", () => {
+    const map = { "watch-history": { items: HISTORY.slice() } };
+    const win = {};
+    const remove = loadOneClientFunction("22_client-creator-profile.js", "removeWatchHistoryItemDirect", {
+      window: win,
+      document: { getElementById: () => null },
+      loadLocalCustomLists: () => map,
+      saveLocalCustomListsMap: () => true,
+      scheduleCreatorSyncSave: () => {},
+      renderCreatorDashboard: () => {},
+      showAddedToast: () => {},
+      syncAiringNextWatchState: () => {},
+      renderWatchHistoryGrid: () => {},
+      updateWatchHistoryGridAfterRemoval: () => true,
+    });
+    const { tiles } = renderGrouped(HISTORY, { grouped: true });
+    remove(tiles.find((t) => t.type === "series").removeHistoryId, null);
+    assert.deepEqual(map["watch-history"].items.map((i) => i.id), ["tt9"],
+      "both episodes of the show should be gone, the movie untouched");
+  });
+
+  it("leaves the ungrouped tiles removing one item each", () => {
+    const { tiles } = renderGrouped(HISTORY, { grouped: false });
+    assert.deepEqual(tiles.map((t) => t.removeHistoryId).sort(), ["s1:1:1", "s1:1:2", "tt9"]);
+    assert.ok(tiles.every((t) => t.removeShowId === undefined));
+  });
+
+  it("agrees with watchHistoryTileCount about how many tiles there are", () => {
+    const count = loadOneClientFunction("23_client-list-management.js", "watchHistoryTileCount", {
+      watchHistoryPassesFilter: loadOneClientFunction("23_client-list-management.js", "watchHistoryPassesFilter", {
+        watchHistoryGridType: loadOneClientFunction("23_client-list-management.js", "watchHistoryGridType"),
+      }),
+    });
+    for (const grouped of [false, true]) {
+      for (const filter of ["all", "movie", "series"]) {
+        const { tiles } = renderGrouped(HISTORY, { grouped, filter });
+        assert.equal(count(HISTORY, filter, grouped), tiles.length,
+          `helper and renderer disagree (grouped=${grouped}, filter=${filter})`);
+      }
+    }
+  });
+});
+
+// --- Adversarial audit 2026-09-06 ------------------------------------------
+//
+// One describe block per finding, each named for its finding id. Every one of
+// these was confirmed to FAIL against the code as it stood before its fix.
+
+describe("A1: an account purge must only ever touch its own lists", () => {
+  // validateCreatorUsername allows [a-z0-9_-], and `_` is SQL LIKE's
+  // single-character wildcard. The purge built its DELETE pattern by
+  // interpolating the username straight into `id LIKE '{u}:%'`, so a username
+  // containing `_` matched every other account whose name fit the pattern.
+  it("does not delete another creator's rows when the username contains _", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const victim = await createUser(env, "abc-films");
+    const other = await createUser(env, "a_c-films");
+
+    for (const u of [victim, other]) {
+      const r = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: u.creatorName, creatorKey: u.creatorKey,
+          name: "Top Ten", type: "movie", visibility: "public", items: [{ id: "tt0111161" }],
+        },
+      });
+      assert.equal(r.body.ok, true, JSON.stringify(r.body));
+    }
+    await call(env, "/api/lists/like", {
+      method: "POST", ip: "203.0.113.9",
+      json: { username: "abc-films", slug: "top-ten" },
+    });
+    assert.equal(db._lists.size, 2);
+    assert.equal(db._lists.get("abc-films:top-ten").likes, 1);
+
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: other.creatorName, creatorKey: other.creatorKey, confirm: "DELETE" },
+    });
+    assert.equal(del.body.ok, true);
+
+    assert.equal(db._lists.has("a_c-films:top-ten"), false, "the deleted account's own row must go");
+    assert.equal(db._lists.has("abc-films:top-ten"), true,
+      "a_c-films deleting their own account must not delete abc-films' list");
+    assert.equal(db._lists.get("abc-films:top-ten").likes, 1,
+      "and must not destroy its like count");
+  });
+
+  // The scaled form: usernames are 3-25 characters and `___` is legal, so one
+  // all-underscore name per length is a wildcard for every account on the
+  // deployment. Registering them is public and self-service.
+  it("survives an attacker registering all-underscore usernames and resetting them", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const victims = ["alice", "bobby", "carl", "dee-jay", "eve1", "frankie-films"];
+    for (const name of victims) {
+      const u = await createUser(env, name);
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: name, creatorKey: u.creatorKey,
+          name: "My List", type: "movie", visibility: "public", items: [{ id: "tt0111161" }],
+        },
+      });
+    }
+    assert.equal(db._lists.size, victims.length);
+
+    for (let len = 3; len <= 25; len++) {
+      const name = "_".repeat(len);
+      const u = await createUser(env, name);
+      // account/reset runs the same purge and, unlike delete-account, can be
+      // repeated forever on the same account.
+      const r = await call(env, "/api/creator/account/reset", {
+        method: "POST",
+        json: { creatorName: name, creatorKey: u.creatorKey, confirm: "RESET" },
+      });
+      assert.equal(r.body.ok, true);
+    }
+
+    assert.equal(db._lists.size, victims.length,
+      "23 self-service resets by a stranger must not empty creator_lists");
+    for (const name of victims) {
+      assert.equal(db._lists.has(`${name}:my-list`), true, `${name} lost their D1 row`);
+    }
+  });
+});
+
+describe("A5: a key rotation must never report success without rotating", () => {
+  const rotationPaths = [
+    ["/api/creator/reset-key", (u) => ({ username: u.creatorName, recoveryAnswer: "purple mountains" })],
+    ["/admin/api/reset-creator-key", (u) => ({ username: u.creatorName })],
+  ];
+
+  for (const [path, body] of rotationPaths) {
+    it(`${path}: a failed D1 update must not leave the old key working`, async () => {
+      const db = makeD1();
+      const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+      const alice = await createUser(env, "alicerot5", { recoveryAnswer: "purple mountains" });
+      const cookie = await adminCookie(env);
+      assert.ok(db._creators.has("alicerot5"));
+
+      // D1 is having a bad minute exactly while the rotation runs.
+      db.failWhen((sql) => /UPDATE creators SET key_hash/i.test(sql));
+      const rot = await call(env, path, { method: "POST", cookie, json: body(alice) });
+      db.failWhen(null);
+
+      assert.equal(rot.body.ok, true, "the row can be dropped, so the rotation can still complete");
+      assert.ok(rot.body.creatorKey);
+
+      const oldKey = await call(env, "/api/creator/restore", {
+        method: "POST",
+        json: { creatorName: "alicerot5", creatorKey: alice.creatorKey },
+      });
+      assert.equal(oldKey.status, 401, "the rotated-away key must stop working immediately");
+
+      const newKey = await call(env, "/api/creator/restore", {
+        method: "POST",
+        json: { creatorName: "alicerot5", creatorKey: rot.body.creatorKey },
+      });
+      assert.equal(newKey.status, 200, "the key the caller was handed must actually work");
+    });
+
+    it(`${path}: reports failure rather than half-rotating when D1 is unreachable`, async () => {
+      const db = makeD1();
+      const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+      const alice = await createUser(env, "aliceoff5", { recoveryAnswer: "purple mountains" });
+      const cookie = await adminCookie(env);
+
+      // Neither the update nor the compensating delete can land.
+      db.failWhen((sql) => /creators/i.test(sql) && !/SELECT/i.test(sql));
+      const rot = await call(env, path, { method: "POST", cookie, json: body(alice) });
+      db.failWhen(null);
+
+      assert.notEqual(rot.body.ok, true, "must not claim success");
+      assert.equal(rot.body.creatorKey, undefined, "must not hand back a key it did not install");
+
+      const oldKey = await call(env, "/api/creator/restore", {
+        method: "POST",
+        json: { creatorName: "aliceoff5", creatorKey: alice.creatorKey },
+      });
+      assert.equal(oldKey.status, 200,
+        "nothing rotated, so the existing key must keep working rather than locking the owner out");
+    });
+  }
+
+  it("migrate-d1 repairs a D1 row whose hash has drifted from KV", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const alice = await createUser(env, "alicedrift", { recoveryAnswer: "purple mountains" });
+    const cookie = await adminCookie(env);
+
+    // However it got there, D1 now holds a hash KV does not agree with.
+    await db.prepare("UPDATE creators SET key_hash = ?, display_name = ? WHERE username = ?")
+      .bind("pbkdf2:100000:dead:beef", "Stale Name", "alicedrift").run();
+    assert.equal(db._creators.get("alicedrift").key_hash, "pbkdf2:100000:dead:beef");
+
+    let done = false;
+    for (let i = 0; i < 20 && !done; i++) {
+      done = (await call(env, "/admin/api/migrate-d1", { method: "POST", cookie })).body.done;
+    }
+    assert.equal(done, true);
+
+    const kvHash = JSON.parse(env.CONFIGS._store.get("creator:alicedrift")).keyHash;
+    assert.equal(db._creators.get("alicedrift").key_hash, kvHash,
+      "the endpoint whose job is to reconcile KV into D1 must actually reconcile it");
+    assert.equal(db._creators.get("alicedrift").display_name, "alicedrift");
+
+    const ok = await call(env, "/api/creator/restore", {
+      method: "POST",
+      json: { creatorName: "alicedrift", creatorKey: alice.creatorKey },
+    });
+    assert.equal(ok.status, 200);
+  });
+});
+
+describe("A3/A4: a purge that failed must not report success", () => {
+  const setup = async (name) => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, name);
+    const K = { creatorName: name, creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Holiday Photos", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Private Notes", type: "movie", visibility: "private", items: [{ id: "tt0068646" }] },
+    });
+    return { db, env, u, K };
+  };
+
+  // A3 -- the D1 identity DELETE used to be best-effort, and getCreator
+  // reads D1, so a swallowed failure left a "deleted" account authenticating.
+  it("delete-account fails loudly when the D1 identity row cannot be removed", async () => {
+    const { db, env, u, K } = await setup("delme3");
+    db.failWhen((sql) => /DELETE FROM creators/i.test(sql));
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST", json: { ...K, confirm: "DELETE" },
+    });
+    db.failWhen(null);
+
+    assert.notEqual(del.body.ok, true, "must not claim the account was deleted");
+    assert.ok(env.CONFIGS._store.get("creator:delme3"),
+      "the identity must survive so the owner can sign in and retry");
+    assert.equal(db._creators.has("delme3"), true);
+
+    const restore = await call(env, "/api/creator/restore", {
+      method: "POST", json: { creatorName: "delme3", creatorKey: u.creatorKey },
+    });
+    assert.equal(restore.status, 200, "a delete that failed leaves a working account, not a limbo one");
+  });
+
+  // A4 -- the list sweep was wrapped in a catch that logged and fell straight
+  // through to deleting the identity, which frees the username.
+  it("delete-account does not free the username when the list sweep failed", async () => {
+    const { env, u, K } = await setup("delme4");
+    env.CONFIGS._hooks.beforeList = async (prefix) => {
+      if (String(prefix).startsWith("creatorlist:delme4:")) throw new Error("KV list failed");
+    };
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST", json: { ...K, confirm: "DELETE" },
+    });
+    env.CONFIGS._hooks.beforeList = null;
+
+    assert.notEqual(del.body.ok, true, "must not claim the account was deleted");
+    assert.ok(env.CONFIGS._store.get("creatorlist:delme4:holiday-photos"), "the data is still there");
+    assert.ok(env.CONFIGS._store.get("creator:delme4"), "so the identity must still be there too");
+
+    const reclaim = await call(env, "/api/creator/create", {
+      method: "POST", json: { creatorName: "delme4", displayName: "Somebody Else" },
+    });
+    assert.notEqual(reclaim.body.ok, true,
+      "a stranger must not be able to claim a username whose data was never removed");
+
+    const stillMine = await call(env, "/api/creator/lists", {
+      method: "POST", json: { creatorName: "delme4", creatorKey: u.creatorKey },
+    });
+    assert.equal(stillMine.body.lists.length, 2, "the owner still owns their lists");
+  });
+
+  it("account/reset reports failure when it could not empty the account", async () => {
+    const { env, K } = await setup("delme4b");
+    env.CONFIGS._hooks.beforeList = async (prefix) => {
+      if (String(prefix).startsWith("creatorlist:delme4b:")) throw new Error("KV list failed");
+    };
+    const reset = await call(env, "/api/creator/account/reset", {
+      method: "POST", json: { ...K, confirm: "RESET" },
+    });
+    env.CONFIGS._hooks.beforeList = null;
+    assert.notEqual(reset.body.ok, true, "the account is not empty, so this did not succeed");
+    assert.ok(env.CONFIGS._store.get("creatorlist:delme4b:holiday-photos"));
+    assert.ok(env.CONFIGS._store.get("creator:delme4b"), "reset never removes the identity");
+  });
+
+  // The inverse, so the fix cannot be 'always fail': a healthy delete must
+  // still hand a reclaiming owner a completely empty account.
+  it("a healthy delete still frees the username, and the next owner inherits nothing", async () => {
+    const { db, env, K } = await setup("delme4c");
+    const del = await call(env, "/api/creator/delete-account", {
+      method: "POST", json: { ...K, confirm: "DELETE" },
+    });
+    assert.equal(del.body.ok, true, JSON.stringify(del.body));
+    assert.equal(db._creators.has("delme4c"), false);
+    assert.equal(db._lists.size, 0);
+    // Everything except the tombstone, which is a "not available yet" marker
+    // rather than account data and expires on its own.
+    assert.deepEqual(
+      [...env.CONFIGS._store.keys()].filter((k) => k.includes("delme4c") && k !== "creatordeleted:delme4c"),
+      [],
+    );
+    assert.ok(env.CONFIGS._store.has("creatordeleted:delme4c"), "the username is held while stragglers finish");
+
+    lapseCreatorTombstone(env, "delme4c");
+    const fresh = await createUser(env, "delme4c", { displayName: "Somebody Else" });
+    const dash = await call(env, "/api/creator/lists", {
+      method: "POST", json: { creatorName: "delme4c", creatorKey: fresh.creatorKey },
+    });
+    assert.deepEqual(dash.body.lists, []);
+  });
+});
+
+describe("A2/A6: D1 is an accelerator, so it must never overrule the store that is authoritative", () => {
+  // The precondition is ordinary: D1 knows the account but not this list yet.
+  // migrate-d1 always does `creator:` before `creatorlist:`, so every
+  // deployment large enough to need more than one chunk spends time in
+  // exactly this state, and a dropped D1 write produces it at any size.
+  const seedKvOnlyList = (env, user, likes) => {
+    env.CONFIGS._store.set(`creatorlist:${user}:top-ten`, JSON.stringify({
+      name: "Top Ten", slug: "top-ten", type: "movie", items: [{ id: "tt0111161" }],
+      visibility: "public", likes, createdAt: 1, updatedAt: 2,
+    }));
+    env.CONFIGS._store.set(`creatorlistorder:${user}`, JSON.stringify({ order: ["top-ten"] }));
+    env.CONFIGS._store.set(`listlikevoters:${user}:top-ten`, JSON.stringify(
+      Array.from({ length: likes }, (_, i) => `a:voter${i}`)
+    ));
+  };
+
+  it("an ordinary edit does not zero a like count that only KV knows about", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "dana2");
+    seedKvOnlyList(env, "dana2", 5);
+    assert.equal(db._lists.has("dana2:top-ten"), false, "precondition: D1 has no row for this list");
+
+    const dash = async () => {
+      const r = await call(env, "/api/creator/lists", {
+        method: "POST", json: { creatorName: "dana2", creatorKey: u.creatorKey },
+      });
+      return r.body.lists.find((l) => l.slug === "top-ten");
+    };
+    const kvLikes = () => JSON.parse(env.CONFIGS._store.get("creatorlist:dana2:top-ten")).likes;
+    assert.equal((await dash()).likes, 5);
+
+    for (let n = 1; n <= 2; n++) {
+      const save = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: "dana2", creatorKey: u.creatorKey, slug: "top-ten",
+          name: `Top Ten v${n}`, type: "movie", visibility: "public", items: [{ id: "tt0111161" }],
+        },
+      });
+      assert.equal(save.body.ok, true);
+      assert.equal(kvLikes(), 5, `edit ${n} destroyed the like count in KV`);
+      assert.equal(db._lists.get("dana2:top-ten").likes, 5, `edit ${n} wrote 0 likes into D1`);
+      assert.equal((await dash()).likes, 5, `edit ${n} made the dashboard report 0 likes`);
+    }
+
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists.find((l) => l.slug === "top-ten").likes, 5);
+  });
+
+  it("a like whose D1 write failed does not get written back as zero by the next edit", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "dana6");
+    const K = { creatorName: "dana6", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Best Of", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+
+    db.failWhen((sql) => /UPDATE creator_lists SET likes/i.test(sql));
+    for (let i = 0; i < 4; i++) {
+      await call(env, "/api/lists/like", {
+        method: "POST", ip: `203.0.113.${20 + i}`,
+        json: { username: "dana6", slug: "best-of" },
+      });
+    }
+    db.failWhen(null);
+
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "best-of", name: "Best Of 2026", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    assert.equal(JSON.parse(env.CONFIGS._store.get("creatorlist:dana6:best-of")).likes, 4,
+      "four real likes must survive an edit that followed a failed D1 like-write");
+
+    const dash = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.equal(dash.body.lists.find((l) => l.slug === "best-of").likes, 4);
+  });
+
+  it("a dropped D1 write does not make the dashboard disagree with what is actually served", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "dana6b");
+    const K = { creatorName: "dana6b", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Doc", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
+    });
+
+    // The owner makes it public; the D1 mirror of that change is lost.
+    db.failWhen((sql) => /INSERT INTO creator_lists/i.test(sql));
+    const pub = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "doc", name: "Doc", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    db.failWhen(null);
+    assert.equal(pub.body.ok, true);
+
+    const dash = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const shown = dash.body.lists.find((l) => l.slug === "doc").visibility;
+    const served = (await call(env, "/lists/dana6b/doc.json")).status === 200;
+    assert.equal(shown, "public",
+      "the owner's dashboard must not report a list private while the world can read it");
+    assert.equal(served, true);
+    assert.equal(shown === "public", served, "dashboard and public path must agree");
+  });
+});
+
+describe("A7/A8: unpublishing must actually remove a list from public discovery", () => {
+  it("reports failure rather than ok:true when the unpublishing write fails", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "alice7");
+    const K = { creatorName: "alice7", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Family Photos", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    const cookie = await adminCookie(env);
+    await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+    assert.equal((await call(env, "/lists/public.json")).body.lists.length, 1);
+
+    env.CONFIGS._hooks.beforePut = async (key) => {
+      if (key.startsWith("creatorlist:")) throw new Error("KV put failed");
+    };
+    const un = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "family-photos", name: "Family Photos", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
+    });
+    env.CONFIGS._hooks.beforePut = null;
+
+    assert.notEqual(un.body.ok, true,
+      "unpublishing cannot report success while the record write fails");
+  });
+
+  it("unpublishing removes a list from directory and search, and rebuild does not re-publish it", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "alice7");
+    const K = { creatorName: "alice7", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Family Photos", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    const cookie = await adminCookie(env);
+    await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+
+    const dirBefore = await call(env, "/lists/public.json");
+    assert.equal(dirBefore.body.lists.some((l) => l.slug === "family-photos"), true);
+
+    // Unpublish
+    const un = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "family-photos", name: "Family Photos", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
+    });
+    assert.equal(un.body.ok, true);
+
+    // Immediate removal from public discovery and search
+    const dirAfter = await call(env, "/lists/public.json");
+    assert.equal(dirAfter.body.lists.some((l) => l.slug === "family-photos"), false);
+    const searchAfter = await call(env, "/api/search-published-lists?q=family");
+    assert.deepEqual(searchAfter.body.lists, []);
+
+    // Rebuild does not re-publish private list
+    await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie });
+    const dirRebuilt = await call(env, "/lists/public.json");
+    assert.equal(dirRebuilt.body.lists.some((l) => l.slug === "family-photos"), false);
+  });
+
+  it("a list republished after being unpublished still comes back", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "alice7");
+    const K = { creatorName: "alice7", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "On Off", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+
+    // Unpublish
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "on-off", name: "On Off", type: "movie", visibility: "private", items: [{ id: "tt0111161" }] },
+    });
+    const dirMid = await call(env, "/lists/public.json");
+    assert.equal(dirMid.body.lists.some((l) => l.slug === "on-off"), false);
+
+    // Republish
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, slug: "on-off", name: "On Off", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    const dirFinal = await call(env, "/lists/public.json");
+    assert.equal(dirFinal.body.lists.some((l) => l.slug === "on-off"), true);
+  });
+});
+
+describe("A9/A10: concurrent devices must not silently overwrite each other", () => {
+  const mk = async (name) => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, name);
+    return { env, K: { creatorName: name, creatorKey: u.creatorKey } };
+  };
+
+  // A9(a) -- Date.now() is frozen for the duration of a Workers request and
+  // only advances on I/O, so two saves genuinely can stamp the same
+  // millisecond. `current.updatedAt > expected` then cannot tell a stale
+  // write from a current one.
+  it("a stale save is still rejected when both writes land in the same millisecond", async () => {
+    const { env, K } = await mk("alice9");
+    const realNow = Date.now;
+    Date.now = () => 1_700_000_000_000;
+    try {
+      const a = await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "A" }] } });
+      const b = await call(env, "/api/creator/sync/save", {
+        method: "POST", json: { ...K, config: [{ url: "B-newer" }], expectedUpdatedAt: a.body.updatedAt },
+      });
+      assert.equal(b.body.ok, true, "the up-to-date save must be accepted");
+      const c = await call(env, "/api/creator/sync/save", {
+        method: "POST", json: { ...K, config: [{ url: "C-stale" }], expectedUpdatedAt: a.body.updatedAt },
+      });
+      assert.equal(c.status, 409, "the stale save must conflict");
+      assert.equal(JSON.parse(env.CONFIGS._store.get("creatorsync:alice9")).config[0].url, "B-newer");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  // A9(b) -- Number.isFinite("1788650901055") is false, so a client that
+  // round-trips the stamp through localStorage or a dataset attribute sent a
+  // string and got last-write-wins with no error at all.
+  it("a malformed expectedUpdatedAt is rejected, not silently ignored", async () => {
+    for (const bad of ["", "not-a-number", {}, [], true]) {
+      const { env, K } = await mk("alice9b");
+      await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "ORIGINAL" }] } });
+      await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "NEWER" }] } });
+      const r = await call(env, "/api/creator/sync/save", {
+        method: "POST", json: { ...K, config: [{ url: "STALE" }], expectedUpdatedAt: bad },
+      });
+      assert.equal(r.status, 400, `expectedUpdatedAt=${JSON.stringify(bad)} must be a client error`);
+      assert.equal(JSON.parse(env.CONFIGS._store.get("creatorsync:alice9b")).config[0].url, "NEWER",
+        `expectedUpdatedAt=${JSON.stringify(bad)} silently disabled the guard`);
+    }
+  });
+
+  it("a numeric string is still honoured as a version", async () => {
+    const { env, K } = await mk("alice9c");
+    const a = await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "A" }] } });
+    await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "B" }] } });
+    const stale = await call(env, "/api/creator/sync/save", {
+      method: "POST", json: { ...K, config: [{ url: "C" }], expectedUpdatedAt: String(a.body.updatedAt) },
+    });
+    assert.equal(stale.status, 409);
+  });
+
+  it("an absent expectedUpdatedAt keeps the old last-write-wins behaviour", async () => {
+    const { env, K } = await mk("alice9d");
+    await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "A" }] } });
+    const r = await call(env, "/api/creator/sync/save", { method: "POST", json: { ...K, config: [{ url: "B" }] } });
+    assert.equal(r.body.ok, true, "an older client must not start failing");
+    assert.equal(JSON.parse(env.CONFIGS._store.get("creatorsync:alice9d")).config[0].url, "B");
+  });
+
+  // A10 -- presets and channels are the blobs the code itself calls the one
+  // piece of synced state that can genuinely grow large, and they had no
+  // guard at all.
+  for (const [route, key, payloadA, payloadB, probe] of [
+    ["/api/creator/sync/save-presets", "creatorsyncpresets", { presets: { keep: { a: 1 } } }, { presets: { other: { b: 2 } } }, (o) => Object.keys(o.presets)],
+    ["/api/creator/sync/save-channels", "creatorsyncchannels", { channels: { keep: { a: 1 } } }, { channels: { other: { b: 2 } } }, (o) => Object.keys(o.channels)],
+  ]) {
+    it(`${route} rejects a stale device instead of replacing the whole blob`, async () => {
+      const { env, K } = await mk("alice10");
+      const first = await call(env, route, { method: "POST", json: { ...K, ...payloadA } });
+      assert.equal(first.body.ok, true);
+      assert.ok(Number.isFinite(first.body.updatedAt), "must hand back a version to build on");
+
+      const onTime = await call(env, route, {
+        method: "POST", json: { ...K, ...payloadB, expectedUpdatedAt: first.body.updatedAt },
+      });
+      assert.equal(onTime.body.ok, true, "an up-to-date save still works");
+
+      const stale = await call(env, route, {
+        method: "POST", json: { ...K, ...payloadA, expectedUpdatedAt: first.body.updatedAt },
+      });
+      assert.equal(stale.status, 409, "a stale device must not silently replace the blob");
+      assert.deepEqual(probe(JSON.parse(env.CONFIGS._store.get(`${key}:alice10`))), ["other"]);
+    });
+  }
+
+  // A10 -- save-tracking guards every array it carries except the watchlist,
+  // which overwrites both the tracking blob and the Watchlist custom list.
+  it("an empty watchlist from a stale device does not wipe a non-empty one", async () => {
+    const { env, K } = await mk("alice10b");
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [], watchlist: [{ id: "tt0111161" }, { id: "tt0068646" }] },
+    });
+    const stored = () => JSON.parse(env.CONFIGS._store.get("creatorsynctracking:alice10b")).watchlist;
+    assert.equal(stored().length, 2);
+
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [], watchlist: [] },
+    });
+    assert.equal(stored().length, 2, "a browser that has not loaded yet must not empty the watchlist");
+    assert.equal(JSON.parse(env.CONFIGS._store.get("creatorlist:alice10b:watchlist")).items.length, 2,
+      "and must not empty the Watchlist custom list either");
+  });
+
+  it("an intentional clear still empties the watchlist", async () => {
+    const { env, K } = await mk("alice10c");
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [], watchlist: [{ id: "tt0111161" }] },
+    });
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [], watchlist: [], intentionalRemoval: true },
+    });
+    assert.deepEqual(JSON.parse(env.CONFIGS._store.get("creatorsynctracking:alice10c")).watchlist, []);
+    assert.deepEqual(JSON.parse(env.CONFIGS._store.get("creatorlist:alice10c:watchlist")).items, []);
+  });
+});
+
+describe("A11: the authenticated list write needs the bounds its anonymous sibling has", () => {
+  const save = (env, K, extra) => call(env, "/api/creator/lists/save", {
+    method: "POST", json: { creatorName: K.creatorName, creatorKey: K.creatorKey, type: "movie", ...extra },
+  });
+
+  it("rejects an over-cap item count, and accepts the cap itself", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "big11");
+    const K = { creatorName: "big11", creatorKey: u.creatorKey };
+    const items = (n) => Array.from({ length: n }, (_, i) => ({ id: "tt" + i }));
+
+    const over = await save(env, K, { name: "Over", items: items(10001) });
+    assert.equal(over.status, 413, JSON.stringify(over.body).slice(0, 120));
+    const at = await save(env, K, { name: "At", items: items(10000) });
+    assert.equal(at.body.ok, true, "the cap itself must still be allowed");
+  });
+
+  it("rejects a payload too large for the D1 mirror rather than silently not mirroring it", async () => {
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const u = await createUser(env, "big11b");
+    const K = { creatorName: "big11b", creatorKey: u.creatorKey };
+    const fat = Array.from({ length: 5000 }, (_, i) => ({ id: "tt" + i, overview: "o".repeat(400) }));
+    const r = await save(env, K, { name: "Fat", items: fat });
+    assert.equal(r.status, 413, JSON.stringify(r.body).slice(0, 160));
+    assert.equal(env.CONFIGS._store.get("creatorlist:big11b:fat"), undefined,
+      "nothing should have been stored");
+  });
+
+  it("rejects an over-long list name", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "big11c");
+    const K = { creatorName: "big11c", creatorKey: u.creatorKey };
+    const over = await save(env, K, { name: "N".repeat(201), items: [] });
+    assert.equal(over.status, 400);
+    const at = await save(env, K, { name: "N".repeat(200), items: [] });
+    assert.equal(at.body.ok, true);
+  });
+
+  it("still accepts an ordinary list", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "big11d");
+    const K = { creatorName: "big11d", creatorKey: u.creatorKey };
+    const r = await save(env, K, {
+      name: "Normal", visibility: "public",
+      items: Array.from({ length: 1200 }, (_, i) => ({ id: "tt" + i, title: "A Film", year: 2001 })),
+    });
+    assert.equal(r.body.ok, true, "the largest genuine list observed was ~1,200 items");
+  });
+
+  // AIII addendum: the ceiling exists because of D1's 2,000,000-BYTE maximum
+  // string size, and it was measured with String.prototype.length, which
+  // counts UTF-16 code units. ASCII makes the two agree, which is why five
+  // audits went past it. A CJK character is 1 unit and 3 bytes, so a list of
+  // Japanese titles passed the guard at 1.78M units while being 4.7 MB on the
+  // wire: KV stored it, the public page served it, the D1 mirror failed inside
+  // a catch that logs and carries on, and every migrate-d1 run afterwards
+  // reported the same error that could never be cleared.
+  it("measures the size ceiling in bytes, not UTF-16 code units", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "big11e");
+    const K = { creatorName: "big11e", creatorKey: u.creatorKey };
+
+    // Deliberately under the cap by .length and well over it by bytes: each
+    // character is 1 UTF-16 unit and 3 UTF-8 bytes.
+    const cjk = Array.from({ length: 700 }, (_, i) => ({ id: "tt" + i, title: "\u65e5".repeat(1000) }));
+    const json = JSON.stringify(cjk);
+    assert.ok(json.length < 1_800_000, "the fixture must pass the OLD units-based check");
+    assert.ok(new TextEncoder().encode(json).length > 1_800_000, "and fail the byte-based one");
+
+    const r = await save(env, K, { name: "Nihongo", items: cjk });
+    assert.equal(r.status, 413, JSON.stringify(r.body).slice(0, 160));
+    assert.equal(env.CONFIGS._store.get("creatorlist:big11e:nihongo"), undefined,
+      "a record KV accepts and D1 silently refuses is the divergence this guard exists to stop");
+  });
+
+  it("leaves an ASCII list of the same character count alone", async () => {
+    // The regression risk of measuring bytes is refusing lists that used to
+    // save. It only bites where bytes and units differ: same 700k characters,
+    // ASCII, comfortably accepted.
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "big11f");
+    const K = { creatorName: "big11f", creatorKey: u.creatorKey };
+    const ascii = Array.from({ length: 700 }, (_, i) => ({ id: "tt" + i, title: "a".repeat(1000) }));
+    const r = await save(env, K, { name: "Ascii", items: ascii });
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+  });
+});
+
+// --- AIII-15: the dashboard's only data source had a hard wall at ~990 lists
+//
+// /api/creator/lists issued one KV get per list with no cap, so 990 lists was
+// 1,001 KV operations -- past Cloudflare's 1,000-per-invocation limit, on both
+// plans. The invocation is terminated at that point, so the dashboard 500s
+// forever; and because deleting a list is done FROM the dashboard, the account
+// had no in-app way back. Not hypothetical: one real account reached 129 list
+// records for 22 real lists through the duplicate-slug bug.
+describe("AIII fix: /api/creator/lists pages instead of reading every list", () => {
+  async function accountWith(n, extra = {}) {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, ...extra });
+    const u = await createUser(env, "pager");
+    const order = [];
+    for (let i = 0; i < n; i++) {
+      const s = "l" + String(i).padStart(4, "0");
+      order.push(s);
+      kv._store.set(`creatorlist:pager:${s}`, JSON.stringify({
+        name: s, slug: s, type: "movie", visibility: "private", items: [{ id: "tt1" }], updatedAt: 1000 + i,
+      }));
+    }
+    kv._store.set("creatorlistorder:pager", JSON.stringify({ order }));
+    return { env, kv, K: { creatorName: u.creatorName, creatorKey: u.creatorKey } };
+  }
+
+  function countOps(kv) {
+    const n = { ops: 0 };
+    for (const m of ["get", "put", "list", "delete"]) {
+      const real = kv[m].bind(kv);
+      kv[m] = async (...a) => { n.ops++; return real(...a); };
+    }
+    return n;
+  }
+
+  it("spends a bounded number of KV operations however many lists there are", async () => {
+    for (const n of [10, 990, 1500]) {
+      const { env, kv, K } = await accountWith(n);
+      const counter = countOps(kv);
+      const r = await call(env, "/api/creator/lists", { method: "POST", json: K });
+      assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+      assert.ok(counter.ops < 1000,
+        `${n} lists spent ${counter.ops} KV operations, past Cloudflare's per-invocation cap`);
+      assert.equal(r.body.total, n, "the count of what exists must not depend on the page size");
+    }
+  });
+
+  it("hands back every list across pages, once each, in order", async () => {
+    const { env, K } = await accountWith(450);
+    const seen = [];
+    let offset = 0;
+    let guard = 0;
+    let page;
+    do {
+      assert.ok(++guard <= 10, "paging must terminate");
+      page = await call(env, "/api/creator/lists", { method: "POST", json: { ...K, offset, limit: 200 } });
+      assert.equal(page.body.ok, true);
+      assert.ok(page.body.lists.length <= 200, "a page must respect the limit");
+      for (const l of page.body.lists) seen.push(l.slug);
+      offset += page.body.lists.length;
+    } while (page.body.hasMore);
+
+    assert.equal(seen.length, 450, "every list must be reachable by paging");
+    assert.equal(new Set(seen).size, 450, "and none returned twice");
+    assert.equal(seen[0], "l0000");
+    assert.equal(seen[449], "l0449", "display order must survive paging");
+  });
+
+  it("caps an over-large limit rather than honouring it", async () => {
+    const { env, K } = await accountWith(900);
+    const r = await call(env, "/api/creator/lists", { method: "POST", json: { ...K, limit: 5000 } });
+    assert.equal(r.body.lists.length, 500, "the request-supplied limit is clamped to the maximum");
+    assert.equal(r.body.hasMore, true);
+  });
+
+  it("reports a deleted slug only when it is deleted, not when it is on another page", async () => {
+    // deletedSlugs used to be filtered against the lists in the RESPONSE. Once
+    // that became one page, a live list sitting on page 2 would be reported to
+    // the client as deleted -- and the client deletes its local copy of
+    // anything named there.
+    const { env, kv, K } = await accountWith(300);
+    kv._store.set("creatorlistdeleted:pager", JSON.stringify({ "l0250": Date.now(), "gone-for-real": Date.now() }));
+    const first = await call(env, "/api/creator/lists", { method: "POST", json: { ...K, offset: 0, limit: 200 } });
+    assert.ok(!first.body.lists.some((l) => l.slug === "l0250"), "l0250 is on the second page");
+    assert.deepEqual(first.body.deletedSlugs, ["gone-for-real"],
+      "a list that still exists must never be advertised as deleted");
+  });
+
+  it("keeps the conditional-response version working per page", async () => {
+    const { env, K } = await accountWith(300);
+    const first = await call(env, "/api/creator/lists", { method: "POST", json: { ...K, offset: 0, limit: 200 } });
+    assert.ok(first.body.version, "a page must carry a version");
+    const again = await call(env, "/api/creator/lists", {
+      method: "POST", json: { ...K, offset: 0, limit: 200, knownVersion: first.body.version },
+    });
+    assert.equal(again.body.unchanged, true, "an unchanged page must not be re-sent");
+    // ...and the paging fields ride along, or a client that cached page 0
+    // could not know to ask for page 1 and would stop at what it had.
+    assert.equal(again.body.hasMore, true);
+    assert.equal(again.body.total, 300);
+  });
+
+  it("still returns a small account in one page, exactly as before", async () => {
+    const { env, K } = await accountWith(6);
+    const r = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.equal(r.body.lists.length, 6);
+    assert.equal(r.body.hasMore, false);
+    assert.equal(r.body.total, 6);
+    assert.equal(r.body.lists[0].items, undefined, "the contents are no longer shipped by this route");
+    assert.equal(typeof r.body.lists[0].itemCount, "number", "itemCount is what replaces them");
+  });
+
+  // --- AIII-15, second half: the transfer, not just the op count -----------
+  //
+  // Paging bounded the KV operations. The response still carried every list's
+  // full items array -- 15.08 MB at 1,200 lists, re-sent after every save,
+  // delete and tab switch.
+  it("does not ship item contents, and says how many there are", async () => {
+    const { env, K } = await accountWith(3);
+    const r = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    for (const l of r.body.lists) {
+      assert.equal(l.items, undefined, "items must not be in the paged response");
+      assert.equal(typeof l.itemCount, "number");
+    }
+    const withItems = await call(env, "/api/creator/lists", {
+      method: "POST", json: { ...K, includeItems: true },
+    });
+    for (const l of withItems.body.lists) {
+      assert.ok(Array.isArray(l.items), "includeItems is the fallback shape and must still work");
+      assert.equal(l.items.length, l.itemCount);
+    }
+  });
+
+  it("serves the contents from /api/creator/lists/items, by slug", async () => {
+    const { env, K } = await accountWith(3);
+    const meta = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const slugs = meta.body.lists.map((l) => l.slug);
+    const r = await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { ...K, slugs },
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.lists.length, slugs.length);
+    for (const l of r.body.lists) {
+      assert.ok(Array.isArray(l.items));
+      assert.equal(l.items.length, l.itemCount);
+      // The version the client caches on. Without it every render refetches.
+      assert.equal(typeof l.updatedAt, "number");
+    }
+    // no-store, like every other per-account answer.
+    assert.match(r.headers.get("cache-control") || "", /no-store/);
+  });
+
+  it("refuses a batch over the cap instead of truncating it", async () => {
+    const { env, K } = await accountWith(1);
+    const many = Array.from({ length: 101 }, (_, i) => "slug-" + i);
+    const r = await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { ...K, slugs: many },
+    });
+    assert.equal(r.status, 400, "a truncated answer would render the missing lists empty");
+    assert.equal(r.body.ok, false);
+  });
+
+  it("de-duplicates slugs before applying the cap", async () => {
+    const { env, K } = await accountWith(1);
+    const meta = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const slug = meta.body.lists[0].slug;
+    const r = await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { ...K, slugs: Array.from({ length: 150 }, () => slug) },
+    });
+    assert.equal(r.status, 200, "150 copies of one slug is one read, not 150");
+    assert.equal(r.body.lists.length, 1);
+  });
+
+  it("needs the account's own key", async () => {
+    const { env, K } = await accountWith(1);
+    const r = await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { creatorName: K.creatorName, creatorKey: "wrong-key", slugs: ["anything"] },
+    });
+    assert.equal(r.status, 401);
+  });
+
+  it("spends a bounded number of KV operations however many lists the account owns", async () => {
+    const { env, kv, K } = await accountWith(400);
+    const counter = countOps(kv);
+    await call(env, "/api/creator/lists/items", {
+      method: "POST", json: { ...K, slugs: ["l0000", "l0001", "l0002"] },
+    });
+    assert.ok(counter.ops < 20,
+      `three slugs against a 400-list account spent ${counter.ops} KV operations -- cost must track the request`);
+  });
+});
+
+// --- AIII-18: bulk-resolve did not fit a free Worker's outbound budget ------
+describe("AIII fix: /api/bulk-resolve fits an invocation budget and says where it stopped", () => {
+  const titles = (n) => Array.from({ length: n }, (_, i) => ({ title: "Film " + i, year: 2000 }));
+
+  it("stays inside the free plan's 50 outbound fetches and reports how far it got", async () => {
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv();
+      const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(200) } });
+      assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 160));
+      // The number that matters: this used to be ~400 against a cap of 50.
+      assert.ok(tmdb.count() <= 50, `spent ${tmdb.count()} outbound fetches, the free plan allows 50`);
+      assert.equal(r.body.nextIndex, 24, "48 fetches, two per title worst case, is 24 titles");
+      assert.equal(r.body.done, false, "and the caller has to be told there is more");
+    } finally { tmdb.restore(); }
+  });
+
+  it("says done when the whole request fitted", async () => {
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv();
+      const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(5) } });
+      assert.equal(r.body.nextIndex, 5);
+      assert.equal(r.body.done, true);
+    } finally { tmdb.restore(); }
+  });
+
+  it("honours a paid plan's larger budget", async () => {
+    const tmdb = stubTmdbSearch();
+    try {
+      const env = makeEnv({ BULK_RESOLVE_SUBREQUEST_BUDGET: "400" });
+      const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(200) } });
+      assert.equal(r.body.nextIndex, 200, "400 outbound fetches covers a whole 200-title request");
+      assert.equal(r.body.done, true);
+    } finally { tmdb.restore(); }
+  });
+
+  it("keeps rejecting a request over the item cap", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/api/bulk-resolve", { method: "POST", json: { items: titles(201) } });
+    assert.equal(r.status, 413, "the request-size bound is separate from the budget and still rejects");
+  });
+});
+
+// --- AIII-19: index:publiclists is one global key, written on every like ----
+describe("AIII fix: likes no longer rewrite the whole directory on every vote", () => {
+  it("coalesces like-driven index writes behind a cooldown", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "hotkey");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: u.creatorName, creatorKey: u.creatorKey, name: "Faves", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    await call(env, "/lists/public.json");   // force the index into existence
+
+    let indexWrites = 0;
+    const realPut = kv.put.bind(kv);
+    kv.put = async (k, ...rest) => { if (isPublicIndexKey(k)) indexWrites++; return realPut(k, ...rest); };
+
+    // Ten distinct voters in the same instant. Each one used to read, sort and
+    // re-serialise the whole directory blob -- 4.45 MB of it at the entry cap
+    // -- against KV's one-write-per-second-per-key limit.
+    for (let i = 0; i < 10; i++) {
+      await call(env, "/api/lists/like", {
+        method: "POST", ip: nextIp(), json: { username: "hotkey", slug: "faves" },
+      });
+    }
+    assert.ok(indexWrites <= 1, `expected the burst to coalesce, got ${indexWrites} whole-directory writes`);
+
+    // The vote itself is never dropped -- only the directory's copy of the
+    // count waits for the next save or the daily rebuild.
+    const rec = JSON.parse(kv._store.get("creatorlist:hotkey:faves"));
+    assert.equal(rec.likes, 10, "every vote must still be counted on the record itself");
+  });
+
+  it("surfaces directory truncation to an operator", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    kv._store.set("index:publiclists", JSON.stringify({
+      updatedAt: Date.now(),
+      entries: Array.from({ length: 20000 }, (_, i) => ({ slug: "s" + i, name: "n", likes: 0 })),
+    }));
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.equal(r.body.ok, true);
+    // It truncates by likes, which is the right entries to drop -- but nothing
+    // anywhere said it had happened.
+    assert.equal(r.body.publicIndex.truncated, true);
+    assert.equal(r.body.publicIndex.entries, 20000);
+  });
+});
+
+// --- AIII-22: /api/publish-list was unauthenticated and wrote permanently ---
+//
+// Round 5 tightened it and left the keep-or-remove call to the maintainer,
+// who chose remove. What replaces those bound-checking tests is the one thing
+// that has to stay true: the route is gone, and everything that READS the
+// records it left behind still works.
+describe("AIII fix: the anonymous publish route is removed", () => {
+  it("no longer accepts a publish", async () => {
+    const env = makeEnv();
+    const r = await call(env, "/api/publish-list", {
+      method: "POST", ip: nextIp(),
+      json: { name: "A List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    assert.equal(r.status, 404, "an unauthenticated permanent write must not answer");
+    assert.equal([...env.CONFIGS._store.keys()].filter((k) => k.startsWith("publishedlist:")).length, 0,
+      "and must not have written anything on the way to saying so");
+  });
+
+  it("still serves, lists and searches the records that already exist", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    seedAnonPublishedList(env, "already-here", { name: "Already Here", items: [{ id: "tt0111161" }] });
+
+    const feed = await call(env, "/lists/user/already-here.json");
+    assert.equal(feed.status, 200, "an existing anonymous list must still resolve");
+    assert.equal(feed.body[0].imdbId, "tt0111161");
+
+    // Sec-Fetch-Mode: navigate is what tells this route a browser is asking;
+    // without it the same path answers with the Stremio feed, which is the
+    // other half of what still has to work. See isBrowserNavigation.
+    const page = await call(env, "/lists/user/already-here", { headers: { "Sec-Fetch-Mode": "navigate" } });
+    assert.equal(page.status, 200, "and its shared page must still render");
+    assert.ok(page.text.includes("Already Here"), "with the name it was published under");
+
+    const dir = await call(env, "/lists/public.json");
+    assert.ok((dir.body.lists || []).some((l) => l.slug === "already-here"),
+      "and must still appear in the directory");
+  });
+
+  it("still lets an admin remove one", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    seedAnonPublishedList(env, "removable", { name: "Removable" });
+    const cookie = await adminCookie(env);
+    const del = await call(env, "/admin/api/delete-published-list", {
+      method: "POST", cookie, json: { slug: "removable" },
+    });
+    assert.equal(del.body.ok, true, JSON.stringify(del.body).slice(0, 200));
+    assert.equal(env.CONFIGS._store.get("publishedlist:user:removable"), undefined);
+  });
+});
+
+// --- AIII free-plan finding: /api/details/batch and the cron tick -----------
+//
+// Measured at 180 and 186 outbound fetches, against the free plan's 50. In
+// both cases the invocation is terminated, so on a free Worker the Airing Next
+// shelf could not refresh and Continue Watching never picked up an episode.
+describe("AIII fix: /api/details/batch fits an invocation's outbound-fetch budget", () => {
+  // A cold id costs several TMDB calls; a cached one costs nothing. The stub
+  // counts what actually goes out, which is what the budget is spent against.
+  function stubTmdbDetails() {
+    const realFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async (u) => {
+      calls++;
+      const href = typeof u === "string" ? u : (u && u.url) || "";
+      const body = href.includes("/find/")
+        ? { movie_results: [], tv_results: [{ id: 100, name: "Show" }] }
+        : { id: 100, name: "Show", seasons: [], episodes: [] };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    return { restore: () => { globalThis.fetch = realFetch; }, count: () => calls };
+  }
+
+  const coldIds = (n) => Array.from({ length: n }, (_, i) => "tt" + String(1000000 + i));
+
+  it("stays inside the free plan's 50 outbound fetches and says what it did not reach", async () => {
+    const env = await freshIsolate().then(() => makeEnv({ TMDB_API_KEY: "k" }));
+    const tmdb = stubTmdbDetails();
+    try {
+      const ids = coldIds(60);
+      const r = await call(env, "/api/details/batch", { method: "POST", json: { ids, type: "series" } });
+      assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
+      assert.ok(tmdb.count() <= 48, `spent ${tmdb.count()} outbound fetches, over the free plan's budget`);
+      assert.equal(r.body.done, false, "a request it could not finish must say so");
+      assert.ok(r.body.remainingIds.length > 0, "and must name what is left");
+      // Nothing may be both answered and reported as remaining, and nothing
+      // may fall between the two -- that is the silent-loss failure.
+      const answered = Object.keys(r.body.results);
+      assert.equal(answered.length + r.body.remainingIds.length, ids.length);
+      assert.equal(new Set([...answered, ...r.body.remainingIds]).size, ids.length);
+    } finally {
+      tmdb.restore();
+    }
+  });
+
+  it("does the whole batch in one call when the ids are already cached", async () => {
+    // The warm case is the common one and is the entire reason this batch
+    // route exists. Budgeting it against the ID count rather than against real
+    // upstream calls would have split every refresh for no reason: here the
+    // second pass runs on the FREE default, which could not have resolved
+    // these ids cold, and still returns all 60 in one invocation.
+    const w = await freshIsolate();
+    const tmdb = stubTmdbDetails();
+    try {
+      const ids = coldIds(60);
+      const ctx = { waitUntil() {} };
+      const post = (env) => w.fetch(new Request("https://example.test/api/details/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "CF-Connecting-IP": "203.0.113.5" },
+        body: JSON.stringify({ ids, type: "series" }),
+      }), env, ctx);
+
+      const paid = makeEnv({ TMDB_API_KEY: "k", DETAILS_BATCH_SUBREQUEST_BUDGET: "600" });
+      const first = await (await post(paid)).json();
+      assert.equal(first.done, true, "600 fetches is room for all 60 cold ids");
+      const spentCold = tmdb.count();
+      assert.ok(spentCold > 48, `precondition: cold ids must cost more than the free budget, spent ${spentCold}`);
+
+      const free = makeEnv({ TMDB_API_KEY: "k" });
+      const second = await (await post(free)).json();
+      assert.equal(second.done, true, "a warm batch must fit one invocation on either plan");
+      assert.equal(Object.keys(second.results).length, 60);
+      assert.equal(tmdb.count(), spentCold, "and must not spend the budget at all");
+    } finally {
+      tmdb.restore();
+    }
+  });
+
+  it("resumes across calls until nothing is left", async () => {
+    // The client loop's server-side contract: what one call could not reach
+    // is exactly what the next call is given, and the two never overlap or
+    // leave a gap. A dropped id is a show silently missing from Airing Next.
+    const w = await freshIsolate();
+    const env = makeEnv({ TMDB_API_KEY: "k" });
+    const tmdb = stubTmdbDetails();
+    try {
+      const ctx = { waitUntil() {} };
+      let pending = coldIds(60);
+      const seen = {};
+      let rounds = 0;
+      while (pending.length && rounds < 8) {
+        rounds++;
+        const res = await (await w.fetch(new Request("https://example.test/api/details/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "CF-Connecting-IP": "203.0.113.6" },
+          body: JSON.stringify({ ids: pending, type: "series" }),
+        }), env, ctx)).json();
+        assert.equal(res.ok, true);
+        Object.assign(seen, res.results);
+        if (res.done) { pending = []; break; }
+        pending = res.remainingIds;
+      }
+      assert.equal(pending.length, 0, "the resume loop never finished");
+      assert.equal(Object.keys(seen).length, 60, "every id must be answered exactly once across the rounds");
+      assert.ok(rounds > 1, "precondition: 60 cold ids must not have fitted one free-plan invocation");
+    } finally {
+      tmdb.restore();
+    }
+  });
+});
+
+describe("AIII fix: one cron tick fits an outbound-fetch budget", () => {
+  const chartEnv = (extra = {}) => ({
+    CONFIGS: makeKv(), TMDB_API_KEY: "k", TRAKT_CLIENT_ID: "t", SIMKL_CLIENT_ID: "s", MDBLIST_API_KEY: "m", ...extra,
+  });
+
+  function stubEverything() {
+    const realFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return new Response(JSON.stringify({ results: [], data: [], episodes: [] }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    };
+    return { restore: () => { globalThis.fetch = realFetch; }, count: () => calls };
+  }
+
+  it("skips chart pre-warming when a free Worker sets the budget down", async () => {
+    // One chart is ~105 outbound fetches (5 paged reads plus a detail call per
+    // item), so no free-plan budget can warm one. Issuing them anyway is what
+    // took the whole tick down -- and the episode sweep with it. A free Worker
+    // sets CRON_SUBREQUEST_BUDGET=48 and gets a tick that completes instead.
+    const env = chartEnv({ CRON_SUBREQUEST_BUDGET: "48" });
+    const net = stubEverything();
+    const warnings = [];
+    const realWarn = console.warn;
+    console.warn = (...a) => warnings.push(a.join(" "));
+    try {
+      await runScheduledTick(env);
+      assert.ok(warnings.some((w) => w.includes("chart pre-warming skipped")),
+        "a skipped pre-warm must say so rather than being silent");
+      assert.ok(warnings.some((w) => w.includes("CRON_SUBREQUEST_BUDGET")),
+        "and must name the variable that turns it back on");
+      assert.ok(net.count() <= 50, `one tick spent ${net.count()} outbound fetches on the free budget`);
+    } finally {
+      console.warn = realWarn;
+      net.restore();
+    }
+  });
+
+  it("warms the charts on the DEFAULT budget, with nothing configured", async () => {
+    // The regression this pins. The default was briefly the free-plan number,
+    // which silently switched pre-warming off and dropped the sweep to 8% of
+    // its throughput on every deployment that had not set a variable -- and
+    // the deployment this add-on is published from is a paste into the
+    // Cloudflare dashboard, which never reads wrangler.toml. A default that
+    // only wrangler users benefit from protects nobody.
+    //
+    // A fresh isolate: chart results are memoised in module scope, so warming
+    // them here would leave a later test's tick with nothing to write.
+    const w = await freshIsolate();
+    const env = chartEnv();
+    const net = stubEverything();
+    try {
+      await runScheduledTick(env, {}, w);
+      assert.ok([...env.CONFIGS._store.keys()].some((k) => k.startsWith("cache:trakt:chart:")),
+        "an unconfigured deployment must still warm the whole chart list");
+      // The whole list fits, so nothing is left for a next tick to resume.
+      assert.equal(env.CONFIGS._store.get("cron:prewarm:cursor"), undefined);
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("keeps the two pacing budgets free-safe and only this one plan-sized", async () => {
+    // The line the three defaults are drawn on: pacing an import or a shelf
+    // refresh costs invocations and nothing else, so those stay free-safe.
+    // Pacing the cron below one chart switches a feature off, so that one is
+    // sized for the deployment and a free Worker steps it down.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "00_constants.js"), "utf8");
+    assert.match(src, /const BULK_RESOLVE_SUBREQUEST_BUDGET = 48;/);
+    assert.match(src, /const DETAILS_BATCH_SUBREQUEST_BUDGET = 48;/);
+    assert.match(src, /const CRON_SUBREQUEST_BUDGET = 10000;/);
+    // README has to tell a free deployment which one to set, and where.
+    const readme = fs.readFileSync(path.join(REPO_ROOT, "README.md"), "utf8");
+    assert.match(readme, /Variables and Secrets/);
+    assert.match(readme, /`CRON_SUBREQUEST_BUDGET`/);
+  });
+
+  it("rotates through the charts when only some of them fit", async () => {
+    // A budget between one chart and all of them: every chart still gets
+    // warmed, just over more ticks. Re-warming the first few forever would be
+    // worse than not chunking at all.
+    const w = await freshIsolate();
+    const env = chartEnv({ CRON_SUBREQUEST_BUDGET: "500" });
+    const net = stubEverything();
+    try {
+      await runScheduledTick(env, {}, w);
+      const first = env.CONFIGS._store.get("cron:prewarm:cursor");
+      assert.ok(first && Number(first) > 0, `expected a resume position, got ${first}`);
+      await runScheduledTick(env, {}, w);
+      const second = env.CONFIGS._store.get("cron:prewarm:cursor");
+      assert.notEqual(second, first, "the next tick must carry on rather than re-warm the same slice");
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("sweeps fewer shows on a small budget, and the full 150 on a large one", async () => {
+    // The sweep is exactly two fetches per show, so this half chunks cleanly:
+    // a smaller slice per tick costs ticks, and there are 240 a day.
+    const seen = [];
+    const src = fs.readFileSync(path.join(REPO_ROOT, "07_source-fetchers-tmdb-simkl.js"), "utf8");
+    assert.match(src, /const SHOW_CHECK_BUDGET = Number\.isFinite\(fetchBudget\)/,
+      "the sweep's slice must come from the budget it was handed");
+    assert.match(src, /Math\.min\(CRON_EPISODE_CHECK_MAX, Math\.floor\(fetchBudget \/ CRON_EPISODE_CHECK_FETCHES\)\)/,
+      "and must still cap at the 150 this sweep has always used");
+    void seen;
+  });
+});
+
+// --- Phase 1: the public list directory is backed by D1 ---------------------
+//
+// Replaces the 32-shard KV index with a direct UNION ALL query over
+// creator_lists and published_lists in D1, filtered by visibility = 'public'
+// and ordered by likes DESC, updated_at DESC.
+describe("Phase 1: the public list directory is backed by D1", () => {
+  async function seeded(n, { withD1 = true } = {}) {
+    const kv = makeKv();
+    const db = withD1 ? makeD1() : undefined;
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "d1dir");
+    for (let i = 0; i < n; i++) {
+      await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: {
+          creatorName: "d1dir", creatorKey: u.creatorKey,
+          name: "List " + i, type: "movie", visibility: "public", items: [{ id: "tt" + i }],
+        },
+      });
+    }
+    return { kv, db, env, u };
+  }
+
+  it("serves public lists directly from D1, without writing KV index keys", async () => {
+    const { kv, env } = await seeded(3);
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 3);
+    assert.equal(dir.body.lists.length, 3);
+    const indexKeys = [...kv._store.keys()].filter((k) => k.startsWith("index:publiclists"));
+    assert.equal(indexKeys.length, 0, "D1 public directory must not write KV index keys");
+  });
+
+  it("serves the whole directory with correct ordering and no duplicates", async () => {
+    const { env } = await seeded(25);
+    const dir = await call(env, "/lists/public.json?limit=500");
+    assert.equal(dir.body.total, 25, "must return all lists");
+    assert.equal(new Set(dir.body.lists.map((l) => l.slug)).size, 25, "and no duplicates");
+  });
+
+  it("ranks lists by likes DESC, updated_at DESC", async () => {
+    const { env } = await seeded(3);
+    await call(env, "/api/lists/like", {
+      method: "POST", ip: nextIp(), json: { username: "d1dir", slug: "list-1" },
+    });
+    await call(env, "/api/lists/like", {
+      method: "POST", ip: nextIp(), json: { username: "d1dir", slug: "list-1" },
+    });
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists[0].slug, "list-1", "most-liked list must rank first");
+    assert.equal(dir.body.lists[0].likes, 2);
+  });
+
+  it("writing a like does not touch any KV index keys", async () => {
+    const { kv, env } = await seeded(5);
+    const touched = new Set();
+    const realPut = kv.put.bind(kv);
+    kv.put = async (k, ...rest) => { if (isPublicIndexKey(k)) touched.add(k); return realPut(k, ...rest); };
+    const r = await call(env, "/api/lists/like", {
+      method: "POST", ip: nextIp(), json: { username: "d1dir", slug: "list-0" },
+    });
+    assert.equal(r.body.ok, true);
+    assert.equal(touched.size, 0, "likes in D1 must not touch KV index shards");
+  });
+
+  it("removes a list from the directory immediately upon deletion", async () => {
+    const { env, u } = await seeded(5);
+    const r = await call(env, "/api/creator/lists/delete", {
+      method: "POST", json: { creatorName: "d1dir", creatorKey: u.creatorKey, slug: "list-2" },
+    });
+    assert.equal(r.body.ok, true);
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 4);
+    assert.ok(!dir.body.lists.some((l) => l.slug === "list-2"), "deleted list must not appear");
+  });
+
+  it("unpublishing a list removes it immediately from public discovery", async () => {
+    const { env, u } = await seeded(3);
+    const unpub = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: "d1dir", creatorKey: u.creatorKey, slug: "list-0",
+        name: "List 0", type: "movie", visibility: "private", items: [{ id: "tt0" }],
+      },
+    });
+    assert.equal(unpub.body.ok, true);
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 2);
+    assert.ok(!dir.body.lists.some((l) => l.slug === "list-0"), "private list must not appear");
+  });
+
+  it("unions creator lists and anonymous published lists seamlessly", async () => {
+    const { db, env } = await seeded(2);
+    db.prepare(`
+      INSERT INTO published_lists (slug, name, type, visibility, items_json, likes, created_at, updated_at)
+      VALUES (?, ?, 'movie', 'public', '[{"id":"tt99"}]', 5, 1, 1)
+    `).bind("anon-gems", "Anon Gems").run();
+
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 3);
+    assert.equal(dir.body.lists[0].slug, "anon-gems");
+    assert.equal(dir.body.lists[0].likes, 5);
+  });
+
+  it("tells the admin panel the D1 directory status", async () => {
+    const { env } = await seeded(2);
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.equal(r.body.publicIndex.d1, true);
+    assert.equal(r.body.publicIndex.entries, 2);
+    assert.equal(r.body.publicIndex.shards, 0);
+  });
+
+  it("falls back to KV scanning when D1 is not bound", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "kvfallback");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "kvfallback", creatorKey: u.creatorKey, name: "KV List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.total, 1);
+    assert.equal(dir.body.lists[0].name, "KV List");
+  });
+});
+
+// --- AIII LOW findings 20, 21 and 23 ----------------------------------------
+describe("AIII fix: the low-severity cleanup", () => {
+  it("does not 500 on a body field that is not a string", async () => {
+    // (body.name || "").trim() reached .trim on an object. It was the only
+    // uncaught 5xx in ~1,700 fuzzed requests, and the same shape sat at six
+    // more sites in the same file.
+    const env = makeEnv();
+    for (const bad of [{}, [], 5, true]) {
+      for (const field of ["name", "provider", "description", "privacy", "type"]) {
+        const r = await call(env, "/api/external-list/create", {
+          method: "POST", json: { provider: "trakt", name: "ok", [field]: bad },
+        });
+        assert.notEqual(r.status, 500, `${field}=${JSON.stringify(bad)} produced a 500`);
+      }
+    }
+  });
+
+  it("does not 500 on a non-string body field at the sibling sites either", async () => {
+    const env = makeEnv();
+    for (const path of ["/api/external-list/item-mutate", "/api/external-list/delete"]) {
+      const r = await call(env, path, { method: "POST", json: { provider: {}, target: [], listId: 1 } });
+      assert.notEqual(r.status, 500, `${path} produced a 500`);
+    }
+  });
+
+  it("answers reset-key failures with a status, not 200", async () => {
+    // Round 1 moved fourteen endpoints off "200 with ok:false" on an auth
+    // failure. This one kept it, so a client branching on the status code read
+    // a refused reset as a success.
+    const env = makeEnv();
+    const u = await createUser(env, "resetstatus", { recoveryAnswer: "blue horizon 42" });
+
+    const unknown = await call(env, "/api/creator/reset-key", {
+      method: "POST", ip: nextIp(), json: { username: "nobody-here", recoveryAnswer: "blue" },
+    });
+    assert.equal(unknown.status, 401);
+
+    const wrong = await call(env, "/api/creator/reset-key", {
+      method: "POST", ip: nextIp(), json: { username: u.creatorName, recoveryAnswer: "not the answer" },
+    });
+    assert.equal(wrong.status, 401);
+    // The message must stay identical across them, or the status pair becomes
+    // a way to ask whether an account exists.
+    assert.equal(wrong.body.error, unknown.body.error);
+
+    const ip = nextIp();
+    let throttled = null;
+    for (let i = 0; i < 14 && !throttled; i++) {
+      const r = await call(env, "/api/creator/reset-key", {
+        method: "POST", ip, json: { username: "nobody-here", recoveryAnswer: "x" },
+      });
+      if (r.status === 429) throttled = r;
+    }
+    assert.ok(throttled, "the per-IP throttle must answer 429");
+
+    // The real answer still works, and still hands back a key.
+    const good = await call(env, "/api/creator/reset-key", {
+      method: "POST", ip: nextIp(), json: { username: u.creatorName, recoveryAnswer: "blue horizon 42" },
+    });
+    assert.equal(good.status, 200, JSON.stringify(good.body).slice(0, 200));
+    assert.ok(good.body.creatorKey);
+  });
+
+  it("no longer ships runListSearch", async () => {
+    // The only function in the client bundle with neither an identifier
+    // reference nor an inline-handler reference.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "19_client-search-and-likes.js"), "utf8");
+    assert.ok(!/function runListSearch/.test(src), "dead function is back");
+  });
+});
+
+describe("Tracking writes: a save that did not land must not report success", () => {
+  const seed = async (env, name) => {
+    const u = await createUser(env, name);
+    return { creatorName: name, creatorKey: u.creatorKey };
+  };
+
+  // DB-001. continue_watching and airing_next are keyed (username, show_id) and
+  // their INSERTs carried no ON CONFLICT, so ONE duplicated show id in a
+  // client-supplied array raised a UNIQUE violation -- and a D1 batch is one
+  // transaction, so it took the meta row, the show states, Continue Watching,
+  // Airing Next and Watch History down with it. The route answered ok:true.
+  it("a duplicated show id does not discard the whole tracking write", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "dupeguard");
+
+    const r = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      intentionalRemoval: true,
+      watchHistory: [{ id: "ttA:1:1", showId: "ttA", seasonNum: 1, episodeNum: 1, watchedAt: 10 }],
+      continueWatching: [
+        { id: "ttB:1:1", showId: "ttB", name: "first", seasonNum: 1, episodeNum: 1 },
+        { id: "ttB:1:2", showId: "ttB", name: "second", seasonNum: 1, episodeNum: 2 },
+      ],
+      airingNext: [
+        { id: "ttC:2:1", showId: "ttC", name: "an-first", airDate: "2099-01-01" },
+        { id: "ttC:2:2", showId: "ttC", name: "an-second", airDate: "2099-02-02" },
+      ],
+    }});
+    assert.equal(r.status, 200);
+    assert.equal(r.body.ok, true);
+
+    // The duplicate collapses to one row, and -- the point -- everything else
+    // in the same write survived.
+    assert.equal(env.DB.q("SELECT show_id FROM continue_watching").length, 1);
+    assert.equal(env.DB.q("SELECT show_id FROM airing_next").length, 1);
+    assert.equal(env.DB.q("SELECT item_id FROM watch_history").length, 1);
+    assert.equal(env.DB.q("SELECT username FROM creator_tracking_meta").length, 1);
+    // First occurrence wins, matching the client's own dedupe.
+    assert.equal(env.DB.q("SELECT name FROM continue_watching")[0].name, "first");
+  });
+
+  // BE-001. saveCreatorTrackingD1 returns false on failure and the route dropped
+  // that value, so a D1 outage answered ok:true -- and because D1 is what
+  // /api/creator/sync/load reads first, the browser was then told its push had
+  // landed, advanced its baseline, and discarded its own copy on the next load.
+  it("a failed D1 tracking write is reported, not swallowed", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "d1failguard");
+
+    env.DB.failWhen((sql) => /INSERT INTO watch_history/i.test(sql));
+    const r = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      watchHistory: [{ id: "ttZ:1:1", showId: "ttZ", seasonNum: 1, episodeNum: 1, watchedAt: 5 }],
+    }});
+    env.DB.failWhen(null);
+
+    assert.equal(r.status, 500, "a tracking write that did not reach D1 must not answer 200");
+    assert.equal(r.body.ok, false);
+    // KV still holds the push, so nothing the user did was thrown away.
+    const kept = JSON.parse(env.CONFIGS._store.get("creatorsynctracking:d1failguard"));
+    assert.equal(kept.watchHistory.length, 1);
+  });
+
+  // The other half of BE-001: with KV holding a copy D1 does not have, the
+  // authoritative read has to notice rather than serve the stale one. This is
+  // the repair getCreatorList has carried for list records all along.
+  it("a KV tracking record newer than D1 wins, and repairs D1", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "freshguard");
+
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      watchHistory: [{ id: "tt1:1:1", showId: "tt1", seasonNum: 1, episodeNum: 1, watchedAt: 1 }],
+    }});
+
+    // A push that reached KV and not D1 -- exactly what a dropped D1 write
+    // leaves behind.
+    const blob = JSON.parse(env.CONFIGS._store.get("creatorsynctracking:freshguard"));
+    blob.watchHistory.push({ id: "tt2:1:1", showId: "tt2", seasonNum: 1, episodeNum: 1, watchedAt: 2 });
+    blob.updatedAt = Date.now() + 60000;
+    env.CONFIGS._store.set("creatorsynctracking:freshguard", JSON.stringify(blob));
+
+    const loaded = await call(env, "/api/creator/sync/load", { method: "POST", json: cred });
+    assert.equal(loaded.status, 200);
+    assert.equal(loaded.body.data.watchHistory.length, 2,
+      "the load served D1's stale copy instead of the newer one in KV");
+  });
+
+  // DB-002. The Continue Watching merge reduced a show id to its show with
+  // split(':')[0]. For "tmdb:222" that is the literal "tmdb", so one
+  // server-side tmdb: entry marked every incoming tmdb: show as handled and
+  // dropped it -- on an ordinary autosave, with ok:true.
+  it("a tmdb-prefixed show id is not collapsed onto the namespace", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "nskeyguard");
+
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred, intentionalRemoval: true,
+      continueWatching: [{ id: "tmdb:111:1:1", showId: "tmdb:111", name: "One", seasonNum: 1, episodeNum: 1 }],
+    }});
+
+    const r = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      continueWatching: [
+        { id: "tmdb:111:1:1", showId: "tmdb:111", name: "One", seasonNum: 1, episodeNum: 1 },
+        { id: "tmdb:222:3:4", showId: "tmdb:222", name: "Two", seasonNum: 3, episodeNum: 4 },
+        { id: "tmdb:333:2:9", showId: "tmdb:333", name: "Three", seasonNum: 2, episodeNum: 9 },
+        { id: "tt444:1:1", showId: "tt444", name: "Four", seasonNum: 1, episodeNum: 1 },
+      ],
+    }});
+    assert.equal(r.status, 200);
+    const stored = env.DB.q("SELECT show_id FROM continue_watching ORDER BY show_id").map((x) => x.show_id);
+    assert.deepEqual(stored, ["tmdb:111", "tmdb:222", "tmdb:333", "tt444"],
+      "tmdb-namespaced shows were dropped by the merge");
+  });
+});
+
+describe("Audit 2026-09-14 regressions", () => {
+  // SEC-001, at the route rather than at the fetcher: the end-to-end shape a
+  // stranger would actually use. /lists/:user/:slug has always been gated;
+  // /api/preview, the Stremio catalog route and /api/resolve were not.
+  it("a stranger cannot read a personal shelf through any route", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const v = await createUser(env, "sec001victim");
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      creatorName: "sec001victim", creatorKey: v.creatorKey,
+      watchHistory: [{ id: "tt77:9:9", showId: "tt77", showTitle: "Private", seasonNum: 9, episodeNum: 9, watchedAt: 1 }],
+      watchlist: [{ id: "tt78", name: "Also Private", type: "movie" }],
+    }});
+
+    // 1. /api/preview -- one unauthenticated GET, which is how this was found.
+    for (const [slug, type] of [["watch-history", "series"], ["watchlist", "movie"],
+                                ["continue-watching", "series"], ["airing-next", "series"]]) {
+      const r = await call(env, `/api/preview?type=${type}&url=` +
+        encodeURIComponent(`autotrack:${slug}:${type}:sec001victim`));
+      assert.equal(r.status, 200);
+      assert.equal((r.body.sample || []).length, 0, `/api/preview leaked ${slug}`);
+    }
+
+    // 2. A hand-made base64 config naming the victim, through the catalog route.
+    const b64 = Buffer.from(JSON.stringify({
+      entries: [{ id: "wh", name: "x", type: "series", url: "autotrack:watch-history:series:sec001victim" }],
+    }), "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const cat = await call(env, `/${b64}/catalog/series/wh.json`);
+    assert.equal((cat.body.metas || []).length, 0, "the catalog route leaked a personal shelf");
+
+    // 3. /api/save must refuse to mint a config that names someone else at all.
+    const forged = await call(env, "/api/save", { method: "POST", json: {
+      entries: [{ id: "wh", name: "x", type: "series", url: "autotrack:watch-history:series:sec001victim" }],
+      trackCreatorName: "sec001victim", trackCreatorKey: "MYL-NOPE-NOPE-NOPE",
+    }});
+    assert.equal(forged.status, 401, "/api/save minted a config naming an account it could not prove");
+  });
+
+  it("the owner's own install link still serves their shelves, with tracking on or off", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "sec001owner");
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      creatorName: "sec001owner", creatorKey: u.creatorKey,
+      watchHistory: [{ id: "tt90:1:1", showId: "tt90", showTitle: "Mine", seasonNum: 1, episodeNum: 1, watchedAt: 1 }],
+    }});
+    const rows = [{ id: "wh", name: "History", type: "series", url: "autotrack:watch-history:series:sec001owner" }];
+
+    // Auto-track Playback OFF is the shape that used to carry no credential.
+    for (const track of [false, true]) {
+      const saved = await call(env, "/api/save", { method: "POST", json: {
+        entries: rows, track, trackCreatorName: "sec001owner", trackCreatorKey: u.creatorKey,
+      }});
+      assert.equal(saved.status, 200, `save failed with track=${track}`);
+      const cat = await call(env, `/${saved.body.id}/catalog/series/wh.json`);
+      assert.equal((cat.body.metas || []).length, 1, `the owner lost their own shelf with track=${track}`);
+    }
+
+    // And an install link minted before any of this existed keeps working --
+    // see LEGACY_UNVERIFIED_CONFIG_SHELVES.
+    env.CONFIGS._store.set("cfg:legacyid0001", JSON.stringify({ entries: rows, trackCreatorName: "sec001owner" }));
+    const legacy = await call(env, "/legacyid0001/catalog/series/wh.json");
+    assert.equal((legacy.body.metas || []).length, 1, "a pre-release install link stopped working");
+  });
+
+  // BE-003. The KV writes used to run regardless, and usernameForScrobbleToken
+  // consults D1 first -- so the new token was rejected and the old one, the one
+  // being revoked, kept working.
+  it("a scrobble token rotation that cannot reach D1 fails closed", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "rotguard");
+    const cred = { creatorName: "rotguard", creatorKey: u.creatorKey };
+
+    const first = await call(env, "/api/creator/scrobble-token", { method: "POST", json: cred });
+    const oldToken = first.body.token;
+    assert.ok(oldToken);
+
+    env.DB.failWhen((sql) => /scrobble_tokens/.test(sql) && /DELETE|INSERT/i.test(sql));
+    const rotated = await call(env, "/api/creator/scrobble-token", { method: "POST", json: { ...cred, rotate: true } });
+    env.DB.failWhen(null);
+
+    assert.equal(rotated.status, 500, "a rotation that did not land answered 200 with a dead token");
+    assert.ok(!rotated.body.token);
+    // The old credential is still the only one, which is the honest outcome:
+    // nothing was revoked, and the caller was told so.
+    assert.equal(env.CONFIGS._store.get(`scrobbletoken:${oldToken}`), "rotguard");
+  });
+
+  // PROTO-001. idPrefixes is how a Stremio-protocol client decides which add-on
+  // owns an id, and these catalogs emit tmdb: ids that /meta has always served.
+  it("the manifest declares every id prefix the catalogs emit", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "prefixguard");
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      creatorName: "prefixguard", creatorKey: u.creatorKey,
+      watchHistory: [{ id: "tmdb:999:1:1", showId: "tmdb:999", showTitle: "TMDB Only", seasonNum: 1, episodeNum: 1, watchedAt: 1 }],
+    }});
+    const saved = await call(env, "/api/save", { method: "POST", json: {
+      entries: [{ id: "wh", name: "History", type: "series", url: "autotrack:watch-history:series:prefixguard" }],
+      trackCreatorName: "prefixguard", trackCreatorKey: u.creatorKey,
+    }});
+
+    const manifest = await call(env, `/${saved.body.id}/manifest.json`);
+    const declared = manifest.body.idPrefixes || [];
+    const metaRes = (manifest.body.resources || []).find((r) => r && r.name === "meta");
+
+    const cat = await call(env, `/${saved.body.id}/catalog/series/wh.json`);
+    for (const meta of (cat.body.metas || [])) {
+      const id = String(meta.id);
+      assert.ok(declared.some((p) => id.startsWith(p)),
+        `catalog returned ${id}, which no manifest idPrefix covers`);
+      assert.ok((metaRes.idPrefixes || []).some((p) => id.startsWith(p)),
+        `catalog returned ${id}, which the meta resource does not claim`);
+    }
+  });
+});
+
+describe("Reset Account Data must not undo itself", () => {
+  // The report: everything clears, then a few hours later the lists, watch
+  // history, continue watching and presets are all back.
+  //
+  // A reset empties the account but KEEPS the identity, so every other browser
+  // signed into it still holds the whole thing in localStorage -- and all five
+  // stamps /api/creator/sync/meta reports go to 0, which is exactly what a
+  // brand-new account reports. Three places in the client treat that as "my
+  // copy is the first save" and upload it back.
+  const seed = async (env, name) => {
+    const u = await createUser(env, name);
+    const cred = { creatorName: name, creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...cred, name: "My Favourites", type: "movie", visibility: "public",
+      items: [{ id: "tt0111161", name: "Shawshank" }],
+    }});
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      watchHistory: [{ id: "tt1:1:1", showId: "tt1", seasonNum: 1, episodeNum: 1, watchedAt: 100 }],
+      continueWatching: [{ id: "tt1:1:2", showId: "tt1", seasonNum: 1, episodeNum: 2 }],
+    }});
+    await call(env, "/api/creator/sync/save-presets", { method: "POST", json: {
+      ...cred, presets: { "Movie Night": { entries: [] } },
+    }});
+    return cred;
+  };
+
+  it("a reset is announced, so a device that slept through it can tell", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "resetann");
+
+    const before = await call(env, "/api/creator/sync/meta", { method: "POST", json: cred });
+    assert.equal(before.body.resetAt || 0, 0, "an account that was never reset must not claim one");
+
+    const reset = await call(env, "/api/creator/account/reset", { method: "POST", json: { ...cred, confirm: "RESET" } });
+    assert.equal(reset.status, 200);
+    assert.ok(Number(reset.body.resetAt) > 0, "the reset response must carry the stamp the device records");
+
+    // Every stamp a polling device compares is now 0 -- indistinguishable from
+    // a new account. resetAt is the one signal that says otherwise.
+    const meta = await call(env, "/api/creator/sync/meta", { method: "POST", json: cred });
+    assert.equal(Number(meta.body.config) || 0, 0);
+    assert.equal(Number(meta.body.tracking) || 0, 0);
+    assert.equal(Number(meta.body.presets) || 0, 0);
+    assert.equal(Number(meta.body.resetAt), Number(reset.body.resetAt));
+
+    const load = await call(env, "/api/creator/sync/load", { method: "POST", json: cred });
+    assert.equal(Number(load.body.resetAt), Number(reset.body.resetAt),
+      "sync/load must carry it too -- the poll is not the only way in");
+  });
+
+  it("a reset tombstones the lists it removed, so another device cannot re-upload them", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "resettomb");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...cred, name: "Sci-Fi", type: "movie", visibility: "private", items: [{ id: "tt0083658" }],
+    }});
+
+    await call(env, "/api/creator/account/reset", { method: "POST", json: { ...cred, confirm: "RESET" } });
+
+    const lists = await call(env, "/api/creator/lists", { method: "POST", json: cred });
+    assert.equal((lists.body.lists || []).length, 0);
+    // applyServerListDeletions consumes these on the other device, and
+    // renderCreatorDashboard's re-upload guard then skips those slugs.
+    const deleted = (lists.body.deletedSlugs || []).slice().sort();
+    assert.deepEqual(deleted, ["my-favourites", "sci-fi"],
+      "the reset left no record that these lists were deleted, so another device will put them back");
+  });
+
+  it("deleting an account does not leave a reset marker behind", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "resetdel");
+    const del = await call(env, "/api/creator/delete-account", { method: "POST", json: { ...cred, confirm: "DELETE" } });
+    assert.equal(del.status, 200);
+    // Nothing to announce to: the account is gone and the key no longer
+    // authenticates. A marker here would only be a stranded key.
+    assert.equal(env.CONFIGS._store.has("creatorreset:resetdel"), false);
+  });
+});
+
+describe("A15: a fresh schema.sql and a migrated database must be the same shape", () => {
+  it("schema.sql declares every index the migrations create", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const read = (rel) => fs.readFileSync(path.join(REPO_ROOT, rel), "utf8");
+    const indexesOf = (db) =>
+      db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name")
+        .all().map((r) => r.name);
+
+    const fresh = new DatabaseSync(":memory:");
+    fresh.exec(read("schema.sql"));
+
+    // The shape migrations/0001 and 0002 were written against.
+    const migrated = new DatabaseSync(":memory:");
+    migrated.exec(`
+      CREATE TABLE creators (username TEXT PRIMARY KEY, display_name TEXT NOT NULL, key_hash TEXT NOT NULL,
+        recovery_answer_hash TEXT, created_at INTEGER NOT NULL, last_active INTEGER);
+      CREATE TABLE creator_lists (id TEXT PRIMARY KEY, username TEXT NOT NULL, name TEXT NOT NULL,
+        type TEXT NOT NULL, visibility TEXT NOT NULL DEFAULT 'private', items_json TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        FOREIGN KEY (username) REFERENCES creators(username) ON DELETE CASCADE);
+      CREATE TABLE source_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, install_count INTEGER NOT NULL DEFAULT 0);
+      CREATE INDEX idx_creator_lists_username ON creator_lists(username);
+      CREATE INDEX idx_creator_lists_visibility ON creator_lists(visibility);
+    `);
+    // Every migration, in order, exactly as an operator would apply them.
+    // Read from the directory rather than listed by hand, so a migration
+    // added later cannot be silently left out of this comparison.
+    const migrationFiles = fs.readdirSync(path.join(REPO_ROOT, "migrations"))
+      .filter((f) => f.endsWith(".sql")).sort();
+    assert.ok(migrationFiles.length >= 4, `expected the migration set, got ${migrationFiles.join(", ")}`);
+    for (const f of migrationFiles) migrated.exec(read(`migrations/${f}`));
+
+    assert.deepEqual(indexesOf(fresh), indexesOf(migrated),
+      "a deployment provisioned from schema.sql must not be missing an index a migrated one has");
+
+    const tables = (db) =>
+      db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .all().map((r) => r.name);
+    assert.deepEqual(tables(fresh), tables(migrated));
+
+    const cols = (db, t) => db.prepare(`PRAGMA table_info(${t})`).all()
+      .map((c) => `${c.name}:${c.type}:${c.notnull}:${c.dflt_value}`).sort();
+    for (const t of tables(fresh)) {
+      assert.deepEqual(cols(fresh, t), cols(migrated, t), `${t} differs between the two provisioning paths`);
+    }
+  });
+});
+
+describe("A12: a response that should never be cached must say so", () => {
+  it("an admin 401 is not cacheable", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    for (const p of ["/admin/api/analytics", "/admin/api/feedback", "/admin/api/leaderboard", "/admin/api/apiusage"]) {
+      const r = await call(env, p);
+      assert.equal(r.status, 401);
+      assert.match(r.headers.get("cache-control") || "", /no-store/,
+        `${p} cached its 401, so a probe from any page breaks the dashboard for an hour`);
+    }
+  });
+
+  it("no error response is cacheable", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const cases = [
+      ["/api/creator/lists/save", { creatorName: "nobody", creatorKey: "MYL-XXXX-XXXX-XXXX" }],
+      ["/api/creator/restore", { creatorName: "nobody", creatorKey: "MYL-XXXX-XXXX-XXXX" }],
+      ["/api/lists/like", { username: "nobody", slug: "nothing" }],
+    ];
+    for (const [p, body] of cases) {
+      const r = await call(env, p, { method: "POST", json: body });
+      assert.ok(r.status >= 400, `${p} was expected to fail`);
+      assert.match(r.headers.get("cache-control") || "", /no-store/, `${p} cached a ${r.status}`);
+    }
+  });
+
+  it("the two responses that carry a plaintext Creator Key are not cacheable", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const created = await call(env, "/api/creator/create", {
+      method: "POST", json: { creatorName: "cache12", recoveryAnswer: "purple mountains" },
+    });
+    assert.ok(created.body.creatorKey);
+    assert.match(created.headers.get("cache-control") || "", /no-store/);
+
+    const reset = await call(env, "/api/creator/reset-key", {
+      method: "POST", json: { username: "cache12", recoveryAnswer: "purple mountains" },
+    });
+    assert.ok(reset.body.creatorKey);
+    assert.match(reset.headers.get("cache-control") || "", /no-store/);
+
+    const cookie = await adminCookie(env);
+    const admin = await call(env, "/admin/api/reset-creator-key", {
+      method: "POST", cookie, json: { username: "cache12" },
+    });
+    assert.ok(admin.body.creatorKey);
+    assert.match(admin.headers.get("cache-control") || "", /no-store/);
+  });
+
+  it("a GET that answers for one person's provider account is not cacheable", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    for (const p of [
+      "/api/trakt-my-lists?token=SECRET&username=someone",
+      "/api/mdblist-my-lists?apikey=SECRET",
+      "/api/simkl/my-lists?token=SECRET",
+      "/api/tmdb-my-lists?session_id=SECRET&account_id=1",
+    ]) {
+      const r = await call(env, p);
+      assert.match(r.headers.get("cache-control") || "", /no-store/,
+        `${p} is a per-person answer keyed on a credential in the URL`);
+    }
+  });
+
+  it("genuinely public responses keep their caching", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "cache12b");
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "cache12b", creatorKey: u.creatorKey, name: "Pub", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    const dir = await call(env, "/lists/public.json");
+    assert.match(dir.headers.get("cache-control") || "", /max-age=120/);
+    const one = await call(env, "/lists/cache12b/pub.json");
+    assert.match(one.headers.get("cache-control") || "", /max-age=300/);
+  });
+});
+
+describe("A13: an unhandled exception must not escape the Worker", () => {
+  it("a KV failure becomes a JSON 500 with security headers, not a Cloudflare error page", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "boom13");
+    env.CONFIGS._hooks.beforePut = async (key) => {
+      if (key.startsWith("creatorlist:")) throw new Error("KV 429 rate limited");
+    };
+    let r;
+    try {
+      r = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: { creatorName: "boom13", creatorKey: u.creatorKey, name: "X", type: "movie", visibility: "public", items: [] },
+      });
+    } catch (e) {
+      assert.fail(`the exception escaped worker.fetch: ${e.message}`);
+    } finally {
+      env.CONFIGS._hooks.beforePut = null;
+    }
+    assert.equal(r.status, 500);
+    assert.equal(r.body.ok, false);
+    assert.ok(typeof r.body.error === "string" && r.body.error.length > 0);
+    assert.equal(r.headers.get("x-content-type-options"), "nosniff",
+      "the boundary must still run the response through withSecurityHeaders");
+  });
+
+  it("a redacting error message never leaks a URL or a long token", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "boom13b");
+    env.CONFIGS._hooks.beforePut = async () => {
+      throw new Error("failed calling https://api.themoviedb.org/3/x?api_key=abcdef0123456789abcdef0123456789");
+    };
+    const r = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "boom13b", creatorKey: u.creatorKey, name: "X", type: "movie", visibility: "public", items: [] },
+    });
+    env.CONFIGS._hooks.beforePut = null;
+    assert.equal(r.status, 500);
+    assert.doesNotMatch(r.text, /themoviedb/, "a URL reached the client");
+    assert.doesNotMatch(r.text, /abcdef0123456789/, "a token reached the client");
+  });
+
+  it("an upstream that answers 200 with a truncated body is handled, not thrown", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), extra: { TMDB_API_KEY: "k" } });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const u = String(input && input.url ? input.url : input);
+      if (/themoviedb/.test(u)) {
+        return new Response("{not json", { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return realFetch(input, init);
+    };
+    try {
+      const r = await call(env, "/api/details?id=tt0111161");
+      assert.ok(r.status === 404 || r.status === 500, `got ${r.status}`);
+      assert.equal(typeof r.body === "object" && r.body !== null, true, "must be a JSON body");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
+describe("P3: hygiene findings", () => {
+  it("A14: migrate-d1 counts rows written, not keys looked at, and reports what it skipped", async () => {
+    const db = makeD1();
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    for (const u of ["p3a", "p3b"]) {
+      kv._store.set(`creator:${u}`, JSON.stringify({ displayName: u, keyHash: "pbkdf2:1:aa:bb", createdAt: 1 }));
+      kv._store.set(`creatorlist:${u}:one`, JSON.stringify({
+        name: "One", slug: "one", type: "movie", items: [], visibility: "public", likes: 3, createdAt: 1, updatedAt: 1,
+      }));
+    }
+    // Records the sweep must skip and say so: a key with no readable record,
+    // and a counter whose stored value is not a number.
+    kv._store.set("creatorlist:p3c:orphan", JSON.stringify({ name: "X", type: "movie", items: [], visibility: "private" }));
+    kv._store.set("stats:pageviews:total", "not-a-number");
+    const cookie = await adminCookie(env);
+
+    let last;
+    for (let i = 0; i < 20; i++) {
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+      if (last.body.done) break;
+    }
+    assert.equal(last.body.done, true);
+    assert.equal(last.body.results.creators, 2);
+    assert.equal(last.body.results.lists, 2, "p3c's list has no creator row, so it cannot be written");
+    assert.ok(last.body.results.skipped >= 1,
+      `records the sweep dropped must be counted, got ${last.body.results.skipped}`);
+    assert.ok(last.body.results.errors.length >= 1,
+      "and the orphaned list, which the foreign key rejects, must surface as an error");
+
+    // Re-running writes nothing new; the counters must not imply otherwise.
+    const again = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+    assert.equal(again.body.results.stats, 0, "a second run must not claim to have migrated counters again");
+  });
+
+  // This used to match on the source text -- it looked for the cursor PUT
+  // appearing after the account loop in the file. That is not a test of
+  // anything: it passed happily while the loop could still break out of a page
+  // it had not finished and let the cursor jump the rest of it, and a mutation
+  // that moved the write back above the loop was caught only because of where
+  // the characters were, not what the code did. Both are behavioural now.
+  it("A17/N6: the Continue Watching cron never advances past an account it did not sweep", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ episodes: [] }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+    try {
+      const kv = makeKv();
+      // 30 accounts across two pages of 25. The first is a heavy user whose
+      // fully-watched list alone can exhaust the whole per-tick show budget.
+      for (let i = 0; i < 30; i++) {
+        const u = `cronfair${String(i).padStart(2, "0")}`;
+        kv._store.set(`creator:${u}`, JSON.stringify({ displayName: u, keyHash: "h", createdAt: 1 }));
+        const shows = i === 0 ? 200 : 1;
+        const ids = [], hist = [];
+        for (let s = 0; s < shows; s++) {
+          ids.push(`tt${i}_${s}`);
+          hist.push({ type: "episode", showId: `tt${i}_${s}`, seasonNum: 1, episodeNum: 1, showTitle: "S" });
+        }
+        kv._store.set(`creatorsynctracking:${u}`, JSON.stringify({
+          fullyWatchedShowIds: ids, watchHistory: hist, continueWatching: [], updatedAt: 1,
+        }));
+      }
+
+      const swept = new Set();
+      const origGet = kv.get.bind(kv);
+      kv.get = async (k, t) => {
+        if (k.startsWith("creatorsynctracking:")) swept.add(k.slice("creatorsynctracking:".length));
+        return origGet(k, t);
+      };
+
+      const env = { CONFIGS: kv, TMDB_API_KEY: "test-key" };
+      for (let tick = 0; tick < 8; tick++) {
+        const pending = [];
+        await worker.scheduled({ cron: "*/6 * * * *" }, env, {
+          waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); },
+        });
+        await Promise.all(pending);
+      }
+      kv.get = origGet;
+
+      const never = [];
+      for (let i = 0; i < 30; i++) {
+        const u = `cronfair${String(i).padStart(2, "0")}`;
+        if (!swept.has(u)) never.push(u);
+      }
+      // Before: one heavy account exhausted the shared budget, the loop broke
+      // out of its page, and the cursor advanced to the end of that page
+      // anyway -- so accounts 01..24 were never swept on any cycle.
+      assert.deepEqual(never, [],
+        `every account must be reached; these never were: ${never.join(", ")}`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("N7: one account that fails does not stop the sweep, and a rejected cursor does not wedge it", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify({ episodes: [] }), {
+      status: 200, headers: { "content-type": "application/json" },
+    });
+    try {
+      const kv = makeKv();
+      for (let i = 0; i < 5; i++) {
+        const u = `cronpoison${i}`;
+        kv._store.set(`creator:${u}`, JSON.stringify({ displayName: u, keyHash: "h", createdAt: 1 }));
+        kv._store.set(`creatorsynctracking:${u}`, JSON.stringify({
+          fullyWatchedShowIds: [`tt${i}`],
+          watchHistory: [{ type: "episode", showId: `tt${i}`, seasonNum: 1, episodeNum: 1 }],
+          continueWatching: [],
+        }));
+      }
+      // Account 2's tracking key will not read.
+      kv._hooks.beforeGet = async (k) => {
+        if (k === "creatorsynctracking:cronpoison2") throw new Error("KV get failed for this one key");
+      };
+      const reached = new Set();
+      const origGet = kv.get.bind(kv);
+      kv.get = async (k, t) => {
+        if (k.startsWith("creatorsynctracking:")) reached.add(k.slice("creatorsynctracking:".length));
+        return origGet(k, t);
+      };
+
+      const env = { CONFIGS: kv, TMDB_API_KEY: "test-key" };
+      const tick = async () => {
+        const pending = [];
+        await worker.scheduled({ cron: "x" }, env, {
+          waitUntil(p) { pending.push(Promise.resolve(p).catch(() => {})); },
+        });
+        await Promise.all(pending);
+      };
+      await tick();
+      kv.get = origGet;
+      kv._hooks.beforeGet = null;
+
+      // Before: the sweep threw at account 2 and the cursor was never written,
+      // so every later account was unreachable on every subsequent tick too.
+      assert.ok(reached.has("cronpoison3") && reached.has("cronpoison4"),
+        `the sweep must continue past a failing account; reached: ${[...reached].join(", ")}`);
+
+      // And a stored cursor KV rejects must be cleared rather than retried forever.
+      kv._store.set("cron:continuewatching:cursor", "NO-LONGER-A-VALID-CURSOR");
+      kv._hooks.beforeList = async (_prefix, cursor) => {
+        if (cursor) throw new Error("KV list failed: invalid cursor");
+      };
+      await tick();
+      kv._hooks.beforeList = null;
+      assert.notEqual(kv._store.get("cron:continuewatching:cursor"), "NO-LONGER-A-VALID-CURSOR",
+        "a cursor the binding rejects must be dropped so the next tick can start over");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("N8: scheduled() does not reject when everything inside it fails", async () => {
+    const dead = {
+      get: async () => { throw new Error("KV down"); },
+      put: async () => { throw new Error("KV down"); },
+      list: async () => { throw new Error("KV down"); },
+      delete: async () => { throw new Error("KV down"); },
+    };
+    const pending = [];
+    await worker.scheduled({ cron: "x" }, { CONFIGS: dead, TMDB_API_KEY: "k" }, {
+      waitUntil(p) { pending.push(p); },
+    });
+    // Before: checkForNewEpisodes had no error handling at all, so a dead KV
+    // rejected it, Promise.all rejected with it, and the rejection escaped the
+    // handler -- Cloudflare recorded the tick as failed with no indication of
+    // which task broke. Two independent changes now stop that: each task
+    // handles its own failure, and scheduled() wraps each one anyway.
+    await assert.doesNotReject(Promise.all(pending));
+
+    // The per-task wrappers are belt-and-braces at this point, so removing
+    // them alone would not fail the assertion above. What must not regress is
+    // the SYNCHRONOUS boundary -- before it, anything thrown before waitUntil
+    // was even reached escaped scheduled() directly.
+    const hostileEnv = new Proxy({ CONFIGS: dead, TMDB_API_KEY: "k" }, {
+      get(target, prop) {
+        if (prop === "TRAKT_CLIENT_ID") throw new Error("env access exploded");
+        return target[prop];
+      },
+    });
+    await assert.doesNotReject(
+      worker.scheduled({ cron: "x" }, hostileEnv, { waitUntil() {} }),
+      "a throw before the tasks are queued must not escape scheduled()",
+    );
+  });
+
+  it("A18: the daily shuffle rolls over on the same calendar day as every counter", async () => {
+    // In the real build these are one concatenated module, so getDailySeed
+    // sees easternDateKey by hoisting. Recreate that here by evaluating both
+    // files into one sandbox.
+    const src02 = fs.readFileSync(path.join(REPO_ROOT, "02_http-and-creator-utils.js"), "utf8");
+    const src03 = fs.readFileSync(path.join(REPO_ROOT, "03_admin.js"), "utf8");
+    const grab = (src, name) => {
+      const start = src.indexOf(`function ${name}`);
+      let i = src.indexOf("{", start), d = 0;
+      for (; i < src.length; i++) {
+        if (src[i] === "{") d++;
+        else if (src[i] === "}") { d--; if (!d) { i++; break; } }
+      }
+      return src.slice(start, i);
+    };
+    const getDailySeed = new Function(
+      `${grab(src03, "easternDateKey")}\n${grab(src02, "getDailySeed")}\nreturn getDailySeed;`
+    )();
+    const realNow = Date.now;
+    try {
+      // 02:00 UTC on Jun 2 is still 22:00 Eastern on Jun 1.
+      Date.now = () => new Date("2026-06-02T02:00:00Z").getTime();
+      const lateEvening = getDailySeed("x");
+      Date.now = () => new Date("2026-06-01T16:00:00Z").getTime();  // noon Eastern, same Eastern day
+      assert.equal(getDailySeed("x"), lateEvening, "the seed must not change during a single Eastern day");
+      Date.now = () => new Date("2026-06-02T05:00:00Z").getTime();  // 01:00 Eastern, next Eastern day
+      assert.notEqual(getDailySeed("x"), lateEvening, "and must change once the Eastern day does");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it("A19: lists/reorder is bounded and rejects a slug that could reach another key", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "p3order");
+    const K = { creatorName: "p3order", creatorKey: u.creatorKey };
+    const huge = await call(env, "/api/creator/lists/reorder", {
+      method: "POST", json: { ...K, order: Array.from({ length: 10000 }, (_, i) => "slug" + i) },
+    });
+    assert.equal(huge.body.ok, true);
+    assert.equal(huge.body.order.length, 5000, "the array must be capped");
+
+    const nasty = await call(env, "/api/creator/lists/reorder", {
+      method: "POST", json: { ...K, order: ["good-slug", "other:user:list", "x".repeat(300)] },
+    });
+    assert.deepEqual(nasty.body.order, ["good-slug"],
+      "a colon is the KV key separator and slugifyServer never emits one");
+  });
+
+  it("A20: a list write self-heals the missing creator row instead of leaving D1 empty", async () => {
+    const db = makeD1();
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p3fk");
+    // Put the account back into the pre-migration state: KV has it, D1 does not.
+    await db.prepare("DELETE FROM creators WHERE username = ?").bind("p3fk").run();
+    assert.equal(db._creators.has("p3fk"), false);
+
+    const r = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { creatorName: "p3fk", creatorKey: u.creatorKey, name: "Mirrored", type: "movie", visibility: "public", items: [{ id: "tt0111161" }] },
+    });
+    assert.equal(r.body.ok, true);
+    assert.equal(db._creators.has("p3fk"), true, "the account row should have been backfilled");
+    assert.equal(db._lists.has("p3fk:mirrored"), true, "and the list should have reached the mirror");
+  });
+});
+
+// The four mutations that still survived the suite after the P0/P1 fixes.
+// Each of these is the test that kills one.
+describe("Test-suite blind spots named by the audit", () => {
+  it("listAllKeys follows the cursor past the first page", async () => {
+    const kv = makeKv();
+    // KV-only on purpose: with D1 bound the dashboard counts with SELECT
+    // COUNT(*) and never touches listAllKeys. The KV fallback is the path
+    // that pages, and KV pages at 1000, so this only comes out right if the
+    // cursor is followed.
+    const env = makeEnv({ CONFIGS: kv });
+    const n = 1500;
+    for (let i = 0; i < n; i++) {
+      kv._store.set(`creator:user${String(i).padStart(5, "0")}`, JSON.stringify({
+        displayName: `User ${i}`, keyHash: "pbkdf2:1:aa:bb", createdAt: 1,
+      }));
+    }
+    const cookie = await adminCookie(env);
+    const page = await call(env, "/admin", { cookie });
+    assert.equal(page.status, 200);
+    assert.match(page.text, new RegExp(`\\b${n}\\b`),
+      `the dashboard must count all ${n} creators, not just the first KV page`);
+  });
+
+  it("the index rebuild picks up anonymously published lists, not only creator ones", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    seedAnonPublishedList(env, "anon-picks", { name: "Anon Picks", items: [{ id: "tt0111161" }] });
+    const cookie = await adminCookie(env);
+    let done = false;
+    for (let i = 0; i < 20 && !done; i++) {
+      done = (await call(env, "/admin/api/rebuild-public-index", { method: "POST", cookie })).body.done;
+    }
+    const dir = await call(env, "/lists/public.json");
+    assert.equal(dir.body.lists.some((l) => l.slug === "anon-picks"), true,
+      "a rebuild that misses the publishedlist:user: prefix silently empties half the directory");
+  });
+
+  // Driving this through the API cannot reach the exhausted branch: the
+  // random-suffix attempts essentially never collide, so pickFreeSlug returns
+  // on the first one every time. The contract it documents -- "returns '' when
+  // it cannot find a free slug, and callers MUST treat that as a failure" --
+  // is therefore only testable directly, and it is worth testing: both call
+  // sites used to run a bounded loop and then use whatever slug it exited on,
+  // which past the bound was a slug that WAS taken, so publishing wrote
+  // straight over someone's existing list.
+  it("pickFreeSlug returns empty rather than a taken slug when it runs out", async () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "02_http-and-creator-utils.js"), "utf8");
+    const grab = (name) => {
+      let start = src.indexOf(`function ${name}`);
+      // Keep a leading `async`, or the extracted body loses its await.
+      if (src.slice(Math.max(0, start - 6), start) === "async ") start -= 6;
+      let i = src.indexOf("{", start), d = 0;
+      for (; i < src.length; i++) {
+        if (src[i] === "{") d++;
+        else if (src[i] === "}") { d--; if (!d) { i++; break; } }
+      }
+      return src.slice(start, i);
+    };
+    const consts = ["SLUG_NUMBERED_ATTEMPTS", "SLUG_RANDOM_ATTEMPTS"]
+      .map((n) => src.match(new RegExp(`const ${n}\\s*=\\s*[^;]+;`))[0]).join("\n");
+    const pickFreeSlug = new Function(
+      "crypto",
+      `${consts}\n${grab("randomSlugSuffix")}\n${grab("pickFreeSlug")}\nreturn pickFreeSlug;`
+    )(globalThis.crypto);
+
+    assert.equal(await pickFreeSlug("movies", async () => true), "",
+      "everything taken must yield '', never a slug the caller would then overwrite");
+    assert.equal(await pickFreeSlug("movies", async () => false), "movies");
+    const taken = new Set(["movies"]);
+    assert.equal(await pickFreeSlug("movies", async (c) => taken.has(c)), "movies-2");
+  });
+
+  it("slug allocation never hands back a slug that is already taken", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "slugs1");
+    const K = { creatorName: "slugs1", creatorKey: u.creatorKey };
+    // Past SLUG_NUMBERED_ATTEMPTS the allocator switches to random suffixes;
+    // past those it must FAIL rather than reuse one. Either way, no save may
+    // ever land on another list's slug.
+    const slugs = [];
+    for (let i = 0; i < 20; i++) {
+      const r = await call(env, "/api/creator/lists/save", {
+        method: "POST",
+        json: { ...K, name: "Movies", type: "movie", visibility: "private", items: [{ id: "tt" + i }] },
+      });
+      if (r.body.ok) slugs.push(r.body.slug);
+      else assert.equal(r.status, 409, "the only acceptable failure here is 'no free slug'");
+    }
+    assert.equal(new Set(slugs).size, slugs.length, "two lists were given the same slug");
+    assert.ok(slugs.length >= 10, "the numbered suffixes should have carried most of these");
+    for (const [i, slug] of slugs.entries()) {
+      const raw = env.CONFIGS._store.get(`creatorlist:slugs1:${slug}`);
+      assert.ok(raw, `${slug} was returned but never stored`);
+      assert.deepEqual(JSON.parse(raw).items, [{ id: "tt" + i }],
+        `${slug} holds another list's items, so a save overwrote one`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Second adversarial audit (AUDIT-2026-09-06-ADVERSARIAL-II.md).
+//
+// One test per finding, each written to fail on the code as it was rather than
+// to describe the fix. Where the audit's mutation testing found the suite
+// silent about something, the guard for it is here too.
+// ---------------------------------------------------------------------------
+describe("N1/N2: a delete that did not delete must not report success", () => {
+  const seedPublicList = async (env, user) => {
+    const u = await createUser(env, user);
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: user, creatorKey: u.creatorKey,
+      name: "Live List", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    await call(env, "/lists/public.json"); // materialise the directory index
+    return u;
+  };
+  const inDirectory = (kv, frag) =>
+    publicIndexEntries(kv).some((e) => String(e.id).includes(frag));
+
+  it("lists/delete reports failure when the KV record could not be removed", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const u = await seedPublicList(env, "n1user");
+    kv._hooks.beforeDelete = async (k) => { if (k.startsWith("creatorlist:")) throw new Error("KV unavailable"); };
+    const r = await call(env, "/api/creator/lists/delete", { method: "POST", json: {
+      creatorName: "n1user", creatorKey: u.creatorKey, slug: "live-list",
+    }});
+    kv._hooks.beforeDelete = null;
+    // Before: {ok:true} while the record stayed in KV and the public page kept
+    // serving it -- with the D1 row gone, so the admin panel disagreed.
+    assert.notEqual(r.body.ok, true, "a delete that deleted nothing must not answer ok:true");
+    const page = await call(env, "/lists/n1user/live-list.json");
+    assert.ok(r.body.ok !== true || page.status === 404,
+      "if it claims success the list must actually be gone");
+  });
+
+  it("every account and list delete path reports a failed database removal", async () => {
+    const cases = [
+      ["lists/delete", async (env, user, key) => call(env, "/api/creator/lists/delete", {
+        method: "POST", json: { creatorName: user, creatorKey: key, slug: "live-list" } })],
+      ["account/reset", async (env, user, key) => call(env, "/api/creator/account/reset", {
+        method: "POST", json: { creatorName: user, creatorKey: key, confirm: "RESET" } })],
+      ["delete-account", async (env, user, key) => call(env, "/api/creator/delete-account", {
+        method: "POST", json: { creatorName: user, creatorKey: key, confirm: "DELETE" } })],
+    ];
+    for (const [label, run] of cases) {
+      const kv = makeKv();
+      const db = makeD1();
+      const env = makeEnv({ CONFIGS: kv, DB: db });
+      const user = "n2" + label.replace(/[^a-z]/g, "").slice(0, 12);
+      const u = await seedPublicList(env, user);
+      db.failWhen((sql) => /DELETE FROM creator_lists/i.test(sql));
+      const r = await run(env, user, u.creatorKey);
+      db.failWhen(null);
+      assert.notEqual(r.body.ok, true,
+        `${label} claimed success while the list was still in the directory`);
+      const dir = await call(env, "/lists/public.json");
+      assert.ok(dir.body.lists.some((l) => (l.creator || l.username) === user),
+        `precondition for ${label}: the removal really did fail`);
+    }
+  });
+
+  it("a delete removes a list immediately from public discovery", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await seedPublicList(env, "n2serve");
+    const r = await call(env, "/api/creator/lists/delete", { method: "POST", json: {
+      creatorName: "n2serve", creatorKey: u.creatorKey, slug: "live-list",
+    }});
+    assert.equal(r.body.ok, true);
+    const dir = await call(env, "/lists/public.json");
+    assert.ok(!JSON.stringify(dir.body).includes("n2serve"),
+      "the directory must not serve an entry that was deleted");
+  });
+});
+
+describe("N3: /api/lists/like must not see past a list's visibility", () => {
+  it("answers a private list exactly as it answers one that does not exist", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const u = await createUser(env, "n3owner");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n3owner", creatorKey: u.creatorKey,
+      name: "Secret Movies", type: "movie", visibility: "private", items: [{ id: "tt-secret" }],
+    }});
+
+    const missing = await call(env, "/api/lists/like", { method: "POST", ip: "203.0.113.5",
+      json: { username: "n3owner", slug: "no-such-list-at-all" } });
+    const priv = await call(env, "/api/lists/like", { method: "POST", ip: "203.0.113.6",
+      json: { username: "n3owner", slug: "secret-movies" } });
+
+    // Before: 404 vs 200, which told any anonymous caller which private slugs
+    // a creator owned. Usernames are published by /lists/public.json.
+    assert.equal(priv.status, missing.status, "a private list must not be distinguishable from a missing one");
+    assert.deepEqual(priv.body, missing.body);
+
+    const rec = JSON.parse(kv._store.get("creatorlist:n3owner:secret-movies"));
+    assert.equal(rec.likes || 0, 0, "a stranger must not be able to change a private list's like count");
+    assert.ok(!kv._store.has("listlikevoters:n3owner:secret-movies"),
+      "and must not mint a permanent ledger key for it");
+
+    // The count a stranger built up while it was private must not appear in
+    // the directory the moment the owner publishes.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n3owner", creatorKey: u.creatorKey, slug: "secret-movies",
+      name: "Secret Movies", type: "movie", visibility: "public", items: [{ id: "tt-secret" }],
+    }});
+    assert.equal(JSON.parse(kv._store.get("creatorlist:n3owner:secret-movies")).likes || 0, 0);
+  });
+
+  it("still lets a public list be liked", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "n3public");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n3public", creatorKey: u.creatorKey,
+      name: "Open List", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    const r = await call(env, "/api/lists/like", { method: "POST", ip: "203.0.113.7",
+      json: { username: "n3public", slug: "open-list" } });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.likes, 1);
+  });
+});
+
+describe("N9: migrate-d1 must be able to repair a drifted list row", () => {
+  it("rewrites name, type, items and updatedAt from KV, not just likes", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "n9user");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n9user", creatorKey: u.creatorKey,
+      name: "Correct Name", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    // The state a swallowed D1 write during an edit leaves behind.
+    db._db.exec("UPDATE creator_lists SET name='Stale Name', items_json='[]', updated_at=1 WHERE id='n9user:correct-name'");
+
+    const cookie = await adminCookie(env);
+    let r, guard = 0;
+    do { r = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie, json: {} }); }
+    while (!r.body.done && ++guard < 30);
+
+    const row = db._lists.get("n9user:correct-name");
+    // Before: DO UPDATE set only likes and visibility, so the documented
+    // repair tool could create a row but never correct one.
+    assert.equal(row.name, "Correct Name", "migrate-d1 must repair a drifted name");
+    assert.equal(row.items_json, JSON.stringify([{ id: "tt1" }]), "and drifted items");
+  });
+
+  // The column that actually drifts in production. /api/lists/like writes KV
+  // first and D1 second inside a catch, so a D1 blip during a like leaves the
+  // mirror low forever: lists/save deliberately does not push likes (the like
+  // endpoint owns that column and may have moved it since), so a later rename
+  // will not repair it either. migrate-d1 is the only thing that can, which is
+  // the whole point of N9.
+  it("repairs a like count that a D1 outage left behind", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "n9likes");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n9likes", creatorKey: u.creatorKey,
+      name: "L", type: "movie", visibility: "public", items: [],
+    }});
+    db.failWhen((sql) => /UPDATE creator_lists SET likes/i.test(sql));
+    for (const ip of ["198.18.0.1", "198.18.0.2", "198.18.0.3"]) {
+      await call(env, "/api/lists/like", { method: "POST", ip, json: { username: "n9likes", slug: "l" } });
+    }
+    db.failWhen(null);
+    assert.equal(JSON.parse(kv._store.get("creatorlist:n9likes:l")).likes, 3, "KV holds the true count");
+    assert.equal(db._lists.get("n9likes:l").likes, 0, "and D1 is the one that drifted");
+
+    // A rename must not be expected to fix it -- that is a different owner's
+    // column -- and must not destroy the real count either.
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "n9likes", creatorKey: u.creatorKey, slug: "l",
+      name: "Renamed", type: "movie", visibility: "public", items: [],
+    }});
+    assert.equal(JSON.parse(kv._store.get("creatorlist:n9likes:l")).likes, 3,
+      "a rename must never write D1's stale zero back over the true count");
+
+    const cookie = await adminCookie(env);
+    let r, guard = 0;
+    do { r = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie, json: {} }); }
+    while (!r.body.done && ++guard < 30);
+    assert.equal(db._lists.get("n9likes:l").likes, 3, "migrate-d1 must converge the mirror");
+  });
+});
+
+describe("N10: a response carrying one account's private data is never cacheable", () => {
+  it("marks every account-scoped endpoint no-store", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "n10user");
+    const K = { creatorName: "n10user", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/sync/save", { method: "POST", json: {
+      ...K, config: [{ a: 1 }], keys: { tmdbKey: "SECRET" },
+    }});
+    for (const p of ["/api/creator/sync/load", "/api/creator/lists", "/api/creator/sync/meta",
+      "/api/creator/restore", "/api/creator/track-status"]) {
+      const r = await call(env, p, { method: "POST", json: K });
+      assert.equal(r.body.ok, true, `${p} should have succeeded`);
+      assert.match(r.headers.get("cache-control") || "", /no-store/,
+        `${p} returns account-private data under a cacheable header`);
+    }
+    // sync/load is the sharpest one: it hands back the account's own provider
+    // API keys.
+    const load = await call(env, "/api/creator/sync/load", { method: "POST", json: K });
+    assert.equal(load.body.data.keys.tmdbKey, "SECRET", "precondition: it really does return the keys");
+  });
+
+  it("does not let list search cache a list that has since been unpublished", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const r = await call(env, "/api/search-published-lists?q=anything");
+    const cc = r.headers.get("cache-control") || "";
+    const maxAge = Number((cc.match(/max-age=(\d+)/) || [])[1] || Infinity);
+    // A GET, so browsers and shared caches really do store it. At the
+    // inherited hour, a list made private stayed findable long after the API
+    // stopped returning it.
+    assert.ok(maxAge <= 120, `search was cacheable for ${maxAge}s; the directory itself uses 120`);
+  });
+
+  // Marking the individual routes was opt-in, and five of them were still
+  // opted out: sync/save, save-tracking, save-presets, save-channels and
+  // lists/delete all answered 200 with max-age=3600. Nothing was leaking --
+  // they are POSTs and browsers do not store a POST response -- but that is
+  // protection by accident of HTTP method, and a route added tomorrow starts
+  // out wrong the same way. So the rule now lives at the response boundary
+  // and this test walks the whole surface rather than a chosen list.
+  it("enforces no-store at the boundary, for every creator and admin path", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "boundary");
+    const K = { creatorName: "boundary", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...K, name: "L", type: "movie", visibility: "public", items: [],
+    }});
+    const cookie = await adminCookie(env);
+
+    const leaky = [];
+    for (const p of ["/api/creator/sync/load", "/api/creator/sync/save", "/api/creator/lists",
+      "/api/creator/sync/meta", "/api/creator/restore", "/api/creator/track-status",
+      "/api/creator/scrobble-token", "/api/creator/sync/save-tracking", "/api/creator/sync/save-presets",
+      "/api/creator/sync/save-channels", "/api/creator/sync/share-tracking", "/api/creator/lists/delete",
+      // A path no route serves: the boundary must cover the 404 too, since
+      // that is the shape a future route arrives in.
+      "/api/creator/not-a-route-yet"]) {
+      const r = await call(env, p, { method: "POST", json: { ...K, slug: "l", shared: false } });
+      if (!/no-store/.test(r.headers.get("cache-control") || "")) {
+        leaky.push(`${p} -> ${r.status} ${r.headers.get("cache-control")}`);
+      }
+    }
+    for (const p of ["/admin", "/admin/api/published-lists", "/admin/api/leaderboard?type=trending&window=last30"]) {
+      const r = await call(env, p, { cookie });
+      if (!/no-store/.test(r.headers.get("cache-control") || "")) {
+        leaky.push(`${p} -> ${r.status} ${r.headers.get("cache-control")}`);
+      }
+    }
+    assert.deepEqual(leaky, [], "these account-scoped responses are storable");
+  });
+
+  // The half a blanket no-store would break. This add-on stays inside the
+  // upstream rate limits by being cacheable where it can be, so the rule has
+  // to be narrow enough to leave the public surface alone.
+  it("leaves the public, cacheable surface alone", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "pubcache");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: "pubcache", creatorKey: u.creatorKey,
+      name: "Public List", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+    }});
+    for (const p of ["/lists/public.json", "/lists/pubcache/public-list.json", "/icon.png"]) {
+      const r = await call(env, p);
+      assert.equal(r.status, 200, `${p} should be served`);
+      assert.match(r.headers.get("cache-control") || "", /max-age=\d+/,
+        `${p} must stay cacheable -- the rate-limit budget depends on it`);
+    }
+  });
+});
+
+describe("N11: verifying a Creator Key is bounded, not free", () => {
+  // Read from the source rather than hardcoded, so raising the ceiling does
+  // not quietly turn this into a test of nothing. Not via
+  // loadSourceFunctions: a top-level `const` lives in the script's lexical
+  // scope and never becomes a property of the vm sandbox, so that would hand
+  // back undefined and the loop below would silently run zero times.
+  const CAP = Number(
+    /const CREATOR_AUTH_VERIFY_PER_MINUTE = (\d+)/.exec(
+      fs.readFileSync(path.join(REPO_ROOT, "00_constants.js"), "utf8"),
+    )[1],
+  );
+  assert.ok(Number.isFinite(CAP) && CAP > 0, "could not read the verification cap");
+
+  it("throttles a flood of key checks on a route that is not restore", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    await createUser(env, "n11user");
+    const ip = "203.0.113.99";
+    let throttled = 0;
+    for (let i = 0; i < CAP + 15; i++) {
+      const r = await call(env, "/api/creator/sync/load", { method: "POST", ip, json: {
+        creatorName: "n11user", creatorKey: "MYL-AAAA-BBBB-" + String(i).padStart(4, "0"),
+      }});
+      if (r.status === 429) throttled++;
+    }
+    // Before: every one of these ran PBKDF2 at 100k iterations -- ~15ms of CPU
+    // each -- unauthenticated and uncounted, on any of sixteen routes.
+    assert.ok(throttled > 0, "an unauthenticated flood of key checks must eventually be refused");
+  });
+
+  it("does not throttle a signed-in client whose key the isolate already verified", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "n11warm");
+    const K = { creatorName: "n11warm", creatorKey: u.creatorKey };
+    const ip = "203.0.113.98";
+    for (let i = 0; i < CAP + 40; i++) {
+      const r = await call(env, "/api/creator/sync/meta", { method: "POST", ip, json: K });
+      assert.equal(r.body.ok, true, `a memoized key must not be charged (failed at attempt ${i})`);
+    }
+  });
+});
+
+describe("test-suite blind spots the audit's mutation testing found", () => {
+  // M15 -- nothing covered the per-IP account creation limit at all.
+  it("M15: creating profiles is rate limited per IP", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const ip = "203.0.113.150";
+    const first = await call(env, "/api/creator/create", { method: "POST", ip, json: { creatorName: "ratefirst" } });
+    assert.equal(first.body.ok, true);
+    const second = await call(env, "/api/creator/create", { method: "POST", ip, json: { creatorName: "ratesecond" } });
+    assert.equal(second.status, 429, "a second profile from the same IP inside the window must be refused");
+    assert.ok(!env.CONFIGS._store.has("creator:ratesecond"), "and must not have been created");
+  });
+
+  // M11 -- nothing proved a rotated key stops working from a WARM isolate,
+  // which is the case invalidateCreatorAuthMemo exists for.
+  //
+  // A note for whoever next runs mutation testing: making
+  // invalidateCreatorAuthMemo a no-op does NOT fail this test, and that is
+  // correct rather than a hole. Measured, with the clear disabled entirely:
+  // a rotated key still 401s in both KV-only and KV+D1 mode, and a deleted
+  // account still 401s. The memo key is a hash of username + presented key +
+  // STORED HASH, so a rotation changes the key and the old entry becomes
+  // unreachable on its own; a deleted account fails on the tombstone or the
+  // missing record long before the memo is consulted. The clear is
+  // belt-and-braces, exactly as its own comment says.
+  //
+  // So the test deliberately asserts the PROPERTY ("the old key stops
+  // working") and not the mechanism. Writing a test that fails when the clear
+  // is removed would mean pinning a redundant line, which is how a suite ends
+  // up describing the implementation instead of the behaviour -- the same
+  // mistake the source-text cron test made. A surviving mutation means either
+  // the test is decorative or the mutated code was redundant, and those need
+  // telling apart rather than papering over.
+  it("M11: a rotated key stops working even after the old one was just verified", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "m11user", { recoveryAnswer: "a long recovery answer" });
+    // Verify the old key first, so it is sitting in this isolate's memo.
+    const warm = await call(env, "/api/creator/restore", { method: "POST", json: {
+      creatorName: "m11user", creatorKey: u.creatorKey,
+    }});
+    assert.equal(warm.body.ok, true, "precondition: the old key is memoized");
+
+    const rotated = await call(env, "/api/creator/reset-key", { method: "POST", json: {
+      username: "m11user", recoveryAnswer: "a long recovery answer",
+    }});
+    assert.equal(rotated.body.ok, true);
+
+    const old = await call(env, "/api/creator/restore", { method: "POST", json: {
+      creatorName: "m11user", creatorKey: u.creatorKey,
+    }});
+    assert.equal(old.status, 401, "the old key must stop working immediately, memo or no memo");
+    const fresh = await call(env, "/api/creator/restore", { method: "POST", json: {
+      creatorName: "m11user", creatorKey: rotated.body.creatorKey,
+    }});
+    assert.equal(fresh.body.ok, true, "and the new one must work");
+  });
+
+  // M22 -- the share allow-list had no test.
+  it("M22: only the three tracking slugs can be shared", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "m22user");
+    const K = { creatorName: "m22user", creatorKey: u.creatorKey };
+    const bad = await call(env, "/api/creator/sync/share-tracking", { method: "POST", json: {
+      ...K, slug: "anything-else", shared: true,
+    }});
+    assert.equal(bad.status, 400);
+    const stored = env.CONFIGS._store.get("creatorshare:m22user");
+    assert.ok(!stored || !JSON.parse(stored)["anything-else"],
+      "a slug outside the allow-list must not be recorded as shared");
+    for (const slug of ["watchlist", "watch-history", "continue-watching"]) {
+      const ok = await call(env, "/api/creator/sync/share-tracking", { method: "POST", json: { ...K, slug, shared: true } });
+      assert.equal(ok.body.ok, true, `${slug} must still be shareable`);
+    }
+  });
+
+  // M9 -- the numbered scan's exact bound was never pinned, so an off-by-one
+  // in how many candidates it tries went unnoticed.
+  it("M9: slug allocation tries every numbered candidate before falling back", async () => {
+    const { pickFreeSlug } = loadSourceFunctions("02_http-and-creator-utils.js");
+    const tried = [];
+    const slug = await pickFreeSlug("movies", async (candidate) => {
+      tried.push(candidate);
+      return candidate !== "movies-10"; // only the LAST numbered candidate is free
+    });
+    assert.equal(slug, "movies-10",
+      "the numbered scan must reach -10; a bound that stops earlier silently falls back to a random suffix");
+    assert.deepEqual(tried.slice(0, 10),
+      ["movies", "movies-2", "movies-3", "movies-4", "movies-5", "movies-6", "movies-7", "movies-8", "movies-9", "movies-10"]);
+  });
+});
+
+describe("audit II §11.1: a provider answering 200 with nothing must not erase the last good chart", () => {
+  const goodTraktChart = JSON.stringify([
+    { movie: { title: "Real Movie", year: 2020, ids: { imdb: "tt0000001", trakt: 1, tmdb: 11 } } },
+    { movie: { title: "Second", year: 2021, ids: { imdb: "tt0000002", trakt: 2, tmdb: 12 } } },
+  ]);
+
+  // `w` is the Worker instance to run the tick on, and `fetches` counts the
+  // upstream calls it made -- both matter, see the test below.
+  let fetches = 0;
+  const tick = async (w, env, body) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = async () => { fetches++; return new Response(body, { status: 200, headers: { "content-type": "application/json" } }); };
+    try {
+      // Drained in rounds. The chart fetchers register their KV cache write
+      // with a SECOND ctx.waitUntil once they are already running, so a single
+      // snapshot of the queue returns before the cache has been written. See
+      // runScheduledTick, which does the same thing.
+      let queue = [];
+      await w.scheduled({ cron: "x" }, env, {
+        waitUntil(p) { queue.push(Promise.resolve(p).catch(() => {})); },
+      });
+      for (let round = 0; round < 20 && queue.length; round++) {
+        const batch = queue;
+        queue = [];
+        await Promise.all(batch);
+      }
+    } finally { globalThis.fetch = real; }
+  };
+
+  it("keeps the last non-empty copy of a shared chart", async () => {
+    const kv = makeKv();
+    // CRON_SUBREQUEST_BUDGET is what wrangler.toml sets on a Workers Paid
+    // plan. Without it the tick gets the free-plan default, which cannot fit
+    // even one chart warm (~105 outbound fetches) and skips pre-warming
+    // altogether -- so this test would have nothing to assert against.
+    const env = { CONFIGS: kv, TMDB_API_KEY: "k", TRAKT_CLIENT_ID: "t", SIMKL_CLIENT_ID: "s", MDBLIST_API_KEY: "m", CRON_SUBREQUEST_BUDGET: "10000" };
+    await tick(worker, env, goodTraktChart);
+    const key = [...kv._store.keys()].find((k) => k.startsWith("cache:trakt:chart:"));
+    assert.ok(key, "precondition: the prewarm cached a Trakt chart");
+    const healthy = String(kv._store.get(key));
+    assert.ok(!/"data":(\[\]|\{\})/.test(healthy), "precondition: the healthy tick cached real items");
+
+    // Two things have to be arranged or the second tick cannot touch the cache
+    // at all, and this test passes whether the guard exists or not. It did
+    // exactly that when first written: disabling the guard left it green.
+    //
+    //   1. Every KV copy has to be STALE, or the refresh is never attempted.
+    //   2. The tick has to run on a DIFFERENT isolate, because the first tick
+    //      left the result in this one's in-memory chart memo and would be
+    //      served from there without a fetch.
+    for (const k of [...kv._store.keys()].filter((x) => x.startsWith("cache:"))) {
+      try {
+        const v = JSON.parse(String(kv._store.get(k)));
+        v.freshUntil = Date.now() - 1;
+        kv._store.set(k, JSON.stringify(v));
+      } catch { /* not a cache record */ }
+    }
+    const coldIsolate = await freshIsolate();
+    fetches = 0;
+    await tick(coldIsolate, env, "[]");
+    assert.ok(fetches > 0, "precondition: the empty tick must actually reach the provider");
+
+    const after = String(kv._store.get(key));
+    // Before: the write gate was only "not null and not undefined", so an
+    // empty array counted as a successful refresh and was written over the
+    // isolate, KV and edge copies at once -- destroying the last-known-good
+    // data those tiers exist to hold, right when the provider needed it.
+    assert.ok(!/"data":(\[\]|\{\})/.test(after),
+      "an empty-but-successful upstream reply overwrote the good cached chart");
+    assert.deepEqual(JSON.parse(after).data, JSON.parse(healthy).data,
+      "the cached chart contents should be untouched");
+  });
+
+  it("still accepts an empty result for a cache the user owns", () => {
+    // Emptiness is only suspicious for a cache the PROVIDER owns. Someone who
+    // clears their own Trakt watchlist must not be shown the items they just
+    // deleted, so the per-user fetchers deliberately do not opt in.
+    const src = fs.readFileSync(path.join(REPO_ROOT, "06_source-fetchers-mdblist-trakt.js"), "utf8");
+    assert.ok(!/refuseEmptyOverwrite/.test(src),
+      "the per-user Trakt/MDBList caches must not refuse an empty result");
+    const shared = fs.readFileSync(path.join(REPO_ROOT, "07_source-fetchers-tmdb-simkl.js"), "utf8");
+    const optedIn = (shared.match(/refuseEmptyOverwrite: true/g) || []).length;
+    assert.equal(optedIn, 4,
+      "the four shared chart/collection caches should opt in (Simkl, Trakt, TMDB charts and TMDB collections)");
+  });
+});
+
+describe("N4: a new account starts clean however data got under its username", () => {
+  it("registering a username purges anything already sitting under it", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+
+    // The state a straggler leaves: account-owned keys with no identity to
+    // own them. Reachable when a write that authenticated before a purge
+    // lands after it, and the tombstone has since lapsed -- so the reclaim
+    // path cannot assume the previous delete finished cleanly.
+    kv._store.set("creatorsync:orphaned", JSON.stringify({
+      config: [{ previousOwner: true }], keys: { tmdbKey: "PREVIOUS-OWNERS-KEY" }, updatedAt: 1,
+    }));
+    kv._store.set("creatorsynctracking:orphaned", JSON.stringify({ watchHistory: [{ id: "tt-private" }] }));
+    kv._store.set("creatorsyncpresets:orphaned", JSON.stringify({ presets: { p: { name: "p" } } }));
+    kv._store.set("creatorlist:orphaned:leftover", JSON.stringify({
+      name: "Leftover", slug: "leftover", type: "movie", visibility: "public", items: [{ id: "tt1" }],
+      likes: 0, createdAt: 1, updatedAt: 1,
+    }));
+    kv._store.set("creatorlistorder:orphaned", JSON.stringify({ order: ["leftover"] }));
+    kv._store.set("creatorscrobbletoken:orphaned", "OLD-WEBHOOK-TOKEN");
+    kv._store.set("scrobbletoken:OLD-WEBHOOK-TOKEN", "orphaned");
+
+    const fresh = await createUser(env, "orphaned");
+    const K = { creatorName: "orphaned", creatorKey: fresh.creatorKey };
+
+    const load = await call(env, "/api/creator/sync/load", { method: "POST", json: K });
+    const d = load.body.data || {};
+    assert.deepEqual(d.config || [], [], "a new account must not inherit the previous config");
+    assert.deepEqual(d.keys || {}, {}, "and certainly not the previous owner's provider API keys");
+    assert.deepEqual(d.watchHistory || [], [], "nor their watch history");
+    assert.deepEqual(d.presets || {}, {}, "nor their presets");
+
+    const lists = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(lists.body.lists, [], "nor their lists");
+    assert.ok(!kv._store.has("creatorlist:orphaned:leftover"), "the leftover list record must be gone");
+
+    // A live webhook credential is the sharpest leftover: it authorises writes
+    // for this username without the Creator Key.
+    assert.ok(!kv._store.has("scrobbletoken:OLD-WEBHOOK-TOKEN"),
+      "the previous owner's scrobble token must not still resolve");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The audit's remaining open items, closed after the report.
+// ---------------------------------------------------------------------------
+describe("R1: an anonymously published list can be removed", () => {
+  // Seeded straight into KV. /api/publish-list was removed in 1.5.3, but the
+  // admin browse-and-delete contract is precisely what has to keep working
+  // for the records it already wrote -- that was the whole argument for
+  // removing the route rather than leaving unowned writes reachable.
+  const publish = (env, name) => seedAnonPublishedList(env, slugifyForTest(name), { name });
+
+  it("an admin can enumerate and delete them", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    for (const n of ["Alpha List", "Beta List"]) await publish(env, n);
+    await call(env, "/api/lists/like", { method: "POST", ip: "203.0.113.9", json: { username: "user", slug: "alpha-list" } });
+    await call(env, "/lists/public.json");
+    const cookie = await adminCookie(env);
+
+    const listed = await call(env, "/admin/api/published-lists", { cookie });
+    assert.equal(listed.body.ok, true);
+    assert.deepEqual(listed.body.lists.map((l) => l.slug).sort(), ["alpha-list", "beta-list"]);
+
+    const del = await call(env, "/admin/api/delete-published-list", { method: "POST", cookie, json: { slug: "alpha-list" } });
+    assert.equal(del.body.ok, true);
+    // Before: no route in the Worker could remove one of these at all -- the
+    // creator-list endpoint validates the username and `user` is reserved --
+    // so anything published anonymously was permanent.
+    assert.ok(!env.CONFIGS._store.has("publishedlist:user:alpha-list"), "the record must be gone");
+    assert.ok(!env.CONFIGS._store.has("listlikevoters:user:alpha-list"), "and its like ledger");
+    assert.equal((await call(env, "/lists/user/alpha-list.json")).status, 404);
+    const dir = await call(env, "/lists/public.json");
+    assert.ok(!JSON.stringify(dir.body).includes("alpha-list"), "and the directory must stop advertising it");
+    assert.ok(env.CONFIGS._store.has("publishedlist:user:beta-list"), "the other list is untouched");
+  });
+
+  // The admin panel's "Load more" button walks this cursor. If the cursor
+  // never went null the button would never disappear; if it went null early
+  // the operator would be shown a truncated list and conclude the rest do not
+  // exist. Both failures are silent, so the paging contract gets its own test.
+  it("pages through more lists than one call returns", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    for (let i = 0; i < 7; i++) await publish(env, "Paged List " + i);
+    const cookie = await adminCookie(env);
+
+    const seen = [];
+    let cursor = "";
+    let calls = 0;
+    let last = null;
+    do {
+      assert.ok(++calls <= 10, "paging must terminate");
+      last = await call(env, "/admin/api/published-lists?limit=3" + (cursor ? "&cursor=" + encodeURIComponent(cursor) : ""), { cookie });
+      assert.equal(last.body.ok, true);
+      assert.ok(last.body.lists.length <= 3, "a page must respect the limit");
+      for (const l of last.body.lists) seen.push(l.slug);
+      cursor = last.body.cursor || "";
+    } while (cursor);
+
+    assert.equal(last.body.done, true, "the final page must say it is the final page");
+    assert.equal(seen.length, 7, "every list must be reachable by paging");
+    assert.equal(new Set(seen).size, 7, "and none returned twice");
+  });
+
+  it("both routes need an admin session, and a failed delete says so", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    await publish(env, "Gamma List");
+    assert.equal((await call(env, "/admin/api/published-lists")).status, 401);
+    assert.equal((await call(env, "/admin/api/delete-published-list", { method: "POST", json: { slug: "gamma-list" } })).status, 401);
+
+    const cookie = await adminCookie(env);
+    kv._hooks.beforeDelete = async (k) => { if (k.startsWith("publishedlist:")) throw new Error("KV down"); };
+    const failed = await call(env, "/admin/api/delete-published-list", { method: "POST", cookie, json: { slug: "gamma-list" } });
+    kv._hooks.beforeDelete = null;
+    assert.notEqual(failed.body.ok, true, "a delete that deleted nothing must not report success");
+    assert.ok(kv._store.has("publishedlist:user:gamma-list"));
+  });
+});
+
+describe("the Worker can tell an operator it is ahead of its own database", () => {
+  // Migrations are applied by hand and nothing records that it happened, so
+  // the Worker can outrun its schema with no signal. Measured before this
+  // existed: deploy without migration 0004 and delete-account still answers
+  // ok:true, still writes its KV tombstone, and still refuses the deleted
+  // account on a normal request -- while a colo with a stale KV cache
+  // authenticates it. One line in the logs was the only trace.
+
+  // The manifest is only useful if it stays in step with migrations/, and
+  // discipline is not a mechanism. Same shape as the FUNCTION-MAP and
+  // build-drift checks: adding a migration without listing what it creates
+  // fails here.
+  it("its manifest lists exactly what migrations/ creates", async () => {
+    const dir = path.join(REPO_ROOT, "migrations");
+    const found = [];
+    for (const file of fs.readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+      const migration = (/^(\d+[a-z]?)_/.exec(file) || [])[1];
+      const sql = fs.readFileSync(path.join(dir, file), "utf8")
+        .split("\n").filter((l) => !l.trim().startsWith("--")).join("\n");
+      for (const m of sql.matchAll(/CREATE\s+(?:VIRTUAL\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z_][\w]*)/gi)) {
+        found.push(`${migration}:table:${m[1]}`);
+      }
+      for (const m of sql.matchAll(/CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+([A-Za-z_][\w]*)/gi)) {
+        found.push(`${migration}:index:${m[1]}`);
+      }
+      for (const m of sql.matchAll(/ALTER\s+TABLE\s+([A-Za-z_][\w]*)\s+ADD\s+COLUMN\s+([A-Za-z_][\w]*)/gi)) {
+        found.push(`${migration}:column:${m[2]}`);
+      }
+    }
+    // Read the manifest back out of the running Worker rather than out of the
+    // source. A top-level `const` lives in the script's lexical scope and
+    // never becomes a property of a vm sandbox, so loadSourceFunctions would
+    // hand back undefined and this would compare against nothing and pass.
+    // An empty database is missing every entry by construction, so the
+    // endpoint's report IS the manifest -- and it comes through the same code
+    // path an operator would use.
+    const db = makeD1();
+    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones", "list_likes", "feedback", "scrobble_tokens", "event_meta", "watch_history", "continue_watching", "airing_next", "creator_user_lists", "creator_show_states", "creator_tracking_meta"]) {
+      db._db.exec(`DROP TABLE IF EXISTS ${t};`);
+    }
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const r = await call(env, "/admin/api/schema-status", { cookie: await adminCookie(env) });
+    const listed = r.body.missing.map((e) => `${e.migration}:${e.kind}:${e.name}`);
+    assert.deepEqual(listed.slice().sort(), found.slice().sort(),
+      "D1_SCHEMA_MANIFEST and migrations/ have drifted apart");
+  });
+
+  it("reports a clean bill of health on a fully migrated database", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.upToDate, true, `unexpectedly missing: ${JSON.stringify(r.body.missing)}`);
+    assert.deepEqual(r.body.pendingMigrations, []);
+  });
+
+  it("names the unapplied migration, and what skipping it costs", async () => {
+    const db = makeD1();
+    // The state of a database that never had 0004 run against it.
+    db._db.exec("DROP TABLE IF EXISTS creator_tombstones;");
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+
+    assert.equal(r.body.upToDate, false);
+    assert.deepEqual(r.body.pendingMigrations, ["0004"]);
+    const entry = r.body.missing.find((m) => m.name === "creator_tombstones");
+    assert.ok(entry, "the missing table must be named");
+    // The consequence is the whole point: "creator_tombstones is missing" is
+    // not something an operator can act on.
+    assert.match(entry.consequence, /still authenticate/i,
+      "the report must say what silently stops working, not just what is absent");
+  });
+
+  it("detects a missing column, not just a missing table", async () => {
+    const db = makeD1();
+    // Rebuild creator_lists without the column 0001a adds. Dropping and
+    // recreating is the only way SQLite offers, and it is what a database
+    // that predates 0001a genuinely looks like.
+    db._db.exec("DROP TABLE IF EXISTS creator_lists;");
+    db._db.exec(`CREATE TABLE creator_lists (
+      id TEXT PRIMARY KEY, username TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL,
+      visibility TEXT NOT NULL DEFAULT 'private', items_json TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.ok(r.body.pendingMigrations.includes("0001a"),
+      `a missing column must be reported too, got ${JSON.stringify(r.body.pendingMigrations)}`);
+  });
+
+  it("is not fooled by a column whose name merely contains the one it wants", async () => {
+    const db = makeD1();
+    // No `likes`, but a `likes_count` that a substring search would accept.
+    // Reporting 0001a as applied here is the worse failure of the two: it
+    // tells an operator the schema is fine while every list save is failing
+    // on a column that is not there.
+    db._db.exec("DROP TABLE IF EXISTS creator_lists;");
+    db._db.exec(`CREATE TABLE creator_lists (
+      id TEXT PRIMARY KEY, username TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL,
+      visibility TEXT NOT NULL DEFAULT 'private', items_json TEXT NOT NULL DEFAULT '[]',
+      likes_count INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const r = await call(env, "/admin/api/schema-status", { cookie: await adminCookie(env) });
+    assert.ok(r.body.pendingMigrations.includes("0001a"),
+      "likes_count must not be mistaken for likes");
+  });
+
+  it("says nothing is wrong when there is no D1 to check", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    // A KV-only deployment is a supported configuration, not a database
+    // that needs migrating. Reporting seven unapplied migrations would be
+    // noise an operator learns to ignore.
+    assert.equal(r.body.bound, false);
+    assert.equal(r.body.upToDate, true);
+    assert.deepEqual(r.body.pendingMigrations, []);
+  });
+
+  it("reports a database it cannot read as unchecked, not as unmigrated", async () => {
+    const db = makeD1();
+    db.failWhen((sql) => /sqlite_master/i.test(sql));
+    const env = makeEnv({ CONFIGS: makeKv(), DB: db });
+    const cookie = await adminCookie(env);
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    db.failWhen(null);
+    // "I could not check" and "it is not there" are different things, and
+    // only one of them is an instruction to go run a migration.
+    assert.equal(r.body.checked, false);
+    assert.deepEqual(r.body.pendingMigrations, [],
+      "a database that will not answer must not be reported as missing every table");
+  });
+
+  it("needs an admin session", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    assert.equal((await call(env, "/admin/api/schema-status")).status, 401);
+  });
+});
+
+describe("R2: the client is actually given a baseline to cite", () => {
+  // The guard and the field that arms it are two halves of one fix, and the
+  // guard shipped alone: /api/creator/lists did not return updatedAt, so the
+  // only version a browser could cite was one it had never been told. The
+  // server-side conflict test below passed the whole time, because it sent a
+  // baseline the real client had no way to know.
+  it("/api/creator/lists reports the version of each list", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const u = await createUser(env, "baseline");
+    const K = { creatorName: "baseline", creatorKey: u.creatorKey };
+    const saved = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...K, name: "Faves", type: "movie", visibility: "private", items: [{ id: "tt1" }],
+    }});
+    assert.equal(saved.body.ok, true);
+
+    const listed = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const list = listed.body.lists.find((l) => l.slug === "faves");
+    assert.ok(Number.isFinite(list.updatedAt), "a list must report the version its items are");
+    assert.equal(list.updatedAt, saved.body.updatedAt,
+      "and it must be the same version the save that produced it returned");
+
+    // The round trip that matters: what /lists reported is accepted as a
+    // baseline by /lists/save, rather than being rejected as stale.
+    const ok = await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...K, slug: "faves", name: "Faves", type: "movie", visibility: "private",
+      items: [], expectedUpdatedAt: list.updatedAt,
+    }});
+    assert.equal(ok.status, 200, "the version the server just reported must be accepted");
+  });
+
+  it("reports no version for a legacy record rather than a misleading zero", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const u = await createUser(env, "legacyver");
+    const K = { creatorName: "legacyver", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      ...K, name: "Old", type: "movie", visibility: "private", items: [],
+    }});
+    // The shape a record written before updatedAt existed still has in KV.
+    const raw = JSON.parse(kv._store.get("creatorlist:legacyver:old"));
+    delete raw.updatedAt;
+    kv._store.set("creatorlist:legacyver:old", JSON.stringify(raw));
+
+    const listed = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const list = listed.body.lists.find((l) => l.slug === "old");
+    // Absent, not 0. parseExpectedUpdatedAt reads absent as "no opinion" and
+    // keeps the old last-write-wins behaviour, which is what additive means;
+    // 0 is an opinion, and a wrong one.
+    assert.ok(!("updatedAt" in list), `a legacy list must report no version, got ${list.updatedAt}`);
+  });
+});
+
+describe("R2: two devices editing one list do not silently overwrite each other", () => {
+  it("rejects a save built on a version that has since moved", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const u = await createUser(env, "r2guard");
+    const K = { creatorName: "r2guard", creatorKey: u.creatorKey };
+    const save = (extra) => call(env, "/api/creator/lists/save", {
+      method: "POST", json: { ...K, name: "Shared", type: "movie", visibility: "private", ...extra },
+    });
+
+    const first = await save({ items: [{ id: "1" }] });
+    assert.equal(typeof first.body.updatedAt, "number", "a save must hand back the version it wrote");
+    const { slug, updatedAt: v1 } = first.body;
+
+    const a = await save({ slug, items: [{ id: "1" }, { id: "2" }], expectedUpdatedAt: v1 });
+    assert.equal(a.body.ok, true);
+    const b = await save({ slug, items: [{ id: "1" }, { id: "3" }], expectedUpdatedAt: v1 });
+    // Before: both answered 200 and whichever landed second won, discarding
+    // the other's edits with no error anywhere.
+    assert.equal(b.status, 409, "the stale save must be refused");
+    assert.equal(b.body.conflict, true);
+    assert.deepEqual(JSON.parse(kv._store.get(`creatorlist:r2guard:${slug}`)).items, [{ id: "1" }, { id: "2" }],
+      "the first device's edit must survive");
+
+    const rebased = await save({ slug, items: [{ id: "1" }, { id: "3" }], expectedUpdatedAt: a.body.updatedAt });
+    assert.equal(rebased.body.ok, true, "and succeed once rebased on the current version");
+  });
+
+  it("stays additive, and a frozen clock does not defeat it", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "r2clock");
+    const K = { creatorName: "r2clock", creatorKey: u.creatorKey };
+    const save = (extra) => call(env, "/api/creator/lists/save", {
+      method: "POST", json: { ...K, name: "Shared", type: "movie", visibility: "private", ...extra },
+    });
+    const first = await save({ items: [] });
+    // A client that sends nothing keeps the previous last-write-wins.
+    assert.equal((await save({ slug: first.body.slug, items: [{ id: "x" }] })).body.ok, true);
+    // Present-but-malformed is a client bug, not a reason to drop the guard --
+    // and is rejected whether or not the record already exists.
+    assert.equal((await save({ slug: first.body.slug, items: [], expectedUpdatedAt: "" })).status, 400);
+    assert.equal((await save({ name: "Brand New", items: [], expectedUpdatedAt: {} })).status, 400);
+
+    // Date.now() is frozen for the duration of a Workers request, so a bare
+    // timestamp could not tell a stale write from a current one.
+    const realNow = Date.now;
+    Date.now = () => realNow();
+    const frozen = realNow();
+    Date.now = () => frozen;
+    try {
+      const a = await save({ slug: first.body.slug, items: [{ id: "a" }] });
+      await save({ slug: first.body.slug, items: [{ id: "b" }], expectedUpdatedAt: a.body.updatedAt });
+      const c = await save({ slug: first.body.slug, items: [{ id: "c" }], expectedUpdatedAt: a.body.updatedAt });
+      assert.equal(c.status, 409, "the second stale save must still be caught inside one millisecond");
+    } finally { Date.now = realNow; }
+  });
+});
+
+describe("R3: a deleted account cannot authenticate from a colo with a stale KV cache", () => {
+  it("is closed when D1 is bound, and honestly open when it is not", async () => {
+    for (const withD1 of [true, false]) {
+      const kv = makeKv();
+      const env = makeEnv({ CONFIGS: kv, DB: withD1 ? makeD1() : undefined });
+      const name = withD1 ? "stalewithd1" : "stalenod1";
+      const u = await createUser(env, name);
+      const K = { creatorName: name, creatorKey: u.creatorKey };
+      const beforeDelete = kv._store.get(`creator:${name}`);
+      await call(env, "/api/creator/delete-account", { method: "POST", json: { ...K, confirm: "DELETE" } });
+
+      // A colo whose KV cache predates both the tombstone write and the
+      // creator: delete -- it sees the account alive and no tombstone.
+      const origGet = kv.get.bind(kv);
+      kv.get = async (k, t) => {
+        if (k === `creator:${name}`) return t === "json" ? JSON.parse(beforeDelete) : beforeDelete;
+        if (k === `creatordeleted:${name}`) return null;
+        return origGet(k, t);
+      };
+      const restore = await call(env, "/api/creator/restore", { method: "POST", json: K });
+      kv.get = origGet;
+
+      if (withD1) {
+        // D1 is strongly consistent, so the tombstone the delete wrote there
+        // is visible from anywhere on the next request.
+        assert.equal(restore.status, 401, "with D1 bound this window must be closed");
+      } else {
+        // Without D1 there is no strongly-consistent store to ask. Asserted as
+        // a known limit so it is not mistaken for a regression, and so that if
+        // it ever starts passing without D1 somebody asks why.
+        assert.equal(restore.status, 200,
+          "KV-only cannot close this; it is bounded by KV propagation and the post-delete sweep");
+      }
+    }
+  });
+
+  it("a failed delete leaves no tombstone in either store", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "r3failed");
+    const K = { creatorName: "r3failed", creatorKey: u.creatorKey };
+    db.failWhen((sql) => /DELETE FROM creators WHERE/i.test(sql));
+    const del = await call(env, "/api/creator/delete-account", { method: "POST", json: { ...K, confirm: "DELETE" } });
+    db.failWhen(null);
+    assert.notEqual(del.body.ok, true);
+    assert.ok(!kv._store.has("creatordeleted:r3failed"), "no KV tombstone");
+    assert.equal(db.q("SELECT * FROM creator_tombstones WHERE username='r3failed'").length, 0, "no D1 tombstone");
+    assert.equal((await call(env, "/api/creator/restore", { method: "POST", json: K })).body.ok, true,
+      "and the account still works, so its owner can retry");
+  });
+});
+
+describe("R5: concurrent list creation does not lose the user's ordering", () => {
+  it("every record ends up in the persisted order", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const u = await createUser(env, "r5order");
+    const K = { creatorName: "r5order", creatorKey: u.creatorKey };
+    // Force the reads to interleave the way real KV latency does.
+    kv._hooks.beforeGet = async () => { await new Promise((r) => setTimeout(r, 1)); };
+    await Promise.all(Array.from({ length: 12 }, (_, i) =>
+      call(env, "/api/creator/lists/save", {
+        method: "POST", json: { ...K, name: "List " + i, type: "movie", visibility: "private", items: [] },
+      })));
+    kv._hooks.beforeGet = null;
+
+    const order = JSON.parse(kv._store.get("creatorlistorder:r5order")).order;
+    const records = [...kv._store.keys()]
+      .filter((k) => k.startsWith("creatorlist:r5order:"))
+      .map((k) => k.slice("creatorlist:r5order:".length));
+    const missing = records.filter((s) => !order.includes(s));
+    // Before: the handler wrote back the array it had read at the top, so
+    // every entry added in between was dropped -- measured, 3 of 12.
+    assert.deepEqual(missing, [], `these records are missing from the persisted order: ${missing.join(", ")}`);
+    assert.equal(new Set(order).size, order.length, "and the order must not contain duplicates");
+  });
+
+  // What this test does NOT claim. Replace the latency above with a hard
+  // barrier -- every one of the twelve blocked until all twelve have read the
+  // key -- and the result is one order entry with the merge and one without
+  // it, because then the re-reads all happen before any of the writes. The
+  // merge shrinks the window; it does not close it. Only moving ordering off
+  // a single key does that, which is a data-model change. Recorded here so a
+  // later reader does not mistake this test for a proof of correctness under
+  // arbitrary interleaving.
+});
+
+// ---------------------------------------------------------------------------
+// FE-17 -- the "custom lists changed" stamp.
+//
+// /api/creator/sync/meta answers the browser's resume poll. It used to report
+// four stamps read straight out of the four sync blobs, which its own comment
+// (rightly) called drift-proof: reading the real record cannot lie. Custom
+// lists have no such blob, so they were simply absent from the answer, and a
+// list edited on another device stayed invisible to a resumed browser.
+//
+// The fifth stamp is a dedicated key, which reintroduces exactly the failure
+// that comment warned about: one mutation that forgets to bump it stops other
+// devices seeing that kind of change, silently and forever. These tests are
+// the mitigation. The first is a canary over the source itself -- it already
+// caught handleSubtitlesTrack, which quietly removes a watched film from the
+// Watchlist and looks nothing like a list edit.
+describe("FE-17: the custom-lists stamp cannot silently stop working", () => {
+  const SRC = {
+    "02_http-and-creator-utils.js": fs.readFileSync(path.join(REPO_ROOT, "02_http-and-creator-utils.js"), "utf8"),
+    "26_api-creator-and-admin-routes.js": fs.readFileSync(path.join(REPO_ROOT, "26_api-creator-and-admin-routes.js"), "utf8"),
+  };
+
+  // Every place in the two storage-owning files that names a custom-list key,
+  // grouped by the route or function it sits in.
+  function listKeyBlocks() {
+    const key = /`(creatorlist(?:order)?:[^`]*)`/g;
+    const anchor = /(?:path === "(\/[^"]+)")|(?:^[ \t]*(?:async )?function (\w+))/gm;
+    const out = new Map();
+    for (const [file, src] of Object.entries(SRC)) {
+      const anchors = [];
+      let m;
+      anchor.lastIndex = 0;
+      while ((m = anchor.exec(src))) anchors.push([m.index, m[1] || m[2]]);
+      key.lastIndex = 0;
+      while ((m = key.exec(src))) {
+        let name = "?", start = 0, end = src.length;
+        for (let i = 0; i < anchors.length; i++) {
+          if (anchors[i][0] < m.index) { name = anchors[i][1]; start = anchors[i][0]; end = i + 1 < anchors.length ? anchors[i + 1][0] : src.length; }
+          else break;
+        }
+        out.set(`${file} :: ${name}`, src.slice(start, end));
+      }
+    }
+    return out;
+  }
+
+  // Touches a custom-list key AND changes it, so it must bump the stamp.
+  const MUTATORS = [
+    "02_http-and-creator-utils.js :: deleteCreatorLists",
+    "02_http-and-creator-utils.js :: purgeCreatorData",
+    "26_api-creator-and-admin-routes.js :: handleSubtitlesTrack",
+    "26_api-creator-and-admin-routes.js :: /api/creator/lists/save",
+    "26_api-creator-and-admin-routes.js :: /api/creator/lists/reorder",
+    "26_api-creator-and-admin-routes.js :: /api/creator/sync/save-tracking",
+  ];
+  // Touches one without changing anything a browser needs told about. Each
+  // entry is a claim someone has to re-justify if this list ever grows.
+  const NON_MUTATORS = {
+    "02_http-and-creator-utils.js :: getCreatorList": "reads one record",
+    "26_api-creator-and-admin-routes.js :: /admin/api/creator-lists": "enumerates one creator's records for the admin browse; changes nothing",
+    "26_api-creator-and-admin-routes.js :: /api/creator/lists": "self-heals the order key on a read; the same response already carries the healed order",
+    "26_api-creator-and-admin-routes.js :: /api/creator/sync/load": "reads the order key",
+    "26_api-creator-and-admin-routes.js :: /api/search-published-lists": "reads published records",
+    "26_api-creator-and-admin-routes.js :: /admin/api/backfill-trending": "reads to build the trending set",
+    "26_api-creator-and-admin-routes.js :: /admin/api/delete-creator-list": "delegates to deleteCreatorLists, which bumps",
+  };
+
+  it("every place that mutates a custom-list key bumps the stamp", () => {
+    const blocks = listKeyBlocks();
+    for (const name of MUTATORS) {
+      const body = blocks.get(name);
+      assert.ok(body, `${name} no longer touches custom-list storage -- if it moved, move its entry too`);
+      assert.match(body, /bumpCreatorListsStamp\(/,
+        `${name} writes a custom-list key without bumping the stamp, so a change made there ` +
+        `is invisible to every other device the account is signed in on (FE-17)`);
+    }
+  });
+
+  it("no new place touches custom-list storage without being classified", () => {
+    const found = [...listKeyBlocks().keys()].sort();
+    const known = [...MUTATORS, ...Object.keys(NON_MUTATORS)].sort();
+    assert.deepEqual(found, known,
+      "somewhere new reads or writes a creatorlist:/creatorlistorder: key. If it CHANGES one, " +
+      "call bumpCreatorListsStamp(env, username) there and add it to MUTATORS; if it only reads, " +
+      "add it to NON_MUTATORS with the reason. Leaving it out is how the stamp goes stale.");
+  });
+
+  it("sync/meta reports a lists stamp, and a fresh account's is 0", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17fresh");
+    const K = { creatorName: "fe17fresh", creatorKey: u.creatorKey };
+    const r = await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K });
+    assert.equal(r.body.ok, true);
+    assert.equal(r.body.lists, 0, "an account that has never saved a list must not look changed");
+  });
+
+  it("saving, reordering and deleting a list each move the stamp", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17moves");
+    const K = { creatorName: "fe17moves", creatorKey: u.creatorKey };
+    const meta = async () => (await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body;
+
+    const before = await meta();
+    const saved = await call(env, "/api/creator/lists/save", { method: "POST", ip: nextIp(),
+      json: { ...K, name: "Shared List", type: "movie", visibility: "public", items: [{ id: "tt1", type: "movie", title: "A" }] } });
+    assert.equal(saved.body.ok, true);
+    const afterSave = await meta();
+    assert.ok(afterSave.lists > before.lists, "saving a list must move the stamp");
+    // The whole point: a list change moves ONLY this stamp, which is why the
+    // four blob stamps could never have carried it.
+    assert.equal(afterSave.config, before.config, "and must not move the config stamp");
+    assert.equal(afterSave.tracking, before.tracking);
+    assert.equal(afterSave.presets, before.presets);
+    assert.equal(afterSave.channels, before.channels);
+
+    await call(env, "/api/creator/lists/reorder", { method: "POST", ip: nextIp(), json: { ...K, order: [saved.body.slug] } });
+    const afterReorder = await meta();
+    assert.ok(afterReorder.lists > afterSave.lists,
+      "reordering must move the stamp -- it writes only the order key, which is why the stamp " +
+      "cannot be derived from the list records themselves");
+
+    await call(env, "/api/creator/lists/delete", { method: "POST", ip: nextIp(), json: { ...K, slug: saved.body.slug } });
+    const afterDelete = await meta();
+    assert.ok(afterDelete.lists > afterReorder.lists,
+      "deleting must move the stamp -- and this is the case a MAX(updated_at) over the surviving " +
+      "records would get wrong, since removing the newest list lowers that maximum");
+  });
+
+  it("the stamp only ever goes up, so a same-millisecond pair cannot be missed", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17mono");
+    const K = { creatorName: "fe17mono", creatorKey: u.creatorKey };
+    const seen = [];
+    for (let i = 0; i < 5; i++) {
+      await call(env, "/api/creator/lists/save", { method: "POST", ip: nextIp(),
+        json: { ...K, name: `L${i}`, type: "movie", visibility: "private", items: [] } });
+      seen.push((await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body.lists);
+    }
+    for (let i = 1; i < seen.length; i++) {
+      assert.ok(seen[i] > seen[i - 1], `stamp must strictly increase (${seen[i - 1]} -> ${seen[i]})`);
+    }
+  });
+
+  it("a deleted account does not leave its stamp behind for the next owner of the name", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17gone");
+    const K = { creatorName: "fe17gone", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", ip: nextIp(),
+      json: { ...K, name: "Shared List", type: "movie", visibility: "private", items: [] } });
+    assert.ok(env.CONFIGS._store.has("creatorliststamp:fe17gone"), "precondition: the stamp exists");
+    await call(env, "/api/creator/delete-account", { method: "POST", ip: nextIp(), json: { ...K, confirm: "DELETE" } });
+    assert.ok(!env.CONFIGS._store.has("creatorliststamp:fe17gone"),
+      "a stamp outliving its account is inherited by whoever registers the name next -- the same " +
+      "class of bug purgeCreatorData's own comment exists to prevent");
+  });
+
+  it("emptying an account moves the stamp rather than resetting it to 0", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, "fe17reset");
+    const K = { creatorName: "fe17reset", creatorKey: u.creatorKey };
+    await call(env, "/api/creator/lists/save", { method: "POST", ip: nextIp(),
+      json: { ...K, name: "Shared List", type: "movie", visibility: "private", items: [] } });
+    // Forced forward rather than left to the clock. A reset sweeps
+    // creatorliststamp: away before re-bumping it, so the bump has nothing to
+    // count up from -- and the natural version of this test only fails when the
+    // whole reset happens to land inside one millisecond of the save, which is
+    // how it reached CI green locally and red there. Pinning the stored stamp
+    // ahead of the wall clock makes the hole deterministic: whatever the timing,
+    // the new stamp has to clear the old one.
+    const pinned = Date.now() + 60000;
+    env.CONFIGS._store.set("creatorliststamp:fe17reset", JSON.stringify({ updatedAt: pinned }));
+    const before = (await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body.lists;
+    assert.equal(before, pinned, "precondition: the pinned stamp is what meta reports");
+    const reset = await call(env, "/api/creator/account/reset", { method: "POST", ip: nextIp(), json: { ...K, confirm: "RESET" } });
+    assert.equal(reset.body.ok, true, "precondition: the reset succeeded");
+    const after = (await call(env, "/api/creator/sync/meta", { method: "POST", ip: nextIp(), json: K })).body.lists;
+    assert.ok(after > before,
+      "a reset empties the lists but leaves every device signed in; a stamp that did not clear the " +
+      "old one reads as 'nothing changed' and leaves them rendering lists that no longer exist");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A change made on one device, reverted a few minutes later by another.
+//
+// Both halves of this are the same shape: a second signed-in browser sends
+// its own full snapshot of state it has not re-read since, and the server
+// takes it. On a desktop tab left open that is rare. On a phone it is the
+// normal case -- an installed PWA is re-launched rather than resumed, so it
+// begins every session holding whatever it last saw, however old that is.
+describe("a second device cannot silently replace what the first one changed", () => {
+  const mk = async (name) => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, name);
+    return { env, K: { creatorName: name, creatorKey: u.creatorKey } };
+  };
+  const tracking = (env, user) => JSON.parse(env.CONFIGS._store.get(`creatorsynctracking:${user}`));
+
+  it("save-tracking refuses a push built on a version another browser has replaced", async () => {
+    const { env, K } = await mk("twodev1");
+    // The desktop saves two watched films, and learns the version it made.
+    const first = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }, { id: "tt2", watchedAt: 20 }] },
+    });
+    assert.equal(first.body.ok, true);
+    const desktopVersion = first.body.clientVersion;
+    assert.ok(Number.isFinite(desktopVersion), "a save must report the version it produced");
+
+    // The desktop removes one of them.
+    const removal = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }], intentionalRemoval: true,
+              expectedClientVersion: desktopVersion },
+    });
+    assert.equal(removal.body.ok, true);
+    assert.equal(tracking(env, "twodev1").watchHistory.length, 1, "precondition: the removal landed");
+
+    // The phone opens, holding the state from before that removal, and pushes.
+    const stale = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }, { id: "tt2", watchedAt: 20 }],
+              expectedClientVersion: desktopVersion },
+    });
+    assert.equal(stale.status, 409, "a push built on a replaced version must be refused");
+    assert.equal(stale.body.conflict, true);
+    assert.equal(tracking(env, "twodev1").watchHistory.length, 1,
+      "and must leave the removal standing -- this is the whole bug: the item came back");
+    assert.ok(stale.body.clientVersion > desktopVersion,
+      "the answer carries the current version, so the browser can retry against it");
+  });
+
+  it("the same push succeeds once it cites the version it was refused with", async () => {
+    const { env, K } = await mk("twodev2");
+    const first = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }] },
+    });
+    const stale = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt9", watchedAt: 90 }], expectedClientVersion: 1 },
+    });
+    assert.equal(stale.status, 409, "precondition: refused");
+    const retry = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt9", watchedAt: 90 }], expectedClientVersion: stale.body.clientVersion },
+    });
+    assert.equal(retry.body.ok, true, "a browser that has caught up must be able to save");
+    assert.ok(retry.body.clientVersion > first.body.clientVersion);
+  });
+
+  it("a scrobble landing in between does not start a conflict", async () => {
+    // updatedAt moves for writes no browser made -- handleSubtitlesTrack and
+    // the Continue Watching cron both rewrite this record. Guarding on it
+    // would 409 through ordinary playback, which the scrobble merge already
+    // handles correctly, so the guard reads a version only a browser bumps.
+    const { env, K } = await mk("twodev3");
+    const first = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }] },
+    });
+    const blob = tracking(env, "twodev3");
+    blob.watchHistory.unshift({ id: "tt-scrobbled", watchedAt: Date.now() });
+    blob.updatedAt = Date.now() + 5000;
+    env.CONFIGS._store.set("creatorsynctracking:twodev3", JSON.stringify(blob));
+
+    const next = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }, { id: "tt2", watchedAt: 20 }],
+              expectedClientVersion: first.body.clientVersion },
+    });
+    assert.equal(next.body.ok, true, "a scrobble is not another browser; this must not be refused");
+    const ids = tracking(env, "twodev3").watchHistory.map((it) => it.id);
+    assert.ok(ids.includes("tt-scrobbled"), "and the scrobble must still be rescued into the result");
+    assert.ok(ids.includes("tt2"));
+  });
+
+  it("a client that sends no version at all still saves, as it always did", async () => {
+    const { env, K } = await mk("twodev4");
+    await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }] },
+    });
+    const second = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [{ id: "tt1", watchedAt: 10 }, { id: "tt2", watchedAt: 20 }] },
+    });
+    assert.equal(second.body.ok, true, "the guard is additive -- an older client must not be locked out");
+  });
+
+  it("rejects a malformed version rather than dropping the guard", async () => {
+    const { env, K } = await mk("twodev5");
+    const bad = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST", json: { ...K, watchHistory: [], expectedClientVersion: "soon" },
+    });
+    assert.equal(bad.status, 400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The other half of the same report: a list deleted on the desktop was back
+// on the account a minute after the phone was opened.
+//
+// Deleting a list leaves the account with no trace of it, and to any OTHER
+// browser "the account does not have this list" is indistinguishable from
+// "the account never received this list" -- which is the case
+// uploadMissingLocalListsToAccount exists to repair. So the phone dutifully
+// re-uploaded it. The account has to say the list was DELETED, not merely be
+// missing it.
+describe("a list deleted on one device stays deleted on the others", () => {
+  const mk = async (name) => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, name);
+    return { env, K: { creatorName: name, creatorKey: u.creatorKey } };
+  };
+  const save = (env, K, extra) => call(env, "/api/creator/lists/save", {
+    method: "POST", json: { ...K, type: "movie", visibility: "private", items: [{ id: "tt1" }], ...extra },
+  });
+
+  it("reports the deleted slug to every other device", async () => {
+    const { env, K } = await mk("deldev1");
+    const saved = await save(env, K, { name: "Faves" });
+    const slug = saved.body.slug;
+
+    const before = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(before.body.deletedSlugs, [], "nothing deleted yet");
+
+    const del = await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug } });
+    assert.equal(del.body.ok, true);
+
+    const after = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(after.body.lists.map((l) => l.slug), [], "precondition: the list is gone");
+    assert.deepEqual(after.body.deletedSlugs, [slug],
+      "another device has to be told it was deleted, or it uploads its own copy back");
+  });
+
+  it("re-creating the list at the same slug retires the deletion", async () => {
+    const { env, K } = await mk("deldev2");
+    const saved = await save(env, K, { name: "Faves" });
+    const slug = saved.body.slug;
+    await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug } });
+
+    const again = await save(env, K, { name: "Faves", slug });
+    assert.equal(again.body.ok, true);
+    const after = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(after.body.deletedSlugs, [],
+      "a deliberate re-create must win, or every other device would throw the new list away");
+    assert.deepEqual(after.body.lists.map((l) => l.slug), [slug]);
+  });
+
+  it("a deletion changes the lists version, so it cannot hide behind an unchanged reply", async () => {
+    const { env, K } = await mk("deldev3");
+    const saved = await save(env, K, { name: "Faves" });
+    const first = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug: saved.body.slug } });
+    const after = await call(env, "/api/creator/lists", {
+      method: "POST", json: { ...K, knownVersion: first.body.version },
+    });
+    assert.notEqual(after.body.unchanged, true, "a delete must not answer 'nothing changed'");
+    assert.deepEqual(after.body.deletedSlugs, [saved.body.slug]);
+  });
+
+  it("deleting the account takes its deletion record with it", async () => {
+    // The username is freed for re-registration, and a tombstone that
+    // outlived the account would tell the next owner's browsers to discard
+    // lists they never deleted.
+    const { env, K } = await mk("deldev4");
+    const saved = await save(env, K, { name: "Faves" });
+    await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug: saved.body.slug } });
+    assert.ok(env.CONFIGS._store.get("creatorlistdeleted:deldev4"), "precondition: recorded");
+
+    const gone = await call(env, "/api/creator/delete-account", {
+      method: "POST", ip: nextIp(), json: { ...K, confirm: "DELETE" },
+    });
+    assert.equal(gone.body.ok, true, JSON.stringify(gone.body).slice(0, 200));
+    assert.equal(env.CONFIGS._store.get("creatorlistdeleted:deldev4"), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// You cannot delete what you cannot name.
+//
+// /admin/api/delete-creator-list takes exact slugs, and nothing in the admin
+// dashboard could tell an admin what a creator's slugs are -- the creator's
+// own dashboard is the only place they appear. That is workable for one
+// reported list and useless for the case it keeps being needed for: an
+// account carrying dozens of copies of the same list under slugs nobody could
+// guess (coming-of-age-3 ... coming-of-age-53, per lists/save's own comment),
+// where typing the base name deletes exactly one of them.
+describe("admin: browsing one creator's stored lists", () => {
+  const mk = async (name) => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const u = await createUser(env, name);
+    return { env, K: { creatorName: name, creatorKey: u.creatorKey }, cookie: await adminCookie(env) };
+  };
+  const save = (env, K, extra) => call(env, "/api/creator/lists/save", {
+    method: "POST", json: { ...K, type: "movie", visibility: "private", items: [{ id: "tt1" }], ...extra },
+  });
+  const browse = (env, cookie, username) => call(env, `/admin/api/creator-lists?username=${username}`, { cookie });
+
+  it("reports every stored list, with its slug", async () => {
+    const { env, K, cookie } = await mk("browse1");
+    await save(env, K, { name: "Coming Of Age" });
+    await save(env, K, { name: "Coming Of Age" });
+    await save(env, K, { name: "Something Else" });
+
+    const r = await browse(env, cookie, "browse1");
+    assert.equal(r.body.ok, true, JSON.stringify(r.body).slice(0, 200));
+    const slugs = r.body.lists.map((l) => l.slug).sort();
+    assert.equal(slugs.length, 3, "all three records must be reported");
+    assert.ok(slugs.filter((s) => s.startsWith("coming-of-age")).length === 2,
+      "including the duplicate, whose slug is the part an admin cannot guess");
+    assert.equal(r.body.username, "browse1");
+  });
+
+  it("reports a record the creator's own dashboard cannot see", async () => {
+    // The runaway that minted these duplicates was caused by lost entries in
+    // creatorlistorder:, and a record missing from it is invisible to the
+    // dashboard while still being served at its URL. Browsing the order key
+    // instead of the records would hide exactly the lists most in need of
+    // deleting.
+    const { env, K, cookie } = await mk("browse2");
+    const saved = await save(env, K, { name: "Orphaned" });
+    env.CONFIGS._store.set("creatorlistorder:browse2", JSON.stringify({ order: [] }));
+
+    const r = await browse(env, cookie, "browse2");
+    const row = r.body.lists.find((l) => l.slug === saved.body.slug);
+    assert.ok(row, "a record with no order entry must still be listed");
+    assert.equal(row.inOrder, false, "and be marked as the orphan it is");
+    assert.equal(r.body.orderCount, 0);
+  });
+
+  it("rejects an invalid username rather than reading a made-up prefix", async () => {
+    const { env, cookie } = await mk("browse3");
+    const r = await call(env, "/admin/api/creator-lists?username=" + encodeURIComponent("../evil"), { cookie });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.ok, false);
+  });
+
+  it("browse then delete removes every copy, and records it for the creator's devices", async () => {
+    const { env, K, cookie } = await mk("browse4");
+    await save(env, K, { name: "Coming Of Age" });
+    await save(env, K, { name: "Coming Of Age" });
+    await save(env, K, { name: "Keep This" });
+
+    const listed = await browse(env, cookie, "browse4");
+    const doomed = listed.body.lists.filter((l) => l.name === "Coming Of Age").map((l) => l.slug);
+    assert.equal(doomed.length, 2, "precondition: both copies found by name");
+
+    const del = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "browse4", slugs: doomed },
+    });
+    assert.equal(del.body.ok, true, JSON.stringify(del.body).slice(0, 200));
+    assert.deepEqual([...del.body.deleted].sort(), [...doomed].sort());
+
+    const after = await browse(env, cookie, "browse4");
+    assert.deepEqual(after.body.lists.map((l) => l.name), ["Keep This"], "the duplicates must be gone");
+
+    // And the creator's other signed-in browsers must be told, or they upload
+    // their own copies straight back -- which is what "it will not delete
+    // them" was.
+    const owner = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual([...owner.body.deletedSlugs].sort(), [...doomed].sort());
+  });
+
+  it("reads lists directly from D1 and deletes them accurately when missing from KV", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await createUser(env, "canadutchy");
+    const cookie = await adminCookie(env);
+    // Insert directly into D1 creator_lists table, leaving KV empty
+    await env.DB.prepare(`
+      INSERT INTO creator_lists (id, username, name, type, visibility, items_json, likes, created_at, updated_at, sort_order)
+      VALUES (?, ?, ?, 'movie', 'public', ?, 5, 1000, 2000, 0)
+    `).bind("canadutchy:coming-of-age", "canadutchy", "Coming Of Age", JSON.stringify([{ id: "tt1" }, { id: "tt2" }])).run();
+
+    // Verify KV has no key for this
+    assert.ok(!env.CONFIGS._store.has("creatorlist:canadutchy:coming-of-age"));
+
+    // Browse via admin endpoint (also test stripping leading @)
+    const res = await call(env, "/admin/api/creator-lists?username=@canadutchy", { cookie });
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.username, "canadutchy");
+    assert.equal(res.body.lists.length, 1);
+    assert.equal(res.body.lists[0].slug, "coming-of-age");
+    assert.equal(res.body.lists[0].name, "Coming Of Age");
+    assert.equal(res.body.lists[0].itemCount, 2);
+    assert.equal(res.body.lists[0].likes, 5);
+
+    // Also verify alias lookup with hyphen: searching "cana-dutchy" resolves to "canadutchy"
+    const resHyphen = await call(env, "/admin/api/creator-lists?username=cana-dutchy", { cookie });
+    assert.equal(resHyphen.body.ok, true);
+    assert.equal(resHyphen.body.username, "canadutchy");
+    assert.equal(resHyphen.body.lists.length, 1);
+
+    // Delete the list via admin endpoint
+    const del = await call(env, "/admin/api/delete-creator-list", {
+      method: "POST", cookie, json: { username: "canadutchy", slugs: ["coming-of-age"] },
+    });
+    assert.equal(del.body.ok, true);
+    assert.deepEqual(del.body.deleted, ["coming-of-age"]);
+    assert.deepEqual(del.body.missing, []);
+    assert.equal(del.body.remaining, 0);
+
+    // Verify row is deleted from D1
+    const d1Check = await env.DB.prepare("SELECT * FROM creator_lists WHERE id = 'canadutchy:coming-of-age'").all();
+    assert.equal((d1Check.results || []).length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "100 items" for a list that has 303.
+//
+// /api/preview reports totalItems so a See All header can say how big a list
+// really is before anything has been scrolled. Trakt's fetchers never
+// supplied one: fetchFn returned res.json() and the Response -- headers and
+// all -- went out of scope, so the only number available was the length of
+// the page in hand, which this endpoint caps at 100.
+describe("a Trakt list reports its real size, not its first page's length", () => {
+  const CHART_PAGE = Array.from({ length: 100 }, (_, i) => ({
+    movie: { title: "Film " + i, year: 2020, ids: { imdb: "tt" + String(1000000 + i) } },
+  }));
+
+  // A fresh module instance per test: the chart memo (PER_USER_CACHE_MAP)
+  // lives in the isolate, is keyed by chart + kind + page, and other tests in
+  // this file stub the same charts -- so the shared worker answers these from
+  // whatever they left behind rather than from the stub below.
+  async function previewOn(isolate, env, json) {
+    const pending = [];
+    const ctx = { waitUntil: (p) => pending.push(Promise.resolve(p).catch(() => {})) };
+    const res = await isolate.fetch(new Request("https://example.test/api/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "CF-Connecting-IP": nextIp() },
+      body: JSON.stringify(json),
+    }), env, ctx);
+    await Promise.all(pending);
+    const text = await res.text();
+    try { return JSON.parse(text); } catch { return text; }
+  }
+
+  function stubTrakt({ total, withHeader = true }) {
+    const seen = [];
+    globalThis.fetch = async (input) => {
+      const href = typeof input === "string" ? input : input && input.url;
+      seen.push(href);
+      if (href && href.includes("api.trakt.tv")) {
+        const headers = new Headers({ "content-type": "application/json" });
+        if (withHeader) headers.set("X-Pagination-Item-Count", String(total));
+        return new Response(JSON.stringify(CHART_PAGE), { status: 200, headers });
+      }
+      // Trailer/details enrichment -- nothing this test cares about.
+      return new Response(JSON.stringify({}), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    return seen;
+  }
+
+  it("carries Trakt's item count through to /api/preview", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      stubTrakt({ total: 303 });
+      const env = makeEnv({ CONFIGS: makeKv() });
+      const body = await previewOn(await freshIsolate(), env,
+        { url: "trakt:chart:trending", type: "movie", skip: 0, sample: 100, traktKey: "trakt-client-id" });
+      assert.equal(body.ok, true, JSON.stringify(body).slice(0, 200));
+      assert.equal(body.count, 100, "precondition: one page is 100 items");
+      assert.equal(body.totalItems, 303,
+        "the See All header has nothing else to show the real size from -- 100 is the page, not the list");
+      assert.equal(body.maybeMore, true);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("reports no total when the endpoint does not paginate", async () => {
+    // movies/boxoffice returns its ten and sends no pagination headers. A
+    // fabricated total would be worse than none.
+    const realFetch = globalThis.fetch;
+    try {
+      stubTrakt({ total: 0, withHeader: false });
+      const env = makeEnv({ CONFIGS: makeKv() });
+      const body = await previewOn(await freshIsolate(), env,
+        { url: "trakt:chart:box_office", type: "movie", skip: 0, sample: 100, traktKey: "trakt-client-id" });
+      assert.equal(body.ok, true, JSON.stringify(body).slice(0, 200));
+      assert.equal(body.totalItems, null);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("still reads a payload cached before the total was carried with it", async () => {
+    // The cached value is now { items, totalItems }; every entry written
+    // before this shipped is a bare array, and those stay valid for a day.
+    const sandbox = loadSourceFunctions("06_source-fetchers-mdblist-trakt.js");
+    const legacy = [{ movie: { title: "Old", ids: { imdb: "tt1" } } }];
+    assert.deepEqual(sandbox.traktPayloadItems(legacy), legacy, "a bare array is still the items");
+    assert.equal(sandbox.traktPayloadTotal(legacy), null, "and carries no total, as before");
+
+    const wrapped = sandbox.traktPayloadWithTotal(legacy, {
+      headers: new Headers({ "X-Pagination-Item-Count": "42" }),
+    });
+    assert.deepEqual(sandbox.traktPayloadItems(wrapped), legacy);
+    assert.equal(sandbox.traktPayloadTotal(wrapped), 42);
+  });
+
+  it("an empty wrapped reply still counts as empty, so it cannot erase a good copy", async () => {
+    // refuseEmptyOverwrite protects the shared chart caches, and it decides
+    // by asking isEmptyPayload. Wrapping the payload to carry its total put
+    // an object with two keys where an array used to be -- which would have
+    // read as "not empty" and let a blank upstream reply overwrite the last
+    // good chart.
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    assert.equal(sandbox.isEmptyPayload({ items: [], totalItems: 0 }), true);
+    assert.equal(sandbox.isEmptyPayload({ items: [1], totalItems: 1 }), false);
+    assert.equal(sandbox.isEmptyPayload([]), true);
+    assert.equal(sandbox.isEmptyPayload([1]), false);
+  });
+
+  it("mapTraktItems resolves season and episode entities to show IMDb or TMDB ID", () => {
+    const sandbox = loadSourceFunctions("06_source-fetchers-mdblist-trakt.js");
+    const rawItems = [
+      { type: "season", season: { number: 2, ids: { trakt: 10 } }, show: { title: "Show One", year: 2023, ids: { imdb: "tt1000", tmdb: 500 } } },
+      { type: "episode", episode: { season: 1, number: 5, ids: { trakt: 20 } }, show: { title: "Show Two", year: 2024, ids: { tmdb: 600 } } },
+      { type: "show", show: { title: "Show Three", year: 2025, ids: { imdb: "tt3000" } } },
+    ];
+    const mapped = sandbox.mapTraktItems(rawItems, "series");
+    assert.equal(mapped.length, 3);
+    assert.equal(mapped[0].id, "tt1000");
+    assert.equal(mapped[0].name, "Show One");
+    assert.equal(mapped[1].id, "tmdb:600");
+    assert.equal(mapped[1].name, "Show Two");
+    assert.equal(mapped[2].id, "tt3000");
+    assert.equal(mapped[2].name, "Show Three");
+  });
+
+  it("mapTmdbItem preserves tmdb:<id> when imdbId is unavailable", () => {
+    const sandbox = loadSourceFunctions("07_source-fetchers-tmdb-simkl.js");
+    const it = { id: 309880, title: "Tunnel Warfare", poster_path: "/img.jpg", release_date: "2020-01-01" };
+    const mapped = sandbox.mapTmdbItem(it, "tmdb:309880", "movie");
+    assert.equal(mapped.id, "tmdb:309880");
+    assert.equal(mapped.name, "Tunnel Warfare");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The three items AUDIT-2026-09-05 left open behind an otherwise-fixed
+// finding. Each was recorded in that report as still outstanding and none had
+// a test, which is how an open item becomes a forgotten one.
+describe("the last open items from the 2026-09-05 audit", () => {
+  // §3's tail. The thread id is a capability, now 72 bits of CSPRNG rather
+  // than 31 bits of Math.random -- but the endpoint that spends it took 20
+  // ids per request with no limit at all, so attempts were free.
+  it("bounds /api/feedback/threads per IP", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const ip = nextIp();
+    const body = { threadIds: ["1757000000000:abcdefghijkl"] };
+    let sawLimit = false;
+    for (let i = 0; i < 65; i++) {
+      const r = await call(env, "/api/feedback/threads", { method: "POST", ip, json: body });
+      if (r.status === 429) { sawLimit = true; break; }
+    }
+    assert.ok(sawLimit, "an unauthenticated capability lookup must not be free to attempt forever");
+
+    // The limit is per IP, and generous enough that the support panel opening
+    // is nowhere near it.
+    const fresh = await call(env, "/api/feedback/threads", { method: "POST", ip: nextIp(), json: body });
+    assert.equal(fresh.status, 200, "another visitor must not inherit someone else's exhausted bucket");
+  });
+
+  // §12. ADMIN_KEY is chosen by the deployer, so its length is a secret --
+  // and timingSafeEqualHex answers from the length before its constant-time
+  // loop runs.
+  it("compares the admin key without answering from its length", async () => {
+    const sandbox = loadSourceFunctions("02_http-and-creator-utils.js");
+    sandbox.crypto = globalThis.crypto;
+    sandbox.TextEncoder = TextEncoder;
+    assert.equal(await sandbox.timingSafeEqualSecret("hunter2", "hunter2"), true);
+    assert.equal(await sandbox.timingSafeEqualSecret("hunter2", "hunter3"), false);
+    assert.equal(await sandbox.timingSafeEqualSecret("hunter2", "h"), false,
+      "a shorter guess is still wrong -- it must be wrong for the right reason");
+    assert.equal(await sandbox.timingSafeEqualSecret("", ""), true);
+    assert.equal(await sandbox.timingSafeEqualSecret(undefined, ""), true);
+
+    const src = fs.readFileSync(path.join(REPO_ROOT, "26_api-creator-and-admin-routes.js"), "utf8");
+    assert.match(src, /timingSafeEqualSecret\(submittedKey, env\.ADMIN_KEY\)/,
+      "the admin login must use the length-blind comparison");
+    assert.doesNotMatch(src, /timingSafeEqualHex\([^)]*ADMIN_KEY/,
+      "and must not go back to the one that returns early on a length mismatch");
+  });
+
+  it("still lets the right admin key in, and keeps every other one out", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const ok = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: env.ADMIN_KEY } });
+    assert.equal(ok.status, 302, "the correct key must still work");
+    for (const wrong of ["", "t", "test-admin-secre", "test-admin-secret-", "TEST-ADMIN-SECRET"]) {
+      const r = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: wrong } });
+      assert.equal(r.status, 401, `"${wrong}" must not authenticate`);
+    }
+  });
+
+  // §14 and top-10 §9: both are decisions rather than defects now, and both
+  // are the kind that gets silently undone by someone tidying up. The comment
+  // IS the decision -- if it goes, the reasoning goes with it.
+  it("keeps the reasoning for the two accepted limitations where the code is", () => {
+    const admin = fs.readFileSync(path.join(REPO_ROOT, "03_admin.js"), "utf8");
+    assert.match(admin, /KV has no atomic increment/,
+      "bumpStat's KV path is lossy on purpose; the D1 branch is the answer for anyone who needs exact counters");
+    const routes = fs.readFileSync(path.join(REPO_ROOT, "25_api-catalog-routes.js"), "utf8");
+    assert.match(routes, /The id IS somebody's install\s*\n\s*\/\/ URL/,
+      "no TTL on /api/save: expiring it breaks a live install months later");
+    assert.match(routes, /\/api\/publish-list was removed in 1\.5\.3/,
+      "the removed route leaves a note saying what still reads its records");
+  });
+});
+
+// The bug this closes was visible as "KV put() limit exceeded for the day" on
+// an unrelated admin action: the free plan allows 1,000 KV writes a day, and
+// the telemetry recorders were spending them four at a time per tracked title.
+// bumpStat's counters moved to D1 a while back; these two never did.
+describe("1.5.3: telemetry counters go to D1 when it is bound", () => {
+  const watch = (env, events, ip) =>
+    call(env, "/api/track-event", { method: "POST", ip: ip || nextIp(), json: { events } });
+  const titles = (n) =>
+    Array.from({ length: n }, (_, i) => ({ eventType: "watched", id: "tt" + i, title: "T" + i, mediaType: "movie" }));
+
+  function countPuts(kv) {
+    const c = { n: 0, keys: [] };
+    const put = kv.put.bind(kv);
+    kv.put = async (...a) => { c.n++; c.keys.push(String(a[0])); return put(...a); };
+    return c;
+  }
+
+  it("writes no per-title count keys to KV at all", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    await watch(env, titles(10));
+    const countKeys = [...kv._store.keys()].filter((k) => k.startsWith("evtcount:") || k.startsWith("evtdayindex:"));
+    assert.deepEqual(countKeys, [],
+      "these are what exhausted the write budget -- with D1 bound they must not be written at all");
+    // ...and the counts really are in D1, under the same `stats` table
+    // bumpStat already uses, so no migration was needed.
+    assert.equal(env.DB._stat("evt:watched:tt0", "total"), 1);
+  });
+
+  it("charges one KV write per tracked title, not four -- and none at all on a repeat", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const cold = countPuts(kv);
+    await watch(env, titles(10));
+    // 10 display-field blobs + the one per-IP rate-limit counter. It was 41.
+    assert.equal(cold.n, 11, `cold: ${JSON.stringify(cold.keys)}`);
+
+    const warm = countPuts(kv);
+    await watch(env, titles(10));
+    assert.equal(warm.n, 1, `a second batch of the same titles must only touch the rate-limit key, got ${JSON.stringify(warm.keys)}`);
+  });
+
+  it("still records a search, and spends nothing on it", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1(), TMDB_API_KEY: "k" });
+    const c = countPuts(kv);
+    await call(env, "/api/title-search?q=matrix", { ip: nextIp() });
+    assert.equal(c.n, 0, `a search must cost zero KV writes with D1 bound, got ${JSON.stringify(c.keys)}`);
+    assert.equal(env.DB._stat("searchq:matrix", "total"), 1);
+  });
+
+  it("the display fields are refreshed when a title is renamed, not on every event", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, DB: makeD1() });
+    const one = (title) => watch(env, [{ eventType: "watched", id: "tt7", title, mediaType: "movie" }]);
+    await one("Old Name");
+    const c = countPuts(kv);
+    await one("Old Name");
+    assert.ok(!c.keys.some((k) => k.startsWith("evtmeta:")), "unchanged meta must not be rewritten");
+    await one("New Name");
+    assert.ok(c.keys.some((k) => k === "evtmeta:watched:tt7"), "a renamed title must still update");
+    assert.equal(JSON.parse(kv._store.get("evtmeta:watched:tt7")).title, "New Name");
+  });
+});
+
+describe("1.5.3: the admin dashboard reads those counters back out of D1", () => {
+  async function adminCookie(env) {
+    const login = await call(env, "/admin/login", { method: "POST", ip: nextIp(), form: { key: "test-admin-secret" } });
+    return (login.headers.get("set-cookie") || "").split(";")[0];
+  }
+
+  it("Trending shows D1-recorded titles, ranked, with their names attached", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const events = [
+      ...Array.from({ length: 3 }, () => ({ eventType: "watched", id: "tt111", title: "Popular", mediaType: "movie" })),
+      { eventType: "watched", id: "tt222", title: "Quiet One", mediaType: "series" },
+    ];
+    await call(env, "/api/track-event", { method: "POST", ip: nextIp(), json: { events } });
+    const cookie = await adminCookie(env);
+    const { body } = await call(env, "/admin/api/leaderboard?type=watched&window=today", { cookie });
+    assert.equal(body.ok, true);
+    assert.deepEqual(body.entries.map((e) => [e.id, e.title, e.count]),
+      [["tt111", "Popular", 3], ["tt222", "Quiet One", 1]]);
+  });
+
+  it("the media-type filter still applies before the top-100 cut", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await call(env, "/api/track-event", { method: "POST", ip: nextIp(), json: { events: [
+      { eventType: "watched", id: "tt111", title: "A Movie", mediaType: "movie" },
+      { eventType: "watched", id: "tt222", title: "A Show", mediaType: "series" },
+    ] } });
+    const cookie = await adminCookie(env);
+    const { body } = await call(env, "/admin/api/leaderboard?type=watched&window=alltime&mediaType=series", { cookie });
+    assert.deepEqual(body.entries.map((e) => e.id), ["tt222"]);
+  });
+
+  it("a window means a window -- yesterday's count is not in today's board", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    // Written straight into the table the way a previous day's traffic would
+    // have left it, since the recorder can only ever write "today".
+    const old = new Date(Date.now() - 40 * 86400000).toISOString().slice(0, 10);
+    await env.DB.prepare("INSERT INTO stats (kind, day, n) VALUES (?, ?, ?)").bind("evt:watched:tt999", old, 99).run();
+    await env.DB.prepare("INSERT INTO stats (kind, day, n) VALUES (?, ?, ?)").bind("evt:watched:tt999", "total", 99).run();
+    const cookie = await adminCookie(env);
+    const today = (await call(env, "/admin/api/leaderboard?type=watched&window=today", { cookie })).body;
+    assert.deepEqual(today.entries, [], "a title last seen 40 days ago is not trending today");
+    const alltime = (await call(env, "/admin/api/leaderboard?type=watched&window=alltime", { cookie })).body;
+    assert.deepEqual(alltime.entries.map((e) => [e.id, e.count]), [["tt999", 99]], "but all-time still has it");
+    const ninety = (await call(env, "/admin/api/leaderboard?type=watched&window=90", { cookie })).body;
+    assert.deepEqual(ninety.entries.map((e) => e.count), [99], "and so does a window wide enough to reach it");
+  });
+
+  it("Search & Queries shows D1-recorded searches", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1(), TMDB_API_KEY: "k" });
+    await call(env, "/api/title-search?q=matrix", { ip: nextIp() });
+    await call(env, "/api/title-search?q=matrix", { ip: nextIp() });
+    await call(env, "/api/title-search?q=alien", { ip: nextIp() });
+    const cookie = await adminCookie(env);
+    const { body } = await call(env, "/admin/api/analytics?section=search&window=today", { cookie });
+    assert.equal(body.ok, true);
+    assert.deepEqual(body.searches.map((s) => [s.query, s.count]), [["matrix", 2], ["alien", 1]]);
+  });
+
+  it("the leaderboards keep working on a deployment with no D1 bound", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), TMDB_API_KEY: "k" });
+    assert.equal(env.DB, undefined);
+    await call(env, "/api/track-event", { method: "POST", ip: nextIp(), json: {
+      events: [{ eventType: "watched", id: "tt111", title: "KV Title", mediaType: "movie" }],
+    } });
+    await call(env, "/api/title-search?q=matrix", { ip: nextIp() });
+    const cookie = await adminCookie(env);
+    const trending = (await call(env, "/admin/api/leaderboard?type=watched&window=today", { cookie })).body;
+    assert.deepEqual(trending.entries.map((e) => [e.id, e.title, e.count]), [["tt111", "KV Title", 1]]);
+    const search = (await call(env, "/admin/api/analytics?section=search&window=today", { cookie })).body;
+    assert.deepEqual(search.searches.map((s) => [s.query, s.count]), [["matrix", 1]]);
+  });
+
+  it("Backfill Existing Data lands where the board actually reads from", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const U = await createUser(env, "backfilluser");
+    await call(env, "/api/creator/lists/save", { method: "POST", json: {
+      creatorName: U.creatorName, creatorKey: U.creatorKey, name: "Faves", type: "movie",
+      items: [{ id: "tt555", title: "Backfilled Movie" }],
+    } });
+    const cookie = await adminCookie(env);
+    let guard = 0;
+    while (guard++ < 20) {
+      const { body } = await call(env, "/admin/api/backfill-trending", { method: "POST", cookie, json: {} });
+      if (body.done) break;
+    }
+    // Written to KV alone, this would have reported success and shown nothing.
+    const board = (await call(env, "/admin/api/leaderboard?type=list-add&window=alltime", { cookie })).body;
+    assert.deepEqual(board.entries.map((e) => [e.id, e.title]), [["tt555", "Backfilled Movie"]]);
+  });
+});
+
+// Discover's six shared-view pills (Movies, Shows, Hidden Gems, Kids,
+// Holidays, Genres -- plus All when it renders through the same feed) had no
+// header and no Refresh button, unlike the Popular Lists and Curated pills
+// right beside them in the same sub-nav, which both have one. Reported
+// directly: "Popular Lists and Curated has a refresh button and the others
+// does not."
+describe("Discover: every sub-nav pill gets a header and a Refresh button", () => {
+  const tab = fs.readFileSync(path.join(REPO_ROOT, "11_tab-quick-add.js"), "utf8").replace(/\r\n/g, "\n");
+  const core = fs.readFileSync(path.join(REPO_ROOT, "16_client-row-core.js"), "utf8").replace(/\r\n/g, "\n");
+  const shell = fs.readFileSync(path.join(REPO_ROOT, "09_page-shell.js"), "utf8").replace(/\r\n/g, "\n");
+
+  it("gives the shared discoverListsFeed its own header and Refresh button", () => {
+    const before = tab.slice(0, tab.indexOf('id="discoverListsFeed"'));
+    const header = before.slice(before.indexOf('<div class="shelf-header" id="discoverListsFeedHeader"'));
+    assert.match(header, /class="shelf-header"/, "same header shape as Popular Lists and Curated");
+    assert.match(header, /id="discoverListsFeedTitle"/, "a title element filterDiscoverShelves can update");
+    assert.match(header, /onclick="[^"]*renderDiscoverChartsList\([^)]*true\)/,
+      "Refresh must force a real refresh, not hit the cache/loaded guard");
+  });
+
+  it("hides the shared header pre-hydration exactly where it hides the feed itself", () => {
+    // Popular and Curated get their own dedicated panel and header, so the
+    // shared one must stay hidden under those two initial subs the same way
+    // #discoverListsFeed already does -- otherwise a saved "popular" or
+    // "curated" sub flashes the wrong header before JS swaps the panels.
+    for (const sub of ["popular", "curated"]) {
+      const re = new RegExp(
+        `html\\[data-initial-discover-sub="${sub}"\\] #discoverListsFeedHeader,`
+      );
+      assert.match(shell, re, `#discoverListsFeedHeader must be hidden alongside #discoverListsFeed for "${sub}"`);
+    }
+  });
+
+  it("filterDiscoverShelves shows the header for every shared-feed pill and titles it correctly", () => {
+    const start = core.indexOf("function filterDiscoverShelves");
+    const fn = core.slice(start, core.indexOf("\n}\n", start) + 3);
+    assert.match(fn, /feedHeader\.style\.display = 'flex'/, "the header must be shown, not just the feed");
+    assert.match(fn, /DISCOVER_FEED_TITLES\[window\._currentDiscoverFilter\]/,
+      "the title must track the active pill rather than staying fixed");
+
+    const titles = core.slice(core.indexOf("const DISCOVER_FEED_TITLES"));
+    const obj = titles.slice(0, titles.indexOf("};") + 2);
+    // Every pill 11_tab-quick-add.js wires to filterDiscoverShelves, other
+    // than popular/curated (which get their own header, not this one), must
+    // have a title here -- a pill added to the sub-nav without one falls
+    // back to "All" silently instead of failing a test.
+    const pillFilters = [...tab.matchAll(/data-sub="(\w+)"/g)].map((m) => m[1]).filter((f) => f !== "popular" && f !== "curated");
+    assert.ok(pillFilters.length >= 6, `expected the shared-feed pills, found ${JSON.stringify(pillFilters)}`);
+    for (const f of pillFilters) {
+      assert.match(obj, new RegExp(`\\b${f}:\\s*'`), `DISCOVER_FEED_TITLES is missing an entry for "${f}"`);
+    }
+  });
+
+  it("hides popular's and curated's own header state from the shared one, and back", () => {
+    const start = core.indexOf("function filterDiscoverShelves");
+    const fn = core.slice(start, core.indexOf("\n}\n", start) + 3);
+    // The unconditional reset near the top of the function is what this
+    // depends on -- it must run before either branch, or switching from a
+    // shared-feed pill to Popular/Curated would leave the old title showing
+    // behind the popular/curated panel.
+    assert.match(fn, /if \(feedHeader\) feedHeader\.style\.display = 'none';/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2 of STORAGE-PLAN-KV-D1.md: Identity and lists become D1-authoritative
+// ---------------------------------------------------------------------------
+describe("Phase 2: Identity and lists become D1-authoritative", () => {
+  it("getCreator reads D1 first and ignores stale/tampered KV keyHash", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2auth");
+    const K = { creatorName: "p2auth", creatorKey: u.creatorKey };
+
+    // Tamper with the KV record: set a bogus keyHash in KV
+    const kvRecord = JSON.parse(kv._store.get("creator:p2auth"));
+    kvRecord.keyHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    kv._store.set("creator:p2auth", JSON.stringify(kvRecord));
+
+    // Authenticated request must succeed because D1 is authoritative
+    const res = await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+    assert.equal(res.status, 200, "D1-authoritative keyHash must authenticate successfully despite stale KV");
+
+    // Also verify KV was refreshed with the authoritative D1 record
+    const refreshedKv = JSON.parse(kv._store.get("creator:p2auth"));
+    assert.equal(refreshedKv.keyHash, db.q("SELECT key_hash FROM creators WHERE username = 'p2auth'")[0].key_hash);
+  });
+
+  it("getCreator falls back to KV when missing in D1 and lazy-backfills D1", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2unmigrated");
+    const K = { creatorName: "p2unmigrated", creatorKey: u.creatorKey };
+
+    // Delete the row from D1 to simulate an unmigrated pre-Phase-2 account that exists only in KV
+    db.exec("DELETE FROM creators WHERE username = 'p2unmigrated';");
+    assert.equal(db.q("SELECT COUNT(*) AS n FROM creators WHERE username = 'p2unmigrated'")[0].n, 0);
+
+    // An authenticated call should fall back to KV, succeed, and lazy-backfill D1
+    const res = await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+    assert.equal(res.status, 200, "must authenticate via KV fallback when D1 row is missing");
+
+    // Verify D1 was backfilled
+    const d1Row = db.q("SELECT * FROM creators WHERE username = 'p2unmigrated'")[0];
+    assert.ok(d1Row, "must lazy-backfill missing account into D1 creators table");
+    assert.equal(d1Row.username, "p2unmigrated");
+    assert.ok(d1Row.key_hash, "must have key_hash populated");
+  });
+
+  it("getCreatorList reads D1 first and ignores stale KV list data", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2listauth");
+    const K = { creatorName: "p2listauth", creatorKey: u.creatorKey };
+
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Authoritative List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    assert.equal(saveRes.body.ok, true);
+    const slug = saveRes.body.slug;
+
+    // Tamper KV list record with older timestamp and modified name/items
+    const kvRecord = JSON.parse(kv._store.get(`creatorlist:p2listauth:${slug}`));
+    kvRecord.name = "Stale KV Name";
+    kvRecord.items = [{ id: "tt_stale" }];
+    kvRecord.updatedAt = saveRes.body.updatedAt - 1000;
+    kv._store.set(`creatorlist:p2listauth:${slug}`, JSON.stringify(kvRecord));
+
+    // Read via /api/creator/lists
+    const listsRes = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const list = listsRes.body.lists.find((l) => l.slug === slug);
+    assert.equal(list.name, "Authoritative List", "D1 data must take precedence over stale KV");
+
+    // Also read public endpoint /lists/:user/:slug
+    const publicRes = await call(env, `/lists/p2listauth/${slug}`);
+    assert.equal(publicRes.status, 200);
+    assert.match(publicRes.text, /tt1/);
+    assert.ok(!publicRes.text.includes("tt_stale"), "must not serve stale KV items");
+  });
+
+  it("getCreatorList self-heals D1 if KV contains a newer edit", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2heal");
+    const K = { creatorName: "p2heal", creatorKey: u.creatorKey };
+
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Initial List", type: "movie", visibility: "public", items: [{ id: "tt1" }] },
+    });
+    const slug = saveRes.body.slug;
+
+    // Simulate fresher KV write (e.g. D1 write had dropped or failed during save)
+    const freshKv = JSON.parse(kv._store.get(`creatorlist:p2heal:${slug}`));
+    freshKv.name = "Healed From KV";
+    freshKv.updatedAt = saveRes.body.updatedAt + 10000;
+    freshKv.items = [{ id: "tt1" }, { id: "tt2" }];
+    kv._store.set(`creatorlist:p2heal:${slug}`, JSON.stringify(freshKv));
+
+    // Calling /api/creator/lists runs getCreatorList, which detects fresher KV and heals D1
+    const listsRes = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    const list = listsRes.body.lists.find((l) => l.slug === slug);
+    assert.equal(list.name, "Healed From KV", "must serve fresher edit from KV");
+
+    // Verify D1 was healed
+    const d1Row = db.q("SELECT name, updated_at, items_json FROM creator_lists WHERE id = ?", `p2heal:${slug}`)[0];
+    assert.equal(d1Row.name, "Healed From KV");
+    assert.equal(d1Row.updated_at, freshKv.updatedAt);
+    assert.ok(d1Row.items_json.includes("tt2"));
+  });
+
+  it("creator_lists.sort_order drives ordering and survives missing creatorlistorder KV key", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2order");
+    const K = { creatorName: "p2order", creatorKey: u.creatorKey };
+
+    // Create 3 lists
+    await call(env, "/api/creator/lists/save", { method: "POST", json: { ...K, name: "List A", type: "movie", visibility: "private", items: [] } });
+    await call(env, "/api/creator/lists/save", { method: "POST", json: { ...K, name: "List B", type: "movie", visibility: "private", items: [] } });
+    await call(env, "/api/creator/lists/save", { method: "POST", json: { ...K, name: "List C", type: "movie", visibility: "private", items: [] } });
+
+    // Initial order is A, B, C
+    const initLists = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(initLists.body.lists.map((l) => l.name), ["List A", "List B", "List C"]);
+
+    // Reorder to C, A, B
+    const reorderRes = await call(env, "/api/creator/lists/reorder", {
+      method: "POST",
+      json: { ...K, order: ["list-c", "list-a", "list-b"] },
+    });
+    assert.equal(reorderRes.body.ok, true);
+
+    // Check D1 sort_order values
+    const d1Rows = db.q("SELECT id, sort_order FROM creator_lists WHERE username = 'p2order' ORDER BY sort_order ASC");
+    assert.deepEqual(d1Rows.map((r) => r.id), ["p2order:list-c", "p2order:list-a", "p2order:list-b"]);
+    assert.deepEqual(d1Rows.map((r) => r.sort_order), [0, 1, 2]);
+
+    // Delete creatorlistorder: from KV
+    kv._store.delete("creatorlistorder:p2order");
+
+    // /api/creator/lists must still report in [C, A, B] order from D1 sort_order
+    const afterDeleteKv = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(afterDeleteKv.body.lists.map((l) => l.name), ["List C", "List A", "List B"]);
+  });
+
+  it("creators.lists_stamp is D1-authoritative and survives missing KV stamp", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2stamp");
+    const K = { creatorName: "p2stamp", creatorKey: u.creatorKey };
+
+    // Initially lists_stamp is 0 in D1
+    const initMeta = await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+    assert.equal(initMeta.body.lists, 0);
+
+    // Save a list -> moves the stamp
+    await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "List 1", type: "movie", visibility: "private", items: [] },
+    });
+    const d1Stamp = db.q("SELECT lists_stamp FROM creators WHERE username = 'p2stamp'")[0].lists_stamp;
+    assert.ok(d1Stamp > 0, "D1 creators.lists_stamp must be updated");
+
+    // Delete KV stamp
+    kv._store.delete("creatorliststamp:p2stamp");
+
+    // /api/creator/sync/meta must still return the D1 stamp
+    const afterMeta = await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+    assert.equal(afterMeta.body.lists, d1Stamp, "sync/meta must read lists_stamp from D1");
+  });
+
+  it("creators.share_json is D1-authoritative and persists share tracking", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2share");
+    const K = { creatorName: "p2share", creatorKey: u.creatorKey };
+
+    // Save share tracking for "watchlist"
+    const postRes = await call(env, "/api/creator/sync/share-tracking", {
+      method: "POST",
+      json: { ...K, slug: "watchlist", shared: true },
+    });
+    assert.equal(postRes.body.ok, true);
+
+    // Check D1 share_json column
+    const d1ShareJson = db.q("SELECT share_json FROM creators WHERE username = 'p2share'")[0].share_json;
+    assert.equal(JSON.parse(d1ShareJson).watchlist, true);
+
+    // Delete KV creatorshare: key
+    kv._store.delete("creatorshare:p2share");
+
+    // Read back via POST /api/creator/sync/share-tracking (no slug = query status)
+    const getRes = await call(env, "/api/creator/sync/share-tracking", { method: "POST", json: K });
+    assert.equal(getRes.body.ok, true);
+    assert.equal(getRes.body.shared.watchlist, true);
+  });
+
+  it("list_tombstones table is D1-authoritative across deletes and re-creates", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2tomb");
+    const K = { creatorName: "p2tomb", creatorKey: u.creatorKey };
+
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Doomed List", type: "movie", visibility: "private", items: [] },
+    });
+    const slug = saveRes.body.slug;
+
+    // Delete the list
+    const delRes = await call(env, "/api/creator/lists/delete", { method: "POST", json: { ...K, slug } });
+    assert.equal(delRes.body.ok, true);
+
+    // Check D1 list_tombstones table
+    const tombstones = db.q("SELECT * FROM list_tombstones WHERE username = 'p2tomb' AND slug = ?", slug);
+    assert.equal(tombstones.length, 1, "tombstone must be recorded in D1");
+    assert.ok(tombstones[0].until > Date.now(), "until timestamp must be in future");
+
+    // Wipe KV creatorlistdeleted: key
+    kv._store.delete("creatorlistdeleted:p2tomb");
+
+    // /api/creator/lists must still report deletedSlugs from D1
+    const listsRes = await call(env, "/api/creator/lists", { method: "POST", json: K });
+    assert.deepEqual(listsRes.body.deletedSlugs, [slug], "must read tombstones from D1 even when KV is wiped");
+
+    // Re-create the list at the same slug
+    const reRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Doomed List", slug, type: "movie", visibility: "private", items: [] },
+    });
+    assert.equal(reRes.body.ok, true);
+
+    // Check D1 list_tombstones was cleared
+    const afterTombstones = db.q("SELECT * FROM list_tombstones WHERE username = 'p2tomb' AND slug = ?", slug);
+    assert.equal(afterTombstones.length, 0, "tombstone must be cleared in D1 on re-create");
+  });
+
+  it("touchCreatorLastSeen writes directly to D1 and drops creatorlastseen: in KV", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p2lastseen");
+    const K = { creatorName: "p2lastseen", creatorKey: u.creatorKey };
+
+    // Authenticate
+    await call(env, "/api/creator/sync/meta", { method: "POST", json: K });
+
+    // Verify creatorlastseen: is NOT in KV
+    assert.ok(!kv._store.has("creatorlastseen:p2lastseen"), "creatorlastseen: KV write must be dropped when D1 is bound");
+
+    // Verify creators.last_active in D1 is updated
+    const d1Row = db.q("SELECT last_active FROM creators WHERE username = 'p2lastseen'")[0];
+    assert.ok(d1Row.last_active > 0, "creators.last_active in D1 must be updated");
+  });
+});
+
+describe("Phase 3: Likes, feedback, telemetry, tokens, tombstones", () => {
+  it("list_likes: applyLikeVote and /api/lists/like write to D1 list_likes and update creator_lists.likes", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p3likeowner");
+    const K = { creatorName: "p3likeowner", creatorKey: u.creatorKey };
+
+    // Save a public list
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Favorite Movies", visibility: "public", type: "movie", items: [{ id: "tt0111161", name: "Shawshank" }] },
+    });
+    const slug = saveRes.body.slug;
+    const listId = `c:p3likeowner:${slug}`;
+    const voterIp = nextIp();
+
+    // 1. First like vote
+    const likeRes1 = await call(env, "/api/lists/like", {
+      method: "POST",
+      ip: voterIp,
+      json: { username: "p3likeowner", slug },
+    });
+    assert.equal(likeRes1.body.ok, true);
+    assert.equal(likeRes1.body.likes, 1);
+    assert.equal(likeRes1.body.liked, true);
+
+    // Verify D1 list_likes has voter
+    const likesRows1 = db.q("SELECT * FROM list_likes WHERE list_id = ?", listId);
+    assert.equal(likesRows1.length, 1);
+    // Verify D1 creator_lists.likes is 1
+    const listRow1 = db.q("SELECT likes FROM creator_lists WHERE id = ?", `p3likeowner:${slug}`)[0];
+    assert.equal(listRow1.likes, 1);
+
+    // 2. Unlike vote
+    const unlikeRes = await call(env, "/api/lists/like", {
+      method: "POST",
+      ip: voterIp,
+      json: { username: "p3likeowner", slug, action: "unlike" },
+    });
+    assert.equal(unlikeRes.body.ok, true);
+    assert.equal(unlikeRes.body.likes, 0);
+    assert.equal(unlikeRes.body.liked, false);
+
+    // Verify D1 list_likes is empty
+    const likesRows2 = db.q("SELECT * FROM list_likes WHERE list_id = ?", listId);
+    assert.equal(likesRows2.length, 0);
+    // Verify D1 creator_lists.likes is 0
+    const listRow2 = db.q("SELECT likes FROM creator_lists WHERE id = ?", `p3likeowner:${slug}`)[0];
+    assert.equal(listRow2.likes, 0);
+
+    // 3. Lazy migration from KV to D1:
+    // When KV has legacy voter array and D1 has no rows, reading or voting migrates KV voters into D1.
+    kv._store.set(`listlikevoters:p3likeowner:${slug}`, JSON.stringify(["legacy_voter_1", "legacy_voter_2"]));
+    const likeRes3 = await call(env, "/api/lists/like", {
+      method: "POST",
+      ip: voterIp,
+      json: { username: "p3likeowner", slug, action: "like" },
+    });
+    assert.equal(likeRes3.body.ok, true);
+    const likesRows3 = db.q("SELECT voter_id FROM list_likes WHERE list_id = ? ORDER BY voter_id", listId);
+    const voterIds = likesRows3.map((r) => r.voter_id);
+    assert.ok(voterIds.includes("legacy_voter_1"), "must lazy-migrate legacy_voter_1");
+    assert.ok(voterIds.includes("legacy_voter_2"), "must lazy-migrate legacy_voter_2");
+  });
+
+  it("list_likes: purgeCreatorData clears list_likes for deleted creator lists", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p3purgelikes");
+    const K = { creatorName: "p3purgelikes", creatorKey: u.creatorKey };
+
+    const saveRes = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: { ...K, name: "Doomed List", visibility: "public", type: "movie", items: [] },
+    });
+    const slug = saveRes.body.slug;
+    const listId = `c:p3purgelikes:${slug}`;
+
+    await call(env, "/api/lists/like", {
+      method: "POST",
+      ip: nextIp(),
+      json: { username: "p3purgelikes", slug },
+    });
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM list_likes WHERE list_id = ?", listId)[0].c, 1);
+
+    // Purge creator via delete-account
+    const purgeRes = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { ...K, confirm: "DELETE" },
+    });
+    assert.equal(purgeRes.body.ok, true);
+
+    // list_likes must be deleted
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM list_likes WHERE list_id = ?", listId)[0].c, 0);
+  });
+
+  it("feedback: /api/feedback and admin endpoints read/write D1 feedback table", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    // 1. Submit feedback via /api/feedback with an allowed category ('idea')
+    const postRes = await call(env, "/api/feedback", {
+      method: "POST",
+      ip: nextIp(),
+      json: { category: "idea", message: "Add dark mode option", contact: "tester@example.com" },
+    });
+    assert.equal(postRes.body.ok, true);
+    const entryId = postRes.body.entry.id;
+    assert.ok(entryId, "feedback ID must be returned");
+
+    // Verify D1 feedback row
+    const fbRows = db.q("SELECT * FROM feedback WHERE id = ?", entryId);
+    assert.equal(fbRows.length, 1);
+    assert.equal(fbRows[0].status, "open");
+    assert.equal(fbRows[0].subject, "idea");
+    assert.ok(fbRows[0].body_json.includes("Add dark mode option"));
+
+    // 2. Admin lists feedback via /admin/api/feedback
+    const listRes = await call(env, "/admin/api/feedback", { cookie });
+    assert.equal(listRes.body.ok, true);
+    const found = listRes.body.entries.find((e) => e.id === entryId);
+    assert.ok(found, "feedback entry must be listed by admin");
+    assert.equal(found.category, "idea");
+
+    // 3. Admin replies via /admin/api/feedback/reply
+    const replyRes = await call(env, "/admin/api/feedback/reply", {
+      method: "POST",
+      cookie,
+      json: { id: entryId, message: "We are considering it!" },
+    });
+    assert.equal(replyRes.body.ok, true);
+    const fbAfterReply = db.q("SELECT body_json FROM feedback WHERE id = ?", entryId)[0];
+    assert.ok(fbAfterReply.body_json.includes("We are considering it!"));
+
+    // 4. Admin edits status via /admin/api/feedback/status
+    const statusRes = await call(env, "/admin/api/feedback/status", {
+      method: "POST",
+      cookie,
+      json: { id: entryId, completed: true },
+    });
+    assert.equal(statusRes.body.ok, true);
+    assert.equal(db.q("SELECT status FROM feedback WHERE id = ?", entryId)[0].status, "closed");
+
+    // 5. Admin edits category via /admin/api/feedback/edit
+    const editRes = await call(env, "/admin/api/feedback/edit", {
+      method: "POST",
+      cookie,
+      json: { id: entryId, category: "improvement", message: "Add dark mode option revised" },
+    });
+    assert.equal(editRes.body.ok, true);
+    assert.equal(db.q("SELECT subject FROM feedback WHERE id = ?", entryId)[0].subject, "improvement");
+
+    // 6. Admin deletes feedback via /admin/api/feedback/delete
+    const delRes = await call(env, "/admin/api/feedback/delete", {
+      method: "POST",
+      cookie,
+      json: { id: entryId },
+    });
+    assert.equal(delRes.body.ok, true);
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM feedback WHERE id = ?", entryId)[0].c, 0);
+  });
+
+  it("event_meta & audience analytics: track-event populates event_meta, and audience reads normalized stats", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    // 1. POST /api/track-event writes to D1 event_meta
+    await call(env, "/api/track-event", {
+      method: "POST",
+      ip: nextIp(),
+      json: {
+        events: [
+          { eventType: "watched", id: "tt1234567", title: "Interstellar Space", mediaType: "movie" },
+        ],
+      },
+    });
+    const metaRows = db.q("SELECT * FROM event_meta WHERE event_type = 'watched' AND item_id = 'tt1234567'");
+    assert.equal(metaRows.length, 1);
+    assert.equal(metaRows[0].title, "Interstellar Space");
+    assert.equal(metaRows[0].media_type, "movie");
+
+    // Leaderboard uses event_meta to attach title
+    const lbRes = await call(env, "/admin/api/leaderboard?type=watched&window=today", { cookie });
+    assert.equal(lbRes.body.ok, true);
+    const entry = lbRes.body.entries.find((e) => e.id === "tt1234567");
+    assert.ok(entry);
+    assert.equal(entry.title, "Interstellar Space");
+
+    // 2. Audience analytics reads normalized genre:* and decade:* rows from D1 stats
+    db.q("INSERT INTO stats (kind, day, n) VALUES ('genre:Science Fiction', 'total', 42)");
+    db.q("INSERT INTO stats (kind, day, n) VALUES ('decade:2010s', 'total', 38)");
+    const audRes = await call(env, "/admin/api/analytics?section=audience", { cookie });
+    assert.equal(audRes.body.ok, true);
+    const sf = audRes.body.genres.find((g) => g.name === "Science Fiction");
+    assert.ok(sf, "genre Science Fiction must be returned from D1 stats");
+    assert.equal(sf.count, 42);
+    const d10 = audRes.body.decades.find((d) => d.name === "2010s");
+    assert.ok(d10, "decade 2010s must be returned from D1 stats");
+    assert.equal(d10.count, 38);
+  });
+
+  it("scrobble_tokens: atomic token rotation in D1 and instant revocation of old tokens", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p3scrobbler");
+    const K = { creatorName: "p3scrobbler", creatorKey: u.creatorKey };
+
+    // 1. Issue first token
+    const r1 = await call(env, "/api/creator/scrobble-token", { method: "POST", json: K });
+    assert.equal(r1.body.ok, true);
+    const token1 = r1.body.token;
+    assert.ok(token1);
+
+    // Verify token1 in D1
+    const tRows1 = db.q("SELECT * FROM scrobble_tokens WHERE token = ?", token1);
+    assert.equal(tRows1.length, 1);
+    assert.equal(tRows1[0].username, "p3scrobbler");
+
+    // Scrobble webhook works with token1
+    const sRes1 = await call(env, `/api/scrobble?st=${encodeURIComponent(token1)}`, {
+      method: "POST",
+      json: { event: "media.play" },
+    });
+    assert.notEqual(sRes1.status, 401);
+
+    // 2. Rotate token
+    const r2 = await call(env, "/api/creator/scrobble-token", {
+      method: "POST",
+      json: { ...K, rotate: true },
+    });
+    assert.equal(r2.body.ok, true);
+    const token2 = r2.body.token;
+    assert.ok(token2);
+    assert.notEqual(token1, token2);
+
+    // D1 must have token2 and MUST NOT have token1
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM scrobble_tokens WHERE token = ?", token1)[0].c, 0);
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM scrobble_tokens WHERE token = ?", token2)[0].c, 1);
+
+    // Old token is immediately revoked (fails auth)
+    const sResOld = await call(env, `/api/scrobble?st=${encodeURIComponent(token1)}`, {
+      method: "POST",
+      json: { event: "media.play" },
+    });
+    assert.equal(sResOld.status, 401);
+
+    // Purge creator removes scrobble_tokens
+    await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { ...K, confirm: "DELETE" },
+    });
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM scrobble_tokens WHERE username = 'p3scrobbler'")[0].c, 0);
+  });
+
+  it("pruneTombstones: cron scheduled() prunes expired tombstones and preserves active ones", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db, TMDB_API_KEY: "k" });
+
+    const past = Date.now() - 60000;
+    const future = Date.now() + 60000;
+
+    // Seed expired and active tombstones
+    db.q("INSERT INTO creator_tombstones (username, until) VALUES ('expired_creator', ?)", past);
+    db.q("INSERT INTO creator_tombstones (username, until) VALUES ('active_creator', ?)", future);
+    db.q("INSERT INTO list_tombstones (username, slug, until) VALUES ('u1', 'expired_slug', ?)", past);
+    db.q("INSERT INTO list_tombstones (username, slug, until) VALUES ('u1', 'active_slug', ?)", future);
+
+    // Run scheduled tick
+    await runScheduledTick(env);
+
+    // Check creator_tombstones
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM creator_tombstones WHERE username = 'expired_creator'")[0].c, 0);
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM creator_tombstones WHERE username = 'active_creator'")[0].c, 1);
+
+    // Check list_tombstones
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM list_tombstones WHERE slug = 'expired_slug'")[0].c, 0);
+    assert.equal(db.q("SELECT COUNT(*) AS c FROM list_tombstones WHERE slug = 'active_slug'")[0].c, 1);
+  });
+
+  it("databaseStats: /admin/api/schema-status reports page count, page size, and table row counts", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    const r = await call(env, "/admin/api/schema-status", { cookie });
+    assert.equal(r.status, 200);
+    assert.ok(r.body.databaseStats, "databaseStats must be returned in response");
+    const ds = r.body.databaseStats;
+    assert.equal(typeof ds.pageSize, "number");
+    assert.ok(ds.pageSize > 0);
+    assert.equal(typeof ds.pageCount, "number");
+    assert.ok(ds.pageCount >= 0);
+    assert.equal(typeof ds.estimatedSizeBytes, "number");
+    assert.ok(ds.estimatedSizeBytes >= 0);
+    assert.ok(ds.rowCounts && typeof ds.rowCounts === "object");
+    assert.equal(typeof ds.rowCounts.creators, "number");
+    assert.equal(typeof ds.rowCounts.list_likes, "number");
+    assert.equal(typeof ds.rowCounts.feedback, "number");
+    assert.equal(typeof ds.rowCounts.scrobble_tokens, "number");
+    assert.equal(typeof ds.rowCounts.event_meta, "number");
+    assert.equal(typeof ds.rowCounts.watch_history, "number");
+    assert.equal(typeof ds.rowCounts.continue_watching, "number");
+    assert.equal(typeof ds.rowCounts.airing_next, "number");
+    assert.equal(typeof ds.rowCounts.creator_user_lists, "number");
+    assert.equal(typeof ds.rowCounts.creator_show_states, "number");
+    assert.equal(typeof ds.rowCounts.creator_tracking_meta, "number");
+  });
+
+  it("/admin/api/migrate-d1 backfills likes, feedback, event_meta, scrobble_tokens, and explodes genre/decade stats", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    // Seed creator row so foreign key doesn't reject list
+    db.q("INSERT INTO creators (username, display_name, key_hash, created_at) VALUES ('miguser', 'miguser', 'hash', 1)");
+
+    // Seed KV keys for phases 4, 5, 6, 7, 8
+    kv._store.set("stats:genres:alltime", JSON.stringify({ Animation: 25, Mystery: 14 }));
+    kv._store.set("stats:decades:alltime", JSON.stringify({ "1960s": 9 }));
+    kv._store.set("listlikevoters:miguser:favs", JSON.stringify(["voter_a", "voter_b"]));
+    kv._store.set("feedback:thread101", JSON.stringify({
+      id: "thread101",
+      status: "open",
+      category: "Feature",
+      subject: "Dark mode",
+      messages: [{ text: "Please add dark mode" }],
+      createdAt: 1000,
+      updatedAt: 2000,
+    }));
+    kv._store.set("evtmeta:movie:tt7777777", JSON.stringify({
+      title: "Interstellar Odyssey",
+      mediaType: "movie",
+      lastSeen: 5000,
+    }));
+    kv._store.set("creatorscrobbletoken:migscrob", "scrob_secret_token_123");
+
+    // Run migrate-d1 to completion
+    let last;
+    for (let i = 0; i < 30; i++) {
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+      if (last.body.done) break;
+    }
+    assert.equal(last.body.done, true);
+
+    // Verify D1:
+    // 1. Stats exploded
+    assert.equal(db.q("SELECT n FROM stats WHERE kind = 'genre:Animation' AND day = 'total'")[0].n, 25);
+    assert.equal(db.q("SELECT n FROM stats WHERE kind = 'genre:Mystery' AND day = 'total'")[0].n, 14);
+    assert.equal(db.q("SELECT n FROM stats WHERE kind = 'decade:1960s' AND day = 'total'")[0].n, 9);
+
+    // 2. Likes migrated
+    const likeRows = db.q("SELECT voter_id FROM list_likes WHERE list_id = 'c:miguser:favs' ORDER BY voter_id");
+    assert.deepEqual(likeRows.map((r) => r.voter_id), ["voter_a", "voter_b"]);
+
+    // 3. Feedback migrated
+    const fb = db.q("SELECT * FROM feedback WHERE id = 'thread101'")[0];
+    assert.ok(fb);
+    assert.equal(fb.status, "open");
+    assert.equal(fb.subject, "Feature");
+
+    // 4. Event meta migrated
+    const em = db.q("SELECT * FROM event_meta WHERE event_type = 'movie' AND item_id = 'tt7777777'")[0];
+    assert.ok(em);
+    assert.equal(em.title, "Interstellar Odyssey");
+    assert.equal(em.media_type, "movie");
+
+    // 5. Scrobble token migrated
+    const st = db.q("SELECT * FROM scrobble_tokens WHERE token = 'scrob_secret_token_123'")[0];
+    assert.ok(st);
+    assert.equal(st.username, "migscrob");
+  });
+});
+
+describe("Phase 4: Split sync blobs into relational D1 tables", () => {
+  const {
+    saveCreatorTrackingD1,
+    readCreatorTrackingD1,
+    saveCreatorUserListsD1,
+    readCreatorUserListsD1,
+    fetchAutoTrackedCatalog,
+  } = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "05_catalog-core.js");
+
+  // A personal shelf is only served to a caller that has proved it owns the
+  // account -- see mayReadTrackedShelf (02_http-and-creator-utils.js). These
+  // tests are about what the D1 read returns, so they say who they are; the
+  // test right below is the one that checks what happens when they do not.
+  const asOwner = (u) => ({ verifiedOwner: u });
+
+  it("saveCreatorTrackingD1 and readCreatorTrackingD1 round-trip relational tables", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const u = "p4roundtrip";
+
+    const trackingData = {
+      watchHistory: [
+        { id: "tt001:1:1", type: "episode", name: "Pilot", showId: "tt001", showTitle: "Show One", seasonNum: 1, episodeNum: 1, watchedAt: 1000 },
+        { id: "tt002", type: "movie", title: "Movie One", year: "2024", watchedAt: 900 },
+      ],
+      continueWatching: [
+        { id: "tt001:1:2", showId: "tt001", name: "Episode 2", seasonNum: 1, episodeNum: 2, updatedAt: 1005 },
+      ],
+      airingNext: [
+        { id: "tt001:1:3", showId: "tt001", name: "Episode 3", seasonNum: 1, episodeNum: 3, airDate: "2026-10-01", isSeasonPremiere: false, isSeasonFinale: false, updatedAt: 1010 },
+      ],
+      fullyWatchedShowIds: ["tt999"],
+      dismissedContinueWatching: { tt888: { seasonNum: 2, episodeNum: 5 } },
+      curatedRecommendations: { movies: [{ id: "tt003" }], shows: [] },
+      trackPlayback: true,
+      removeWatchedFromWatchlist: true,
+      scrobbleFilterUsers: true,
+      scrobbleAllowedUsers: "alice,bob",
+      scrobbleBlockAnonymous: true,
+      clientVersion: 12345,
+      updatedAt: 2000,
+    };
+
+    const saved = await saveCreatorTrackingD1(env, u, trackingData, false);
+    assert.equal(saved, true);
+
+    // Verify D1 rows
+    const whRows = db.q("SELECT * FROM watch_history WHERE username = ? ORDER BY watched_at DESC", u);
+    assert.equal(whRows.length, 2);
+    assert.equal(whRows[0].item_id, "tt001:1:1");
+    assert.equal(whRows[0].show_title, "Show One");
+    assert.equal(whRows[1].item_id, "tt002");
+    assert.equal(whRows[1].title, "Movie One");
+
+    const cwRows = db.q("SELECT * FROM continue_watching WHERE username = ?", u);
+    assert.equal(cwRows.length, 1);
+    assert.equal(cwRows[0].show_id, "tt001");
+    assert.equal(cwRows[0].episode_num, 2);
+
+    const anRows = db.q("SELECT * FROM airing_next WHERE username = ?", u);
+    assert.equal(anRows.length, 1);
+    assert.equal(anRows[0].air_date, "2026-10-01");
+
+    const stateRows = db.q("SELECT * FROM creator_show_states WHERE username = ?", u);
+    assert.equal(stateRows.length, 2);
+    const fullyWatched = stateRows.find((r) => r.show_id === "tt999");
+    assert.equal(fullyWatched.is_fully_watched, 1);
+    const dismissed = stateRows.find((r) => r.show_id === "tt888");
+    assert.equal(dismissed.dismissed_season, 2);
+    assert.equal(dismissed.dismissed_episode, 5);
+
+    const metaRows = db.q("SELECT * FROM creator_tracking_meta WHERE username = ?", u);
+    assert.equal(metaRows.length, 1);
+    assert.equal(metaRows[0].client_version, 12345);
+    assert.equal(metaRows[0].scrobble_allowed_users, "alice,bob");
+    assert.equal(metaRows[0].scrobble_block_anonymous, 1);
+
+    // Read back via helper
+    const loaded = JSON.parse(JSON.stringify(await readCreatorTrackingD1(env, u)));
+    assert.ok(loaded);
+    assert.equal(loaded.watchHistory.length, 2);
+    assert.equal(loaded.continueWatching.length, 1);
+    assert.equal(loaded.airingNext.length, 1);
+    assert.deepEqual(loaded.fullyWatchedShowIds, ["tt999"]);
+    assert.deepEqual(loaded.dismissedContinueWatching, { tt888: { seasonNum: 2, episodeNum: 5 } });
+    assert.equal(loaded.clientVersion, 12345);
+    assert.equal(loaded.scrobbleAllowedUsers, "alice,bob");
+    assert.equal(loaded.trackPlayback, true);
+
+    // Intentional removal clears watch history
+    await saveCreatorTrackingD1(env, u, { watchHistory: [] }, true);
+    const whAfter = db.q("SELECT * FROM watch_history WHERE username = ?", u);
+    assert.equal(whAfter.length, 0);
+  });
+
+  it("saveCreatorUserListsD1 and readCreatorUserListsD1 round-trip user lists", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const u = "p4userlists";
+
+    const ok = await saveCreatorUserListsD1(
+      env,
+      u,
+      ["c:alice:favs", "c:bob:watchlist"],
+      ["c:charlie:badlist"],
+      ["section_horror", "section_drama"]
+    );
+    assert.equal(ok, true);
+
+    const rows = db.q("SELECT * FROM creator_user_lists WHERE username = ? ORDER BY list_type, list_id", u);
+    assert.equal(rows.length, 5);
+
+    const loaded = JSON.parse(JSON.stringify(await readCreatorUserListsD1(env, u)));
+    assert.ok(loaded);
+    assert.deepEqual(loaded.likedLists.sort(), ["c:alice:favs", "c:bob:watchlist"].sort());
+    assert.deepEqual(loaded.hiddenLists, ["c:charlie:badlist"]);
+    assert.deepEqual(loaded.hiddenMyListsSections.sort(), ["section_horror", "section_drama"].sort());
+  });
+
+  it("/api/creator/sync/save and /api/creator/sync/like write to creator_user_lists in D1", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p4synclike");
+
+    const saveRes = await call(env, "/api/creator/sync/save", {
+      method: "POST",
+      json: {
+        creatorName: "p4synclike",
+        creatorKey: u.creatorKey,
+        likedLists: ["c:friend:superlist"],
+        hiddenLists: ["c:foe:spamlist"],
+        hiddenMyListsSections: ["collapsed_section"],
+      },
+    });
+    assert.equal(saveRes.status, 200);
+
+    // D1 has rows
+    const d1Lists = db.q("SELECT list_id, list_type FROM creator_user_lists WHERE username = 'p4synclike' ORDER BY list_type");
+    assert.equal(d1Lists.length, 3);
+
+    // Like endpoint
+    const likeRes = await call(env, "/api/creator/sync/like", {
+      method: "POST",
+      json: {
+        creatorName: "p4synclike",
+        creatorKey: u.creatorKey,
+        usernameSlug: "someone:coollist",
+        liked: true,
+      },
+    });
+    assert.equal(likeRes.status, 200);
+
+    const likedD1 = db.q("SELECT list_id FROM creator_user_lists WHERE username = 'p4synclike' AND list_type = 'liked' ORDER BY list_id");
+    assert.deepEqual(likedD1.map((r) => r.list_id), ["c:friend:superlist", "someone:coollist"]);
+
+    // sync/load returns merged lists
+    const loadRes = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: "p4synclike", creatorKey: u.creatorKey },
+    });
+    assert.equal(loadRes.status, 200);
+    assert.ok(loadRes.body.data.likedLists.includes("someone:coollist"));
+    assert.ok(loadRes.body.data.hiddenLists.includes("c:foe:spamlist"));
+  });
+
+  it("/api/creator/sync/save-tracking and /api/creator/sync/load work through D1 with conflict detection", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p4trackingtest");
+
+    const saveRes = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: {
+        creatorName: "p4trackingtest",
+        creatorKey: u.creatorKey,
+        watchHistory: [
+          { id: "tt101:1:1", type: "episode", showId: "tt101", showTitle: "Show 101", seasonNum: 1, episodeNum: 1, watchedAt: 5000 },
+        ],
+        continueWatching: [
+          { id: "tt101:1:2", showId: "tt101", seasonNum: 1, episodeNum: 2, updatedAt: 5005 },
+        ],
+        airingNext: [
+          { id: "tt101:1:3", showId: "tt101", seasonNum: 1, episodeNum: 3, airDate: "2026-11-15", updatedAt: 5010 },
+        ],
+        trackPlayback: true,
+      },
+    });
+    assert.equal(saveRes.status, 200);
+
+    // Verify D1 rows
+    const whD1 = db.q("SELECT * FROM watch_history WHERE username = 'p4trackingtest'");
+    assert.equal(whD1.length, 1);
+    assert.equal(whD1[0].show_title, "Show 101");
+
+    const metaD1 = db.q("SELECT * FROM creator_tracking_meta WHERE username = 'p4trackingtest'")[0];
+    assert.ok(metaD1);
+    const clientVer = metaD1.client_version;
+    assert.ok(clientVer > 0);
+
+    // sync/meta reports tracking timestamp from D1
+    const metaRes = await call(env, "/api/creator/sync/meta", {
+      method: "POST",
+      json: { creatorName: "p4trackingtest", creatorKey: u.creatorKey },
+    });
+    assert.equal(metaRes.status, 200);
+    assert.equal(metaRes.body.tracking, metaD1.updated_at);
+
+    // Stale expectedClientVersion returns 409 conflict
+    const staleRes = await call(env, "/api/creator/sync/save-tracking", {
+      method: "POST",
+      json: {
+        creatorName: "p4trackingtest",
+        creatorKey: u.creatorKey,
+        expectedClientVersion: clientVer - 1,
+        watchHistory: [],
+      },
+    });
+    assert.equal(staleRes.status, 409);
+    assert.equal(staleRes.body.conflict, true);
+
+    // If KV is wiped, sync/load still returns tracking state from D1
+    kv._store.delete("creatorsynctracking:p4trackingtest");
+    const loadRes = await call(env, "/api/creator/sync/load", {
+      method: "POST",
+      json: { creatorName: "p4trackingtest", creatorKey: u.creatorKey },
+    });
+    assert.equal(loadRes.status, 200);
+    assert.equal(loadRes.body.data.watchHistory.length, 1);
+    assert.equal(loadRes.body.data.watchHistory[0].id, "tt101:1:1");
+    assert.equal(loadRes.body.data.continueWatching.length, 1);
+    assert.equal(loadRes.body.data.airingNext.length, 1);
+  });
+
+  it("fetchAutoTrackedCatalog queries D1 relational tables directly", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = "p4catuser";
+
+    // Insert directly into D1 without KV
+    db.q(
+      `INSERT INTO watch_history (username, item_id, item_type, title, show_id, show_title, season_num, episode_num, watched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt201:1:1", "episode", "Pilot", "tt201", "D1 Series", 1, 1, 9000
+    );
+    db.q(
+      `INSERT INTO continue_watching (username, show_id, item_id, name, show_title, season_num, episode_num, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt201", "tt201:1:2", "Ep 2", "D1 Series", 1, 2, 9050
+    );
+    db.q(
+      `INSERT INTO airing_next (username, show_id, item_id, name, show_title, season_num, episode_num, air_date, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt201", "tt201:1:3", "Ep 3", "D1 Series", 1, 3, "2026-12-01", 9100
+    );
+
+    const whCat = await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env, asOwner(u));
+    assert.equal(whCat.length, 1);
+    assert.equal(whCat[0].id, "tt201");
+    assert.equal(whCat[0].showTitle, "D1 Series");
+
+    const cwCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env, asOwner(u));
+    assert.equal(cwCat.length, 1);
+    assert.equal(cwCat[0].id, "tt201");
+    assert.equal(cwCat[0].episodeNum, 2);
+
+    const anCat = await fetchAutoTrackedCatalog({ url: `autotrack:airing-next:series:${u}` }, env, asOwner(u));
+    assert.equal(anCat.length, 1);
+    assert.equal(anCat[0].id, "tt201");
+    assert.equal(anCat[0].airDate, "2026-12-01");
+  });
+
+  // SEC-001. A personal shelf is named by a string in a catalog URL, and
+  // fetchAutoTrackedCatalog used to read it on the strength of that alone --
+  // so /api/preview?url=autotrack:watch-history:series:<username> handed any
+  // stranger the whole of that account's viewing history. The share flags
+  // /api/creator/sync/share-tracking writes are the opt-in, and they are the
+  // only thing that makes one of these public.
+  it("a personal shelf is not served to a caller that has proved nothing", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = "p4gateuser";
+    db.q(
+      `INSERT INTO watch_history (username, item_id, item_type, title, show_id, show_title, season_num, episode_num, watched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt301:1:1", "episode", "Pilot", "tt301", "Private Series", 1, 1, 9000
+    );
+
+    for (const slug of ["watch-history", "continue-watching", "watchlist", "airing-next"]) {
+      const anon = await fetchAutoTrackedCatalog({ url: `autotrack:${slug}:series:${u}` }, env, {});
+      // .length, not deepEqual: the sandbox is its own realm, so its [] has a
+      // different Array.prototype and deepStrictEqual compares prototypes.
+      assert.equal(anon.length, 0, `${slug} answered a caller with no proof of ownership`);
+    }
+
+    // The owner still gets it...
+    const owner = await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env, asOwner(u));
+    assert.equal(owner.length, 1);
+
+    // ...and so does anyone, once the owner opts that one shelf in.
+    kv._store.set(`creatorshare:${u}`, JSON.stringify({ "watch-history": true }));
+    const shared = await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env, {});
+    assert.equal(shared.length, 1, "an explicitly shared shelf must stay readable");
+
+    // Strictly === true: a truthy leftover is not consent, and a different
+    // slug is not covered by this one's flag.
+    kv._store.set(`creatorshare:${u}`, JSON.stringify({ "watch-history": "yes" }));
+    assert.equal(
+      (await fetchAutoTrackedCatalog({ url: `autotrack:watch-history:series:${u}` }, env, {})).length, 0,
+      "a truthy non-boolean share flag must not expose a shelf"
+    );
+  });
+
+  it("fetchAutoTrackedCatalog enriches continue-watching with airing_next metadata and Stremio applies badges", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = "badgetestuser";
+
+    // 1. D1 path: insert continue_watching and airing_next with premiere/finale/airDate info
+    db.q(
+      `INSERT INTO continue_watching (username, show_id, item_id, name, show_title, season_num, episode_num, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt999", "tt999:2:1", "Season 2 Premiere", "Badge Show", 2, 1, 9050
+    );
+    db.q(
+      `INSERT INTO airing_next (username, show_id, item_id, name, show_title, season_num, episode_num, air_date, is_season_premiere, is_season_finale, season_finale_air_date, season_finale_episode_number, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt999", "tt999:2:1", "Season 2 Premiere", "Badge Show", 2, 1, "2027-02-15", 1, 0, "2027-05-10", 10, 9100
+    );
+
+    // Direct fetchAutoTrackedCatalog enrichment check
+    const cwCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env, asOwner(u));
+    assert.equal(cwCat.length, 1);
+    assert.equal(cwCat[0].id, "tt999");
+    assert.equal(cwCat[0].airDate, "2027-02-15");
+    assert.equal(cwCat[0].isSeasonPremiere, true);
+    assert.equal(cwCat[0].seasonFinaleAirDate, "2027-05-10");
+    assert.equal(cwCat[0].seasonFinaleEpisodeNumber, 10);
+
+    // Stremio catalog request via call() with badging enabled
+    const cfgBadged = "cwbadgecfg1";
+    await kv.put(cfgBadged, JSON.stringify({
+      trackCreatorName: u,
+      entries: [
+        { id: "continue-watching", type: "series", name: "Continue Watching", url: `autotrack:continue-watching:series:${u}` }
+      ],
+      showBadgesStremio: true,
+      showBadgesStremioContinueWatching: true,
+    }));
+
+    const resBadged = await call(env, `/${cfgBadged}/catalog/series/continue-watching.json`);
+    assert.equal(resBadged.status, 200);
+    assert.equal(resBadged.body.metas.length, 1);
+    const posterBadged = resBadged.body.metas[0].poster;
+    assert.ok(posterBadged.includes("/api/poster-badge?"), "Poster must be converted to badge endpoint URL");
+    assert.ok(posterBadged.includes("airDate=2027-02-15"), "Poster badge URL must have upcoming airDate");
+    assert.ok(posterBadged.includes("premiere=1"), "Poster badge URL must include premiere=1");
+    assert.ok(posterBadged.includes("finaleDate=2027-05-10"), "Poster badge URL must include finaleDate");
+
+    // Stremio catalog request with showBadgesStremioContinueWatching disabled
+    const cfgUnbadged = "cwbadgecfg2";
+    await kv.put(cfgUnbadged, JSON.stringify({
+      trackCreatorName: u,
+      entries: [
+        { id: "continue-watching", type: "series", name: "Continue Watching", url: `autotrack:continue-watching:series:${u}` }
+      ],
+      showBadgesStremio: true,
+      showBadgesStremioContinueWatching: false,
+    }));
+
+    const resUnbadged = await call(env, `/${cfgUnbadged}/catalog/series/continue-watching.json`);
+    assert.equal(resUnbadged.status, 200);
+    assert.equal(resUnbadged.body.metas.length, 1);
+    const posterUnbadged = resUnbadged.body.metas[0].poster;
+    assert.ok(!posterUnbadged.includes("/api/poster-badge?"), "Poster must not be badged when toggle is disabled");
+
+    // 2. KV fallback path check
+    const uKv = "kvuserbadge";
+    await kv.put(`creatorsynctracking:${uKv}`, JSON.stringify({
+      continueWatching: [
+        { id: "tt888:1:1", showId: "tt888", showTitle: "KV Show", seasonNum: 1, episodeNum: 1, updatedAt: 9000 }
+      ],
+      airingNext: [
+        { id: "tt888:1:1", showId: "tt888", showTitle: "KV Show", seasonNum: 1, episodeNum: 1, airDate: "2027-03-01", isSeasonPremiere: true, seasonFinaleAirDate: "2027-06-01", seasonFinaleEpisodeNumber: 8, updatedAt: 9000 }
+      ]
+    }));
+
+    const cfgKv = "cwkvcfg1";
+    await kv.put(cfgKv, JSON.stringify({
+      trackCreatorName: uKv,
+      entries: [
+        { id: "continue-watching", type: "series", name: "Continue Watching", url: `autotrack:continue-watching:series:${uKv}` }
+      ],
+      showBadgesStremio: true,
+      showBadgesStremioContinueWatching: true,
+    }));
+
+    const resKv = await call(env, `/${cfgKv}/catalog/series/continue-watching.json`);
+    assert.equal(resKv.status, 200);
+    assert.equal(resKv.body.metas.length, 1);
+    assert.ok(resKv.body.metas[0].poster.includes("/api/poster-badge?"), "KV fallback must also produce badged poster");
+    assert.ok(resKv.body.metas[0].poster.includes("airDate=2027-03-01"), "KV fallback badge URL must include airDate");
+  });
+
+  it("saveCreatorTrackingD1 and readCreatorTrackingD1 faithfully round-trip companion metadata", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const u = "roundtripuser";
+
+    const trackingData = {
+      continueWatching: [
+        {
+          id: "tt9243946",
+          showId: "tt9243946",
+          name: "El Camino: A Breaking Bad Movie",
+          poster: "https://image.tmdb.org/t/p/w500/elcamino.jpg",
+          type: "movie",
+          kind: "movie",
+          isCompanion: true,
+          companionType: "sequel_movie",
+          companionNote: "Sequel Film",
+          companionStoryline: "Breaking Bad Complete Universe",
+          precedingShowId: "tt0903747",
+          updatedAt: 5000,
+        }
+      ],
+      updatedAt: 5000,
+    };
+
+    const saved = await saveCreatorTrackingD1(env, u, trackingData, false);
+    assert.equal(saved, true);
+
+    const rows = db.q("SELECT * FROM continue_watching WHERE username = ?", u);
+    assert.equal(rows.length, 1);
+    assert.ok(rows[0].show_title.startsWith("COMPANION:"), "show_title encodes companion JSON");
+
+    const loaded = await readCreatorTrackingD1(env, u);
+    assert.ok(loaded);
+    assert.equal(loaded.continueWatching.length, 1);
+    const item = loaded.continueWatching[0];
+    assert.equal(item.id, "tt9243946");
+    assert.equal(item.isCompanion, true);
+    assert.equal(item.companionType, "sequel_movie");
+    assert.equal(item.companionNote, "Sequel Film");
+    assert.equal(item.companionStoryline, "Breaking Bad Complete Universe");
+    assert.equal(item.precedingShowId, "tt0903747");
+    assert.equal(item.type, "movie");
+    assert.equal(item.kind, "movie");
+  });
+
+  it("fetchAutoTrackedCatalog filters out fully watched shows, preserves storyline companions, and routes companion movies to movie catalog", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = "companioncwuser";
+
+    // 1. Mark Breaking Bad (tt0903747) as fully watched in D1
+    db.q(
+      `INSERT INTO creator_show_states (username, show_id, is_fully_watched, updated_at)
+       VALUES (?, ?, 1, ?)`,
+      u, "tt0903747", 1000
+    );
+
+    // 2. Insert into continue_watching:
+    // a) Breaking Bad episode (should be filtered out because it is fully watched)
+    db.q(
+      `INSERT INTO continue_watching (username, show_id, item_id, name, show_title, season_num, episode_num, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt0903747", "tt0903747:5:16", "Felina", "Breaking Bad", 5, 16, 2000
+    );
+
+    // b) Storyline sequel companion movie: El Camino (encoded as COMPANION in show_title)
+    const compMeta = JSON.stringify({
+      isCompanion: true,
+      companionType: "sequel_movie",
+      companionNote: "Sequel Film",
+      companionStoryline: "Breaking Bad Complete Universe",
+      precedingShowId: "tt0903747",
+      type: "movie",
+      kind: "movie",
+    });
+    db.q(
+      `INSERT INTO continue_watching (username, show_id, item_id, name, poster, show_title, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      u, "tt9243946", "tt9243946", "El Camino: A Breaking Bad Movie", "https://image.tmdb.org/t/p/w500/elcamino.jpg", "COMPANION:" + compMeta, 3000
+    );
+
+    // 3. Request Movie catalog for continue-watching:
+    // - Breaking Bad must NOT be in Movie catalog
+    // - El Camino (companion movie) MUST be in Movie catalog
+    const movieCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:movie:${u}` }, env, { origin: "https://example.com", ...asOwner(u) });
+    assert.equal(movieCat.length, 1, "Movie continue-watching must contain only El Camino");
+    assert.equal(movieCat[0].id, "tt9243946");
+    assert.equal(movieCat[0].name, "El Camino: A Breaking Bad Movie");
+    assert.equal(movieCat[0].isCompanion, true);
+    assert.equal(movieCat[0].companionType, "sequel_movie");
+    assert.equal(movieCat[0].precedingShowId, "tt0903747");
+
+    // 4. Request Series catalog for continue-watching:
+    // - Breaking Bad must be excluded (fully watched)
+    // - El Camino must be excluded (it's a movie!)
+    const seriesCat = await fetchAutoTrackedCatalog({ url: `autotrack:continue-watching:series:${u}` }, env, { origin: "https://example.com", ...asOwner(u) });
+    assert.equal(seriesCat.length, 0, "Series continue-watching must exclude fully watched shows and companion movies");
+
+    // 5. Stremio call with badged poster:
+    const cfg = "compbadgecfg";
+    await kv.put(cfg, JSON.stringify({
+      trackCreatorName: u,
+      entries: [
+        { id: "continue-watching", type: "movie", name: "Continue Watching", url: `autotrack:continue-watching:movie:${u}` }
+      ],
+      showBadgesStremio: true,
+      showBadgesStremioContinueWatching: true,
+    }));
+
+    const res = await call(env, `/${cfg}/catalog/movie/continue-watching.json`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.metas.length, 1);
+    const poster = res.body.metas[0].poster;
+    assert.ok(poster.includes("/api/poster-badge?"), "Poster must be converted to badge endpoint URL");
+    assert.ok(poster.includes("companion=Sequel+Film"), "Poster badge URL must include companion=Sequel+Film");
+  });
+
+  it("/api/poster-badge renders blue accent badge when companion param is provided", async () => {
+    const env = makeEnv();
+    const originalFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = async (url) => {
+        return new Response(new Uint8Array([0xFF, 0xD8, 0xFF, 0xE0]), {
+          status: 200,
+          headers: { "Content-Type": "image/jpeg" },
+        });
+      };
+
+      const res = await call(env, "/api/poster-badge?poster=" + encodeURIComponent("https://image.tmdb.org/t/p/w500/test.jpg") + "&companion=" + encodeURIComponent("Bridge Movie"));
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-type"), "image/svg+xml; charset=utf-8");
+      assert.ok(res.text.includes("Bridge Movie"), "SVG must include Bridge Movie text");
+      assert.ok(res.text.includes("rgba(37, 99, 235, 0.95)"), "SVG must include design system accent color");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("/admin/api/migrate-d1 backfills tracking and user lists into D1", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const cookie = await adminCookie(env);
+
+    // Seed creator row
+    db.q("INSERT INTO creators (username, display_name, key_hash, created_at) VALUES ('p4mig', 'p4mig', 'hash', 1)");
+
+    // Seed KV keys for phase 9 (tracking) and phase 10 (user lists)
+    kv._store.set("creatorsynctracking:p4mig", JSON.stringify({
+      watchHistory: [{ id: "tt301", type: "movie", title: "Migrated Film", watchedAt: 3000 }],
+      continueWatching: [{ id: "tt302:1:2", showId: "tt302", seasonNum: 1, episodeNum: 2, updatedAt: 3100 }],
+      airingNext: [{ id: "tt302:1:3", showId: "tt302", seasonNum: 1, episodeNum: 3, airDate: "2027-01-01", updatedAt: 3200 }],
+      fullyWatchedShowIds: ["tt303"],
+      clientVersion: 999,
+      updatedAt: 3300,
+    }));
+
+    kv._store.set("creatorsync:p4mig", JSON.stringify({
+      likedLists: ["c:friend:listA"],
+      hiddenLists: ["c:bad:listB"],
+      hiddenMyListsSections: ["sectionC"],
+      updatedAt: 3350,
+    }));
+
+    // Run migrate-d1
+    let last;
+    for (let i = 0; i < 35; i++) {
+      last = await call(env, "/admin/api/migrate-d1", { method: "POST", cookie });
+      if (last.body.done) break;
+    }
+    assert.equal(last.body.done, true);
+    assert.ok(last.body.results.tracking >= 1);
+    assert.ok(last.body.results.userlists >= 1);
+
+    // Verify D1 records
+    const whD1 = db.q("SELECT * FROM watch_history WHERE username = 'p4mig'");
+    assert.equal(whD1.length, 1);
+    assert.equal(whD1[0].title, "Migrated Film");
+
+    const cwD1 = db.q("SELECT * FROM continue_watching WHERE username = 'p4mig'");
+    assert.equal(cwD1.length, 1);
+    assert.equal(cwD1[0].show_id, "tt302");
+
+    const anD1 = db.q("SELECT * FROM airing_next WHERE username = 'p4mig'");
+    assert.equal(anD1.length, 1);
+    assert.equal(anD1[0].air_date, "2027-01-01");
+
+    const listsD1 = db.q("SELECT list_id, list_type FROM creator_user_lists WHERE username = 'p4mig' ORDER BY list_type");
+    assert.equal(listsD1.length, 3);
+  });
+
+  it("purgeCreatorData cleans up all 6 Phase 4 tables upon account deletion", async () => {
+    const kv = makeKv();
+    const db = makeD1();
+    const env = makeEnv({ CONFIGS: kv, DB: db });
+    const u = await createUser(env, "p4purgeuser");
+
+    // Seed rows across all 6 tables
+    db.q("INSERT INTO watch_history (username, item_id, item_type, watched_at) VALUES ('p4purgeuser', 'it1', 'movie', 100)");
+    db.q("INSERT INTO continue_watching (username, show_id, item_id, updated_at) VALUES ('p4purgeuser', 'sh1', 'it2', 100)");
+    db.q("INSERT INTO airing_next (username, show_id, item_id, updated_at) VALUES ('p4purgeuser', 'sh1', 'it3', 100)");
+    db.q("INSERT INTO creator_user_lists (username, list_id, list_type, created_at) VALUES ('p4purgeuser', 'l1', 'liked', 100)");
+    db.q("INSERT INTO creator_show_states (username, show_id, is_fully_watched, updated_at) VALUES ('p4purgeuser', 'sh1', 1, 100)");
+    db.q("INSERT INTO creator_tracking_meta (username, client_version, updated_at) VALUES ('p4purgeuser', 1, 100)");
+
+    // Delete account
+    const delRes = await call(env, "/api/creator/delete-account", {
+      method: "POST",
+      json: { creatorName: "p4purgeuser", creatorKey: u.creatorKey, confirm: "DELETE" },
+    });
+    assert.equal(delRes.status, 200);
+
+    // Verify all 6 tables are clean
+    for (const tbl of ["watch_history", "continue_watching", "airing_next", "creator_user_lists", "creator_show_states", "creator_tracking_meta"]) {
+      const rows = db.q(`SELECT * FROM ${tbl} WHERE username = 'p4purgeuser'`);
+      assert.equal(rows.length, 0, `${tbl} must have 0 rows after account deletion`);
+    }
+  });
+});
+
+describe("Anime Unpacking: restoring multi-season division for compressed anime shows", () => {
+  const tmdbFns = loadSourceFunctions("07_source-fetchers-tmdb-simkl.js");
+
+  it("pickDefaultEpisodeGroupId selects 'Seasons' for MASHLE (TMDB 204832)", () => {
+    const mashleGroups = [
+      { id: "g_air", name: "Air Date", type: 1, group_count: 2, episode_count: 25 },
+      { id: "g_arc", name: "Story Arcs", type: 5, group_count: 3, episode_count: 24 },
+      { id: "65edb5c4e93e950161e0a6b1", name: "Seasons", type: 6, group_count: 3, episode_count: 26 },
+    ];
+    // MASHLE standard: 1 season (24 episodes), 2 specials (total 26 episodes)
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(mashleGroups, 1, 24, 26);
+    assert.equal(picked, "65edb5c4e93e950161e0a6b1");
+  });
+
+  it("pickDefaultEpisodeGroupId selects 'Seasons' for Re:ZERO (TMDB 65930) with specials", () => {
+    const rezeroGroups = [
+      { id: "g_story", name: "Story Arc", type: 5, group_count: 5, episode_count: 66 },
+      { id: "641eb9d6b234b9007ac67063", name: "Seasons", type: 6, group_count: 5, episode_count: 166 },
+    ];
+    // Re:ZERO standard: 1 season (85 episodes), 81 specials (total 166 episodes)
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(rezeroGroups, 1, 85, 166);
+    assert.equal(picked, "641eb9d6b234b9007ac67063");
+  });
+
+  it("pickDefaultEpisodeGroupId rejects volume splits on multi-season shows (e.g. Stranger Things)", () => {
+    const stGroups = [
+      { id: "g_vol", name: "Release Volumes", type: 1, group_count: 8, episode_count: 42 },
+    ];
+    // Standard: 5 seasons, 42 episodes
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(stGroups, 5, 42, 42);
+    assert.equal(picked, null, "volume split on multi-season series must be rejected");
+  });
+
+  it("pickDefaultEpisodeGroupId accepts volume splits on single-season shows", () => {
+    const singleVolGroups = [
+      { id: "g_vol_s1", name: "Release Volumes", type: 1, group_count: 3, episode_count: 24 },
+    ];
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(singleVolGroups, 1, 24, 24);
+    assert.equal(picked, "g_vol_s1");
+  });
+
+  it("pickDefaultEpisodeGroupId rejects editorial recuts and variants", () => {
+    const editGroups = [
+      { id: "g_dir", name: "Director's Cut Parts", group_count: 3, episode_count: 24 },
+      { id: "g_dvd", name: "DVD Ordering", group_count: 3, episode_count: 24 },
+      { id: "g_alt", name: "Alternate Broadcast", group_count: 3, episode_count: 24 },
+    ];
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(editGroups, 1, 24, 24);
+    assert.equal(picked, null);
+  });
+
+  it("pickDefaultEpisodeGroupId rejects groups where group_count matches standardSeasonCount", () => {
+    const groups = [
+      { id: "g_same", name: "Seasons", group_count: 2, episode_count: 24 },
+    ];
+    const picked = tmdbFns.pickDefaultEpisodeGroupId(groups, 2, 24, 24);
+    assert.equal(picked, null);
+  });
+
+  it("unpackEpisodeGroupDetails maps specials to Season 0 and parts to Season 1, Season 2", () => {
+    const groupDetails = {
+      id: "grp_test",
+      groups: [
+        {
+          id: "g0",
+          name: "Specials",
+          order: 0,
+          episodes: [
+            { id: 101, name: "Special 1", order: 0, still_path: "/sp1.jpg", air_date: "2023-01-01" },
+          ],
+        },
+        {
+          id: "g1",
+          name: "Season 1",
+          order: 1,
+          episodes: [
+            { id: 201, name: "Ep 1", order: 0, still_path: "/ep1.jpg", air_date: "2023-04-01" },
+            { id: 202, name: "Ep 2", order: 1, still_path: "/ep2.jpg", air_date: "2023-04-08" },
+          ],
+        },
+        {
+          id: "g2",
+          name: "Season 2",
+          order: 2,
+          episodes: [
+            { id: 301, name: "S2 Ep 1", order: 0, still_path: "/s2ep1.jpg", air_date: "2024-01-06" },
+          ],
+        },
+      ],
+    };
+    const unpacked = tmdbFns.unpackEpisodeGroupDetails(groupDetails);
+    assert.ok(unpacked);
+    assert.equal(unpacked.seasons.length, 2);
+    assert.equal(unpacked.seasons[0].season, 1);
+    assert.equal(unpacked.seasons[0].episodeCount, 2);
+    assert.equal(unpacked.seasons[1].season, 2);
+    assert.equal(unpacked.seasons[1].episodeCount, 1);
+
+    // Verify episode numbering within Season 2 starts at 1
+    assert.equal(unpacked.episodesBySeason[2].length, 1);
+    assert.equal(unpacked.episodesBySeason[2][0].episode_number, 1);
+    assert.equal(unpacked.episodesBySeason[2][0].name, "S2 Ep 1");
+    assert.equal(unpacked.episodesBySeason[2][0].still_path, "https://image.tmdb.org/t/p/w500/s2ep1.jpg");
+  });
+
+  it("/api/show-seasons unpacks a compressed show into multiple seasons", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/204832?") || u.includes("/tv/204832/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 204832,
+          name: "MASHLE: MAGIC AND MUSCLES",
+          external_ids: { imdb_id: "tt21209804" },
+          seasons: [
+            { season_number: 0, name: "Specials", episode_count: 2 },
+            { season_number: 1, name: "Season 1", episode_count: 24 },
+          ],
+          episode_groups: {
+            results: [
+              { id: "g_mashle_grp", name: "Seasons", type: 6, group_count: 3, episode_count: 26 },
+            ],
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/episode_group/g_mashle_grp")) {
+        return new Response(JSON.stringify({
+          id: "g_mashle_grp",
+          groups: [
+            { id: "sp", name: "Specials", order: 0, episodes: [{}, {}] },
+            {
+              id: "s1",
+              name: "Season 1",
+              order: 1,
+              episodes: Array.from({ length: 12 }, (_, i) => ({ id: 100 + i, order: i, name: `Mashle S1E${i + 1}` })),
+            },
+            {
+              id: "s2",
+              name: "Season 2",
+              order: 2,
+              episodes: Array.from({ length: 12 }, (_, i) => ({ id: 200 + i, order: i, name: `Mashle S2E${i + 1}` })),
+            },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-seasons?tmdbId=204832");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.name, "MASHLE: MAGIC AND MUSCLES");
+      assert.equal(data.imdbId, "tt21209804");
+      assert.equal(data.seasons.length, 2, "must be unpacked into 2 seasons");
+      assert.equal(data.seasons[0].season, 1);
+      assert.equal(data.seasons[0].episodeCount, 12);
+      assert.equal(data.seasons[1].season, 2);
+      assert.equal(data.seasons[1].episodeCount, 12);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("/api/show-episodes serves episodes from unpacked season 2", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/204833?") || u.includes("/tv/204833/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 204833,
+          name: "MASHLE: MAGIC AND MUSCLES",
+          external_ids: { imdb_id: "tt21209804" },
+          seasons: [
+            { season_number: 1, name: "Season 1", episode_count: 24 },
+          ],
+          episode_groups: {
+            results: [
+              { id: "g_mashle_grp2", name: "Seasons", type: 6, group_count: 2, episode_count: 24 },
+            ],
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/episode_group/g_mashle_grp2")) {
+        return new Response(JSON.stringify({
+          id: "g_mashle_grp2",
+          groups: [
+            {
+              id: "s1",
+              name: "Season 1",
+              order: 1,
+              episodes: Array.from({ length: 12 }, (_, i) => ({ id: 100 + i, order: i, name: `Mashle S1E${i + 1}` })),
+            },
+            {
+              id: "s2",
+              name: "Season 2",
+              order: 2,
+              episodes: Array.from({ length: 12 }, (_, i) => ({
+                id: 200 + i,
+                order: i,
+                name: i === 0 ? "Mash Burnedead and the Divine Visionaries" : `Mashle S2E${i + 1}`,
+                still_path: "/s2e1.jpg",
+                air_date: "2024-01-06",
+              })),
+            },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-episodes?tmdbId=204833&season=2");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.episodes.length, 12);
+      assert.equal(data.episodes[0].episode, 1);
+      assert.equal(data.episodes[0].name, "Mash Burnedead and the Divine Visionaries");
+      assert.equal(data.episodes[0].released, "2024-01-06");
+      assert.equal(data.episodes[0].thumbnail, "https://image.tmdb.org/t/p/w500/s2e1.jpg");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("Cinemeta fallback unpacks seasons when TMDB has no episode groups", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/99999?") || u.includes("/tv/99999/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 99999,
+          name: "Anime Show With No Groups",
+          external_ids: { imdb_id: "tt9999999" },
+          seasons: [{ season_number: 1, name: "Season 1", episode_count: 24 }],
+          episode_groups: { results: [] },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("v3-cinemeta.strem.io/meta/series/tt9999999.json")) {
+        return new Response(JSON.stringify({
+          meta: {
+            name: "Anime Show With No Groups",
+            videos: [
+              { season: 1, episode: 1, title: "S1E1", id: "tt9999999:1:1" },
+              { season: 1, episode: 2, title: "S1E2", id: "tt9999999:1:2" },
+              { season: 2, episode: 1, title: "S2E1", id: "tt9999999:2:1" },
+              { season: 2, episode: 2, title: "S2E2", id: "tt9999999:2:2" },
+            ],
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-seasons?tmdbId=99999");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.seasons.length, 2);
+      assert.equal(data.seasons[0].season, 1);
+      assert.equal(data.seasons[0].episodeCount, 2);
+      assert.equal(data.seasons[1].season, 2);
+      assert.equal(data.seasons[1].episodeCount, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("Standard multi-season shows remain untouched", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/1396?") || u.includes("/tv/1396/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 1396,
+          name: "Breaking Bad",
+          external_ids: { imdb_id: "tt0903747" },
+          seasons: [
+            { season_number: 1, name: "Season 1", episode_count: 7 },
+            { season_number: 2, name: "Season 2", episode_count: 13 },
+            { season_number: 3, name: "Season 3", episode_count: 13 },
+            { season_number: 4, name: "Season 4", episode_count: 13 },
+            { season_number: 5, name: "Season 5", episode_count: 16 },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-seasons?tmdbId=1396");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.seasons.length, 5);
+      assert.equal(data.seasons[0].season, 1);
+      assert.equal(data.seasons[4].season, 5);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("/api/details unpacks compressed anime shows into multiple seasons", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/find/tt21209804")) {
+        return new Response(JSON.stringify({ tv_results: [{ id: 204832, media_type: "tv" }] }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/tv/204832?") && !u.includes("/episode_groups")) {
+        return new Response(JSON.stringify({
+          id: 204832,
+          name: "MASHLE: MAGIC AND MUSCLES",
+          external_ids: { imdb_id: "tt21209804" },
+          seasons: [{ season_number: 1, name: "Season 1", episode_count: 24 }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/tv/204832/episode_groups")) {
+        return new Response(JSON.stringify({
+          results: [{ id: "eg_mashle_details", name: "Seasons", type: 1, group_count: 2, episode_count: 24 }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/episode_group/eg_mashle_details")) {
+        return new Response(JSON.stringify({
+          id: "eg_mashle_details",
+          groups: [
+            { id: "s1", name: "Season 1", order: 1, episodes: Array.from({ length: 12 }, (_, i) => ({ id: 100 + i, order: i, name: `Ep ${i + 1}` })) },
+            { id: "s2", name: "Season 2", order: 2, episodes: Array.from({ length: 12 }, (_, i) => ({ id: 200 + i, order: i, name: `Ep ${i + 1}` })) },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/details?imdbId=tt21209804&type=series");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      const details = res.body.details;
+      assert.ok(details, "details object returned");
+      assert.ok(Array.isArray(details.seasonsData), "seasonsData is array");
+      assert.equal(details.seasonsData.length, 2, "must be unpacked into exactly 2 seasons");
+      assert.equal(details.seasonsData[0].season_number, 1);
+      assert.equal(details.seasonsData[0].episode_count, 12);
+      assert.equal(details.seasonsData[1].season_number, 2);
+      assert.equal(details.seasonsData[1].episode_count, 12);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("fetchTmdbItemDetails dynamically upgrades stale single-season cache entries", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const cacheKey = "cache:tmdb:itemdetails:tt21209804:series:US";
+    // Populate KV cache with stale single-season entry
+    await env.CONFIGS.put(cacheKey, JSON.stringify({
+      data: {
+        id: "tt21209804",
+        tmdbId: 204832,
+        title: "MASHLE: MAGIC AND MUSCLES",
+        seasonsData: [{ season_number: 1, name: "Season 1", episode_count: 24 }],
+      },
+      freshUntil: Date.now() + 100000,
+    }));
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/204832/episode_groups")) {
+        return new Response(JSON.stringify({
+          results: [{ id: "eg_mashle_kv", name: "Seasons", type: 1, group_count: 2, episode_count: 24 }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("/episode_group/eg_mashle_kv")) {
+        return new Response(JSON.stringify({
+          id: "eg_mashle_kv",
+          groups: [
+            { id: "s1", name: "Season 1", order: 1, episodes: Array.from({ length: 12 }, (_, i) => ({ id: 100 + i, order: i, name: `Ep ${i + 1}` })) },
+            { id: "s2", name: "Season 2", order: 2, episodes: Array.from({ length: 12 }, (_, i) => ({ id: 200 + i, order: i, name: `Ep ${i + 1}` })) },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/details?imdbId=tt21209804&type=series");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      const details = res.body.details;
+      assert.equal(details.seasonsData.length, 2, "stale single season upgraded to 2 seasons");
+      assert.equal(details.seasonsData[0].episode_count, 12);
+      assert.equal(details.seasonsData[1].episode_count, 12);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("Cinemeta series fallback filters out unreleased placeholder seasons", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/88888?") || u.includes("/tv/88888/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 88888,
+          name: "Placeholder Season Anime",
+          external_ids: { imdb_id: "tt8888888" },
+          seasons: [{ season_number: 1, name: "Season 1", episode_count: 24 }],
+          episode_groups: { results: [] },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (u.includes("v3-cinemeta.strem.io/meta/series/tt8888888.json")) {
+        return new Response(JSON.stringify({
+          meta: {
+            name: "Placeholder Season Anime",
+            videos: [
+              { season: 1, episode: 1, title: "S1E1", id: "tt8888888:1:1", released: "2023-04-08T00:00:00.000Z" },
+              { season: 1, episode: 2, title: "S1E2", id: "tt8888888:1:2", released: "2023-04-15T00:00:00.000Z" },
+              { season: 2, episode: 1, title: "S2E1", id: "tt8888888:2:1", released: "2024-01-06T00:00:00.000Z" },
+              { season: 2, episode: 2, title: "S2E2", id: "tt8888888:2:2", released: "2024-01-13T00:00:00.000Z" },
+              // Dummy Season 3 with no air date and 1 dummy episode
+              { season: 3, episode: 1, title: "Episode 1", id: "tt8888888:3:1", released: null, firstAired: null },
+            ],
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-seasons?tmdbId=88888");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.seasons.length, 2, "dummy season 3 must be filtered out");
+      assert.equal(data.seasons[0].season, 1);
+      assert.equal(data.seasons[1].season, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("/api/preview preserves seasonNum, episodeNum, and badge properties in sample items", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    await env.CONFIGS.put("creatorsynctracking:alice", JSON.stringify({
+      continueWatching: [
+        { id: "tt8360212:2:5", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 2, episodeNum: 5, airDate: "2024-08-01" },
+      ],
+      airingNext: [
+        { id: "tt8360212:3:1", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 1, airDate: "2099-07-05", seasonFinaleAirDate: "2099-09-22" },
+      ],
+    }));
+    // A personal shelf is private unless its owner opted it in or the caller
+    // proves it owns the account -- see mayReadTrackedShelf
+    // (02_http-and-creator-utils.js). This test is about which FIELDS survive
+    // the mapping, so it takes the opt-in route; the gate itself is covered in
+    // "a personal shelf is not served to a caller that has proved nothing".
+    await env.CONFIGS.put("creatorshare:alice", JSON.stringify({ "continue-watching": true }));
+
+    const res = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        sample: 5,
+      },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true);
+    assert.ok(Array.isArray(res.body.sample), "sample is array");
+    assert.equal(res.body.sample.length, 1);
+    const sampleItem = res.body.sample[0];
+    assert.equal(sampleItem.seasonNum, 2);
+    assert.equal(sampleItem.episodeNum, 5);
+    assert.equal(sampleItem.showId, "tt8360212");
+    // Since user is on season 2 and airing is season 3, finale date must be stripped
+    assert.equal(sampleItem.seasonFinaleAirDate, undefined);
+
+    // Now test when user is on season 3 (matching airing season)
+    await env.CONFIGS.put("creatorsynctracking:alice", JSON.stringify({
+      continueWatching: [
+        { id: "tt8360212:3:2", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 2, airDate: "2024-08-01" },
+      ],
+      airingNext: [
+        { id: "tt8360212:3:1", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 1, airDate: "2099-07-05", seasonFinaleAirDate: "2099-09-22" },
+      ],
+    }));
+
+    const resS3 = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        sample: 5,
+      },
+    });
+    assert.equal(resS3.status, 200);
+    const s3Item = resS3.body.sample[0];
+    assert.equal(s3Item.seasonNum, 3);
+    assert.equal(s3Item.seasonFinaleAirDate, "2099-09-22", "season 3 item receives finale date");
+
+    // Test when user is on Season 3 Episode 1 (already aired), while Episode 11 is airing next
+    await env.CONFIGS.put("creatorsynctracking:alice", JSON.stringify({
+      continueWatching: [
+        { id: "tt8360212:3:1", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 1, airDate: "2024-07-05" },
+      ],
+      airingNext: [
+        { id: "tt8360212:3:11", showId: "tt8360212", showTitle: "Grand Blue Dreaming", seasonNum: 3, episodeNum: 11, airDate: "2099-09-15", seasonFinaleAirDate: "2099-09-22" },
+      ],
+    }));
+
+    const resS3Ep1 = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        sample: 5,
+      },
+    });
+    assert.equal(resS3Ep1.status, 200);
+    const s3Ep1Item = resS3Ep1.body.sample[0];
+    assert.equal(s3Ep1Item.seasonNum, 3);
+    assert.equal(s3Ep1Item.episodeNum, 1);
+    assert.equal(s3Ep1Item.seasonFinaleAirDate, "2099-09-22", "season 3 episode 1 receives finale date");
+    assert.equal(s3Ep1Item.isSeasonPremiere, undefined, "aired episode 1 is not flagged as season premiere");
+    assert.notEqual(s3Ep1Item.airDate, "2099-09-15", "airDate must not leak from different episode 11");
+  });
+});
+
+describe("worker: adult content filter & safe poster generator", () => {
+  const httpUtils = loadSourceFunctions("02_http-and-creator-utils.js");
+  const configFns = loadSourceFunctions("04_config-resolution.js");
+  const catalogFns = loadSourceFunctions("05_catalog-core.js");
+
+  it("serves SVG safe poster at /api/safe-poster with valid headers", async () => {
+    const env = makeEnv();
+    const res = await call(env, "/api/safe-poster?title=Adult+Anime&year=2024&type=series&cert=R18%2B");
+    assert.equal(res.status, 200);
+    assert.ok(res.headers.get("content-type")?.includes("image/svg+xml"));
+    assert.ok(res.headers.get("cache-control")?.includes("public"));
+    const svg = res.body;
+    assert.ok(svg.includes("<svg"), "must be valid SVG");
+    assert.ok(svg.includes("Adult Anime"), "must contain title");
+    assert.ok(svg.includes("2024"), "must contain year");
+    assert.ok(svg.includes("SERIES"), "must contain uppercase type");
+    assert.ok(svg.includes("R18+"), "must contain certification");
+    assert.ok(svg.includes("AGE-APPROPRIATE FILTER ACTIVE"), "must contain safe shield badge text");
+  });
+
+  it("serves fallback SVG when query parameters are missing", async () => {
+    const env = makeEnv();
+    const res = await call(env, "/api/safe-poster");
+    assert.equal(res.status, 200);
+    assert.ok(res.headers.get("content-type")?.includes("image/svg+xml"));
+    assert.ok(res.body.includes("Untitled"));
+  });
+
+  it("decodes and resolves adultContentFilter in config", async () => {
+    const b64True = btoa(JSON.stringify({ adultContentFilter: true }));
+    const decodedTrue = httpUtils.decodeConfig(b64True);
+    assert.equal(decodedTrue.adultContentFilter, true);
+
+    const b641 = btoa(JSON.stringify({ adultContentFilter: 1 }));
+    const decoded1 = httpUtils.decodeConfig(b641);
+    assert.equal(decoded1.adultContentFilter, true);
+
+    const b64False = btoa(JSON.stringify({ adultContentFilter: false }));
+    const decodedFalse = httpUtils.decodeConfig(b64False);
+    assert.equal(decodedFalse.adultContentFilter, false);
+
+    // Test resolveConfig through KV short-id config path with env
+    const env = makeEnv();
+    await env.CONFIGS.put("testadult", JSON.stringify({ adultContentFilter: true, entries: [] }));
+    const resolvedFromKv = await call(env, "/testadult/configure");
+    assert.equal(resolvedFromKv.status, 200);
+    assert.ok(resolvedFromKv.body.includes('id="adultContentFilterCheckbox" checked'));
+  });
+
+  it("isAdultOrNsfw accurately identifies adult, explicit certifications, and NSFW genres", () => {
+    const isAdult = catalogFns.isAdultOrNsfw;
+
+    assert.equal(isAdult({ adult: true }), true);
+    assert.equal(isAdult({ isAdult: true }), true);
+    assert.equal(isAdult({ certification: "NC-17" }), true);
+    assert.equal(isAdult({ certification: "XXX" }), true);
+    assert.equal(isAdult({ contentRating: "R18+" }), true);
+    assert.equal(isAdult({ ageRating: "18+" }), true);
+    assert.equal(isAdult({ genres: ["Animation", "Hentai"] }), true);
+    assert.equal(isAdult({ genres: ["Ecchi", "Comedy"] }), true);
+    assert.equal(isAdult({ genres: "Drama, Erotica" }), true);
+
+    // Non-adult items must return false
+    assert.equal(isAdult({ title: "Inception", certification: "PG-13", genres: ["Action", "Sci-Fi"] }), false);
+    assert.equal(isAdult({ title: "Frozen", adult: false, genres: ["Animation", "Family"] }), false);
+    assert.equal(isAdult(null), false);
+  });
+
+  it("applyAdultContentFilterToMetas filters adult posters and leaves clean items untouched", () => {
+    const metas = [
+      { id: "tt1", name: "Family Movie", poster: "https://images.example.com/family.jpg", adult: false },
+      { id: "tt2", name: "Explicit Anime", poster: "https://images.example.com/nsfw.jpg", genres: ["Hentai"] },
+    ];
+
+    const filtered = catalogFns.applyAdultContentFilterToMetas(metas, "https://mylistsaddon.com");
+    assert.equal(filtered[0].poster, "https://images.example.com/family.jpg");
+    assert.equal(filtered[0].isAdultPosterFiltered, undefined);
+
+    assert.ok(filtered[1].poster.startsWith("https://mylistsaddon.com/api/safe-poster"));
+    assert.ok(filtered[1].poster.includes("Explicit+Anime") || filtered[1].poster.includes("Explicit%20Anime"));
+    assert.equal(filtered[1].isAdultPosterFiltered, true);
+  });
+
+  it("/api/preview filters adult posters when adultContentFilter is requested", async () => {
+    const env = makeEnv();
+    await env.CONFIGS.put("creatorsynctracking:alice", JSON.stringify({
+      continueWatching: [
+        { id: "tt101", showTitle: "Safe Show", showPoster: "https://images.example.com/safe.jpg" },
+        { id: "tt102", showTitle: "Adult Show", showPoster: "https://images.example.com/nsfw.jpg", adult: true },
+      ],
+      airingNext: [],
+    }));
+    // Personal shelves are private unless opted in -- see mayReadTrackedShelf
+    // (02_http-and-creator-utils.js). This test is about poster filtering, not
+    // about who may read the shelf.
+    await env.CONFIGS.put("creatorshare:alice", JSON.stringify({ "continue-watching": true }));
+
+    // 1. Without adultContentFilter
+    const resUnfiltered = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        adultContentFilter: false,
+      },
+    });
+    assert.equal(resUnfiltered.status, 200);
+    const itemUnfiltered = resUnfiltered.body.sample.find((i) => i.id === "tt102");
+    assert.equal(itemUnfiltered.poster, "https://images.example.com/nsfw.jpg");
+    assert.equal(itemUnfiltered.isAdult, true);
+    assert.equal(itemUnfiltered.isAdultPosterFiltered, false);
+
+    // 2. With adultContentFilter: true
+    const resFiltered = await call(env, "/api/preview", {
+      method: "POST",
+      json: {
+        url: "autotrack:continue-watching:series:alice",
+        type: "series",
+        adultContentFilter: true,
+      },
+    });
+    assert.equal(resFiltered.status, 200);
+    const itemFiltered = resFiltered.body.sample.find((i) => i.id === "tt102");
+    assert.ok(itemFiltered.poster.includes("/api/safe-poster"));
+    assert.equal(itemFiltered.isAdult, true);
+    assert.equal(itemFiltered.isAdultPosterFiltered, true);
+  });
+});
+
+describe("Title Search resilience (word variations and fuzzy fallback)", () => {
+  it("handles missing space between words via fallback variation query", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const realFetch = globalThis.fetch;
+    const fetchedUrls = [];
+
+    globalThis.fetch = async (input) => {
+      const u = typeof input === "string" ? input : (input && input.url) || "";
+      fetchedUrls.push(u);
+
+      // Initial search with 'pickup' returns 0 results
+      if (u.includes("query=Is%20it%20wrong%20to%20pickup%20girls%20in%20the%20dungeon")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ results: [], total_pages: 1 }),
+        };
+      }
+      // Split query variation 'pick up' succeeds
+      if (u.includes("query=Is%20it%20wrong%20to%20pick%20up%20girls%20in%20the%20dungeon")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            results: [
+              {
+                id: 574475,
+                title: "Is It Wrong to Try to Pick Up Girls in a Dungeon?: Arrow of the Orion",
+                release_date: "2019-02-15",
+                poster_path: "/poster.jpg",
+                vote_average: 7.7,
+                genre_ids: [16, 28],
+              },
+            ],
+            total_pages: 1,
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ results: [] }) };
+    };
+
+    try {
+      const res = await call(env, "/api/title-search?q=Is%20it%20wrong%20to%20pickup%20girls%20in%20the%20dungeon&type=movie");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      assert.equal(res.body.results.length, 1);
+      assert.equal(res.body.results[0].tmdbId, 574475);
+      assert.ok(res.body.results[0].title.includes("Arrow of the Orion"));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("falls back to Cinemeta fuzzy search and resolves IMDB ID to TMDB when query has a typo", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const realFetch = globalThis.fetch;
+    const fetchedUrls = [];
+
+    globalThis.fetch = async (input) => {
+      const u = typeof input === "string" ? input : (input && input.url) || "";
+      fetchedUrls.push(u);
+
+      // Direct TMDB search with typo returns empty
+      if (u.includes("api.themoviedb.org/3/search/movie") && u.includes("query=Interstelar")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ results: [], total_pages: 0 }),
+        };
+      }
+      // Cinemeta search returns fuzzy match with IMDB id
+      if (u.includes("v3-cinemeta.strem.io")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            metas: [
+              {
+                id: "tt0816692",
+                imdb_id: "tt0816692",
+                name: "Interstellar",
+                releaseInfo: "2014",
+                poster: "https://example.com/interstellar.jpg",
+              },
+            ],
+          }),
+        };
+      }
+      // TMDB /3/find/ resolves tt0816692 to TMDB movie
+      if (u.includes("api.themoviedb.org/3/find/tt0816692")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            movie_results: [
+              {
+                id: 157336,
+                title: "Interstellar",
+                release_date: "2014-11-05",
+                poster_path: "/interstellar_tmdb.jpg",
+                vote_average: 8.4,
+              },
+            ],
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({ results: [] }) };
+    };
+
+    try {
+      const res = await call(env, "/api/title-search?q=Interstelar&type=movie");
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true);
+      assert.equal(res.body.results.length, 1);
+      assert.equal(res.body.results[0].tmdbId, 157336);
+      assert.equal(res.body.results[0].title, "Interstellar");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
+
+

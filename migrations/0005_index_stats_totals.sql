@@ -1,0 +1,42 @@
+-- 0005_index_stats_totals.sql
+--
+-- The admin dashboard's counter panels read totals with:
+--
+--   SELECT kind, n FROM stats
+--    WHERE day = 'total' AND kind LIKE ? ESCAPE '\'
+--    ORDER BY n DESC LIMIT ?
+--
+-- The table's primary key is (kind, day), so a predicate that fixes `day` and
+-- range-matches `kind` cannot use it, and the plan was:
+--
+--   SCAN stats | USE TEMP B-TREE FOR ORDER BY
+--
+-- a full scan plus a sort of everything, on every dashboard load.
+--
+-- That is fine while `stats` is small, and `stats` does not stay small: `kind`
+-- is unbounded by construction. Most kinds are fixed strings (pageviews,
+-- installs, apiuse:tmdb), but `list_copy:{slug}` and `watch_type:{type}` mint a
+-- new one per list and per media type, and each kind carries one row per daily
+-- bucket it has ever been counted in. So the table grows with (lists ever
+-- copied) x (days), and the scan grows with it.
+--
+-- (day, n DESC, kind) matches the query exactly: seek to day = 'total', walk
+-- in n DESC order, and read `kind` from the index. Plan afterwards:
+--
+--   SEARCH stats USING COVERING INDEX idx_stats_day_totals (day=?)
+--
+-- Covering, so the table is never touched, and the ORDER BY disappears
+-- entirely rather than merely sorting a smaller set -- which also means LIMIT
+-- can stop early instead of ranking everything first.
+--
+-- The other two stats queries -- readStatCount's (kind, day) point lookup and
+-- the per-kind bucket scan -- keep using the primary key, unaffected.
+--
+-- Safe to run against a live database, and safe to run twice.
+--
+-- Run it (README.md's D1 section has the full walkthrough):
+--   Dashboard: open this database's Console tab and paste/run the statement
+--   below (skip these comment lines).
+--   Wrangler:  npx wrangler d1 execute my-lists-db --remote --file=./migrations/0005_index_stats_totals.sql
+
+CREATE INDEX IF NOT EXISTS idx_stats_day_totals ON stats(day, n DESC, kind);

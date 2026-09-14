@@ -1,0 +1,3793 @@
+// --- Admin stats (page views, install links generated) -----------------
+//
+// Deliberately simple counters -- KV has no atomic increment (each bump is
+// a read-then-write), so under truly simultaneous requests a bump can very
+// occasionally get lost. That's an acceptable tradeoff for a personal
+// project's traffic; this isn't meant to be exact to the request, just a
+// reasonable running total and day-by-day trend for the admin-only
+// dashboard below. No cookies, no per-visitor identity involved -- just a
+// running count of events.
+// Calendar date (YYYY-MM-DD) for a given moment, in Eastern time -- this
+// admin dashboard is for a single owner in a fixed timezone, and using
+// UTC's day boundary meant "today" started rolling over into "tomorrow"
+// as early as ~7-8pm Eastern, well before the day was actually over
+// locally. en-CA formats as YYYY-MM-DD directly; America/New_York's IANA
+// data handles the EST/EDT switch automatically, unlike a fixed offset
+// would.
+function easternDateKey(date) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function statsToday() {
+  return easternDateKey(new Date());
+}
+
+// --- Counter storage ---------------------------------------------------------
+//
+// Every counter here used to be a KV read-modify-write: GET, add one, PUT.
+// KV has no atomic increment and no compare-and-swap, so two overlapping
+// requests both read the same number and both write the same number+1, and
+// one is silently lost. Measured against this Worker: twenty concurrent
+// requests recorded as ONE.
+//
+// Production is worse than that measurement, in two ways that compound with
+// traffic: KV reads are edge-cached, so every request inside a cache window
+// can read the same stale value; and KV allows roughly one write per second
+// per key, which the hot keys (stats:pageviews:total and each day bucket)
+// are. The dashboard therefore drifts further from reality the busier the
+// deployment gets -- downward, silently, while still rendering a confident,
+// precise-looking number.
+//
+// SQLite's upsert is atomic and removes the class outright. This is the same
+// shape the source_groups counter has always used (see bumpStatBy below) --
+// every other counter now works the way that one already did.
+//
+// D1 stays OPTIONAL, exactly as it is everywhere else in this codebase: with
+// no DB bound the KV path below runs unchanged, lost updates and all. That
+// is a real remaining limitation for KV-only deployments, not an oversight
+// -- KV genuinely cannot do this correctly, and the honest options there are
+// to bind D1 or to read the numbers as approximate.
+//
+// Counters are the ONE data family where "D1 is optional and removable at any
+// time without data loss" -- true of accounts, lists and likes, which are
+// always written to KV -- does not hold. Once D1 is bound these write to D1
+// alone, because dual-writing would put the lost-update race straight back in
+// (and spend a second write per bump on a key KV rate-limits to one per
+// second). So unbinding D1, or rebuilding it from schema.sql, rolls every
+// counter back to the KV value it had at migration time. That trade is the
+// right one and is now stated in wrangler.toml where an operator will see it,
+// rather than being a surprise.
+async function d1BumpStat(env, kind, buckets, amount) {
+  // One statement per bucket, sent as a batch so the whole bump is a single
+  // round trip. ON CONFLICT ... n = n + excluded.n is the atomic part.
+  const stmts = buckets.map((bucket) =>
+    env.DB.prepare(
+      "INSERT INTO stats (kind, day, n) VALUES (?, ?, ?) ON CONFLICT(kind, day) DO UPDATE SET n = n + excluded.n"
+    ).bind(kind, bucket, amount)
+  );
+  await env.DB.batch(stmts);
+}
+
+async function bumpStat(env, kind) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    if (env.DB) {
+      await d1BumpStat(env, kind, ["total", statsToday()], 1);
+      return;
+    }
+    // KV path: get-then-put, so concurrent bumps lose increments
+    // (AUDIT-2026-09-05 §14). Deliberately left as it is, and recorded here
+    // rather than silently: KV has no atomic increment and no
+    // compare-and-swap, so the only correct fix is a different storage
+    // primitive -- which is exactly what the D1 branch above is
+    // (d1BumpStat's upsert is atomic, and it is the path any deployment
+    // that cares about exact counters should be on). What is lost is a
+    // display statistic under simultaneous load; nothing reads these
+    // numbers to make a decision, and no user-visible behaviour depends on
+    // one. Spending a durable object per counter on that would be the
+    // wrong trade.
+    const totalKey = `stats:${kind}:total`;
+    const dayKey = `stats:${kind}:${statsToday()}`;
+    const [totalRaw, dayRaw] = await Promise.all([env.CONFIGS.get(totalKey), env.CONFIGS.get(dayKey)]);
+    const total = (parseInt(totalRaw, 10) || 0) + 1;
+    const day = (parseInt(dayRaw, 10) || 0) + 1;
+    await Promise.all([env.CONFIGS.put(totalKey, String(total)), env.CONFIGS.put(dayKey, String(day))]);
+  } catch (e) {
+    // best-effort -- a failed stat bump should never break the actual
+    // request it's riding along on (see the ctx.waitUntil call sites,
+    // which don't await this at all for exactly that reason).
+  }
+}
+
+// Like bumpStat above, but by a caller-supplied amount in one write
+// instead of always +1 -- used for the per-source-group counters (a
+// single "generate install link" beacon can represent several rows of the
+// same group at once, e.g. five Custom Lists in one install). Total only,
+// no daily breakdown -- "which sources people use" reads more like a
+// standing preference than a day-to-day trend, and this keeps the write
+// count reasonable for a request that can touch several groups at once.
+async function bumpStatBy(env, kind, amount) {
+  if (!env || !env.CONFIGS || !amount) return;
+  try {
+    const totalKey = `stats:${kind}:total`;
+    
+    if (env.DB && kind.startsWith("sourcegroup:")) {
+      // Left exactly as it was: source groups have their own table, their
+      // own read path in renderAdminDashboard, and their own branch in
+      // /admin/api/migrate-d1. It was already atomic -- it is the precedent
+      // the rest of this now follows, not something to re-route.
+      const groupName = kind.slice("sourcegroup:".length);
+      await env.DB.prepare(
+        "INSERT INTO source_groups (id, name, install_count) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET install_count = source_groups.install_count + excluded.install_count"
+      ).bind(groupName, groupName, amount).run();
+    } else if (env.DB) {
+      // Total only, no day bucket -- see this function's own comment on why
+      // per-source-group counters are all-time.
+      await d1BumpStat(env, kind, ["total"], amount);
+    } else {
+      const totalRaw = await env.CONFIGS.get(totalKey);
+      const total = (parseInt(totalRaw, 10) || 0) + amount;
+      await env.CONFIGS.put(totalKey, String(total));
+    }
+  } catch (e) {
+    // best-effort, see bumpStat above
+  }
+}
+
+// Bumps one or more named counters that all live inside a single JSON blob
+// at `key`, in one read + one write total -- rather than a separate KV key
+// (and separate bumpStat total+day pair) per counter. Used for genre/decade
+// playback telemetry (see recordPlaybackTelemetry below): a single ping
+// with up to 5 genres used to cost 10 writes just for the genre piece
+// (bumpStat's total+day pair x5); this costs 1, regardless of how many
+// fields are bumped in the same call.
+//
+// The tradeoff, on purpose: every field sharing one key means any two
+// concurrent playback pings -- even on completely different genres --
+// now race on the same read-modify-write, where before only two pings on
+// the *same* genre could collide. KV has no atomic increment either way
+// (see bumpStat's own comment), so this trades a wider collision surface
+// for a large write-count cut. Worth it here specifically because this
+// data was already "a reasonable running total, not an exact ledger" (see
+// computeAudienceAnalytics, which only ever reads the all-time snapshot --
+// there's no day-by-day genre/decade view for a dropped increment to be
+// conspicuously missing from), not because undercounting is free in
+// general.
+async function bumpJsonCounterBlob(env, key, fields) {
+  if (!fields || !fields.length) return;
+  // If D1 is bound, explode genres and decades into atomic stats rows per §5.2
+  if (env && env.DB) {
+    try {
+      const isGenre = key === "stats:genres:alltime";
+      const isDecade = key === "stats:decades:alltime";
+      if (isGenre || isDecade) {
+        const prefix = isGenre ? "genre:" : "decade:";
+        for (const f of fields) {
+          if (!f) continue;
+          await d1BumpStat(env, prefix + f, ["total"], 1);
+        }
+      }
+    } catch (e) {
+      // best-effort
+    }
+  }
+  if (!env || !env.CONFIGS) return;
+  try {
+    const raw = await env.CONFIGS.get(key);
+    let counts = {};
+    if (raw) {
+      try {
+        counts = JSON.parse(raw) || {};
+      } catch {
+        counts = {};
+      }
+    }
+    for (const f of fields) {
+      if (!f) continue;
+      counts[f] = (parseInt(counts[f], 10) || 0) + 1;
+    }
+    await env.CONFIGS.put(key, JSON.stringify(counts));
+  } catch (e) {
+    // best-effort, see bumpStat above
+  }
+}
+
+// One-time migration: folds the old per-genre/per-decade
+// "stats:genre:X:total" / "stats:decade:X:total" keys (written by the
+// bumpStat-per-genre approach recordPlaybackTelemetry used before it
+// switched to bumpJsonCounterBlob above) into the new single-blob keys
+// (stats:genres:alltime / stats:decades:alltime), adding their values into
+// those all-time totals so switching formats didn't reset the Trending
+// Data tab's existing genre/decade counts back to zero.
+//
+// Guarded by its own sentinel key so the list()+N-gets below -- exactly
+// the expensive read pattern the new blob format exists to get away from
+// -- only ever runs once, no matter how many times the dashboard's
+// Audience tab gets loaded afterward. Old counts are added to (not
+// overwritten over) whatever the new blob already has, so any plays that
+// already landed in the new blob in the window before this migration ran
+// aren't double-counted away.
+async function migrateGenreDecadeStatsIfNeeded(env) {
+  if (!env || !env.CONFIGS) return;
+  const sentinelKey = "stats:genredecade:migrated";
+  try {
+    const already = await env.CONFIGS.get(sentinelKey);
+    if (already) return;
+
+    const [genreBlobRaw, decadeBlobRaw, genreList, decadeList] = await Promise.all([
+      env.CONFIGS.get("stats:genres:alltime"),
+      env.CONFIGS.get("stats:decades:alltime"),
+      listAllKeys(env.CONFIGS, "stats:genre:"),
+      listAllKeys(env.CONFIGS, "stats:decade:"),
+    ]);
+
+    let genreCounts = {};
+    try {
+      genreCounts = genreBlobRaw ? JSON.parse(genreBlobRaw) || {} : {};
+    } catch {
+      genreCounts = {};
+    }
+    let decadeCounts = {};
+    try {
+      decadeCounts = decadeBlobRaw ? JSON.parse(decadeBlobRaw) || {} : {};
+    } catch {
+      decadeCounts = {};
+    }
+
+    const genreTotalKeys = (genreList.keys || []).filter((k) => k.name.endsWith(":total"));
+    await Promise.all(
+      genreTotalKeys.map(async (k) => {
+        const name = k.name.slice("stats:genre:".length, -":total".length);
+        const raw = await env.CONFIGS.get(k.name);
+        const count = parseInt(raw, 10) || 0;
+        if (name && count > 0) genreCounts[name] = (parseInt(genreCounts[name], 10) || 0) + count;
+      })
+    );
+
+    const decadeTotalKeys = (decadeList.keys || []).filter((k) => k.name.endsWith(":total"));
+    await Promise.all(
+      decadeTotalKeys.map(async (k) => {
+        const name = k.name.slice("stats:decade:".length, -":total".length);
+        const raw = await env.CONFIGS.get(k.name);
+        const count = parseInt(raw, 10) || 0;
+        if (name && count > 0) decadeCounts[name] = (parseInt(decadeCounts[name], 10) || 0) + count;
+      })
+    );
+
+    await Promise.all([
+      env.CONFIGS.put("stats:genres:alltime", JSON.stringify(genreCounts)),
+      env.CONFIGS.put("stats:decades:alltime", JSON.stringify(decadeCounts)),
+      // Written last and only after both blobs above succeed -- if this
+      // whole function throws partway through, the sentinel never gets
+      // set, so the next Audience tab load just retries the migration
+      // from scratch rather than a partial migration looking "done".
+      env.CONFIGS.put(sentinelKey, "1"),
+    ]);
+  } catch (e) {
+    // best-effort -- if this fails, the sentinel key was never written,
+    // so this just retries next time computeAudienceAnalytics runs. Old
+    // per-key data is untouched either way (this only ever adds to the
+    // new blob, never deletes the old keys), so nothing is lost by a
+    // failed attempt.
+  }
+}
+
+// Records roughly how recently a creator account was last active -- feeds
+// the "Last Active" column in the admin dashboard's Creator Accounts tab.
+// Throttled to at most once per 30 minutes per account (one extra read to
+// check, skipped write if already recent) so a burst of debounced
+// autosaves during a single active session doesn't turn into a KV write
+// on every one of them -- called from authenticateCreator on every
+// successful auth, fire-and-forget (never awaited there), so this can
+// never add latency or a failure mode to the actual authenticated action
+// it's riding along with.
+//
+// The timestamp is mirrored into D1's creators.last_active on the same
+// throttle. That column existed for a long time but nothing ever wrote to
+// it, which forced the dashboard to do one KV `get` per account just to
+// render the "Last Active" column -- linear in the account count, and
+// over Cloudflare's 1,000-storage-operations/invocation cap past roughly a
+// thousand creators (the admin dashboard then stopped loading entirely in
+// production; Miniflare doesn't enforce that limit, so it rendered fine
+// locally). Writing it here lets the dashboard read last-active straight
+// out of the creators SELECT it already runs. Accounts that predate this
+// have NULL in D1 and are repaired lazily by backfillCreatorLastActive.
+const _lastSeenMemo = new Map();
+const LAST_SEEN_THROTTLE_MS = 30 * 60 * 1000;
+
+async function touchCreatorLastSeen(env, username) {
+  if (!env || !username) return;
+  const now = Date.now();
+  const last = _lastSeenMemo.get(username) || 0;
+  if (now - last < LAST_SEEN_THROTTLE_MS) return;
+
+  _lastSeenMemo.set(username, now);
+  if (_lastSeenMemo.size > 2000) {
+    const pruneBefore = now - LAST_SEEN_THROTTLE_MS;
+    for (const [u, ts] of _lastSeenMemo.entries()) {
+      if (ts < pruneBefore) _lastSeenMemo.delete(u);
+    }
+  }
+
+  if (env.DB) {
+    try {
+      await env.DB.prepare("UPDATE creators SET last_active = ? WHERE username = ?")
+        .bind(now, username)
+        .run();
+      return;
+    } catch (dbErr) {
+      // D1 write error, best-effort fallback to KV
+    }
+  }
+
+  if (env.CONFIGS) {
+    try {
+      const key = `creatorlastseen:${username}`;
+      await env.CONFIGS.put(key, String(now));
+    } catch (e) {
+      // best-effort
+    }
+  }
+}
+
+// How many NULL last_active rows one dashboard load repairs. Kept well
+// under the subrequest cap: at most this many KV reads plus a single D1
+// batch write per call, so the backfill itself can never be the thing
+// that tips a dashboard load over the limit even mid-migration.
+const LAST_ACTIVE_BACKFILL_BATCH = 100;
+
+// Lazily fills creators.last_active in D1 from the KV creatorlastseen:
+// marker for accounts that still have NULL there -- every account created
+// before touchCreatorLastSeen started mirroring into D1. Runs only on an
+// admin dashboard load, repairs a bounded batch each time, and then has
+// nothing left to do: once a row is set, touchCreatorLastSeen keeps it
+// current going forward. Converges over a handful of loads (1,200 accounts
+// -> ~12 loads) and then costs zero KV reads. Each repaired value is also
+// written onto the in-memory account object so it shows the right "Last
+// Active" on the load that repairs it, not one load later.
+async function backfillCreatorLastActive(env, accounts) {
+  if (!env || !env.DB || !env.CONFIGS || !Array.isArray(accounts)) return;
+  const missing = accounts.filter((c) => c && c.username && !c.lastActive).slice(0, LAST_ACTIVE_BACKFILL_BATCH);
+  if (!missing.length) return;
+  const stmts = [];
+  await Promise.all(
+    missing.map(async (c) => {
+      try {
+        const raw = await env.CONFIGS.get(`creatorlastseen:${c.username}`);
+        const ts = raw ? parseInt(raw, 10) || 0 : 0;
+        if (ts) {
+          c.lastActive = ts;
+          // `AND last_active IS NULL` guards against clobbering a value a
+          // concurrent touch already wrote.
+          stmts.push(
+            env.DB.prepare("UPDATE creators SET last_active = ? WHERE username = ? AND last_active IS NULL").bind(ts, c.username)
+          );
+        }
+      } catch {
+        // best-effort per account; retried on a later load
+      }
+    })
+  );
+  if (stmts.length) {
+    try {
+      // One batched D1 call for the whole batch rather than one per row.
+      await env.DB.batch(stmts);
+    } catch (e) {
+      // Non-fatal: the same rows are picked up again on the next load.
+    }
+  }
+}
+
+// Records one "marked as watched" or "added to a list" event for a given
+// title -- feeds the admin dashboard's Trending Data tab, which is meant
+// to eventually seed this add-on's own trending/popular catalogs once
+// there's enough data. Bucketed by Eastern calendar day (see
+// easternDateKey) rather than a raw event log, so an arbitrary rolling
+// window (7/30/90 days) can be summed later without needing a real
+// time-series database -- evtdayindex tracks which title ids had any
+// activity on a given day, so the dashboard only has to sum counts for
+// titles that were actually active in the requested window instead of
+// checking every title that's ever been tracked. KV has no atomic
+// increment (same tradeoff as bumpStat above), so this is a reasonable
+// running total, not an exact ledger.
+// Telemetry keys used to live forever. `evtcount:` / `evtmeta:` grow one
+// pair per title ever watched; `searchquery:` is worse -- the query string
+// is the key, so an unauthenticated `/api/track-search` loop mints unbounded
+// KV. Day-scoped blobs and indexes expire after 120 days (wider than the
+// 90-day dashboard window). All-time counters expire 400 days after the
+// last increment, so dormant titles/queries drop and active ones refresh.
+const TELEMETRY_DAY_TTL_SEC = 120 * 24 * 60 * 60;
+const TELEMETRY_ALLTIME_TTL_SEC = 400 * 24 * 60 * 60;
+const EVT_DAY_INDEX_CAP = 1000;
+const SEARCH_DAY_INDEX_CAP = 400;
+// Support threads: 180 days from last write (create/reply/edit refreshes).
+const FEEDBACK_TTL_SEC = 180 * 24 * 60 * 60;
+const FEEDBACK_ADMIN_GET_CAP = 300;
+
+async function putFeedbackThread(env, key, entry) {
+  const id = key.startsWith("feedback:") ? key.slice("feedback:".length) : (entry.id || key);
+  const status = (entry.completed ? "closed" : null) || entry.status || "open";
+  const subject = entry.category || entry.subject || (entry.messages && entry.messages[0] && entry.messages[0].text ? entry.messages[0].text.slice(0, 100) : null);
+  const createdAt = Number(entry.createdAt) || Date.now();
+  const updatedAt = Number(entry.updatedAt) || createdAt;
+  const bodyJson = JSON.stringify(entry);
+
+  if (env && env.DB) {
+    try {
+      await env.DB.prepare(
+        `INSERT INTO feedback (id, status, subject, body_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           status = excluded.status,
+           subject = excluded.subject,
+           body_json = excluded.body_json,
+           updated_at = excluded.updated_at`
+      ).bind(id, status, subject, bodyJson, createdAt, updatedAt).run();
+    } catch (dbErr) {
+      console.error("D1 write error (putFeedbackThread):", dbErr);
+    }
+  }
+  if (env && env.CONFIGS) {
+    await env.CONFIGS.put(key, bodyJson, { expirationTtl: FEEDBACK_TTL_SEC });
+  }
+}
+
+// The display fields for a tracked title -- its name and media type.
+// In D1 they live in the event_meta table; in KV they live at evtmeta:{type}:{id}.
+// Written when the title or media type has actually changed, and otherwise
+// at most once a day per title so lastSeen stays meaningful.
+//
+// Returns whether it wrote, which is what the tests assert on.
+const EVT_META_REFRESH_MS = 24 * 60 * 60 * 1000;
+async function writeEventMetaIfChanged(env, eventType, id, title, mediaType) {
+  let changed = false;
+  if (env && env.DB) {
+    try {
+      const existing = await env.DB.prepare(
+        "SELECT title, media_type, last_seen FROM event_meta WHERE event_type = ? AND item_id = ?"
+      ).bind(eventType, id).first();
+      if (
+        !existing ||
+        (existing.title || "") !== (title || "") ||
+        (existing.media_type || "") !== (mediaType || "") ||
+        Date.now() - (existing.last_seen || 0) >= EVT_META_REFRESH_MS
+      ) {
+        await env.DB.prepare(
+          `INSERT INTO event_meta (event_type, item_id, title, media_type, last_seen)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(event_type, item_id) DO UPDATE SET
+             title = excluded.title,
+             media_type = excluded.media_type,
+             last_seen = excluded.last_seen`
+        ).bind(eventType, id, title || "", mediaType || "", Date.now()).run();
+        changed = true;
+      }
+    } catch (e) {
+      console.error("D1 write error (event_meta):", e);
+    }
+  }
+
+  if (env && env.CONFIGS) {
+    const metaKey = `evtmeta:${eventType}:${id}`;
+    const metaRaw = await env.CONFIGS.get(metaKey);
+    try {
+      const prev = metaRaw ? JSON.parse(metaRaw) : null;
+      if (prev
+        && (prev.title || "") === (title || "")
+        && (prev.mediaType || "") === (mediaType || "")
+        && Number.isFinite(prev.lastSeen)
+        && Date.now() - prev.lastSeen < EVT_META_REFRESH_MS) {
+        return changed;
+      }
+    } catch {
+      // Unreadable -- rewrite it.
+    }
+    await env.CONFIGS.put(metaKey, JSON.stringify({ title: title || "", mediaType: mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC });
+    return true;
+  }
+  return changed;
+}
+
+async function recordTrackedEvent(env, eventType, id, title, mediaType) {
+  if (!env || !env.CONFIGS || !id) return;
+  try {
+    const day = statsToday();
+    // With D1 bound the counts go there and cost ZERO KV writes, the same way
+    // bumpStat's counters already did. This function was the biggest consumer
+    // of the free plan's 1,000-writes-a-day budget that bumpStat's move left
+    // behind: four KV writes per tracked title, so a browser posting a
+    // ten-title batch spent 41 of them and roughly 250 watched titles in a
+    // day exhausted the whole allowance -- at which point every KV write in
+    // the app fails, which is how this was found (marking a feedback item
+    // done started answering "KV put() limit exceeded for the day").
+    //
+    // No migration was needed: `stats` is keyed (kind, day) and its `kind`
+    // dimension is already unbounded (list_copy:{slug} mints one per list),
+    // so `evt:{eventType}:{id}` just goes in beside them. The day index is
+    // not written at all on this path -- a range scan over `day` is what
+    // replaces it (see d1LeaderboardCounts).
+    if (env.DB) {
+      await d1BumpStat(env, `evt:${eventType}:${id}`, ["total", day], 1);
+      // The display fields still live in KV, and are still written at most
+      // once a day per title rather than on every event.
+      await writeEventMetaIfChanged(env, eventType, id, title, mediaType);
+      return;
+    }
+    const daysKey = `evtcount:${eventType}:${id}:days`;
+    const totalKey = `evtcount:${eventType}:${id}:alltime`;
+    const indexKey = `evtdayindex:${eventType}:${day}`;
+
+    const [daysRaw, totalRaw, indexRaw] = await Promise.all([
+      env.CONFIGS.get(daysKey),
+      env.CONFIGS.get(totalKey),
+      env.CONFIGS.get(indexKey),
+    ]);
+    // One JSON blob per (eventType, id) holding every day's count, rather
+    // than one KV key per (eventType, id, day) -- summing a 90-day window
+    // used to mean 90 separate reads per candidate title (see
+    // computeLeaderboard below), which multiplied against even a modest
+    // candidate list blew past a safe per-invocation KV read budget and
+    // was quietly capping the leaderboard to far fewer than 100 entries
+    // for every window wider than a day or two. One read per candidate
+    // here, regardless of window width, fixes that at the root instead of
+    // just raising a cap number. Trimmed to the most recent 95 days on
+    // write (a few days' buffer past the widest window this dashboard
+    // ever queries, 90) so this blob can't grow without bound for a title
+    // that's been tracked for years.
+    let dayCounts = {};
+    try {
+      dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+    } catch {
+      dayCounts = {};
+    }
+    dayCounts[day] = (dayCounts[day] || 0) + 1;
+    const dayKeys = Object.keys(dayCounts).sort();
+    if (dayKeys.length > 95) {
+      dayKeys.slice(0, dayKeys.length - 95).forEach((k) => delete dayCounts[k]);
+    }
+    const totalCount = (parseInt(totalRaw, 10) || 0) + 1;
+
+    let index = [];
+    try {
+      index = indexRaw ? JSON.parse(indexRaw) : [];
+    } catch {
+      index = [];
+    }
+    // Written only when it actually changed. This key is one list per
+    // (eventType, day), so after the first event for a given title every
+    // later one rewrote a blob it had not altered.
+    const indexChanged = !index.includes(id) && index.length < EVT_DAY_INDEX_CAP;
+    if (indexChanged) index.push(id);
+
+    const writes = [
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+    ];
+    if (indexChanged) {
+      writes.push(env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }));
+    }
+    // Both this and the day index above were rewritten on EVERY event even
+    // when their contents had not changed -- half of this function's four
+    // KV writes per tracked title, so a ten-title batch spent 41 of the free
+    // plan's 1,000 a day.
+    writes.push(writeEventMetaIfChanged(env, eventType, id, title, mediaType));
+    await Promise.all(writes);
+  } catch (e) {
+    // best-effort -- never breaks the actual watch/list action riding along
+  }
+}
+
+// Computes a top-100 leaderboard of the most tracked titles for a given
+// event type ("watched" or "list-add") and time window -- powers the
+// admin dashboard's Trending Data tab. See recordTrackedEvent's own
+// comment for the underlying data model. "today"/"7"/"30"/"90" sum via
+// each day's index (bounded to titles that were actually active
+// somewhere in that window, not every title ever tracked); "alltime"
+// reads each title's running total directly instead, since there's no
+// day-index for it that would need summing. mediaTypeFilter ("movie" /
+// "series" / falsy for both) is applied before the top-100 cut, not
+// after, so filtering to just movies still returns up to 100 movies
+// instead of whatever happened to survive filtering an already-mixed
+// top 100.
+// Attaches the display fields (title, media type) to a set of tracked ids.
+//
+// These stay in KV on every deployment, D1-bound or not. The COUNTS are what
+// were spending the write budget -- four KV writes per tracked title, and a
+// ten-title batch was 41 -- and those move to D1 below. This blob is now
+// written at most once a day per title (see recordTrackedEvent), and it is
+// only ever READ here, bounded by the candidate cap. Reads are the cheap
+// side: 100,000 a day against 1,000 writes.
+async function attachEventMeta(env, eventType, ids) {
+  if (!ids || !ids.length) return [];
+  const metaMap = new Map();
+  if (env && env.DB) {
+    try {
+      const placeholders = ids.map(() => "?").join(",");
+      const rows = await env.DB.prepare(
+        `SELECT item_id, title, media_type FROM event_meta WHERE event_type = ? AND item_id IN (${placeholders})`
+      ).bind(eventType, ...ids).all();
+      if (rows && Array.isArray(rows.results)) {
+        for (const r of rows.results) {
+          metaMap.set(r.item_id, { title: r.title || r.item_id, mediaType: r.media_type || "" });
+        }
+      }
+    } catch {}
+  }
+  return await Promise.all(
+    ids.map(async (id) => {
+      if (metaMap.has(id)) {
+        const m = metaMap.get(id);
+        return { id, title: m.title, mediaType: m.mediaType };
+      }
+      let title = id;
+      let mediaType = "";
+      try {
+        if (env && env.CONFIGS) {
+          const metaRaw = await env.CONFIGS.get(`evtmeta:${eventType}:${id}`);
+          if (metaRaw) {
+            const meta = JSON.parse(metaRaw);
+            title = meta.title || id;
+            mediaType = meta.mediaType || "";
+          }
+        }
+      } catch {
+        // fall back to the raw id as the title
+      }
+      return { id, title, mediaType };
+    })
+  );
+}
+
+// The D1 candidate source. One indexed query replaces the whole day-index
+// dance the KV branches need: `stats` is keyed (kind, day), so a window is a
+// range scan and "alltime" is the single day='total' row per title.
+//
+// The kind is `evt:{eventType}:{id}` -- the same shape bumpStat has always
+// written into this table for its own counters, and the same unbounded
+// `kind` dimension list_copy:{slug} already uses. That is why this needed no
+// migration: the table it wants already exists.
+async function d1CountsByKindPrefix(env, prefix, window, candidateCap) {
+  const like = prefix.replace(/[%_]/g, "\\$&") + "%";
+  let rows;
+  if (window === "alltime") {
+    rows = await env.DB.prepare(
+      "SELECT kind, n AS total FROM stats WHERE kind LIKE ? ESCAPE '\\' AND day = 'total' ORDER BY n DESC LIMIT ?"
+    ).bind(like, candidateCap).all();
+  } else {
+    const days = window === "today" ? 1 : parseInt(window, 10) || 7;
+    const nowMs = Date.now();
+    const oldest = easternDateKey(new Date(nowMs - (days - 1) * 86400000));
+    const newest = easternDateKey(new Date(nowMs));
+    rows = await env.DB.prepare(
+      "SELECT kind, SUM(n) AS total FROM stats WHERE kind LIKE ? ESCAPE '\\' AND day >= ? AND day <= ? GROUP BY kind ORDER BY total DESC LIMIT ?"
+    ).bind(like, oldest, newest, candidateCap).all();
+  }
+  return (rows && rows.results ? rows.results : [])
+    .map((r) => ({ key: String(r.kind).slice(prefix.length), count: Number(r.total) || 0 }))
+    .filter((e) => e.key);
+}
+
+async function d1LeaderboardCounts(env, eventType, window, candidateCap) {
+  const rows = await d1CountsByKindPrefix(env, `evt:${eventType}:`, window, candidateCap);
+  return rows.map((r) => ({ id: r.key, count: r.count }));
+}
+
+async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
+  if (!env || !env.CONFIGS) return [];
+  const prefix = `evtcount:${eventType}:`;
+  const wantType = mediaTypeFilter === "movie" || mediaTypeFilter === "series" ? mediaTypeFilter : null;
+
+  // Cap the candidate pool before any per-title work. The KV branches below
+  // pay reads per candidate, so this is what stops the Trending tab crossing
+  // Cloudflare's 1,000-storage-operations-per-invocation cap on a large
+  // corpus; the D1 branch does not need it for cost, but keeping the same
+  // ceiling keeps the three paths returning the same shape of answer.
+  const CANDIDATE_CAP = 400;
+
+  // Candidates: { id, count }. Three sources, one tail.
+  let candidates;
+  // Only the KV window branch can produce a zero -- see the note where it
+  // builds its id set.
+  let dropZero = false;
+
+  if (env.DB) {
+    candidates = await d1LeaderboardCounts(env, eventType, window, CANDIDATE_CAP);
+  } else if (window === "alltime") {
+    const listResult = await listAllKeys(env.CONFIGS, prefix);
+    const alltimeKeys = listResult.keys
+      .filter((k) => k.name.endsWith(":alltime"))
+      .slice(0, CANDIDATE_CAP);
+    candidates = await Promise.all(
+      alltimeKeys.map(async (k) => ({
+        id: k.name.slice(prefix.length, -":alltime".length),
+        count: parseInt(await env.CONFIGS.get(k.name), 10) || 0,
+      }))
+    );
+  } else {
+    const days = window === "today" ? 1 : parseInt(window, 10) || 7;
+    const nowMs = Date.now();
+    const dateKeys = [];
+    for (let i = 0; i < days; i++) {
+      dateKeys.push(easternDateKey(new Date(nowMs - i * 86400000)));
+    }
+    // Union of every title id that had any activity anywhere in this window.
+    const indexResults = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`evtdayindex:${eventType}:${d}`)));
+    const idSet = new Set();
+    indexResults.forEach((raw) => {
+      if (!raw) return;
+      try {
+        JSON.parse(raw).forEach((id) => idSet.add(id));
+      } catch {
+        // skip an unparseable day index rather than failing the whole window
+      }
+    });
+    const ids = [...idSet].slice(0, CANDIDATE_CAP);
+    candidates = await Promise.all(
+      ids.map(async (id) => {
+        const daysRaw = await env.CONFIGS.get(`evtcount:${eventType}:${id}:days`);
+        let dayCounts = {};
+        try {
+          dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+        } catch {
+          dayCounts = {};
+        }
+        return { id, count: dateKeys.reduce((sum, d) => sum + (parseInt(dayCounts[d], 10) || 0), 0) };
+      })
+    );
+    // An id in the day index with no data in the counts blob -- e.g. one only
+    // ever tracked before the blob format shipped -- would otherwise show as a
+    // real-looking row stuck at 0 forever. The other two branches cannot
+    // produce one: both read the count itself rather than an index of ids.
+    dropZero = true;
+  }
+
+  const meta = await attachEventMeta(env, eventType, candidates.map((c) => c.id));
+  const entries = candidates.map((c, i) => ({ ...meta[i], count: c.count }));
+
+  const filtered = wantType ? entries.filter((e) => e.mediaType === wantType) : entries;
+  const nonZero = dropZero ? filtered.filter((e) => e.count > 0) : filtered;
+  nonZero.sort((a, b) => b.count - a.count);
+  const topEntries = nonZero.slice(0, 100);
+
+  // Auto-resolve raw tt... or tmdb:... IDs to real titles if missing. This is
+  // also what repopulates evtmeta after it expires, and what fills it in on a
+  // D1 deployment for a title first seen since the counters moved.
+  await Promise.all(
+    topEntries.map(async (e) => {
+      if (!e.title || e.title === e.id || /^tt\d+$/i.test(e.title) || /^tmdb:\d+$/i.test(e.title)) {
+        try {
+          if (typeof fetchTmdbItemDetails === "function") {
+            const det = await fetchTmdbItemDetails(e.id, TMDB_API_KEY, e.mediaType, "", false, env, null).catch(() => null);
+            if (det && det.title) {
+              e.title = det.title;
+              if (!e.mediaType && det.type) e.mediaType = (det.type === "tv" || det.type === "series") ? "series" : "movie";
+              if (env && env.DB) {
+                env.DB.prepare(
+                  `INSERT INTO event_meta (event_type, item_id, title, media_type, last_seen)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(event_type, item_id) DO UPDATE SET
+                     title = excluded.title,
+                     media_type = excluded.media_type,
+                     last_seen = excluded.last_seen`
+                ).bind(eventType, e.id, det.title, e.mediaType || "", Date.now()).run().catch(() => {});
+              }
+              if (env && env.CONFIGS) {
+                env.CONFIGS.put(`evtmeta:${eventType}:${e.id}`, JSON.stringify({ title: det.title, mediaType: e.mediaType || "", lastSeen: Date.now() }), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }).catch(() => {});
+              }
+            }
+          }
+        } catch {}
+      }
+    })
+  );
+
+  return topEntries;
+}
+
+// Lean sibling of recordTrackedEvent used only by the trending-data
+// backfill (26_api-creator-and-admin-routes.js) -- updates just the
+// all-time counter and metadata for a title, skipping the day-bucket and
+// day-index writes recordTrackedEvent also does. Backfilling from
+// existing Watch History/Custom List data has no natural "today" to
+// bucket it under, and walking real historical per-day data would
+// multiply KV operations well past a single Worker invocation's practical
+// budget (Cloudflare's free-plan subrequest limit in particular) for any
+// account with meaningful history. All-time-only is also the
+// semantically correct home for this anyway: a rolling "last 7 days"
+// window showing something watched two years ago wouldn't make sense
+// even if it were cheap to compute. Returns true/false so the caller can
+// track how many titles it actually got through this call.
+async function backfillTitleCount(env, eventType, id, title, mediaType, incrementBy) {
+  if (!env || !env.CONFIGS || !id || !incrementBy) return false;
+  try {
+    // Has to follow recordTrackedEvent onto D1, not just for the write
+    // budget: computeLeaderboard reads its counts from D1 wherever D1 is
+    // bound, so a backfill that only wrote KV would run to completion, report
+    // its title counts, and leave the All Time board showing nothing.
+    //
+    // "total" only, no day bucket -- see this function's comment above.
+    if (env.DB) {
+      await d1BumpStat(env, `evt:${eventType}:${id}`, ["total"], incrementBy);
+      await writeEventMetaIfChanged(env, eventType, id, title, mediaType);
+      return true;
+    }
+    const totalKey = `evtcount:${eventType}:${id}:alltime`;
+    const totalRaw = await env.CONFIGS.get(totalKey);
+    const total = (parseInt(totalRaw, 10) || 0) + incrementBy;
+    await Promise.all([
+      env.CONFIGS.put(totalKey, String(total), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+      writeEventMetaIfChanged(env, eventType, id, title, mediaType),
+    ]);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Anonymous search query tracking
+async function recordSearchQuery(env, query) {
+  if (!env || !env.CONFIGS) return;
+  const q = String(query || "").trim().toLowerCase().slice(0, 60);
+  if (q.length < 2) return;
+  try {
+    const day = statsToday();
+    // Same move as recordTrackedEvent above, and the same reason: three KV
+    // writes per search, none of which the free plan's write budget can
+    // afford. Nothing but counts here, so there is no meta to keep.
+    //
+    // The per-day unique-query cap that the KV path enforces through
+    // SEARCH_DAY_INDEX_CAP is not needed on this path: `stats` rows are
+    // bounded by (kind, day) and a query string mints one row per day rather
+    // than an unbounded keyspace of KV keys, and D1 writes do not come out of
+    // the KV write budget that cap exists to protect.
+    if (env.DB) {
+      await d1BumpStat(env, `searchq:${q}`, ["total", day], 1);
+      return;
+    }
+    const daysKey = `searchquery:${q}:days`;
+    const totalKey = `searchquery:${q}:alltime`;
+    const indexKey = `searchquerydayindex:${day}`;
+
+    const [daysRaw, totalRaw, indexRaw] = await Promise.all([
+      env.CONFIGS.get(daysKey),
+      env.CONFIGS.get(totalKey),
+      env.CONFIGS.get(indexKey),
+    ]);
+    // Same consolidated-blob shape as recordTrackedEvent above, and the
+    // same reason: one JSON blob per query holding every day's count,
+    // instead of one KV key per (query, day), so summing a wide window
+    // costs one read per candidate query instead of one read per
+    // candidate per day. See recordTrackedEvent's own comment for the
+    // full story -- this is the same fix applied to the same bug in the
+    // Search & Queries leaderboard.
+    let dayCounts = {};
+    try {
+      dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+    } catch {
+      dayCounts = {};
+    }
+    dayCounts[day] = (dayCounts[day] || 0) + 1;
+    const dayKeys = Object.keys(dayCounts).sort();
+    if (dayKeys.length > 95) {
+      dayKeys.slice(0, dayKeys.length - 95).forEach((k) => delete dayCounts[k]);
+    }
+    const totalCount = (parseInt(totalRaw, 10) || 0) + 1;
+
+    let index = [];
+    try {
+      index = indexRaw ? JSON.parse(indexRaw) : [];
+    } catch {
+      index = [];
+    }
+    const alreadyListed = index.includes(q);
+    // Written only when it actually changed -- the same waste
+    // recordTrackedEvent had. This is one list per day, so the second and
+    // every later search for the same term rewrote a blob identical to the
+    // one already there. `listed` keeps its old meaning (is this query in
+    // the day index at all) for the guard below; `indexChanged` is the
+    // narrower question of whether the blob needs storing again.
+    const indexChanged = !alreadyListed && index.length < SEARCH_DAY_INDEX_CAP;
+    if (indexChanged) index.push(q);
+    const listed = alreadyListed || indexChanged;
+    // Day index full of other queries: still bump counters for a query
+    // that already has keys, but do not mint a brand-new unique-query
+    // pair -- that is the unbounded, user-controlled keyspace.
+    if (!listed && !daysRaw && !totalRaw) return;
+
+    const writes = [
+      env.CONFIGS.put(daysKey, JSON.stringify(dayCounts), { expirationTtl: TELEMETRY_DAY_TTL_SEC }),
+      env.CONFIGS.put(totalKey, String(totalCount), { expirationTtl: TELEMETRY_ALLTIME_TTL_SEC }),
+    ];
+    if (indexChanged) {
+      writes.push(env.CONFIGS.put(indexKey, JSON.stringify(index), { expirationTtl: TELEMETRY_DAY_TTL_SEC }));
+    }
+    await Promise.all(writes);
+  } catch (e) {}
+}
+
+async function computeSearchLeaderboard(env, window) {
+  if (!env || !env.CONFIGS) return [];
+  // D1 is where recordSearchQuery puts the counts when it is bound, so read
+  // them back from there. Same shape of query as the Trending leaderboard
+  // (see d1CountsByKindPrefix), minus the meta join -- a search term is its
+  // own display value, so there is nothing to attach.
+  //
+  // Deployments that switched over see their Search & Queries numbers start
+  // from the switchover: the KV history is still there under its existing
+  // TTL, but it is not merged in. Merging would mean reading the whole KV
+  // corpus on every call to add a shrinking tail of pre-switch counts to
+  // rows that D1 already answers in one query, and the two would double-count
+  // for any day both paths wrote.
+  if (env.DB) {
+    const rows = await d1CountsByKindPrefix(env, "searchq:", window, 100);
+    return rows
+      .map((r) => ({ query: r.key, count: r.count }))
+      .filter((e) => e.count > 0)
+      .slice(0, 100);
+  }
+  const prefix = "searchquery:";
+  if (window === "alltime") {
+    const listResult = await listAllKeys(env.CONFIGS, prefix);
+    // Same fan-out bound as computeLeaderboard's alltime branch: one read
+    // per query ever recorded, so cap the candidates before the reads.
+    const SEARCH_ALLTIME_CANDIDATE_CAP = 1000;
+    const alltimeKeys = listResult.keys
+      .filter((k) => k.name.endsWith(":alltime"))
+      .slice(0, SEARCH_ALLTIME_CANDIDATE_CAP);
+    const entries = await Promise.all(
+      alltimeKeys.map(async (k) => {
+        const query = k.name.slice(prefix.length, -":alltime".length);
+        const countRaw = await env.CONFIGS.get(k.name);
+        return { query, count: parseInt(countRaw, 10) || 0 };
+      })
+    );
+    const valid = entries.filter((e) => e.count > 0);
+    valid.sort((a, b) => b.count - a.count);
+    return valid.slice(0, 100);
+  }
+
+  const days = window === "today" ? 1 : parseInt(window, 10) || 7;
+  const nowMs = Date.now();
+  const dateKeys = [];
+  for (let i = 0; i < days; i++) {
+    dateKeys.push(easternDateKey(new Date(nowMs - i * 86400000)));
+  }
+
+  // Union of every query that had any activity anywhere in this window,
+  // from the day-index only -- same pattern as computeLeaderboard above.
+  // This used to also list()-scan the entire "searchquery:" prefix (up to
+  // 1000 keys) unconditionally on every call, which pulled in every query
+  // ever recorded on any day, not just this window -- defeating the
+  // day-index's entire purpose and inflating the candidate set (and the
+  // KV reads below) regardless of how narrow a window was actually asked
+  // for. Removed rather than kept "just in case": the day-index is
+  // written every time recordSearchQuery runs, so there's nothing a raw
+  // prefix scan would catch that the index doesn't already have.
+  const indexResults = await Promise.all(dateKeys.map((d) => env.CONFIGS.get(`searchquerydayindex:${d}`)));
+  const querySet = new Set();
+  indexResults.forEach((raw) => {
+    if (!raw) return;
+    try {
+      JSON.parse(raw).forEach((q) => querySet.add(q));
+    } catch {}
+  });
+
+  // Flat top-100 cap regardless of window width -- see recordSearchQuery's
+  // own comment: summing a window now costs one read per candidate query
+  // (the days-blob), not one per candidate per day.
+  const queries = [...querySet].slice(0, 100);
+
+  const entries = await Promise.all(
+    queries.map(async (q) => {
+      const daysRaw = await env.CONFIGS.get(`searchquery:${q}:days`);
+      let dayCounts = {};
+      try {
+        dayCounts = daysRaw ? JSON.parse(daysRaw) : {};
+      } catch {
+        dayCounts = {};
+      }
+      const count = dateKeys.reduce((sum, d) => sum + (parseInt(dayCounts[d], 10) || 0), 0);
+      return { query: q, count };
+    })
+  );
+  const valid = entries.filter((e) => e.count > 0);
+  valid.sort((a, b) => b.count - a.count);
+  return valid.slice(0, 100);
+}
+
+// Telemetry for Stremio playback tracking. Genre and decade counters are
+// batched into one JSON blob write each (bumpJsonCounterBlob above)
+// instead of a separate KV key per genre -- see that function's own
+// comment for the write-count math and the tradeoff it makes.
+// playback_pings and watch_type stay on bumpStat as-is: playback_pings is
+// the one kind here that actually has a day-by-day reader (loadStatsByDay,
+// used for the dashboard's 30-day trend table), so it needs its daily key.
+async function recordPlaybackTelemetry(env, mediaType, genres, releaseYear) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    const promises = [bumpStat(env, "playback_pings")];
+    const mt = mediaType === "episode" ? "episode" : mediaType === "series" ? "series" : "movie";
+    promises.push(bumpStat(env, `watch_type:${mt}`));
+
+    const genreList = Array.isArray(genres)
+      ? genres
+      : typeof genres === "string"
+      ? genres.split(",").map((s) => s.trim()).filter(Boolean)
+      : [];
+
+    const cleanGenres = genreList.slice(0, 5).map((g) => String(g || "").trim()).filter(Boolean);
+    if (cleanGenres.length) {
+      promises.push(bumpJsonCounterBlob(env, "stats:genres:alltime", cleanGenres));
+    }
+
+    const yearNum = parseInt(releaseYear, 10);
+    if (yearNum && yearNum > 1900 && yearNum < 2100) {
+      let decade = "Classic (<1970)";
+      if (yearNum >= 2020) decade = "2020s";
+      else if (yearNum >= 2010) decade = "2010s";
+      else if (yearNum >= 2000) decade = "2000s";
+      else if (yearNum >= 1990) decade = "1990s";
+      else if (yearNum >= 1980) decade = "1980s";
+      else if (yearNum >= 1970) decade = "1970s";
+      promises.push(bumpJsonCounterBlob(env, "stats:decades:alltime", [decade]));
+    }
+    await Promise.all(promises);
+  } catch (e) {}
+}
+
+// Hard ceilings on what this one panel may cost, independent of how many
+// stats:* keys exist.
+//
+// This function enumerates three prefixes and then issues one KV get per
+// ":total" key it finds, so its subrequest count used to scale 1:1 with
+// the size of those key spaces -- and none of the three is intrinsically
+// bounded. A caller who minted enough keys (see recordListCopySlug's
+// comment for how that was possible without any authentication) pushed
+// this past Cloudflare's per-invocation subrequest limit, at which point
+// the panel threw on every load and there was no route that could delete
+// the keys again to recover it.
+//
+// The scan cap bounds the enumeration (one list() call per 1,000 keys);
+// the read cap bounds the far more expensive per-key gets. Both are far
+// above any real deployment -- a genuine install has tens of catalog
+// names and source groups, not hundreds -- so this truncates abuse and
+// nothing else. Truncating renders a partial panel rather than throwing,
+// which is the right failure mode for a dashboard: some data beats a
+// permanently broken tab.
+const STAT_KEY_SCAN_CAP = 20000;
+const STAT_TOTALS_READ_CAP = 500;
+
+async function computeCatalogAndCommunityLeaderboards(env, ctx) {
+  if (!env || !env.CONFIGS) return { catalogs: [], communityLists: [] };
+
+  // 1. Installed Catalogs (combining catalog_add events and sourcegroup install counts)
+  const catalogMap = new Map();
+  const [catalogTotals, sourceGroupTotals] = await Promise.all([
+    readStatTotalsByPrefix(env, "catalog_add:"),
+    readSourceGroupTotals(env),
+  ]);
+  for (const [name, count] of catalogTotals) {
+    if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
+  }
+  for (const [name, count] of sourceGroupTotals) {
+    if (count > 0 && name) catalogMap.set(name, (catalogMap.get(name) || 0) + count);
+  }
+
+  const catalogEntries = Array.from(catalogMap.entries()).map(([name, count]) => ({ name, count }));
+  catalogEntries.sort((a, b) => b.count - a.count);
+
+  // 2. Community / Creator Lists
+  //
+  // Copy counts live under stats:list_copy:{slug}:total, one key per slug
+  // that has EVER been copied. Enumerate that short prefix ONCE (it's
+  // bounded by real copy activity, not by list count, and lists that have
+  // never been copied have no key) rather than doing one get per list --
+  // that per-list fan-out (plus the reads below) is what made this panel
+  // cost ~2 subrequests per list and eventually cross the 1,000 cap.
+  let copiesBySlug = new Map();
+  try {
+    copiesBySlug = await readStatTotalsByPrefix(env, "list_copy:");
+  } catch (e) {
+    // best-effort: copy counts are a ranking tiebreak, not load-bearing
+  }
+
+  // Bounded candidate set regardless of store: the panel shows 100 lists,
+  // so there is no reason to read every list in the system to get there.
+  const COMMUNITY_CAP = 100;
+  let communityListsRaw = [];
+  if (env.DB) {
+    // Project only what's needed and compute the item count in SQL. This
+    // used to SELECT * (pulling every list's full items_json over the wire
+    // just to call .length on it) with no limit. Likes come straight from
+    // the likes column (kept current by the like route), which replaces
+    // the old read of `creatorlistlikes:{slug}` -- a key no code path
+    // writes, so the column used to show 0 for every list.
+    const { results } = await env.DB.prepare(
+      "SELECT id, username, name, type, visibility, likes, created_at, updated_at, json_array_length(items_json) AS item_count FROM creator_lists WHERE visibility = 'public' ORDER BY likes DESC, updated_at DESC LIMIT ?"
+    ).bind(COMMUNITY_CAP).all();
+    communityListsRaw = (results || []).map((row) => ({
+      slug: row.id.split(':')[1] || row.id,
+      name: row.name,
+      creatorName: row.username,
+      type: row.type || 'mixed',
+      likes: Number(row.likes) || 0,
+      itemCount: Number(row.item_count) || 0,
+      updatedAt: row.updated_at || row.created_at || 0,
+    }));
+  } else {
+    // KV-only: rank from the directory index, which already carries likes,
+    // itemCount and the creator's display name, and is already sorted by
+    // likes (see sortPublicIndexEntries, 02_http-and-creator-utils.js).
+    //
+    // This replaces a bounded prefix scan that was wrong twice over:
+    //
+    //  * It read the alphabetically-first COMMUNITY_CAP keys and then
+    //    sorted THOSE by likes, so with more lists than the cap the panel
+    //    reported a lexicographic sample as "top". You cannot get the top
+    //    100 by likes out of an arbitrary 100.
+    //  * It then dropped every candidate without a `creatorName` field --
+    //    and /api/creator/lists/save has never written one (the record is
+    //    { name, slug, type, items, visibility, likes, createdAt,
+    //    updatedAt }, and the creator is in the KEY). So in practice the
+    //    filter discarded everything and this panel showed nothing at all
+    //    whenever D1 was unbound.
+    //
+    // Reading the index also removes the one-KV-get-per-candidate fan-out
+    // entirely: it is a single get.
+    const indexEntries = await getPublicListIndex(env, ctx);
+    if (indexEntries) {
+      communityListsRaw = indexEntries
+        .filter((e) => e && e.isCreator && (e.itemCount || 0) > 0)
+        .slice(0, COMMUNITY_CAP)
+        .map((e) => ({
+          slug: e.slug,
+          name: e.name || e.slug,
+          creatorName: e.creatorName || e.username,
+          type: e.type || 'mixed',
+          likes: Number(e.likes) || 0,
+          itemCount: Number(e.itemCount) || 0,
+          updatedAt: e.updatedAt || 0,
+        }));
+    } else {
+      // Index absent and a rebuild is already running (or could not start).
+      // Bounded scan for this one request; the creator comes from the key,
+      // which is where it has always actually lived.
+      const listResult = await env.CONFIGS.list({ prefix: "creatorlist:", limit: COMMUNITY_CAP });
+      communityListsRaw = (await Promise.all(
+        (listResult.keys || []).map(async (k) => {
+          const raw = await env.CONFIGS.get(k.name);
+          if (!raw) return null;
+          let data;
+          try { data = JSON.parse(raw); } catch { return null; }
+          if (!data || !isPublicListVisibility(data.visibility)) return null;
+          const rest = k.name.slice("creatorlist:".length);
+          const sep = rest.indexOf(":");
+          if (sep === -1) return null;
+          const username = rest.slice(0, sep);
+          const slug = data.slug || rest.slice(sep + 1);
+          if (!username || !slug) return null;
+          return {
+            slug,
+            name: data.name || slug,
+            creatorName: username,
+            type: data.type || 'mixed',
+            likes: Number(data.likes) || 0,
+            itemCount: Array.isArray(data.items) ? data.items.length : 0,
+            updatedAt: data.updatedAt || data.createdAt || 0,
+          };
+        })
+      )).filter(Boolean);
+    }
+  }
+
+  // No per-list KV reads remain: likes and itemCount already came from the
+  // row/record above, copies come from the one prefix scan.
+  const communityLists = communityListsRaw.map((data) => ({
+    slug: data.slug,
+    name: data.name || data.slug,
+    creator: data.creatorName,
+    type: data.type || 'mixed',
+    itemCount: data.itemCount || 0,
+    likes: data.likes || 0,
+    copies: copiesBySlug.get(data.slug) || 0,
+    updatedAt: data.updatedAt || 0,
+  }));
+  const validLists = communityLists.filter(Boolean);
+  validLists.sort((a, b) => (b.likes + b.copies * 2) - (a.likes + a.copies * 2));
+
+  return { catalogs: catalogEntries.slice(0, 100), communityLists: validLists.slice(0, 100) };
+}
+
+async function computeAudienceAnalytics(env) {
+  if (!env || (!env.CONFIGS && !env.DB)) return { watchTypes: {}, genres: [], decades: [] };
+
+  if (env.CONFIGS) {
+    // Self-healing, same pattern as ensureTrackingMigrated elsewhere in this
+    // add-on: runs the old-keys-into-new-blob migration once (see its own
+    // comment), a no-op single read on every call after that.
+    await migrateGenreDecadeStatsIfNeeded(env);
+  }
+
+  const [movies, series, episodes, genreBlobRaw, decadeBlobRaw] = await Promise.all([
+    readStatCount(env, "watch_type:movie", "total"),
+    readStatCount(env, "watch_type:series", "total"),
+    readStatCount(env, "watch_type:episode", "total"),
+    env.CONFIGS ? env.CONFIGS.get("stats:genres:alltime") : null,
+    env.CONFIGS ? env.CONFIGS.get("stats:decades:alltime") : null,
+  ]);
+
+  const totalWatch = movies + series + episodes;
+
+  let validGenres = null;
+  let validDecades = null;
+
+  if (env.DB) {
+    try {
+      const genreRows = await env.DB.prepare(
+        "SELECT kind, n FROM stats WHERE kind LIKE 'genre:%' AND day = 'total' ORDER BY n DESC LIMIT 50"
+      ).all();
+      if (genreRows && Array.isArray(genreRows.results) && genreRows.results.length > 0) {
+        validGenres = genreRows.results.map((r) => ({
+          name: r.kind.slice("genre:".length),
+          count: Number(r.n) || 0,
+        })).filter((g) => g.count > 0 && g.name);
+      }
+      const decadeRows = await env.DB.prepare(
+        "SELECT kind, n FROM stats WHERE kind LIKE 'decade:%' AND day = 'total' ORDER BY n DESC LIMIT 50"
+      ).all();
+      if (decadeRows && Array.isArray(decadeRows.results) && decadeRows.results.length > 0) {
+        validDecades = decadeRows.results.map((r) => ({
+          name: r.kind.slice("decade:".length),
+          count: Number(r.n) || 0,
+        })).filter((d) => d.count > 0 && d.name);
+      }
+    } catch {}
+  }
+
+  if (!validGenres) {
+    let genreCounts = {};
+    try {
+      genreCounts = genreBlobRaw ? JSON.parse(genreBlobRaw) || {} : {};
+    } catch {
+      genreCounts = {};
+    }
+    validGenres = Object.entries(genreCounts)
+      .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
+      .filter((g) => g.count > 0 && g.name);
+    validGenres.sort((a, b) => b.count - a.count);
+  }
+
+  if (!validDecades) {
+    let decadeCounts = {};
+    try {
+      decadeCounts = decadeBlobRaw ? JSON.parse(decadeBlobRaw) || {} : {};
+    } catch {
+      decadeCounts = {};
+    }
+    validDecades = Object.entries(decadeCounts)
+      .map(([name, count]) => ({ name, count: parseInt(count, 10) || 0 }))
+      .filter((d) => d.count > 0 && d.name);
+    validDecades.sort((a, b) => b.count - a.count);
+  }
+
+  return {
+    watchTypes: { movies, series, episodes, total: totalWatch },
+    genres: validGenres.slice(0, 50),
+    decades: validDecades.slice(0, 50),
+  };
+}
+
+// The group names bumpStatBy above gets called with ultimately come from
+// the client's own collectEntries() -- not attacker-controlled in the
+// normal case, but /api/track-install has no auth on it (same as the
+// plain pageview/install counters), so a malicious request could send
+// arbitrary junk trying to spam garbage keys into KV. This caps length and
+// character set rather than trusting it outright; doesn't need to be
+// exhaustive, just enough that a genuine group name always passes through
+// untouched.
+//
+// NOTE: this bounds the character set and the LENGTH of a single name, not
+// the NUMBER of distinct names -- a caller sending 40-char random strings
+// still mints a new key every time. That is acceptable here only because
+// /api/track-install is rate-limited per IP; anywhere without a rate limit
+// needs a real allowlist instead (see recordListCopySlug below, and the
+// caps in computeCatalogAndCommunityLeaderboards that stop a large key
+// space from breaking the dashboard whatever produced it).
+function sanitizeStatGroupName(raw) {
+  const s = String(raw || "").trim().slice(0, 40);
+  return /^[A-Za-z0-9 &().'-]+$/.test(s) ? s : null;
+}
+
+// The "copies" column of the admin Community Lists panel is keyed by a
+// list's own slug (see computeCatalogAndCommunityLeaderboards, which looks
+// up copiesBySlug.get(data.slug)). The client, though, sends
+// `listUrl || listName` as the event id -- a full provider URL, or a
+// human-readable list title. Neither is a slug, so the stored counts
+// essentially never matched anything the panel could display: the whole
+// stats:list_copy: namespace was write-only.
+//
+// Worse, because the id was accepted verbatim (any 100 characters), every
+// distinct URL or title minted two brand-new permanent KV keys from an
+// endpoint with no authentication -- an unbounded key-space write
+// primitive, and one that the panel above then paid one KV read per key to
+// enumerate.
+//
+// Both problems have the same fix: only record a copy of a list that
+// actually lives on THIS add-on, keyed by the slug the panel is already
+// looking for. The key space is then bounded by the number of real
+// published lists, and the counts land where they can actually be read.
+// Copies of external provider lists are simply not counted -- which is
+// what was already happening in practice, just without the storage cost.
+function recordListCopySlug(rawId, origin) {
+  const raw = String(rawId || "").trim();
+  if (!raw || raw.length > 300) return null;
+  let pathname = "";
+  if (/^https?:\/\//i.test(raw)) {
+    let u;
+    try {
+      u = new URL(raw);
+    } catch {
+      return null;
+    }
+    // Only this Worker's own list URLs. An external provider's URL is not
+    // a list this dashboard can show a copy count for.
+    if (origin) {
+      let originHost = "";
+      try {
+        originHost = new URL(origin).hostname.toLowerCase();
+      } catch {
+        return null;
+      }
+      if (u.hostname.toLowerCase() !== originHost) return null;
+    }
+    pathname = u.pathname;
+  } else {
+    // Also accept a bare path, which is what a same-origin relative link
+    // resolves to before the client expands it.
+    if (!raw.startsWith("/")) return null;
+    pathname = raw;
+  }
+  // /lists/{user}/{slug}  ->  {slug}
+  const m = pathname.match(/^\/lists\/[^/]+\/([^/]+?)(?:\.json)?\/?$/);
+  if (!m) return null;
+  let slug;
+  try {
+    slug = decodeURIComponent(m[1]).toLowerCase();
+  } catch {
+    slug = m[1].toLowerCase();
+  }
+  // Same shape slugifyServer produces, so this can only ever name a key
+  // that a real list could also have produced.
+  return /^[a-z0-9][a-z0-9-]{0,80}$/.test(slug) ? slug : null;
+}
+
+// --- Counter reads -----------------------------------------------------------
+//
+// D1 is authoritative when bound, and falls back to KV when the row is
+// ABSENT rather than reporting zero. A missing row means "not migrated
+// yet", not "never happened" -- the same rule getCreator already applies to
+// accounts, and the reason binding D1 does not make a dashboard's history
+// vanish before the operator presses "Migrate KV -> D1". Once the migration
+// has run (or once new activity lands), D1 wins and the KV copy is inert.
+//
+// Deliberately NOT "D1 + KV summed": /admin/api/migrate-d1 COPIES the KV
+// value into D1, so summing would double every migrated counter.
+async function readStatCount(env, kind, bucket) {
+  if (env && env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT n FROM stats WHERE kind = ? AND day = ?"
+      ).bind(kind, bucket).all();
+      if (results && results.length) return Number(results[0].n) || 0;
+    } catch (e) {
+      // Table missing (migration 0002 not applied yet) or D1 unavailable --
+      // fall through to KV rather than showing zeroes.
+    }
+  }
+  if (!env || !env.CONFIGS) return 0;
+  const raw = await env.CONFIGS.get(`stats:${kind}:${bucket}`);
+  return parseInt(raw, 10) || 0;
+}
+
+// Escapes the LIKE metacharacters in a literal string so it can be used as a
+// prefix pattern. `%` and `_` are wildcards, and the escape character itself
+// has to be escaped first or `\%` would be produced from a lone backslash.
+// Pair it with `ESCAPE '\'` in the statement.
+//
+// SQL LIKE patterns built by concatenation are how the account purge came to
+// delete other creators' rows (see purgeCreatorData,
+// 02_http-and-creator-utils.js): the input there was a username, which may
+// contain `_`. Nothing reaches the call sites below from a request today, but
+// a helper is cheaper than remembering the rule at each new one.
+function escapeLikePrefix(s) {
+  return String(s == null ? "" : s).replace(/[\\%_]/g, "\\$&");
+}
+
+// All-time totals for a family of counters ("catalog_add:", "list_copy:"),
+// as a Map of the name after the prefix -> count.
+//
+// With D1 this is one indexed query. Without it, it is the prefix scan it
+// always was, still bounded by STAT_KEY_SCAN_CAP / STAT_TOTALS_READ_CAP so
+// a large key space cannot push this request past Cloudflare's subrequest
+// limit (see computeCatalogAndCommunityLeaderboards' own comment).
+async function readStatTotalsByPrefix(env, prefix) {
+  const out = new Map();
+  if (!env || !env.CONFIGS) return out;
+  if (env.DB) {
+    try {
+      // ESCAPE, because two of the three prefixes this is called with
+      // (`catalog_add:`, `list_copy:`, `sourcegroup:`) contain `_`, which is
+      // LIKE's single-character wildcard -- so `kind LIKE 'list_copy:%'` also
+      // matches `listXcopy:...`. Every kind here is generated internally
+      // today, so nothing is actually mismatched; this is the same defect
+      // class as the account purge's `id LIKE` (see purgeCreatorData,
+      // 02_http-and-creator-utils.js) and is closed the same day rather than
+      // left as the one instance that happens to be safe.
+      const { results } = await env.DB.prepare(
+        "SELECT kind, n FROM stats WHERE day = 'total' AND kind LIKE ? ESCAPE '\\' ORDER BY n DESC LIMIT ?"
+      ).bind(escapeLikePrefix(prefix) + "%", STAT_TOTALS_READ_CAP).all();
+      if (results && results.length) {
+        for (const row of results) {
+          const name = String(row.kind).slice(prefix.length);
+          if (name) out.set(name, Number(row.n) || 0);
+        }
+        return out;
+      }
+      // No rows: fall through to KV, same "not migrated yet" rule as
+      // readStatCount.
+    } catch (e) {
+      // Table missing or D1 unavailable -- fall through to KV.
+    }
+  }
+  const listed = await listAllKeys(env.CONFIGS, `stats:${prefix}`, STAT_KEY_SCAN_CAP);
+  const totalKeys = (listed.keys || [])
+    .filter((k) => k.name.endsWith(":total"))
+    .slice(0, STAT_TOTALS_READ_CAP);
+  await Promise.all(
+    totalKeys.map(async (k) => {
+      const raw = await env.CONFIGS.get(k.name);
+      const count = parseInt(raw, 10) || 0;
+      const name = k.name.slice(`stats:${prefix}`.length, -":total".length);
+      if (name) out.set(name, count);
+    })
+  );
+  return out;
+}
+
+// Source groups keep their own table and their own migrate-d1 branch (see
+// bumpStatBy), so they are read separately from the generic stats table --
+// this mirrors the split renderAdminDashboard already makes.
+async function readSourceGroupTotals(env) {
+  const out = new Map();
+  if (!env || !env.CONFIGS) return out;
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT name, install_count FROM source_groups ORDER BY install_count DESC LIMIT ?"
+      ).bind(STAT_TOTALS_READ_CAP).all();
+      if (results && results.length) {
+        for (const row of results) out.set(row.name, Number(row.install_count) || 0);
+        return out;
+      }
+    } catch (e) {
+      // fall through to KV
+    }
+  }
+  return readStatTotalsByPrefix({ CONFIGS: env.CONFIGS }, "sourcegroup:");
+}
+
+// Reads every stats:{kind}:YYYY-MM-DD entry via a prefix list (there's no
+// KV range-query, so this is the only way to enumerate them) and returns a
+// { "YYYY-MM-DD": count } map, skipping the :total key itself.
+async function loadStatsByDay(env, kind) {
+  if (!env || !env.CONFIGS) return {};
+  if (env.DB) {
+    try {
+      const { results } = await env.DB.prepare(
+        "SELECT day, n FROM stats WHERE kind = ? AND day != 'total'"
+      ).bind(kind).all();
+      // Same fallback rule as readStatCount: no rows at all means this
+      // counter has not been migrated yet, so read KV instead of drawing an
+      // empty chart. One real day bucket is enough to trust D1.
+      if (results && results.length) {
+        const byDay = {};
+        for (const row of results) byDay[row.day] = Number(row.n) || 0;
+        return byDay;
+      }
+    } catch (e) {
+      // Table missing or D1 unavailable -- fall through to the KV scan.
+    }
+  }
+  const prefix = `stats:${kind}:`;
+  const result = await listAllKeys(env.CONFIGS, prefix);
+  const byDay = {};
+  await Promise.all(
+    result.keys.map(async (k) => {
+      const day = k.name.slice(prefix.length);
+      if (day === "total") return;
+      const raw = await env.CONFIGS.get(k.name);
+      byDay[day] = parseInt(raw, 10) || 0;
+    })
+  );
+  return byDay;
+}
+
+// HMAC-SHA256 via the Workers runtime's native Web Crypto API, same
+// approach as hashStringForKey above -- used to sign the admin session
+// cookie so it can't be forged without knowing ADMIN_KEY, without needing
+// any server-side session storage (the cookie IS the session: an
+// expiry timestamp plus a signature over that timestamp).
+async function hmacHex(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sigBuf = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return [...new Uint8Array(sigBuf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const ADMIN_COOKIE_NAME = "mla_admin";
+const ADMIN_SESSION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+async function makeAdminCookieValue(env) {
+  const expiresAt = Date.now() + ADMIN_SESSION_MS;
+  const sig = await hmacHex(env.ADMIN_KEY, String(expiresAt));
+  return `${expiresAt}.${sig}`;
+}
+
+async function isValidAdminCookie(env, value) {
+  if (!value || !env || !env.ADMIN_KEY) return false;
+  const dot = value.indexOf(".");
+  if (dot === -1) return false;
+  const expiresAtStr = value.slice(0, dot);
+  const sig = value.slice(dot + 1);
+  const expiresAt = parseInt(expiresAtStr, 10);
+  if (!expiresAt || Date.now() > expiresAt) return false;
+  const expectedSig = await hmacHex(env.ADMIN_KEY, expiresAtStr);
+  return timingSafeEqualHex(sig, expectedSig);
+}
+
+function parseCookies(request) {
+  const header = request.headers.get("Cookie") || "";
+  const map = {};
+  header.split(";").forEach((part) => {
+    const idx = part.indexOf("=");
+    if (idx === -1) return;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (k) {
+      try {
+        map[k] = decodeURIComponent(v);
+      } catch {
+        map[k] = v;
+      }
+    }
+  });
+  return map;
+}
+
+async function isAdminRequest(request, env) {
+  const cookies = parseCookies(request);
+  return isValidAdminCookie(env, cookies[ADMIN_COOKIE_NAME]);
+}
+
+function renderAdminLoginPage(errorMsg) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#F2F2F7">
+<title>Admin \u2014 ${ADDON_NAME}</title>
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script>
+  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.classList.add('dark-theme');
+  }
+</script>
+<style>
+  :root {
+    --bg: #F2F2F7;
+    --surface: #FFFFFF;
+    --panel-strong: #E5E5EA;
+    --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.15);
+    --text: #000000;
+    --text-2: #3A3A3C;
+    --muted: #8E8E93;
+    --accent: #007AFF;
+    --danger: #FF3B30;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --shadow: 0 2px 10px rgba(0,0,0,0.08);
+    --radius: 14px;
+    --radius-sm: 10px;
+    --radius-pill: 999px;
+    --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif;
+  }
+  html.dark-theme {
+    --bg: #000000; --surface: #1C1C1E; --panel-strong: #2C2C2E;
+    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+    --text: #FFFFFF; --text-2: #EBEBF5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--font-body);
+    margin: 0;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px 16px;
+  }
+  .login-wrap { width: 100%; max-width: 380px; }
+  .login-header {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    margin-bottom: 20px;
+  }
+  .login-header img { width: 36px; height: 36px; border-radius: 10px; box-shadow: var(--shadow-sm); }
+  .login-header span { font-size: 1.2rem; font-weight: 800; letter-spacing: -0.02em; color: var(--text); }
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-sm);
+    padding: 20px;
+    width: 100%;
+  }
+  .panel-title { font-size: 1.1rem; font-weight: 700; margin: 0 0 14px; letter-spacing: -0.01em; color: var(--text); }
+  .row { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-bottom: 0; width: 100%; }
+  input {
+    width: 100%;
+    padding: 11px 14px;
+    border-radius: var(--radius-sm);
+    border: 1.5px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    outline: none;
+    font-size: 16px;
+    font-family: inherit;
+    min-height: 44px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0,122,255,0.15); }
+  button {
+    width: 100%;
+    margin-top: 14px;
+    padding: 11px 18px;
+    min-height: 44px;
+    border-radius: var(--radius-pill);
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.925rem;
+    font-family: inherit;
+    transition: opacity 0.12s;
+  }
+  button:hover { opacity: 0.85; }
+  .err { color: var(--danger); margin: 14px 0 0; font-size: 0.85rem; }
+</style></head>
+<body>
+  <div class="login-wrap">
+    <div class="login-header">
+      <img src="/icon.png" alt="${ADDON_NAME}">
+      <span>${ADDON_NAME}</span>
+    </div>
+    <div class="panel">
+      <h2 class="panel-title">Admin sign in</h2>
+      <form method="POST" action="/admin/login">
+        <div class="row">
+          <input type="password" name="key" placeholder="Admin key" autofocus>
+        </div>
+        <button type="submit">Sign in</button>
+      </form>
+      ${errorMsg ? `<p class="err">${escapeHtmlServer(errorMsg)}</p>` : ""}
+    </div>
+  </div>
+</body></html>`;
+}
+
+async function renderAdminDashboard(env) {
+  if (!env || !env.CONFIGS) {
+    return `<!DOCTYPE html><html><body style="background:#F2F2F7;color:#1C1C1E;font-family:sans-serif;padding:40px;">This Worker has no CONFIGS KV namespace bound, so there's no stats to show.</body></html>`;
+  }
+  // Surfaced in the Maintenance tab below so a dashboard-only self-hoster
+  // (no wrangler.toml in front of them) can see at a glance whether this
+  // Worker even has a D1 database bound, instead of guessing -- D1 is
+  // entirely optional, and every D1-specific action in that tab only
+  // makes sense once this is true.
+  const isD1Bound = !!(env && env.DB);
+  const today = statsToday();
+  const [
+    totalPV, todayPV, totalIN, todayIN, totalPP, todayPP,
+    pvByDay, inByDay, ppByDay,
+    creatorResult, sourceGroupResult
+  ] = await Promise.all([
+    readStatCount(env, "pageviews", "total"),
+    readStatCount(env, "pageviews", today),
+    readStatCount(env, "installs", "total"),
+    readStatCount(env, "installs", today),
+    readStatCount(env, "playback_pings", "total"),
+    readStatCount(env, "playback_pings", today),
+    loadStatsByDay(env, "pageviews"),
+    loadStatsByDay(env, "installs"),
+    loadStatsByDay(env, "playback_pings"),
+    // "creator:" (with the colon) is deliberately narrow -- creatorlist:,
+    // creatorsync:, etc. all start with "creator" too but not "creator:",
+    // so this can't accidentally sweep those in as if they were accounts.
+    listAllKeys(env.CONFIGS, "creator:"),
+    listAllKeys(env.CONFIGS, "stats:sourcegroup:"),
+  ]);
+
+  // Walks the last 30 calendar days explicitly (rather than just listing
+  // whatever KV happens to have) so days with zero activity still show up
+  // as a 0 row instead of silently vanishing from the table. Same Eastern-
+  // time day boundary as statsToday()/bumpStat() above, so these labels
+  // actually match the keys being looked up.
+  const rows = [];
+  const nowMs = Date.now();
+  for (let i = 0; i < 30; i++) {
+    const key = easternDateKey(new Date(nowMs - i * 86400000));
+    rows.push(`<tr><td>${key}</td><td>${pvByDay[key] || 0}</td><td>${inByDay[key] || 0}</td><td>${ppByDay[key] || 0}</td></tr>`);
+  }
+
+  // Creator accounts. The total is counted separately from the rows we
+  // render because creators can outnumber a single request's safe read
+  // budget: the stat card must report the true number of accounts rather
+  // than silently displaying the capped number as if it were the total.
+  let creatorAccounts = [];
+  let totalCreatorCount = 0;
+  // Hard ceiling on how many accounts one dashboard load will render. The
+  // page is for a human eyeballing the newest/most-recent accounts, not
+  // paging through thousands, and this keeps a load bounded regardless of
+  // how large the site grows (the real cap is Cloudflare's 1,000
+  // subrequests/invocation; D1 rows are cheap, so this sits just under it
+  // to leave headroom for everything else the page does).
+  const CREATOR_RENDER_CAP = 1000;
+  if (env.DB) {
+    // One query for the count, one bounded query for the rows -- no
+    // per-account reads. last_active now comes straight from the row (kept
+    // current by touchCreatorLastSeen), which is what removed the old
+    // one-KV-get-per-creator fan-out.
+    let count = 0;
+    try {
+      const countRes = await env.DB.prepare("SELECT COUNT(*) AS n FROM creators").all();
+      count = countRes.results && countRes.results[0] ? Number(countRes.results[0].n) || 0 : 0;
+    } catch (e) {
+      console.error("D1 creator count failed:", e);
+    }
+    totalCreatorCount = count;
+    const { results } = await env.DB.prepare(
+      "SELECT username, display_name, created_at, last_active FROM creators ORDER BY last_active DESC, created_at DESC LIMIT ?"
+    ).bind(CREATOR_RENDER_CAP).all();
+    creatorAccounts = (results || []).map((row) => ({
+      username: row.username,
+      displayName: row.display_name,
+      createdAt: row.created_at || null,
+      lastActive: row.last_active || null,
+    }));
+    // Historical accounts have NULL last_active in D1; repair a bounded
+    // batch from KV each load (see backfillCreatorLastActive).
+    await backfillCreatorLastActive(env, creatorAccounts);
+  } else {
+    // KV-only fallback. listAllKeys is a full cursor sweep (fine for
+    // enumerating, no per-key reads), then bound the fan-out: a KV get per
+    // account over more than this many would blow the subrequest cap, so
+    // cap the renders and report the real total.
+    totalCreatorCount = (creatorResult.keys || []).length;
+    const keys = (creatorResult.keys || []).slice(0, CREATOR_RENDER_CAP);
+    creatorAccounts = await Promise.all(
+      keys.map(async (k) => {
+        const username = k.name.slice("creator:".length);
+        let displayName = username;
+        let createdAt = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          if (raw) {
+            const data = JSON.parse(raw);
+            displayName = data.displayName || username;
+            createdAt = typeof data.createdAt === "number" ? data.createdAt : null;
+          }
+        } catch {}
+        let lastActive = null;
+        try {
+          const lastRaw = await env.CONFIGS.get(`creatorlastseen:${username}`);
+          lastActive = lastRaw ? parseInt(lastRaw, 10) || null : null;
+        } catch {}
+        return { username, displayName, createdAt, lastActive };
+      })
+    );
+  }
+
+  creatorAccounts.sort((a, b) => (b.lastActive || b.createdAt || 0) - (a.lastActive || a.createdAt || 0));
+  const shownCreatorCount = creatorAccounts.length;
+  const accountRows = creatorAccounts
+    .map(
+      (c) =>
+        `<tr><td>${escapeHtmlServer(c.displayName)}</td><td>${escapeHtmlServer(c.username)}</td>` +
+        `<td>${c.createdAt ? easternDateKey(new Date(c.createdAt)) : "\u2014"}</td>` +
+        `<td>${c.lastActive ? easternDateKey(new Date(c.lastActive)) : "\u2014"}</td>` +
+        // data-* attributes here rather than passing c.displayName inline into
+        // the onclick string -- displayName is arbitrary creator-chosen text
+        // (only .trim()'d server-side, not restricted to safe characters the
+        // way the normalized username is), so splicing it directly into an
+        // onclick="..." attribute would both break on a display name
+        // containing a quote and, worse, let a crafted display name inject
+        // script into this admin page. escapeHtmlServer handles the HTML-
+        // attribute escaping here the same way it already does for the two
+        // <td> values above; resetCreatorKey reads the values back off the
+        // element at click time instead of receiving them as literals.
+        `<td><button type="button" class="lc-btn secondary" style="padding:4px 10px; font-size:0.8rem;" data-username="${escapeHtmlServer(c.username)}" data-displayname="${escapeHtmlServer(c.displayName)}" onclick="resetCreatorKey(this)">Reset Key</button></td></tr>`
+    )
+    .join("");
+  const creatorTruncatedNote = shownCreatorCount < totalCreatorCount
+    ? `, showing ${shownCreatorCount} of ${totalCreatorCount}`
+    : "";
+
+  // Each key is stats:sourcegroup:{group}:total -- strip both ends to get
+  // the group name back. ":total" is a fixed suffix here (see bumpStatBy's
+  // total-only design above), so a plain slice is enough, no need to guard
+  // against a stray per-day key existing alongside it the way
+  // loadStatsByDay has to for pageviews/installs.
+  let sourceGroups = [];
+  if (env.DB) {
+    const { results } = await env.DB.prepare("SELECT * FROM source_groups").all();
+    sourceGroups = results.map(row => ({ group: row.name, count: row.install_count }));
+  } else {
+    const sourceGroupPrefix = "stats:sourcegroup:";
+    sourceGroups = await Promise.all(
+      sourceGroupResult.keys.map(async (k) => {
+        const group = k.name.slice(sourceGroupPrefix.length, -":total".length);
+        const raw = await env.CONFIGS.get(k.name);
+        return { group, count: parseInt(raw, 10) || 0 };
+      })
+    );
+  }
+  sourceGroups.sort((a, b) => b.count - a.count);
+  const sourceGroupTotal = sourceGroups.reduce((sum, g) => sum + g.count, 0);
+  const sourceGroupRows = sourceGroups
+    .map((g) => {
+      const pct = sourceGroupTotal ? Math.round((g.count / sourceGroupTotal) * 100) : 0;
+      return `<tr><td>${escapeHtmlServer(g.group)}</td><td>${g.count}</td><td>${pct}%</td></tr>`;
+    })
+    .join("");
+
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin \u2014 My Lists Addon</title>
+<script>
+  if (localStorage.getItem('theme') === 'dark' || (!localStorage.getItem('theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+    document.documentElement.classList.add('dark-theme');
+  }
+</script>
+<style>
+  :root {
+    --bg: #F2F2F7;
+    --surface: #FFFFFF;
+    --panel-strong: #E5E5EA;
+    --border: rgba(0,0,0,0.08);
+    --border-strong: rgba(0,0,0,0.15);
+    --text: #000000;
+    --text-2: #3A3A3C;
+    --muted: #8E8E93;
+    --accent: #007AFF;
+    --danger: #FF3B30;
+    --success: #34C759;
+    --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+    --shadow: 0 2px 10px rgba(0,0,0,0.08);
+    --shadow-md: 0 8px 30px rgba(0,0,0,0.18);
+    --radius: 14px;
+    --radius-sm: 10px;
+    --radius-pill: 999px;
+  }
+  html.dark-theme {
+    --bg: #000000; --surface: #1C1C1E; --panel-strong: #2C2C2E;
+    --border: rgba(255,255,255,0.15); --border-strong: rgba(255,255,255,0.25);
+    --text: #FFFFFF; --text-2: #EBEBF5;
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,sans-serif; max-width:900px; margin:0 auto; padding:20px 14px; }
+  h1 { margin-bottom:4px; font-size:1.6rem; color:var(--text); }
+  h2 { font-size:1.1rem; color:var(--text); }
+  .stat-cards { display:grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:12px; margin:16px 0; }
+  .stat-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px; box-shadow:var(--shadow-sm); }
+  .stat-value { font-size:1.6rem; font-weight:700; color:var(--text); }
+  .stat-label { color:var(--muted); font-size:0.82rem; margin-top:4px; }
+  .table-wrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; margin-top:10px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow-sm); }
+  table { width:100%; border-collapse:collapse; background:var(--surface); border:none; margin:0; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); font-size:0.85rem; white-space:nowrap; color:var(--text); }
+  th { color:var(--muted); font-weight:600; background:var(--panel-strong); }
+  a { color:var(--accent); }
+  .admin-main-tab-bar { display:flex; gap:16px; border-bottom:1px solid var(--border); margin-top:20px; flex-wrap:wrap; }
+  .admin-main-tab-btn {
+    background:none; border:none; color:var(--muted); font-size:0.95rem; font-weight:700; cursor:pointer;
+    padding:10px 4px; margin-bottom:-1px; border-bottom:2px solid transparent; transition:color 0.15s ease;
+  }
+  .admin-main-tab-btn:hover { color:var(--text); }
+  .admin-main-tab-btn.active { color:var(--text); border-bottom-color:var(--accent); }
+  .admin-subnav-bar { display:flex; gap:8px; margin:14px 0 16px; flex-wrap:wrap; }
+  .subnav-pill {
+    background:var(--surface); border:1px solid var(--border); border-radius:20px; padding:6px 14px;
+    font-size:0.85rem; font-weight:600; color:var(--muted); cursor:pointer; transition:all 0.15s ease;
+  }
+  .subnav-pill:hover { border-color:var(--border-strong); color:var(--text); }
+  .subnav-pill.active { background:var(--accent); color:#FFFFFF; border-color:var(--accent); }
+  .admin-tab-panel { display:none; }
+  .admin-tab-panel.active { display:block; }
+  .admin-select { padding:6px 10px; border-radius:var(--radius-sm); border:1px solid var(--border-strong); background:var(--surface); color:var(--text); font-size:0.85rem; margin-right:6px; outline:none; }
+  .admin-badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:700; text-transform:uppercase; }
+  .admin-badge.bug { background:rgba(255,59,48,0.12); color:var(--danger); }
+  .admin-badge.improvement { background:rgba(0,122,255,0.12); color:var(--accent); }
+  .admin-badge.idea { background:rgba(255,149,0,0.12); color:#FF9500; }
+  .admin-badge.other { background:rgba(142,142,147,0.15); color:var(--muted); }
+  .feedback-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-top:10px; box-shadow:var(--shadow-sm); }
+  .feedback-card.completed { opacity:0.55; }
+  .feedback-card-header { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; }
+  .feedback-actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .feedback-meta { color:var(--muted); font-size:0.8rem; margin-top:6px; }
+  .feedback-message { margin-top:8px; white-space:pre-wrap; font-size:0.92rem; word-break:break-word; color:var(--text); }
+  .netflix-preview-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap:10px; margin-top:10px; }
+  .netflix-preview-poster { width:100%; aspect-ratio:2/3; object-fit:cover; border-radius:8px; background:var(--panel-strong); box-shadow:var(--shadow-sm); }
+  .netflix-preview-poster-placeholder { width:100%; aspect-ratio:2/3; border-radius:8px; background:var(--panel-strong); display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:0.75rem; text-align:center; padding:6px; }
+  .netflix-preview-title { font-size:0.8rem; margin-top:4px; line-height:1.25; color:var(--text); }
+  .netflix-preview-year { color:var(--muted); font-size:0.75rem; }
+
+  /* Standard Modals & Buttons */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px; z-index: 1000;
+  }
+  .modal-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 20px; padding: 22px; max-width: 440px; width: 100%;
+    max-height: 90vh; overflow-y: auto; box-shadow: var(--shadow-md);
+    color: var(--text);
+  }
+  button.linklike {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+  button.linklike:hover { opacity: 0.85; }
+
+  .modal-close-x {
+    float: right; background: var(--bg); border: 1px solid var(--border-strong);
+    color: var(--muted); font-size: 1rem; cursor: pointer;
+    padding: 4px 10px; border-radius: 8px;
+  }
+  .modal-close-x:hover { color: var(--text); border-color: var(--text-2); }
+  .lc-btn {
+    padding: 10px 18px; min-height: 38px; border-radius: var(--radius-pill);
+    border: none; background: var(--accent); color: #fff; cursor: pointer;
+    font-weight: 600; font-size: 0.925rem; font-family: inherit;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: opacity 0.12s; text-decoration: none;
+  }
+  .lc-btn.secondary {
+    background: var(--surface); color: var(--text);
+    border: 1.5px solid var(--border-strong);
+  }
+  .lc-btn.danger {
+    background: var(--danger); color: #fff; border: none;
+  }
+  .lc-btn:hover:not(:disabled) { opacity: 0.85; }
+  .lc-btn:disabled { opacity: 0.4; cursor: default; }
+
+  @media (max-width: 600px) {
+    body { padding: 14px 10px; }
+    .stat-cards { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .feedback-card { padding: 12px; }
+    .feedback-card-header { flex-direction: column; align-items: flex-start !important; }
+    .feedback-actions { width: 100%; }
+    .feedback-actions button { flex-grow: 1; text-align: center; }
+  }
+</style></head>
+<body>
+  <h1>Admin Dashboard</h1>
+  <p style="color:#8E8E93; margin-top:0;">My Lists Addon usage stats.</p>
+  ${isD1Bound ? '' : '<div style="background:rgba(255,59,48,0.12); border:1px solid #FF3B30; border-radius:8px; padding:12px 16px; margin:0 0 18px; color:#FF3B30; font-size:0.88rem; line-height:1.4;"><strong>Warning: No D1 database bound.</strong> D1 is required for authoritative accounts, lists, full-text search, likes, feedback, and tracking. Please bind your D1 database as <code>DB</code> in the Cloudflare Dashboard (Worker Settings &rarr; Bindings).</div>'}
+
+  <!-- Not a tablist: these three buttons do not reveal panels, they choose
+       which row of sub-tabs is shown, and it is the sub-tab that selects
+       content. role="tablist" with nothing inside it carrying role="tab"
+       told assistive technology to expect tabs and hand it none, so this
+       is a labelled group of toggle buttons, which is what it is. -->
+  <div class="admin-main-tab-bar" role="group" aria-label="Dashboard sections">
+    <button type="button" class="admin-main-tab-btn active" aria-pressed="true" data-main-tab="overview" onclick="switchAdminMainTab('overview')">Overview &amp; Traffic</button>
+    <button type="button" class="admin-main-tab-btn" aria-pressed="false" data-main-tab="discovery" onclick="switchAdminMainTab('discovery')">Analytics &amp; Discovery</button>
+    <button type="button" class="admin-main-tab-btn" aria-pressed="false" data-main-tab="management" onclick="switchAdminMainTab('management')">Management &amp; Tools</button>
+  </div>
+
+  <div class="admin-subnav-bar" id="adminSubnavOverview">
+    <button type="button" class="subnav-pill active" data-sub-tab="last30" onclick="switchAdminSubTab('last30')">Last 30 Days</button>
+    <button type="button" class="subnav-pill" data-sub-tab="sources" onclick="switchAdminSubTab('sources')">Sources people use</button>
+    <button type="button" class="subnav-pill" data-sub-tab="apiusage" onclick="switchAdminSubTab('apiusage')">API Usage</button>
+  </div>
+  <div class="admin-subnav-bar" id="adminSubnavDiscovery" style="display:none;">
+    <button type="button" class="subnav-pill" data-sub-tab="trending" onclick="switchAdminSubTab('trending')">Trending Data</button>
+    <button type="button" class="subnav-pill" data-sub-tab="search" onclick="switchAdminSubTab('search')">Search &amp; Queries</button>
+    <button type="button" class="subnav-pill" data-sub-tab="catalogs_lists" onclick="switchAdminSubTab('catalogs_lists')">Catalogs &amp; Lists</button>
+    <button type="button" class="subnav-pill" data-sub-tab="audience" onclick="switchAdminSubTab('audience')">Playback &amp; Audience</button>
+  </div>
+  <div class="admin-subnav-bar" id="adminSubnavManagement" style="display:none;">
+    <button type="button" class="subnav-pill" data-sub-tab="creators" onclick="switchAdminSubTab('creators')">Creator Accounts</button>
+    <button type="button" class="subnav-pill" data-sub-tab="feedback" onclick="switchAdminSubTab('feedback')">Feedback</button>
+    <button type="button" class="subnav-pill" data-sub-tab="netflixpreview" onclick="switchAdminSubTab('netflixpreview')">Provider Preview</button>
+    <button type="button" class="subnav-pill" data-sub-tab="maintenance" onclick="switchAdminSubTab('maintenance')">Maintenance</button>
+  </div>
+
+  <div class="admin-tab-panel active" data-admin-panel="last30">
+    <div class="stat-cards">
+      <div class="stat-card"><div class="stat-value">${Number(totalPV) || 0}</div><div class="stat-label">Total page views</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(todayPV) || 0}</div><div class="stat-label">Page views today</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(totalIN) || 0}</div><div class="stat-label">Total install links</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(todayIN) || 0}</div><div class="stat-label">Install links today</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(totalPP) || 0}</div><div class="stat-label">Total playback streams</div></div>
+      <div class="stat-card"><div class="stat-value">${Number(todayPP) || 0}</div><div class="stat-label">Streams today</div></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Date</th><th>Page views</th><th>Install links</th><th>Playback pings</th></tr>
+        ${rows.join("")}
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="creators">
+    <div class="stat-cards">
+      <div class="stat-card"><div class="stat-value">${totalCreatorCount}</div><div class="stat-label">Creator accounts${creatorTruncatedNote}</div></div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Display name</th><th>Username</th><th>Created</th><th>Last Active</th><th>Key</th></tr>
+        ${accountRows || '<tr><td colspan="5">No accounts yet.</td></tr>'}
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="sources">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Counted from each row's group at the moment an install link is generated -- one Custom List and one Channel in the same install still count as one of each, five MDBList Charts rows count as five.</p>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Source</th><th>Count</th><th>Share</th></tr>
+        ${sourceGroupRows || '<tr><td colspan="3">No data yet.</td></tr>'}
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="trending">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. Meant to eventually seed this add-on's own trending/popular catalogs once there's enough data.</p>
+    <div style="margin:12px 0;">
+      <select class="admin-select" id="trendingTypeSelect" onchange="loadTrendingData()">
+        <option value="watched">Most Watched</option>
+        <option value="list-add">Most Added to Lists</option>
+      </select>
+      <select class="admin-select" id="trendingWindowSelect" onchange="loadTrendingData()">
+        <option value="today">Today</option>
+        <option value="7" selected>Last 7 Days</option>
+        <option value="30">Last 30 Days</option>
+        <option value="90">Last 90 Days</option>
+        <option value="alltime">All Time</option>
+      </select>
+      <select class="admin-select" id="trendingMediaTypeSelect" onchange="loadTrendingData()">
+        <option value="">Movies + Shows</option>
+        <option value="movie">Movies Only</option>
+        <option value="series">Shows Only</option>
+      </select>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="backfillTrendingBtn" onclick="runBackfillTrending()">Backfill Existing Data</button>
+      <span id="backfillTrendingStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+    <p style="color:#8E8E93; margin:0 0 12px; font-size:0.8rem;">Backfill only adds to the <strong>All Time</strong> window (there's no historical date to bucket existing data into 7/30/90-day windows) -- it seeds counts from Watch History and Custom Lists that already existed before this feature shipped. Safe to run more than once; it only adds, never resets anything. Processes accounts a few at a time, so it may take a minute for larger sites.</p>
+    <div style="margin:0 0 12px;">
+      <button type="button" class="admin-select" style="cursor:pointer;" id="migrateDayCountsBtn" onclick="runMigrateDayCounts()">Migrate Historical Day Counts</button>
+      <span id="migrateDayCountsStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      <p style="color:#8E8E93; margin:6px 0 0; font-size:0.8rem;">One-time migration for the switch from one KV key per day to one JSON blob per title -- reads every old per-day count still sitting in KV and folds it into the new format, so 7/30/90-day windows reflect activity from before that switch instead of only counting forward from it. Safe to run more than once (adds, never subtracts); old keys are deleted once folded in, so re-running just confirms there's nothing left. Also covers the Search &amp; Queries leaderboard.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <tr><th>#</th><th>Title</th><th>Type</th><th>Count</th></tr>
+        <tbody id="trendingTableBody"><tr><td colspan="4">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="search">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Anonymous queries and search terms users have entered in the Discover and Search tabs.</p>
+    <div style="margin:12px 0;">
+      <select class="admin-select" id="searchWindowSelect" onchange="loadSearchData()">
+        <option value="today">Today</option>
+        <option value="7" selected>Last 7 Days</option>
+        <option value="30">Last 30 Days</option>
+        <option value="90">Last 90 Days</option>
+        <option value="alltime">All Time</option>
+      </select>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Search Query</th><th>Count</th></tr></thead>
+        <tbody id="searchTableBody"><tr><td colspan="3">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="catalogs_lists">
+    <h2 style="margin-top:0;">Most Installed Curated &amp; Provider Catalogs</h2>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Which built-in charts and provider catalogs users add to their Stremio configuration.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Catalog / Chart Name</th><th>Times Installed</th></tr></thead>
+        <tbody id="installedCatalogsTableBody"><tr><td colspan="3">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+
+    <h2 style="margin-top:28px;">Top Community &amp; Creator Lists</h2>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Ranked by community engagement (likes and list copies/imports).</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>List Name</th><th>Creator</th><th>Type</th><th>Items</th><th>Likes</th><th>Copies</th></tr></thead>
+        <tbody id="topCommunityListsTableBody"><tr><td colspan="7">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="audience">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Audience viewing breakdown derived from Stremio stream playback pings.</p>
+    
+    <div class="stat-cards">
+      <div class="stat-card"><div class="stat-value" id="audienceTotalPlays">0</div><div class="stat-label">Total streams tracked</div></div>
+      <div class="stat-card"><div class="stat-value" id="audienceMoviePlays">0</div><div class="stat-label">Movie plays</div></div>
+      <div class="stat-card"><div class="stat-value" id="audienceSeriesPlays">0</div><div class="stat-label">Show plays</div></div>
+      <div class="stat-card"><div class="stat-value" id="audienceEpisodePlays">0</div><div class="stat-label">Episode plays</div></div>
+    </div>
+
+    <h2 style="margin-top:20px;">Top Watched Genres</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Genre</th><th>Stream Count</th></tr></thead>
+        <tbody id="topGenresTableBody"><tr><td colspan="3">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+
+    <h2 style="margin-top:28px;">Release Era / Decades</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Release Era</th><th>Stream Count</th></tr></thead>
+        <tbody id="topDecadesTableBody"><tr><td colspan="3">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="feedback">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Bug reports, improvement requests, and ideas submitted from Settings &gt; Feedback, newest first.</p>
+    <div class="feedback-card">
+      <div style="font-weight:600; margin-bottom:8px;">Log something yourself</div>
+      <select class="admin-select" id="newFeedbackCategory" style="margin-bottom:8px;">
+        <option value="bug" selected>Bug</option>
+        <option value="improvement">Improvement</option>
+        <option value="idea">Idea</option>
+        <option value="other">Other</option>
+      </select>
+      <textarea id="newFeedbackMessage" placeholder="What did you find?" style="width:100%; min-height:70px; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid rgba(0,0,0,0.15); font-family:inherit; font-size:0.9rem; resize:vertical;"></textarea>
+      <div style="margin-top:8px; display:flex; align-items:center; gap:10px;">
+        <button type="button" class="admin-select" style="cursor:pointer;" id="newFeedbackSubmitBtn" onclick="submitAdminFeedback()">Add to list</button>
+        <span id="newFeedbackStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+    </div>
+    <div id="feedbackList">Loading\u2026</div>
+  </div>
+
+  <!-- Edit Feedback Modal -->
+  <div id="editFeedbackModal" class="modal-overlay" style="display:none;">
+    <div class="modal-card" style="max-width:500px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <h3 style="margin:0; font-size:1.15rem; font-weight:700; color:var(--text);">Edit Feedback</h3>
+        <button type="button" class="modal-close-x" aria-label="Close" onclick="closeEditFeedbackModal()">&#x2715;</button>
+      </div>
+      <input type="hidden" id="editFeedbackId">
+      <label style="display:block; font-size:0.82rem; font-weight:600; color:var(--muted); margin-bottom:6px;">Category</label>
+      <select class="admin-select" id="editFeedbackCategory" style="margin-bottom:14px; width:100%; padding:10px 12px; border-radius:var(--radius-sm); border:1.5px solid var(--border-strong); background:var(--surface); color:var(--text);">
+        <option value="bug">bug</option>
+        <option value="improvement">improvement</option>
+        <option value="idea">idea</option>
+        <option value="other">other</option>
+      </select>
+      <label style="display:block; font-size:0.82rem; font-weight:600; color:var(--muted); margin-bottom:6px;">Message</label>
+      <textarea id="editFeedbackMessage" style="width:100%; min-height:120px; box-sizing:border-box; padding:10px 12px; border-radius:var(--radius-sm); border:1.5px solid var(--border-strong); background:var(--surface); color:var(--text); font-family:inherit; font-size:0.92rem; resize:vertical; margin-bottom:16px; outline:none;"></textarea>
+      <div style="display:flex; justify-content:flex-end; gap:10px;">
+        <button type="button" class="lc-btn secondary" onclick="closeEditFeedbackModal()">Cancel</button>
+        <button type="button" class="lc-btn primary" id="editFeedbackSaveBtn" onclick="saveEditFeedback()">Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="apiusage">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">Requests made using this Worker's own shared API keys (the fallback used whenever a visitor hasn't supplied their own) -- not counting anyone's personal keys, which only they can rate-limit. Watch these against each provider's limit if catalogs start coming back empty or slow.</p>
+    <div class="table-wrap">
+      <table>
+        <tr><th>Key</th><th>Last 24h</th><th>Last 7 days</th><th>Last 30 days</th><th>Provider limit</th></tr>
+        <tbody id="apiUsageTableBody"><tr><td colspan="5">Loading\u2026</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="netflixpreview">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">A look at what a TMDB-discover-based shelf would actually contain for any streaming provider, before wiring it into Quick Add for real -- pulled live from TMDB, not a saved list. Counts are TMDB/JustWatch's own tracking, not the provider's real numbers, and typically run a bit under what trackers like FlixPatrol report.</p>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Find a provider's id</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">TMDB sometimes has more than one entry for the same service (e.g. two separate "Disney Plus" ids) -- look the name up here rather than guessing, since a wrong id fails silently: it just quietly shows the wrong catalog under the right label.</p>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input type="text" id="providerLookupQueryInput" class="admin-select" style="margin-right:0; flex:1; max-width:220px;" placeholder="e.g. disney, max, hulu" onkeydown="if(event.key==='Enter'){event.preventDefault();lookupProviderIds();}">
+        <button type="button" class="secondary lc-btn" onclick="lookupProviderIds()">Search</button>
+        <span id="providerLookupStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+      <div id="providerLookupResults" style="margin-top:10px;"></div>
+    </div>
+
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:16px; flex-wrap:wrap;">
+      <label style="font-size:0.85rem; color:#8E8E93;">Provider id
+        <input type="text" id="netflixPreviewProviderIdInput" class="admin-select" style="margin-right:0; width:60px;" value="8" placeholder="8">
+      </label>
+      <label style="font-size:0.85rem; color:#8E8E93;">Region
+        <input type="text" id="netflixPreviewRegionInput" class="admin-select" style="margin-right:0; width:70px; text-transform:uppercase;" value="US" maxlength="2" placeholder="US">
+      </label>
+      <button type="button" class="secondary lc-btn" onclick="loadNetflixPreview()">Load Preview</button>
+      <span id="netflixPreviewStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+    </div>
+    <div id="netflixPreviewMovies"></div>
+    <div id="netflixPreviewShows" style="margin-top:28px;"></div>
+  </div>
+
+  <div class="admin-tab-panel" data-admin-panel="maintenance">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">One-off, click-to-run maintenance actions -- everything here is also reachable as a raw <code>POST</code> request for anyone using <code>wrangler</code>/curl, but these buttons are the point-and-click way to run the same thing entirely from this dashboard, no terminal required.</p>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">D1 database: ${isD1Bound
+        ? '<span style="color:#30d158;">bound</span>'
+        : '<span style="color:#FF3B30;">not bound (required)</span>'}</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">${isD1Bound
+        ? 'This Worker has a D1 database bound as <code>DB</code>. Use the button below to backfill existing KV records into D1.'
+        : 'This Worker has no D1 database bound (Settings &rarr; Bindings). D1 is required for authoritative accounts, lists, search, likes, feedback, and tracking. Bind a D1 database as <code>DB</code> to enable full functionality.'}</p>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="migrateD1Btn" onclick="runMigrateD1()" ${isD1Bound ? '' : 'disabled'}>Migrate KV &rarr; D1</button>
+      <span id="migrateD1Status" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Copies existing Creator Profiles, Custom Lists, likes, feedback, and tracking records from KV into D1. Safe to run more than once.</p>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Database schema</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Migrations are applied by hand and nothing records that it happened, so this Worker can end up running ahead of its own database. It degrades quietly when that happens rather than refusing to start &mdash; which is why this check exists. Run it after any deploy that shipped a new file under <code>migrations/</code>.</p>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="schemaCheckBtn" onclick="runSchemaCheck()">Check schema</button>
+      <span id="schemaCheckStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      <div id="schemaCheckResult" style="margin-top:10px;"></div>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Public list directory &amp; search index</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">The public list directory and in-app search query D1 tables and the full-text search index (lists_fts). This button rebuilds the search index directly from creator_lists and published_lists &mdash; useful after importing data or to recreate the index after a D1 database export.</p>
+      <button type="button" class="admin-select" style="cursor:pointer;" id="rebuildIndexBtn" onclick="runRebuildPublicIndex()">Rebuild Search Index</button>
+      <span id="rebuildIndexStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Delete a creator&rsquo;s lists</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Removes specific lists belonging to one Creator Profile: the list itself, its likes, its place in that creator&rsquo;s order, and its directory entry. Use it for content a creator cannot or will not remove themselves. A slug whose list is already gone is still cleared from the directory, which is how you get rid of an entry that shows an item count but opens empty.</p>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Browse first: this reads the creator&rsquo;s actual stored records, including any the creator&rsquo;s own dashboard cannot see because they are missing from their display order &mdash; which is how an account ends up with dozens of copies of one list under slugs nobody could guess. Filter by name, select them all, then delete. Deleting also records the deletion on the account, so the creator&rsquo;s other signed-in browsers drop their copies instead of uploading them straight back.</p>
+      <p style="color:#FF9500; margin:0 0 10px; font-size:0.82rem;"><strong>This cannot be undone.</strong> There is no backup of a deleted list. Prefer &ldquo;Rebuild Public List Index&rdquo; above first &mdash; if the lists are only phantom directory entries, that fixes them without deleting anything.</p>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="deleteListUserInput" class="admin-select" placeholder="Creator username" style="margin-right:6px;">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="browseCreatorListsBtn" onclick="loadCreatorLists(true)">Browse this creator&rsquo;s lists</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="browseCreatorListsMoreBtn" onclick="loadCreatorLists(false)" hidden>Load more</button>
+        <span id="creatorListsStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      </div>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="creatorListsFilterInput" class="admin-select" placeholder="Filter by name or slug (e.g. coming of age)" style="min-width:280px; margin-right:6px;" oninput="renderCreatorListsTable()">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="selectShownListsBtn" onclick="selectShownCreatorLists()">Select all shown</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="clearSelectedListsBtn" onclick="clearSelectedCreatorLists()">Clear selection</button>
+      </div>
+      <div id="creatorListsResults" style="margin-bottom:8px; max-height:340px; overflow:auto;"></div>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="deleteListSlugsInput" class="admin-select" placeholder="Slugs, comma or newline separated" style="min-width:320px;">
+      </div>
+      <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteListBtn" onclick="runDeleteCreatorLists()">Delete these lists</button>
+      <span id="deleteListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Anonymously published lists</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Lists published without a Creator Profile, under the shared <code>user</code> namespace. Anyone can create one and no owner exists to ask, so this is the only way to remove one. Browse to find a list, or type slugs directly if you already know them.</p>
+      <p style="color:#FF9500; margin:0 0 10px; font-size:0.82rem;"><strong>This cannot be undone.</strong> There is no backup of a deleted list.</p>
+      <div class="row" style="margin-bottom:8px;">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="browseAnonBtn" onclick="loadPublishedLists(true)">Browse</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="browseAnonMoreBtn" onclick="loadPublishedLists(false)" hidden>Load more</button>
+        <span id="anonListStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      </div>
+      <div id="anonListResults" style="margin-bottom:8px;"></div>
+      <div class="row" style="margin-bottom:8px;">
+        <input type="text" id="deleteAnonSlugsInput" class="admin-select" placeholder="Slugs, comma or newline separated" style="min-width:320px;">
+      </div>
+      <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteAnonBtn" onclick="runDeletePublishedLists()">Delete these lists</button>
+      <span id="deleteAnonStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+    </div>
+  </div>
+
+  <!-- A form, not a link: logging out is a state change, and /admin/logout
+       answers POST only now. See that route for why. -->
+  <form method="POST" action="/admin/logout" style="margin-top:24px;">
+    <button type="submit" class="linklike">Log out</button>
+  </form>
+  <script>
+    const categoryDefaults = {
+      overview: 'last30',
+      discovery: 'trending',
+      management: 'creators',
+    };
+    const tabToCategory = {
+      last30: 'overview',
+      sources: 'overview',
+      apiusage: 'overview',
+      trending: 'discovery',
+      search: 'discovery',
+      catalogs_lists: 'discovery',
+      audience: 'discovery',
+      creators: 'management',
+      feedback: 'management',
+      netflixpreview: 'management',
+      maintenance: 'management',
+    };
+
+    function switchAdminMainTab(catId) {
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => {
+        const on = b.dataset.mainTab === catId;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
+        bar.style.display = bar.id === ('adminSubnav' + catId.charAt(0).toUpperCase() + catId.slice(1)) ? 'flex' : 'none';
+      });
+      let targetSubTab = categoryDefaults[catId] || 'last30';
+      try {
+        const savedTab = localStorage.getItem('myListAddon:adminActiveTab');
+        if (savedTab && tabToCategory[savedTab] === catId) {
+          targetSubTab = savedTab;
+        }
+      } catch (e) {}
+      switchAdminSubTab(targetSubTab);
+    }
+
+    function switchAdminSubTab(tabId, updateUrl = true) {
+      const cat = tabToCategory[tabId] || 'overview';
+      try {
+        localStorage.setItem('myListAddon:adminActiveTab', tabId);
+      } catch (e) {}
+      if (updateUrl && history.replaceState) {
+        history.replaceState(null, '', '#' + tabId);
+      }
+      document.querySelectorAll('.admin-main-tab-btn').forEach((b) => {
+        const on = b.dataset.mainTab === cat;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      document.querySelectorAll('.admin-subnav-bar').forEach((bar) => {
+        bar.style.display = bar.id === ('adminSubnav' + cat.charAt(0).toUpperCase() + cat.slice(1)) ? 'flex' : 'none';
+      });
+      document.querySelectorAll('.subnav-pill').forEach((p) => p.classList.toggle('active', p.dataset.subTab === tabId));
+      document.querySelectorAll('.admin-tab-panel').forEach((p) => p.classList.toggle('active', p.dataset.adminPanel === tabId));
+
+      if (tabId === 'trending' && !window._trendingLoadedOnce) { window._trendingLoadedOnce = true; loadTrendingData(); }
+      if (tabId === 'search' && !window._searchLoadedOnce) { window._searchLoadedOnce = true; loadSearchData(); }
+      if (tabId === 'catalogs_lists' && !window._catalogsListsLoadedOnce) { window._catalogsListsLoadedOnce = true; loadCatalogsAndListsData(); }
+      if (tabId === 'audience' && !window._audienceLoadedOnce) { window._audienceLoadedOnce = true; loadAudienceData(); }
+      if (tabId === 'feedback' && !window._feedbackLoadedOnce) { window._feedbackLoadedOnce = true; loadFeedback(); }
+      if (tabId === 'apiusage' && !window._apiUsageLoadedOnce) { window._apiUsageLoadedOnce = true; loadApiUsage(); }
+      if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
+    }
+
+    function restoreAdminActiveTab() {
+      let targetTab = '';
+      const hashTab = (window.location.hash || '').replace(/^#/, '').trim();
+      if (hashTab && tabToCategory[hashTab]) {
+        targetTab = hashTab;
+      } else {
+        try {
+          const savedTab = localStorage.getItem('myListAddon:adminActiveTab');
+          if (savedTab && tabToCategory[savedTab]) {
+            targetTab = savedTab;
+          }
+        } catch (e) {}
+      }
+      if (!targetTab) targetTab = 'last30';
+      switchAdminSubTab(targetTab, false);
+    }
+
+    window.addEventListener('hashchange', () => {
+      const hashTab = (window.location.hash || '').replace(/^#/, '').trim();
+      if (hashTab && tabToCategory[hashTab]) {
+        switchAdminSubTab(hashTab, false);
+      }
+    });
+
+    restoreAdminActiveTab();
+
+    // Resets a creator's login key server-side (see /admin/api/reset-creator-key
+    // -- it can only invalidate + replace, never recover the original,
+    // since only a salted hash of it is ever stored). Two-step confirm
+    // matching this dashboard's other destructive actions: a plain
+    // confirm() naming exactly what's about to happen and to whom, then
+    // the new key is shown once in a copyable box -- there is no second
+    // chance to see it, same as the reveal shown at signup.
+    async function resetCreatorKey(btn) {
+      const username = btn.dataset.username;
+      const displayName = btn.dataset.displayname;
+      const sure = confirm(
+        'Reset the login key for "' + displayName + '" (' + username + ')?\\n\\n' +
+        'Their current key will stop working immediately. You will need to ' +
+        'send them the new key yourself -- there is no email on file to send it to.'
+      );
+      if (!sure) return;
+      try {
+        const res = await fetch('/admin/api/reset-creator-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert('Could not reset key: ' + (data.error || 'unknown error'));
+          return;
+        }
+        showResetKeyModal(displayName, data.creatorKey);
+      } catch (e) {
+        alert('Network error -- could not reset key. Try again.');
+      }
+    }
+
+    function showResetKeyModal(displayName, creatorKey) {
+      const overlay = document.createElement('div');
+      overlay.id = 'resetKeyOverlay';
+      overlay.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; z-index:9999;';
+      overlay.innerHTML =
+        '<div style="background:#fff; border-radius:12px; padding:24px; max-width:380px; width:90%;">' +
+          '<h3 style="margin-top:0;">New key for ' + escapeHtmlAdmin(displayName) + '</h3>' +
+          '<p style="color:#8E8E93; font-size:0.9rem;">This is shown once. Copy it now and send it to the creator yourself -- their old key no longer works.</p>' +
+          '<div id="resetKeyDisplay" style="font-family:monospace; font-size:1.1rem; background:#F2F2F7; border-radius:8px; padding:10px; text-align:center; margin:12px 0; user-select:all;">' + escapeHtmlAdmin(creatorKey) + '</div>' +
+          '<div style="display:flex; gap:8px;">' +
+            '<button type="button" class="lc-btn secondary" style="flex:1;" onclick="navigator.clipboard.writeText(\\'' + creatorKey + '\\'); this.textContent=\\'Copied!\\';">Copy Key</button>' +
+            '<button type="button" class="lc-btn" style="flex:1;" onclick="document.getElementById(\\'resetKeyOverlay\\').remove();">Done</button>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(overlay);
+    }
+
+    async function loadSearchData() {
+      const body = document.getElementById('searchTableBody');
+      body.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
+      const win = document.getElementById('searchWindowSelect').value;
+      try {
+        const res = await fetch('/admin/api/analytics?section=search&window=' + encodeURIComponent(win));
+        const data = await res.json();
+        if (!data.ok || !data.searches || !data.searches.length) {
+          body.innerHTML = '<tr><td colspan="3">No searches recorded yet for this window.</td></tr>';
+          return;
+        }
+        body.innerHTML = data.searches.map((s, i) =>
+          '<tr><td>' + (i + 1) + '</td><td><strong>' + escapeHtmlAdmin(s.query) + '</strong></td><td>' + s.count + '</td></tr>'
+        ).join('');
+      } catch (e) {
+        body.innerHTML = '<tr><td colspan="3">Could not load search data -- try again.</td></tr>';
+      }
+    }
+
+    async function loadCatalogsAndListsData() {
+      const catBody = document.getElementById('installedCatalogsTableBody');
+      const listBody = document.getElementById('topCommunityListsTableBody');
+      catBody.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
+      listBody.innerHTML = '<tr><td colspan="7">Loading\u2026</td></tr>';
+      try {
+        const res = await fetch('/admin/api/analytics?section=catalogs_lists');
+        const data = await res.json();
+        if (!data.ok) {
+          catBody.innerHTML = '<tr><td colspan="3">Could not load.</td></tr>';
+          listBody.innerHTML = '<tr><td colspan="7">Could not load.</td></tr>';
+          return;
+        }
+        if (!data.catalogs || !data.catalogs.length) {
+          catBody.innerHTML = '<tr><td colspan="3">No catalog installations recorded yet.</td></tr>';
+        } else {
+          catBody.innerHTML = data.catalogs.map((c, i) =>
+            '<tr><td>' + (i + 1) + '</td><td>' + escapeHtmlAdmin(c.name) + '</td><td>' + c.count + '</td></tr>'
+          ).join('');
+        }
+
+        if (!data.communityLists || !data.communityLists.length) {
+          listBody.innerHTML = '<tr><td colspan="7">No community lists found.</td></tr>';
+        } else {
+          listBody.innerHTML = data.communityLists.map((l, i) =>
+            '<tr><td>' + (i + 1) + '</td><td><strong>' + escapeHtmlAdmin(l.name) + '</strong></td><td>' + escapeHtmlAdmin(l.creator) + '</td><td>' + escapeHtmlAdmin(l.type) + '</td><td>' + l.itemCount + '</td><td>&#x2764; ' + l.likes + '</td><td>' + l.copies + '</td></tr>'
+          ).join('');
+        }
+      } catch (e) {
+        catBody.innerHTML = '<tr><td colspan="3">Could not load -- try again.</td></tr>';
+        listBody.innerHTML = '<tr><td colspan="7">Could not load -- try again.</td></tr>';
+      }
+    }
+
+    async function loadAudienceData() {
+      const genresBody = document.getElementById('topGenresTableBody');
+      const decadesBody = document.getElementById('topDecadesTableBody');
+      genresBody.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
+      decadesBody.innerHTML = '<tr><td colspan="3">Loading\u2026</td></tr>';
+      try {
+        const res = await fetch('/admin/api/analytics?section=audience');
+        const data = await res.json();
+        if (!data.ok) {
+          genresBody.innerHTML = '<tr><td colspan="3">Could not load.</td></tr>';
+          decadesBody.innerHTML = '<tr><td colspan="3">Could not load.</td></tr>';
+          return;
+        }
+
+        const wt = data.watchTypes || {};
+        document.getElementById('audienceTotalPlays').textContent = (wt.total || 0).toLocaleString();
+        document.getElementById('audienceMoviePlays').textContent = (wt.movies || 0).toLocaleString();
+        document.getElementById('audienceSeriesPlays').textContent = (wt.series || 0).toLocaleString();
+        document.getElementById('audienceEpisodePlays').textContent = (wt.episodes || 0).toLocaleString();
+
+        if (!data.genres || !data.genres.length) {
+          genresBody.innerHTML = '<tr><td colspan="3">No genre playback data yet.</td></tr>';
+        } else {
+          genresBody.innerHTML = data.genres.map((g, i) =>
+            '<tr><td>' + (i + 1) + '</td><td>' + escapeHtmlAdmin(g.name) + '</td><td>' + g.count + '</td></tr>'
+          ).join('');
+        }
+
+        if (!data.decades || !data.decades.length) {
+          decadesBody.innerHTML = '<tr><td colspan="3">No decade playback data yet.</td></tr>';
+        } else {
+          decadesBody.innerHTML = data.decades.map((d, i) =>
+            '<tr><td>' + (i + 1) + '</td><td>' + escapeHtmlAdmin(d.name) + '</td><td>' + d.count + '</td></tr>'
+          ).join('');
+        }
+      } catch (e) {
+        genresBody.innerHTML = '<tr><td colspan="3">Could not load -- try again.</td></tr>';
+        decadesBody.innerHTML = '<tr><td colspan="3">Could not load -- try again.</td></tr>';
+      }
+    }
+
+    function escapeHtmlAdmin(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    async function loadTrendingData() {
+      const body = document.getElementById('trendingTableBody');
+      body.innerHTML = '<tr><td colspan="4">Loading\u2026</td></tr>';
+      const type = document.getElementById('trendingTypeSelect').value;
+      const win = document.getElementById('trendingWindowSelect').value;
+      const mediaType = document.getElementById('trendingMediaTypeSelect').value;
+      try {
+        const res = await fetch('/admin/api/leaderboard?type=' + encodeURIComponent(type) + '&window=' + encodeURIComponent(win) + (mediaType ? '&mediaType=' + encodeURIComponent(mediaType) : ''));
+        const data = await res.json();
+        if (!data.ok || !data.entries || !data.entries.length) {
+          body.innerHTML = '<tr><td colspan="4">No data yet for this window.</td></tr>';
+          return;
+        }
+        body.innerHTML = data.entries.map((e, i) =>
+          '<tr><td>' + (i + 1) + '</td><td>' + escapeHtmlAdmin(e.title || e.id) + '</td><td>' + escapeHtmlAdmin(e.mediaType === 'series' ? 'Show' : 'Movie') + '</td><td>' + e.count + '</td></tr>'
+        ).join('');
+      } catch (e) {
+        body.innerHTML = '<tr><td colspan="4">Could not load -- try again.</td></tr>';
+      }
+    }
+
+    async function runBackfillTrending() {
+      const btn = document.getElementById('backfillTrendingBtn');
+      const status = document.getElementById('backfillTrendingStatus');
+      btn.disabled = true;
+      let accountsDone = 0;
+      let titlesDone = 0;
+      let safetyCounter = 0;
+      // safetyCounter guards against an unexpected infinite loop (e.g. a
+      // bug that never returns done:true) -- 500 calls is comfortably
+      // past what any realistic account count needs right now, and this
+      // is a manual, admin-triggered action, not something that runs
+      // unattended.
+      try {
+        while (safetyCounter < 500) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/backfill-trending', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Stopped: ' + (data.error || 'unknown error') + ' (processed ' + accountsDone + ' account' + (accountsDone === 1 ? '' : 's') + ')';
+            break;
+          }
+          if (data.done) {
+            status.textContent = 'Done \u2014 processed ' + accountsDone + ' account' + (accountsDone === 1 ? '' : 's') + ', ' + titlesDone + ' title update' + (titlesDone === 1 ? '' : 's') + '.';
+            break;
+          }
+          accountsDone += data.accountsThisCall || 0;
+          titlesDone += data.titlesThisCall || 0;
+          status.textContent = 'Working\u2026 ' + accountsDone + ' account' + (accountsDone === 1 ? '' : 's') + ' processed so far.';
+        }
+      } catch (e) {
+        status.textContent = 'Stopped: network error (processed ' + accountsDone + ' accounts).';
+      }
+      btn.disabled = false;
+      loadTrendingData();
+    }
+
+    // Same shape as runBackfillTrending just above -- see
+    // /admin/api/migrate-day-counts's own comment for what this is
+    // actually migrating and why.
+    async function runMigrateDayCounts() {
+      const btn = document.getElementById('migrateDayCountsBtn');
+      const status = document.getElementById('migrateDayCountsStatus');
+      btn.disabled = true;
+      let keysMigrated = 0;
+      let safetyCounter = 0;
+      try {
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/migrate-day-counts', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Stopped: ' + (data.error || 'unknown error') + ' (migrated ' + keysMigrated + ' day-count' + (keysMigrated === 1 ? '' : 's') + ')';
+            break;
+          }
+          if (data.done) {
+            status.textContent = 'Done \u2014 migrated ' + keysMigrated + ' old day-count' + (keysMigrated === 1 ? '' : 's') + ' into the new format.';
+            break;
+          }
+          keysMigrated += data.keysMigratedThisCall || 0;
+          status.textContent = 'Working\u2026 ' + keysMigrated + ' day-count' + (keysMigrated === 1 ? '' : 's') + ' migrated so far.';
+        }
+      } catch (e) {
+        status.textContent = 'Stopped: network error (migrated ' + keysMigrated + ' day-counts).';
+      }
+      btn.disabled = false;
+      loadTrendingData();
+      if (typeof loadSearchData === 'function') loadSearchData();
+    }
+
+    // Like the loops above, /admin/api/migrate-d1 now does one bounded chunk
+    // per call rather than the whole sweep -- see its own comment for why a
+    // single pass could not survive a site large enough to need migrating --
+    // so this keeps calling until it reports done. The results object comes
+    // back cumulative for the whole run, so the final response already holds
+    // the totals and there is nothing to add up here.
+    //
+    // No backticks in this function, or anywhere else inside
+    // renderAdminDashboard's returned template literal: everything from that
+    // opening backtick onwards is string content, so one here would close the
+    // template early and break the whole admin page. (The module-scope
+    // helpers at the top of this file are ordinary JS and do use them.)
+    async function runMigrateD1() {
+      const btn = document.getElementById('migrateD1Btn');
+      const status = document.getElementById('migrateD1Status');
+      btn.disabled = true;
+      status.textContent = 'Working\u2026 this can take a moment on a large site.';
+      let safetyCounter = 0;
+      try {
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/migrate-d1', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            break;
+          }
+          const r = data.results || {};
+          if (!data.done) {
+            status.textContent = 'Working\u2026 ' + (data.scanned || 0) + ' key' + ((data.scanned || 0) === 1 ? '' : 's') +
+              ' scanned, ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ' and ' +
+              (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ' migrated so far.';
+            continue;
+          }
+          const errCount = (r.errors || []).length;
+          status.textContent = 'Done \u2014 ' + (r.creators || 0) + ' creator' + ((r.creators || 0) === 1 ? '' : 's') + ', ' +
+            (r.lists || 0) + ' list' + ((r.lists || 0) === 1 ? '' : 's') + ', ' +
+            (r.sourcegroups || 0) + ' source group' + ((r.sourcegroups || 0) === 1 ? '' : 's') + ', ' +
+            (r.feedback || 0) + ' feedback, ' +
+            (r.tracking || 0) + ' tracking migrated' +
+            (errCount ? (', ' + errCount + ' error' + (errCount === 1 ? '' : 's') + ' (see console)') : '') + '.';
+          if (errCount) console.error('migrate-d1 errors:', r.errors);
+          break;
+        }
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Browsing one creator's stored list records.
+    //
+    // The delete below takes exact slugs, and until now nothing here could
+    // tell you what they were: the creator's own dashboard is the only place
+    // that lists them, an admin cannot open it, and the slugs of a duplicate
+    // run (coming-of-age-3 ... coming-of-age-53) are not guessable. Typing the
+    // base name deletes exactly one of fifty-three.
+    //
+    // Kept in memory rather than re-fetched on every keystroke: the filter
+    // below is a view of what has already been loaded, and paging with "Load
+    // more" appends to it.
+    let creatorListsLoaded = [];
+    let creatorListsCursor = null;
+    let creatorListsUser = '';
+
+    function creatorListsFilterText() {
+      return (document.getElementById('creatorListsFilterInput').value || '').trim().toLowerCase();
+    }
+
+    // Matched against name AND slug, and with spaces treated as the hyphens a
+    // slug actually uses -- someone hunting "coming of age" is typing the
+    // list's name, not "coming-of-age".
+    function creatorListMatchesFilter(L, q) {
+      if (!q) return true;
+      const name = String(L.name || '').toLowerCase();
+      const slug = String(L.slug || '').toLowerCase();
+      const dashed = q.replace(/\\s+/g, '-');
+      return name.indexOf(q) !== -1 || slug.indexOf(q) !== -1 || slug.indexOf(dashed) !== -1;
+    }
+
+    function shownCreatorLists() {
+      const q = creatorListsFilterText();
+      return creatorListsLoaded.filter(function (L) { return creatorListMatchesFilter(L, q); });
+    }
+
+    function renderCreatorListsTable() {
+      const results = document.getElementById('creatorListsResults');
+      const status = document.getElementById('creatorListsStatus');
+      if (!creatorListsLoaded.length) {
+        results.innerHTML = '';
+        return;
+      }
+      const shown = shownCreatorLists();
+      if (!shown.length) {
+        results.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No list matches that filter.</p>';
+      } else {
+        const rows = shown.map(function (L) {
+          const vis = L.visibility ? escapeHtmlAdmin(L.visibility) : 'unreadable';
+          // A record the creator's own dashboard cannot see, because its
+          // order entry was lost. These are the ones that get re-uploaded and
+          // re-duplicated, so they are worth calling out rather than hiding.
+          const orphan = L.inOrder ? '' :
+            '<span title="not in this creator\\'s display order" style="color:#FF9500;"> orphan</span>';
+          return '<tr>' +
+            '<td style="padding:4px 8px 4px 0;"><button type="button" class="admin-select" data-creator-slug="' +
+              escapeHtmlAdmin(L.slug) + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem;">Select</button></td>' +
+            '<td style="padding:4px 8px 4px 0;"><code>' + escapeHtmlAdmin(L.slug) + '</code>' + orphan + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(L.name) + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(L.itemCount) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + vis + '</td>' +
+            '<td style="padding:4px 0;"><a href="' + escapeHtmlAdmin(L.url) + '" target="_blank" rel="noopener">open</a></td>' +
+            '</tr>';
+        }).join('');
+        results.innerHTML = '<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+          '<thead><tr style="color:#8E8E93; text-align:left;">' +
+          '<th></th><th style="padding-right:8px;">Slug</th><th style="padding-right:8px;">Name</th>' +
+          '<th style="padding-right:8px; text-align:right;">Items</th>' +
+          '<th style="padding-right:8px;">Visibility</th><th></th>' +
+          '</tr></thead><tbody>' + rows + '</tbody></table>';
+      }
+      const q = creatorListsFilterText();
+      status.textContent = creatorListsLoaded.length + ' list' + (creatorListsLoaded.length === 1 ? '' : 's') +
+        ' loaded for "' + creatorListsUser + '"' +
+        (q ? (', ' + shown.length + ' matching') : '') +
+        (creatorListsCursor ? ', more available.' : '.');
+    }
+
+    async function loadCreatorLists(reset) {
+      const btn = document.getElementById('browseCreatorListsBtn');
+      const moreBtn = document.getElementById('browseCreatorListsMoreBtn');
+      const status = document.getElementById('creatorListsStatus');
+      const username = (document.getElementById('deleteListUserInput').value || '').trim();
+      if (!username) {
+        status.textContent = 'Enter a creator username first.';
+        return;
+      }
+      // Switching creator without resetting would mix two accounts' slugs
+      // into one selection, and this is a delete tool.
+      if (reset || username !== creatorListsUser) {
+        creatorListsLoaded = [];
+        creatorListsCursor = null;
+        creatorListsUser = username;
+        document.getElementById('creatorListsResults').innerHTML = '';
+        moreBtn.hidden = true;
+      }
+      btn.disabled = true;
+      moreBtn.disabled = true;
+      status.textContent = 'Loading…';
+      try {
+        const qs = '?username=' + encodeURIComponent(username) + '&limit=200' +
+          (creatorListsCursor ? '&cursor=' + encodeURIComponent(creatorListsCursor) : '');
+        const res = await fetch('/admin/api/creator-lists' + qs);
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          return;
+        }
+        if (data.username && data.username !== username) {
+          document.getElementById('deleteListUserInput').value = data.username;
+          creatorListsUser = data.username;
+        }
+        creatorListsLoaded = creatorListsLoaded.concat(data.lists || []);
+        creatorListsCursor = data.cursor || null;
+        moreBtn.hidden = !creatorListsCursor;
+        renderCreatorListsTable();
+        if (!creatorListsLoaded.length) {
+          document.getElementById('creatorListsResults').innerHTML =
+            '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">This creator has no stored lists.</p>';
+        }
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      } finally {
+        btn.disabled = false;
+        moreBtn.disabled = false;
+      }
+    }
+
+    // Fills the slug box rather than deleting, exactly as the anonymous browse
+    // does: a one-click delete next to a browse list is how the wrong list
+    // gets removed. The delete button still asks, and still names what it is
+    // about to remove.
+    function setSelectedCreatorSlugs(slugs) {
+      const input = document.getElementById('deleteListSlugsInput');
+      input.value = slugs.join(', ');
+      document.getElementById('deleteListStatus').textContent =
+        slugs.length + ' slug' + (slugs.length === 1 ? '' : 's') + ' selected.';
+    }
+
+    function currentSelectedCreatorSlugs() {
+      const input = document.getElementById('deleteListSlugsInput');
+      return (input.value || '').split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+    }
+
+    function selectShownCreatorLists() {
+      const shown = shownCreatorLists();
+      if (!shown.length) {
+        document.getElementById('deleteListStatus').textContent = 'Nothing shown to select.';
+        return;
+      }
+      const current = currentSelectedCreatorSlugs();
+      shown.forEach(function (L) {
+        if (current.indexOf(L.slug) === -1) current.push(L.slug);
+      });
+      setSelectedCreatorSlugs(current);
+    }
+
+    function clearSelectedCreatorLists() {
+      setSelectedCreatorSlugs([]);
+      document.getElementById('deleteListStatus').textContent = 'Selection cleared.';
+    }
+
+    document.getElementById('creatorListsResults').addEventListener('click', function (ev) {
+      const btn = ev.target.closest('[data-creator-slug]');
+      if (!btn) return;
+      const slug = btn.getAttribute('data-creator-slug');
+      const current = currentSelectedCreatorSlugs();
+      if (current.indexOf(slug) === -1) current.push(slug);
+      setSelectedCreatorSlugs(current);
+    });
+
+    // Irreversible, so it asks first and names exactly what it is about to
+    // remove. The endpoint caps each call (ADMIN_LIST_DELETE_MAX), so a bigger
+    // cleanup is sent as several batches here rather than rejected.
+    async function runDeleteCreatorLists() {
+      const btn = document.getElementById('deleteListBtn');
+      const status = document.getElementById('deleteListStatus');
+      const username = (document.getElementById('deleteListUserInput').value || '').trim();
+      const rawSlugs = (document.getElementById('deleteListSlugsInput').value || '').trim();
+      if (!username || !rawSlugs) {
+        status.textContent = 'Enter a username and at least one slug.';
+        return;
+      }
+      const slugs = rawSlugs.split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (!slugs.length) {
+        status.textContent = 'Enter at least one slug.';
+        return;
+      }
+      const ok = confirm('Permanently delete ' + slugs.length + ' list' + (slugs.length === 1 ? '' : 's') +
+        ' belonging to "' + username + '"?\\n\\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
+        '\\n\\nThis cannot be undone.');
+      if (!ok) return;
+
+      btn.disabled = true;
+      const BATCH = 50;
+      let deleted = 0;
+      let missing = 0;
+      let remaining = null;
+      try {
+        for (let i = 0; i < slugs.length; i += BATCH) {
+          const batch = slugs.slice(i, i + BATCH);
+          status.textContent = 'Deleting\u2026 ' + (deleted + missing) + ' of ' + slugs.length + ' processed.';
+          const res = await fetch('/admin/api/delete-creator-list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: username, slugs: batch }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            // The endpoint reports what it managed to remove even when the
+            // sweep as a whole failed -- most often the records are gone and
+            // only the directory cleanup did not finish. Saying just "Failed"
+            // hid that difference, so a delete that had actually worked read
+            // as one that had not, and got retried forever.
+            deleted += (data.deleted || []).length;
+            missing += (data.missing || []).length;
+            const detail = (data.remaining === null || data.remaining === undefined)
+              ? ''
+              : (' ' + data.remaining + ' list' + (data.remaining === 1 ? '' : 's') + ' left for this creator.');
+            status.textContent = 'Failed: ' + (data.error || 'unknown error') +
+              ' (removed ' + deleted + ' before stopping.' + detail + ')';
+            btn.disabled = false;
+            return;
+          }
+          deleted += (data.deleted || []).length;
+          missing += (data.missing || []).length;
+          remaining = data.remaining;
+        }
+        status.textContent = 'Done \u2014 deleted ' + deleted + ', cleared ' + missing +
+          ' stale directory entr' + (missing === 1 ? 'y' : 'ies') +
+          (remaining === null ? '.' : ('. ' + remaining + ' list' + (remaining === 1 ? '' : 's') + ' left for this creator.'));
+        document.getElementById('deleteListSlugsInput').value = '';
+        await loadCreatorLists(true);
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Anonymous published lists (publishedlist:user:*). These have no owner,
+    // so runDeleteCreatorLists above cannot reach them -- it requires a
+    // creator username, and "user" is a reserved one. The keyspace is
+    // unbounded by construction, so this pages rather than scanning: the
+    // cursor is kept here between calls and "Load more" continues it.
+    let anonListCursor = null;
+    let anonListCount = 0;
+
+    async function loadPublishedLists(reset) {
+      const btn = document.getElementById('browseAnonBtn');
+      const moreBtn = document.getElementById('browseAnonMoreBtn');
+      const status = document.getElementById('anonListStatus');
+      const results = document.getElementById('anonListResults');
+      if (reset) {
+        anonListCursor = null;
+        anonListCount = 0;
+        results.innerHTML = '';
+        moreBtn.hidden = true;
+      }
+      btn.disabled = true;
+      moreBtn.disabled = true;
+      status.textContent = 'Loading\u2026';
+      try {
+        const qs = '?limit=50' + (anonListCursor ? '&cursor=' + encodeURIComponent(anonListCursor) : '');
+        const res = await fetch('/admin/api/published-lists' + qs);
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          moreBtn.disabled = false;
+          return;
+        }
+        const lists = data.lists || [];
+        anonListCount += lists.length;
+        if (!anonListCount) {
+          results.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">No anonymously published lists.</p>';
+        } else {
+          const rows = lists.map(function (L) {
+            const vis = L.visibility ? escapeHtmlAdmin(L.visibility) : 'unreadable';
+            return '<tr>' +
+              '<td style="padding:4px 8px 4px 0;"><button type="button" class="admin-select" data-anon-slug="' +
+                escapeHtmlAdmin(L.slug) + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem;">Select</button></td>' +
+              '<td style="padding:4px 8px 4px 0;"><code>' + escapeHtmlAdmin(L.slug) + '</code></td>' +
+              '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(L.name) + '</td>' +
+              '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(L.itemCount) || 0) + '</td>' +
+              '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(L.likes) || 0) + '</td>' +
+              '<td style="padding:4px 8px 4px 0;">' + vis + '</td>' +
+              '<td style="padding:4px 0;"><a href="' + escapeHtmlAdmin(L.url) + '" target="_blank" rel="noopener">open</a></td>' +
+              '</tr>';
+          }).join('');
+          if (reset || !results.querySelector('tbody')) {
+            results.innerHTML = '<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+              '<thead><tr style="color:#8E8E93; text-align:left;">' +
+              '<th></th><th style="padding-right:8px;">Slug</th><th style="padding-right:8px;">Name</th>' +
+              '<th style="padding-right:8px; text-align:right;">Items</th>' +
+              '<th style="padding-right:8px; text-align:right;">Likes</th>' +
+              '<th style="padding-right:8px;">Visibility</th><th></th>' +
+              '</tr></thead><tbody>' + rows + '</tbody></table>';
+          } else {
+            results.querySelector('tbody').insertAdjacentHTML('beforeend', rows);
+          }
+        }
+        anonListCursor = data.cursor || null;
+        moreBtn.hidden = !anonListCursor;
+        status.textContent = anonListCount + ' list' + (anonListCount === 1 ? '' : 's') + ' shown' +
+          (anonListCursor ? ', more available.' : '. That is all of them.');
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+      moreBtn.disabled = false;
+    }
+
+    // "Select" fills the slug box rather than deleting directly: a one-click
+    // delete next to a browse list is how the wrong list gets removed.
+    document.getElementById('anonListResults').addEventListener('click', function (ev) {
+      const btn = ev.target.closest('[data-anon-slug]');
+      if (!btn) return;
+      const input = document.getElementById('deleteAnonSlugsInput');
+      const slug = btn.getAttribute('data-anon-slug');
+      const current = (input.value || '').split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (current.indexOf(slug) === -1) current.push(slug);
+      input.value = current.join(', ');
+      document.getElementById('deleteAnonStatus').textContent = current.length + ' slug' + (current.length === 1 ? '' : 's') + ' selected.';
+    });
+
+    // Same shape as runDeleteCreatorLists: irreversible, so it names what it
+    // is about to remove, and batches to ADMIN_LIST_DELETE_MAX per call.
+    async function runDeletePublishedLists() {
+      const btn = document.getElementById('deleteAnonBtn');
+      const status = document.getElementById('deleteAnonStatus');
+      const raw = (document.getElementById('deleteAnonSlugsInput').value || '').trim();
+      const slugs = raw.split(/[\\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
+      if (!slugs.length) {
+        status.textContent = 'Enter at least one slug.';
+        return;
+      }
+      const ok = confirm('Permanently delete ' + slugs.length + ' anonymously published list' +
+        (slugs.length === 1 ? '' : 's') + '?\\n\\n' + slugs.slice(0, 12).join(', ') +
+        (slugs.length > 12 ? ', and ' + (slugs.length - 12) + ' more' : '') +
+        '\\n\\nThis cannot be undone.');
+      if (!ok) return;
+
+      btn.disabled = true;
+      const BATCH = 50;
+      let deleted = 0;
+      let missing = 0;
+      try {
+        for (let i = 0; i < slugs.length; i += BATCH) {
+          const batch = slugs.slice(i, i + BATCH);
+          status.textContent = 'Deleting\u2026 ' + (deleted + missing) + ' of ' + slugs.length + ' processed.';
+          const res = await fetch('/admin/api/delete-published-list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slugs: batch }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            btn.disabled = false;
+            return;
+          }
+          deleted += (data.deleted || []).length;
+          missing += (data.missing || []).length;
+        }
+        status.textContent = 'Done \u2014 deleted ' + deleted + ', ' + missing +
+          ' slug' + (missing === 1 ? '' : 's') + ' had no list to remove.';
+        document.getElementById('deleteAnonSlugsInput').value = '';
+        if (anonListCount) await loadPublishedLists(true);
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // Reports which files under migrations/ this database has not had run,
+    // and what each omission silently costs. The consequence text is the
+    // useful part: "creator_tombstones is missing" is not something an
+    // operator can act on.
+    async function runSchemaCheck() {
+      const btn = document.getElementById('schemaCheckBtn');
+      const status = document.getElementById('schemaCheckStatus');
+      const out = document.getElementById('schemaCheckResult');
+      btn.disabled = true;
+      status.textContent = 'Checking\u2026';
+      out.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/schema-status');
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          return;
+        }
+        // The public directory index truncates silently at its entry cap --
+        // it keeps the most-liked and drops the tail, which is the right
+        // choice, but nothing said it had happened. Reported here in every
+        // branch below, because it has nothing to do with D1: a KV-only
+        // deployment can hit it too.
+        var idx = data.publicIndex;
+        var indexNote = '';
+        if (idx) {
+          var pct = idx.max ? Math.round((idx.entries / idx.max) * 100) : 0;
+          indexNote = idx.truncated
+            ? '<p style="color:#FF9500; margin:10px 0 0; font-size:0.82rem;"><strong>The public list directory is full.</strong> ' +
+              'It holds ' + idx.entries.toLocaleString() + ' of a maximum ' + idx.max.toLocaleString() +
+              ' entries, so the least-liked lists past that point are no longer being advertised. ' +
+              'They are still reachable by their own URL.</p>'
+            : '<p style="color:#8E8E93; margin:10px 0 0; font-size:0.82rem;">Public list directory: ' +
+              idx.entries.toLocaleString() + ' of ' + idx.max.toLocaleString() + ' entries (' + pct + '%).</p>';
+        }
+        if (!data.bound) {
+          status.textContent = '';
+          out.innerHTML = '<p style="color:#FF3B30; margin:0; font-size:0.82rem;"><strong>Warning: No D1 database is bound.</strong> D1 is required for authoritative accounts, lists, search, likes, feedback, and tracking. Bind a D1 database as <code>DB</code> in Cloudflare Settings &rarr; Bindings.</p>' + indexNote;
+          btn.disabled = false;
+          return;
+        }
+        if (!data.checked) {
+          status.textContent = '';
+          out.innerHTML = '<p style="color:#FF9500; margin:0; font-size:0.82rem;">Could not read the database to check' +
+            (data.error ? (': ' + escapeHtmlAdmin(data.error)) : '.') +
+            ' This is not the same as a missing migration \u2014 try again.</p>' + indexNote;
+          btn.disabled = false;
+          return;
+        }
+        var dbStats = data.databaseStats;
+        var dbStatsNote = '';
+        if (dbStats && dbStats.estimatedSizeBytes != null) {
+          var mb = (dbStats.estimatedSizeBytes / (1024 * 1024)).toFixed(2);
+          var rowsStr = dbStats.rowCounts
+            ? Object.entries(dbStats.rowCounts).map(function (e) { return e[0] + ': ' + e[1].toLocaleString(); }).join(', ')
+            : '';
+          dbStatsNote = '<p style="color:#8E8E93; margin:8px 0 0; font-size:0.82rem;">Database size: ~' +
+            mb + ' MB (' + (dbStats.pageCount || 0).toLocaleString() + ' pages &times; ' +
+            (dbStats.pageSize || 0).toLocaleString() + ' B).' +
+            (rowsStr ? ('<br><span style="font-size:0.78rem;">Rows: ' + escapeHtmlAdmin(rowsStr) + '</span>') : '') +
+            '</p>';
+        }
+        if (data.upToDate) {
+          status.textContent = '';
+          out.innerHTML = '<p style="color:#34C759; margin:0; font-size:0.82rem;">Up to date \u2014 every migration has been applied.</p>' + dbStatsNote + indexNote;
+          btn.disabled = false;
+          return;
+        }
+        const rows = (data.missing || []).map(function (m) {
+          return '<tr>' +
+            '<td style="padding:4px 10px 4px 0; vertical-align:top; white-space:nowrap;"><code>' + escapeHtmlAdmin(m.migration) + '</code></td>' +
+            '<td style="padding:4px 10px 4px 0; vertical-align:top; white-space:nowrap;"><code>' + escapeHtmlAdmin(m.name) + '</code></td>' +
+            '<td style="padding:4px 0; vertical-align:top;">' + escapeHtmlAdmin(m.consequence) + '</td>' +
+            '</tr>';
+        }).join('');
+        status.textContent = '';
+        out.innerHTML = '<p style="color:#FF9500; margin:0 0 8px; font-size:0.82rem;"><strong>This Worker is running ahead of its database.</strong> ' +
+          'Unapplied migration' + ((data.pendingMigrations || []).length === 1 ? '' : 's') + ': ' +
+          escapeHtmlAdmin((data.pendingMigrations || []).join(', ')) +
+          '. Apply the matching file(s) under <code>migrations/</code> in the D1 Console, in filename order.</p>' +
+          '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+          '<thead><tr style="color:#8E8E93; text-align:left;"><th style="padding-right:10px;">Migration</th><th style="padding-right:10px;">Missing</th><th>What does not work without it</th></tr></thead>' +
+          '<tbody>' + rows + '</tbody></table></div>' + dbStatsNote + indexNote;
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    // The endpoint does one bounded chunk per call (see its own comment for
+    // why a rebuild cannot be one pass), so this loops until it reports
+    // done -- the same shape as runMigrateDayCounts above.
+    async function runRebuildPublicIndex() {
+      const btn = document.getElementById('rebuildIndexBtn');
+      const status = document.getElementById('rebuildIndexStatus');
+      btn.disabled = true;
+      status.textContent = 'Working\u2026';
+      const started = Date.now();
+      let scanned = 0;
+      let safetyCounter = 0;
+      try {
+        while (safetyCounter < 1000) {
+          safetyCounter++;
+          const res = await fetch('/admin/api/rebuild-public-index', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) {
+            status.textContent = 'Failed: ' + (data.error || 'unknown error');
+            break;
+          }
+          scanned += data.scanned || 0;
+          if (data.done) {
+            status.textContent = 'Done \u2014 indexed ' + data.count + ' list' + (data.count === 1 ? '' : 's') +
+              ' from ' + scanned + ' record' + (scanned === 1 ? '' : 's') + ' in ' + (Date.now() - started) + 'ms.';
+            break;
+          }
+          status.textContent = 'Working\u2026 ' + scanned + ' record' + (scanned === 1 ? '' : 's') +
+            ' scanned, ' + data.count + ' indexed so far.';
+        }
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      btn.disabled = false;
+    }
+
+    async function loadApiUsage() {
+      const body = document.getElementById('apiUsageTableBody');
+      body.innerHTML = '<tr><td colspan="5">Loading\u2026</td></tr>';
+      try {
+        const res = await fetch('/admin/api/apiusage');
+        const data = await res.json();
+        if (!data.ok || !data.keys || !data.keys.length) {
+          body.innerHTML = '<tr><td colspan="5">No data yet.</td></tr>';
+          return;
+        }
+        body.innerHTML = data.keys.map((k) =>
+          '<tr>' +
+            '<td>' + escapeHtmlAdmin(k.label) + (k.configured ? '' : ' <span style="color:#FF9500;">(not set)</span>') + '</td>' +
+            '<td>' + k.last24h + '</td>' +
+            '<td>' + k.last7d + '</td>' +
+            '<td>' + k.last30d + '</td>' +
+            '<td style="color:#8E8E93;">' + escapeHtmlAdmin(k.limit) + '</td>' +
+          '</tr>'
+        ).join('');
+      } catch (e) {
+        body.innerHTML = '<tr><td colspan="5">Could not load -- try again.</td></tr>';
+      }
+    }
+
+    function netflixPreviewSectionHtml(label, section) {
+      if (!section) return '';
+      const posters = section.items.map((it) =>
+        '<div>' +
+          (it.poster
+            ? '<img class="netflix-preview-poster" src="' + escapeHtmlAdmin(it.poster) + '" alt="" loading="lazy">'
+            : '<div class="netflix-preview-poster-placeholder">No poster</div>') +
+          '<div class="netflix-preview-title">' + escapeHtmlAdmin(it.title) + '</div>' +
+          (it.date ? '<div class="netflix-preview-year">' + escapeHtmlAdmin(it.date) + '</div>' : '') +
+        '</div>'
+      ).join('');
+      return '<h3 style="margin:0 0 4px; font-size:1.05rem;">' + label + ' <span style="color:#8E8E93; font-weight:400; font-size:0.85rem;">(~' + section.total.toLocaleString() + ' total on TMDB/JustWatch, showing first ' + section.items.length + ')</span></h3>' +
+        '<div class="netflix-preview-grid">' + posters + '</div>';
+    }
+
+    async function loadNetflixPreview() {
+      const statusEl = document.getElementById('netflixPreviewStatus');
+      const moviesEl = document.getElementById('netflixPreviewMovies');
+      const showsEl = document.getElementById('netflixPreviewShows');
+      const regionInput = document.getElementById('netflixPreviewRegionInput');
+      const providerIdInput = document.getElementById('netflixPreviewProviderIdInput');
+      const region = (regionInput.value || 'US').trim().toUpperCase().slice(0, 2) || 'US';
+      const providerId = (providerIdInput.value || '8').trim() || '8';
+      statusEl.textContent = 'Loading\u2026';
+      moviesEl.innerHTML = '';
+      showsEl.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/netflix-preview?region=' + encodeURIComponent(region) + '&providerId=' + encodeURIComponent(providerId));
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not load preview.';
+          return;
+        }
+        statusEl.textContent = '';
+        moviesEl.innerHTML = netflixPreviewSectionHtml('Movies', data.movies);
+        showsEl.innerHTML = netflixPreviewSectionHtml('Shows', data.shows);
+      } catch (e) {
+        statusEl.textContent = 'Could not load -- check your connection.';
+      }
+    }
+
+    // Fills the Provider id field from a lookup result and immediately
+    // reloads the preview with it -- clicking a name found this way should
+    // just show that provider's shelf, not require a second manual click.
+    function pickProviderId(id) {
+      document.getElementById('netflixPreviewProviderIdInput').value = id;
+      loadNetflixPreview();
+    }
+
+    async function lookupProviderIds() {
+      const statusEl = document.getElementById('providerLookupStatus');
+      const resultsEl = document.getElementById('providerLookupResults');
+      const queryInput = document.getElementById('providerLookupQueryInput');
+      const regionInput = document.getElementById('netflixPreviewRegionInput');
+      const query = (queryInput.value || '').trim();
+      const region = (regionInput.value || 'US').trim().toUpperCase().slice(0, 2) || 'US';
+      statusEl.textContent = 'Searching\u2026';
+      resultsEl.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/provider-lookup?region=' + encodeURIComponent(region) + (query ? '&query=' + encodeURIComponent(query) : ''));
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not search.';
+          return;
+        }
+        statusEl.textContent = '';
+        if (!data.results.length) {
+          resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">No matches.</p>';
+          return;
+        }
+        resultsEl.innerHTML = data.results.map((p) =>
+          '<button type="button" class="admin-select" style="cursor:pointer; margin:0 6px 6px 0;" onclick="pickProviderId(' + p.id + ')">' +
+            escapeHtmlAdmin(p.name) + ' <span style="color:#8E8E93;">(' + p.id + ')</span>' +
+          '</button>'
+        ).join('');
+      } catch (e) {
+        statusEl.textContent = 'Could not search -- check your connection.';
+      }
+    }
+
+    // feedbackEntries is the client's local copy of the list, kept in sync
+    // with the server -- submitAdminFeedback and toggleFeedbackStatus both
+    // mutate this array and re-render immediately (optimistic), then send
+    // the real change to the server in the background, only reaching back
+    // into the DOM again if that background call fails and the local
+    // change needs to be rolled back.
+    let feedbackEntries = [];
+    let feedbackTruncated = false;
+
+    async function loadFeedback() {
+      const box = document.getElementById('feedbackList');
+      box.textContent = 'Loading\u2026';
+      try {
+        const res = await fetch('/admin/api/feedback');
+        const data = await res.json();
+        if (!data.ok) {
+          box.innerHTML = '<p style="color:#FF3B30;">Could not load feedback -- try again.</p>';
+          return;
+        }
+        feedbackEntries = data.entries || [];
+        feedbackTruncated = !!data.truncated;
+        renderFeedbackList();
+      } catch (e) {
+        box.innerHTML = '<p style="color:#FF3B30;">Could not load feedback -- try again.</p>';
+      }
+    }
+
+    // Pure render of whatever's currently in feedbackEntries -- called
+    // after the initial load, and again (instantly, no fetch) any time
+    // submitAdminFeedback/toggleFeedbackStatus change that array so the
+    // list reflects the change right away instead of waiting on a round
+    // trip back to the server.
+    function renderFeedbackList() {
+      const box = document.getElementById('feedbackList');
+      if (!box) return;
+      if (!feedbackEntries.length) {
+        box.innerHTML = '<p style="color:#8E8E93;">No feedback yet.</p>';
+        return;
+      }
+      const open = feedbackEntries.filter((f) => !f.completed);
+      const done = feedbackEntries.filter((f) => f.completed);
+      box.innerHTML = open.map(feedbackCardHtml).join('') +
+        (done.length ? '<h3 style="margin:20px 0 4px; font-size:0.95rem; color:#8E8E93;">Completed</h3>' + done.map(feedbackCardHtml).join('') : '') +
+        (feedbackTruncated ? '<p style="color:#8E8E93; font-size:0.85rem;">Showing the most recent 300.</p>' : '');
+      initFeedbackListEvents();
+    }
+
+    function feedbackCardHtml(f) {
+      const cat = ['bug', 'improvement', 'idea', 'other'].includes(f.category) ? f.category : 'other';
+      const when = f.createdAt ? new Date(f.createdAt).toLocaleString('en-US', { timeZone: 'America/New_York', dateStyle: 'medium', timeStyle: 'short' }) : '';
+      const isSelfLogged = f.creatorName === 'admin';
+      // Already escaped here, so every use of it below must NOT escape it
+      // again -- the reply placeholder did, and rendered a creator called
+      // A&B as A&amp;B. (No backticks in this function: everything from
+      // renderAdminDashboard's opening backtick onwards is string content.)
+      const who = isSelfLogged ? 'admin (self-logged)' : (f.creatorName ? escapeHtmlAdmin(f.creatorName) : 'anonymous');
+      const contact = f.contact ? ' \u2014 ' + escapeHtmlAdmin(f.contact) : '';
+      const completed = !!f.completed;
+      const statusLabel = (!isSelfLogged && f.status === 'replied')
+        ? '<span class="admin-badge improvement" style="margin-left:6px;">Replied</span>'
+        : (completed ? '<span class="admin-badge other" style="margin-left:6px;">Resolved</span>' : '<span class="admin-badge bug" style="margin-left:6px;">Open</span>');
+
+      const messages = Array.isArray(f.messages) && f.messages.length
+        ? f.messages
+        : [{
+            id: 'msg_init',
+            sender: isSelfLogged ? 'admin' : 'user',
+            senderName: isSelfLogged ? 'Admin' : (f.creatorName || 'User'),
+            text: f.message || '',
+            timestamp: f.createdAt || Date.now()
+          }];
+
+      const messagesHtml = messages.map((m) => {
+        const isAdmin = m.sender === 'admin';
+        const sender = isAdmin ? '\uD83D\uDC68\u200D\uD83D\uDCBB Developer (Admin)' : (m.senderName || who);
+        const mTime = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+        const bg = isAdmin ? 'rgba(0,122,255,0.08)' : 'rgba(255,255,255,0.04)';
+        const border = isAdmin ? 'rgba(0,122,255,0.25)' : 'var(--border)';
+        return '<div style="margin-top:6px; padding:8px 12px; border-radius:8px; background:' + bg + '; border:1px solid ' + border + ';">' +
+          '<div style="display:flex; justify-content:space-between; font-size:0.75rem; font-weight:700; color:' + (isAdmin ? 'var(--accent)' : 'var(--text)') + ';">' +
+            '<span>' + escapeHtmlAdmin(sender) + '</span>' +
+            '<span style="color:var(--muted); font-weight:normal;">' + escapeHtmlAdmin(mTime) + '</span>' +
+          '</div>' +
+          '<div style="margin-top:4px; font-size:0.88rem; white-space:pre-wrap; word-break:break-word; color:var(--text);">' + escapeHtmlAdmin(m.text || '') + '</div>' +
+        '</div>';
+      }).join('');
+
+      return '<div class="feedback-card' + (completed ? ' completed' : '') + '" id="feedbackCard_' + escapeHtmlAdmin(f.id) + '">' +
+        '<div class="feedback-card-header">' +
+          '<div>' +
+            '<span class="admin-badge ' + cat + '">' + cat + '</span>' +
+            statusLabel +
+          '</div>' +
+          '<div class="feedback-actions">' +
+            '<button type="button" class="admin-select fb-copy-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="margin:0; cursor:pointer;">&#x2398; Copy</button>' +
+            '<button type="button" class="admin-select fb-edit-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="margin:0; cursor:pointer;">&#x270E; Edit</button>' +
+            '<button type="button" class="admin-select fb-status-btn" data-id="' + escapeHtmlAdmin(f.id) + '" data-completed="' + (!completed) + '" style="margin:0; cursor:pointer;">' +
+              (completed ? '\u21a9 Reopen' : '\u2713 Mark done') +
+            '</button>' +
+            '<button type="button" class="admin-select fb-delete-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="margin:0; cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.3);">&#x2715; Delete</button>' +
+          '</div>' +
+        '</div>' +
+        '<div style="margin-top:10px;">' + messagesHtml + '</div>' +
+        '<div class="feedback-meta" style="margin-top:8px;">' + when + ' \u2014 ' + who + contact + '</div>' +
+        (!isSelfLogged ?
+          '<div style="margin-top:10px; display:flex; gap:8px; align-items:center;">' +
+            '<input type="text" id="adminReplyInput_' + escapeHtmlAdmin(f.id) + '" class="admin-select fb-reply-input" data-id="' + escapeHtmlAdmin(f.id) + '" style="flex:1; margin-right:0; padding:8px 10px;" placeholder="Type reply to ' + who + '...">' +
+            '<button type="button" class="secondary lc-btn fb-reply-btn" data-id="' + escapeHtmlAdmin(f.id) + '" style="padding:6px 14px; font-size:0.82rem;">Reply</button>' +
+          '</div>' : ''
+        ) +
+      '</div>';
+    }
+
+    function initFeedbackListEvents() {
+      const listEl = document.getElementById('feedbackList');
+      if (!listEl || listEl._eventsBound) return;
+      listEl._eventsBound = true;
+
+      listEl.addEventListener('click', (e) => {
+        const replyBtn = e.target.closest('.fb-reply-btn');
+        if (replyBtn) {
+          sendAdminFeedbackReply(replyBtn.dataset.id);
+          return;
+        }
+        const copyBtn = e.target.closest('.fb-copy-btn');
+        if (copyBtn) {
+          copyFeedbackMessage(copyBtn, copyBtn.dataset.id);
+          return;
+        }
+        const editBtn = e.target.closest('.fb-edit-btn');
+        if (editBtn) {
+          openEditFeedbackModal(editBtn.dataset.id);
+          return;
+        }
+        const statusBtn = e.target.closest('.fb-status-btn');
+        if (statusBtn) {
+          toggleFeedbackStatus(statusBtn.dataset.id, statusBtn.dataset.completed === 'true');
+          return;
+        }
+        const deleteBtn = e.target.closest('.fb-delete-btn');
+        if (deleteBtn) {
+          deleteFeedbackEntry(deleteBtn.dataset.id);
+          return;
+        }
+      });
+
+      listEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          const input = e.target.closest('.fb-reply-input');
+          if (input) {
+            e.preventDefault();
+            sendAdminFeedbackReply(input.dataset.id);
+          }
+        }
+      });
+    }
+
+    async function sendAdminFeedbackReply(id) {
+      const input = document.getElementById('adminReplyInput_' + id);
+      const text = (input ? input.value : '').trim();
+      if (!text) return;
+      input.disabled = true;
+
+      try {
+        const res = await fetch('/admin/api/feedback/reply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, message: text }),
+        });
+        const data = await res.json().catch(() => null);
+        if (data && data.ok && data.entry) {
+          const idx = feedbackEntries.findIndex((f) => f.id === id);
+          if (idx !== -1) {
+            feedbackEntries[idx] = data.entry;
+          }
+          renderFeedbackList();
+        } else {
+          showAdminAlert('Reply Failed', (data && data.error) || 'Could not send reply.', false);
+          if (input) input.disabled = false;
+        }
+      } catch (e) {
+        showAdminAlert('Connection Error', 'Could not send reply -- check your connection.', false);
+        if (input) input.disabled = false;
+      }
+    }
+
+    // Lets the admin log an issue directly from the dashboard, without
+    // going through Settings > Feedback -- posts to the same /api/feedback
+    // endpoint real users hit, just tagged so it's obviously self-logged
+    // in the list below. Optimistic: the card appears the instant this
+    // function runs, built from a temporary client-side id, and is
+    // swapped for the server's real entry once the save actually
+    // completes (or removed again if it fails).
+    async function submitAdminFeedback() {
+      const category = document.getElementById('newFeedbackCategory').value;
+      const messageBox = document.getElementById('newFeedbackMessage');
+      const message = messageBox.value.trim();
+      const status = document.getElementById('newFeedbackStatus');
+      const btn = document.getElementById('newFeedbackSubmitBtn');
+      if (!message) {
+        status.textContent = 'Type something first.';
+        return;
+      }
+      btn.disabled = true;
+
+      const tempId = 'temp:' + Date.now() + ':' + Math.random().toString(36).slice(2, 8);
+      const optimisticEntry = {
+        id: tempId,
+        category: category,
+        message: message,
+        contact: null,
+        creatorName: 'admin',
+        createdAt: Date.now(),
+        completed: false,
+      };
+      feedbackEntries.unshift(optimisticEntry);
+      renderFeedbackList();
+      messageBox.value = '';
+      status.textContent = 'Saving\u2026';
+
+      try {
+        const res = await fetch('/api/feedback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // fromAdminPanel: true is the deliberate signal that this
+          // request really is the admin dashboard's own "Log something
+          // yourself" feature, not just any page that happens to load in
+          // a browser that also has a valid admin cookie. /api/feedback
+          // is the same public endpoint the regular addon's Settings page
+          // posts to -- without this flag, isAdmin there was based on
+          // cookie presence alone, so testing the public feedback UI
+          // (e.g. under a different Creator Profile/persona) in the same
+          // browser as an active admin session got every message
+          // mislabeled as sent by "Developer" instead of that persona.
+          body: JSON.stringify({ category: category, message: message, creatorName: 'admin', fromAdminPanel: true }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          feedbackEntries = feedbackEntries.filter((f) => f.id !== tempId);
+          renderFeedbackList();
+          messageBox.value = message;
+          status.textContent = (data && data.error) || 'Could not save -- try again.';
+          btn.disabled = false;
+          return;
+        }
+        // Swap the temp id for the server's real one -- otherwise a Mark
+        // Completed click on this card would send an id the server has
+        // never heard of.
+        if (data.entry && data.entry.id) {
+          const idx = feedbackEntries.findIndex((f) => f.id === tempId);
+          if (idx !== -1) {
+            feedbackEntries[idx] = data.entry;
+            renderFeedbackList();
+          }
+        }
+        status.textContent = 'Added.';
+      } catch (e) {
+        feedbackEntries = feedbackEntries.filter((f) => f.id !== tempId);
+        renderFeedbackList();
+        messageBox.value = message;
+        status.textContent = 'Could not save -- check your connection.';
+      }
+      btn.disabled = false;
+    }
+
+    function closeAdminModal() {
+      const existing = document.getElementById('activeAdminModalOverlay');
+      if (existing) existing.remove();
+    }
+
+    function showAdminModal(innerHtml) {
+      closeAdminModal();
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      overlay.id = 'activeAdminModalOverlay';
+      overlay.innerHTML = '<div class="modal-card"><div class="modal-body">' + innerHtml + '</div></div>';
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) closeAdminModal();
+      });
+      document.body.appendChild(overlay);
+    }
+
+    function showAdminAlert(title, message, isSuccess = false) {
+      const icon = isSuccess ? '\u2713' : '\u2715';
+      const iconColor = isSuccess ? 'var(--success, #34C759)' : 'var(--danger, #FF3B30)';
+      const html =
+        '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">' +
+          '<h3 style="margin:0; font-size:1.15rem; font-weight:700; display:flex; align-items:center; gap:8px; color:var(--text);">' +
+            '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
+            escapeHtmlAdmin(title) +
+          '</h3>' +
+          '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeAdminModal()">\u2715</button>' +
+        '</div>' +
+        '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
+        '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
+          '<button type="button" class="lc-btn primary" onclick="closeAdminModal()" style="min-width:80px;">OK</button>' +
+        '</div>';
+      showAdminModal(html);
+    }
+
+    function showAdminConfirm(title, message, confirmBtnText, onConfirm, isDanger = true) {
+      const icon = isDanger ? '\u26A0' : '?';
+      const iconColor = isDanger ? 'var(--danger, #FF3B30)' : 'var(--accent, #007AFF)';
+      const btnClass = isDanger ? 'lc-btn danger' : 'lc-btn primary';
+      const html =
+        '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">' +
+          '<h3 style="margin:0; font-size:1.15rem; font-weight:700; display:flex; align-items:center; gap:8px; color:var(--text);">' +
+            '<span style="color:' + iconColor + '; font-weight:bold; font-size:1.2rem;">' + icon + '</span> ' +
+            escapeHtmlAdmin(title) +
+          '</h3>' +
+          '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeAdminModal()">\u2715</button>' +
+        '</div>' +
+        '<p style="margin:0 0 18px; color:var(--muted); font-size:0.92rem; line-height:1.45; white-space:pre-wrap;">' + escapeHtmlAdmin(message) + '</p>' +
+        '<div style="display:flex; justify-content:flex-end; gap:10px;">' +
+          '<button type="button" class="lc-btn secondary" onclick="closeAdminModal()">Cancel</button>' +
+          '<button type="button" class="' + btnClass + '" id="adminConfirmOkBtn">' + escapeHtmlAdmin(confirmBtnText || 'Confirm') + '</button>' +
+        '</div>';
+      showAdminModal(html);
+      document.getElementById('adminConfirmOkBtn')?.addEventListener('click', () => {
+        closeAdminModal();
+        if (typeof onConfirm === 'function') onConfirm();
+      });
+    }
+
+    // Optimistic: flips the entry's completed flag (and re-renders,
+    // moving the card between the Open/Completed groups) the instant
+    // it's clicked, then sends the real change to the server in the
+    // background. Rolled back to whatever the server still actually has
+    // if that background call fails.
+    async function toggleFeedbackStatus(id, completed) {
+      const idx = feedbackEntries.findIndex((f) => f.id === id);
+      if (idx === -1) return;
+      const previousCompleted = feedbackEntries[idx].completed;
+      feedbackEntries[idx] = Object.assign({}, feedbackEntries[idx], { completed: completed });
+      renderFeedbackList();
+      try {
+        const res = await fetch('/admin/api/feedback/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id, completed: completed }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          const stillIdx = feedbackEntries.findIndex((f) => f.id === id);
+          if (stillIdx !== -1) {
+            feedbackEntries[stillIdx] = Object.assign({}, feedbackEntries[stillIdx], { completed: previousCompleted });
+            renderFeedbackList();
+          }
+          const err = (data && data.error) || 'Could not update -- try again.';
+          showAdminAlert(err === 'Not authorized.' ? 'Not Authorized' : 'Update Failed', err, false);
+          return;
+        }
+      } catch (e) {
+        const stillIdx = feedbackEntries.findIndex((f) => f.id === id);
+        if (stillIdx !== -1) {
+          feedbackEntries[stillIdx] = Object.assign({}, feedbackEntries[stillIdx], { completed: previousCompleted });
+          renderFeedbackList();
+        }
+        showAdminAlert('Connection Error', 'Could not update -- check your connection.', false);
+      }
+    }
+
+    function openEditFeedbackModal(id) {
+      const entry = feedbackEntries.find((f) => f.id === id);
+      if (!entry) return;
+      document.getElementById('editFeedbackId').value = entry.id;
+      document.getElementById('editFeedbackCategory').value = entry.category || 'other';
+      document.getElementById('editFeedbackMessage').value = entry.message || '';
+      document.getElementById('editFeedbackSaveBtn').disabled = false;
+      document.getElementById('editFeedbackSaveBtn').textContent = 'Save Changes';
+      document.getElementById('editFeedbackModal').style.display = 'flex';
+    }
+
+    function closeEditFeedbackModal() {
+      document.getElementById('editFeedbackModal').style.display = 'none';
+    }
+
+    async function saveEditFeedback() {
+      const id = document.getElementById('editFeedbackId').value;
+      const category = document.getElementById('editFeedbackCategory').value;
+      const message = document.getElementById('editFeedbackMessage').value.trim();
+      const saveBtn = document.getElementById('editFeedbackSaveBtn');
+      if (!message) {
+        showAdminAlert('Missing Message', 'Please enter a message.', false);
+        return;
+      }
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving\u2026';
+      try {
+        const res = await fetch('/admin/api/feedback/edit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, category, message }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!data || !data.ok) {
+          const err = (data && data.error) || 'Could not save feedback edits.';
+          showAdminAlert(err === 'Not authorized.' ? 'Not Authorized' : 'Save Error', err, false);
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save Changes';
+          return;
+        }
+        const idx = feedbackEntries.findIndex((f) => f.id === id);
+        if (idx !== -1 && data.entry) {
+          feedbackEntries[idx] = data.entry;
+          renderFeedbackList();
+        }
+        closeEditFeedbackModal();
+      } catch (err) {
+        showAdminAlert('Network Error', 'Network error while saving feedback edits.', false);
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save Changes';
+      }
+    }
+
+    async function copyFeedbackMessage(btn, id) {
+      const entry = feedbackEntries.find((f) => f.id === id);
+      let text = '';
+      if (entry) {
+        if (Array.isArray(entry.messages) && entry.messages.length) {
+          text = entry.messages.map((m) => m.text).join('\\n\\n');
+        } else {
+          text = entry.message || '';
+        }
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        const prevText = btn.innerHTML;
+        btn.innerHTML = '&#x2713; Copied!';
+        btn.style.color = '#34C759';
+        setTimeout(() => {
+          btn.innerHTML = prevText;
+          btn.style.color = '';
+        }, 1800);
+      } catch (e) {
+        showAdminAlert('Copy Failed', 'Could not copy message to clipboard.', false);
+      }
+    }
+
+    async function deleteFeedbackEntry(id) {
+      showAdminConfirm('Delete Feedback', 'Permanently delete this feedback entry?', 'Delete', async () => {
+        const idx = feedbackEntries.findIndex((f) => f.id === id);
+        if (idx === -1) return;
+        const removedEntry = feedbackEntries[idx];
+        feedbackEntries.splice(idx, 1);
+        renderFeedbackList();
+
+        try {
+          const res = await fetch('/admin/api/feedback/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: id }),
+          });
+          const data = await res.json().catch(() => null);
+          if (!data || !data.ok) {
+            feedbackEntries.splice(idx, 0, removedEntry);
+            renderFeedbackList();
+            const err = (data && data.error) || 'Could not delete feedback entry.';
+            showAdminAlert(err === 'Not authorized.' ? 'Not Authorized' : 'Delete Failed', err, false);
+          }
+        } catch (err) {
+          feedbackEntries.splice(idx, 0, removedEntry);
+          renderFeedbackList();
+          showAdminAlert('Network Error', 'Network error while deleting feedback entry.', false);
+        }
+      }, true);
+    }
+  </script>
+</body></html>`;
+}
+
+// generateShortId() always produces a 12-character id; legacy base64
+// configs are virtually always much longer than that (even a single list's
+// JSON encodes to well over 100 characters), so length alone reliably
+// tells the two apart without needing a prefix.

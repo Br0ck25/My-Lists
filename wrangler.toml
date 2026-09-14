@@ -1,0 +1,127 @@
+name = "my-lists-addon"
+main = "worker_entry_combined.js"
+compatibility_date = "2024-01-01"
+
+# --- KV (REQUIRED) -----------------------------------------------------------
+# Every stateful feature depends on this binding: Creator Profiles, cloud
+# sync, published lists, likes, feedback, analytics, and all catalog
+# caching. Without it the Worker still boots and serves pages, but each of
+# those silently degrades to a no-op -- it does NOT fail loudly, so a
+# missing binding is easy to miss.
+#
+# Create one and paste the id it prints:
+#   npx wrangler kv namespace create CONFIGS
+[[kv_namespaces]]
+binding = "CONFIGS"
+id = "YOUR_KV_NAMESPACE_ID"
+
+# --- D1 (REQUIRED) -----------------------------------------------------------
+# Required. D1 is the primary authoritative store for Creator Profiles, lists,
+# full-text search (lists_fts), likes ledgers, feedback, tracking, and counters.
+#
+# Create the database, execute schema.sql and all migrations, and fill in the database_id:
+#   npx wrangler d1 create my-lists-db
+#   npx wrangler d1 execute my-lists-db --file=./schema.sql
+#
+# If deploying an existing site with data in KV, run the "Migrate KV -> D1"
+# tool in /admin's Maintenance tab to backfill your records into D1.
+[[d1_databases]]
+binding = "DB"
+database_name = "my-lists-db"
+database_id = "YOUR_DATABASE_ID"
+
+# --- Plan tuning (optional) --------------------------------------------------
+# BULK_RESOLVE_SUBREQUEST_BUDGET -- how many outbound fetches /api/bulk-resolve
+# (the Letterboxd CSV import) may spend in ONE invocation.
+#
+# Cloudflare allows 50 outbound fetches per invocation on the Workers FREE
+# plan and 10,000 on Paid. The import costs two TMDB calls per title, so the
+# default of 48 gets through 24 titles per invocation and works on either
+# plan -- the client just re-posts the remainder until the import is done.
+#
+# On a Paid plan you can raise this and finish an import in far fewer
+# invocations. 400 covers a full 200-title request in one go.
+#
+# DETAILS_BATCH_SUBREQUEST_BUDGET -- the same knob for /api/details/batch, which
+# is what rebuilds the Airing Next shelf. An id already in the memory, KV or
+# edge cache costs nothing, so a warm refresh is one invocation on either plan;
+# this only bounds how many COLD ids one invocation may resolve. The client
+# re-posts whatever the server did not get to.
+#
+# CRON_SUBREQUEST_BUDGET -- how many outbound fetches ONE cron tick may spend.
+# Half of it goes to the Continue Watching sweep (two fetches per show), the
+# rest to chart pre-warming. One chart is about 105 fetches, so under that the
+# pre-warm is skipped with a log line and only the episode sweep runs.
+#
+# This one defaults to the PAID number (10,000) while the two above default to
+# the free-safe 48, and the difference is what each does when it binds. Pacing
+# bulk-resolve or details-batch costs invocations and nothing else -- the client
+# re-posts what the server did not reach, and the work still completes. Pacing
+# the cron below one chart's worth switches pre-warming OFF and drops the sweep
+# to 8% of its throughput: a feature going dark rather than a slower path to the
+# same place. A default that silently does that to a working deployment is the
+# wrong default.
+#
+# ON A FREE WORKER, set it down:
+#
+#   CRON_SUBREQUEST_BUDGET = "48"
+#
+# which gives you a tick that completes -- Continue Watching sweeping 12 shows
+# every 6 minutes, 2,880 a day -- and no chart pre-warming, because no free-plan
+# budget can fit even one chart. That is a strictly better free plan than the
+# tick Cloudflare used to terminate outright.
+#
+# Deploying by pasting into the Cloudflare dashboard instead of with wrangler?
+# None of this file is read. Set these as plain-text variables under your
+# Worker -> Settings -> Variables and Secrets, or leave them unset and take the
+# defaults. See README.md's "Which Cloudflare plan do I need?".
+[vars]
+# Both raise a free-safe default to its Paid equivalent: a whole 200-title
+# import in one invocation, and a whole cold Airing Next refresh in one.
+BULK_RESOLVE_SUBREQUEST_BUDGET = "400"
+DETAILS_BATCH_SUBREQUEST_BUDGET = "600"
+# Already the code's default; stated here so all three knobs are visible in one
+# place. Change it to "48" if you deploy this file to a free Worker.
+CRON_SUBREQUEST_BUDGET = "10000"
+
+# --- Cron trigger (REQUIRED for Continue Watching) ---------------------------
+# Drives the scheduled() export at the bottom of
+# 26_api-creator-and-admin-routes.js: checkForNewEpisodes() sweeps creator
+# accounts for newly-aired episodes and pushes them into Continue Watching,
+# and prewarmSharedCatalogs() refreshes the shared Trakt/TMDB/Simkl/MDBList
+# charts into KV.
+#
+# Without this block scheduled() never runs at all -- Continue Watching
+# never picks up new episodes and the shared charts are never pre-warmed,
+# with no error anywhere to indicate why.
+#
+# "*/6 * * * *" is every 6 MINUTES, which matches the README's setup step
+# and is driven by prewarmSharedCatalogs: keeping the shared Trakt / TMDB /
+# Simkl / MDBList charts hot in KV is what keeps catalog loads fast for
+# every visitor and keeps the Worker off those providers' rate limits.
+# checkForNewEpisodes rides along on the same tick but is internally
+# cursor-paginated (one slice of accounts per run), so the per-account
+# episode sweep does NOT actually run 240x/day per account.
+#
+# If you do not use Continue Watching and want to minimise invocations,
+# "0 */6 * * *" (every 6 hours) is a reasonable alternative -- but expect
+# colder catalogs and more upstream API calls.
+[triggers]
+crons = ["*/6 * * * *"]
+
+# --- Secrets (set these with `wrangler secret put`, never in this file) ------
+#
+# Required for the admin dashboard at /admin:
+#   npx wrangler secret put ADMIN_KEY
+#
+# Provider API keys. All optional -- each feature gated on one degrades to
+# a clear in-app message when its key is absent, rather than crashing:
+#   npx wrangler secret put TMDB_API_KEY            # themoviedb.org/settings/api
+#   npx wrangler secret put TRAKT_CLIENT_ID         # trakt.tv/oauth/applications
+#   npx wrangler secret put TRAKT_CLIENT_SECRET     # required only for Trakt OAuth login
+#   npx wrangler secret put MDBLIST_API_KEY         # mdblist.com/preferences
+#   npx wrangler secret put MDBLIST_POPULAR_KEY     # optional, for the Toplists proxy
+#   npx wrangler secret put MDBLIST_CLIENT_ID       # required only for MDBList OAuth
+#   npx wrangler secret put MDBLIST_CLIENT_SECRET   # required with the id above; OAuth fails without it
+#   npx wrangler secret put SIMKL_CLIENT_ID         # simkl.com/settings/developer/
+#   npx wrangler secret put SIMKL_CLIENT_SECRET     # required only for Simkl OAuth

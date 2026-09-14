@@ -1,0 +1,80 @@
+# Adversarial Audit III — executable probes (2026-09-08)
+
+The findings these produce are written up in
+[`../../docs/history/AUDIT-2026-09-08-ADVERSARIAL-III.md`](../../docs/history/AUDIT-2026-09-08-ADVERSARIAL-III.md).
+
+Every probe drives the real `worker_entry_combined.js` export (or the real client bundle)
+through the repo's own harnesses in `tests/`. Nothing here modifies the Worker. Run from this
+directory with Node 22:
+
+    node p03_curated.mjs
+
+## Security
+
+| Probe | Proves |
+|---|---|
+| `p12_xss_final.mjs` | the full `</script>`-breakout sink inventory (list name, item title, item poster, display name, `serverEntries`, four OAuth/key fields) |
+| `p15_ctx.mjs` | which reflection context each `/{config}/configure` field lands in (script body vs. HTML attribute) |
+| `p16_attr.mjs` | the four unescaped `value="${…}"` attributes |
+| `p17_entries.mjs` | `serverEntries` breakout via both the base64 config and the short `/api/save` id |
+| `p13_browser_xss.mjs` | **real Chromium**: anonymous `/api/publish-list` → shared page → attacker script reads the victim's Creator Key |
+| `p14_browser_xss2.mjs` | **real Chromium**: the install-link (`/<config>/configure` and `/<config>/manifest.json`) variant |
+| `p39_attr_browser.mjs` | **real Chromium**: the attribute half — a payload in an install link's `tmdbKey` ending `value="…"` |
+| `p40_roundtrip.mjs` | **real Chromium**: that the fix is lossless — `<`, `>`, `&`, quotes, em-dash, emoji and CJK all round-trip exactly, ld+json still parses |
+| `p20_ssrf.mjs` | `/api/resolve?url=` fetches an attacker-named origin, echoes its body, no rate limit |
+| `p41_resolve_fixed.mjs` | after the fix: the sibling-deployment path still works and is `no-store`, 11 SSRF variants make **zero** outbound requests, the outbound branch throttles at 20/min, and an ordinary import never touches the bucket |
+| `p31_installlink.mjs` | what an install link hands to anyone who has it |
+| `p34_cache.mjs` | `/api/resolve` is the only per-account GET with `max-age=3600` |
+| `p05_authmatrix.mjs` | 19 creator routes × {no auth, wrong key, **another creator's key**} — all 401 |
+| `p06_adminmatrix.mjs` | 22 admin routes × {no cookie, forged signature, expired} — all 401 |
+| `p07_fuzz.mjs` | 112 routes × 9 hostile payload shapes + query abuse; prototype-pollution check |
+| `p08_pathfuzz.mjs` | the regex/parameterised routes, traversal and encoding abuse |
+| `p35_misc.mjs` | `/admin/logout` accepts any method; the cookie survives logout; publish-list rate limit |
+
+## Correctness
+
+| Probe | Proves |
+|---|---|
+| `undef.mjs` | scope analysis (acorn + eslint-scope). `node undef.mjs ../../worker_entry_combined.js` → `isShow`, `clientId` |
+| `triage.mjs` | separates `typeof`-guarded references from bare ones in the client bundle |
+| `deadfn.mjs` | functions declared but never referenced |
+| `handlers.py` | broader inline-handler resolution scan than `html_checks.py` (both quote styles, all `on*`) |
+| `p03_curated.mjs` | `/lists/curated/:slug` returns 500 on every request |
+| `p02_clientid.mjs` | the Trakt OAuth callback never issues its `/users/me` request |
+| `p04b_listcopy_e2e.mjs` | copying a list sends **zero** `/api/track-event` requests |
+| `p04c.mjs` | control: the same run with a `listName` binding sends exactly one |
+| `p19_anonurl.mjs` | the cold-index directory advertises `/lists/Anonymous/<slug>`, which 404s |
+| `p33_falsesuccess.mjs` | `saveLocalCustomListEdit` shows "saved" on 401, 409 and 500 |
+| `p42_falsesuccess_fixed.mjs` | after the fix: each of those three now shows the failure and names it, the local copy is still written, and a genuine 200 still shows the success modal |
+| `p43_guards_armed.mjs` | after the fix: all three slug-bearing `lists/save` call sites cite a baseline, and the two that carry a delta re-apply it to the other device's copy on a 409 |
+
+## Data integrity and scale
+
+| Probe | Proves |
+|---|---|
+| `p25_race.mjs` | 20 parallel saves / 20 parallel likes / 10 parallel tracking pushes — all clean |
+| `p26_ghostpublic.mjs` | a write held across `delete-account` leaves a permanently-public, unremovable list |
+| `p27_ghostnatural.mjs` | the same with **no** artificial stalling: 6/10 plain concurrent runs |
+| `p28_rebuild_privacy.mjs` | making a list private *through the API* mid-rebuild is **not** republished (clean) |
+| `p29_dashscale.mjs` | `/api/creator/lists` KV ops and response size at 10 / 100 / 500 / 1,200 lists. Re-run after the paging fix: KV ops flatten at **209** and the response at **2.52 MB**, whatever the list count |
+| `p30_breakpoint.mjs` | the exact breakpoint: 990 lists → 1,001 KV ops, over Cloudflare's cap. Re-run after the fix: **210 at every size**, so the breakpoint is gone |
+| `p21_scale_index.mjs` | cost of one public save at index sizes 100 → 20,000 (4.45 MB RMW) |
+| `p22_kvops.mjs` | KV get/put/delete/list counts per request, with and without D1 |
+| `p23_subrequests.mjs` | outbound `fetch()` per invocation vs. the free plan's 50. Re-run after the budget fix: `/api/bulk-resolve` at its 200-title maximum is **48**, was 400. `/api/details/batch` (180) and the cron tick (186) are untouched and still over |
+| `p44_hotkey_and_publish.mjs` | after the fix: 25 likes in a burst cost **1** whole-directory rewrite (was 25) with every vote still counted, and one IP's anonymous publishing is down to 5 records and 2.1 MB a minute with five kinds of non-item entry refused |
+| `p24_cpu.mjs` | PBKDF2 and per-request CPU vs. the free plan's 10 ms |
+
+## Deployment profile (Addendum A)
+
+Added after the maintainer confirmed production runs with **D1 bound at ~400 accounts**, and
+that the KV-only configuration is the self-hosting path.
+
+| Probe | Proves |
+|---|---|
+| `p36_d1_bytes.mjs` | the list-size guard counts UTF-16 units while D1 limits bytes: a 1,775,971-unit list is 4,711,971 bytes, saves 200 OK to KV, and is silently refused by D1 forever. Re-run after the fix, the same probe now reports `413`, nothing in KV, nothing in D1, and no `migrate-d1` error |
+| `p37_d1_profile.mjs` | KV ops and D1 queries per invocation at 400 accounts, cold index |
+| `p38_warm_index.mjs` | the same in steady state with the index warm — the honest production numbers |
+
+`p13_browser_xss.mjs` and `p14_browser_xss2.mjs` need `npm i playwright` and a Chromium at
+`/opt/pw-browsers/chromium-*/chrome-linux/chrome`; adjust `executablePath` for your machine.
+Everything else needs only Node 22 and this repository.

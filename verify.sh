@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Run from the repo root: bash verify.sh
+set -euo pipefail
+cd "$(dirname "$0")"
+
+echo "=== 1. rebuild combined Worker ==="
+python3 build.py
+
+echo
+echo "=== 2. build drift (CRLF-insensitive) ==="
+if git diff --ignore-cr-at-eol --quiet -- worker_entry_combined.js; then
+  echo "  OK"
+else
+  echo "  FAILED — worker_entry_combined.js does not match source"
+  git diff --ignore-cr-at-eol --stat -- worker_entry_combined.js
+  exit 1
+fi
+
+echo
+echo "=== 3. node --check ==="
+node --check worker_entry_combined.js && echo "  OK"
+
+echo
+echo "=== 3b. every identifier resolves ==="
+# node --check above proves the file PARSES. It says nothing about whether the
+# names in it exist -- and with 27 sources sharing one scope, a const declared
+# in one route's block looks, in the source, like it is available in the next
+# one's. Three live bugs came from exactly that (isShow, clientId, listName),
+# two of them hidden behind a bare catch. See scope_check.mjs.
+#
+# The one place this repo needs npm. Pinned, --no-save, and node_modules is
+# already gitignored.
+if [ ! -d node_modules/acorn ] || [ ! -d node_modules/eslint-scope ]; then
+  echo "  installing the parser (acorn, eslint-scope)..."
+  npm install --no-save --no-audit --no-fund --silent acorn@8.14.0 eslint-scope@8.2.0
+fi
+node scope_check.mjs worker worker_entry_combined.js
+node render_check.js rendered-scope.html > /dev/null
+node scope_check.mjs page rendered-scope.html
+rm -f rendered-scope.html
+
+echo
+echo "=== 4. render + validate the builder page ==="
+# node --check above only parses the outer JS file; the inline <script> the
+# rendered page returns as a template-literal STRING is invisible to it. See
+# .github/workflows/ci.yml for the full explanation.
+node render_check.js rendered.html
+python3 html_checks.py rendered.html local
+rm -f rendered.html inner_local.js
+
+echo
+echo "=== 4b. render + validate the admin dashboard ==="
+# The same treatment for /admin, which used to get none. It is a template
+# literal too, and a single backslash inside one never reaches the browser:
+# '\n\n' inside a confirm() string became a real newline, split the string
+# across two lines, and turned the whole 60KB dashboard script into one
+# SyntaxError. Every admin control -- including the only way to remove an
+# anonymously published list -- was dead for two days, and step 4 above could
+# not see it because it only ever rendered the builder page.
+node render_check.js rendered-admin.html --admin
+python3 html_checks.py rendered-admin.html local-admin
+rm -f rendered-admin.html inner_local-admin.js
+
+echo
+echo "=== 4c. syntax-check the service worker ==="
+# /sw.js is emitted from a template literal too, so `node --check` on the
+# combined Worker sees it as string content -- the same blind spot that let a
+# SyntaxError sit in the admin page for two days. A broken service worker is
+# quieter still: it fails to register and the page carries on looking fine,
+# so nobody notices until offline stops working.
+node render_check.js service-worker.js --sw
+node --check service-worker.js && echo "  OK"
+rm -f service-worker.js
+
+echo
+echo "=== 4d. render the builder page with hostile input ==="
+# Steps 4 and 4b prove the page PARSES. They cannot see the bug that mattered
+# most: JSON.stringify escapes " and \ but not "</script", so a published
+# list's name -- or an OAuth token in an install link -- ended the inline
+# <script> and everything after it was parsed as HTML. Stored XSS, reachable
+# with no account at all. This renders the same page with every
+# caller-supplied field set to a payload and asserts it came out inert.
+node render_check.js rendered-hostile.html --hostile
+python3 html_checks.py rendered-hostile.html local-hostile
+rm -f rendered-hostile.html inner_local-hostile.js
+
+echo
+echo "=== 5. FUNCTION-MAP.md drift ==="
+# gen_map.py is only useful if it is actually re-run. It was not: 26% of the
+# map's 811 line numbers pointed at a line that no longer held that symbol,
+# so navigating by it quietly sent you to the wrong place. Regenerating is
+# cheap and deterministic, so the map is now checked the same way the
+# combined Worker is.
+python3 gen_map.py > /dev/null
+if git diff --ignore-cr-at-eol --quiet -- FUNCTION-MAP.md; then
+  echo "  OK"
+else
+  echo "  FAILED — FUNCTION-MAP.md is stale; run: python3 gen_map.py"
+  git diff --ignore-cr-at-eol --stat -- FUNCTION-MAP.md
+  exit 1
+fi
+
+echo
+echo "=== 6. tests ==="
+node --test tests/*.test.mjs
+
+echo
+echo "ALL CHECKS PASSED"

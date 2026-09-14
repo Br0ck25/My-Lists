@@ -1,0 +1,507 @@
+const SHORT_ID_LENGTH = 12;
+
+// Stored install configs live under a namespace like every other key.
+//
+// They used to be written at the bare id -- `CONFIGS.put(id, payload)` -- which
+// made this function a read of an ARBITRARY 12-character KV key: whatever
+// /:config/... is asked for is handed straight to CONFIGS.get. Nothing is
+// exposed by that today, because every other namespace in this Worker is
+// prefixed and longer than twelve characters, but that is an accident of
+// current key names rather than a rule, and the day something shorter is added
+// it becomes readable through /api/resolve with no further code change.
+//
+// Prefixing the STORAGE key fixes that without touching a single install URL:
+// the id in the link is unchanged, only where it is filed changes. Old configs
+// are still read at their bare key, because those links are in people's Stremio
+// installs and will be for years.
+const SAVED_CONFIG_KEY_PREFIX = "cfg:";
+
+function savedConfigKey(id) {
+  return SAVED_CONFIG_KEY_PREFIX + id;
+}
+
+async function resolveConfig(configParam, env) {
+  if (configParam.length <= SHORT_ID_LENGTH && env && env.CONFIGS) {
+    const stored = (await env.CONFIGS.get(savedConfigKey(configParam)))
+      || (await env.CONFIGS.get(configParam));
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        let watchHistory = Array.isArray(parsed.watchHistory) ? parsed.watchHistory : [];
+        let continueWatching = Array.isArray(parsed.continueWatching) ? parsed.continueWatching : [];
+        let watchlist = Array.isArray(parsed.watchlist) ? parsed.watchlist : [];
+        let airingNext = Array.isArray(parsed.airingNext) ? parsed.airingNext : [];
+
+        let creatorName = parsed.trackCreatorName || parsed.creatorName || "";
+        if (!creatorName && Array.isArray(parsed.entries)) {
+          for (const e of parsed.entries) {
+            if (e && e.url && typeof e.url === 'string' && e.url.startsWith("autotrack:")) {
+              const parts = e.url.split(":");
+              if (parts.length >= 4 && parts[3]) {
+                creatorName = parts[3];
+                break;
+              }
+            }
+          }
+        }
+        // Who, if anyone, this config PROVES it speaks for.
+        //
+        // `creatorName` above is a name lifted out of the stored payload -- and
+        // /api/save used to accept `trackCreatorName` (and an
+        // `autotrack:...:<username>` entry url) from anyone, unauthenticated, so
+        // it was a claim rather than a credential. Everything downstream treated
+        // it as one: the tracking read immediately below, and
+        // fetchAutoTrackedCatalog via keys.trackOwner. That is SEC-001 -- see
+        // mayReadTrackedShelf (02_http-and-creator-utils.js).
+        //
+        // Three ways a config can prove it now, in descending order of strength:
+        //   * it carries the account's own Creator Key (track-on links always
+        //     have, and /api/save now stores one whenever a personal shelf is
+        //     present) -- verified here, memoized, so it costs one PBKDF2 per
+        //     isolate per config rather than one per request;
+        //   * /api/save stamped `trackOwner` on it after verifying at save time,
+        //     so a later key rotation does not silently empty the shelf;
+        //   * it predates both, and LEGACY_UNVERIFIED_CONFIG_SHELVES says to
+        //     honour those -- see that constant for exactly what it costs.
+        let trackOwner = "";
+        if (creatorName) {
+          if (parsed.trackCreatorKey) {
+            trackOwner = await verifyShelfOwner(env, creatorName, parsed.trackCreatorKey);
+          }
+          if (!trackOwner && typeof parsed.trackOwner === "string" && parsed.trackOwner) {
+            const stamped = String(parsed.trackOwner).toLowerCase();
+            if (stamped === String(creatorName).toLowerCase()) trackOwner = stamped;
+          }
+          if (!trackOwner && LEGACY_UNVERIFIED_CONFIG_SHELVES && !parsed.trackCreatorKey && !parsed.trackOwner) {
+            trackOwner = String(creatorName).toLowerCase();
+          }
+        }
+        if (trackOwner && env.CONFIGS) {
+          const trackingRaw = await env.CONFIGS.get(`creatorsynctracking:${trackOwner}`);
+          if (trackingRaw) {
+            try {
+              const tracking = JSON.parse(trackingRaw);
+              if (Array.isArray(tracking.watchHistory) && tracking.watchHistory.length && !watchHistory.length) {
+                watchHistory = tracking.watchHistory;
+              }
+              if (Array.isArray(tracking.continueWatching) && tracking.continueWatching.length && !continueWatching.length) {
+                continueWatching = tracking.continueWatching;
+              }
+              if (Array.isArray(tracking.watchlist) && tracking.watchlist.length && !watchlist.length) {
+                watchlist = tracking.watchlist;
+              }
+              if (Array.isArray(tracking.airingNext) && tracking.airingNext.length && !airingNext.length) {
+                airingNext = tracking.airingNext;
+              }
+            } catch {}
+          }
+        }
+
+        return {
+          entries: Array.isArray(parsed.entries) ? parsed.entries : [],
+          watchHistory,
+          continueWatching,
+          watchlist,
+          airingNext,
+          tmdbKey: parsed.tmdbKey || "",
+          mdblistKey: parsed.mdblistKey || "",
+          mdblistAccessToken: parsed.mdblistAccessToken || "",
+          traktKey: parsed.traktKey || "",
+          traktUsername: parsed.traktUsername || "",
+          traktAccessToken: parsed.traktAccessToken || "",
+          simklKey: parsed.simklKey || "",
+          simklAccessToken: parsed.simklAccessToken || "",
+          track: !!parsed.track,
+          trackCreatorName: parsed.trackCreatorName || "",
+          trackCreatorKey: parsed.trackCreatorKey || "",
+          // The verified username, or "". Every personal-shelf read downstream
+          // is gated on this rather than on trackCreatorName -- see the block
+          // above and mayReadTrackedShelf (02_http-and-creator-utils.js).
+          trackOwner,
+          shuffleShelves: !!parsed.shuffleShelves,
+          shuffleItems: !!parsed.shuffleItems,
+          region: parsed.region || "US",
+          hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
+          adultContentFilter: !!parsed.adultContentFilter,
+          showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
+          showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
+          showBadgesCatalogs: parsed.showBadgesCatalogs !== false,
+          showBadgesStremioAiringNext: parsed.showBadgesStremioAiringNext !== false,
+          showBadgesStremioContinueWatching: parsed.showBadgesStremioContinueWatching !== false,
+          showBadgesStremioCatalogs: parsed.showBadgesStremioCatalogs !== false,
+          showBadgesStremio: parsed.showBadgesStremio !== false,
+        };
+      } catch {
+        // fall through to legacy decode below
+      }
+    }
+  }
+  return decodeConfig(configParam);
+}
+
+// Accepts a full mdblist URL (https://mdblist.com/lists/user/listname[/...])
+// or a bare "user/listname" and returns the public JSON feed URL. Pass an
+// apikey to also reach a private/personal list you own (mdblist honors the
+// key on this endpoint the same way its own site does when you're signed
+// in) — public lists work fine with no key.
+function mdblistJsonUrl(input, apikey, type) {
+  let s = (input || "").trim();
+  // Query string / fragment stripped before anything else. Without this,
+  // a URL copied while some filter/view toggle on mdblist's own site is
+  // active (e.g. "?sort=rank", or a trailing "/?Mode=Show"-shaped param)
+  // becomes part of the list slug below -- either glued onto the last
+  // segment, or its own segment entirely if there's a trailing slash
+  // before the "?". Either way the constructed JSON-feed URL points at a
+  // list that doesn't exist, and mdblist 404s (or returns something
+  // unrelated) instead of the real list.
+  s = s.split(/[?#]/)[0];
+
+  s = s.replace(/^https?:\/\/(www\.)?mdblist\.com\/lists\//i, "");
+  s = s.replace(/\/(json\/?)?$/i, "");
+  const parts = s.split("/").filter(Boolean);
+  if (parts.length < 2) return null;
+  // Normal user lists are /lists/{username}/{slug} (2 segments), but
+  // mdblist's own "Official Lists" (mdblist.com/lists/official) are one
+  // level deeper -- /lists/official/{movies|shows}/{slug} (3 segments).
+  // mdblist's JSON-feed convention is simply "whatever the display page's
+  // own path is, plus /json/", so preserving however many segments there
+  // are (rather than assuming exactly 2) handles both shapes correctly.
+  const encodedPath = parts.map((p) => encodeURIComponent(p)).join("/");
+  const base = `https://mdblist.com/lists/${encodedPath}/json/`;
+  // append_to_response=poster is documented for mdblist's api.mdblist.com
+  // REST endpoint; this add-on actually uses their simpler public JSON feed
+  // (this URL), which isn't confirmed to support the same param. Requesting
+  // it anyway is a safe bet either way: if unsupported, mdblist just ignores
+  // the unknown query param and responds exactly as before (mapMdblistItems
+  // below falls back to the metahub poster whenever `poster` isn't present).
+  const params = new URLSearchParams({ append_to_response: "poster" });
+  if (apikey) params.set("apikey", apikey);
+  return `${base}?${params.toString()}`;
+}
+
+// --- list-site detection -----------------------------------------------
+
+// Looks at a pasted URL (or the special "mdblist:watchlist" sentinel) and
+// figures out which backend should handle it.
+// Matches the shareable "/lists/{username}/{listname}" path a published
+// Custom List gets, regardless of domain -- this is deliberately domain-
+// agnostic (checked structurally, not against a hardcoded hostname) so it
+// keeps working whether someone's on the raw *.workers.dev subdomain or a
+// custom domain, and so one deployment can resolve a link shared from
+// another. Reading this always goes straight to this Worker's OWN KV (see
+// fetchPublishedListCatalog) rather than an HTTP fetch of the URL itself.
+//
+// Critical exception: mdblist.com's own list URLs use this *exact* same
+// shape (mdblist.com/lists/{user}/{list}) -- without excluding it here,
+// every ordinary mdblist list URL already in use throughout this add-on
+// would get misdetected as one of our own published lists and resolved
+// against our (empty, for that key) KV instead of mdblist's real data.
+function parsePublishedListUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  if (/^https?:\/\/(www\.)?mdblist\.com\//i.test(s)) return null;
+  const m = s.match(/\/lists\/([^/?#]+)\/([^/?#]+)(?:\.json)?\/?(?:[?#].*)?$/i);
+  if (!m) return null;
+  let username = m[1];
+  let listName = m[2];
+  try {
+    username = decodeURIComponent(username);
+    listName = decodeURIComponent(listName);
+  } catch {}
+  return {
+    username: username.toLowerCase(),
+    listName: listName.toLowerCase(),
+    rawUsername: m[1],
+    rawListName: m[2],
+  };
+}
+
+function parseTmdbWebChartUrl(rawUrl) {
+  const s = String(rawUrl || "").trim();
+  const m = s.match(/^https?:\/\/(?:www\.)?themoviedb\.org\/(movie|tv|trending)(?:\/([a-z0-9_-]+))?/i);
+  if (!m) return null;
+  const section = m[1].toLowerCase();
+  const sub = (m[2] || "").toLowerCase();
+  
+  if (section === "movie") {
+    if (!sub || sub === "popular") return { chartKey: "popular", type: "movie", name: "TMDB Popular Movies" };
+    if (sub === "top-rated" || sub === "top_rated") return { chartKey: "top_rated", type: "movie", name: "TMDB Top Rated Movies" };
+    if (sub === "now-playing" || sub === "now_playing") return { chartKey: "now_playing", type: "movie", name: "TMDB Now Playing" };
+    if (sub === "upcoming") return { chartKey: "upcoming", type: "movie", name: "TMDB Upcoming Movies" };
+  } else if (section === "tv") {
+    if (!sub || sub === "popular") return { chartKey: "popular", type: "series", name: "TMDB Popular Shows" };
+    if (sub === "top-rated" || sub === "top_rated") return { chartKey: "top_rated", type: "series", name: "TMDB Top Rated Shows" };
+    if (sub === "airing-today" || sub === "airing_today") return { chartKey: "now_playing", type: "series", name: "TMDB Airing Today" };
+    if (sub === "on-the-air" || sub === "on_the_air") return { chartKey: "upcoming", type: "series", name: "TMDB On The Air" };
+  } else if (section === "trending") {
+    if (sub === "movie" || sub === "movies") return { chartKey: "trending", type: "movie", name: "TMDB Trending Movies" };
+    if (sub === "tv" || sub === "shows") return { chartKey: "trending", type: "series", name: "TMDB Trending Shows" };
+    return { chartKey: "trending", type: "movie", name: "TMDB Trending" };
+  }
+  return null;
+}
+
+function detectSource(input) {
+  const s = (input || "").trim();
+  if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?watchlist\/?/i.test(s)) return "mdblist-watchlist";
+  if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?history\/?/i.test(s)) return "mdblist-history";
+  if (s === "mdblist:airing-next" || s.startsWith("mdblist:airing-next:") || s === "mdblist:user:shows:airing-next") return "mdblist-airing-next";
+  // (www.|app.) and a trailing "?query" or "#hash" both tolerated here --
+  // matching every other trakt.tv regex in this function -- because a
+  // fully $-anchored .../watchlist$ / .../history$ (this used to require
+  // the URL end exactly there) silently failed to recognize a URL copied
+  // while some filter/view toggle on trakt.tv's own site was active (e.g.
+  // a trailing "?something=x"), or one copied from app.trakt.tv. It still
+  // fell through to the generic "trakt" case below rather than erroring,
+  // but generic handling expects a /lists/ path a watchlist/history URL
+  // doesn't have, so the list failed to resolve at all.
+  if (s === "trakt:watchlist" || s.startsWith("trakt:watchlist:") || /^https?:\/\/(www\.|app\.)?trakt\.tv\/users\/[^/]+\/watchlist\/?(?:[?#].*)?$/i.test(s)) return "trakt-watchlist";
+  if (s === "trakt:history" || s.startsWith("trakt:history:") || /^https?:\/\/(www\.|app\.)?trakt\.tv\/users\/[^/]+\/history\/?(?:[?#].*)?$/i.test(s)) return "trakt-history";
+  if (s === "trakt:airing-next" || s.startsWith("trakt:airing-next:") || s === "trakt:user:shows:airing-next") return "trakt-airing-next";
+  if (s.startsWith("tmdb:chart:") || parseTmdbWebChartUrl(s)) return "tmdb-chart";
+  if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
+  if (s === "tmdb:hidden-gems") return "tmdb-hidden-gems";
+  if (s.startsWith("tmdb:kids:")) return "tmdb-kids";
+  if (s.startsWith("tmdb:holiday:")) return "tmdb-holiday";
+  if (s.startsWith("tmdb:genre:")) return "tmdb-genre";
+  if (s.startsWith("trakt:chart:")) return "trakt-chart";
+  if (s.startsWith("simkl:chart:")) return "simkl-chart";
+  if (s.startsWith("simkl:user:")) return "simkl-user";
+  if (s.startsWith("channel:v1:")) return "channel";
+  if (s.startsWith("customlist:v1:")) return "custom-list";
+  if (s.startsWith("autotrack:") || s === "custom:watch-history" || s === "custom:continue-watching" || s === "custom:watchlist" || s.startsWith("custom:watch-history:") || s.startsWith("custom:continue-watching:")) return "autotrack";
+  if (s.startsWith("custom:curated:") || s.startsWith("curated:")) return "curated";
+  if (s.startsWith("tmdb:collection:") || /^https?:\/\/(?:www\.)?themoviedb\.org\/collection\//i.test(s)) return "tmdb-collection";
+  if (parsePublishedListUrl(s)) return "published-list";
+  if (/^https?:\/\/(www\.|app\.)?trakt\.tv\//i.test(s)) return "trakt";
+  if (/^https?:\/\/(www\.)?themoviedb\.org\/list\//i.test(s)) return "tmdb";
+  return "mdblist"; // default / backwards-compatible with existing configs
+}
+
+// /api/preview takes a caller-supplied url and feeds it to fetchCatalog.
+// detectSource used to default unknown strings to "mdblist", and the
+// preview handler echoed the raw fetch error, so an unauthenticated
+// client could probe hosts by the distinct failure strings even though
+// Workers block RFC1918. Gate first: only the sentinels fetchCatalog
+// actually dispatches on, plus https URLs on the provider hosts those
+// fetchers talk to. Published-list URLs are KV-only (no outbound fetch)
+// so any https host with that path shape is fine. Failures after this
+// check still collapse to one generic message at the route.
+function isAllowedCatalogSourceUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return false;
+  if (
+    s.startsWith("mdblist:") ||
+    s.startsWith("trakt:") ||
+    s.startsWith("tmdb:") ||
+    s.startsWith("simkl:") ||
+    s.startsWith("channel:v1:") ||
+    s.startsWith("customlist:v1:") ||
+    s.startsWith("autotrack:") ||
+    s.startsWith("custom:") ||
+    s.startsWith("curated:")
+  ) {
+    return true;
+  }
+  // Bare "user/listname" -- mdblistJsonUrl accepts this and always fetches
+  // mdblist.com, never the string as a URL.
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) {
+    const parts = s.split("/").filter(Boolean);
+    return parts.length >= 2 && parts.length <= 8 && parts.every((p) => /^[A-Za-z0-9._-]+$/.test(p));
+  }
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "https:") return false;
+  const host = u.hostname.toLowerCase();
+  if (
+    host === "mdblist.com" || host === "www.mdblist.com" ||
+    host === "trakt.tv" || host === "www.trakt.tv" || host === "app.trakt.tv" ||
+    host === "themoviedb.org" || host === "www.themoviedb.org" ||
+    host === "simkl.com" || host === "www.simkl.com" ||
+    host === "letterboxd.com" || host === "www.letterboxd.com"
+  ) {
+    return true;
+  }
+  // Own published lists -- resolved from KV, never fetched. Any https host
+  // with /lists/{user}/{slug} is the share URL shape parsePublishedListUrl
+  // already accepts (including a sibling workers.dev deployment).
+  if (typeof parsePublishedListUrl === "function" && parsePublishedListUrl(s)) return true;
+  return false;
+}
+
+function previewSourceUrls(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return [];
+  // channel:v1: / customlist:v1: payloads are JSON that may contain
+  // newlines. Those are not merge separators -- fetchCatalog only splits
+  // the whole url when it is several sources stacked, not a single
+  // sentinel blob. Treat the payload as one URL so a Live Preview of a
+  // Channel still works.
+  if (s.startsWith("channel:v1:") || s.startsWith("customlist:v1:")) return [s];
+  return s.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+// Parses a pasted trakt.tv list URL into the { user, list } pair the Trakt
+// API needs. Accepts the standard public-list URL shape:
+//   https://trakt.tv/users/USERNAME/lists/LIST-SLUG-OR-ID
+// (also tolerates a trailing slash or extra path segments like /items).
+// `list` can be either the list's slug or its numeric id — Trakt's API
+// accepts both interchangeably in this position.
+function traktListPath(input) {
+  const s = (input || "").trim().replace(/^https?:\/\/(www\.|app\.)?trakt\.tv\//i, "");
+  const m = s.match(/^users\/([^/]+)\/lists\/([^/?#]+)/i);
+  if (!m) return null;
+  return { user: m[1], list: m[2] };
+}
+
+// Parses a pasted themoviedb.org list URL into its numeric list id.
+// TMDB lists are global (not scoped under a username the way Trakt's are),
+// referenced as either https://www.themoviedb.org/list/8290920 or with a
+// trailing display slug like .../list/8290920-my-favorites.
+function tmdbListId(input) {
+  const s = (input || "").trim();
+  const m = s.match(/themoviedb\.org\/list\/(\d+)/i);
+  return m ? m[1] : null;
+}
+
+// Parses a TMDB collection URL or sentinel (e.g. tmdb:collection:86311 or
+// https://www.themoviedb.org/collection/86311) into its numeric collection id.
+function tmdbCollectionId(input) {
+  const s = (input || "").trim();
+  if (s.startsWith("tmdb:collection:")) {
+    const id = s.slice("tmdb:collection:".length).split(/[^0-9]/)[0];
+    return id || null;
+  }
+  const m = s.match(/themoviedb\.org\/collection\/(\d+)/i);
+  return m ? m[1] : null;
+}
+
+// --- popular lists (mdblist.com/toplists) -------------------------------
+
+// Pulls mdblist.com's own "Popular Lists" page (https://mdblist.com/toplists/)
+// via their REST API and normalizes each entry into something the builder
+// page can turn into an entry with one click. Requires an MDBList API key —
+// same one used for private lists / the watchlist quick-add.
+async function fetchTopLists(apikey, env = null, ctx = null) {
+  if (!apikey) {
+    throw new Error(
+      "Popular Lists isn't configured on this add-on yet — the Worker owner needs to set MDBLIST_POPULAR_KEY."
+    );
+  }
+
+  const cacheKey = "user_cache:mdblist:toplists";
+  const kvKey = "mdblist:toplists";
+
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    kvKey,
+    env,
+    ctx,
+    freshTtlSec: 3600,
+    staleTtlSec: 86400,
+    kvTtlSec: 86400,
+    providerLabel: "MDBList Toplists",
+    fetchFn: async () => {
+      const res = await fetch(
+        `https://api.mdblist.com/lists/top?apikey=${encodeURIComponent(apikey)}`,
+        {
+          headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
+          cf: { cacheTtl: 3600, cacheEverything: true },
+        }
+      );
+      if (!res.ok) {
+        const hint =
+          res.status === 401 || res.status === 403 ? " Double-check your MDBList API key." : "";
+        throw new Error(`MDBList top-lists request failed (HTTP ${res.status}).${hint}`);
+      }
+
+      const data = await res.json();
+      return (Array.isArray(data) ? data : []).map((l) => ({
+        name: l.name,
+        user: l.user_name,
+        slug: l.slug,
+        type: l.mediatype === "show" ? "series" : "movie",
+        items: l.items,
+        likes: l.likes,
+        url: `https://mdblist.com/lists/${encodeURIComponent(l.user_name)}/${encodeURIComponent(l.slug)}`,
+      }));
+    },
+  });
+}
+
+async function searchTraktLists(query, traktKeyOverride) {
+  const rawQ = (query || "").trim();
+  if (!rawQ) return [];
+  const q = rawQ.replace(/^@/, "").trim();
+  const traktKey = traktKeyOverride || TRAKT_CLIENT_ID;
+  if (!traktKey) {
+    throw new Error("Trakt lists aren't configured on this add-on yet — the Worker owner needs to set TRAKT_CLIENT_ID.");
+  }
+
+  const headers = {
+    "Content-Type": "application/json",
+    "trakt-api-version": "2",
+    "trakt-api-key": traktKey,
+    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+  };
+
+  const requests = [
+    fetchTraktWithRetry(`https://api.trakt.tv/search/list?query=${encodeURIComponent(q)}&limit=30`, {
+      headers,
+      cf: { cacheTtl: 900, cacheEverything: true },
+    }).then(async (r) => (r.ok ? await r.json() : [])).catch(() => [])
+  ];
+
+  // If query looks like a possible username (single token without spaces), also query user lists directly
+  const isPossibleUsername = /^[a-zA-Z0-9_-]{2,32}$/.test(q);
+  if (isPossibleUsername) {
+    requests.push(
+      fetchTraktWithRetry(`https://api.trakt.tv/users/${encodeURIComponent(q)}/lists`, {
+        headers,
+        cf: { cacheTtl: 900, cacheEverything: true },
+      }).then(async (r) => {
+        if (!r.ok) return [];
+        const userLists = await r.json();
+        if (!Array.isArray(userLists)) return [];
+        return userLists.map((l) => ({ list: { ...l, user: l.user || { ids: { slug: q }, username: q } } }));
+      }).catch(() => [])
+    );
+  }
+
+  const [searchData, userData] = await Promise.all(requests);
+  const combinedRaw = [...(Array.isArray(searchData) ? searchData : []), ...(Array.isArray(userData) ? userData : [])];
+
+  const seenUrls = new Set();
+  const lists = [];
+
+  for (const r of combinedRaw) {
+    const l = r && r.list ? r.list : r;
+    if (!l || !l.ids || !l.ids.slug) continue;
+    const userSlug = (l.user && l.user.ids && l.user.ids.slug) || (l.user && l.user.username) || (isPossibleUsername ? q : '');
+    if (!userSlug) continue;
+    const url = `https://trakt.tv/users/${encodeURIComponent(userSlug)}/lists/${encodeURIComponent(l.ids.slug)}`;
+    if (seenUrls.has(url.toLowerCase())) continue;
+    seenUrls.add(url.toLowerCase());
+
+    const name = l.name || "";
+    const isMovie = /\bmovie(s)?\b/i.test(name);
+    const isSeries = /\b(show|shows|series|anime|tv|season(s)?)\b/i.test(name);
+    const contentType = isMovie && !isSeries ? "movie" : (isSeries && !isMovie ? "series" : "unknown");
+
+    lists.push({
+      name: l.name || l.ids.slug,
+      user: (l.user && l.user.username) || userSlug,
+      slug: l.ids.slug,
+      items: l.item_count || 0,
+      likes: l.likes || 0,
+      contentType,
+      url,
+      source: "Trakt",
+    });
+  }
+
+  return lists;
+}

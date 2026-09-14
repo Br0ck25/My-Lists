@@ -1,0 +1,37 @@
+-- 0001a_add_likes_column.sql
+--
+-- Adds the `likes` column that the Worker has always tried to write.
+--
+-- /api/lists/like runs "UPDATE creator_lists SET likes = ? WHERE id = ?"
+-- inside a try/catch. Without this column that statement throws on every
+-- single like and the error is swallowed, so likes were silently KV-only:
+-- a D1 restore, or any read that trusted D1, would lose every count.
+--
+-- Safe to run against a live database. ADD COLUMN with a NOT NULL DEFAULT
+-- backfills existing rows with 0 and rewrites no data.
+--
+-- NOT IDEMPOTENT -- re-running errors with "duplicate column name: likes".
+-- That is harmless in itself, but it is the reason this file contains ONE
+-- statement and its index lives in 0001b.
+--
+-- They used to be one file, and SQL runners stop at the first error: if the
+-- session died between the two statements (a dashboard console timing out, a
+-- dropped wrangler connection), re-running the file aborted on the ALTER and
+-- the CREATE INDEX never ran. The database was then permanently missing an
+-- index with no documented way to get it, because the file's own guidance was
+-- "only apply it once". Split, the recovery is obvious: whichever half failed
+-- is the half to run, and 0001b is idempotent so running it again costs
+-- nothing.
+--
+-- Run it (README.md's D1 section has the full walkthrough):
+--   Dashboard: open this database's Console tab and paste/run the statement
+--   below (skip these comment lines), then do the same for 0001b.
+--   Wrangler:  npx wrangler d1 execute my-lists-db --remote --file=./migrations/0001a_add_likes_column.sql
+--
+-- Existing counts live in KV and are the source of truth. After migrating,
+-- use the "Migrate KV -> D1" button under /admin's Management & Tools ->
+-- Maintenance tab (or POST /admin/api/migrate-d1 directly) to copy them
+-- across; until then the column reads 0 for lists that have not been
+-- liked again since.
+
+ALTER TABLE creator_lists ADD COLUMN likes INTEGER NOT NULL DEFAULT 0;

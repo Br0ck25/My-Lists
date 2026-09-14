@@ -1,0 +1,400 @@
+// Shared in-memory Worker harness for the production-audit test suite.
+// The Worker is a real ES module; we only stub KV, D1, caches, and waitUntil.
+//
+// D1 is backed by REAL SQLite (node:sqlite, Node 22.13+), loaded from the
+// committed schema.sql, with PRAGMA foreign_keys = ON to match D1's own
+// documented default ("D1 enforces that foreign key constraints are valid
+// within all queries and migrations"). It used to be a regex-matching mock,
+// and three of its shortcuts were each hiding a live defect:
+//
+//   * `SELECT * FROM creator_lists WHERE id = ?` was hardcoded to return no
+//     rows, so getCreatorList's D1 branch was never executed by ANY test in
+//     this suite. A mutation that removed the D1 write from
+//     /api/creator/lists/save outright left the whole suite green.
+//   * It could not throw, so no test ever covered "KV healthy, D1 fails" --
+//     which is the state where key rotation and account deletion both used
+//     to report success while doing nothing.
+//   * It could not enforce a primary key, a NOT NULL, a DEFAULT or a foreign
+//     key, so a column the code never binds (creator_lists.likes) silently
+//     read back as whatever the mock had stashed rather than as the column
+//     default the real database would apply.
+//
+// Real SQLite removes all three at once. `failWhen(fn)` is the fault
+// injector: any statement the predicate matches throws, the same way a D1
+// outage or a row-size violation does.
+
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
+
+if (!globalThis.caches) {
+  globalThis.caches = {
+    default: { match: async () => null, put: async () => {} },
+    open: async () => ({ match: async () => null, put: async () => {} }),
+  };
+}
+
+export const worker = (await import("../worker_entry_combined.js")).default;
+
+// A SECOND, independent instance of the Worker -- a different isolate.
+//
+// The Worker keeps per-isolate memory: PER_USER_CACHE_MAP (the shared chart
+// memo), the verified-key memo, the page memos. In a single Node process every
+// call goes through one module instance, so a test that calls the cron twice
+// gets the second one served entirely from that memory and never reaches KV or
+// the network at all -- which quietly turns "the second tick did not damage the
+// cache" into "the second tick did nothing", and a test asserting the former
+// into one that cannot fail.
+//
+// Importing the same file under a distinct URL gives a fresh module instance
+// with empty memos and the same KV underneath, which is what a request landing
+// on a cold colo actually looks like.
+let __isolateSeq = 0;
+export async function freshIsolate() {
+  return (await import(`../worker_entry_combined.js?isolate=${++__isolateSeq}`)).default;
+}
+
+const SCHEMA_SQL = readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
+
+export function makeKv(initial = {}) {
+  const store = new Map(Object.entries(initial));
+  // Fault injection, matching makeD1().failWhen: a hook that throws makes the
+  // corresponding KV call fail. Used to cover the partial-write paths where a
+  // route has to decide between reporting success and reporting the truth.
+  const hooks = { beforeGet: null, beforePut: null, beforeDelete: null, beforeList: null };
+  return {
+    _store: store,
+    _hooks: hooks,
+    async get(key, type) {
+      if (hooks.beforeGet) await hooks.beforeGet(key);
+      if (!store.has(key)) return null;
+      const raw = store.get(key);
+      if (type === "json") {
+        try { return JSON.parse(raw); } catch { return null; }
+      }
+      return raw;
+    },
+    async put(key, value) {
+      if (hooks.beforePut) await hooks.beforePut(key, value);
+      store.set(key, typeof value === "string" ? value : JSON.stringify(value));
+    },
+    async delete(key) {
+      if (hooks.beforeDelete) await hooks.beforeDelete(key);
+      store.delete(key);
+    },
+    // Real KV cursors are opaque and positioned by KEY, not by offset. An
+    // integer offset into a freshly re-sorted array behaves differently the
+    // moment keys are added or removed mid-traversal -- which is exactly what
+    // happens during an index rebuild or an account purge -- so this models
+    // the real contract instead.
+    async list({ prefix = "", limit = 1000, cursor } = {}) {
+      if (hooks.beforeList) await hooks.beforeList(prefix, cursor);
+      const keys = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
+      const after = cursor ? Buffer.from(cursor, "base64").toString("utf8") : null;
+      const found = after ? keys.findIndex((k) => k > after) : 0;
+      const start = found === -1 ? keys.length : found;
+      const slice = keys.slice(start, start + limit);
+      const complete = start + slice.length >= keys.length;
+      return {
+        keys: slice.map((name) => ({ name })),
+        list_complete: complete,
+        cursor: complete ? undefined : Buffer.from(slice[slice.length - 1]).toString("base64"),
+      };
+    },
+  };
+}
+
+export function makeD1({ foreignKeys = true } = {}) {
+  const db = new DatabaseSync(":memory:");
+  if (foreignKeys) db.exec("PRAGMA foreign_keys = ON;");
+  db.exec(SCHEMA_SQL);
+  // schema.sql is the documented way to provision a fresh database and now
+  // carries every index the migrations leave behind, so there is nothing to
+  // add here -- the drift test in worker.test.mjs is what keeps the two
+  // provisioning paths identical.
+
+  const state = { fail: null };
+  const norm = (v) => (v === undefined ? null : typeof v === "boolean" ? (v ? 1 : 0) : v);
+
+  function exec(sql, args) {
+    const s = String(sql);
+    if (state.fail && state.fail(s, args)) {
+      const err = new Error("D1_ERROR: injected failure");
+      err.injected = true;
+      throw err;
+    }
+    const stmt = db.prepare(s);
+    const bound = args.map(norm);
+    if (/^\s*(SELECT|PRAGMA|WITH)/i.test(s)) {
+      return { results: stmt.all(...bound), success: true, meta: { changes: 0 } };
+    }
+    const info = stmt.run(...bound);
+    return {
+      results: [],
+      success: true,
+      meta: { changes: Number(info.changes), last_row_id: Number(info.lastInsertRowid), duration: 0 },
+    };
+  }
+
+  const q = (sql, ...args) => db.prepare(sql).all(...args.map(norm));
+
+  // Map-shaped views over the real tables, so assertions that predate the
+  // SQLite backing (db._creators.size, db._lists.has(id)) keep reading
+  // naturally. Live queries, not snapshots.
+  const tableView = (table, idCol) => ({
+    get size() { return Number(q(`SELECT COUNT(*) AS n FROM ${table}`)[0].n); },
+    has: (id) => q(`SELECT 1 FROM ${table} WHERE ${idCol} = ?`, id).length > 0,
+    get: (id) => q(`SELECT * FROM ${table} WHERE ${idCol} = ?`, id)[0],
+    keys: () => q(`SELECT ${idCol} AS id FROM ${table}`).map((r) => r.id),
+    values: () => q(`SELECT * FROM ${table}`),
+  });
+
+  // Standalone (not `this`-bound): one test hands these to a wrapper object.
+  const _stat = (kind, day) => {
+    const rows = q("SELECT n FROM stats WHERE kind = ? AND day = ?", kind, day);
+    return rows.length ? Number(rows[0].n) : undefined;
+  };
+  const _statBuckets = (kind) => q("SELECT day FROM stats WHERE kind = ?", kind).map((r) => r.day);
+
+  return {
+    _db: db,
+    _creators: tableView("creators", "username"),
+    _lists: tableView("creator_lists", "id"),
+    _stat,
+    _statBuckets,
+    q,
+    // Make chosen statements throw. `fn(sql, args) => boolean`; null clears.
+    failWhen(fn) { state.fail = fn; },
+    prepare(sql) {
+      // Real D1 exposes run()/all() directly as well as after .bind(), since
+      // bind() is only needed for a query that actually has placeholders.
+      // `_spec` lets batch() run the statements itself, synchronously -- see
+      // batch's own comment.
+      const mk = (args) => ({
+        _spec: { sql, args },
+        async run() { const r = exec(sql, args); return { success: true, meta: r.meta }; },
+        async all() { const r = exec(sql, args); return { success: true, results: r.results, meta: r.meta }; },
+        async first(col) {
+          const row = exec(sql, args).results[0] || null;
+          return col && row ? row[col] : row;
+        },
+        bind: (...a) => mk(a),
+      });
+      return mk([]);
+    },
+    // Atomic, and synchronous once entered. node:sqlite's DatabaseSync is a
+    // single synchronous connection, so awaiting each statement inside an
+    // explicit BEGIN lets a second overlapping batch open a nested
+    // transaction and throw -- which, since every counter call site swallows
+    // its errors, silently dropped 19 of 20 concurrent bumps and made the
+    // atomic-counter test fail for a reason that has nothing to do with the
+    // Worker. Running the statements straight through models what D1
+    // actually guarantees: a batch is one transaction, and batches do not
+    // interleave with each other.
+    async batch(stmts) {
+      const specs = stmts.map((st) => st && st._spec).filter(Boolean);
+      db.exec("BEGIN");
+      try {
+        const out = specs.map((sp) => {
+          const r = exec(sp.sql, sp.args);
+          return { success: true, meta: r.meta, results: r.results };
+        });
+        db.exec("COMMIT");
+        return out;
+      } catch (e) {
+        db.exec("ROLLBACK");
+        throw e;
+      }
+    },
+    async exec(sql) { db.exec(String(sql)); return { count: 0, duration: 0 }; },
+  };
+}
+
+let ipSeq = 1;
+export function nextIp() {
+  const n = ipSeq++;
+  return `198.51.${(n >> 8) & 255}.${n & 255}`;
+}
+
+// Anything else passed in rides along as an env var, so a test can set the
+// same wrangler.toml [vars] a deployment would (BULK_RESOLVE_SUBREQUEST_BUDGET,
+// for one). Without the spread those keys were silently dropped and a test
+// asserting on one passed for the wrong reason.
+export function makeEnv(opts = {}) {
+  return {
+    ...opts,
+    CONFIGS: opts.CONFIGS || makeKv(),
+    ADMIN_KEY: opts.ADMIN_KEY === undefined ? "test-admin-secret" : opts.ADMIN_KEY,
+    DB: opts.DB,
+  };
+}
+
+export async function call(env, path, opts = {}) {
+  const {
+    method = "GET",
+    json,
+    form,
+    headers = {},
+    ip = nextIp(),
+    cookie,
+  } = opts;
+  const pending = [];
+  const ctx = {
+    waitUntil(p) {
+      pending.push(Promise.resolve(p).catch(() => {}));
+    },
+  };
+  const h = { ...headers };
+  if (ip) h["CF-Connecting-IP"] = ip;
+  if (cookie) h.Cookie = cookie;
+  const init = { method, headers: h };
+  if (json !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(json);
+  } else if (form) {
+    const fd = new FormData();
+    for (const [k, v] of Object.entries(form)) fd.set(k, v);
+    init.body = fd;
+  }
+  const res = await worker.fetch(new Request("https://example.test" + path, init), env, ctx);
+  await Promise.all(pending);
+  const text = await res.text();
+  let body = text;
+  try { body = JSON.parse(text); } catch { /* html / empty */ }
+  return { status: res.status, body, headers: res.headers, text };
+}
+
+// Fast-forwards past the hold a deleted username is kept under, so a test can
+// exercise re-registration without waiting out CREATOR_TOMBSTONE_TTL_SEC.
+//
+// There are two tombstones and a test that clears only one still fails: KV is
+// the copy every deployment has, D1 the strongly-consistent one that closes
+// the read-cache window when it is bound (see isCreatorTombstoned). Expiring
+// the D1 row rather than deleting it is deliberate -- that is what actually
+// happens in production, and it keeps the test honest about `until` being what
+// the check reads.
+export function lapseCreatorTombstone(env, username) {
+  if (env.CONFIGS && env.CONFIGS._store) env.CONFIGS._store.delete(`creatordeleted:${username}`);
+  if (env.DB && env.DB._db) {
+    try {
+      env.DB._db.exec(`UPDATE creator_tombstones SET until = 1 WHERE username = '${username}'`);
+    } catch {
+      // Table absent (a database provisioned before migration 0004) -- the KV
+      // copy above is the whole of the hold in that case.
+    }
+  }
+}
+
+export async function createUser(env, name, extra = {}) {
+  const ip = extra.ip || nextIp();
+  const r = await call(env, "/api/creator/create", {
+    method: "POST",
+    ip,
+    json: {
+      creatorName: name,
+      displayName: extra.displayName,
+      recoveryAnswer: extra.recoveryAnswer,
+    },
+  });
+  if (!r.body || !r.body.ok) {
+    throw new Error(`create ${name} failed: ${r.status} ${JSON.stringify(r.body)}`);
+  }
+  return { ...r.body, ip };
+}
+
+// Seeds an anonymously published list straight into KV.
+//
+// These records used to be created by POSTing /api/publish-list, which 1.5.3
+// removed: unauthenticated, unowned, permanent, and with no caller anywhere in
+// the shipped bundle. The RECORDS still exist and every read path still serves
+// them -- /lists/user/<slug>, the directory, search, the admin browse-and-
+// delete tools -- so the tests that cover those read paths still need one, and
+// writing the key is now the only way to get one.
+//
+// Deliberately writes the same shape the removed route wrote, so a test that
+// used to seed through the route is testing the same record it always was.
+export function seedAnonPublishedList(env, slug, extra = {}) {
+  const now = extra.publishedAt || Date.now();
+  const record = {
+    name: extra.name || slug,
+    type: extra.type || "movie",
+    items: extra.items || [{ id: "tt0000001" }],
+    visibility: extra.visibility || "public",
+    likes: extra.likes || 0,
+    publishedAt: now,
+  };
+  env.CONFIGS._store.set("publishedlist:user:" + slug, JSON.stringify(record));
+  return { slug, record, url: "/lists/user/" + slug };
+}
+
+// Runs one cron tick and drains its background work to a standstill.
+//
+// scheduled() hands its tasks to ctx.waitUntil, and some of those tasks call
+// ctx.waitUntil AGAIN once they are already running -- advancePublicListIndexBuild
+// is the one that matters, since it registers the actual rebuild chunk and
+// returns immediately. A test that snapshots the queue once and awaits that
+// snapshot therefore misses the rebuild entirely.
+//
+// It used to get away with it by accident: prewarmSharedCatalogs slept between
+// ~47 chart warms, which was long enough for the chunk to finish before the
+// first snapshot resolved. Budgeting the pre-warm removed those sleeps and the
+// accident with them. Draining in rounds is what the test actually meant.
+//
+// `w` defaults to the shared module instance. Pass a freshIsolate() when the
+// tick warms provider caches: those live in module scope, so a second test in
+// the same process would find them already warm and see no KV write at all.
+export async function runScheduledTick(env, event = {}, w = worker) {
+  let queue = [];
+  const ctx = { waitUntil: (p) => queue.push(Promise.resolve(p).catch(() => {})) };
+  await w.scheduled(event, env, ctx);
+  for (let round = 0; round < 20 && queue.length; round++) {
+    const batch = queue;
+    queue = [];
+    await Promise.all(batch);
+  }
+}
+
+// --- The directory index, after it was sharded across 32 keys ---------------
+//
+// 1.5.3 replaced the single `index:publiclists` blob with
+// `index:publiclists:s0` .. `:s31` plus an `index:publiclists:meta` marker,
+// because one key holding the whole directory was a 4.45 MB read-modify-write
+// against KV's one-write-per-second-per-key limit. Tests that used to poke the
+// single key go through these three so they say what they mean rather than
+// naming a storage layout.
+export const PUBLIC_INDEX_SHARD_COUNT = 32;
+
+/** Is there a published directory index at all? */
+export function hasPublicIndex(kv) {
+  return kv._store.has("index:publiclists:meta") || kv._store.has("index:publiclists");
+}
+
+/** Every entry in it, whichever layout it is stored in. */
+export function publicIndexEntries(kv) {
+  if (kv._store.has("index:publiclists:meta")) {
+    const out = [];
+    for (let n = 0; n < PUBLIC_INDEX_SHARD_COUNT; n++) {
+      const raw = kv._store.get("index:publiclists:s" + n);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.entries)) out.push(...parsed.entries);
+      } catch { /* a shard this test corrupted on purpose */ }
+    }
+    return out;
+  }
+  const raw = kv._store.get("index:publiclists");
+  if (!raw) return [];
+  try { return JSON.parse(raw).entries || []; } catch { return []; }
+}
+
+/** A stable snapshot of the whole index, for "was this rebuilt needlessly". */
+export function publicIndexSnapshot(kv) {
+  const keys = ["index:publiclists", "index:publiclists:meta"];
+  for (let n = 0; n < PUBLIC_INDEX_SHARD_COUNT; n++) keys.push("index:publiclists:s" + n);
+  return keys.map((k) => k + "=" + String(kv._store.get(k) || "")).join("\n");
+}
+
+/** Every key a directory write can land on, for hooks and write counters. */
+export function isPublicIndexKey(key) {
+  return key === "index:publiclists" || String(key || "").startsWith("index:publiclists:s");
+}
