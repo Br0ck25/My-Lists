@@ -1246,66 +1246,110 @@ function newOnStreamingWalkPath(kind, providerId, region, page, todayIso) {
   return `discover/movie?sort_by=primary_release_date.desc&primary_release_date.lte=${todayIso}&${common}`;
 }
 
-// The flat list of sweep units the rotating cursor walks: every provider, both
-// kinds, every page up to the walk depth. Built the same way every tick, so a
-// cursor stored by one tick means the same thing to the next.
+// The stable axis the walk turns on: every provider x kind x region, in a
+// fixed order. Sixteen entries, and -- unlike a page-bounded unit list -- its
+// length does not change when a catalogue grows or shrinks, which is what lets
+// a stored cursor still mean something on the next tick.
 //
-// PAGE is the outermost loop, and that ordering is the whole design.
-//
-// Nested the other way -- provider outermost, which is how this shipped -- the
-// walk drains all 40 pages of Netflix movies before it looks at Netflix shows,
-// and all 80 of those before it reaches the second provider. Peacock is unit
-// 560 of 640: over four hours in. So for the first hours of a fresh database
-// the shelf is Netflix films and nothing else, and it has collected Netflix's
-// 800th-newest title before Hulu's newest. On a list whose entire premise is
-// "newest first", that is exactly backwards.
-//
-// Page-major instead: units 0..15 are page 1 of every provider and kind, so
-// roughly one tick fills the TOP of the shelf across all of them, and each
-// pass after that adds a page of depth everywhere at once. The pass still
-// takes the same total time; what changes is that the part a reader actually
-// sees is right from the first minutes rather than the last.
-function newOnStreamingUnits() {
-  const units = [];
-  for (let page = 1; page <= NEW_ON_STREAMING_WALK_DEPTH_PAGES; page++) {
-    for (const region of NEW_ON_STREAMING_REGIONS) {
-      for (const provider of NEW_ON_STREAMING_PROVIDERS) {
-        for (const kind of ["movie", "tv"]) {
-          units.push({ region, provider, kind, page });
-        }
+// The walk itself is PAGE-MAJOR over this list: page 1 of all sixteen, then
+// page 2 of all sixteen, and so on. Nested the other way -- provider
+// outermost, which is how this shipped -- the sweep drained every page of
+// Netflix movies before it looked at Netflix shows, and all of those before
+// the second provider, so for hours the shelf was Netflix films and nothing
+// else. Page-major means one tick fills the TOP of the shelf everywhere and
+// the rest of the pass only adds depth.
+function newOnStreamingCombos() {
+  const combos = [];
+  for (const region of NEW_ON_STREAMING_REGIONS) {
+    for (const provider of NEW_ON_STREAMING_PROVIDERS) {
+      for (const kind of ["movie", "tv"]) {
+        combos.push({ region, provider, kind, key: `${region}:${provider.key}:${kind}` });
       }
     }
   }
-  return units;
+  return combos;
 }
 
-// Bumped whenever newOnStreamingUnits() changes shape or order. The cursor is
-// an INDEX into that list, so a stored position from an older layout points at
-// a different unit entirely -- resuming on it would silently leave a band of
-// the catalog unswept until the next full pass. A mismatch restarts the pass
-// at unit 0 instead, which costs one repeat of ground already covered (a
-// no-op, since a re-seen title only refreshes its "still present" marker).
-const NEW_ON_STREAMING_CURSOR_LAYOUT = 2;
+// Bumped whenever the walk's shape changes. The cursor describes a position in
+// it, so a position recorded under an older shape is not a position at all --
+// resuming on it would silently leave a band of the catalogue unswept. A
+// mismatch restarts the pass, which costs one repeat of ground already covered
+// (a no-op: a re-seen title only refreshes its "still present" marker).
+//
+// 3: the walk stopped being a fixed 40 pages per catalogue and started reading
+//    each one to its learned end, so `unit` (an index into a fixed-length
+//    list) became `page` + `idx`.
+const NEW_ON_STREAMING_CURSOR_LAYOUT = 3;
+
+// How deep each catalogue actually goes, learned from the total_pages every
+// discover response carries and cached in KV between ticks.
+//
+// Unknown means 1, not "skip": page 1 is always attempted, and the answer it
+// returns is the depth. That is what makes a cold start correct without a
+// configured guess -- the first sixteen units of a fresh database measure
+// every catalogue before the walk ever advances to page 2.
+async function readNewOnStreamingDepths(env) {
+  if (!env || !env.CONFIGS) return {};
+  try {
+    const raw = await env.CONFIGS.get("cron:newonstreaming:depths");
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function newOnStreamingDepthOf(depths, key) {
+  const n = parseInt(depths && depths[key], 10);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, NEW_ON_STREAMING_MAX_PAGES_PER_CATALOG) : 1;
+}
+
+// The highest page any catalogue reaches, which is where a pass ends. Computed
+// fresh each time it is needed rather than cached: on a first walk it climbs
+// from 1 to the real depth as the sixteen page-1 reads come back, and a pass
+// must not be declared complete against the value it started with.
+function newOnStreamingMaxPage(combos, depths) {
+  let max = 1;
+  for (const c of combos) max = Math.max(max, newOnStreamingDepthOf(depths, c.key));
+  return max;
+}
+
+// Total pages in one full pass -- what the admin panel reports, and the number
+// that says how long a pass takes at NEW_ON_STREAMING_PAGES_PER_TICK.
+function newOnStreamingPassPages(combos, depths) {
+  let total = 0;
+  for (const c of combos) total += newOnStreamingDepthOf(depths, c.key);
+  return total;
+}
 
 // Reads the sweep cursor. `unit` is where in newOnStreamingUnits() the next
 // tick starts; `walk` counts completed passes over the whole list, and walk 0
 // is the one that seeds -- see the `seeded` column in migration 0011.
 async function readNewOnStreamingCursor(env) {
-  const fallback = { unit: 0, walk: 0 };
+  const fallback = { page: 1, idx: 0, walk: 0, passErrors: 0 };
   if (!env || !env.CONFIGS) return fallback;
   try {
     const raw = await env.CONFIGS.get("cron:newonstreaming:cursor");
     if (!raw) return fallback;
-    const parsed = JSON.parse(raw);
-    const unit = Number.isFinite(parsed && parsed.unit) && parsed.unit >= 0 ? Math.floor(parsed.unit) : 0;
-    const walk = Number.isFinite(parsed && parsed.walk) && parsed.walk >= 0 ? Math.floor(parsed.walk) : 0;
-    // A position recorded against a different unit layout is not a position.
+    const parsed = JSON.parse(raw) || {};
+    const num = (v, min, dflt) => {
+      const n = Math.floor(Number(v));
+      return Number.isFinite(n) && n >= min ? n : dflt;
+    };
+    const walk = num(parsed.walk, 0, 0);
+    // A position recorded against a different walk shape is not a position.
     // The walk generation is kept: a database part-way through its seeding
-    // pass is still seeding, and promoting it to "observed" here would date
-    // every title it has yet to reach as an arrival that never happened.
-    const layout = Number.isFinite(parsed && parsed.layout) ? parsed.layout : 1;
-    if (layout !== NEW_ON_STREAMING_CURSOR_LAYOUT) return { unit: 0, walk };
-    return { unit, walk };
+    // pass is still seeding, and promoting it here would date every title it
+    // has yet to reach as an arrival that never happened.
+    if (num(parsed.layout, 0, 1) !== NEW_ON_STREAMING_CURSOR_LAYOUT) {
+      return { page: 1, idx: 0, walk, passErrors: 0 };
+    }
+    return {
+      page: num(parsed.page, 1, 1),
+      idx: num(parsed.idx, 0, 0),
+      walk,
+      passErrors: num(parsed.passErrors, 0, 0),
+    };
   } catch (e) {
     console.warn("[Cron] could not read the New on Streaming cursor:", e && e.message ? e.message : e);
     return fallback;
@@ -1326,48 +1370,48 @@ async function fetchNewOnStreamingPage(pathAndQuery, apiKey) {
   });
   if (!res.ok) throw new Error(`TMDB request failed (HTTP ${res.status}).`);
   const data = await res.json();
-  return Array.isArray(data.results) ? data.results : [];
+  const totalPages = Number.isFinite(Number(data.total_pages)) ? Number(data.total_pages) : null;
+  return { items: Array.isArray(data.results) ? data.results : [], totalPages };
 }
 
 // Which of this page's TMDB ids the table already knows about, for this region
 // and kind, across EVERY service -- not just the one being swept.
 //
-// Two different questions come out of one read. A row for this same service
+// Three different questions come out of one read. A row for this same service
 // means the title was already here and only its "still present" marker needs
-// touching. A row for a different service still carries the IMDb id, which is
-// the expensive half of recording an arrival, so a title moving onto a second
-// service costs no TMDB call at all.
+// touching -- unless that row is currently marked gone, in which case this
+// sighting is a return and dates itself today. And a row for a DIFFERENT
+// service still carries the IMDb id, which is the expensive half of recording
+// an arrival, so a title moving onto a second service costs no TMDB call.
 async function lookupNewOnStreamingKnown(env, region, kind, tmdbIds) {
   const known = new Map();
   if (!env || !env.DB || !tmdbIds.length) return known;
   const placeholders = tmdbIds.map(() => "?").join(",");
   const { results } = await env.DB.prepare(
-    `SELECT tmdb_id, imdb_id, service FROM streaming_events
+    `SELECT tmdb_id, imdb_id, service, removed_at FROM streaming_events
       WHERE region = ? AND kind = ? AND tmdb_id IN (${placeholders})`
   ).bind(region, kind, ...tmdbIds).all();
   for (const row of (results || [])) {
     const id = Number(row && row.tmdb_id);
     if (!Number.isFinite(id)) continue;
-    const entry = known.get(id) || { imdbId: null, services: new Set() };
+    const entry = known.get(id) || { imdbId: null, services: new Map() };
     if (row.imdb_id) entry.imdbId = row.imdb_id;
-    if (row.service) entry.services.add(String(row.service));
+    if (row.service) entry.services.set(String(row.service), { removed: row.removed_at != null });
     known.set(id, entry);
   }
   return known;
 }
 
-// Walks a slice of the provider catalogs and records what it has not seen
-// before. Invoked from scheduled(); `fetchBudget` is its share of the tick's
-// outbound fetches (see CRON_NEW_ON_STREAMING_SHARE).
-//
-// Returns a small summary the admin dashboard renders, so a sweep can be
-// judged by what it did rather than by whether it threw.
 // `maxUnits` overrides NEW_ON_STREAMING_PAGES_PER_TICK. Only the admin
 // dashboard's "Run a sweep now" passes it, so a first walk can be pushed along
 // by hand instead of waiting out the cron -- the cron itself always uses the
 // constant.
 async function sweepNewOnStreaming(env, ctx, fetchBudget, maxUnits) {
-  const summary = { ran: false, reason: "", units: 0, seen: 0, added: 0, touched: 0, resolved: 0, walk: 0, unit: 0, errors: 0 };
+  const summary = {
+    ran: false, reason: "", units: 0, seen: 0, added: 0, returned: 0, touched: 0, resolved: 0,
+    walk: 0, page: 1, idx: 0, errors: 0, passErrors: 0, wrapped: false, passPages: 0,
+    removal: null,
+  };
   if (!env || !env.CONFIGS) {
     summary.reason = "no KV binding";
     return summary;
@@ -1404,17 +1448,18 @@ async function sweepNewOnStreaming(env, ctx, fetchBudget, maxUnits) {
     return summary;
   }
 
-  const units = newOnStreamingUnits();
-  if (!units.length) {
+  const combos = newOnStreamingCombos();
+  if (!combos.length) {
     summary.reason = "no providers configured";
     return summary;
   }
 
   const cursor = await readNewOnStreamingCursor(env);
+  const depths = await readNewOnStreamingDepths(env);
   const perTick = Number.isFinite(maxUnits) && maxUnits > 0
     ? Math.floor(maxUnits)
     : NEW_ON_STREAMING_PAGES_PER_TICK;
-  const take = Math.min(units.length, affordable, perTick);
+  const take = Math.min(affordable, perTick);
   const nowSec = Math.floor(Date.now() / 1000);
   const todayIso = new Date(nowSec * 1000).toISOString().slice(0, 10);
   // Walk 0 is the first pass over every provider catalog, and everything it
@@ -1424,125 +1469,111 @@ async function sweepNewOnStreaming(env, ctx, fetchBudget, maxUnits) {
   const seeding = cursor.walk === 0;
   summary.walk = cursor.walk;
 
+  let page = cursor.page;
+  let idx = cursor.idx;
+  let wrapped = false;
+  let depthsChanged = false;
   const writes = [];
+
   for (let n = 0; n < take; n++) {
-    const unit = units[(cursor.unit + n) % units.length];
-    let page;
-    try {
-      page = await fetchNewOnStreamingPage(
-        newOnStreamingWalkPath(unit.kind, unit.provider.tmdbId, unit.region, unit.page, todayIso),
-        apiKey
-      );
-    } catch (e) {
-      summary.errors++;
-      console.warn(
-        `[Cron] New on Streaming sweep ${unit.provider.key}/${unit.kind} p${unit.page} failed:`,
-        e && e.message ? e.message : e
-      );
-      continue;
-    }
-    summary.units++;
-    // A page past the end of a provider's catalog is the normal way a walk
-    // reaches its horizon, not a fault -- the unit list is a fixed depth and
-    // most providers are shallower than the deepest one.
-    if (!page.length) continue;
+    const combo = combos[idx % combos.length];
+    const depth = newOnStreamingDepthOf(depths, combo.key);
 
-    const entryType = unit.kind === "tv" ? "series" : "movie";
-    // No poster is this add-on's cheapest quality floor, and provider
-    // catalogs need one: they carry a long tail of filler that TMDB has a row
-    // for and nothing else -- no art, no votes -- which would otherwise be
-    // most of what a "newest first" shelf shows.
-    const candidates = page.filter((it) => it && it.id && (it.poster_path || it.backdrop_path) && it.adult !== true);
-    summary.seen += candidates.length;
-    if (!candidates.length) continue;
+    // Past the end of THIS catalog while others are still deeper. Costs no
+    // fetch -- the walk just steps over it.
+    if (page <= depth) {
+      let result = null;
+      try {
+        result = await fetchNewOnStreamingPage(
+          newOnStreamingWalkPath(combo.kind, combo.provider.tmdbId, combo.region, page, todayIso),
+          apiKey
+        );
+        summary.units++;
+      } catch (e) {
+        summary.errors++;
+        console.warn(
+          `[Cron] New on Streaming sweep ${combo.provider.key}/${combo.kind} p${page} failed:`,
+          e && e.message ? e.message : e
+        );
+      }
 
-    const known = await lookupNewOnStreamingKnown(
-      env, unit.region, entryType, candidates.map((it) => Number(it.id))
-    );
-
-    // Only titles with no row anywhere cost a TMDB detail call. Everything
-    // else already carries its IMDb id in the table.
-    const needResolve = candidates.filter((it) => !(known.get(Number(it.id)) || {}).imdbId);
-    summary.resolved += needResolve.length;
-    const resolvedIds = new Map();
-    if (needResolve.length) {
-      const details = await mapWithConcurrency(needResolve, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
-        const { imdbId } = await fetchTmdbDetails(it.id, unit.kind, apiKey, env);
-        return { tmdbId: Number(it.id), imdbId };
-      });
-      for (const d of details) {
-        if (d && d.imdbId) resolvedIds.set(d.tmdbId, d.imdbId);
+      if (result) {
+        // Every discover response carries total_pages, so the depth is
+        // re-learned on every read rather than measured once -- a catalog that
+        // grows is walked further on the very next pass, and one that shrinks
+        // stops being asked for pages that no longer exist.
+        if (Number.isFinite(result.totalPages) && result.totalPages > 0) {
+          const learned = Math.min(result.totalPages, NEW_ON_STREAMING_MAX_PAGES_PER_CATALOG);
+          if (depths[combo.key] !== learned) {
+            depths[combo.key] = learned;
+            depthsChanged = true;
+          }
+        }
+        await collectNewOnStreamingPage({
+          env, apiKey, combo, page, items: result.items,
+          nowSec, seeding, walk: cursor.walk, writes, summary,
+        });
       }
     }
 
-    for (const it of candidates) {
-      const tmdbId = Number(it.id);
-      const prior = known.get(tmdbId);
-      const imdbId = (prior && prior.imdbId) || resolvedIds.get(tmdbId);
-      // Stremio and Nuvio key metas by IMDb id. A title TMDB has no external
-      // id for cannot be played from this shelf, so it is not put on it --
-      // unlike fetchTmdbGenre, which falls back to a "tmdb:" pseudo-id
-      // because a genre browse is allowed to be a dead end and a "what can I
-      // watch tonight" shelf is not.
-      if (!imdbId) continue;
-
-      const dateStr = it.release_date || it.first_air_date || "";
-      const releaseEpoch = newOnStreamingDateToEpoch(dateStr, nowSec);
-      const alreadyHere = prior && prior.services.has(unit.provider.key);
-      if (alreadyHere) {
-        summary.touched++;
-      } else {
-        summary.added++;
+    idx++;
+    if (idx >= combos.length) {
+      idx = 0;
+      page++;
+      // Recomputed here, AFTER this round of pages has taught it something.
+      // On a fresh database the first sixteen reads lift it from 1 to the real
+      // depth; computing it once up front would have declared the pass
+      // complete after page 1 and ended seeding before it had seen anything.
+      if (page > newOnStreamingMaxPage(combos, depths)) {
+        page = 1;
+        wrapped = true;
+        break;
       }
-      const eventAt = seeding ? releaseEpoch : nowSec;
-      writes.push(
-        env.DB.prepare(
-          `INSERT INTO streaming_events
-             (region, service, imdb_id, tmdb_id, kind, added_at, last_event_at, event_kind,
-              seeded, last_seen_walk, name, poster, background, year)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (region, service, imdb_id) DO UPDATE SET
-             last_seen_walk = excluded.last_seen_walk,
-             tmdb_id        = excluded.tmdb_id,
-             name           = excluded.name,
-             poster         = excluded.poster,
-             background     = excluded.background,
-             year           = excluded.year,
-             removed_at     = NULL`
-        ).bind(
-          unit.region,
-          unit.provider.key,
-          imdbId,
-          tmdbId,
-          entryType,
-          eventAt || nowSec,
-          eventAt,
-          seeding ? 1 : 0,
-          cursor.walk,
-          it.title || it.name || "",
-          it.poster_path ? `https://image.tmdb.org/t/p/w500${it.poster_path}` : (it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null),
-          it.backdrop_path ? `https://image.tmdb.org/t/p/w1280${it.backdrop_path}` : null,
-          String(dateStr).slice(0, 4) || null
-        )
-      );
     }
   }
 
-  // The ON CONFLICT clause above is what makes a first sighting permanent:
-  // an existing row keeps its added_at, its last_event_at and its seeded
-  // flag, and only has its "still present" marker and its artwork refreshed.
-  // Re-running a sweep over ground it has already covered therefore changes
-  // no dates, which is what lets the cursor be advanced optimistically below.
+  // The ON CONFLICT clause in collectNewOnStreamingPage is what makes a first
+  // sighting permanent: an existing, still-present row keeps its added_at, its
+  // last_event_at and its seeded flag, and only has its "still here" marker and
+  // its artwork refreshed. Re-running a sweep over ground it has already
+  // covered therefore changes no dates, which is what lets the cursor be
+  // advanced optimistically below.
   await d1BatchInChunks(env, writes, "New on Streaming sweep");
 
   summary.ran = true;
-  const nextUnit = (cursor.unit + take) % units.length;
-  const wrapped = cursor.unit + take >= units.length;
-  summary.unit = nextUnit;
+  summary.wrapped = wrapped;
+  summary.page = page;
+  summary.idx = idx;
+  summary.passErrors = cursor.passErrors + summary.errors;
+  summary.passPages = newOnStreamingPassPages(combos, depths);
+
+  // A completed pass has read every page of every catalog, so a row it did not
+  // touch is a title that is no longer there. That inference is only available
+  // here, at the wrap.
+  if (wrapped) {
+    summary.removal = await applyNewOnStreamingRemovals(env, cursor.walk, summary.passErrors, nowSec);
+  }
+
+  if (depthsChanged) {
+    try {
+      await env.CONFIGS.put("cron:newonstreaming:depths", JSON.stringify(depths));
+    } catch (e) {
+      console.warn("[Cron] could not store the New on Streaming catalog depths:", e && e.message ? e.message : e);
+    }
+  }
   try {
     await env.CONFIGS.put(
       "cron:newonstreaming:cursor",
-      JSON.stringify({ unit: nextUnit, walk: wrapped ? cursor.walk + 1 : cursor.walk, layout: NEW_ON_STREAMING_CURSOR_LAYOUT })
+      JSON.stringify({
+        page,
+        idx,
+        walk: wrapped ? cursor.walk + 1 : cursor.walk,
+        // Errors accumulate across the ticks of ONE pass and reset with it:
+        // whether a pass may conclude that something is absent depends on how
+        // much of it could be read, not on how the last tick happened to go.
+        passErrors: wrapped ? 0 : summary.passErrors,
+        layout: NEW_ON_STREAMING_CURSOR_LAYOUT,
+      })
     );
   } catch (e) {
     console.warn("[Cron] could not advance the New on Streaming cursor:", e && e.message ? e.message : e);
@@ -1558,6 +1589,188 @@ async function sweepNewOnStreaming(env, ctx, fetchBudget, maxUnits) {
     // its own receipt is still a tick that swept correctly.
   }
   return summary;
+}
+
+// Turns one discover page into upserts. Split out of the sweep loop so the
+// loop reads as the walk it is, and so the "what counts as an arrival"
+// decision sits in one place.
+async function collectNewOnStreamingPage({ env, apiKey, combo, page, items, nowSec, seeding, walk, writes, summary }) {
+  const entryType = combo.kind === "tv" ? "series" : "movie";
+  // No poster is this add-on's cheapest quality floor, and provider catalogs
+  // need one: they carry a long tail of filler that TMDB has a row for and
+  // nothing else -- no art, no votes -- which would otherwise be most of what
+  // a "newest first" shelf shows.
+  const candidates = (items || []).filter(
+    (it) => it && it.id && (it.poster_path || it.backdrop_path) && it.adult !== true
+  );
+  summary.seen += candidates.length;
+  if (!candidates.length) return;
+
+  const known = await lookupNewOnStreamingKnown(
+    env, combo.region, entryType, candidates.map((it) => Number(it.id))
+  );
+
+  // Only titles with no row anywhere cost a TMDB detail call. Everything else
+  // already carries its IMDb id in the table.
+  const needResolve = candidates.filter((it) => !(known.get(Number(it.id)) || {}).imdbId);
+  summary.resolved += needResolve.length;
+  const resolvedIds = new Map();
+  if (needResolve.length) {
+    const details = await mapWithConcurrency(needResolve, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
+      const { imdbId } = await fetchTmdbDetails(it.id, combo.kind, apiKey, env);
+      return { tmdbId: Number(it.id), imdbId };
+    });
+    for (const d of details) {
+      if (d && d.imdbId) resolvedIds.set(d.tmdbId, d.imdbId);
+    }
+  }
+
+  for (const it of candidates) {
+    const tmdbId = Number(it.id);
+    const prior = known.get(tmdbId);
+    const imdbId = (prior && prior.imdbId) || resolvedIds.get(tmdbId);
+    // Stremio and Nuvio key metas by IMDb id. A title TMDB has no external id
+    // for cannot be played from this shelf, so it is not put on it -- unlike
+    // fetchTmdbGenre, which falls back to a "tmdb:" pseudo-id because a genre
+    // browse is allowed to be a dead end and a "what can I watch tonight"
+    // shelf is not.
+    if (!imdbId) continue;
+
+    const dateStr = it.release_date || it.first_air_date || "";
+    const releaseEpoch = newOnStreamingDateToEpoch(dateStr, nowSec);
+    const priorHere = prior && prior.services.get(combo.provider.key);
+    if (priorHere) {
+      summary.touched++;
+    } else {
+      summary.added++;
+    }
+    const eventAt = seeding ? releaseEpoch : nowSec;
+    writes.push(
+      env.DB.prepare(
+        `INSERT INTO streaming_events
+           (region, service, imdb_id, tmdb_id, kind, added_at, last_event_at, event_kind,
+            seeded, last_seen_walk, name, poster, background, year)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (region, service, imdb_id) DO UPDATE SET
+           last_seen_walk = excluded.last_seen_walk,
+           tmdb_id        = excluded.tmdb_id,
+           name           = excluded.name,
+           poster         = excluded.poster,
+           background     = excluded.background,
+           year           = excluded.year,
+           -- A row that was marked gone and has turned up again is an arrival
+           -- in its own right: it IS on the service today and it was not
+           -- yesterday, which is precisely what this shelf reports. So a
+           -- returning title takes today's date and loses its seeded flag,
+           -- while a title that never left keeps every date it had.
+           added_at       = CASE WHEN streaming_events.removed_at IS NOT NULL THEN excluded.added_at ELSE streaming_events.added_at END,
+           last_event_at  = CASE WHEN streaming_events.removed_at IS NOT NULL THEN excluded.last_event_at ELSE streaming_events.last_event_at END,
+           event_kind     = CASE WHEN streaming_events.removed_at IS NOT NULL THEN 'added' ELSE streaming_events.event_kind END,
+           seeded         = CASE WHEN streaming_events.removed_at IS NOT NULL THEN 0 ELSE streaming_events.seeded END,
+           removed_at     = NULL`
+      ).bind(
+        combo.region,
+        combo.provider.key,
+        imdbId,
+        tmdbId,
+        entryType,
+        eventAt || nowSec,
+        eventAt,
+        seeding ? 1 : 0,
+        walk,
+        it.title || it.name || "",
+        it.poster_path ? `https://image.tmdb.org/t/p/w500${it.poster_path}` : (it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null),
+        it.backdrop_path ? `https://image.tmdb.org/t/p/w1280${it.backdrop_path}` : null,
+        String(dateStr).slice(0, 4) || null
+      )
+    );
+    if (priorHere && priorHere.removed) summary.returned++;
+  }
+}
+
+// Marks rows a completed pass did not see as gone.
+//
+// last_seen_walk is stamped on every row the sweep touches, so after pass W
+// anything still carrying a generation older than W was not found. Requiring
+// NEW_ON_STREAMING_REMOVAL_GRACE_WALKS consecutive misses rather than one
+// turns "TMDB did not list it this time" into "TMDB has not listed it for
+// hours", which is the difference between a hiccup and a departure.
+//
+// Rows are marked, never deleted: the row is the history. If the title comes
+// back, the upsert above clears removed_at and dates it as the new arrival it
+// is -- and it can only do that because the row was still there.
+async function applyNewOnStreamingRemovals(env, completedWalk, passErrors, nowSec) {
+  const out = { ran: false, reason: "", marked: 0, live: 0, candidates: 0, held: [] };
+  // Generations are only meaningful once enough of them exist to be missed.
+  // Before that there is nothing a row could have failed to appear in.
+  const cutoff = completedWalk - NEW_ON_STREAMING_REMOVAL_GRACE_WALKS;
+  if (cutoff < 0) {
+    out.reason = `pass ${completedWalk}: too early to tell anything is gone (needs ${NEW_ON_STREAMING_REMOVAL_GRACE_WALKS} completed passes)`;
+    return out;
+  }
+  if (passErrors > NEW_ON_STREAMING_MAX_PASS_ERRORS) {
+    out.reason = `pass ${completedWalk} could not read ${passErrors} pages, so it did not establish that anything is absent`;
+    console.warn(`[Cron] New on Streaming removals skipped: ${out.reason}`);
+    return out;
+  }
+  try {
+    // Judged per catalogue, not across the table, and that distinction is the
+    // whole value of the guard.
+    //
+    // The failure it exists for is not an error -- it is TMDB answering 200
+    // with an empty result set for one provider, which no error count catches.
+    // A single service is an eighth of the table, so a table-wide threshold
+    // would wave through "every Netflix title left overnight" as a perfectly
+    // ordinary 12%. Measured against that service's own rows it is 100%, and
+    // obviously wrong.
+    //
+    // No region filter is needed: a pass walks every region in
+    // NEW_ON_STREAMING_REGIONS, so a completed pass has looked everywhere.
+    const { results } = await env.DB.prepare(
+      `SELECT service, kind,
+              COUNT(*) AS live,
+              SUM(CASE WHEN last_seen_walk <= ? THEN 1 ELSE 0 END) AS gone
+         FROM streaming_events
+        WHERE removed_at IS NULL
+        GROUP BY service, kind`
+    ).bind(cutoff).all();
+
+    const writes = [];
+    for (const row of (results || [])) {
+      const live = Number(row.live) || 0;
+      const gone = Number(row.gone) || 0;
+      out.live += live;
+      if (!gone) continue;
+      out.candidates += gone;
+      const share = live > 0 ? gone / live : 1;
+      if (share > NEW_ON_STREAMING_MAX_REMOVAL_SHARE) {
+        const note =
+          `${row.service}/${row.kind}: ${gone} of ${live} (${Math.round(share * 100)}%)`;
+        out.held.push(note);
+        continue;
+      }
+      writes.push(
+        env.DB.prepare(
+          `UPDATE streaming_events SET removed_at = ?
+            WHERE removed_at IS NULL AND last_seen_walk <= ? AND service = ? AND kind = ?`
+        ).bind(nowSec, cutoff, row.service, row.kind)
+      );
+      out.marked += gone;
+    }
+
+    if (out.held.length) {
+      out.reason =
+        `pass ${completedWalk} concluded that whole catalogues had emptied, which is not something that happens: ` +
+        out.held.join("; ") + ". Those were left alone -- check TMDB for that provider.";
+      console.warn(`[Cron] New on Streaming removals skipped: ${out.reason}`);
+    }
+    await d1BatchInChunks(env, writes, "New on Streaming removals");
+    out.ran = true;
+  } catch (e) {
+    out.reason = safeErrorMessage(e);
+    console.warn("[Cron] New on Streaming removals failed:", e && e.message ? e.message : e);
+  }
+  return out;
 }
 
 // D1 caps how much one batch may carry, and a sweep tick can produce a few
@@ -1673,12 +1886,12 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
         console.warn(`[Cron] New on Streaming episode scan ${provider.key} p${p} failed:`, e && e.message ? e.message : e);
         break;
       }
-      for (const it of page) {
+      for (const it of page.items) {
         if (it && it.id) candidateIds.add(Number(it.id));
       }
       // Past the end of what is airing on this service -- the next page cannot
       // hold anything either.
-      if (!page.length) break;
+      if (!page.items.length) break;
     }
   }
   summary.candidates = candidateIds.size;
@@ -1845,19 +2058,26 @@ async function fetchNewOnStreaming(entry, skip = 0, keys = {}) {
 // What the admin dashboard reads: enough to tell a sweep that is working from
 // one that has never run, without opening the database by hand.
 async function newOnStreamingStatus(env) {
+  const combos = newOnStreamingCombos();
+  const depths = await readNewOnStreamingDepths(env);
   const out = {
     d1Bound: !!(env && env.DB),
     tableReady: false,
     region: NEW_ON_STREAMING_REGIONS[0],
     providers: NEW_ON_STREAMING_PROVIDERS.map((p) => ({ key: p.key, name: p.name, tmdbId: p.tmdbId })),
     inQuickAdd: NEW_ON_STREAMING_IN_QUICK_ADD,
-    totalUnits: newOnStreamingUnits().length,
+    combos: combos.length,
+    // 0 until the first pass has measured the catalogs. Reported rather than
+    // assumed, because "how big is a pass" is the number that says how long a
+    // full sweep -- and so a removal -- takes, and it is not a constant.
+    passPages: newOnStreamingPassPages(combos, depths),
     unitsPerTick: NEW_ON_STREAMING_PAGES_PER_TICK,
-    cursor: { unit: 0, walk: 0 },
+    depthsKnown: combos.filter((c) => depths[c.key] > 0).length,
+    cursor: { page: 1, idx: 0, walk: 0, passErrors: 0 },
     lastSweep: null,
     lastBump: null,
     byService: [],
-    totals: { movie: 0, series: 0, seeded: 0, observed: 0 },
+    totals: { movie: 0, series: 0, seeded: 0, observed: 0, removed: 0 },
     error: "",
   };
   if (env && env.CONFIGS) {
@@ -1872,26 +2092,36 @@ async function newOnStreamingStatus(env) {
   if (!out.d1Bound) return out;
   try {
     const { results } = await env.DB.prepare(
-      `SELECT service, kind, COUNT(*) AS n, SUM(seeded) AS seeded, MAX(last_event_at) AS newest
+      `SELECT service, kind,
+              SUM(CASE WHEN removed_at IS NULL THEN 1 ELSE 0 END) AS live,
+              SUM(CASE WHEN removed_at IS NULL THEN seeded ELSE 0 END) AS seeded,
+              SUM(CASE WHEN removed_at IS NOT NULL THEN 1 ELSE 0 END) AS removed,
+              MAX(CASE WHEN removed_at IS NULL THEN last_event_at ELSE 0 END) AS newest
          FROM streaming_events
-        WHERE region = ? AND removed_at IS NULL
+        WHERE region = ?
         GROUP BY service, kind`
     ).bind(out.region).all();
     out.tableReady = true;
     for (const row of (results || [])) {
-      const n = Number(row.n) || 0;
+      const n = Number(row.live) || 0;
       const seeded = Number(row.seeded) || 0;
+      const removed = Number(row.removed) || 0;
+      const key = `${out.region}:${row.service}:${row.kind === "series" ? "tv" : "movie"}`;
       out.byService.push({
         service: String(row.service || ""),
         kind: String(row.kind || ""),
         count: n,
         seeded,
         observed: n - seeded,
+        removed,
+        pages: newOnStreamingDepthOf(depths, key),
+        measured: !!depths[key],
         newest: Number(row.newest) || 0,
       });
       if (row.kind === "series") out.totals.series += n; else out.totals.movie += n;
       out.totals.seeded += seeded;
       out.totals.observed += n - seeded;
+      out.totals.removed += removed;
     }
     out.byService.sort((a, b) => a.service.localeCompare(b.service) || a.kind.localeCompare(b.kind));
   } catch (e) {

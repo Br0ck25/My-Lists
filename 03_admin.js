@@ -2274,15 +2274,15 @@ async function renderAdminDashboard(env) {
         <button type="button" class="admin-select" style="cursor:pointer;" id="nosSweepBtn" onclick="runNewOnStreamingSweep()">Run a sweep now</button>
         <span id="nosSweepStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
       </div>
-      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">One unit is one provider, one type, one page of 20 &mdash; the same slice the cron takes. Running a sweep here advances the same cursor the cron uses, so it brings the first walk in sooner rather than duplicating it. Capped at 40 units a click because this spends the request&rsquo;s own subrequest allowance, not the cron&rsquo;s.</p>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">One unit is one provider, one type, one page of 20 &mdash; the same slice the cron takes. A pass reads every catalogue to its end (the depth is measured from TMDB, not configured), and the pass that completes is what lets titles no longer on a service be marked gone. Running a sweep here advances the same cursor the cron uses, so it brings the walk in sooner rather than duplicating it. Capped at 40 units a click because this spends the request&rsquo;s own subrequest allowance, not the cron&rsquo;s.</p>
     </div>
 
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Rows collected</div>
       <div class="table-wrap">
         <table>
-          <tr><th>Service</th><th>Type</th><th>Titles</th><th>Seeded</th><th>Observed</th><th>Newest</th></tr>
-          <tbody id="nosByServiceBody"><tr><td colspan="6">Loading&hellip;</td></tr></tbody>
+          <tr><th>Service</th><th>Type</th><th>Pages</th><th>Titles</th><th>Seeded</th><th>Observed</th><th>Gone</th><th>Newest</th></tr>
+          <tbody id="nosByServiceBody"><tr><td colspan="8">Loading&hellip;</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -3416,16 +3416,31 @@ async function renderAdminDashboard(env) {
         bits.push('<div>Visible to users: ' + (st.inQuickAdd
           ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
           : '<span style="color:#FF9500;">no -- admin only (NEW_ON_STREAMING_IN_QUICK_ADD is false)</span>') + '</div>');
-        const cursor = st.cursor || { unit: 0, walk: 0 };
-        const pct = st.totalUnits ? Math.floor((cursor.unit / st.totalUnits) * 100) : 0;
-        bits.push('<div>Walk: generation <strong>' + cursor.walk + '</strong>, at unit ' + cursor.unit + ' of ' + st.totalUnits + ' (' + pct + '% through this pass), ' + st.unitsPerTick + ' units a tick</div>');
+        const cursor = st.cursor || { page: 1, idx: 0, walk: 0, passErrors: 0 };
+        const perPass = st.passPages || 0;
+        const done = perPass ? Math.min(perPass, ((cursor.page - 1) * st.combos) + cursor.idx) : 0;
+        const pct = perPass ? Math.floor((done / perPass) * 100) : 0;
+        bits.push('<div>Pass size: <strong>' + (perPass || '?') + '</strong> pages ('
+          + st.depthsKnown + ' of ' + st.combos + ' catalogues measured)'
+          + (perPass && st.unitsPerTick ? ' &mdash; about ' + (Math.round((perPass / st.unitsPerTick) * 6 / 6) * 1) + ' ticks, ~' + (Math.round((perPass / st.unitsPerTick) * 6 / 60 * 10) / 10) + ' h a full pass' : '')
+          + '</div>');
+        bits.push('<div>Walk: generation <strong>' + cursor.walk + '</strong>, at page ' + cursor.page + ', catalogue ' + cursor.idx + ' of ' + st.combos + ' (' + pct + '% through this pass), ' + st.unitsPerTick + ' pages a tick</div>');
+        if (cursor.passErrors) {
+          bits.push('<div style="color:#FF9500;">' + cursor.passErrors + ' page(s) failed so far this pass &mdash; removals are skipped for a pass that could not be read.</div>');
+        }
         bits.push('<div>' + (cursor.walk === 0
           ? '<span style="color:#FF9500;">Still on the seeding pass</span> -- dates are the titles&rsquo; own release dates until this first pass finishes.'
           : '<span style="color:#30d158;">Past the seeding pass</span> -- arrivals found from here on are observed, not inferred.') + '</div>');
         const totals = st.totals || {};
-        bits.push('<div>Titles: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows &mdash; ' + (totals.seeded || 0) + ' seeded, <strong>' + (totals.observed || 0) + ' observed</strong></div>');
+        bits.push('<div>Titles: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows &mdash; ' + (totals.seeded || 0) + ' seeded, <strong>' + (totals.observed || 0) + ' observed</strong>, ' + (totals.removed || 0) + ' marked gone</div>');
         if (st.lastSweep) {
-          bits.push('<div>Last sweep: ' + nosEpochToDay(st.lastSweep.at) + ' &mdash; ' + (st.lastSweep.units || 0) + ' pages, ' + (st.lastSweep.added || 0) + ' new rows, ' + (st.lastSweep.resolved || 0) + ' IMDb lookups, ' + (st.lastSweep.errors || 0) + ' errors' + (st.lastSweep.reason ? ' (' + escapeHtmlAdmin(st.lastSweep.reason) + ')' : '') + '</div>');
+          bits.push('<div>Last sweep: ' + nosEpochToDay(st.lastSweep.at) + ' &mdash; ' + (st.lastSweep.units || 0) + ' pages, ' + (st.lastSweep.added || 0) + ' new rows, ' + (st.lastSweep.returned || 0) + ' returned, ' + (st.lastSweep.resolved || 0) + ' IMDb lookups, ' + (st.lastSweep.errors || 0) + ' errors' + (st.lastSweep.reason ? ' (' + escapeHtmlAdmin(st.lastSweep.reason) + ')' : '') + '</div>');
+          const rm = st.lastSweep.removal;
+          if (rm) {
+            bits.push('<div>' + (rm.ran
+              ? 'Last completed pass marked <strong>' + rm.marked + '</strong> title(s) gone (of ' + rm.live + ' on record).'
+              : '<span style="color:#FF9500;">Removals held back: ' + escapeHtmlAdmin(rm.reason || 'not yet applicable') + '</span>') + '</div>');
+          }
         } else {
           bits.push('<div style="color:#FF9500;">No sweep has completed yet.</div>');
         }
@@ -3437,9 +3452,9 @@ async function renderAdminDashboard(env) {
         const rows = st.byService || [];
         bodyEl.innerHTML = rows.length
           ? rows.map(function (r) {
-              return '<tr><td>' + escapeHtmlAdmin(r.service) + '</td><td>' + escapeHtmlAdmin(r.kind) + '</td><td>' + r.count + '</td><td>' + r.seeded + '</td><td>' + r.observed + '</td><td>' + nosEpochToDay(r.newest) + '</td></tr>';
+              return '<tr><td>' + escapeHtmlAdmin(r.service) + '</td><td>' + escapeHtmlAdmin(r.kind) + '</td><td>' + (r.measured ? r.pages : '?') + '</td><td>' + r.count + '</td><td>' + r.seeded + '</td><td>' + r.observed + '</td><td>' + r.removed + '</td><td>' + nosEpochToDay(r.newest) + '</td></tr>';
             }).join('')
-          : '<tr><td colspan="6">Nothing collected yet -- run a sweep.</td></tr>';
+          : '<tr><td colspan="8">Nothing collected yet -- run a sweep.</td></tr>';
 
         const sel = document.getElementById('nosPreviewService');
         if (sel && sel.options.length <= 1) {
@@ -3478,7 +3493,9 @@ async function renderAdminDashboard(env) {
         if (!sw.ran) {
           statusEl.textContent = sw.reason || 'The sweep did not run.';
         } else {
-          let msg = sw.units + ' pages, ' + sw.seen + ' titles seen, ' + sw.added + ' new rows, ' + sw.touched + ' already known';
+          let msg = sw.units + ' pages, ' + sw.seen + ' titles seen, ' + sw.added + ' new rows, ' + sw.returned + ' returned, ' + sw.touched + ' already known';
+          if (sw.wrapped) msg += '; pass complete';
+          if (sw.removal && sw.removal.ran && sw.removal.marked) msg += ', ' + sw.removal.marked + ' marked gone';
           if (data.bump && data.bump.ran) msg += '; ' + data.bump.bumped + ' shows re-bumped';
           if (sw.errors) msg += '; ' + sw.errors + ' errors (see the Worker log)';
           statusEl.textContent = msg;

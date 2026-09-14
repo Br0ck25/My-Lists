@@ -6,6 +6,50 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🔁 New on Streaming: read whole catalogues, and notice when a title leaves
+
+Two defects in the sweep shipped in the entry below, both found by running it and asking it questions.
+
+- **A fixed page horizon meant the feature could not do the thing it was built for.** The walk was capped at
+  `NEW_ON_STREAMING_WALK_DEPTH_PAGES = 40` -- and sorted by release date descending, 40 pages is the ~800
+  most recently *released* titles, one to three years. A 2010 film added to Netflix today sits far outside
+  that window, so the sweep never fetched the page it was on and the title never entered `streaming_events`
+  at all: not as an arrival, not even as a seeded row. The list could only report new *releases* arriving,
+  which is the case that needed it least, and is exactly the failure the README cites to justify the feature.
+  Depth is now **learned** from the `total_pages` every discover response already carries, so each catalogue
+  is read to its end; the only bound left is TMDB's own page-500 pagination limit. A pass grew from 640 pages
+  to ~1,000-1,500 (measured, and reported in the admin panel), and `NEW_ON_STREAMING_PAGES_PER_TICK` went
+  12 -> 40 to keep a full pass near three hours.
+- **Nothing ever marked a title as gone.** `removed_at` existed, the catalog query filtered on it, and the
+  upsert cleared it -- but no code path ever *set* it. `last_seen_walk` was written on every sweep and read
+  by nothing. So the shelf only ever accumulated: a film that left Netflix in March was still listed in
+  December. A completed pass now marks what it did not see, which is only sound because the walk above reads
+  whole catalogues.
+- **Three guards on that inference**, because a false removal costs a title vanishing and then returning as
+  an arrival that never happened: a row must be missed by `NEW_ON_STREAMING_REMOVAL_GRACE_WALKS` (2)
+  consecutive passes; a pass that could not read more than `NEW_ON_STREAMING_MAX_PASS_ERRORS` (20) pages
+  concludes nothing; and a catalogue that appears to have lost more than `NEW_ON_STREAMING_MAX_REMOVAL_SHARE`
+  (25%) of its titles at once is left alone and logged. That last guard is **per catalogue, not per table**,
+  and the distinction is the whole point: TMDB answering 200 with an empty result set for one provider is not
+  an error, and one service is an eighth of the table, so a table-wide threshold would wave "every Netflix
+  title left overnight" through as an ordinary 12%.
+- **A title that comes back is dated as a new arrival.** It is on the service today and was not yesterday,
+  which is what this shelf reports. Rows are marked, never deleted, precisely so the row is still there to
+  clear -- and a title that never left keeps every date it had.
+- **Cursor layout 3.** A fixed-depth walk let the cursor be an index into a fixed-length list; a learned-depth
+  one cannot, so the cursor is now a coordinate (`page` + `idx` over a stable provider x kind axis) plus the
+  pass's accumulated error count. A stored position from an older layout restarts the pass, keeping the walk
+  generation -- a database part-way through seeding is still seeding, and promoting it would date every title
+  it has not yet reached as an arrival that never happened.
+- **Admin panel** reports measured pass size, how many catalogues have been measured, pages per catalogue,
+  titles marked gone, this pass's error count, and why a removal was held back.
+- **Tests**: the sweep is now driven end-to-end against a stubbed TMDB, so the parts that only happen over
+  time are exercised rather than reasoned about -- a catalogue deeper than any fixed horizon collected in
+  full, a 2010 title added today picked up and dated as observed, a departure marked only after the grace
+  passes, an unreadable pass marking nothing, one provider going dark neither wiping itself nor blocking a
+  real departure on a healthy service, a returning title re-dated, and a still-present title keeping its
+  original arrival date across passes.
+
 ### 🔧 Watch History, Continue Watching and Airing Next read "No items found." in Live Preview & Editor
 
 - **What was wrong**: those three rows are `autotrack:<slug>:<type>:<username>` sources, and reading one
