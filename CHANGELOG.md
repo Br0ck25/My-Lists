@@ -6,6 +6,32 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 📺 A Channel episode asks a stream add-on for the episode it actually is
+
+- **Reported**: "Non-debrid addons (like Pengu) dont pickup the fake episodes order. I.e: FRIENDS randomized
+  channel has the S01E01 at the start of the queue when in fact it's, let's say, S05E13. With Debrid addons
+  it plays correctly the S05E13, but non debrid scrapes the original S01E01."
+- **A Channel video's `id` *is* its stream request.** Stremio asks every installed stream add-on for
+  `/stream/<type>/<video.id>.json` and sends nothing else -- the `season`/`episode` on each video are the
+  channel's own running order, for display, and never reach an add-on at all. So a malformed id is not a
+  dead link anybody notices: something plays, it is just the wrong thing.
+- **`parseInt(it.season, 10) || 1` could not tell "no season" from season 0.** Both became 1, so an item
+  stored without a season or an episode was published as `<show>:1:1` -- that show's series premiere, under
+  the title of the episode we meant. Such an item is now dropped from the channel instead: a missing episode
+  is something a person can report, a wrong one looks like it worked.
+- **A show with no IMDb id was published as a bare TMDB number.** `12345:5:13` matches no `idPrefixes`
+  anywhere, so no add-on is ever asked for it. It is now the `tmdb:12345:5:13` form this add-on's own
+  manifest declares and the rest of the app already reads. An id that is neither `tt...` nor `tmdb:...`
+  (including the empty string, which used to publish as `:5:13`) is dropped.
+- **The Channel builder stores the same shapes.** `channelStreamShowId` is applied where draft items are
+  built -- picked episodes, "Add every season", Quick Add Channel and the crossover/storyline channels --
+  so the Worker's check has nothing left to catch. The episode picker now carries the show's TMDB id
+  alongside its IMDb id, which is what gives an IMDb-less show a real fallback rather than an empty one.
+- **The shuffled running order is untouched**, and a dropped item closes its gap rather than leaving a hole:
+  the queue is still 1..N. For a channel whose items all carry a real `tt` id and a real season and episode
+  -- which a Friends channel built from TMDB does -- the published id was already correct, and a stream
+  add-on that returns S01E01 for `tt0108778:5:13` is resolving it wrongly on its own side.
+
 ### ⏭️ Nothing marks a future episode as watched any more
 
 - **Reported**: "if i use the Mark Show Watched the future season is marked as watched but the episode isnt
