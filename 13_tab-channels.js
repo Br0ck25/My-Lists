@@ -157,9 +157,14 @@
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove all</button>
       </div>
       <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
-        <input type="checkbox" id="channelRandomizeCheck">
+        <input type="checkbox" id="channelRandomizeCheck" onchange="setChannelPlayOrderMode('shuffle', this)">
         <span style="font-size:0.85rem;">Randomize play order (reshuffles once a day)</span>
       </label>
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:6px;">
+        <input type="checkbox" id="channelSortAiredCheck" onchange="setChannelPlayOrderMode('aired', this)">
+        <span style="font-size:0.85rem;">Sort by air date (oldest first, across every show)</span>
+      </label>
+      <p style="margin:6px 0 0; color:var(--muted); font-size:0.78rem;">Pick one or neither &mdash; checking either of these clears the other. Leave both off to play the picks in the order listed above. Air dates come from TMDB (each episode's own air date, a movie's release date); anything with no known date plays last.</p>
 
       <!-- Channel Poster Selection Section -->
       <div id="channelPosterPickerSection" style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; display:none;">

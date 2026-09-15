@@ -13096,6 +13096,53 @@ function channelItemNumber(value) {
   return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
+// The date one channel item first aired, as a sortable "YYYY-MM-DD" string,
+// or "" when the item carries none.
+//
+// Nothing has to be looked up for this: every pick already stores it. An
+// episode's `released` is TMDB's own `air_date` for that exact episode --
+// /api/show-episodes hands it to the Channel builder, and
+// compactChannelItemForStorage keeps it on the saved item -- and a movie's
+// is its release date, falling back to the year the builder stored when
+// that was all TMDB gave. That is the same fallback the video's own
+// `released` below uses, so the running order matches the dates a client
+// displays next to each item.
+//
+// Zero-padded ISO dates sort correctly as plain strings, so no Date parsing
+// (and therefore no timezone) is involved.
+function channelItemAiredDate(it) {
+  if (!it) return "";
+  const raw = String(it.released == null ? "" : it.released).trim();
+  const m = raw.match(/^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?/);
+  if (m) return `${m[1]}-${m[2] || "01"}-${m[3] || "01"}`;
+  const year = parseInt(it.year, 10);
+  if (Number.isInteger(year) && year > 0) return `${String(year).padStart(4, "0")}-01-01`;
+  return "";
+}
+
+// "Sort by air date", the other half of the Channel builder's one-or-the-
+// other play-order choice (see buildChannelMeta): oldest first, across every
+// show in the channel, so a multi-show channel plays in the order the
+// episodes actually went out rather than show by show.
+//
+// An item with no date it can be placed by goes to the end rather than to
+// the front (where an empty string would sort), keeping the order it was
+// saved in -- being unable to date something is not a reason to open the
+// channel with it. Ties keep their saved order too, which is what puts a
+// double-header of two episodes aired the same night back in broadcast
+// order.
+function sortChannelItemsByAired(items) {
+  return items
+    .map((it, i) => ({ it, i, aired: channelItemAiredDate(it) }))
+    .sort((a, b) => {
+      if (a.aired === b.aired) return a.i - b.i;
+      if (!a.aired) return 1;
+      if (!b.aired) return -1;
+      return a.aired < b.aired ? -1 : 1;
+    })
+    .map((w) => w.it);
+}
+
 // The full stream id for one channel item, or "" if it cannot be formed.
 function channelItemStreamId(it) {
   if (!it) return "";
@@ -13120,6 +13167,10 @@ function buildChannelMeta(entry, origin) {
   // same reasoning as Hidden Gems' daily reshuffle (see daysSinceEpochUTC
   // below): the order stays put if someone reopens the channel later the
   // same day (mid-binge), but looks freshly shuffled again tomorrow.
+  //
+  // "Sort by air date" is the alternative to it (one or the other, never
+  // both) and is applied further down, after the rotation below: it needs
+  // no seed because it is the same order every day.
   //
   // dailyRotate is a step further, set by Quick Add Channel: the payload
   // stores a much bigger pool than what's ever actually shown, and this
@@ -13159,11 +13210,22 @@ function buildChannelMeta(entry, origin) {
       const start = starts.length ? starts[0] : 0;
       items.push(...showEpisodes.slice(start, start + perShow));
     });
-  } else if (payload.shuffle) {
+  } else if (payload.shuffle && !payload.sortByAired) {
     items = seededShuffle(playableItems, seed);
   } else {
     items = playableItems;
   }
+  // "Sort by air date" is the other half of the same choice: the builder
+  // offers it and "Randomize play order" as one-or-the-other (checking
+  // either clears the other), so a payload should never arrive with both
+  // set. An older payload still can -- shuffle was the only flag that
+  // existed -- so the explicit sort wins here as well, rather than leaving
+  // the outcome to whichever branch happened to be tested first.
+  //
+  // It is applied last so it also orders a rotated day's lineup: a Quick Add
+  // channel picks WHICH shows and episodes play today (above), and this
+  // decides the order they play in.
+  if (payload.sortByAired) items = sortChannelItemsByAired(items);
   const videos = items.map((it, i) => {
     // TMDB's air_date/release_date (and our own year-only fallback for
     // movies) are bare "YYYY-MM-DD" dates. Stremio Web's core is compiled
@@ -22709,9 +22771,14 @@ if ('serviceWorker' in navigator) {
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove all</button>
       </div>
       <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
-        <input type="checkbox" id="channelRandomizeCheck">
+        <input type="checkbox" id="channelRandomizeCheck" onchange="setChannelPlayOrderMode('shuffle', this)">
         <span style="font-size:0.85rem;">Randomize play order (reshuffles once a day)</span>
       </label>
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:6px;">
+        <input type="checkbox" id="channelSortAiredCheck" onchange="setChannelPlayOrderMode('aired', this)">
+        <span style="font-size:0.85rem;">Sort by air date (oldest first, across every show)</span>
+      </label>
+      <p style="margin:6px 0 0; color:var(--muted); font-size:0.78rem;">Pick one or neither &mdash; checking either of these clears the other. Leave both off to play the picks in the order listed above. Air dates come from TMDB (each episode's own air date, a movie's release date); anything with no known date plays last.</p>
 
       <!-- Channel Poster Selection Section -->
       <div id="channelPosterPickerSection" style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; display:none;">
@@ -25331,6 +25398,12 @@ function channelSourceRowHtml(u) {
     if (payload.dailyRotate) {
       summary = items.length + '-episode pool \u2014 shows ' + CHANNEL_ROTATION_SHOWS_PER_DAY + ' shows \u00d7 ' +
         CHANNEL_ROTATION_EPISODES_PER_SHOW + ' episodes each, refreshed daily';
+      if (payload.sortByAired) summary += ', in air date order';
+    } else if (payload.sortByAired) {
+      // Checked ahead of shuffle for the same reason buildChannelMeta
+      // applies it last: on a payload old enough to carry both, the
+      // explicit sort is what the channel actually plays in.
+      summary += ' \u2014 in air date order';
     } else if (payload.shuffle) {
       summary += ' \u2014 shuffled daily';
     }
@@ -34451,6 +34524,7 @@ function saveLocalChannelsMap(map) {
       backdrop: ch.backdrop || null,
       items: compressChannelItemsForStorage(ch.items, 5000),
       shuffle: !!ch.shuffle,
+      sortByAired: !!ch.sortByAired,
       dailyRotate: !!ch.dailyRotate,
       createdAt: ch.createdAt || Date.now(),
       updatedAt: ch.updatedAt || Date.now(),
@@ -34543,6 +34617,7 @@ function ensureAllChannelsSyncedFromRows(map) {
                   backdrop: payload.backdrop || null,
                   items: compressChannelItemsForStorage(payload.items),
                   shuffle: !!payload.shuffle,
+                  sortByAired: !!payload.sortByAired,
                   dailyRotate: !!payload.dailyRotate,
                   createdAt: Date.now(),
                   updatedAt: Date.now(),
@@ -34574,6 +34649,7 @@ function saveLocalChannel(payload) {
     backdrop: payload.backdrop || null,
     items: compressChannelItemsForStorage(payload.items),
     shuffle: !!payload.shuffle,
+    sortByAired: !!payload.sortByAired,
     dailyRotate: !!payload.dailyRotate,
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now,
@@ -41645,6 +41721,40 @@ function reorderChannelDraftFromDom() {
   renderChannelDraftList();
 }
 
+// The builder's two play-order checkboxes -- "Randomize play order" and
+// "Sort by air date" -- are one choice with three outcomes: reshuffled every
+// day, oldest-aired first, or exactly the order the picks are listed in.
+// They are two checkboxes rather than a radio group because "neither" is a
+// real answer and the default one, and a radio group would need a third
+// "as listed" option to say so. Checking either therefore clears the other
+// here, on the page, rather than only in the saved payload -- what is on
+// screen is what saves.
+function setChannelPlayOrderMode(mode, el) {
+  const randCheck = document.getElementById('channelRandomizeCheck');
+  const airedCheck = document.getElementById('channelSortAiredCheck');
+  const on = el ? !!el.checked : true;
+  if (mode === 'aired') {
+    if (airedCheck) airedCheck.checked = on;
+    if (on && randCheck) randCheck.checked = false;
+  } else {
+    if (randCheck) randCheck.checked = on;
+    if (on && airedCheck) airedCheck.checked = false;
+  }
+}
+
+// Puts a saved channel's play order back on those checkboxes (and clears
+// both for a new draft). A channel saved before air-date order existed can
+// only carry shuffle; one that somehow carries both is resolved the way the
+// Worker resolves it (see buildChannelMeta) -- the explicit sort wins -- so
+// the box that is ticked is the order the channel actually plays in.
+function setChannelPlayOrderChecks(shuffle, sortByAired) {
+  const randCheck = document.getElementById('channelRandomizeCheck');
+  const airedCheck = document.getElementById('channelSortAiredCheck');
+  const aired = !!sortByAired;
+  if (airedCheck) airedCheck.checked = aired;
+  if (randCheck) randCheck.checked = !aired && !!shuffle;
+}
+
 function shuffleChannelDraft() {
   if (channelDraftItems.length < 2) return;
   for (let i = channelDraftItems.length - 1; i > 0; i--) {
@@ -41684,7 +41794,12 @@ function saveChannel() {
     const matchedItem = channelDraftItems.find((it) => it && (it.showPoster === verticalPoster || it.poster === verticalPoster));
     horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || verticalPoster;
   }
-  const shuffle = document.getElementById('channelRandomizeCheck').checked;
+  // Never both: the checkboxes already keep each other clear (see
+  // setChannelPlayOrderMode), and this is the second guard on the way out,
+  // so no payload this builder writes can leave the Worker to break a tie.
+  const airedCheck = document.getElementById('channelSortAiredCheck');
+  const sortByAired = !!(airedCheck && airedCheck.checked);
+  const shuffle = !sortByAired && document.getElementById('channelRandomizeCheck').checked;
 
   const map = loadLocalChannels();
   const channelId = editingChannelId || generateChannelId();
@@ -41697,6 +41812,7 @@ function saveChannel() {
     backdrop: horizontalBackdrop,
     items: channelDraftItems,
     shuffle: shuffle,
+    sortByAired: sortByAired,
     dailyRotate: existing.dailyRotate || false
   };
 
@@ -41730,7 +41846,7 @@ function saveChannel() {
   channelDraftPoster = null;
   channelDraftBackdrop = null;
   nameInput.value = '';
-  document.getElementById('channelRandomizeCheck').checked = false;
+  setChannelPlayOrderChecks(false, false);
   const searchInput = document.getElementById('channelSearchInput');
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('channelSearchResult');
@@ -42332,8 +42448,7 @@ async function loadStorylineToDraft(eventId, btn) {
 
     const nameInput = document.getElementById('channelNameInput');
     if (nameInput) nameInput.value = event.name;
-    const randCheck = document.getElementById('channelRandomizeCheck');
-    if (randCheck) randCheck.checked = false;
+    setChannelPlayOrderChecks(false, false);
 
     renderChannelDraftList();
     updateChannelSaveButtonLabel();
@@ -42406,8 +42521,7 @@ function openBuildCustomChannel() {
   channelDraftBackdrop = null;
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  if (randCheck) randCheck.checked = false;
+  setChannelPlayOrderChecks(false, false);
   const searchInput = document.getElementById('channelSearchInput');
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('channelSearchResult');
@@ -42444,8 +42558,7 @@ function editChannelById(channelId) {
   
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = channel.name || '';
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  if (randCheck) randCheck.checked = !!channel.shuffle;
+  setChannelPlayOrderChecks(channel.shuffle, channel.sortByAired);
   
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
@@ -42491,6 +42604,36 @@ function editChannel(btnOrRow) {
     saveLocalChannel(payload);
     editChannelById(channelId);
   }
+}
+
+// Client twins of the Worker's channelItemAiredDate/sortChannelItemsByAired
+// (05_catalog-core.js), so "See All" lists an air-date-ordered channel in
+// the order it actually plays rather than the order its picks happen to be
+// stored in. Same rules, because it has to be the same answer: zero-padded
+// ISO dates compare as plain strings, an item with no date it can be placed
+// by goes last, and ties keep their saved order.
+function channelItemAiredDateClient(it) {
+  if (!it) return '';
+  const raw = String(it.released == null ? '' : it.released).trim();
+  const m = raw.match(/^([0-9]{4})(?:-([0-9]{2})(?:-([0-9]{2}))?)?/);
+  if (m) return m[1] + '-' + (m[2] || '01') + '-' + (m[3] || '01');
+  const year = parseInt(it.year, 10);
+  if (Number.isInteger(year) && year > 0) return String(year).padStart(4, '0') + '-01-01';
+  return '';
+}
+
+function channelItemsInPlayOrder(items, channel) {
+  const list = Array.isArray(items) ? items : [];
+  if (!channel || !channel.sortByAired || list.length < 2) return list;
+  return list
+    .map((it, i) => ({ it: it, i: i, aired: channelItemAiredDateClient(it) }))
+    .sort((a, b) => {
+      if (a.aired === b.aired) return a.i - b.i;
+      if (!a.aired) return 1;
+      if (!b.aired) return -1;
+      return a.aired < b.aired ? -1 : 1;
+    })
+    .map((w) => w.it);
 }
 
 function openChannelDetailsPage(channelIdOrDivId) {
@@ -42592,7 +42735,7 @@ function openChannelDetailsPage(channelIdOrDivId) {
     });
   }
   
-  const sample = (resolvedItems || []).map((it, idx) => {
+  const sample = channelItemsInPlayOrder(resolvedItems, channel).map((it, idx) => {
     let showName = it.showName || '';
     let epName = it.epName || '';
     let seasonEp = '';
@@ -42710,7 +42853,9 @@ function renderMyCreatedChannelsList() {
     const isAdded = [...document.querySelectorAll('#lists .entry .url')].some((u) => u.value.includes(ch.channelId));
     const allItems = ch.items || [];
     const totalEpisodes = allItems.length;
-    const metaText = '24/7 TV Channel &middot; ' + totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's');
+    const orderLabel = ch.sortByAired ? 'air date order' : (ch.shuffle ? 'shuffled daily' : '');
+    const metaText = '24/7 TV Channel &middot; ' + totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's') +
+      (orderLabel ? ' &middot; ' + orderLabel : '');
     
     const allPosters = allItems.slice(0, 9);
     const posterThumbs = allPosters.map((it, i) => {
@@ -42831,8 +42976,7 @@ function cancelEditChannel() {
   channelDraftBackdrop = null;
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  if (randCheck) randCheck.checked = false;
+  setChannelPlayOrderChecks(false, false);
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
   switchChannelsSubmenu('my-channels', document.querySelector('#channelsSubnavBar button:nth-child(1)'));
@@ -59876,6 +60020,7 @@ function renderGuidePage(origin) {
       <li>Use the <strong>Shows / Movies</strong> toggle to set what you're searching for.</li>
       <li>Search a title and add picks &mdash; for shows, an episode picker lets you choose specific seasons/episodes.</li>
       <li>Reorder or remove picks in <strong>Picks in this channel</strong>. <strong>Shuffle picks now</strong> randomizes the order once; the <strong>Randomize play order</strong> checkbox re-shuffles automatically every 24 hours.</li>
+      <li>Or tick <strong>Sort by air date</strong> instead &mdash; the channel plays oldest first across every show in it, using each episode's TMDB air date (a movie's release date), with anything undated last. It and <strong>Randomize play order</strong> are one-or-the-other: ticking either clears the other, and leaving both off plays the picks in the order they are listed.</li>
       <li>Choose a <strong>Channel Poster</strong> from an added show's artwork, or use the default channel poster.</li>
       <li>Name the channel and click <strong>Save</strong>.</li>
     </ol>

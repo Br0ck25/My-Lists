@@ -10867,6 +10867,94 @@ describe("worker: channel video ids are real stream requests", () => {
     assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0133093"]);
   });
 
+  // "Sort by air date" is the other half of the builder's one-or-the-other
+  // play-order choice. Nothing is looked up for it: every pick already
+  // carries the air date TMDB gave when it was added (`released`), so the
+  // order is decided from the payload alone.
+  it("plays an air-date-sorted channel oldest first, across every show", () => {
+    const meta = channelMeta([
+      ep({ imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13", released: "1999-02-11" }),
+      ep({ imdbId: "tt0386676", season: 2, episode: 7, title: "The Office S2E7", released: "2005-11-22" }),
+      ep({ imdbId: "tt0108778", season: 1, episode: 1, title: "Friends S1E1", released: "1994-09-22" }),
+      { kind: "movie", imdbId: "tt0133093", title: "The Matrix", released: "1999-03-31" },
+    ], { sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title),
+      ["Friends S1E1", "Friends S5E13", "The Matrix", "The Office S2E7"]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.episode), [1, 2, 3, 4], "running order is still 1..N");
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id),
+      ["tt0108778:1:1", "tt0108778:5:13", "tt0133093", "tt0386676:2:7"], "sorting never renumbers an id");
+  });
+
+  it("dates a movie by its year when that is all the builder stored", () => {
+    const meta = channelMeta([
+      { kind: "movie", imdbId: "tt0499549", title: "Avatar", year: 2009 },
+      { kind: "movie", imdbId: "tt0133093", title: "The Matrix", year: "1999" },
+      { kind: "movie", imdbId: "tt0111161", title: "Shawshank", released: "1994-09-23T00:00:00.000Z" },
+    ], { sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["Shawshank", "The Matrix", "Avatar"]);
+  });
+
+  it("sends an item with no date it can be placed by to the END, in its saved order", () => {
+    const meta = channelMeta([
+      ep({ season: 2, episode: 2, title: "undated A" }),
+      ep({ season: 3, episode: 3, title: "dated", released: "2001-01-05" }),
+      ep({ season: 4, episode: 4, title: "undated B", released: "" }),
+    ], { sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["dated", "undated A", "undated B"],
+      "an undated item must not open the channel, and undated items keep their saved order");
+  });
+
+  it("keeps two episodes aired the same night in the order they were saved", () => {
+    const meta = channelMeta([
+      ep({ season: 1, episode: 1, title: "part one", released: "1997-09-24" }),
+      ep({ season: 1, episode: 2, title: "part two", released: "1997-09-24" }),
+    ], { sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["part one", "part two"]);
+  });
+
+  // The builder never writes both flags (the checkboxes clear each other,
+  // and saveChannel drops shuffle when the sort is on), but a payload saved
+  // before air-date order existed can only carry shuffle -- so the tie has
+  // to resolve somewhere rather than falling to whichever branch is tested
+  // first.
+  it("lets the explicit sort win over shuffle if a payload somehow carries both", () => {
+    const items = [];
+    for (let e = 1; e <= 12; e++) items.push(ep({ season: 1, episode: e, title: `E${e}`, released: `2001-01-${String(e).padStart(2, "0")}` }));
+    const meta = channelMeta(items, { shuffle: true, sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), items.map((it) => it.title));
+  });
+
+  it("orders a rotating Quick Add channel's day by air date too, without changing what it picked", () => {
+    const items = [];
+    for (let show = 1; show <= 3; show++) {
+      for (let e = 1; e <= 4; e++) {
+        items.push(ep({
+          imdbId: `tt000000${show}`, season: 1, episode: e,
+          title: `show${show} E${e}`,
+          released: `200${show}-0${e}-01`,
+        }));
+      }
+    }
+    const rotated = channelMeta(items, { dailyRotate: true });
+    const sorted = channelMeta(items, { dailyRotate: true, sortByAired: true });
+    assert.deepEqual(
+      Array.from(sorted.videos, (v) => v.id).sort(),
+      Array.from(rotated.videos, (v) => v.id).sort(),
+      "the same day's lineup -- the sort decides the order, not the picks"
+    );
+    const dates = Array.from(sorted.videos, (v) => v.released);
+    assert.deepEqual(dates, [...dates].sort(), "today's lineup plays oldest first");
+  });
+
+  it("leaves a channel with neither flag exactly as its picks were listed", () => {
+    const items = [
+      ep({ season: 9, episode: 9, title: "last aired", released: "2009-01-01" }),
+      ep({ season: 1, episode: 1, title: "first aired", released: "1999-01-01" }),
+    ];
+    const meta = channelMeta(items, {});
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["last aired", "first aired"]);
+  });
+
   it("a shuffled channel reorders the queue without ever renumbering an id", () => {
     const items = [];
     for (let s = 1; s <= 4; s++) {

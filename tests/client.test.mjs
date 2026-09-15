@@ -2299,6 +2299,124 @@ describe("client: local storage quota and creator profile watch history preserva
   });
 });
 
+// A channel plays in exactly one order: the order its picks are listed,
+// reshuffled once a day, or oldest-aired first. The builder offers the last
+// two as two checkboxes (because "neither" is the default answer and a radio
+// group would need a third option to say it), which only works if they keep
+// each other clear -- on the page AND in what gets saved, since the Worker
+// reads the saved payload and nothing else.
+describe("client: a channel's play order is one choice, not two", () => {
+  function boxes(client) {
+    const doc = client.get("document");
+    return {
+      rand: doc.getElementById("channelRandomizeCheck"),
+      aired: doc.getElementById("channelSortAiredCheck"),
+    };
+  }
+
+  it("checking either play-order box clears the other", () => {
+    const client = loadClient();
+    const { rand, aired } = boxes(client);
+
+    rand.checked = true;
+    client.call("setChannelPlayOrderMode", "aired", { checked: true });
+    assert.equal(aired.checked, true);
+    assert.equal(rand.checked, false, "air date order must clear randomize");
+
+    client.call("setChannelPlayOrderMode", "shuffle", { checked: true });
+    assert.equal(rand.checked, true);
+    assert.equal(aired.checked, false, "randomize must clear air date order");
+
+    client.call("setChannelPlayOrderMode", "shuffle", { checked: false });
+    assert.equal(rand.checked, false);
+    assert.equal(aired.checked, false, "unticking one must not tick the other -- neither is a valid answer");
+  });
+
+  it("saves the chosen order onto the channel, and never both flags at once", () => {
+    const client = loadClient();
+    const { rand, aired } = boxes(client);
+    client.set("channelDraftItems", [
+      { kind: "episode", imdbId: "tt0108778", season: 1, episode: 1, title: "Friends S1E1", released: "1994-09-22" },
+    ]);
+    client.get("document").getElementById("channelNameInput").value = "Air Date Channel";
+
+    // Both ticked is not reachable through the checkboxes, but a save must
+    // still publish one order rather than leaving the Worker to break a tie.
+    rand.checked = true;
+    aired.checked = true;
+    client.call("saveChannel");
+
+    const saved = Object.values(client.call("loadLocalChannels"))[0];
+    assert.equal(saved.sortByAired, true, "air date order must survive the save");
+    assert.equal(saved.shuffle, false, "a channel must never be saved as both shuffled and sorted");
+    assert.equal(rand.checked, false, "saving clears the builder for the next channel");
+    assert.equal(aired.checked, false);
+  });
+
+  it("puts the saved order back on the checkboxes when the channel is edited", () => {
+    const client = loadClient();
+    const { rand, aired } = boxes(client);
+    client.call("saveLocalChannel", {
+      channelId: "ch-aired", name: "Aired", sortByAired: true,
+      items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, title: "one" }],
+    });
+    client.call("saveLocalChannel", {
+      channelId: "ch-shuffled", name: "Shuffled", shuffle: true,
+      items: [{ kind: "episode", imdbId: "tt2", season: 1, episode: 1, title: "two" }],
+    });
+
+    client.call("editChannelById", "ch-aired");
+    assert.equal(aired.checked, true);
+    assert.equal(rand.checked, false);
+
+    client.call("editChannelById", "ch-shuffled");
+    assert.equal(rand.checked, true);
+    assert.equal(aired.checked, false, "a channel saved before air date order existed only carries shuffle");
+  });
+
+  // "See All" reads the saved items directly rather than going through the
+  // Worker, so without this it would list an air-date channel in the order
+  // its picks happen to be stored in -- contradicting the page that told
+  // the person what order it plays in.
+  it("lists an air-date channel oldest first in See All, undated picks last", () => {
+    const client = loadClient();
+    client.call("saveLocalChannel", {
+      channelId: "ch-order", name: "Order", sortByAired: true,
+      items: [
+        { kind: "episode", imdbId: "tt0386676", season: 2, episode: 7, showName: "The Office", epName: "The Client", released: "2005-11-22" },
+        { kind: "episode", imdbId: "tt0903747", season: 1, episode: 1, showName: "Breaking Bad", epName: "Pilot", released: "" },
+        { kind: "movie", imdbId: "tt0133093", title: "The Matrix", released: "1999-03-31" },
+        { kind: "episode", imdbId: "tt0108778", season: 1, episode: 1, showName: "Friends", epName: "The One Where It Begins", released: "1994-09-22" },
+      ],
+    });
+
+    let opened = null;
+    client.set("openListDetailsPage", (title, type, url, preloaded) => { opened = preloaded; });
+    client.call("openChannelDetailsPage", "ch-order");
+
+    assert.ok(opened, "See All must open");
+    assert.deepEqual(
+      [...opened.sample].map((it) => it.name),
+      ["Friends S1E1", "The Matrix S1E1", "The Office S2E7", "Breaking Bad S1E1"]
+    );
+  });
+
+  it("leaves See All in the picked order for a channel with no play-order flag", () => {
+    const client = loadClient();
+    client.call("saveLocalChannel", {
+      channelId: "ch-listed", name: "Listed",
+      items: [
+        { kind: "episode", imdbId: "tt0386676", season: 2, episode: 7, showName: "The Office", epName: "The Client", released: "2005-11-22" },
+        { kind: "episode", imdbId: "tt0108778", season: 1, episode: 1, showName: "Friends", epName: "The One", released: "1994-09-22" },
+      ],
+    });
+    let opened = null;
+    client.set("openListDetailsPage", (title, type, url, preloaded) => { opened = preloaded; });
+    client.call("openChannelDetailsPage", "ch-listed");
+    assert.deepEqual([...opened.sample].map((it) => it.name), ["The Office S2E7", "Friends S1E1"]);
+  });
+});
+
 describe("client: season watched detection (isSeasonFullyWatched)", () => {
   it("never returns true for an unwatched season even if the show is in _fullyWatchedShowIds", () => {
     const client = loadClient();

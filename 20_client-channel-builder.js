@@ -512,6 +512,7 @@ function saveLocalChannelsMap(map) {
       backdrop: ch.backdrop || null,
       items: compressChannelItemsForStorage(ch.items, 5000),
       shuffle: !!ch.shuffle,
+      sortByAired: !!ch.sortByAired,
       dailyRotate: !!ch.dailyRotate,
       createdAt: ch.createdAt || Date.now(),
       updatedAt: ch.updatedAt || Date.now(),
@@ -604,6 +605,7 @@ function ensureAllChannelsSyncedFromRows(map) {
                   backdrop: payload.backdrop || null,
                   items: compressChannelItemsForStorage(payload.items),
                   shuffle: !!payload.shuffle,
+                  sortByAired: !!payload.sortByAired,
                   dailyRotate: !!payload.dailyRotate,
                   createdAt: Date.now(),
                   updatedAt: Date.now(),
@@ -635,6 +637,7 @@ function saveLocalChannel(payload) {
     backdrop: payload.backdrop || null,
     items: compressChannelItemsForStorage(payload.items),
     shuffle: !!payload.shuffle,
+    sortByAired: !!payload.sortByAired,
     dailyRotate: !!payload.dailyRotate,
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now,
@@ -7706,6 +7709,40 @@ function reorderChannelDraftFromDom() {
   renderChannelDraftList();
 }
 
+// The builder's two play-order checkboxes -- "Randomize play order" and
+// "Sort by air date" -- are one choice with three outcomes: reshuffled every
+// day, oldest-aired first, or exactly the order the picks are listed in.
+// They are two checkboxes rather than a radio group because "neither" is a
+// real answer and the default one, and a radio group would need a third
+// "as listed" option to say so. Checking either therefore clears the other
+// here, on the page, rather than only in the saved payload -- what is on
+// screen is what saves.
+function setChannelPlayOrderMode(mode, el) {
+  const randCheck = document.getElementById('channelRandomizeCheck');
+  const airedCheck = document.getElementById('channelSortAiredCheck');
+  const on = el ? !!el.checked : true;
+  if (mode === 'aired') {
+    if (airedCheck) airedCheck.checked = on;
+    if (on && randCheck) randCheck.checked = false;
+  } else {
+    if (randCheck) randCheck.checked = on;
+    if (on && airedCheck) airedCheck.checked = false;
+  }
+}
+
+// Puts a saved channel's play order back on those checkboxes (and clears
+// both for a new draft). A channel saved before air-date order existed can
+// only carry shuffle; one that somehow carries both is resolved the way the
+// Worker resolves it (see buildChannelMeta) -- the explicit sort wins -- so
+// the box that is ticked is the order the channel actually plays in.
+function setChannelPlayOrderChecks(shuffle, sortByAired) {
+  const randCheck = document.getElementById('channelRandomizeCheck');
+  const airedCheck = document.getElementById('channelSortAiredCheck');
+  const aired = !!sortByAired;
+  if (airedCheck) airedCheck.checked = aired;
+  if (randCheck) randCheck.checked = !aired && !!shuffle;
+}
+
 function shuffleChannelDraft() {
   if (channelDraftItems.length < 2) return;
   for (let i = channelDraftItems.length - 1; i > 0; i--) {
@@ -7745,7 +7782,12 @@ function saveChannel() {
     const matchedItem = channelDraftItems.find((it) => it && (it.showPoster === verticalPoster || it.poster === verticalPoster));
     horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || verticalPoster;
   }
-  const shuffle = document.getElementById('channelRandomizeCheck').checked;
+  // Never both: the checkboxes already keep each other clear (see
+  // setChannelPlayOrderMode), and this is the second guard on the way out,
+  // so no payload this builder writes can leave the Worker to break a tie.
+  const airedCheck = document.getElementById('channelSortAiredCheck');
+  const sortByAired = !!(airedCheck && airedCheck.checked);
+  const shuffle = !sortByAired && document.getElementById('channelRandomizeCheck').checked;
 
   const map = loadLocalChannels();
   const channelId = editingChannelId || generateChannelId();
@@ -7758,6 +7800,7 @@ function saveChannel() {
     backdrop: horizontalBackdrop,
     items: channelDraftItems,
     shuffle: shuffle,
+    sortByAired: sortByAired,
     dailyRotate: existing.dailyRotate || false
   };
 
@@ -7791,7 +7834,7 @@ function saveChannel() {
   channelDraftPoster = null;
   channelDraftBackdrop = null;
   nameInput.value = '';
-  document.getElementById('channelRandomizeCheck').checked = false;
+  setChannelPlayOrderChecks(false, false);
   const searchInput = document.getElementById('channelSearchInput');
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('channelSearchResult');
@@ -8393,8 +8436,7 @@ async function loadStorylineToDraft(eventId, btn) {
 
     const nameInput = document.getElementById('channelNameInput');
     if (nameInput) nameInput.value = event.name;
-    const randCheck = document.getElementById('channelRandomizeCheck');
-    if (randCheck) randCheck.checked = false;
+    setChannelPlayOrderChecks(false, false);
 
     renderChannelDraftList();
     updateChannelSaveButtonLabel();
@@ -8467,8 +8509,7 @@ function openBuildCustomChannel() {
   channelDraftBackdrop = null;
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  if (randCheck) randCheck.checked = false;
+  setChannelPlayOrderChecks(false, false);
   const searchInput = document.getElementById('channelSearchInput');
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('channelSearchResult');
@@ -8505,8 +8546,7 @@ function editChannelById(channelId) {
   
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = channel.name || '';
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  if (randCheck) randCheck.checked = !!channel.shuffle;
+  setChannelPlayOrderChecks(channel.shuffle, channel.sortByAired);
   
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
@@ -8552,6 +8592,36 @@ function editChannel(btnOrRow) {
     saveLocalChannel(payload);
     editChannelById(channelId);
   }
+}
+
+// Client twins of the Worker's channelItemAiredDate/sortChannelItemsByAired
+// (05_catalog-core.js), so "See All" lists an air-date-ordered channel in
+// the order it actually plays rather than the order its picks happen to be
+// stored in. Same rules, because it has to be the same answer: zero-padded
+// ISO dates compare as plain strings, an item with no date it can be placed
+// by goes last, and ties keep their saved order.
+function channelItemAiredDateClient(it) {
+  if (!it) return '';
+  const raw = String(it.released == null ? '' : it.released).trim();
+  const m = raw.match(/^([0-9]{4})(?:-([0-9]{2})(?:-([0-9]{2}))?)?/);
+  if (m) return m[1] + '-' + (m[2] || '01') + '-' + (m[3] || '01');
+  const year = parseInt(it.year, 10);
+  if (Number.isInteger(year) && year > 0) return String(year).padStart(4, '0') + '-01-01';
+  return '';
+}
+
+function channelItemsInPlayOrder(items, channel) {
+  const list = Array.isArray(items) ? items : [];
+  if (!channel || !channel.sortByAired || list.length < 2) return list;
+  return list
+    .map((it, i) => ({ it: it, i: i, aired: channelItemAiredDateClient(it) }))
+    .sort((a, b) => {
+      if (a.aired === b.aired) return a.i - b.i;
+      if (!a.aired) return 1;
+      if (!b.aired) return -1;
+      return a.aired < b.aired ? -1 : 1;
+    })
+    .map((w) => w.it);
 }
 
 function openChannelDetailsPage(channelIdOrDivId) {
@@ -8653,7 +8723,7 @@ function openChannelDetailsPage(channelIdOrDivId) {
     });
   }
   
-  const sample = (resolvedItems || []).map((it, idx) => {
+  const sample = channelItemsInPlayOrder(resolvedItems, channel).map((it, idx) => {
     let showName = it.showName || '';
     let epName = it.epName || '';
     let seasonEp = '';
@@ -8771,7 +8841,9 @@ function renderMyCreatedChannelsList() {
     const isAdded = [...document.querySelectorAll('#lists .entry .url')].some((u) => u.value.includes(ch.channelId));
     const allItems = ch.items || [];
     const totalEpisodes = allItems.length;
-    const metaText = '24/7 TV Channel &middot; ' + totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's');
+    const orderLabel = ch.sortByAired ? 'air date order' : (ch.shuffle ? 'shuffled daily' : '');
+    const metaText = '24/7 TV Channel &middot; ' + totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's') +
+      (orderLabel ? ' &middot; ' + orderLabel : '');
     
     const allPosters = allItems.slice(0, 9);
     const posterThumbs = allPosters.map((it, i) => {
@@ -8892,8 +8964,7 @@ function cancelEditChannel() {
   channelDraftBackdrop = null;
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  if (randCheck) randCheck.checked = false;
+  setChannelPlayOrderChecks(false, false);
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
   switchChannelsSubmenu('my-channels', document.querySelector('#channelsSubnavBar button:nth-child(1)'));
