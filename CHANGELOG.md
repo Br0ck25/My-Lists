@@ -6,6 +6,38 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ⏭️ Nothing marks a future episode as watched any more
+
+- **Reported**: "if i use the Mark Show Watched the future season is marked as watched but the episode isnt
+  marked as watched and the show isnt added to continue watching."
+- **What was happening**: `markShowWatched` has always fetched only *aired* episodes -- so nothing wrong
+  went into Watch History -- but it finished by relabelling **every** `.btn-mark-season-watched` on screen
+  to "Mark Season Unwatched", including a season that has not started. The button claimed a season was
+  watched over an empty Watch History. It now relabels only the seasons it actually wrote to (the aired
+  episodes it fetched say which), and hands the rest to the shared state below.
+- **One description of that button, instead of four.** The item modal's first render,
+  `updateSeasonWatchedButton`, `markSeasonWatched`'s own result and `markShowWatched`'s bulk relabel each
+  set it their own way and disagreed about the not-yet-aired case. `seasonWatchedButtonState` is now the
+  single answer, and an upcoming season gets a disabled button saying when it airs rather than one that
+  looks pressable and does nothing.
+- **"Fully watched" now means caught up.** `isShowFullyWatched` required *every* regular season to be fully
+  watched, so one announced season made it false forever: reopening the modal contradicted the button the
+  person had just pressed. Seasons with nothing aired are excluded, matching what Mark Show Watched
+  actually marks.
+- **A caught-up show stays in Continue Watching.** Marking the last aired episode one at a time leaves the
+  show on the shelf with an "Airs …" badge for what is coming; Mark Show Watched was the one path that
+  evicted it outright. It now keeps the upcoming entry the reconciliation just computed, and only evicts
+  (and queues a storyline conclusion like Breaking Bad → El Camino) when there is genuinely nothing left
+  to air.
+- **The episode modal no longer offers a watch button on an unaired episode** — it shows when the episode
+  airs instead — and `toggleWatchStatus`, the single door every episode toggle goes through, refuses to
+  *add* one. Removing stays possible, so an entry made before this (or a stray scrobble) can still be
+  undone. Marking a show or season with nothing aired yet now says so instead of appearing to fail.
+- **Two supporting fixes**: the fetched episode list for a season is now stashed in `_seasonEpisodesMap` by
+  `markShowWatched` and `markSeasonWatched` as well as by expanding the grid, so "is this season fully
+  watched" stops guessing from `episode_count` (which counts unaired episodes); and `.lc-btn:disabled` now
+  actually looks disabled, having been visually identical to a working button.
+
 ### 📺 Airing Next: take one show off the shelf without unwatching anything
 
 - **What was missing**: Airing Next lists the next upcoming episode of every show with at least one watched

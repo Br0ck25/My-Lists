@@ -1557,7 +1557,29 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   const list = getOrCreateWatchHistoryList();
   
   let existingIdx = list.items.findIndex(it => it.id === id);
-  
+
+  // An episode that has not aired yet cannot have been watched, and letting
+  // one in poisons everything downstream: it counts towards "fully watched",
+  // evicts the show from Continue Watching, and is pushed to the account as
+  // a real viewing. The modal no longer offers the button (see
+  // openEpisodeDetails, 19_client-search-and-likes.js) -- this is the guard
+  // behind it, because this function is the single door every episode toggle
+  // goes through.
+  //
+  // Only ADDING is refused. Removing one that is already recorded is exactly
+  // how a person undoes a mistake made before this existed, so that path is
+  // left alone -- as is anything this browser has no air date for, which is
+  // unknown rather than future.
+  if (existingIdx < 0 && type === 'episode' && typeof isEpisodeAired === 'function') {
+    const cached = Object.values(window._episodeDataCache || {}).find(ep => String(ep && ep.id) === String(id));
+    if (cached && (cached.air_date || cached.airDate) && !isEpisodeAired(cached)) {
+      if (typeof showAddedToast === 'function') {
+        showAddedToast('That episode has not aired yet, so it was not marked watched.');
+      }
+      return;
+    }
+  }
+
   if (existingIdx < 0 && type === 'episode') {
     const d = window._currentItemDetails;
     if (d) {
@@ -1907,6 +1929,11 @@ window.markShowWatched = async function(imdbId) {
             '&seasonNum=' + season.season_number + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
           const data = await res.json();
           if (data.ok && data.season && Array.isArray(data.season.episodes)) {
+            // Shared with the season buttons: once the real episode list is
+            // known, "has this season aired anything" and "is it fully
+            // watched" stop having to guess from episode_count.
+            if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+            window._seasonEpisodesMap[season.season_number] = data.season.episodes;
             data.season.episodes.forEach((ep) => {
               if (typeof isEpisodeAired === 'function' && !isEpisodeAired(ep)) return;
               const epStill = ep.still_path
@@ -1945,6 +1972,11 @@ window.markShowWatched = async function(imdbId) {
       btn.innerHTML = "Couldn't load episodes -- try again";
     } else {
       btn.innerHTML = wasFullyWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched';
+      // Every season is still to come, so there is genuinely nothing to
+      // mark. Silence here read as a broken button.
+      if (typeof showAddedToast === 'function') {
+        showAddedToast('Nothing has aired yet, so there is nothing to mark watched.');
+      }
     }
     return;
   }
@@ -1996,18 +2028,39 @@ window.markShowWatched = async function(imdbId) {
       };
 
       if (nowWatched) {
-        // Evict any entry for this completed show from Continue Watching
+        // "Watched everything that has aired" is not the same as "finished".
+        //
+        // The reconciliation awaited above (updateContinueWatching) has
+        // already worked out what comes next for this show, and for a show
+        // that is merely caught up that is an episode with a future air date
+        // -- the entry Continue Watching renders with an "Airs ..." badge,
+        // exactly as it does when the last episode is marked watched one at a
+        // time. Evicting it here made Mark Show Watched the one path that
+        // dropped the show off the shelf entirely, which is the difference
+        // the report describes.
+        //
+        // A show with nothing left to air keeps the old behaviour: evicted,
+        // and its storyline conclusion (Breaking Bad -> El Camino) queued in
+        // its place. A companion only makes sense once a show is actually
+        // over, so it is not queued while an episode is still coming.
+        const isUpcomingEntry = (it) => !!(it && (it.isUnaired ||
+          (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate))));
+        const upcoming = (cwList.items || []).find((it) => isShowItem(it) && isUpcomingEntry(it));
         cwList.items = (cwList.items || []).filter((it) => !isShowItem(it));
-        // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
-        let companion = null;
-        for (const alias of allShowAliases) {
-          if (typeof findCompanionShowConclusion === 'function') {
-            companion = findCompanionShowConclusion(alias);
+        if (upcoming) {
+          cwList.items.unshift(upcoming);
+        } else {
+          // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
+          let companion = null;
+          for (const alias of allShowAliases) {
+            if (typeof findCompanionShowConclusion === 'function') {
+              companion = findCompanionShowConclusion(alias);
+            }
+            if (companion) break;
           }
-          if (companion) break;
-        }
-        if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
-          cwList.items.unshift(companion);
+          if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
+            cwList.items.unshift(companion);
+          }
         }
       } else {
         // If unwatching the whole show, remove any companion queued for this show
@@ -2035,7 +2088,23 @@ window.markShowWatched = async function(imdbId) {
     btn.classList.remove('secondary');
     btn.classList.add('primary');
   }
+  // Only the seasons this actually wrote to. allEpisodes holds the AIRED
+  // episodes that were toggled, so a season absent from it had nothing to
+  // mark -- and relabelling it "Mark Season Unwatched" anyway is what made a
+  // not-yet-aired season read as watched over an empty Watch History. Those
+  // seasons are handed back to the shared state instead, which says when they
+  // air (seasonWatchedButtonState, 19_client-search-and-likes.js).
+  const touchedSeasons = new Set(allEpisodes.map((ep) => String(ep.seasonNum)));
   document.querySelectorAll('.btn-mark-season-watched').forEach((seasonBtn) => {
+    const sNum = seasonBtn.dataset ? seasonBtn.dataset.season : null;
+    if (sNum != null && !touchedSeasons.has(String(sNum))) {
+      if (typeof updateSeasonWatchedButton === 'function') updateSeasonWatchedButton(Number(sNum));
+      return;
+    }
+    if (typeof applySeasonWatchedButton === 'function' && typeof watchedSeasonButtonState === 'function') {
+      applySeasonWatchedButton(seasonBtn, watchedSeasonButtonState(nowWatched));
+      return;
+    }
     if (nowWatched) {
       seasonBtn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
       seasonBtn.classList.remove('primary');

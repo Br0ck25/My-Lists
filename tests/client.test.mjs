@@ -3884,3 +3884,177 @@ describe("client: Reset Account Data says it is working", () => {
     }
   });
 });
+
+describe("client: a not-yet-aired episode is not something anyone watched", () => {
+  const SEASON = "/api/season";
+
+  // Far enough out that no clock skew makes it "aired" mid-test.
+  const FUTURE = "2099-06-01";
+
+  const showWith = (seasons) => ({
+    id: "tt5555555", tmdbId: 9999, title: "Renewed Show", poster: "", seasonsData: seasons,
+  });
+
+  const seasonRoutes = (bySeason) => ({
+    [SEASON]: (req) => {
+      const s = new URL(req.url, "https://example.com").searchParams.get("seasonNum");
+      const eps = bySeason[s];
+      if (!eps) return { json: { ok: false, error: "Not found" } };
+      return { json: { ok: true, season: { episodes: eps } } };
+    },
+  });
+
+  const fakeBtn = () => ({ disabled: false, textContent: "", innerHTML: "", title: "", classList: { remove() {}, add() {} } });
+
+  it("marking the whole show watched leaves the future season alone", async () => {
+    const client = loadClient({
+      routes: seasonRoutes({
+        "1": [{ id: 101, name: "Pilot", episode_number: 1, air_date: "2020-01-01" }],
+        "2": [{ id: 201, name: "Return", episode_number: 1, air_date: FUTURE }],
+      }),
+    });
+    const d = showWith([
+      { season_number: 1, episode_count: 1, air_date: "2020-01-01" },
+      { season_number: 2, episode_count: 1, air_date: FUTURE },
+    ]);
+    client.set("_currentItemDetails", d);
+    const btnShow = client.get("document").getElementById("btnMarkShowWatched");
+    btnShow.classList.add("primary");
+    btnShow.innerHTML = "Mark Show Watched";
+
+    await client.call("markShowWatched", "tt5555555");
+
+    const hist = (client.call("loadLocalCustomLists")["watch-history"] || {}).items || [];
+    // Joined rather than deep-compared: the array comes out of the bundle's
+    // own realm and is not deep-equal to a plain one out here.
+    assert.equal(hist.map((it) => String(it.id)).join(","), "101",
+      "only the aired episode is watched -- a season that has not started cannot have been");
+
+    // The season button is the part the report was about: it used to be
+    // relabelled "Mark Season Unwatched" for every season on screen,
+    // including one with nothing in Watch History behind it.
+    const s2 = client.call("seasonWatchedButtonState", d, d.seasonsData[1]);
+    assert.equal(s2.upcoming, true);
+    assert.equal(s2.label.includes("Unwatched"), false, "a season that has not aired must never read as watched");
+    const s1 = client.call("seasonWatchedButtonState", d, d.seasonsData[0]);
+    assert.equal(s1.upcoming, false);
+    assert.equal(s1.label.includes("Mark Season Unwatched"), true, "the aired season did get watched");
+  });
+
+  it("counts the show as caught up rather than unfinished", async () => {
+    const client = loadClient({
+      routes: seasonRoutes({
+        "1": [{ id: 101, name: "Pilot", episode_number: 1, air_date: "2020-01-01" }],
+        "2": [{ id: 201, name: "Return", episode_number: 1, air_date: FUTURE }],
+      }),
+    });
+    const d = showWith([
+      { season_number: 1, episode_count: 1, air_date: "2020-01-01" },
+      { season_number: 2, episode_count: 1, air_date: FUTURE },
+    ]);
+    client.set("_currentItemDetails", d);
+    const btnShow = client.get("document").getElementById("btnMarkShowWatched");
+    btnShow.classList.add("primary");
+    btnShow.innerHTML = "Mark Show Watched";
+
+    await client.call("markShowWatched", "tt5555555");
+
+    // Before: an announced season made this false forever, so reopening the
+    // modal contradicted the button the person had just pressed.
+    assert.equal(client.call("isShowFullyWatched", d), true);
+  });
+
+  it("keeps the caught-up show on Continue Watching instead of dropping it", async () => {
+    const client = loadClient({
+      routes: seasonRoutes({
+        "1": [
+          { id: 101, name: "Pilot", episode_number: 1, air_date: "2020-01-01" },
+          { id: 102, name: "Finale", episode_number: 2, air_date: FUTURE },
+        ],
+      }),
+    });
+    const d = showWith([{ season_number: 1, episode_count: 2, air_date: "2020-01-01" }]);
+    client.set("_currentItemDetails", d);
+    const btnShow = client.get("document").getElementById("btnMarkShowWatched");
+    btnShow.classList.add("primary");
+    btnShow.innerHTML = "Mark Show Watched";
+
+    await client.call("markShowWatched", "tt5555555");
+    await settle();
+
+    const cw = (client.call("loadLocalCustomLists")["continue-watching"] || {}).items || [];
+    // Marking the last aired episode one at a time leaves the show here with
+    // an "Airs ..." badge; Mark Show Watched used to be the one path that
+    // evicted it outright, which is the difference the report describes.
+    assert.equal(cw.length, 1, "a show with an episode still to come has not finished");
+    assert.equal(String(cw[0].id), "102");
+    assert.equal(cw[0].isUnaired, true);
+  });
+
+  it("refuses to mark a future episode watched, and still lets one be unmarked", () => {
+    const client = loadClient();
+    client.set("_currentItemDetails", { id: "tt5555555", title: "Renewed Show", poster: "" });
+    client.set("_episodeDataCache", { 1: { id: 201, episode_number: 1, season_number: 2, air_date: FUTURE, name: "Return" } });
+
+    client.call("toggleWatchStatus", "201", "episode", "Return", "");
+    let hist = (client.call("loadLocalCustomLists")["watch-history"] || {}).items || [];
+    assert.equal(hist.length, 0, "the door every episode toggle goes through has to hold this line too");
+
+    // An entry recorded before this guard existed is still removable -- the
+    // guard only refuses to ADD.
+    const map = client.call("loadLocalCustomLists");
+    map["watch-history"] = { slug: "watch-history", name: "Watch History", type: "series", items: [
+      { id: "201", type: "episode", name: "Return", showId: "tt5555555", seasonNum: 2, episodeNum: 1, watchedAt: 10 },
+    ], updatedAt: 1 };
+    client.call("saveLocalCustomListsMap", map);
+    client.call("toggleWatchStatus", "201", "episode", "Return", "");
+    hist = (client.call("loadLocalCustomLists")["watch-history"] || {}).items || [];
+    assert.equal(hist.length, 0, "a mistake made before the guard existed must still be undoable");
+  });
+
+  it("offers no watch button on an unaired episode, and keeps one on a watched episode", () => {
+    const client = loadClient();
+    const upcoming = client.call("episodeWatchButtonHtml", { id: 201, air_date: FUTURE, name: "Return" }, false);
+    assert.match(upcoming, /disabled/);
+    assert.equal(upcoming.includes("toggleEpisodeWatchStatusFromModal"), false,
+      "a button that cannot legitimately be pressed should not be wired up");
+
+    const aired = client.call("episodeWatchButtonHtml", { id: 101, air_date: "2020-01-01", name: "Pilot" }, false);
+    assert.match(aired, /Mark as Watched/);
+    assert.equal(aired.includes("disabled"), false);
+
+    // Already in Watch History: the way back has to stay open whatever the date.
+    const watchedButUnaired = client.call("episodeWatchButtonHtml", { id: 201, air_date: FUTURE, name: "Return" }, true);
+    assert.match(watchedButUnaired, /Mark as unwatched/);
+    assert.equal(watchedButUnaired.includes("disabled"), false);
+  });
+
+  it("says when a season airs instead of doing nothing", async () => {
+    const client = loadClient({
+      routes: seasonRoutes({ "2": [{ id: 201, name: "Return", episode_number: 1, air_date: FUTURE }] }),
+    });
+    const d = showWith([{ season_number: 2, episode_count: 1, air_date: FUTURE }]);
+    client.set("_currentItemDetails", d);
+
+    const btn = fakeBtn();
+    await client.call("markSeasonWatched", 2, btn);
+
+    const hist = (client.call("loadLocalCustomLists")["watch-history"] || {}).items || [];
+    assert.equal(hist.length, 0);
+    // It did nothing before either -- silently, handing back a button that
+    // read "Mark Season Watched" and looked broken.
+    assert.equal(btn.disabled, true);
+    assert.equal(btn.innerHTML.includes("Unwatched"), false);
+    assert.match(btn.innerHTML, /Airs|Not aired yet/);
+  });
+
+  it("treats a season with no air date at all as ordinary", () => {
+    const client = loadClient();
+    // TMDB does not always carry a season air date. Unknown is not future:
+    // disabling the button on a guess would take the feature away from every
+    // show with thin metadata.
+    assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, episode_count: 8 }), true);
+    assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, air_date: FUTURE }), false);
+    assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, air_date: "2020-01-01" }), true);
+  });
+});

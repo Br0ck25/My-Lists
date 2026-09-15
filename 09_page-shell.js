@@ -1341,6 +1341,12 @@ ${seoHeadHtml}
   }
   .lc-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .lc-btn.primary:hover:not(:disabled) { opacity: 0.85; }
+  /* Disabled meant "ignores clicks" and looked identical to a working
+     button, which is how a season that has not aired yet -- whose button
+     now says when it does -- would otherwise read as one that is simply
+     broken. Covers every disabled .lc-btn, including the ones already
+     disabled mid-fetch. */
+  .lc-btn:disabled { opacity: 0.55; cursor: default; }
   /* The same surface 'button.secondary' gives every Connect / Disconnect /
      Copy button, spelled with two classes so it also reaches the <a>s that
      are styled as buttons. Those needed it: 'button, .actions a' (further
