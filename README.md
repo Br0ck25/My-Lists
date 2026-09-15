@@ -41,7 +41,7 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 ### Virtual TV Channel Builder
 - Create synthetic linear TV channels and scheduled playlists combining hand-picked episodes from different TV shows and whole movies into a single row.
 - Built-in channel logo generator, custom poster rendering (`/api/channel-poster`), and quick-add channel presets.
-- Choose how a channel plays: the picks in the order you listed them, **Randomize play order** (reshuffled once every 24 hours), or **Sort by air date** (oldest first across every show in the channel, from each episode's TMDB air date). The last two are one-or-the-other -- ticking either clears the other.
+- A **Play order** dropdown arranges a channel's picks: by air date (oldest or newest first, from each episode's TMDB air date and each movie's release date), by show then season and episode, A-Z by title, or shuffled once. Each sorts the list in place, so the order you see is the order it plays -- and a sort is re-applied as you add more picks. Drag a pick by hand and it stays put. **Shuffle daily** is the one live mode: the channel reshuffles itself every 24 hours.
 
 ### Continue Watching & Background Watch Sync
 - Automatically tracks watch progress and next unwatched episode per show.

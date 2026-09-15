@@ -2305,115 +2305,188 @@ describe("client: local storage quota and creator profile watch history preserva
 // group would need a third option to say it), which only works if they keep
 // each other clear -- on the page AND in what gets saved, since the Worker
 // reads the saved payload and nothing else.
-describe("client: a channel's play order is one choice, not two", () => {
-  function boxes(client) {
-    const doc = client.get("document");
-    return {
-      rand: doc.getElementById("channelRandomizeCheck"),
-      aired: doc.getElementById("channelSortAiredCheck"),
-    };
+// A channel's picks play in the order they are listed, full stop. The Play
+// order dropdown is a menu of one-shot ARRANGEMENTS of that list -- picking
+// one reorders the picks then and there -- rather than a rule applied over
+// the top of them at serve time, which is what the old "Sort by air date"
+// checkbox was and why a hand-moved pick used to snap back.
+//
+// The one exception is "Shuffle daily": the Worker reshuffles from a
+// date-based seed on every request, so no stored order can express it.
+describe("client: a channel's Play order arranges the list itself", () => {
+  const ep = (over = {}) => ({
+    kind: "episode", imdbId: "tt1", season: 1, episode: 1,
+    showName: "Show", epName: "Ep", title: "Show S1E1", ...over,
+  });
+  // Deliberately out of every order this tests: not by date, not by show.
+  const PICKS = [
+    ep({ imdbId: "tt_office", showName: "The Office", season: 2, episode: 7, title: "The Office S2E7", released: "2005-11-22" }),
+    ep({ imdbId: "tt_friends", showName: "Friends", season: 5, episode: 13, title: "Friends S5E13", released: "1999-02-11" }),
+    ep({ imdbId: "tt_office", showName: "The Office", season: 1, episode: 1, title: "The Office S1E1", released: "2005-03-24" }),
+    ep({ imdbId: "tt_friends", showName: "Friends", season: 1, episode: 1, title: "Friends S1E1", released: "1994-09-22" }),
+  ];
+  const titles = (client) => client.get("channelDraftItems").map((it) => it.title);
+
+  function withPicks(client, picks = PICKS) {
+    client.set("channelDraftItems", picks.map((it) => ({ ...it })));
+    return client;
   }
 
-  it("checking either play-order box clears the other", () => {
-    const client = loadClient();
-    const { rand, aired } = boxes(client);
+  it("reorders the picks themselves when a sort is chosen", () => {
+    const client = withPicks(loadClient());
+    client.call("applyChannelPlayOrder", "aired-asc");
+    assert.deepEqual(titles(client),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"]);
 
-    rand.checked = true;
-    client.call("setChannelPlayOrderMode", "aired", { checked: true });
-    assert.equal(aired.checked, true);
-    assert.equal(rand.checked, false, "air date order must clear randomize");
+    client.call("applyChannelPlayOrder", "aired-desc");
+    assert.deepEqual(titles(client),
+      ["The Office S2E7", "The Office S1E1", "Friends S5E13", "Friends S1E1"]);
 
-    client.call("setChannelPlayOrderMode", "shuffle", { checked: true });
-    assert.equal(rand.checked, true);
-    assert.equal(aired.checked, false, "randomize must clear air date order");
+    // Shows keep the order they first appear in; within a show, broadcast order.
+    withPicks(client);
+    client.call("applyChannelPlayOrder", "show-season-episode");
+    assert.deepEqual(titles(client),
+      ["The Office S1E1", "The Office S2E7", "Friends S1E1", "Friends S5E13"]);
 
-    client.call("setChannelPlayOrderMode", "shuffle", { checked: false });
-    assert.equal(rand.checked, false);
-    assert.equal(aired.checked, false, "unticking one must not tick the other -- neither is a valid answer");
+    withPicks(client);
+    client.call("applyChannelPlayOrder", "title-az");
+    assert.deepEqual(titles(client),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"]);
   });
 
-  it("saves the chosen order onto the channel, and never both flags at once", () => {
-    const client = loadClient();
-    const { rand, aired } = boxes(client);
-    client.set("channelDraftItems", [
-      { kind: "episode", imdbId: "tt0108778", season: 1, episode: 1, title: "Friends S1E1", released: "1994-09-22" },
-    ]);
-    client.get("document").getElementById("channelNameInput").value = "Air Date Channel";
+  it("keeps a sorted channel sorted as picks are added", () => {
+    const client = withPicks(loadClient());
+    client.call("applyChannelPlayOrder", "aired-asc");
 
-    // Both ticked is not reachable through the checkboxes, but a save must
-    // still publish one order rather than leaving the Worker to break a tie.
-    rand.checked = true;
-    aired.checked = true;
+    // Every add path in the builder ends with renderChannelDraftList, which
+    // is where a remembered sort is re-applied.
+    client.get("channelDraftItems").push(ep({
+      imdbId: "tt_frasier", showName: "Frasier", season: 8, episode: 14,
+      title: "Frasier S8E14", released: "2001-02-20",
+    }));
+    client.call("renderChannelDraftList");
+
+    assert.deepEqual(titles(client),
+      ["Friends S1E1", "Friends S5E13", "Frasier S8E14", "The Office S1E1", "The Office S2E7"],
+      "a pick added later must land in its place, not at the bottom");
+  });
+
+  // The whole point of the change: what you drag stays dragged.
+  it("stops re-sorting once a pick is moved by hand, and keeps the new order", () => {
+    const client = withPicks(loadClient());
+    client.call("applyChannelPlayOrder", "aired-asc");
+
+    // Move the last pick to the front, the way the position input does.
+    const items = client.get("channelDraftItems");
+    client.call("clearChannelDraftAutoSort");
+    items.unshift(items.pop());
+    client.call("renderChannelDraftList");
+
+    assert.deepEqual(titles(client),
+      ["The Office S2E7", "Friends S1E1", "Friends S5E13", "The Office S1E1"],
+      "the hand-moved pick must stay where it was put");
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed",
+      "the dropdown must fall back to As listed");
+    assert.equal(client.call("channelDraftAutoSortKey"), "",
+      "and nothing must be armed to re-sort on the next render");
+
+    // A further add must not resurrect the sort either.
+    client.get("channelDraftItems").push(ep({ imdbId: "tt_new", title: "Added Later", released: "1990-01-01" }));
+    client.call("renderChannelDraftList");
+    assert.equal(titles(client)[0], "The Office S2E7", "still the person's order");
+    assert.equal(titles(client)[4], "Added Later", "a new pick appends once the sort is off");
+  });
+
+  it("shuffles once without arming anything, and leaves the dropdown alone", () => {
+    const client = withPicks(loadClient());
+    client.call("applyChannelPlayOrder", "aired-asc");
+    client.call("applyChannelPlayOrder", "shuffle-now");
+
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed");
+    assert.equal(client.call("channelDraftAutoSortKey"), "", "Shuffle now is a one-off, not a mode");
+    assert.deepEqual([...titles(client)].sort(), [...PICKS.map((it) => it.title)].sort(),
+      "every pick is still there, once");
+  });
+
+  it("saves a sort as the item order, and Shuffle daily as the only flag", () => {
+    const client = withPicks(loadClient());
+    client.get("document").getElementById("channelNameInput").value = "Sorted Channel";
+    client.call("applyChannelPlayOrder", "aired-asc");
     client.call("saveChannel");
 
     const saved = Object.values(client.call("loadLocalChannels"))[0];
-    assert.equal(saved.sortByAired, true, "air date order must survive the save");
-    assert.equal(saved.shuffle, false, "a channel must never be saved as both shuffled and sorted");
-    assert.equal(rand.checked, false, "saving clears the builder for the next channel");
-    assert.equal(aired.checked, false);
+    assert.deepEqual(saved.items.map((it) => it.title),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"],
+      "the saved order IS the play order -- the Worker does not sort it");
+    assert.equal(saved.autoSort, "aired-asc", "remembered so later picks land in order");
+    assert.equal(saved.shuffle, false);
+    assert.equal(saved.sortByAired, false, "the serve-time flag is never written again");
+
+    const client2 = withPicks(loadClient());
+    client2.get("document").getElementById("channelNameInput").value = "Daily Channel";
+    client2.call("applyChannelPlayOrder", "shuffle-daily");
+    client2.call("saveChannel");
+    const daily = Object.values(client2.call("loadLocalChannels"))[0];
+    assert.equal(daily.shuffle, true, "Shuffle daily is the one entry the Worker acts on");
+    assert.equal(daily.autoSort, "", "and it arranges nothing itself");
+    assert.deepEqual(daily.items.map((it) => it.title), PICKS.map((it) => it.title),
+      "the picks keep their order -- the daily reshuffle happens at serve time");
   });
 
-  it("puts the saved order back on the checkboxes when the channel is edited", () => {
+  it("puts the saved play order back on the dropdown when a channel is edited", () => {
     const client = loadClient();
-    const { rand, aired } = boxes(client);
-    client.call("saveLocalChannel", {
-      channelId: "ch-aired", name: "Aired", sortByAired: true,
-      items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, title: "one" }],
-    });
-    client.call("saveLocalChannel", {
-      channelId: "ch-shuffled", name: "Shuffled", shuffle: true,
-      items: [{ kind: "episode", imdbId: "tt2", season: 1, episode: 1, title: "two" }],
-    });
+    client.call("saveLocalChannel", { channelId: "ch-sorted", name: "Sorted", autoSort: "title-az", items: [PICKS[0]] });
+    client.call("saveLocalChannel", { channelId: "ch-daily", name: "Daily", shuffle: true, items: [PICKS[0]] });
+    client.call("saveLocalChannel", { channelId: "ch-plain", name: "Plain", items: [PICKS[0]] });
 
-    client.call("editChannelById", "ch-aired");
-    assert.equal(aired.checked, true);
-    assert.equal(rand.checked, false);
-
-    client.call("editChannelById", "ch-shuffled");
-    assert.equal(rand.checked, true);
-    assert.equal(aired.checked, false, "a channel saved before air date order existed only carries shuffle");
+    client.call("editChannelById", "ch-sorted");
+    assert.equal(client.call("getChannelPlayOrder"), "title-az");
+    client.call("editChannelById", "ch-daily");
+    assert.equal(client.call("getChannelPlayOrder"), "shuffle-daily");
+    client.call("editChannelById", "ch-plain");
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed");
   });
 
-  // "See All" reads the saved items directly rather than going through the
-  // Worker, so without this it would list an air-date channel in the order
-  // its picks happen to be stored in -- contradicting the page that told
-  // the person what order it plays in.
-  it("lists an air-date channel oldest first in See All, undated picks last", () => {
+  // The previous release's checkbox wrote a flag the Worker sorted on every
+  // request. Editing such a channel has to turn that into a real order, or
+  // it would open in the builder looking unsorted and save that way.
+  it("migrates a channel saved with the old serve-time sortByAired flag", () => {
+    const client = loadClient();
+    client.call("saveLocalChannel", {
+      channelId: "ch-legacy", name: "Legacy", sortByAired: true, items: PICKS.map((it) => ({ ...it })),
+    });
+
+    client.call("editChannelById", "ch-legacy");
+    assert.equal(client.call("getChannelPlayOrder"), "aired-asc");
+    assert.deepEqual(titles(client),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"],
+      "opening it sorts the picks for real");
+
+    client.get("document").getElementById("channelNameInput").value = "Legacy";
+    client.call("saveChannel");
+    const saved = client.call("loadLocalChannels")["ch-legacy"];
+    assert.equal(saved.sortByAired, false, "the serve-time flag is dropped on save");
+    assert.equal(saved.autoSort, "aired-asc");
+    assert.deepEqual(saved.items.map((it) => it.title),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"]);
+  });
+
+  it("still lists a not-yet-migrated sortByAired channel in play order in See All", () => {
     const client = loadClient();
     client.call("saveLocalChannel", {
       channelId: "ch-order", name: "Order", sortByAired: true,
       items: [
-        { kind: "episode", imdbId: "tt0386676", season: 2, episode: 7, showName: "The Office", epName: "The Client", released: "2005-11-22" },
-        { kind: "episode", imdbId: "tt0903747", season: 1, episode: 1, showName: "Breaking Bad", epName: "Pilot", released: "" },
-        { kind: "movie", imdbId: "tt0133093", title: "The Matrix", released: "1999-03-31" },
-        { kind: "episode", imdbId: "tt0108778", season: 1, episode: 1, showName: "Friends", epName: "The One Where It Begins", released: "1994-09-22" },
+        ep({ imdbId: "tt_office", showName: "The Office", season: 2, episode: 7, released: "2005-11-22" }),
+        ep({ imdbId: "tt_bb", showName: "Breaking Bad", released: "" }),
+        ep({ imdbId: "tt_friends", showName: "Friends", released: "1994-09-22" }),
       ],
     });
-
     let opened = null;
     client.set("openListDetailsPage", (title, type, url, preloaded) => { opened = preloaded; });
     client.call("openChannelDetailsPage", "ch-order");
-
-    assert.ok(opened, "See All must open");
-    assert.deepEqual(
-      [...opened.sample].map((it) => it.name),
-      ["Friends S1E1", "The Matrix S1E1", "The Office S2E7", "Breaking Bad S1E1"]
-    );
-  });
-
-  it("leaves See All in the picked order for a channel with no play-order flag", () => {
-    const client = loadClient();
-    client.call("saveLocalChannel", {
-      channelId: "ch-listed", name: "Listed",
-      items: [
-        { kind: "episode", imdbId: "tt0386676", season: 2, episode: 7, showName: "The Office", epName: "The Client", released: "2005-11-22" },
-        { kind: "episode", imdbId: "tt0108778", season: 1, episode: 1, showName: "Friends", epName: "The One", released: "1994-09-22" },
-      ],
-    });
-    let opened = null;
-    client.set("openListDetailsPage", (title, type, url, preloaded) => { opened = preloaded; });
-    client.call("openChannelDetailsPage", "ch-listed");
-    assert.deepEqual([...opened.sample].map((it) => it.name), ["The Office S2E7", "Friends S1E1"]);
+    assert.deepEqual([...opened.sample].map((it) => it.name),
+      ["Friends S1E1", "The Office S2E7", "Breaking Bad S1E1"],
+      "undated last, the rest oldest first");
   });
 });
 

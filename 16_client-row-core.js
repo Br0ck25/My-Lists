@@ -2017,14 +2017,11 @@ function channelSourceRowHtml(u) {
     if (payload.dailyRotate) {
       summary = items.length + '-episode pool \u2014 shows ' + CHANNEL_ROTATION_SHOWS_PER_DAY + ' shows \u00d7 ' +
         CHANNEL_ROTATION_EPISODES_PER_SHOW + ' episodes each, refreshed daily';
-      if (payload.sortByAired) summary += ', in air date order';
-    } else if (payload.sortByAired) {
-      // Checked ahead of shuffle for the same reason buildChannelMeta
-      // applies it last: on a payload old enough to carry both, the
-      // explicit sort is what the channel actually plays in.
-      summary += ' \u2014 in air date order';
-    } else if (payload.shuffle) {
-      summary += ' \u2014 shuffled daily';
+      const rotatedOrder = channelPlayOrderLabel(payload);
+      if (rotatedOrder && rotatedOrder !== 'shuffled daily') summary += ', ' + rotatedOrder;
+    } else {
+      const order = channelPlayOrderLabel(payload);
+      if (order) summary += ' \u2014 ' + order;
     }
   }
   return '<div class="source-row">' +

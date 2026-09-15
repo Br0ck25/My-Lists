@@ -22767,18 +22767,21 @@ if ('serviceWorker' in navigator) {
       <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel:</p>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
-        <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft()">Shuffle picks now</button>
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove all</button>
       </div>
-      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
-        <input type="checkbox" id="channelRandomizeCheck" onchange="setChannelPlayOrderMode('shuffle', this)">
-        <span style="font-size:0.85rem;">Randomize play order (reshuffles once a day)</span>
-      </label>
-      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:6px;">
-        <input type="checkbox" id="channelSortAiredCheck" onchange="setChannelPlayOrderMode('aired', this)">
-        <span style="font-size:0.85rem;">Sort by air date (oldest first, across every show)</span>
-      </label>
-      <p style="margin:6px 0 0; color:var(--muted); font-size:0.78rem;">Pick one or neither &mdash; checking either of these clears the other. Leave both off to play the picks in the order listed above. Air dates come from TMDB (each episode's own air date, a movie's release date); anything with no known date plays last.</p>
+      <div style="display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap;">
+        <label for="channelPlayOrderSelect" style="font-size:0.85rem; font-weight:600; white-space:nowrap;">Play order:</label>
+        <select id="channelPlayOrderSelect" onchange="applyChannelPlayOrder(this.value)" style="flex:1; min-width:210px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="as-listed">As listed (custom)</option>
+          <option value="aired-asc">Air date &mdash; oldest first</option>
+          <option value="aired-desc">Air date &mdash; newest first</option>
+          <option value="show-season-episode">Show, then season &amp; episode</option>
+          <option value="title-az">Title A&ndash;Z</option>
+          <option value="shuffle-now">Shuffle now</option>
+          <option value="shuffle-daily">Shuffle daily (reshuffles every 24h)</option>
+        </select>
+      </div>
+      <p id="channelPlayOrderHint" style="margin:6px 0 0; color:var(--muted); font-size:0.78rem;">Picks play in the order listed above &mdash; drag one, or type a new position, to change it.</p>
 
       <!-- Channel Poster Selection Section -->
       <div id="channelPosterPickerSection" style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; display:none;">
@@ -25398,14 +25401,11 @@ function channelSourceRowHtml(u) {
     if (payload.dailyRotate) {
       summary = items.length + '-episode pool \u2014 shows ' + CHANNEL_ROTATION_SHOWS_PER_DAY + ' shows \u00d7 ' +
         CHANNEL_ROTATION_EPISODES_PER_SHOW + ' episodes each, refreshed daily';
-      if (payload.sortByAired) summary += ', in air date order';
-    } else if (payload.sortByAired) {
-      // Checked ahead of shuffle for the same reason buildChannelMeta
-      // applies it last: on a payload old enough to carry both, the
-      // explicit sort is what the channel actually plays in.
-      summary += ' \u2014 in air date order';
-    } else if (payload.shuffle) {
-      summary += ' \u2014 shuffled daily';
+      const rotatedOrder = channelPlayOrderLabel(payload);
+      if (rotatedOrder && rotatedOrder !== 'shuffled daily') summary += ', ' + rotatedOrder;
+    } else {
+      const order = channelPlayOrderLabel(payload);
+      if (order) summary += ' \u2014 ' + order;
     }
   }
   return '<div class="source-row">' +
@@ -34524,6 +34524,7 @@ function saveLocalChannelsMap(map) {
       backdrop: ch.backdrop || null,
       items: compressChannelItemsForStorage(ch.items, 5000),
       shuffle: !!ch.shuffle,
+      autoSort: ch.autoSort || '',
       sortByAired: !!ch.sortByAired,
       dailyRotate: !!ch.dailyRotate,
       createdAt: ch.createdAt || Date.now(),
@@ -34617,6 +34618,7 @@ function ensureAllChannelsSyncedFromRows(map) {
                   backdrop: payload.backdrop || null,
                   items: compressChannelItemsForStorage(payload.items),
                   shuffle: !!payload.shuffle,
+                  autoSort: payload.autoSort || '',
                   sortByAired: !!payload.sortByAired,
                   dailyRotate: !!payload.dailyRotate,
                   createdAt: Date.now(),
@@ -34649,6 +34651,7 @@ function saveLocalChannel(payload) {
     backdrop: payload.backdrop || null,
     items: compressChannelItemsForStorage(payload.items),
     shuffle: !!payload.shuffle,
+    autoSort: payload.autoSort || '',
     sortByAired: !!payload.sortByAired,
     dailyRotate: !!payload.dailyRotate,
     createdAt: existing ? existing.createdAt : now,
@@ -34776,6 +34779,11 @@ function toggleChannelInCatalog(channelId) {
 }
 
 function renderChannelDraftList() {
+  // Re-applies a remembered sort before drawing, so picks added since the
+  // last render land in order. Every manual reorder disarms the sort first
+  // (see clearChannelDraftAutoSort), which is what lets a hand-moved pick
+  // survive the render it triggers.
+  applyChannelDraftAutoSort();
   const box = document.getElementById('channelDraftList');
   const badge = document.getElementById('channelDraftCountBadge');
   if (badge) badge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ')' : '';
@@ -41539,6 +41547,7 @@ document.getElementById('channelDraftList').addEventListener('change', (e) => {
     renderChannelDraftList();
     return;
   }
+  clearChannelDraftAutoSort();
   const [item] = channelDraftItems.splice(from, 1);
   channelDraftItems.splice(to, 0, item);
   renderChannelDraftList();
@@ -41716,47 +41725,181 @@ function reorderChannelDraftFromDom() {
   const container = document.getElementById('channelDraftList');
   const rows = [...container.querySelectorAll('.channel-pick')];
   if (rows.length) {
+    clearChannelDraftAutoSort();
     channelDraftItems = rows.map((row) => channelDraftItems[parseInt(row.dataset.idx, 10)]).filter(Boolean);
   }
   renderChannelDraftList();
 }
 
-// The builder's two play-order checkboxes -- "Randomize play order" and
-// "Sort by air date" -- are one choice with three outcomes: reshuffled every
-// day, oldest-aired first, or exactly the order the picks are listed in.
-// They are two checkboxes rather than a radio group because "neither" is a
-// real answer and the default one, and a radio group would need a third
-// "as listed" option to say so. Checking either therefore clears the other
-// here, on the page, rather than only in the saved payload -- what is on
-// screen is what saves.
-function setChannelPlayOrderMode(mode, el) {
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  const airedCheck = document.getElementById('channelSortAiredCheck');
-  const on = el ? !!el.checked : true;
-  if (mode === 'aired') {
-    if (airedCheck) airedCheck.checked = on;
-    if (on && randCheck) randCheck.checked = false;
-  } else {
-    if (randCheck) randCheck.checked = on;
-    if (on && airedCheck) airedCheck.checked = false;
-  }
+// --- play order ---------------------------------------------------------
+//
+// One dropdown, and almost every entry in it is an ACTION rather than a
+// mode: picking "Air date -- oldest first" reorders the picks then and
+// there, and what is saved is that order. So the list on screen is always
+// the list that plays, and moving a pick by hand afterwards simply stays
+// moved -- which is what the old "Sort by air date" checkbox could not do,
+// because it re-sorted at serve time and silently overrode every manual
+// move.
+//
+// Two entries are not one-shot sorts:
+//  - "Shuffle daily" is the one real MODE left (the payload's shuffle
+//    flag): the Worker reshuffles from a date-based seed on every request,
+//    so no stored order could express it and the list order is ignored
+//    while it is on.
+//  - "Shuffle now" is a one-shot like the sorts, and leaves the dropdown on
+//    "As listed" -- there is no arrangement to keep re-applying.
+//
+// A static sort is also REMEMBERED, as the payload's autoSort field, and
+// re-applied whenever picks are added later (see applyChannelDraftAutoSort)
+// so an air-date channel stays in air-date order as it grows. Moving a pick
+// by hand disarms that and puts the dropdown back to "As listed": from then
+// on the order is the person's, not the sort's.
+const CHANNEL_STATIC_SORTS = ['aired-asc', 'aired-desc', 'show-season-episode', 'title-az'];
+
+const CHANNEL_PLAY_ORDER_HINTS = {
+  'as-listed': 'Picks play in the order listed above \u2014 drag one, or type a new position, to change it.',
+  'shuffle-daily': 'The channel reshuffles itself once every 24 hours, so the order listed above is ignored while this is selected.',
+  'sorted': 'Sorted now, and sorted again whenever you add more picks. Move a pick by hand and this switches back to "As listed", keeping your order.',
+};
+
+const CHANNEL_SORT_LABELS = {
+  'aired-asc': 'air date order',
+  'aired-desc': 'newest aired first',
+  'show-season-episode': 'by show, season & episode',
+  'title-az': 'A\u2013Z by title',
+};
+
+// How a saved channel plays, in a few words, or '' when it is simply the
+// order its picks are listed in. sortByAired is the pre-dropdown flag the
+// Worker still honours for a channel nobody has edited since.
+function channelPlayOrderLabel(ch) {
+  if (!ch) return '';
+  if (ch.shuffle) return 'shuffled daily';
+  if (ch.autoSort && CHANNEL_SORT_LABELS[ch.autoSort]) return CHANNEL_SORT_LABELS[ch.autoSort];
+  if (ch.sortByAired) return CHANNEL_SORT_LABELS['aired-asc'];
+  return '';
 }
 
-// Puts a saved channel's play order back on those checkboxes (and clears
-// both for a new draft). A channel saved before air-date order existed can
-// only carry shuffle; one that somehow carries both is resolved the way the
-// Worker resolves it (see buildChannelMeta) -- the explicit sort wins -- so
-// the box that is ticked is the order the channel actually plays in.
-function setChannelPlayOrderChecks(shuffle, sortByAired) {
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  const airedCheck = document.getElementById('channelSortAiredCheck');
-  const aired = !!sortByAired;
-  if (airedCheck) airedCheck.checked = aired;
-  if (randCheck) randCheck.checked = !aired && !!shuffle;
+function getChannelPlayOrder() {
+  const sel = document.getElementById('channelPlayOrderSelect');
+  const v = sel && sel.value ? sel.value : 'as-listed';
+  return v === 'shuffle-now' ? 'as-listed' : v;
+}
+
+function updateChannelPlayOrderHint() {
+  const hint = document.getElementById('channelPlayOrderHint');
+  if (!hint) return;
+  const v = getChannelPlayOrder();
+  const key = v === 'shuffle-daily' ? 'shuffle-daily' : (CHANNEL_STATIC_SORTS.indexOf(v) !== -1 ? 'sorted' : 'as-listed');
+  hint.textContent = CHANNEL_PLAY_ORDER_HINTS[key];
+}
+
+function setChannelPlayOrder(value) {
+  const sel = document.getElementById('channelPlayOrderSelect');
+  const v = value || 'as-listed';
+  if (sel) sel.value = v;
+  updateChannelPlayOrderHint();
+}
+
+// The static sort to re-apply when picks are added, or '' when there is
+// none -- "As listed" and "Shuffle daily" both leave the order alone.
+function channelDraftAutoSortKey() {
+  const v = getChannelPlayOrder();
+  return CHANNEL_STATIC_SORTS.indexOf(v) !== -1 ? v : '';
+}
+
+// Every manual reorder path calls this BEFORE it re-renders: the re-render
+// is what re-applies a remembered sort (see applyChannelDraftAutoSort), so
+// disarming first is what lets a hand-moved pick stay where it was put.
+function clearChannelDraftAutoSort() {
+  if (channelDraftAutoSortKey()) setChannelPlayOrder('as-listed');
+}
+
+function channelSortComparator(key) {
+  if (key === 'aired-asc' || key === 'aired-desc') {
+    const dir = key === 'aired-desc' ? -1 : 1;
+    return (a, b) => {
+      const da = channelItemAiredDateClient(a.it);
+      const db = channelItemAiredDateClient(b.it);
+      if (da === db) return a.i - b.i;
+      // Undated last in BOTH directions: "newest first" is still no reason
+      // to open a channel with the picks we could not place at all.
+      if (!da) return 1;
+      if (!db) return -1;
+      return (da < db ? -1 : 1) * dir;
+    };
+  }
+  if (key === 'show-season-episode') {
+    // Shows keep the order they first appear in, so this groups a channel
+    // back into runs of each show without also reshuffling which show opens
+    // it. Within a show it is plain broadcast order.
+    return (a, b) => {
+      if (a.showRank !== b.showRank) return a.showRank - b.showRank;
+      const sa = Number(a.it.season); const sb = Number(b.it.season);
+      if (sa !== sb) return (isNaN(sa) ? 0 : sa) - (isNaN(sb) ? 0 : sb);
+      const ea = Number(a.it.episode); const eb = Number(b.it.episode);
+      if (ea !== eb) return (isNaN(ea) ? 0 : ea) - (isNaN(eb) ? 0 : eb);
+      return a.i - b.i;
+    };
+  }
+  return (a, b) => {
+    const na = String(a.it.showName || a.it.title || '').toLowerCase();
+    const nb = String(b.it.showName || b.it.title || '').toLowerCase();
+    if (na !== nb) return na < nb ? -1 : 1;
+    const sa = Number(a.it.season); const sb = Number(b.it.season);
+    if (sa !== sb) return (isNaN(sa) ? 0 : sa) - (isNaN(sb) ? 0 : sb);
+    const ea = Number(a.it.episode); const eb = Number(b.it.episode);
+    if (ea !== eb) return (isNaN(ea) ? 0 : ea) - (isNaN(eb) ? 0 : eb);
+    return a.i - b.i;
+  };
+}
+
+// Sorts channelDraftItems in place-ish. Every comparator falls back to the
+// item's current index, so a tie -- two episodes aired the same night, a
+// whole season dropped on one day, anything undated -- keeps the order it
+// is already in rather than jumping around on each re-sort.
+function sortChannelDraftItems(key) {
+  if (!key || channelDraftItems.length < 2) return;
+  const showRanks = new Map();
+  const wrapped = channelDraftItems.map((it, i) => {
+    const showKey = String((it && (it.showName || it.imdbId)) || '');
+    if (!showRanks.has(showKey)) showRanks.set(showKey, showRanks.size);
+    return { it: it, i: i, showRank: showRanks.get(showKey) };
+  });
+  wrapped.sort(channelSortComparator(key));
+  channelDraftItems = wrapped.map((w) => w.it);
+}
+
+// Called by renderChannelDraftList, which is the one thing every path that
+// adds picks ends with -- the episode picker, "Add every season", a movie,
+// a crossover, an imported channel. Hooking it here is what keeps a sorted
+// channel sorted as it grows without every one of those paths having to
+// remember to re-sort.
+function applyChannelDraftAutoSort() {
+  sortChannelDraftItems(channelDraftAutoSortKey());
+}
+
+// The dropdown's onchange. A static sort reorders the picks and stays
+// selected (so it re-applies as the channel grows); "Shuffle now" reorders
+// them once and falls back to "As listed"; the other two only set state.
+function applyChannelPlayOrder(value) {
+  const v = value || 'as-listed';
+  if (v === 'shuffle-now') {
+    setChannelPlayOrder('as-listed');
+    shuffleChannelDraft();
+    return;
+  }
+  setChannelPlayOrder(v);
+  const key = channelDraftAutoSortKey();
+  if (key) sortChannelDraftItems(key);
+  renderChannelDraftList();
 }
 
 function shuffleChannelDraft() {
   if (channelDraftItems.length < 2) return;
+  // A one-shot, so it cannot leave a sort armed to undo it on the next
+  // render.
+  clearChannelDraftAutoSort();
   for (let i = channelDraftItems.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     const tmp = channelDraftItems[i];
@@ -41794,12 +41937,13 @@ function saveChannel() {
     const matchedItem = channelDraftItems.find((it) => it && (it.showPoster === verticalPoster || it.poster === verticalPoster));
     horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || verticalPoster;
   }
-  // Never both: the checkboxes already keep each other clear (see
-  // setChannelPlayOrderMode), and this is the second guard on the way out,
-  // so no payload this builder writes can leave the Worker to break a tie.
-  const airedCheck = document.getElementById('channelSortAiredCheck');
-  const sortByAired = !!(airedCheck && airedCheck.checked);
-  const shuffle = !sortByAired && document.getElementById('channelRandomizeCheck').checked;
+  // The dropdown is the whole play-order state: "Shuffle daily" is the only
+  // entry the Worker acts on, and a static sort has already been applied to
+  // channelDraftItems, so the saved item order IS the play order. autoSort
+  // only says which sort to re-apply when picks are added later.
+  const playOrder = getChannelPlayOrder();
+  const shuffle = playOrder === 'shuffle-daily';
+  const autoSort = channelDraftAutoSortKey();
 
   const map = loadLocalChannels();
   const channelId = editingChannelId || generateChannelId();
@@ -41812,7 +41956,11 @@ function saveChannel() {
     backdrop: horizontalBackdrop,
     items: channelDraftItems,
     shuffle: shuffle,
-    sortByAired: sortByAired,
+    autoSort: autoSort,
+    // Cleared, never written: a channel that carried it was sorted by the
+    // Worker on every request, and its picks have just been sorted for real
+    // (see editChannelById) -- so the stored order is now the answer.
+    sortByAired: false,
     dailyRotate: existing.dailyRotate || false
   };
 
@@ -41846,7 +41994,7 @@ function saveChannel() {
   channelDraftPoster = null;
   channelDraftBackdrop = null;
   nameInput.value = '';
-  setChannelPlayOrderChecks(false, false);
+  setChannelPlayOrder('as-listed');
   const searchInput = document.getElementById('channelSearchInput');
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('channelSearchResult');
@@ -42448,7 +42596,7 @@ async function loadStorylineToDraft(eventId, btn) {
 
     const nameInput = document.getElementById('channelNameInput');
     if (nameInput) nameInput.value = event.name;
-    setChannelPlayOrderChecks(false, false);
+    setChannelPlayOrder('as-listed');
 
     renderChannelDraftList();
     updateChannelSaveButtonLabel();
@@ -42521,7 +42669,7 @@ function openBuildCustomChannel() {
   channelDraftBackdrop = null;
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
-  setChannelPlayOrderChecks(false, false);
+  setChannelPlayOrder('as-listed');
   const searchInput = document.getElementById('channelSearchInput');
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('channelSearchResult');
@@ -42558,7 +42706,12 @@ function editChannelById(channelId) {
   
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = channel.name || '';
-  setChannelPlayOrderChecks(channel.shuffle, channel.sortByAired);
+  // A channel saved with the old "Sort by air date" flag is migrated here:
+  // it becomes the equivalent dropdown selection, the render below sorts its
+  // picks for real, and saveChannel then writes the sorted order with the
+  // flag cleared. Until it is edited the Worker keeps sorting it, so nothing
+  // changes for a channel nobody opens.
+  setChannelPlayOrder(channel.shuffle ? 'shuffle-daily' : (channel.sortByAired ? 'aired-asc' : (channel.autoSort || 'as-listed')));
   
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
@@ -42606,12 +42759,17 @@ function editChannel(btnOrRow) {
   }
 }
 
-// Client twins of the Worker's channelItemAiredDate/sortChannelItemsByAired
-// (05_catalog-core.js), so "See All" lists an air-date-ordered channel in
-// the order it actually plays rather than the order its picks happen to be
-// stored in. Same rules, because it has to be the same answer: zero-padded
-// ISO dates compare as plain strings, an item with no date it can be placed
-// by goes last, and ties keep their saved order.
+// An item's air date, as a sortable "YYYY-MM-DD" string or '' -- the field
+// the builder's air-date sorts order by, and the client twin of the Worker's
+// channelItemAiredDate (05_catalog-core.js). Zero-padded ISO dates compare
+// as plain strings, and an item with no date it can be placed by sorts as ''
+// so callers can push it to the end.
+//
+// channelItemsInPlayOrder below is now only for a channel still carrying the
+// pre-dropdown sortByAired flag, which the Worker sorts on every request:
+// "See All" reads the saved items directly, so without this it would list
+// such a channel in an order it does not play in. A channel saved since has
+// its picks stored in the order they play, and falls straight through.
 function channelItemAiredDateClient(it) {
   if (!it) return '';
   const raw = String(it.released == null ? '' : it.released).trim();
@@ -42853,7 +43011,7 @@ function renderMyCreatedChannelsList() {
     const isAdded = [...document.querySelectorAll('#lists .entry .url')].some((u) => u.value.includes(ch.channelId));
     const allItems = ch.items || [];
     const totalEpisodes = allItems.length;
-    const orderLabel = ch.sortByAired ? 'air date order' : (ch.shuffle ? 'shuffled daily' : '');
+    const orderLabel = channelPlayOrderLabel(ch);
     const metaText = '24/7 TV Channel &middot; ' + totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's') +
       (orderLabel ? ' &middot; ' + orderLabel : '');
     
@@ -42976,7 +43134,7 @@ function cancelEditChannel() {
   channelDraftBackdrop = null;
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
-  setChannelPlayOrderChecks(false, false);
+  setChannelPlayOrder('as-listed');
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
   switchChannelsSubmenu('my-channels', document.querySelector('#channelsSubnavBar button:nth-child(1)'));
@@ -60019,8 +60177,10 @@ function renderGuidePage(origin) {
       <li>Click <strong>+ New Channel</strong>.</li>
       <li>Use the <strong>Shows / Movies</strong> toggle to set what you're searching for.</li>
       <li>Search a title and add picks &mdash; for shows, an episode picker lets you choose specific seasons/episodes.</li>
-      <li>Reorder or remove picks in <strong>Picks in this channel</strong>. <strong>Shuffle picks now</strong> randomizes the order once; the <strong>Randomize play order</strong> checkbox re-shuffles automatically every 24 hours.</li>
-      <li>Or tick <strong>Sort by air date</strong> instead &mdash; the channel plays oldest first across every show in it, using each episode's TMDB air date (a movie's release date), with anything undated last. It and <strong>Randomize play order</strong> are one-or-the-other: ticking either clears the other, and leaving both off plays the picks in the order they are listed.</li>
+      <li>Drag a pick, or type a new position, to reorder <strong>Picks in this channel</strong>. Where a pick sits in this list is the order it plays in.</li>
+      <li>Use the <strong>Play order</strong> dropdown to arrange them all at once &mdash; <strong>Air date</strong> (oldest or newest first, from each episode's TMDB air date and each movie's release date, with anything undated last), <strong>Show, then season &amp; episode</strong>, <strong>Title A&ndash;Z</strong>, or <strong>Shuffle now</strong>. Each one reorders the list right there, so what you see is what plays.</li>
+      <li>A sort stays selected and is re-applied whenever you add more picks, so a channel keeps its order as it grows. Move a pick by hand and the dropdown goes back to <strong>As listed</strong> &mdash; your order is kept from then on.</li>
+      <li><strong>Shuffle daily</strong> is the one option that is not a one-off: the channel reshuffles itself every 24 hours, and the order in the list is ignored while it is selected.</li>
       <li>Choose a <strong>Channel Poster</strong> from an added show's artwork, or use the default channel poster.</li>
       <li>Name the channel and click <strong>Save</strong>.</li>
     </ol>
