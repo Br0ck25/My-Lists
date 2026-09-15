@@ -1736,6 +1736,53 @@ function channelItemNumber(value) {
   return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
+// The date one channel item first aired, as a sortable "YYYY-MM-DD" string,
+// or "" when the item carries none.
+//
+// Nothing has to be looked up for this: every pick already stores it. An
+// episode's `released` is TMDB's own `air_date` for that exact episode --
+// /api/show-episodes hands it to the Channel builder, and
+// compactChannelItemForStorage keeps it on the saved item -- and a movie's
+// is its release date, falling back to the year the builder stored when
+// that was all TMDB gave. That is the same fallback the video's own
+// `released` below uses, so the running order matches the dates a client
+// displays next to each item.
+//
+// Zero-padded ISO dates sort correctly as plain strings, so no Date parsing
+// (and therefore no timezone) is involved.
+function channelItemAiredDate(it) {
+  if (!it) return "";
+  const raw = String(it.released == null ? "" : it.released).trim();
+  const m = raw.match(/^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?/);
+  if (m) return `${m[1]}-${m[2] || "01"}-${m[3] || "01"}`;
+  const year = parseInt(it.year, 10);
+  if (Number.isInteger(year) && year > 0) return `${String(year).padStart(4, "0")}-01-01`;
+  return "";
+}
+
+// "Sort by air date", the other half of the Channel builder's one-or-the-
+// other play-order choice (see buildChannelMeta): oldest first, across every
+// show in the channel, so a multi-show channel plays in the order the
+// episodes actually went out rather than show by show.
+//
+// An item with no date it can be placed by goes to the end rather than to
+// the front (where an empty string would sort), keeping the order it was
+// saved in -- being unable to date something is not a reason to open the
+// channel with it. Ties keep their saved order too, which is what puts a
+// double-header of two episodes aired the same night back in broadcast
+// order.
+function sortChannelItemsByAired(items) {
+  return items
+    .map((it, i) => ({ it, i, aired: channelItemAiredDate(it) }))
+    .sort((a, b) => {
+      if (a.aired === b.aired) return a.i - b.i;
+      if (!a.aired) return 1;
+      if (!b.aired) return -1;
+      return a.aired < b.aired ? -1 : 1;
+    })
+    .map((w) => w.it);
+}
+
 // The full stream id for one channel item, or "" if it cannot be formed.
 function channelItemStreamId(it) {
   if (!it) return "";
@@ -1760,6 +1807,10 @@ function buildChannelMeta(entry, origin) {
   // same reasoning as Hidden Gems' daily reshuffle (see daysSinceEpochUTC
   // below): the order stays put if someone reopens the channel later the
   // same day (mid-binge), but looks freshly shuffled again tomorrow.
+  //
+  // "Sort by air date" is the alternative to it (one or the other, never
+  // both) and is applied further down, after the rotation below: it needs
+  // no seed because it is the same order every day.
   //
   // dailyRotate is a step further, set by Quick Add Channel: the payload
   // stores a much bigger pool than what's ever actually shown, and this
@@ -1799,11 +1850,22 @@ function buildChannelMeta(entry, origin) {
       const start = starts.length ? starts[0] : 0;
       items.push(...showEpisodes.slice(start, start + perShow));
     });
-  } else if (payload.shuffle) {
+  } else if (payload.shuffle && !payload.sortByAired) {
     items = seededShuffle(playableItems, seed);
   } else {
     items = playableItems;
   }
+  // "Sort by air date" is the other half of the same choice: the builder
+  // offers it and "Randomize play order" as one-or-the-other (checking
+  // either clears the other), so a payload should never arrive with both
+  // set. An older payload still can -- shuffle was the only flag that
+  // existed -- so the explicit sort wins here as well, rather than leaving
+  // the outcome to whichever branch happened to be tested first.
+  //
+  // It is applied last so it also orders a rotated day's lineup: a Quick Add
+  // channel picks WHICH shows and episodes play today (above), and this
+  // decides the order they play in.
+  if (payload.sortByAired) items = sortChannelItemsByAired(items);
   const videos = items.map((it, i) => {
     // TMDB's air_date/release_date (and our own year-only fallback for
     // movies) are bare "YYYY-MM-DD" dates. Stremio Web's core is compiled

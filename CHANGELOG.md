@@ -6,6 +6,32 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🗓️ A Channel can play in air date order
+
+- **Asked for**: a way to sort a channel by aired date when creating or editing it, working like *Randomize
+  play order* but with only one of the two selectable.
+- **New checkbox in the Channel builder: *Sort by air date*.** The channel plays oldest first across every
+  show in it -- so a channel of Friends, Seinfeld and Frasier runs as the week they actually went out,
+  rather than one show at a time.
+- **Nothing is looked up for it.** Every pick already stores the date TMDB gave when it was added:
+  `/api/show-episodes` returns each episode's own `air_date` (a movie carries its release date, or the year
+  the builder had), the builder saves it as `released` on the item, and the ordering is decided from the
+  saved payload alone -- no extra request, on the page or in the Worker.
+- **It and *Randomize play order* are one choice.** Ticking either clears the other on the page, and
+  `saveChannel` drops the other flag on the way out, so no channel is ever saved as both. A payload old
+  enough to carry both (shuffle was the only flag that existed) resolves the same way in the Worker: the
+  explicit sort wins.
+- **Leaving both off is still a real answer** -- the picks play in the order they are listed, which is why
+  these are two checkboxes and not a radio group.
+- **A dateless pick plays last**, keeping its saved order, rather than opening the channel; two episodes
+  aired the same night keep the order they were added in, which is what puts a two-part premiere back in
+  broadcast order.
+- **A Quick Add network channel can use it too**: the daily rotation still picks *which* shows and episodes
+  play today, and the sort then decides the order they play in.
+- **"See All" agrees with it.** The channel details page reads the saved items directly rather than through
+  the Worker, so it now applies the same ordering -- it was listing air-date channels in whatever order
+  their picks happened to be stored in.
+
 ### 📺 A Channel episode asks a stream add-on for the episode it actually is
 
 - **Reported**: "Non-debrid addons (like Pengu) dont pickup the fake episodes order. I.e: FRIENDS randomized

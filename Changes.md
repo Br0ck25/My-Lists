@@ -1,5 +1,73 @@
 # Changes Log
 
+## 2026-09-15 - A Channel can play in air date order
+
+### Files Changed
+`05_catalog-core.js`, `13_tab-channels.js`, `16_client-row-core.js`, `20_client-channel-builder.js`,
+`24_client-backup-restore-presets.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### What was asked for
+
+A way to sort a channel by aired date when creating or editing it -- working like the existing *Randomize
+play order (reshuffles once a day)* checkbox, with only one of the two selectable at a time.
+
+### Where the air date comes from
+
+Nowhere new. Every channel pick has carried its air date since it was added:
+
+- **Episodes**: `/api/show-episodes` maps TMDB's `air_date` for that exact episode to `released`, and every
+  path that builds a draft item (the episode picker, *Add every season*, Quick Add Channel, the
+  crossover/storyline builders) copies it onto the item.
+- **Movies**: the movie's release date, falling back to `<year>-01-01` when the year was all TMDB gave.
+- `compactChannelItemForStorage` already keeps `released` on the saved item (it drops `year`), and the
+  payload the Worker reads is that same item list.
+
+So the ordering is decided from the saved payload alone -- no TMDB request is made for it, on the page or
+in the Worker, and a channel built before this change sorts correctly without being rebuilt.
+
+### The change
+
+**Worker (`05_catalog-core.js`)**. `channelItemAiredDate` reads an item's date as a sortable `YYYY-MM-DD`
+string (accepting a full ISO timestamp, a bare year, or the `year` field), and `sortChannelItemsByAired`
+orders a list by it: oldest first, undated items last in their saved order, ties keeping their saved order
+-- which is what puts two episodes aired the same night back in broadcast order. `buildChannelMeta` applies
+it after the rotation/shuffle branch, so it also orders a `dailyRotate` channel's lineup for the day
+(the rotation still chooses *which* shows and episodes play; the sort chooses the order). The running
+order is still renumbered 1..N afterwards and no stream id changes.
+
+**One choice, not two.** The builder's two checkboxes clear each other (`setChannelPlayOrderMode`), and
+`saveChannel` drops `shuffle` whenever `sortByAired` is set, so no payload this app writes carries both.
+A payload old enough to carry both -- `shuffle` was the only flag that existed -- resolves the same way in
+the Worker: the branch is `payload.shuffle && !payload.sortByAired`, and the sort is applied last.
+Leaving both off keeps the picks in the order they are listed, which is why these are two checkboxes
+rather than a radio group: "neither" is the default answer and a radio group would need a third option to
+say it.
+
+**Persistence.** `sortByAired` is carried through `saveLocalChannel`, `saveLocalChannelsMap` (all three
+quota tiers) and `ensureAllChannelsSyncedFromRows`, so it survives a reload and rides the existing
+`/api/creator/sync/save-channels` push to other devices like `shuffle` always has.
+
+**"See All".** `openChannelDetailsPage` reads the saved items directly rather than going through the
+Worker, so it was listing an air-date channel in whatever order its picks happened to be stored in --
+contradicting the builder that had just been told otherwise. `channelItemsInPlayOrder` applies the same
+ordering client-side (its regex uses `[0-9]` character classes, not `\d`, because these files are string
+content inside `renderBuilder`'s template literal and a lone backslash never reaches the browser).
+
+**Where it shows.** The channel card in *My Channels* and the source-row summary under a catalog row both
+say which order a channel plays in ("air date order" / "shuffled daily").
+
+### Tests
+
+`tests/worker.test.mjs` -- oldest-first across shows without renumbering an id, the `year`-only fallback,
+undated items last in saved order, same-night ties in saved order, the sort winning over a payload that
+carries both flags, a rotating channel's day ordered without changing what it picked, and a channel with
+neither flag left exactly as listed.
+
+`tests/client.test.mjs` -- the checkboxes clearing each other (and unticking one not ticking the other),
+`saveChannel` never saving both flags, `editChannelById` putting the saved order back on the right box,
+and "See All" listing an air-date channel oldest first with undated picks last.
+
 ## 2026-09-15 - A Channel episode asks a stream add-on for the episode it actually is
 
 ### Files Changed

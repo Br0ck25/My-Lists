@@ -3524,6 +3524,7 @@ function renderGuidePage(origin) {
       <li>Use the <strong>Shows / Movies</strong> toggle to set what you're searching for.</li>
       <li>Search a title and add picks &mdash; for shows, an episode picker lets you choose specific seasons/episodes.</li>
       <li>Reorder or remove picks in <strong>Picks in this channel</strong>. <strong>Shuffle picks now</strong> randomizes the order once; the <strong>Randomize play order</strong> checkbox re-shuffles automatically every 24 hours.</li>
+      <li>Or tick <strong>Sort by air date</strong> instead &mdash; the channel plays oldest first across every show in it, using each episode's TMDB air date (a movie's release date), with anything undated last. It and <strong>Randomize play order</strong> are one-or-the-other: ticking either clears the other, and leaving both off plays the picks in the order they are listed.</li>
       <li>Choose a <strong>Channel Poster</strong> from an added show's artwork, or use the default channel poster.</li>
       <li>Name the channel and click <strong>Save</strong>.</li>
     </ol>
