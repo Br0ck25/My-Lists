@@ -10946,6 +10946,20 @@ describe("worker: channel video ids are real stream requests", () => {
     assert.deepEqual(dates, [...dates].sort(), "today's lineup plays oldest first");
   });
 
+  // autoSort is a BUILDER field: it says which sort to re-apply when picks
+  // are added on the page, and the picks are stored already in that order.
+  // If the Worker acted on it too, a pick the person then dragged somewhere
+  // else would snap back on every request -- the exact bug the dropdown
+  // replaced the sortByAired checkbox to fix.
+  it("never re-sorts on the builder's autoSort -- the stored order is the play order", () => {
+    const items = [
+      ep({ season: 9, episode: 9, title: "moved to the front by hand", released: "2009-01-01" }),
+      ep({ season: 1, episode: 1, title: "oldest", released: "1999-01-01" }),
+    ];
+    const meta = channelMeta(items, { autoSort: "aired-asc" });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["moved to the front by hand", "oldest"]);
+  });
+
   it("leaves a channel with neither flag exactly as its picks were listed", () => {
     const items = [
       ep({ season: 9, episode: 9, title: "last aired", released: "2009-01-01" }),

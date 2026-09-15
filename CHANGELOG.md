@@ -6,6 +6,35 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🔀 A Channel's Play order is a menu of arrangements, and a pick you move stays moved
+
+- **Replaces the two checkboxes** added below with one **Play order** dropdown in the Channel builder:
+  *As listed (custom)*, *Air date — oldest first*, *Air date — newest first*, *Show, then season &
+  episode*, *Title A–Z*, *Shuffle now*, *Shuffle daily*. "Shuffle picks now" moves into it as an entry
+  rather than a separate button.
+- **A sort now rearranges the picks themselves**, right there in the list, instead of being a rule the
+  Worker re-applied on every request. So the order on screen is the order that plays — and **moving a pick
+  by hand simply stays**, which the "Sort by air date" checkbox could not do: it silently overrode every
+  manual move except between two picks sharing a date.
+- **A sort stays selected and is re-applied when picks are added**, so an air-date channel lands each new
+  episode in its place instead of at the bottom as the channel grows. It hooks `renderChannelDraftList`,
+  the one call every add path already ends with, so every way of adding picks is covered.
+- **Moving a pick by hand switches the dropdown back to *As listed*** and stops the re-sorting there: from
+  that point the order is the person's. Dragging and typing a position both disarm it before they re-render.
+- **"Shuffle daily" is the only entry that stays a mode**, because it is the only one no stored order can
+  express — the Worker reshuffles it from a date-based seed each day. The list order is ignored while it is
+  selected, and the hint under the dropdown says so.
+- **Air date and release date are one field, not two.** A saved pick keeps a single date: TMDB's `air_date`
+  for an episode, the release date for a movie. Both air-date sorts read it, and anything undated sorts
+  last in either direction — "newest first" is still no reason to open a channel with picks that could not
+  be placed at all.
+- **Channels already set to "Sort by air date" keep playing correctly.** The Worker still honours that flag
+  for a channel nobody has edited; opening one in the builder sorts its picks for real, selects the
+  matching entry, and saving drops the flag.
+- **A Quick Add network channel is no longer re-ordered at serve time by a sort**, which also settles the
+  odd case where air-date order interleaved a rotating channel's day across shows: the rotation decides the
+  day's lineup, and the stored order is whatever the builder arranged.
+
 ### 🗓️ A Channel can play in air date order
 
 - **Asked for**: a way to sort a channel by aired date when creating or editing it, working like *Randomize

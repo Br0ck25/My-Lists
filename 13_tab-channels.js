@@ -153,18 +153,21 @@
       <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel:</p>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
-        <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft()">Shuffle picks now</button>
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove all</button>
       </div>
-      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
-        <input type="checkbox" id="channelRandomizeCheck" onchange="setChannelPlayOrderMode('shuffle', this)">
-        <span style="font-size:0.85rem;">Randomize play order (reshuffles once a day)</span>
-      </label>
-      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:6px;">
-        <input type="checkbox" id="channelSortAiredCheck" onchange="setChannelPlayOrderMode('aired', this)">
-        <span style="font-size:0.85rem;">Sort by air date (oldest first, across every show)</span>
-      </label>
-      <p style="margin:6px 0 0; color:var(--muted); font-size:0.78rem;">Pick one or neither &mdash; checking either of these clears the other. Leave both off to play the picks in the order listed above. Air dates come from TMDB (each episode's own air date, a movie's release date); anything with no known date plays last.</p>
+      <div style="display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap;">
+        <label for="channelPlayOrderSelect" style="font-size:0.85rem; font-weight:600; white-space:nowrap;">Play order:</label>
+        <select id="channelPlayOrderSelect" onchange="applyChannelPlayOrder(this.value)" style="flex:1; min-width:210px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="as-listed">As listed (custom)</option>
+          <option value="aired-asc">Air date &mdash; oldest first</option>
+          <option value="aired-desc">Air date &mdash; newest first</option>
+          <option value="show-season-episode">Show, then season &amp; episode</option>
+          <option value="title-az">Title A&ndash;Z</option>
+          <option value="shuffle-now">Shuffle now</option>
+          <option value="shuffle-daily">Shuffle daily (reshuffles every 24h)</option>
+        </select>
+      </div>
+      <p id="channelPlayOrderHint" style="margin:6px 0 0; color:var(--muted); font-size:0.78rem;">Picks play in the order listed above &mdash; drag one, or type a new position, to change it.</p>
 
       <!-- Channel Poster Selection Section -->
       <div id="channelPosterPickerSection" style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; display:none;">

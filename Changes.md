@@ -1,5 +1,71 @@
 # Changes Log
 
+## 2026-09-15 - A Channel's Play order is a menu of arrangements, not a rule applied over the top
+
+### Files Changed
+`13_tab-channels.js`, `16_client-row-core.js`, `20_client-channel-builder.js`,
+`24_client-backup-restore-presets.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### What prompted it
+
+Asked, of the "Sort by air date" checkbox shipped earlier the same day: what happens if a user selects sort
+by air date and then manually moves an item? Nothing good. The flag was a SERVE-TIME rule -- the Worker
+re-sorted on every request -- so the move was saved, shown in the builder, and then ignored on playback
+except where two picks shared a date. The list on screen was not the list that played.
+
+The fix is to change what a sort IS: an action that rearranges the stored picks once, rather than a rule
+layered over them forever. Then the stored order is the only order, and a hand-moved pick needs no special
+case to survive.
+
+### The control
+
+One **Play order** dropdown replaces both checkboxes and the "Shuffle picks now" button:
+
+| Entry | Kind |
+|---|---|
+| As listed (custom) | state -- the stored order plays |
+| Air date -- oldest first / newest first | one-shot sort, stays selected |
+| Show, then season & episode | one-shot sort, stays selected |
+| Title A-Z | one-shot sort, stays selected |
+| Shuffle now | one-shot, falls back to "As listed" |
+| Shuffle daily | the one persistent MODE (payload `shuffle`) |
+
+A static sort is remembered as the payload's `autoSort` purely so it can be re-applied when picks are added
+later; the Worker never reads it. `applyChannelDraftAutoSort` hooks `renderChannelDraftList` -- the one call
+every add path in the builder already ends with (episode picker, "Add every season", movies, crossovers,
+imports) -- so a sorted channel stays sorted as it grows without each of those paths knowing about sorting.
+
+Both manual reorder paths (the position input and the hold-drag `reorderChannelDraftFromDom`) call
+`clearChannelDraftAutoSort` BEFORE they re-render, which is the whole trick: the re-render is what would
+re-apply the sort, so disarming first is what lets the moved pick stay put.
+
+### Sorting rules
+
+Every comparator falls back to the item's current index, so ties keep the order they are already in: two
+episodes aired the same night, a whole season dropped on one day, anything undated. Undated picks sort last
+in both air-date directions. "Show, then season & episode" ranks shows by first appearance, so it groups a
+channel into runs of each show without also reshuffling which show opens it.
+
+### Migration
+
+`sortByAired` shipped a few hours earlier, so a channel could already carry it. The Worker keeps honouring
+it -- a channel nobody edits plays exactly as it does now -- and `editChannelById` turns it into the
+equivalent dropdown selection, which sorts the picks for real on the render that follows; `saveChannel`
+then writes the sorted order with the flag cleared. `channelItemsInPlayOrder` stays in "See All" for the
+same un-migrated case and falls straight through for everything else.
+
+### Tests
+
+`tests/client.test.mjs` (8) -- each sort rearranging the picks; a pick added later landing mid-list rather
+than at the bottom; a hand-moved pick staying put, the dropdown falling back to "As listed", nothing armed
+to re-sort, and a further add appending; "Shuffle now" arming nothing; a sort saving as the item order with
+`sortByAired: false` while "Shuffle daily" saves the flag and leaves the picks alone; the dropdown restored
+on edit; the legacy flag migrating; and "See All" still ordering an un-migrated channel.
+
+`tests/worker.test.mjs` -- one added: the Worker never acts on `autoSort`, so the stored order is the play
+order. The existing air-date tests stay, covering the retained `sortByAired` path.
+
 ## 2026-09-15 - A Channel can play in air date order
 
 ### Files Changed

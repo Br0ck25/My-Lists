@@ -3523,8 +3523,10 @@ function renderGuidePage(origin) {
       <li>Click <strong>+ New Channel</strong>.</li>
       <li>Use the <strong>Shows / Movies</strong> toggle to set what you're searching for.</li>
       <li>Search a title and add picks &mdash; for shows, an episode picker lets you choose specific seasons/episodes.</li>
-      <li>Reorder or remove picks in <strong>Picks in this channel</strong>. <strong>Shuffle picks now</strong> randomizes the order once; the <strong>Randomize play order</strong> checkbox re-shuffles automatically every 24 hours.</li>
-      <li>Or tick <strong>Sort by air date</strong> instead &mdash; the channel plays oldest first across every show in it, using each episode's TMDB air date (a movie's release date), with anything undated last. It and <strong>Randomize play order</strong> are one-or-the-other: ticking either clears the other, and leaving both off plays the picks in the order they are listed.</li>
+      <li>Drag a pick, or type a new position, to reorder <strong>Picks in this channel</strong>. Where a pick sits in this list is the order it plays in.</li>
+      <li>Use the <strong>Play order</strong> dropdown to arrange them all at once &mdash; <strong>Air date</strong> (oldest or newest first, from each episode's TMDB air date and each movie's release date, with anything undated last), <strong>Show, then season &amp; episode</strong>, <strong>Title A&ndash;Z</strong>, or <strong>Shuffle now</strong>. Each one reorders the list right there, so what you see is what plays.</li>
+      <li>A sort stays selected and is re-applied whenever you add more picks, so a channel keeps its order as it grows. Move a pick by hand and the dropdown goes back to <strong>As listed</strong> &mdash; your order is kept from then on.</li>
+      <li><strong>Shuffle daily</strong> is the one option that is not a one-off: the channel reshuffles itself every 24 hours, and the order in the list is ignored while it is selected.</li>
       <li>Choose a <strong>Channel Poster</strong> from an added show's artwork, or use the default channel poster.</li>
       <li>Name the channel and click <strong>Save</strong>.</li>
     </ol>
