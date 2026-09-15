@@ -1135,6 +1135,32 @@ function showAppAlert(title, message, isSuccess = false) {
   showModal(html);
 }
 
+// The third member of the showAppAlert/showAppConfirm family: a dialog for
+// the gap between confirming something slow and hearing how it went.
+//
+// Reset Account Data is the case that asked for it. It clears this browser,
+// then waits on a server round trip that empties the account -- one to two
+// seconds during which the confirm dialog had already closed, the lists on
+// screen had already emptied, and nothing said why or whether anything was
+// still happening. A person watching that has no way to tell a reset in
+// progress from one that silently failed, and clicking Reset again during it
+// is the obvious thing to try.
+//
+// Deliberately has no buttons: there is nothing to decide, and the caller
+// replaces it with showAppAlert (or another showModal) when the work
+// finishes. Escape and a backdrop click still dismiss it, like any other
+// dialog -- dismissing the status of an action does not cancel the action,
+// and the caller's own result dialog still arrives.
+function showAppBusy(title, message) {
+  const html =
+    '<h3 style="margin:0 0 12px; font-size:1.1rem; display:flex; align-items:center; gap:10px;">' +
+      '<span class="app-spinner" aria-hidden="true"></span> ' +
+      escapeHtml(title) +
+    '</h3>' +
+    '<p role="status" aria-live="polite" style="margin:0; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message || '') + '</p>';
+  showModal(html);
+}
+
 function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = true) {
   const icon = isDanger ? '&#x26A0;' : '?';
   const iconColor = isDanger ? 'var(--danger, #e63946)' : 'var(--accent-2, #00b4d8)';

@@ -257,8 +257,10 @@ ${seoHeadHtml}
     border-radius: 4px;
   }
 
-  /* The page has three @keyframes animations and 33 transitions and said
-     nothing about people who have asked their system not to animate. */
+  /* The page has four @keyframes animations and 33 transitions and said
+     nothing about people who have asked their system not to animate.
+     The busy spinner (.app-spinner) is covered by this too -- it stops
+     turning, and the wording beside it is what says the work is running. */
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
       animation-duration: 0.01ms !important;
@@ -3044,6 +3046,19 @@ ${seoHeadHtml}
   .modal-card.modal-card-wide {
     max-width: 1100px;
     width: 95vw;
+  }
+  /* The one animation in here that is not decoration: it is the only signal
+     a modal gives that a slow action (Reset Account Data, generating an
+     install link) is still running rather than stuck. The spin animation was
+     referenced by name in two places and declared in none, so both spinners
+     sat perfectly still. */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .app-spinner {
+    display: inline-block; width: 20px; height: 20px; flex: none;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
   }
   .modal-close-x {
     float: right; background: var(--bg); border: 1px solid var(--border-strong);

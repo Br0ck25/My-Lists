@@ -227,12 +227,16 @@ CREATE INDEX idx_creator_user_lists_lookup ON creator_user_lists(username, list_
 
 DROP TABLE IF EXISTS creator_show_states;
 CREATE TABLE creator_show_states (
-    username           TEXT NOT NULL,
-    show_id            TEXT NOT NULL,
-    is_fully_watched   INTEGER DEFAULT 0,
-    dismissed_season   INTEGER,
-    dismissed_episode  INTEGER,
-    updated_at         INTEGER NOT NULL,
+    username               TEXT NOT NULL,
+    show_id                TEXT NOT NULL,
+    is_fully_watched       INTEGER DEFAULT 0,
+    dismissed_season       INTEGER,
+    dismissed_episode      INTEGER,
+    -- The watched episode an Airing Next removal was made at; NULL means the
+    -- show has not been removed from that shelf. See migrations/0012.
+    airing_removed_season  INTEGER,
+    airing_removed_episode INTEGER,
+    updated_at             INTEGER NOT NULL,
     PRIMARY KEY (username, show_id)
 );
 CREATE INDEX idx_creator_show_states_fw ON creator_show_states(username, is_fully_watched);

@@ -3876,6 +3876,39 @@ async function d1ReplaceRowsById(env, table, username, keyColumn, keepIds) {
   );
 }
 
+// Whether this database has migration 0012's airing-removal columns on
+// creator_show_states.
+//
+// Every other column this file writes has been there since the table was
+// created, so a write could assume the whole shape. These two arrived later,
+// and an operator who deploys the Worker without running the migration would
+// otherwise have EVERY tracking write fail on "no such column" -- not just
+// the new feature, but Watch History, Continue Watching and Airing Next with
+// it. So the write asks first and falls back to the older statement, which is
+// exactly what a database without the migration used to receive.
+//
+// Only a positive answer is cached. A negative one is re-checked on the next
+// write, so applying the migration takes effect without waiting for isolates
+// to recycle; the cost while it is missing is one extra tiny read per save,
+// on a deployment that is already being told to migrate by /admin.
+let _d1AiringRemovalColumns = false;
+async function d1HasAiringRemovalColumns(env) {
+  if (_d1AiringRemovalColumns) return true;
+  try {
+    const row = await env.DB.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='creator_show_states'"
+    ).first();
+    // Same word-boundary match checkD1Schema uses, and for the same reason:
+    // sqlite_master's stored DDL is what ALTER TABLE ADD COLUMN updates.
+    _d1AiringRemovalColumns = /(^|[(,\s])airing_removed_season\s/i.test(String((row && row.sql) || ""));
+  } catch (e) {
+    // Unreadable right now -- treat it as absent and write the older shape,
+    // which is always accepted. Never cached, so the next write asks again.
+    _d1AiringRemovalColumns = false;
+  }
+  return _d1AiringRemovalColumns;
+}
+
 async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   if (!env || !env.DB || !username || !trackingData) return false;
   try {
@@ -3922,16 +3955,30 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       )
     );
 
-    // 2. Show states (fullyWatchedShowIds & dismissedContinueWatching)
+    // 2. Show states (fullyWatchedShowIds, dismissedContinueWatching &
+    //    removedAiringNext)
     const fullyWatched = Array.isArray(trackingData.fullyWatchedShowIds) ? trackingData.fullyWatchedShowIds.map(String) : [];
     const dismissed = trackingData.dismissedContinueWatching && typeof trackingData.dismissedContinueWatching === "object"
       ? trackingData.dismissedContinueWatching
       : {};
+    // A payload that does not mention Airing Next removals at all (an older
+    // browser, or one of the scrobble paths writing a blob it built itself)
+    // has no opinion about them, which is not the same as "there are none".
+    // In that case the columns are left out of the statement entirely, so an
+    // ON CONFLICT update keeps whatever is stored instead of nulling it.
+    const removedAiring = trackingData.removedAiringNext && typeof trackingData.removedAiringNext === "object"
+      ? trackingData.removedAiringNext
+      : null;
+    const writeAiringRemoval = !!removedAiring && await d1HasAiringRemovalColumns(env);
 
     // Deferred to the end and narrowed to the rows that are actually gone --
     // see d1ReplaceRowsById.
     const prunes = [];
-    const allShows = new Set([...fullyWatched, ...Object.keys(dismissed)]);
+    const allShows = new Set([
+      ...fullyWatched,
+      ...Object.keys(dismissed),
+      ...(writeAiringRemoval ? Object.keys(removedAiring) : []),
+    ]);
     if (isIntentionalRemoval) {
       prunes.push(...await d1ReplaceRowsById(env, "creator_show_states", username, "show_id", allShows));
     }
@@ -3940,6 +3987,29 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       const dis = dismissed[sid];
       const disSeason = dis && Number.isFinite(Number(dis.seasonNum)) ? Number(dis.seasonNum) : null;
       const disEpisode = dis && Number.isFinite(Number(dis.episodeNum)) ? Number(dis.episodeNum) : null;
+      if (writeAiringRemoval) {
+        const rem = removedAiring[sid];
+        // Stored as the two numbers rather than a flag, because the numbers
+        // ARE the record: they say which watched episode the removal was
+        // made at, and a later one supersedes it. A removal recorded with
+        // nothing watched is 0/0, which any real episode passes.
+        const remSeason = rem ? (Number.isFinite(Number(rem.seasonNum)) ? Number(rem.seasonNum) : 0) : null;
+        const remEpisode = rem ? (Number.isFinite(Number(rem.episodeNum)) ? Number(rem.episodeNum) : 0) : null;
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO creator_show_states (username, show_id, is_fully_watched, dismissed_season, dismissed_episode, airing_removed_season, airing_removed_episode, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(username, show_id) DO UPDATE SET
+               is_fully_watched = excluded.is_fully_watched,
+               dismissed_season = excluded.dismissed_season,
+               dismissed_episode = excluded.dismissed_episode,
+               airing_removed_season = excluded.airing_removed_season,
+               airing_removed_episode = excluded.airing_removed_episode,
+               updated_at = excluded.updated_at`
+          ).bind(username, sid, isFw, disSeason, disEpisode, remSeason, remEpisode, meta.updatedAt)
+        );
+        continue;
+      }
       stmts.push(
         env.DB.prepare(
           `INSERT INTO creator_show_states (username, show_id, is_fully_watched, dismissed_season, dismissed_episode, updated_at)
@@ -4276,12 +4346,23 @@ async function readCreatorTrackingD1(env, username) {
 
     const fullyWatchedShowIds = [];
     const dismissedContinueWatching = {};
+    const removedAiringNext = {};
     for (const s of stateRows) {
       if (s.is_fully_watched) fullyWatchedShowIds.push(s.show_id);
       if (s.dismissed_season != null || s.dismissed_episode != null) {
         dismissedContinueWatching[s.show_id] = {
           seasonNum: s.dismissed_season != null ? s.dismissed_season : 0,
           episodeNum: s.dismissed_episode != null ? s.dismissed_episode : 0,
+        };
+      }
+      // Undefined rather than null on a database that has not had migration
+      // 0012 applied -- SELECT * simply does not return a column that is not
+      // there -- so this reads as "no removals" instead of throwing, which is
+      // the same degraded-but-working answer the write side falls back to.
+      if (s.airing_removed_season != null || s.airing_removed_episode != null) {
+        removedAiringNext[s.show_id] = {
+          seasonNum: s.airing_removed_season != null ? s.airing_removed_season : 0,
+          episodeNum: s.airing_removed_episode != null ? s.airing_removed_episode : 0,
         };
       }
     }
@@ -4297,6 +4378,7 @@ async function readCreatorTrackingD1(env, username) {
       airingNext,
       fullyWatchedShowIds,
       dismissedContinueWatching,
+      removedAiringNext,
       curatedRecommendations: curatedRecs,
       trackPlayback: Boolean(metaRow.track_playback),
       removeWatchedFromWatchlist: Boolean(metaRow.remove_watched_watchlist),

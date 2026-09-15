@@ -5915,6 +5915,128 @@ describe("Tracking writes: a save that did not land must not report success", ()
     assert.equal(env.DB.q("SELECT name FROM continue_watching")[0].name, "first");
   });
 
+  // Airing Next is rebuilt from Watch History by every browser that loads the
+  // page, so "I took this show off the shelf" cannot live only in the browser
+  // that said it: the next device to recompute the shelf would put the show
+  // straight back and push that up. The removal therefore has to survive the
+  // account round trip, which means reaching creator_show_states and coming
+  // back out of /api/creator/sync/load.
+  it("an Airing Next removal survives the account round trip", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "airingremoval");
+
+    const saved = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      intentionalRemoval: true,
+      watchHistory: [
+        { id: "ttA:1:1", showId: "ttA", type: "episode", seasonNum: 1, episodeNum: 1, watchedAt: 10 },
+        { id: "ttB:4:7", showId: "ttB", type: "episode", seasonNum: 4, episodeNum: 7, watchedAt: 20 },
+      ],
+      // The shelf as the browser now shows it: ttB removed, ttA still on it.
+      airingNext: [{ id: "ttA:1:2", showId: "ttA", name: "next", airDate: "2099-01-01" }],
+      removedAiringNext: { ttB: { seasonNum: 4, episodeNum: 7 } },
+    }});
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.ok, true);
+
+    const state = env.DB.q("SELECT show_id, airing_removed_season, airing_removed_episode FROM creator_show_states");
+    assert.equal(state.length, 1);
+    assert.equal(state[0].show_id, "ttB");
+    // Stored as the episode it was made at, so a later one can supersede it.
+    assert.equal(state[0].airing_removed_season, 4);
+    assert.equal(state[0].airing_removed_episode, 7);
+
+    // Watch History is untouched: removing a show from one shelf is not a
+    // statement about what has been watched, which is the whole point.
+    assert.equal(env.DB.q("SELECT item_id FROM watch_history").length, 2);
+
+    const loaded = await call(env, "/api/creator/sync/load", { method: "POST", json: cred });
+    assert.equal(loaded.status, 200);
+    assert.deepEqual(loaded.body.data.removedAiringNext, { ttB: { seasonNum: 4, episodeNum: 7 } },
+      "another device has to be told, or it recomputes the show back onto the shelf");
+    assert.equal(loaded.body.data.airingNext.length, 1);
+  });
+
+  // A payload that never mentions removals is not the same as one saying
+  // there are none -- an older browser, or one of the scrobble paths writing a
+  // blob it assembled itself, sends no such field. Reading that as "none"
+  // would clear the removals of every show that write happens to touch.
+  it("a tracking write that omits removals leaves the stored ones alone", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "airingomit");
+
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      intentionalRemoval: true,
+      watchHistory: [{ id: "ttB:4:7", showId: "ttB", type: "episode", seasonNum: 4, episodeNum: 7, watchedAt: 20 }],
+      fullyWatchedShowIds: ["ttB"],
+      removedAiringNext: { ttB: { seasonNum: 4, episodeNum: 7 } },
+    }});
+
+    // Same account, same show, a push with no opinion about Airing Next.
+    const r = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      watchHistory: [{ id: "ttB:4:7", showId: "ttB", type: "episode", seasonNum: 4, episodeNum: 7, watchedAt: 20 }],
+      fullyWatchedShowIds: ["ttB"],
+    }});
+    assert.equal(r.status, 200);
+
+    const state = env.DB.q("SELECT airing_removed_season, airing_removed_episode FROM creator_show_states WHERE show_id = 'ttB'");
+    assert.equal(state.length, 1, "an ordinary autosave must not undo a removal it says nothing about");
+    assert.equal(state[0].airing_removed_season, 4);
+    assert.equal(state[0].airing_removed_episode, 7);
+  });
+
+  // The columns arrived in migration 0012, and an operator can deploy the
+  // Worker without having run it. That must cost the removals and nothing
+  // else -- not Watch History, not Continue Watching, not Airing Next itself.
+  it("a database without migration 0012 still stores everything else", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "premigration");
+    env.DB._db.exec("DROP TABLE creator_show_states");
+    env.DB._db.exec(`CREATE TABLE creator_show_states (
+      username TEXT NOT NULL, show_id TEXT NOT NULL, is_fully_watched INTEGER DEFAULT 0,
+      dismissed_season INTEGER, dismissed_episode INTEGER, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (username, show_id));`);
+
+    // A cold isolate, because the Worker remembers a database that HAS the
+    // columns and this one deliberately does not. Nothing takes a column away
+    // in production, so that memory is safe there; here it would answer for
+    // the wrong database. Same reasoning as every other freshIsolate() in
+    // this file.
+    const cold = await freshIsolate();
+    const post = async (path, body) => {
+      const res = await cold.fetch(
+        new Request("https://example.test" + path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "CF-Connecting-IP": nextIp() },
+          body: JSON.stringify(body),
+        }),
+        env,
+        { waitUntil() {} }
+      );
+      return { status: res.status, body: JSON.parse(await res.text()) };
+    };
+
+    const r = await post("/api/creator/sync/save-tracking", {
+      ...cred,
+      intentionalRemoval: true,
+      watchHistory: [{ id: "ttA:1:1", showId: "ttA", type: "episode", seasonNum: 1, episodeNum: 1, watchedAt: 10 }],
+      airingNext: [{ id: "ttA:1:2", showId: "ttA", name: "next", airDate: "2099-01-01" }],
+      fullyWatchedShowIds: ["ttA"],
+      removedAiringNext: { ttB: { seasonNum: 4, episodeNum: 7 } },
+    });
+    assert.equal(r.status, 200, JSON.stringify(r.body).slice(0, 200));
+    assert.equal(r.body.ok, true);
+    assert.equal(env.DB.q("SELECT item_id FROM watch_history").length, 1);
+    assert.equal(env.DB.q("SELECT show_id FROM airing_next").length, 1);
+    assert.equal(env.DB.q("SELECT show_id FROM creator_show_states")[0].show_id, "ttA");
+
+    const loaded = await post("/api/creator/sync/load", cred);
+    assert.deepEqual(loaded.body.data.removedAiringNext, {},
+      "nowhere to store them in D1, so the account reports none rather than failing");
+  });
+
   // BE-001. saveCreatorTrackingD1 returns false on failure and the route dropped
   // that value, so a D1 outage answered ok:true -- and because D1 is what
   // /api/creator/sync/load reads first, the browser was then told its push had

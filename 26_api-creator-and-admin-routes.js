@@ -2959,6 +2959,23 @@
           : null,
         fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
         dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
+        // Shows taken off Airing Next, each mapped to the watched episode the
+        // removal was made at -- the account's copy of what removeAiringNextShow
+        // recorded (21_client-custom-list-builder.js). Unlike airingNext itself
+        // this is not derived: no browser can recompute it, so losing it means
+        // every device puts the removed shows straight back.
+        //
+        // A push that does not carry the field at all (an older browser) has
+        // no opinion about removals rather than saying there are none, so the
+        // stored set is carried forward. Defaulting it to {} here would erase
+        // the account's removals on the first autosave from such a browser --
+        // and would erase them in D1 too, since what this route hands
+        // saveCreatorTrackingD1 is this blob, not the raw body.
+        removedAiringNext: (body.removedAiringNext && typeof body.removedAiringNext === "object")
+          ? body.removedAiringNext
+          : ((existingBlob && existingBlob.removedAiringNext && typeof existingBlob.removedAiringNext === "object")
+              ? existingBlob.removedAiringNext
+              : {}),
         trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
         removeWatchedFromWatchlist: typeof body.removeWatchedFromWatchlist === "boolean" ? body.removeWatchedFromWatchlist : true,
         scrobbleFilterUsers: typeof body.scrobbleFilterUsers === "boolean" ? body.scrobbleFilterUsers : false,
@@ -3466,6 +3483,7 @@
           : undefined;
         data.fullyWatchedShowIds = Array.isArray(d1Tracking.fullyWatchedShowIds) ? d1Tracking.fullyWatchedShowIds : [];
         data.dismissedContinueWatching = d1Tracking.dismissedContinueWatching && typeof d1Tracking.dismissedContinueWatching === "object" ? d1Tracking.dismissedContinueWatching : {};
+        data.removedAiringNext = d1Tracking.removedAiringNext && typeof d1Tracking.removedAiringNext === "object" ? d1Tracking.removedAiringNext : {};
         data.trackPlayback = typeof d1Tracking.trackPlayback === "boolean" ? d1Tracking.trackPlayback : false;
         data.removeWatchedFromWatchlist = typeof d1Tracking.removeWatchedFromWatchlist === "boolean" ? d1Tracking.removeWatchedFromWatchlist : true;
         data.scrobbleFilterUsers = typeof d1Tracking.scrobbleFilterUsers === "boolean" ? d1Tracking.scrobbleFilterUsers : false;
@@ -3536,6 +3554,7 @@
             : undefined;
           data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
           data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
+          data.removedAiringNext = trackingBlob.removedAiringNext && typeof trackingBlob.removedAiringNext === "object" ? trackingBlob.removedAiringNext : {};
           data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;
           data.removeWatchedFromWatchlist = typeof trackingBlob.removeWatchedFromWatchlist === "boolean" ? trackingBlob.removeWatchedFromWatchlist : true;
           data.scrobbleFilterUsers = typeof trackingBlob.scrobbleFilterUsers === "boolean" ? trackingBlob.scrobbleFilterUsers : false;
