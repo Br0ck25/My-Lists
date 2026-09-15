@@ -19688,6 +19688,12 @@ ${seoHeadHtml}
   }
   .lc-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .lc-btn.primary:hover:not(:disabled) { opacity: 0.85; }
+  /* Disabled meant "ignores clicks" and looked identical to a working
+     button, which is how a season that has not aired yet -- whose button
+     now says when it does -- would otherwise read as one that is simply
+     broken. Covers every disabled .lc-btn, including the ones already
+     disabled mid-fetch. */
+  .lc-btn:disabled { opacity: 0.55; cursor: default; }
   /* The same surface 'button.secondary' gives every Connect / Disconnect /
      Copy button, spelled with two classes so it also reaches the <a>s that
      are styled as buttons. Those needed it: 'button, .actions a' (further
@@ -31748,6 +31754,109 @@ function isEpisodeAired(ep) {
   return airDate.getTime() < today.getTime();
 }
 
+// --- Not-yet-aired seasons and episodes -------------------------------------
+//
+// isEpisodeAired above is the rule for ONE episode. These three answer the
+// same question for a whole season, which is what every "Mark Season Watched"
+// control needs: a season nothing has aired from yet has nothing to mark, and
+// showing it as watched -- or letting a click claim it is -- states something
+// about the person's viewing that is not true.
+//
+// Two sources, most specific first. Once a season's episode grid has been
+// loaded (toggleSeasonEpisodes, or markSeasonWatched's own fetch) the episode
+// list is exact. Before that, only the season's own TMDB air_date is known: a
+// season dated in the future cannot have aired episodes, and one dated in the
+// past may be part-way through. A season with no air date at all is unknown,
+// and unknown is treated as "aired" -- the button keeps working exactly as it
+// did rather than being disabled on a guess.
+function seasonHasAiredEpisodes(seasonNum, seasonMeta) {
+  const eps = window._seasonEpisodesMap && window._seasonEpisodesMap[seasonNum];
+  if (Array.isArray(eps) && eps.length) return eps.some((ep) => isEpisodeAired(ep));
+  const airDate = seasonMeta && (seasonMeta.air_date || seasonMeta.airDate);
+  if (airDate) return isEpisodeAired(airDate);
+  return true;
+}
+
+// The date an upcoming season starts, for the button that says so.
+function seasonFirstAirDate(seasonNum, seasonMeta) {
+  const eps = window._seasonEpisodesMap && window._seasonEpisodesMap[seasonNum];
+  if (Array.isArray(eps) && eps.length) {
+    const dates = eps.map((ep) => (ep && (ep.air_date || ep.airDate)) || '').filter(Boolean).sort();
+    if (dates.length) return dates[0];
+  }
+  return (seasonMeta && (seasonMeta.air_date || seasonMeta.airDate)) || '';
+}
+
+// One description of what a "Mark Season Watched" button should say and do,
+// because four places set that button -- the item modal's first render,
+// updateSeasonWatchedButton, markSeasonWatched's own result, and
+// markShowWatched (21_client-custom-list-builder.js) relabelling every season
+// at once. They disagreed about the upcoming case, which is how pressing
+// Mark Show Watched left a season that has not aired reading "Mark Season
+// Unwatched" over an empty Watch History.
+function seasonWatchedButtonState(d, seasonMeta) {
+  const sNum = Number(seasonMeta && seasonMeta.season_number);
+  if (!seasonHasAiredEpisodes(sNum, seasonMeta)) {
+    const when = seasonFirstAirDate(sNum, seasonMeta);
+    const badge = when && typeof formatAirDateBadge === 'function' ? formatAirDateBadge(when) : '';
+    return {
+      upcoming: true,
+      label: badge ? 'Airs ' + escapeHtml(badge) : 'Not aired yet',
+      className: 'secondary',
+      title: when ? 'This season starts on ' + when + ' \u2014 there is nothing to mark watched yet.' : 'This season has not aired yet.',
+    };
+  }
+  const watched = isSeasonFullyWatched(d && d.id, sNum, seasonMeta && seasonMeta.episode_count);
+  return watchedSeasonButtonState(watched);
+}
+
+// The watched/unwatched half, split out because markSeasonWatched knows the
+// answer from the write it just made and must not re-derive it (see its own
+// call site).
+function watchedSeasonButtonState(watched) {
+  return watched
+    ? { upcoming: false, label: '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched', className: 'secondary', title: '' }
+    : { upcoming: false, label: 'Mark Season Watched', className: 'primary', title: '' };
+}
+
+function applySeasonWatchedButton(btn, state) {
+  if (!btn || !state) return;
+  btn.innerHTML = state.label;
+  btn.disabled = !!state.upcoming;
+  if (btn.classList) {
+    btn.classList.remove('primary', 'secondary');
+    btn.classList.add(state.className);
+  }
+  // Assigned rather than removeAttribute'd: an empty title shows no tooltip,
+  // and this keeps the helper to plain property writes so it works on any
+  // button-shaped object a caller hands it.
+  btn.title = state.title || '';
+}
+
+// The episode modal's watch button. An episode that has not aired has nothing
+// to mark, and offering the button anyway is how a future episode reached
+// Watch History -- from where it counts towards "fully watched", hides the
+// show from Continue Watching, and is pushed to the account as a real
+// viewing.
+//
+// The one exception is an episode already recorded as watched: that button
+// has to stay whatever its air date, or a mistake made before this existed
+// (or a scrobble from a preview screening) could never be undone.
+function episodeWatchButtonHtml(ep, isWatched) {
+  const hasAired = typeof isEpisodeAired !== 'function' || isEpisodeAired(ep);
+  if (hasAired || isWatched) {
+    return '<button type="button" id="btnMarkWatched" class="lc-btn ' + (isWatched ? 'secondary' : 'primary') + '" onclick="toggleEpisodeWatchStatusFromModal()">' +
+      (isWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
+      '</button>';
+  }
+  const airDate = (ep && (ep.air_date || ep.airDate)) || '';
+  const badge = (airDate && typeof formatAirDateBadge === 'function') ? formatAirDateBadge(airDate) : '';
+  return '<button type="button" id="btnMarkWatched" class="lc-btn secondary" disabled title="' +
+    escapeAttr(airDate ? ('This episode airs on ' + airDate + '.') : 'This episode has not aired yet.') + '">' +
+    (badge ? 'Airs ' + escapeHtml(badge) : 'Not aired yet') +
+    '</button>';
+}
+
 function formatAirDateBadge(airDateStr) {
   if (!airDateStr) return '';
   const parts = String(airDateStr).split(/[-T\s]/);
@@ -31819,6 +31928,8 @@ function openEpisodeDetails(epNum) {
       return false;
     });
   }
+  const watchBtnHtml = episodeWatchButtonHtml(ep, isWatched);
+
   const innerHtml = 
     '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap; margin-top:20px;">' +
@@ -31827,11 +31938,7 @@ function openEpisodeDetails(epNum) {
       '</div>' +
       '<div style="flex: 1; min-width: 300px;">' +
         '<h1 style="margin:0 0 16px; font-size:2.5rem; font-family: serif;">E' + ep.episode_number + ' - ' + escapeHtml(ep.name) + '</h1>' +
-          '<div style="margin-bottom:20px;">' +
-            '<button type="button" id="btnMarkWatched" class="lc-btn ' + (isWatched ? 'secondary' : 'primary') + '" onclick="toggleEpisodeWatchStatusFromModal()">' +
-              (isWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
-            '</button>' +
-          '</div>' +
+          '<div style="margin-bottom:20px;">' + watchBtnHtml + '</div>' +
         '<div style="margin-bottom:16px; color:var(--text); font-size:1.05rem;">' + infoHtml + '</div>' +
         '<p style="font-size:1.05rem; line-height:1.6; color:var(--text); margin-bottom: 24px;">' + escapeHtml(ep.overview || 'No overview available.') + '</p>' +
       '</div>' +
@@ -31909,19 +32016,10 @@ function updateSeasonWatchedButton(seasonNum) {
   const d = window._currentItemDetails;
   if (!d) return;
   const sNum = Number(seasonNum);
-  const seasonMeta = (d.seasonsData || []).find(s => Number(s.season_number) === sNum);
-  const epCount = seasonMeta ? seasonMeta.episode_count : 0;
-  const isWatched = isSeasonFullyWatched(d.id, sNum, epCount);
+  const seasonMeta = (d.seasonsData || []).find(s => Number(s.season_number) === sNum) || { season_number: sNum };
+  const state = seasonWatchedButtonState(d, seasonMeta);
   document.querySelectorAll('.btn-mark-season-watched[data-season="' + sNum + '"]').forEach(btn => {
-    if (isWatched) {
-      btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
-      btn.classList.remove('primary');
-      btn.classList.add('secondary');
-    } else {
-      btn.innerHTML = 'Mark Season Watched';
-      btn.classList.remove('secondary');
-      btn.classList.add('primary');
-    }
+    applySeasonWatchedButton(btn, state);
   });
 }
 window.updateSeasonWatchedButton = updateSeasonWatchedButton;
@@ -31946,6 +32044,13 @@ window.markSeasonWatched = async function(seasonNum, btn) {
       throw new Error(data.error || 'Failed to fetch season episodes');
     }
 
+    // Now that this season's real episode list is in hand, everything that
+    // asks "how many episodes has this season actually aired" can stop
+    // guessing from episode_count -- which counts the unaired ones too, so a
+    // part-aired season could never read as fully watched.
+    if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+    window._seasonEpisodesMap[seasonNum] = data.season.episodes;
+
     const episodes = [];
     data.season.episodes.forEach(ep => {
       if (typeof isEpisodeAired === 'function' && !isEpisodeAired(ep)) return;
@@ -31966,9 +32071,13 @@ window.markSeasonWatched = async function(seasonNum, btn) {
     });
 
     if (!episodes.length) {
+      // Nothing in this season has aired. The button used to be handed back
+      // enabled and labelled "Mark Season Watched", so it looked like a
+      // control that simply did nothing; now it says why, and stays out of
+      // the way until the season starts.
       if (btn) {
         btn.disabled = false;
-        btn.textContent = 'Mark Season Watched';
+        applySeasonWatchedButton(btn, seasonWatchedButtonState(d, (d.seasonsData || []).find(sd => Number(sd.season_number) === Number(seasonNum)) || { season_number: seasonNum }));
       }
       return;
     }
@@ -31976,24 +32085,24 @@ window.markSeasonWatched = async function(seasonNum, btn) {
     const resBatch = toggleBatchWatchStatus(episodes);
     if (btn) {
       btn.disabled = false;
-      if (resBatch.nowWatched) {
-        btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
-        btn.classList.remove('primary');
-        btn.classList.add('secondary');
-      } else {
-        btn.innerHTML = 'Mark Season Watched';
-        btn.classList.remove('secondary');
-        btn.classList.add('primary');
-      }
+      // From the write that just happened, not re-derived: this season's
+      // aired episodes are exactly what was toggled.
+      applySeasonWatchedButton(btn, watchedSeasonButtonState(resBatch.nowWatched));
     }
 
     // Check if whole show is watched or not
     let allSeasonsWatched = false;
     if (d.seasonsData && Array.isArray(d.seasonsData)) {
-      allSeasonsWatched = d.seasonsData.filter(s => s.season_number !== 0).every(s => {
-        if (s.season_number === seasonNum) return resBatch.nowWatched;
-        return isSeasonFullyWatched(d.id, s.season_number, s.episode_count);
-      });
+      allSeasonsWatched = d.seasonsData
+        .filter(s => s.season_number !== 0)
+        // A season that has not started is not something the person is
+        // behind on -- counting it as unwatched meant a show could never
+        // read as caught up once a future season was announced.
+        .filter(s => seasonHasAiredEpisodes(Number(s.season_number), s))
+        .every(s => {
+          if (s.season_number === seasonNum) return resBatch.nowWatched;
+          return isSeasonFullyWatched(d.id, s.season_number, s.episode_count);
+        });
       if (typeof setShowFullyWatched === 'function') {
         setShowFullyWatched(String(d.id), allSeasonsWatched);
       }
@@ -32030,7 +32139,15 @@ function isShowFullyWatched(d) {
 
   // If seasonsData is available and has non-specials seasons, verify that every season is fully watched
   if (d.seasonsData && Array.isArray(d.seasonsData)) {
-    const regularSeasons = d.seasonsData.filter(s => s.season_number !== 0);
+    // Announced-but-unaired seasons are excluded, the same way markShowWatched
+    // (21_client-custom-list-builder.js) only ever fetches aired episodes:
+    // "fully watched" here means caught up on everything that exists to
+    // watch. Counting a future season made this answer false for every
+    // caught-up show with a renewal, so reopening the modal contradicted the
+    // button the person had just pressed.
+    const regularSeasons = d.seasonsData
+      .filter(s => s.season_number !== 0)
+      .filter(s => seasonHasAiredEpisodes(Number(s.season_number), s));
     if (regularSeasons.length > 0) {
       return regularSeasons.every(s => isSeasonFullyWatched(d.id, s.season_number, s.episode_count));
     }
@@ -32333,7 +32450,7 @@ async function openItemDetailsModal(id, type, opts) {
         // long-running / reality shows) -- fall back to the show's own
         // poster rather than leaving a blank placeholder box.
         const sPoster = season.poster_path ? 'https://image.tmdb.org/t/p/w200' + season.poster_path : (d.poster || '');
-        const isSeasonWatched = isSeasonFullyWatched(d.id, season.season_number, season.episode_count);
+        const seasonBtnState = seasonWatchedButtonState(d, season);
         seasonsHtml +=
           '<div class="season-card">' +
             '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeJsAttr(d.id) + '&quot;)">' +
@@ -32345,8 +32462,11 @@ async function openItemDetailsModal(id, type, opts) {
                 '</div>' +
               '</div>' +
               '<div class="season-header-actions">' +
-                '<button type="button" class="lc-btn ' + (isSeasonWatched ? 'secondary' : 'primary') + ' btn-mark-season-watched" data-season="' + season.season_number + '" onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
-                  (isSeasonWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched' : 'Mark Season Watched') +
+                '<button type="button" class="lc-btn ' + seasonBtnState.className + ' btn-mark-season-watched" data-season="' + season.season_number + '"' +
+                  (seasonBtnState.upcoming ? ' disabled' : '') +
+                  (seasonBtnState.title ? ' title="' + escapeAttr(seasonBtnState.title) + '"' : '') +
+                  ' onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
+                  seasonBtnState.label +
                 '</button>' +
               '</div>' +
             '</div>' +
@@ -44841,7 +44961,29 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   const list = getOrCreateWatchHistoryList();
   
   let existingIdx = list.items.findIndex(it => it.id === id);
-  
+
+  // An episode that has not aired yet cannot have been watched, and letting
+  // one in poisons everything downstream: it counts towards "fully watched",
+  // evicts the show from Continue Watching, and is pushed to the account as
+  // a real viewing. The modal no longer offers the button (see
+  // openEpisodeDetails, 19_client-search-and-likes.js) -- this is the guard
+  // behind it, because this function is the single door every episode toggle
+  // goes through.
+  //
+  // Only ADDING is refused. Removing one that is already recorded is exactly
+  // how a person undoes a mistake made before this existed, so that path is
+  // left alone -- as is anything this browser has no air date for, which is
+  // unknown rather than future.
+  if (existingIdx < 0 && type === 'episode' && typeof isEpisodeAired === 'function') {
+    const cached = Object.values(window._episodeDataCache || {}).find(ep => String(ep && ep.id) === String(id));
+    if (cached && (cached.air_date || cached.airDate) && !isEpisodeAired(cached)) {
+      if (typeof showAddedToast === 'function') {
+        showAddedToast('That episode has not aired yet, so it was not marked watched.');
+      }
+      return;
+    }
+  }
+
   if (existingIdx < 0 && type === 'episode') {
     const d = window._currentItemDetails;
     if (d) {
@@ -45191,6 +45333,11 @@ window.markShowWatched = async function(imdbId) {
             '&seasonNum=' + season.season_number + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
           const data = await res.json();
           if (data.ok && data.season && Array.isArray(data.season.episodes)) {
+            // Shared with the season buttons: once the real episode list is
+            // known, "has this season aired anything" and "is it fully
+            // watched" stop having to guess from episode_count.
+            if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+            window._seasonEpisodesMap[season.season_number] = data.season.episodes;
             data.season.episodes.forEach((ep) => {
               if (typeof isEpisodeAired === 'function' && !isEpisodeAired(ep)) return;
               const epStill = ep.still_path
@@ -45229,6 +45376,11 @@ window.markShowWatched = async function(imdbId) {
       btn.innerHTML = "Couldn't load episodes -- try again";
     } else {
       btn.innerHTML = wasFullyWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched';
+      // Every season is still to come, so there is genuinely nothing to
+      // mark. Silence here read as a broken button.
+      if (typeof showAddedToast === 'function') {
+        showAddedToast('Nothing has aired yet, so there is nothing to mark watched.');
+      }
     }
     return;
   }
@@ -45280,18 +45432,39 @@ window.markShowWatched = async function(imdbId) {
       };
 
       if (nowWatched) {
-        // Evict any entry for this completed show from Continue Watching
+        // "Watched everything that has aired" is not the same as "finished".
+        //
+        // The reconciliation awaited above (updateContinueWatching) has
+        // already worked out what comes next for this show, and for a show
+        // that is merely caught up that is an episode with a future air date
+        // -- the entry Continue Watching renders with an "Airs ..." badge,
+        // exactly as it does when the last episode is marked watched one at a
+        // time. Evicting it here made Mark Show Watched the one path that
+        // dropped the show off the shelf entirely, which is the difference
+        // the report describes.
+        //
+        // A show with nothing left to air keeps the old behaviour: evicted,
+        // and its storyline conclusion (Breaking Bad -> El Camino) queued in
+        // its place. A companion only makes sense once a show is actually
+        // over, so it is not queued while an episode is still coming.
+        const isUpcomingEntry = (it) => !!(it && (it.isUnaired ||
+          (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate))));
+        const upcoming = (cwList.items || []).find((it) => isShowItem(it) && isUpcomingEntry(it));
         cwList.items = (cwList.items || []).filter((it) => !isShowItem(it));
-        // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
-        let companion = null;
-        for (const alias of allShowAliases) {
-          if (typeof findCompanionShowConclusion === 'function') {
-            companion = findCompanionShowConclusion(alias);
+        if (upcoming) {
+          cwList.items.unshift(upcoming);
+        } else {
+          // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
+          let companion = null;
+          for (const alias of allShowAliases) {
+            if (typeof findCompanionShowConclusion === 'function') {
+              companion = findCompanionShowConclusion(alias);
+            }
+            if (companion) break;
           }
-          if (companion) break;
-        }
-        if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
-          cwList.items.unshift(companion);
+          if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
+            cwList.items.unshift(companion);
+          }
         }
       } else {
         // If unwatching the whole show, remove any companion queued for this show
@@ -45319,7 +45492,23 @@ window.markShowWatched = async function(imdbId) {
     btn.classList.remove('secondary');
     btn.classList.add('primary');
   }
+  // Only the seasons this actually wrote to. allEpisodes holds the AIRED
+  // episodes that were toggled, so a season absent from it had nothing to
+  // mark -- and relabelling it "Mark Season Unwatched" anyway is what made a
+  // not-yet-aired season read as watched over an empty Watch History. Those
+  // seasons are handed back to the shared state instead, which says when they
+  // air (seasonWatchedButtonState, 19_client-search-and-likes.js).
+  const touchedSeasons = new Set(allEpisodes.map((ep) => String(ep.seasonNum)));
   document.querySelectorAll('.btn-mark-season-watched').forEach((seasonBtn) => {
+    const sNum = seasonBtn.dataset ? seasonBtn.dataset.season : null;
+    if (sNum != null && !touchedSeasons.has(String(sNum))) {
+      if (typeof updateSeasonWatchedButton === 'function') updateSeasonWatchedButton(Number(sNum));
+      return;
+    }
+    if (typeof applySeasonWatchedButton === 'function' && typeof watchedSeasonButtonState === 'function') {
+      applySeasonWatchedButton(seasonBtn, watchedSeasonButtonState(nowWatched));
+      return;
+    }
     if (nowWatched) {
       seasonBtn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
       seasonBtn.classList.remove('primary');

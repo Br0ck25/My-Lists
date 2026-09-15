@@ -1,5 +1,73 @@
 # Changes Log
 
+## 2026-09-15 - No "mark as watched" control can claim a future episode
+
+### Files Changed
+`09_page-shell.js`, `19_client-search-and-likes.js`, `21_client-custom-list-builder.js`,
+`worker_entry_combined.js`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/client.test.mjs`
+
+### Root Cause
+
+Reported: "if i use the Mark Show Watched the future season is marked as watched but the episode isnt marked
+as watched and the show isnt added to continue watching, any mark as watched buttons should not mark a
+future episode as watched."
+
+Two of those three are one bug and the third is a second one.
+
+`markShowWatched` never marked a future episode watched -- it filters on `isEpisodeAired` when it fetches
+each season, which is why the episode was correctly absent from Watch History. What it did do was finish
+with `document.querySelectorAll('.btn-mark-season-watched').forEach(...)` and relabel **every** season
+button on the page to "Mark Season Unwatched", including a season with nothing aired and nothing watched.
+The state was right; the only thing wrong was the button, and the button is what the person reads.
+
+Behind that sat a smaller mess: four places set that same button (the item modal's first render,
+`updateSeasonWatchedButton`, `markSeasonWatched`'s own post-write update, and the bulk relabel above) and
+none of them had a case for "this season has not aired". `markSeasonWatched` on such a season fetched, found
+zero aired episodes, and handed the button back enabled and labelled "Mark Season Watched" -- a control that
+silently does nothing. And the episode modal offered "Mark as Watched" for any episode at all, with
+`toggleWatchStatus` -- the single function every episode toggle goes through -- doing no air-date check, so
+a future episode could be recorded as watched from there and then counted towards fully-watched, evicted the
+show from Continue Watching, and been pushed to the account.
+
+The third symptom is separate. `updateContinueWatching` deliberately keeps a caught-up show on the shelf
+with its next, unaired episode (`isUnaired`, rendered with an "Airs ..." badge) -- that is what marking the
+last aired episode one at a time does. `markShowWatched` then ran its own Continue Watching commit *after*
+that reconciliation and unconditionally evicted the show, so the whole-show button was the one path that
+dropped a caught-up show off the shelf.
+
+### What changed
+
+**One button state (`19`)** -- `seasonHasAiredEpisodes`, `seasonFirstAirDate`, `seasonWatchedButtonState`,
+`watchedSeasonButtonState` and `applySeasonWatchedButton`. Airedness comes from the season's loaded episode
+list when there is one and from its TMDB `air_date` otherwise; a season with no air date at all is unknown,
+and unknown behaves exactly as before rather than being disabled on a guess. An upcoming season gets a
+disabled button saying when it airs. All four call sites now go through it, `markShowWatched`'s included --
+and that one only relabels the seasons whose episodes it actually wrote, from `allEpisodes`.
+
+**Caught up is fully watched (`19`)** -- `isShowFullyWatched` and `markSeasonWatched`'s `allSeasonsWatched`
+both skip seasons with nothing aired. One announced season used to make a show unfinishable.
+
+**The episode door (`19`, `21`)** -- `episodeWatchButtonHtml` renders "Airs ..." disabled for an unaired
+episode, and `toggleWatchStatus` refuses to ADD one. Removal is untouched: an entry made before this, or by
+a scrobble, still has to be undoable. `markShowWatched` and `markSeasonWatched` now say so with a toast when
+there is nothing aired to mark, instead of appearing to fail.
+
+**Continue Watching (`21`)** -- `markShowWatched` keeps the upcoming entry the reconciliation just computed
+for the show, and only evicts (and queues a storyline conclusion) when nothing is left to air.
+
+**Supporting (`19`, `21`, `09`)** -- both mark paths now stash their fetched episode lists in
+`_seasonEpisodesMap`, so `isSeasonFullyWatched` stops falling back to `episode_count` (which counts unaired
+episodes) for those seasons; and `.lc-btn:disabled` finally looks disabled.
+
+### Tests
+
+Client: marking a whole show watched writes only the aired episode and leaves the future season's button
+saying it has not aired; the show reads as caught up rather than unfinished; it stays on Continue Watching
+with the unaired next episode; `toggleWatchStatus` refuses to add a future episode but still removes one
+already recorded; the episode modal offers no wired-up button for an unaired episode and keeps one for an
+episode already marked watched; marking a not-yet-aired season leaves a disabled button that says when it
+airs; and a season with no air date is treated as ordinary.
+
 ## 2026-09-14 - Airing Next gets a remove, and Reset Account Data stops looking stuck
 
 ### Files Changed
