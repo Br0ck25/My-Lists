@@ -1,5 +1,76 @@
 # Changes Log
 
+## 2026-09-15 - A Channel episode asks a stream add-on for the episode it actually is
+
+### Files Changed
+`05_catalog-core.js`, `20_client-channel-builder.js`, `worker_entry_combined.js`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`
+
+### Root Cause
+
+Reported: "Non-debrid addons (like Pengu) dont pickup the fake episodes order. I.e: FRIENDS randomized
+channel has the S01E01 at the start of the queue when in fact it's, let's say, S05E13. With Debrid addons it
+plays correctly the S05E13, but non debrid scrapes the original S01E01."
+
+The first thing to establish is what a stream add-on can actually see, because the report assumes it sees
+the channel's running order. It cannot. Stremio asks every installed stream add-on for
+`/stream/<type>/<video.id>.json` and sends nothing else -- the addon SDK's own `defineStreamHandler`
+documentation says the id it receives IS the video id, and stremio-core builds that request from
+`video.id` alone. `buildChannelMeta` has always put the REAL episode there (`tt0108778:5:13`) and used
+`season: 1, episode: i + 1` only for display, which is what makes the shuffled order hold in the UI. Those
+two fields never leave this Worker. Confirmed against the live deployment: a four-item shuffled Friends
+channel publishes ids `tt0108778:1:1`, `tt0108778:10:17`, `tt0108778:5:13`, `tt0108778:3:5` under running
+numbers 1-4.
+
+So for a Friends channel built from TMDB -- every item carrying a real `tt` id and a real season and
+episode -- the request Pengu receives is byte-identical to the one it receives when someone opens Friends
+from Cinemeta and clicks S05E13, and an S01E01 result is Pengu resolving it wrongly on its own side. That
+half is not ours to fix.
+
+What IS ours is every case where the id we publish is not the episode we display, and there were three:
+
+1. `parseInt(it.season, 10) || 1` could not distinguish "no season stored" from season 0. An item missing
+   either number -- or carrying `"0"` as a string -- was published as `<show>:1:1`. That is not a broken
+   link that gets reported; it is that show's series premiere playing under the title of the episode we
+   meant, which is exactly the symptom described.
+2. A show TMDB has no IMDb id for was stored as a bare TMDB number (`String(ep.tmdbId)`) in the
+   crossover/storyline builders, or as an empty string from the episode picker (whose buttons carried only
+   `data-imdbid`, which `/api/show-seasons` leaves empty in that case). Those publish as `12345:5:13` and
+   `:5:13`. Neither matches an `idPrefixes` entry anywhere, so no add-on is asked for either.
+3. `/api/channel-preset` already used the correct `tmdb:<id>` fallback, so the same channel built two
+   different ways published two different id shapes.
+
+### What changed
+
+**`05_catalog-core.js`** -- `channelItemShowId`, `channelItemNumber` and `channelItemStreamId`, directly
+above `buildChannelMeta`. The show half is normalised to `tt...` or `tmdb:<id>` (a bare number is given the
+prefix; anything else is unusable), and a season or episode has to be a real integer >= 0 -- 0 included,
+which is what the old `|| 1` could not express. `buildChannelMeta` filters items through
+`channelItemStreamId` BEFORE the daily rotation or the shuffle picks a lineup, so a dropped item costs the
+channel one slot instead of leaving a hole in the middle of it, and the running order stays 1..N. Trading a
+wrong episode for a missing one is the point: a missing episode can be reported, a wrong one looks like it
+worked.
+
+**`20_client-channel-builder.js`** -- `channelStreamShowId`, the same normalisation where draft items are
+built, so the Worker's check has nothing left to catch: picked episodes, "Add every season", Quick Add
+Channel and both crossover/storyline paths. The episode picker's two add buttons now carry `data-tmdbid`
+beside `data-imdbid`, and `addCheckedEpisodesToChannel`/`addAllEpisodesToChannel` take it, which is what
+gives a show with no IMDb id a real `tmdb:` fallback rather than an empty string. `tmdb:<id>:<s>:<e>` is
+already a first-class shape elsewhere in the app (`23_client-list-management.js` splits it explicitly), so
+nothing downstream had to change.
+
+**`tests/worker.test.mjs`** -- eight cases against the real `buildChannelMeta`: the real season/episode
+reaching the id while the display numbering stays the running order, an unnumbered item being dropped
+rather than resolving to `:1:1`, season/episode 0 surviving as 0, a bare TMDB number gaining its prefix, an
+unusable show id being dropped rather than publishing `:5:13`, the queue closing its gaps, a movie keeping
+its plain id, and a shuffled channel reordering the queue without ever renumbering an id.
+
+### Still open (not this change)
+
+A stream add-on that resolves `tt0108778:5:13` to S01E01 is doing so from an identical request to the one
+the normal Cinemeta detail page produces. The way to prove that to its author is to play the same episode
+from outside a channel; if it is also wrong there, nothing in this repository is involved.
+
 ## 2026-09-15 - No "mark as watched" control can claim a future episode
 
 ### Files Changed

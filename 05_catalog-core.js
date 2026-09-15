@@ -1699,6 +1699,55 @@ function seededShuffle(arr, seed) {
 const CHANNEL_ROTATION_SHOWS_PER_DAY = 24;
 const CHANNEL_ROTATION_EPISODES_PER_SHOW = 3;
 
+// --- channel video ids -------------------------------------------------
+//
+// A channel video's `id` IS the stream request: Stremio asks every stream
+// add-on for /stream/<type>/<video.id>.json, and that id is the only thing
+// it sends. The `season`/`episode` fields set below are the channel's own
+// running order for display and never reach a stream add-on at all.
+//
+// So a malformed id here is not a dead link that someone notices -- it is a
+// silently WRONG episode. The three helpers below exist to make that
+// impossible to emit.
+
+// The show half of a channel item's stream id. "tt..." is the form every
+// add-on understands; a TMDB fallback has to carry the "tmdb:" prefix this
+// add-on's manifest declares (see buildManifest's idPrefixes), because a
+// BARE number matches no idPrefix anywhere and no add-on is ever even asked
+// for it. Anything else is unusable and the item it belongs to gets dropped.
+function channelItemShowId(rawId) {
+  const id = String(rawId == null ? "" : rawId).trim();
+  if (/^tt[0-9]+$/.test(id)) return id;
+  if (/^tmdb:[0-9]+$/.test(id)) return id;
+  if (/^[0-9]+$/.test(id)) return `tmdb:${id}`;
+  return "";
+}
+
+// A season or episode number exactly as stored, or null when the item does
+// not carry a real one. `parseInt(x, 10) || 1` used to stand in for this and
+// could not tell "no season at all" from season 0 -- both came out as 1. An
+// item missing either number therefore resolved to `<show>:1:1`, so a stream
+// add-on was pointed at that show's S01E01 while the video still displayed
+// the title of the episode we meant. Dropping the item instead turns a wrong
+// episode (which nobody can report, because it looks like it played) into a
+// missing one (which they can).
+function channelItemNumber(value) {
+  const n = typeof value === "number" ? value : parseInt(value, 10);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+// The full stream id for one channel item, or "" if it cannot be formed.
+function channelItemStreamId(it) {
+  if (!it) return "";
+  const showId = channelItemShowId(it.imdbId);
+  if (!showId) return "";
+  if (it.kind === "movie") return showId;
+  const season = channelItemNumber(it.season);
+  const episode = channelItemNumber(it.episode);
+  if (season === null || episode === null) return "";
+  return `${showId}:${season}:${episode}`;
+}
+
 function buildChannelMeta(entry, origin) {
   const payload = parseChannelPayload(entry.url);
   if (!payload || !payload.items.length) return null;
@@ -1720,10 +1769,16 @@ function buildChannelMeta(entry, origin) {
   // of one show and none of many others. Stable within a day, different
   // the next.
   const seed = daysSinceEpochUTC(new Date()) + hashStringToInt(channelId);
+  // Anything that cannot produce a real stream id (see channelItemStreamId
+  // above) is dropped HERE, before the rotation or the shuffle runs, so a
+  // dropped item costs the channel one slot rather than leaving a hole in
+  // the middle of a day's lineup -- and so the running order below stays
+  // 1..N with no gaps.
+  const playableItems = payload.items.filter((it) => channelItemStreamId(it));
   let items;
   if (payload.dailyRotate) {
     const byShow = new Map();
-    payload.items.forEach((it) => {
+    playableItems.forEach((it) => {
       const key = it.imdbId || it.kind + ":" + it.title;
       if (!byShow.has(key)) byShow.set(key, []);
       byShow.get(key).push(it);
@@ -1745,9 +1800,9 @@ function buildChannelMeta(entry, origin) {
       items.push(...showEpisodes.slice(start, start + perShow));
     });
   } else if (payload.shuffle) {
-    items = seededShuffle(payload.items, seed);
+    items = seededShuffle(playableItems, seed);
   } else {
-    items = payload.items;
+    items = playableItems;
   }
   const videos = items.map((it, i) => {
     // TMDB's air_date/release_date (and our own year-only fallback for
@@ -1760,11 +1815,8 @@ function buildChannelMeta(entry, origin) {
     // to begin with) and matches the shape a known-working reference
     // implementation's meta responses use.
     const releaseDate = it.released || (it.year ? `${it.year}-01-01` : undefined);
-    const realSeason = typeof it.season === "number" ? it.season : parseInt(it.season, 10) || 1;
-    const realEpisode = typeof it.episode === "number" ? it.episode : parseInt(it.episode, 10) || 1;
-    const streamId = it.kind === "movie" ? it.imdbId : `${it.imdbId}:${realSeason}:${realEpisode}`;
     return {
-      id: streamId,
+      id: channelItemStreamId(it),
       title: it.title,
       season: 1,
       episode: i + 1,

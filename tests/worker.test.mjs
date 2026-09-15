@@ -10797,3 +10797,85 @@ describe("Title Search resilience (word variations and fuzzy fallback)", () => {
 
 
 
+// A Channel's video ids ARE its stream requests.
+//
+// Stremio asks every installed stream add-on for
+// /stream/<type>/<video.id>.json and sends nothing else -- the season/episode
+// fields on the video object are this channel's own running order, for
+// display, and never reach an add-on at all. So an id that is merely
+// well-formed but wrong does not fail visibly: the episode plays, it is just
+// the wrong episode. That is what `parseInt(it.season, 10) || 1` used to
+// produce for any item that had no season or episode stored (and for a
+// season stored as the string "0"): `<show>:1:1`, i.e. that show's series
+// premiere, under the title of the episode we meant.
+describe("worker: channel video ids are real stream requests", () => {
+  const channelFns = loadSourceFunctions("05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+
+  function channelMeta(items, extra = {}) {
+    const payload = { channelId: "ch1", name: "Test Channel", items, ...extra };
+    const entry = { id: "ch1", type: "series", name: "Test Channel", url: "channel:v1:" + JSON.stringify(payload) };
+    return channelFns.buildChannelMeta(entry, "https://example.com");
+  }
+
+  const ep = (over = {}) => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13", ...over });
+
+  it("carries the REAL season/episode in the id while the displayed numbering is the running order", () => {
+    const meta = channelMeta([ep({ season: 1, episode: 1 }), ep({ season: 10, episode: 17 }), ep()]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:1:1", "tt0108778:10:17", "tt0108778:5:13"]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.season), [1, 1, 1]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.episode), [1, 2, 3], "display numbering is the channel's running order");
+  });
+
+  it("drops an item with no season or no episode instead of pointing it at S01E01", () => {
+    const meta = channelMeta([
+      ep({ season: undefined }),
+      ep({ episode: null }),
+      ep({ season: "", episode: "" }),
+      ep({ season: 4, episode: 8 }),
+    ]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:4:8"]);
+    assert.ok(!meta.videos.some((v) => v.id === "tt0108778:1:1"), "an unnumbered item must never resolve to the show's premiere");
+  });
+
+  it("keeps season 0 and episode 0 as 0 -- the old `|| 1` could not tell them from missing", () => {
+    const meta = channelMeta([ep({ season: 0, episode: 2 }), ep({ season: "0", episode: "1" })]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:0:2", "tt0108778:0:1"]);
+  });
+
+  it("gives a show with no IMDb id the tmdb: prefix the manifest declares, not a bare number", () => {
+    const meta = channelMeta([ep({ imdbId: "1668" }), ep({ imdbId: "tmdb:1668", season: 2, episode: 3 })]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tmdb:1668:5:13", "tmdb:1668:2:3"]);
+    assert.ok(
+      meta.videos.every((v) => v.id.startsWith("tt") || v.id.startsWith("tmdb:")),
+      "every id must match one of buildManifest's declared idPrefixes, or no add-on is asked for it"
+    );
+  });
+
+  it("drops an item whose show id is missing or unusable rather than emitting ':5:13'", () => {
+    const meta = channelMeta([ep({ imdbId: "" }), ep({ imdbId: undefined }), ep({ imdbId: "kitsu:44" }), ep({ imdbId: "tt42", season: 2, episode: 2 })]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt42:2:2"]);
+  });
+
+  it("closes the gap left by a dropped item so the running order stays 1..N", () => {
+    const meta = channelMeta([ep({ season: 1, episode: 1 }), ep({ season: undefined }), ep({ season: 3, episode: 3 }), ep({ imdbId: "" }), ep({ season: 4, episode: 4 })]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.episode), [1, 2, 3], "no holes in the queue numbering");
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:1:1", "tt0108778:3:3", "tt0108778:4:4"]);
+  });
+
+  it("leaves a movie's id alone -- no season/episode appended", () => {
+    const meta = channelMeta([{ kind: "movie", imdbId: "tt0133093", title: "The Matrix", year: 1999 }]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0133093"]);
+  });
+
+  it("a shuffled channel reorders the queue without ever renumbering an id", () => {
+    const items = [];
+    for (let s = 1; s <= 4; s++) {
+      for (let e = 1; e <= 6; e++) items.push(ep({ season: s, episode: e, title: `S${s}E${e}` }));
+    }
+    const meta = channelMeta(items, { shuffle: true });
+    const ids = Array.from(meta.videos, (v) => v.id);
+    assert.equal(new Set(ids).size, items.length, "every real episode appears exactly once");
+    assert.deepEqual([...ids].sort(), items.map((it) => `tt0108778:${it.season}:${it.episode}`).sort());
+    assert.deepEqual(Array.from(meta.videos, (v) => v.episode), items.map((_, i) => i + 1));
+  });
+});

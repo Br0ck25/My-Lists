@@ -12,6 +12,26 @@ let channelDraftPoster = null;
 let channelDraftBackdrop = null;
 let channelSearchType = 'tv';
 
+// The show half of the stream id a channel item will be published with.
+//
+// buildChannelMeta joins this to the episode's season/episode to form the
+// video id Stremio hands to every stream add-on, and that id is the only
+// thing the add-on receives -- so a show with no IMDb id has to fall back to
+// the "tmdb:" form this add-on's manifest declares, never to a BARE TMDB
+// number (which matches no idPrefix anywhere, so nothing is asked for it)
+// and never to an empty string (which used to produce ":5:13"). The Worker
+// re-checks this in channelItemShowId and drops whatever still cannot form
+// a real id; this is what keeps it from having to.
+function channelStreamShowId(imdbId, tmdbId) {
+  const imdb = String(imdbId == null ? '' : imdbId).trim();
+  if (/^tt[0-9]+$/.test(imdb)) return imdb;
+  const tmdb = String(tmdbId == null ? '' : tmdbId).trim().replace(/^tmdb:/, '');
+  if (/^[0-9]+$/.test(tmdb)) return 'tmdb:' + tmdb;
+  if (/^tmdb:[0-9]+$/.test(imdb)) return imdb;
+  if (/^[0-9]+$/.test(imdb)) return 'tmdb:' + imdb;
+  return '';
+}
+
 function setChannelSearchType(type, btn) {
   channelSearchType = type === 'movie' ? 'movie' : 'tv';
   const bar = document.getElementById('channelSearchTypeChips');
@@ -231,12 +251,12 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
   }
   const addAllBtn = e.target.closest('.channelAddAllEpisodesBtn');
   if (addAllBtn) {
-    addAllEpisodesToChannel(addAllBtn.dataset.imdbid, addAllBtn.dataset.showname, addAllBtn.dataset.poster, addAllBtn.dataset.backdrop);
+    addAllEpisodesToChannel(addAllBtn.dataset.imdbid, addAllBtn.dataset.showname, addAllBtn.dataset.poster, addAllBtn.dataset.backdrop, addAllBtn.dataset.tmdbid);
     return;
   }
   const addBtn = e.target.closest('.channelAddEpisodesBtn');
   if (addBtn) {
-    addCheckedEpisodesToChannel(addBtn.dataset.imdbid, addBtn.dataset.showname, addBtn.dataset.poster, addBtn.dataset.backdrop);
+    addCheckedEpisodesToChannel(addBtn.dataset.imdbid, addBtn.dataset.showname, addBtn.dataset.poster, addBtn.dataset.backdrop, addBtn.dataset.tmdbid);
   }
 });
 
@@ -247,6 +267,7 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
 async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, showBackdrop, seasonsCsv, btn) {
   const seasons = String(seasonsCsv || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!seasons.length) return;
+  const showStreamId = channelStreamShowId(imdbId, tmdbId);
   if (btn) {
     btn.disabled = true;
     btn.textContent = 'Adding every season\u2026';
@@ -265,7 +286,7 @@ async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, show
         episodes.forEach((ep) => {
           showEpisodes.push({
             kind: 'episode',
-            imdbId: imdbId,
+            imdbId: showStreamId,
             season: season,
             episode: ep.episode,
             showName: showName || '',
@@ -332,10 +353,12 @@ async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, s
     listBox.innerHTML = rows +
       '<div class="actions" style="margin-top:8px;">' +
       '<button type="button" class="secondary channelAddEpisodesBtn"' +
-      ' data-imdbid="' + escapeAttr(imdbId) + '" data-showname="' + escapeAttr(showName) + '"' +
+      ' data-imdbid="' + escapeAttr(imdbId) + '" data-tmdbid="' + escapeAttr(tmdbId) + '"' +
+      ' data-showname="' + escapeAttr(showName) + '"' +
       ' data-poster="' + escapeAttr(showPoster) + '" data-backdrop="' + escapeAttr(showBackdrop || '') + '">Add checked episodes</button>' +
       '<button type="button" class="secondary channelAddAllEpisodesBtn"' +
-      ' data-imdbid="' + escapeAttr(imdbId) + '" data-showname="' + escapeAttr(showName) + '"' +
+      ' data-imdbid="' + escapeAttr(imdbId) + '" data-tmdbid="' + escapeAttr(tmdbId) + '"' +
+      ' data-showname="' + escapeAttr(showName) + '"' +
       ' data-poster="' + escapeAttr(showPoster) + '" data-backdrop="' + escapeAttr(showBackdrop || '') + '">Add all episodes</button>' +
       '</div>';
     listBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -344,7 +367,7 @@ async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, s
   }
 }
 
-function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop) {
+function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop, tmdbId) {
   const checks = document.querySelectorAll('#channelEpisodeList .channelEpisodeCheck:checked');
   if (!checks.length) {
     if (typeof showAppAlert === 'function') {
@@ -354,6 +377,7 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop)
     }
     return;
   }
+  const showStreamId = channelStreamShowId(imdbId, tmdbId);
   checks.forEach((cb) => {
     let ep;
     try {
@@ -363,7 +387,7 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop)
     }
     channelDraftItems.push({
       kind: 'episode',
-      imdbId: imdbId,
+      imdbId: showStreamId,
       season: ep.season,
       episode: ep.episode,
       showName: showName || '',
@@ -384,11 +408,11 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop)
 
 // Checks every episode box for the currently-loaded season, then reuses
 // addCheckedEpisodesToChannel above rather than duplicating its logic.
-function addAllEpisodesToChannel(imdbId, showName, showPoster, showBackdrop) {
+function addAllEpisodesToChannel(imdbId, showName, showPoster, showBackdrop, tmdbId) {
   document.querySelectorAll('#channelEpisodeList .channelEpisodeCheck').forEach((cb) => {
     cb.checked = true;
   });
-  addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop);
+  addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop, tmdbId);
 }
 
 const LOCAL_CHANNELS_KEY = 'myListAddon:localChannels';
@@ -8163,7 +8187,7 @@ async function fetchStorylineOrderedItems(eventId) {
 
             fullOrderedItems.push({
               kind: 'episode',
-              imdbId: showImdbId || String(ep.tmdbId),
+              imdbId: channelStreamShowId(showImdbId, ep.tmdbId),
               season: sNum,
               episode: epItem.episode,
               showName: ep.showName,
@@ -8213,7 +8237,7 @@ async function fetchStorylineOrderedItems(eventId) {
 
       fullOrderedItems.push({
         kind: 'episode',
-        imdbId: showImdbId || (epData && epData.imdbId) || String(ep.tmdbId),
+        imdbId: channelStreamShowId(showImdbId || (epData && epData.imdbId), ep.tmdbId),
         season: ep.season,
         episode: ep.episode,
         showName: ep.showName,
@@ -9044,7 +9068,7 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
               const showPosterUrl = show.poster || '';
               showEpisodes.push({
                 kind: 'episode',
-                imdbId: show.imdbId,
+                imdbId: channelStreamShowId(show.imdbId, show.tmdbId),
                 season: season,
                 episode: ep.episode,
                 showName: show.name || '',
