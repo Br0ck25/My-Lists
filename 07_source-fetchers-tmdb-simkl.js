@@ -2573,10 +2573,25 @@ async function fetchShowAirTime(imdbId, env, ctx, meter) {
 // and so never touches it, which is what lets the batch route keep spending
 // one invocation on a whole warm refresh while still fitting a free Worker's
 // 50-fetch budget when the ids are cold. Every other caller passes nothing.
+// The SHAPE of what this function returns, as a cache key segment. Bump it
+// whenever a field is added to or removed from the details payload.
+//
+// Entries live for two hours fresh in isolate memory and a week in KV, keyed
+// only by id/type/region, so a deploy that adds a field kept serving payloads
+// written WITHOUT it -- correct-looking, just missing the new thing, for up to
+// two hours after the code that fills it went live. That is exactly how air
+// times shipped and then did not appear: the stored copy of a show someone had
+// just opened had no airTime in it, and nothing about the key said the shape
+// had moved on. Changing the key retires every old entry at once, at the cost
+// of one cold lookup per title.
+//
+// v2: airTime / nextEpisodeAirTimeLabel (episode air times).
+const ITEM_DETAILS_SHAPE = "v2";
+
 async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache, env, ctx, meter) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
-  const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
+  const cacheKey = `tmdb:itemdetails:${ITEM_DETAILS_SHAPE}:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
 
   const upgradeIfUnpacked = async (d) => {
     if (!d || !Array.isArray(d.seasonsData)) return d;

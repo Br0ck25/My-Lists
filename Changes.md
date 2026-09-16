@@ -1,5 +1,46 @@
 # Changes Log
 
+## 2026-09-16 - Air times that did not appear, and a date that read a day early
+
+### Files Changed
+`05_catalog-core.js`, `07_source-fetchers-tmdb-simkl.js`, `worker_entry_combined.js`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`
+
+### Air times shipped and then did not show
+
+Reported with a screenshot: The Ark S3E8, "Airs Tomorrow", date shown, no time. TVmaze has that show --
+`schedule.time` 22:00, `America/New_York`, i.e. 10 PM ET -- so the data was there and the page was not
+printing it.
+
+The cause is the details cache, not the air-time code. `fetchTmdbItemDetails` keys on
+`tmdb:itemdetails:<id>:<type>:<region>` and nothing else: entries live two hours fresh in isolate memory
+and a week in KV. A show opened shortly BEFORE the air-time deploy had a copy stored without an `airTime`
+field, and after the deploy that copy was still fresh and still served -- correct-looking, just missing the
+new field, for up to two hours.
+
+The key now carries `ITEM_DETAILS_SHAPE`, bumped to `v2` for this payload change. Every entry written by
+the old code is on a key the new code never asks for, so the fix lands on deploy rather than two hours
+later. The convention is written down where the constant is declared: a field added to or removed from the
+details payload bumps it.
+
+### A 1996 movie that read "Dec 31, 1995"
+
+Visible in the same report's channel screenshot. `buildChannelMeta` emits each pick's date as
+`<date>T00:00:00.000Z`, and a client renders that in the VIEWER's timezone -- so midnight UTC is the
+previous evening across the whole of the Americas.
+
+It is now 11:00 UTC. An instant at hour H shows as the intended date wherever the offset is in [-H, 24-H);
+world offsets span UTC-12 to UTC+14, 26 hours, so no instant covers all of them and two hours' worth are
+always wrong. H=11 covers UTC-11 to UTC+12:59 -- every inhabited zone except UTC+13/+14 -- and is one
+better than midday, which also slips in New Zealand. The first attempt here WAS midday; the test written
+alongside it caught the New Zealand case.
+
+### Tests
+
+`tests/worker.test.mjs` (3) -- the shape segment declared and actually used in the key, an old shape
+landing on a different key than the new one, and a pick's date holding across eleven offsets from UTC-11
+to UTC+12:45.
+
 ## 2026-09-16 - A movie in a Channel is no longer a dead end in Stremio
 
 ### Files Changed

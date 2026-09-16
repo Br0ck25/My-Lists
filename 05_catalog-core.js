@@ -1928,16 +1928,27 @@ function buildChannelMeta(entry, origin) {
     // surfaced during debugging) -- its deserializer likely expects a full
     // ISO 8601 *datetime* here and can silently fail to parse the whole
     // meta object on a bare date, unlike a loose JS parser that wouldn't
-    // care. Pinning to midnight UTC costs nothing (we only ever had a date
-    // to begin with) and matches the shape a known-working reference
-    // implementation's meta responses use.
+    // care. Giving it a datetime costs nothing, since we only ever had a
+    // date to begin with.
+    //
+    // 11:00 UTC, not midnight: a client renders this in the VIEWER's
+    // timezone, and midnight UTC is the previous evening everywhere west of
+    // Greenwich -- which is why a 1996 movie in a channel read "Dec 31,
+    // 1995" across the Americas.
+    //
+    // An instant at hour H shows as the date we meant in every zone whose
+    // offset is in [-H, 24-H). World offsets span UTC-12 to UTC+14, 26 hours,
+    // so no single instant covers all of them and two hours' worth are always
+    // wrong. H=11 covers UTC-11 to UTC+12:59 -- every inhabited zone except
+    // UTC+13/+14 (NZ daylight, Samoa, Tonga, Kiribati) -- and is one better
+    // than midday, which also slips in New Zealand.
     const releaseDate = it.released || (it.year ? `${it.year}-01-01` : undefined);
     return {
       id: channelItemStreamId(it),
       title: it.title,
       season: 1,
       episode: i + 1,
-      released: releaseDate ? `${releaseDate}T00:00:00.000Z` : undefined,
+      released: releaseDate ? `${releaseDate}T11:00:00.000Z` : undefined,
       thumbnail: it.thumbnail || it.poster || payload.poster || undefined,
     };
   });

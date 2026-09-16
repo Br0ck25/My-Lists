@@ -6,6 +6,17 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 Fixed: air times did not appear, and a channel pick could show yesterday's date
+
+- **Air times were missing on shows you had recently opened.** The details cache is keyed by id, type and
+  region only — nothing about the shape of what it stores — so after the air-time deploy it kept handing
+  back copies written *before* it, with no air time in them, for up to two hours. The key now carries a
+  payload-shape version that a field change moves, which retires every stale copy at once.
+- **A movie in a Channel could show the previous day's date** — a 1996 film reading `Dec 31, 1995`. The
+  date was pinned to midnight UTC, which is the previous evening everywhere west of Greenwich. It is now
+  11:00 UTC, which holds the intended date from UTC-11 to UTC+12:45. (World offsets span 26 hours, so no
+  single instant is right in all of them; this one is wrong only at UTC+13/+14.)
+
 ### 🎬 Fixed: a movie in a Channel had no streams in Stremio
 
 - **Reported**: a movie added to a Channel could not be played in Stremio — PenguPlay found no stream for

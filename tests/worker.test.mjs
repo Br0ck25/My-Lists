@@ -10987,6 +10987,26 @@ describe("worker: channel video ids are real stream requests", () => {
 // These pin down what is asked of it, what is made of the answer, and that a
 // show it has never heard of -- or a streaming service with no slot -- degrades
 // to the date alone rather than to a guess.
+// A payload that gains a field is a payload whose stored copies are now the
+// wrong shape. The details cache is keyed by id/type/region only, so without a
+// shape segment a deploy keeps serving pre-change copies for up to two hours --
+// which is exactly why air times shipped and then did not appear.
+describe("worker: the details cache key tracks the payload shape", () => {
+  it("carries a shape version that a field change can move", () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "07_source-fetchers-tmdb-simkl.js"), "utf8");
+    const declared = /const ITEM_DETAILS_SHAPE = "(v\d+)"/.exec(src);
+    assert.ok(declared, "ITEM_DETAILS_SHAPE must be declared");
+    assert.match(src, /tmdb:itemdetails:\$\{ITEM_DETAILS_SHAPE\}:/,
+      "the key has to actually use it, or bumping it retires nothing");
+  });
+
+  it("puts a show opened before a shape change on a different key than after it", () => {
+    const keyFor = (shape) => `tmdb:itemdetails:${shape}:tt17371078:series:US`;
+    assert.notEqual(keyFor("v1"), keyFor("v2"),
+      "an entry written by the old code must be unreachable to the new code");
+  });
+});
+
 describe("worker: episode air times", () => {
   function loadAirTimeSource(fetchStub) {
     const sandbox = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "07_source-fetchers-tmdb-simkl.js");
@@ -11188,6 +11208,23 @@ describe("worker: a movie inside a channel", () => {
     const id = await savedConfig(env, [channelEntry([EPISODE, MOVIE])]);
     const res = await call(env, `/${id}/stream/series/tt0108778.json`);
     assert.deepEqual(res.body.streams, []);
+  });
+
+  it("dates a pick so it reads the same on every clock", () => {
+    // Midnight UTC is the previous evening anywhere west of Greenwich, which
+    // is how a 1996 movie in a channel came out as "Dec 31, 1995" in the US.
+    const meta = channelFns.buildChannelMeta(channelEntry([MOVIE, { ...EPISODE, released: "2009-02-19" }]), "https://example.com");
+    const dates = Array.from(meta.videos, (v) => v.released);
+    assert.deepEqual(dates, ["1999-01-01T11:00:00.000Z", "2009-02-19T11:00:00.000Z"]);
+    // World offsets span 26 hours, so no instant is right in all of them; this
+    // one holds from UTC-11 (American Samoa) to UTC+12:45 (Chatham).
+    dates.forEach((iso) => {
+      for (const offsetHours of [-11, -8, -5, -3, 0, 1, 5.5, 8, 10, 12, 12.75]) {
+        const shifted = new Date(new Date(iso).getTime() + offsetHours * 3600000);
+        assert.equal(shifted.toISOString().slice(0, 10), iso.slice(0, 10),
+          `${iso} slips a day at UTC${offsetHours >= 0 ? "+" : ""}${offsetHours}`);
+      }
+    });
   });
 
   it("still emits the movie's plain id in the channel meta", () => {
