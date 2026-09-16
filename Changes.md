@@ -41,7 +41,7 @@ alongside it caught the New Zealand case.
 landing on a different key than the new one, and a pick's date holding across eleven offsets from UTC-11
 to UTC+12:45.
 
-## 2026-09-16 - A movie in a Channel is no longer a dead end in Stremio
+## 2026-09-16 - A movie in a Channel: tried, reverted, documented as a limit
 
 ### Files Changed
 `05_catalog-core.js`, `25_api-catalog-routes.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`,
@@ -87,12 +87,26 @@ The route matches the id against that same set rather than parsing it. An id wit
 not proof of a movie -- a show's own bare id is a real request Stremio makes -- and offering the link there
 would be a dead link of a different kind.
 
+### Reverted, on the report that it did not work
+
+The deep link was tested in Stremio Web and does not work there. An `externalUrl` is treated as *leaving*
+Stremio: it routes through a `stremio.com/warning` interstitial ("It seems you are leaving Stremio") and
+then hands the `stremio://` scheme to the operating system. It may work in the desktop app, but where it
+was tested it was a dead end -- and a dead end that looks like a working option is worse than an empty
+stream list, which at least reads as "nothing here".
+
+So the stream resource, the route, and `channelMovieStreamIndex` are all removed, and the code comment now
+records the limit and what was tried, so the next person does not try the same thing.
+
+Asked which of the three real options to take -- proxy the person's own stream add-on (reliable, but this
+add-on would hold their debrid key), split a channel's movies into their own movie-typed row (reliable, but
+out of the channel's play order), or remove the dead link and document -- the answer was to remove and
+document.
+
 ### Tests
 
-`tests/worker.test.mjs` (7) -- the index picking up movies and ignoring episodes, disabled channels and
-non-channel entries; the resource declared only with a movie present; the route answering that one id and
-returning an empty list for an episode, a movie in nobody's channel, the movie type, and a show's bare id;
-a TMDB-only movie id; and the channel meta still emitting the movie's plain id.
+`tests/worker.test.mjs` (2) -- the channel meta still emitting the movie's plain id (what Nuvio resolves)
+with no stream resource declared and no stream route served, and a pick's date holding across offsets.
 
 ## 2026-09-16 - Episode air times, from the one source that actually has them
 

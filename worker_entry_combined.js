@@ -11466,13 +11466,6 @@ function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
   if (track) {
     resources.push({ name: "subtitles", types: ["movie", "series"], idPrefixes: ["tt", "tmdb", "kitsu"] });
   }
-  // Declared only for a config that actually has a movie inside a Channel --
-  // see the note above channelMovieStreamIndex. Declaring it unconditionally
-  // would have Stremio call this add-on for every episode anyone plays
-  // anywhere, to be told "no streams" every time.
-  if (channelMovieStreamIndex(active).size > 0) {
-    resources.push({ name: "stream", types: ["series"], idPrefixes: ["tt", "tmdb:"] });
-  }
   return {
     id: ADDON_ID,
     version: ADDON_VERSION,
@@ -13088,24 +13081,36 @@ async function fetchPublishedListCatalog(entry, env) {
     });
 }
 
-// --- a movie inside a channel ------------------------------------------
+// --- a movie inside a channel: a known limit ---------------------------
 //
 // A channel's meta is a SERIES, and Stremio does not re-derive a type per
 // video: tapping a movie in one asks every stream add-on for
 // /stream/series/<the movie's own imdb id>.json. Most stream add-ons branch
 // their whole handler on that type param before they ever look at the id, so
-// the request is answered with nothing -- reported from the field as "Stremio
+// the request is answered with nothing. Reported from the field as "Stremio
 // cannot find the movie, PenguPlay finds no stream", while Nuvio, which
-// resolves the id itself, plays it fine. Torrentio-style add-ons tend to be
-// lenient about id shape, which is why this looked like it worked for some
-// people and not others.
+// resolves the id itself, plays it fine; Torrentio-style add-ons are lenient
+// about id shape, which is why this works for some people and not others.
 //
-// Nothing here can make a third-party add-on answer a series request for a
-// movie. What it can do is make sure that request is not a dead end: this
-// add-on answers that one id itself, with a link straight to the movie's own
-// page, where every stream add-on is asked for it as a MOVIE and finds it.
-// See channelMovieStreamIndex below and the /stream route in
-// 25_api-catalog-routes.js.
+// Nothing here can change that. The type comes from the parent meta, and no
+// id shape gets around it: tt123:1:1 points at a season 1 episode 1 that does
+// not exist, and a bare number or a private prefix matches no idPrefixes
+// anywhere so no add-on is even asked. Attaching metadata to the video does
+// not change what a third-party add-on is asked for either.
+//
+// Tried and removed: answering that request here with a stream whose
+// externalUrl deep-linked to the movie's own page. Stremio Web treats an
+// externalUrl as leaving the app -- it routes through a stremio.com/warning
+// interstitial and then hands the stremio:// scheme to the OS -- so it was a
+// dead end where it was tested, and looked like a working option while not
+// being one.
+//
+// What does work is left to the person: play the movie from its own page, or
+// use a client that resolves the id itself. The two ways to fix this properly
+// both cost something the add-on should not spend on its own -- proxying the
+// person's own stream add-on (which means holding their debrid key) or
+// splitting a channel's movies into a separate movie-typed row (which takes
+// them out of the channel's play order).
 //
 // A stable string->int hash (not cryptographic, just needs to be a decent
 // spread) so each channel's shuffle looks independent of every other
@@ -13244,45 +13249,6 @@ function channelItemStreamId(it) {
   const episode = channelItemNumber(it.episode);
   if (season === null || episode === null) return "";
   return `${showId}:${season}:${episode}`;
-}
-
-// Every movie id reachable from this config's channels, mapped to what it is
-// called -- built from the config the request already resolved, so answering
-// a stream request costs no lookup and can never point at a movie that is not
-// actually in one of this person's channels.
-function channelMovieStreamIndex(entries) {
-  const index = new Map();
-  (entries || []).forEach((e) => {
-    if (!e || e.enabled === false) return;
-    String(e.url || "").split("\n").map((u) => u.trim()).filter(Boolean).forEach((subUrl) => {
-      const payload = parseChannelPayload(subUrl);
-      if (!payload) return;
-      payload.items.forEach((it) => {
-        if (!it || it.kind !== "movie") return;
-        const streamId = channelItemStreamId(it);
-        // The same id twice across two channels is one movie; first name wins.
-        if (streamId && !index.has(streamId)) {
-          index.set(streamId, { title: it.title || "", year: it.year || null });
-        }
-      });
-    });
-  });
-  return index;
-}
-
-// The one stream this add-on serves. Not a video -- it has none -- but a link
-// back to the movie's own detail page, which is where a stream add-on will
-// answer for it. `stremio:///detail/...` is handled by Stremio itself, so this
-// moves within the app rather than leaving it.
-function channelMovieStream(streamId, info) {
-  const name = (info && info.title) ? info.title : "this movie";
-  const encoded = encodeURIComponent(streamId);
-  return {
-    name: ADDON_NAME,
-    title: `Open ${name}\nStream add-ons list a movie under "movie", not as an episode`,
-    externalUrl: `stremio:///detail/movie/${encoded}/${encoded}`,
-    behaviorHints: { notWebReady: true },
-  };
 }
 
 function buildChannelMeta(entry, origin) {
@@ -61734,36 +61700,6 @@ async function handleFetch(request, env, ctx) {
       return jsonPublic({ subtitles: [] });
     }
 
-    // /:config/stream/:type/:id.json
-    //
-    // This add-on has no streams of its own and declares this resource only
-    // for a config with a movie inside a Channel (see channelMovieStreamIndex,
-    // 05_catalog-core.js). That movie is the one video Stremio asks the world
-    // for under type "series", which is why no stream add-on answers it; the
-    // answer here is a link to the movie's own page, where they all do.
-    //
-    // Everything else gets an empty list, including every episode, which is
-    // what this route is asked about most.
-    m = path.match(/^\/([^/]+)\/stream\/(movie|series)\/([^/]+?)(?:\/[^/]+)?\.json$/);
-    if (m) {
-      const [, configParam, stremioType, rawId] = m;
-      if (stremioType !== "series") return jsonPublic({ streams: [] });
-      try {
-        const { entries } = await resolveConfig(configParam, env);
-        const index = channelMovieStreamIndex(entries);
-        // Matched against this person's own channels rather than parsed out
-        // of the id: an id with no season and episode is not proof of a
-        // movie, and offering this on a show's id would be a dead link.
-        const info = index.get(decodeURIComponent(rawId));
-        if (!info) return jsonPublic({ streams: [] });
-        return jsonPublic({ streams: [channelMovieStream(decodeURIComponent(rawId), info)] });
-      } catch (err) {
-        // A stream list is not worth an error page: the video simply has
-        // nothing extra offered for it.
-        return jsonPublic({ streams: [] });
-      }
-    }
-
     if (path === "/app.webmanifest") {
       // background_color (the splash-screen fill while the PWA cold-starts)
       // and theme_color (the OS status bar / task-switcher chrome color for
@@ -61822,7 +61758,6 @@ Disallow: /*/configure
 Disallow: /*/manifest.json
 Disallow: /*/catalog/
 Disallow: /*/subtitles/
-Disallow: /*/stream/
 
 Sitemap: ${url.origin}/sitemap.xml`;
       return new Response(robots, {

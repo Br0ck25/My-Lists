@@ -17,24 +17,24 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
   11:00 UTC, which holds the intended date from UTC-11 to UTC+12:45. (World offsets span 26 hours, so no
   single instant is right in all of them; this one is wrong only at UTC+13/+14.)
 
-### 🎬 Fixed: a movie in a Channel had no streams in Stremio
+### 🎬 Known limit, documented: a movie in a Channel may have no streams in strict add-ons
 
-- **Reported**: a movie added to a Channel could not be played in Stremio — PenguPlay found no stream for
-  it — while Nuvio played it fine.
-- **Why**: a Channel's metadata is a *series*, and Stremio does not work out a type per video. Tapping a
-  movie in one asks every stream add-on for `/stream/series/<the movie's own IMDb id>.json`. Most stream
-  add-ons branch on that `type` before they ever look at the id, so the request comes back empty.
-  Torrentio-style add-ons tend to be lenient about id shape, which is why this worked for some people and
-  not others; Nuvio resolves the id itself, which is why it never broke.
-- **Nothing can make a third-party add-on answer a series request for a movie.** What this does is stop
-  that request being a dead end: the add-on now answers that one id itself, with a **link straight to the
-  movie's own page**, where every stream add-on is asked for it as a movie and finds it. One tap instead
-  of nothing.
-- **The video's id is unchanged**, so Nuvio keeps resolving and playing it directly as it does today.
-- **Declared only where it is needed.** The `stream` resource appears in your manifest only if one of your
-  enabled Channels actually contains a movie — otherwise Stremio would call this add-on for every episode
-  anyone plays, to be told "no streams" every time. Episodes, movies in nobody's Channel, and a show's own
-  bare id all get an empty list.
+- **What happens**: a movie added to a Channel plays in Nuvio and in lenient add-ons (Torrentio-style), and
+  shows no streams in strict ones (PenguPlay). A Channel's metadata is a *series*, and Stremio does not
+  work out a type per video — so tapping a movie asks every stream add-on for
+  `/stream/series/<the movie's own IMDb id>.json`, and add-ons that branch on that `type` before reading
+  the id answer with nothing.
+- **This cannot be fixed from inside the add-on.** The type comes from the parent metadata, and no id shape
+  gets around it: `tt123:1:1` points at a season 1 episode 1 that does not exist, and a bare number or a
+  private prefix matches no `idPrefixes` anywhere, so no add-on is even asked.
+- **Tried and removed**: answering that request with a link to the movie's own page. Stremio Web treats an
+  external link as *leaving* Stremio — it routes through a `stremio.com/warning` interstitial and then
+  hands the `stremio://` scheme to the operating system — so it was a dead end that looked like a working
+  option. It is gone rather than left in place looking useful.
+- **What works today**: open the movie from its own page, or use a client that resolves the id itself.
+  The two ways to fix this properly each cost something real — proxying your own stream add-on (which means
+  this add-on holding your debrid key) or splitting a Channel's movies into a separate movie row (which
+  takes them out of the Channel's play order) — so neither is done on the add-on's own initiative.
 
 ### 🕒 Episode air times: `9 PM ET` under the air date
 

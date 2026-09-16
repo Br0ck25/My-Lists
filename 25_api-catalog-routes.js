@@ -613,36 +613,6 @@ async function handleFetch(request, env, ctx) {
       return jsonPublic({ subtitles: [] });
     }
 
-    // /:config/stream/:type/:id.json
-    //
-    // This add-on has no streams of its own and declares this resource only
-    // for a config with a movie inside a Channel (see channelMovieStreamIndex,
-    // 05_catalog-core.js). That movie is the one video Stremio asks the world
-    // for under type "series", which is why no stream add-on answers it; the
-    // answer here is a link to the movie's own page, where they all do.
-    //
-    // Everything else gets an empty list, including every episode, which is
-    // what this route is asked about most.
-    m = path.match(/^\/([^/]+)\/stream\/(movie|series)\/([^/]+?)(?:\/[^/]+)?\.json$/);
-    if (m) {
-      const [, configParam, stremioType, rawId] = m;
-      if (stremioType !== "series") return jsonPublic({ streams: [] });
-      try {
-        const { entries } = await resolveConfig(configParam, env);
-        const index = channelMovieStreamIndex(entries);
-        // Matched against this person's own channels rather than parsed out
-        // of the id: an id with no season and episode is not proof of a
-        // movie, and offering this on a show's id would be a dead link.
-        const info = index.get(decodeURIComponent(rawId));
-        if (!info) return jsonPublic({ streams: [] });
-        return jsonPublic({ streams: [channelMovieStream(decodeURIComponent(rawId), info)] });
-      } catch (err) {
-        // A stream list is not worth an error page: the video simply has
-        // nothing extra offered for it.
-        return jsonPublic({ streams: [] });
-      }
-    }
-
     if (path === "/app.webmanifest") {
       // background_color (the splash-screen fill while the PWA cold-starts)
       // and theme_color (the OS status bar / task-switcher chrome color for
@@ -701,7 +671,6 @@ Disallow: /*/configure
 Disallow: /*/manifest.json
 Disallow: /*/catalog/
 Disallow: /*/subtitles/
-Disallow: /*/stream/
 
 Sitemap: ${url.origin}/sitemap.xml`;
       return new Response(robots, {
