@@ -6,6 +6,42 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🔧 Channels: fixes from the first round of use
+
+- **A Spotlight channel took episodes its subject is not in.** Tobey Maguire's single guest
+  appearance in Roseanne put *ten* Roseanne episodes into the channel, because a TV credit meant
+  "take this show's first N episodes". It now asks which episodes are actually his: a season's own
+  `credits.cast` is that season's regulars (who are in every episode of it without being listed on
+  each one), and each episode's `guest_stars` and `crew` name everyone else — so a regular
+  contributes the whole season and a one-episode guest contributes one episode. Directing credits
+  count too, so a director's spotlight is the episodes they *made*.
+- **"Add everything" now means everything** — every film, and every episode of every show, with no
+  per-show slice and no four-show cap.
+- **The whole lot is ordered together.** Films first and television after read as broken: a 1993
+  guest spot played *after* a 2022 film in what was supposed to be career order. Films and episodes
+  are now sorted as one set, so each episode sits where it belongs among the films. Best-first ranks
+  an episode by its show's rating, which keeps a show's run together.
+- **Per-show precision.** In a filmography, a show's button adds only that person's episodes; its
+  poster still opens the full season-and-episode picker.
+- **Re-sharing a channel you published was refused as someone else's.** An unlisted re-share proved
+  nothing about who was sending it, so the ownership check on the record it was overwriting turned
+  down the record's own owner. Credentials now go with a re-share as well as a publish.
+- **The share link was unreachable once the modal closed.** A channel that has been shared now
+  carries **Copy link** on its card, and a published one shows its link in the Explore Channels
+  publish panel. **Share** became **Update link** for a channel that already has one, which is what
+  it does.
+- **Dialogs no longer scroll sideways.** A share URL has no spaces to break at, so it widened the
+  modal past the screen. Long words now wrap.
+- **Explore Channels cards open.** Tapping one — or **See all** — shows every show, film and
+  episode in that channel before you decide to add it. Looking at a channel no longer files it
+  under My Channels.
+- **The generated channel poster showed no text in Nuvio** while Stremio drew it correctly. The SVG
+  named `-apple-system`/`BlinkMacSystemFont` and a quoted `'Segoe UI'`, used numeric font weights,
+  and wrapped the channel name in an `feDropShadow` filter — a rasterizer that resolves none of
+  those fonts, or drops a filtered subtree it cannot render, loses the text while drawing everything
+  else. It is now `Arial, Helvetica, sans-serif`, `font-weight="bold"`, explicit `x`/`y` on every
+  `<text>`, and the name's shadow is a second offset copy rather than a filter.
+
 ### 📺 Channels: broadcast scheduling, smart rules, sharing and a directory
 
 Ten additions, all of them in the Channels tab. The three that change how an existing channel

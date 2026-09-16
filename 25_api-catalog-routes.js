@@ -1254,7 +1254,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
   <image x="100" y="300" width="400" height="240" preserveAspectRatio="xMidYMid meet" href="${dataUri}"/>
   <g transform="translate(300, 780)">
     <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGradP)"/>
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
   </g>
 </svg>`;
 
@@ -2074,8 +2074,12 @@ function generateSearchVariations(query) {
       const personId = (url.searchParams.get("personId") || "").trim();
       if (!/^[0-9]+$/.test(personId)) return json({ ok: false, error: "Missing personId." }, 400);
       const sort = url.searchParams.get("sort") === "rating" ? "rating" : "chronological";
-      const movieLimit = Math.min(Math.max(parseInt(url.searchParams.get("movies") || "12", 10) || 12, 0), 40);
-      const showLimit = Math.min(Math.max(parseInt(url.searchParams.get("shows") || "4", 10) || 4, 0), 12);
+      // A filmography is the whole point here, so the ceilings are a career
+      // rather than a shelf. Popularity still decides the ORDER these are
+      // cut in (see byWeight below), so asking for fewer gives the best of
+      // them rather than an arbitrary slice.
+      const movieLimit = Math.min(Math.max(parseInt(url.searchParams.get("movies") || "12", 10) || 12, 0), 120);
+      const showLimit = Math.min(Math.max(parseInt(url.searchParams.get("shows") || "4", 10) || 4, 0), 60);
       try {
         ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
         const [personRes, creditsRes] = await Promise.all([
@@ -2154,6 +2158,108 @@ function generateSearchVariations(query) {
           backdrop: (movies[0] && movies[0].backdrop) || (shows[0] && shows[0].backdrop) || null,
           movies,
           shows,
+        }, 200, { "Cache-Control": "public, max-age=86400" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/person-show-episodes?personId=<id>&tmdbId=<show id>
+    //   -> { ok, imdbId, showName, poster, backdrop, regular, episodes: [...] }
+    //
+    // The episodes of one show that a given person is ACTUALLY in.
+    //
+    // A Spotlight channel used to take a show's first N episodes whenever a
+    // person had any TV credit on it, so Tobey Maguire's single guest
+    // appearance in Roseanne put ten Roseanne episodes into the channel --
+    // nine of which he is not in. TMDB does not answer "which episodes" in
+    // one call, but it does carry the two facts that settle it:
+    //
+    //   * a season's own `credits.cast` is that season's REGULARS, who are
+    //     in every episode of it without being listed on each one;
+    //   * each episode's `guest_stars` and `crew` name everyone else --
+    //     which is where a one-episode guest, and a director, turn up.
+    //
+    // So: a regular contributes the whole season, and anyone else
+    // contributes exactly the episodes that name them.
+    if (path === "/api/person-show-episodes") {
+      const personId = (url.searchParams.get("personId") || "").trim();
+      const tmdbId = (url.searchParams.get("tmdbId") || "").trim();
+      if (!/^[0-9]+$/.test(personId) || !/^[0-9]+$/.test(tmdbId)) {
+        return json({ ok: false, error: "Missing personId or tmdbId." }, 400);
+      }
+      const wantedPerson = parseInt(personId, 10);
+      try {
+        const showRes = await fetch(
+          `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+        );
+        if (!showRes.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${showRes.status}).` });
+        const show = await showRes.json();
+        const imdbId = (show.external_ids && show.external_ids.imdb_id) || `tmdb:${tmdbId}`;
+        const showPoster = show.poster_path ? `https://image.tmdb.org/t/p/w500${show.poster_path}` : "";
+        const showBackdrop = show.backdrop_path ? `https://image.tmdb.org/t/p/w780${show.backdrop_path}` : "";
+        // Specials (season 0) are left out: they are recaps, gag reels and
+        // clip shows as often as they are episodes, and a channel built out
+        // of them plays badly.
+        const seasons = (show.seasons || [])
+          .filter((s) => s && s.season_number > 0)
+          .map((s) => s.season_number)
+          .slice(0, PERSON_SHOW_MAX_SEASONS);
+        let anyRegular = false;
+        const perSeason = await mapWithConcurrency(seasons, 4, async (seasonNumber) => {
+          try {
+            const sRes = await fetch(
+              `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/season/${seasonNumber}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=credits`,
+              { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+            );
+            if (!sRes.ok) return [];
+            const sData = await sRes.json();
+            const seasonCast = (sData.credits && Array.isArray(sData.credits.cast)) ? sData.credits.cast : [];
+            const seasonCrew = (sData.credits && Array.isArray(sData.credits.crew)) ? sData.credits.crew : [];
+            const isRegular =
+              seasonCast.some((c) => c && c.id === wantedPerson) ||
+              seasonCrew.some((c) => c && c.id === wantedPerson && /^(creator|executive producer)$/i.test(String(c.job || "")));
+            if (isRegular) anyRegular = true;
+            const out = [];
+            for (const ep of (sData.episodes || [])) {
+              if (!ep || !Number.isInteger(ep.episode_number)) continue;
+              if (!isRegular) {
+                const named =
+                  (ep.guest_stars || []).some((g) => g && g.id === wantedPerson) ||
+                  (ep.crew || []).some((c) => c && c.id === wantedPerson);
+                if (!named) continue;
+              }
+              const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+              out.push({
+                season: seasonNumber,
+                episode: ep.episode_number,
+                name: ep.name || `Episode ${ep.episode_number}`,
+                released: ep.air_date || "",
+                thumbnail: stillUrl,
+              });
+            }
+            return out;
+          } catch {
+            return [];
+          }
+        });
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 1 + seasons.length));
+        const episodes = [];
+        for (const run of perSeason) episodes.push(...run);
+        episodes.sort((a, b) => (a.season - b.season) || (a.episode - b.episode));
+        return json({
+          ok: true,
+          imdbId,
+          showName: show.name || "",
+          poster: showPoster,
+          backdrop: showBackdrop,
+          // True when the person is a season regular somewhere in this show,
+          // which is what "every episode of that season" above is standing
+          // on -- surfaced so the client can say which of the two answers
+          // it got rather than presenting a guess as a fact.
+          regular: anyRegular,
+          episodes: episodes.slice(0, PERSON_SHOW_MAX_EPISODES),
         }, 200, { "Cache-Control": "public, max-age=86400" });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });

@@ -11644,3 +11644,237 @@ describe("worker: the Explore Channels directory", () => {
     assert.equal((await call(env, "/api/channel/directory")).body.channels.length, 1);
   });
 });
+
+// --- the episodes a person is actually in --------------------------------
+//
+// A Spotlight channel used to take a show's first N episodes whenever a
+// person had any credit on it, so a single guest appearance in Roseanne put
+// ten Roseanne episodes into the channel. These pin down the two facts that
+// settle which episodes are really theirs.
+describe("worker: a person's own episodes in a show", () => {
+  const SHOW = {
+    id: 99, name: "Roseanne", poster_path: "/p.jpg", backdrop_path: "/b.jpg",
+    external_ids: { imdb_id: "tt0094540" },
+    seasons: [
+      { season_number: 0, name: "Specials" },
+      { season_number: 1, name: "Season 1" },
+      { season_number: 2, name: "Season 2" },
+    ],
+  };
+  const episode = (n, over = {}) => ({
+    episode_number: n, name: "Episode " + n, air_date: "1993-0" + n + "-01",
+    still_path: null, guest_stars: [], crew: [], ...over,
+  });
+
+  function seasonRoutes(fetchImpl) {
+    return fetchImpl;
+  }
+
+  // The harness's Worker talks to the real TMDB host, so these tests stub
+  // global fetch for the duration and assert on what the route made of the
+  // answers rather than on the network.
+  function withTmdb(handler, run) {
+    const real = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const u = String(input && input.url ? input.url : input);
+      const body = handler(u);
+      if (body === undefined) return new Response("{}", { status: 404 });
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    return run().finally(() => { globalThis.fetch = real; });
+  }
+
+  it("takes one episode for a one-episode guest, not the season", async () => {
+    const env = makeEnv();
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      if (u.includes("/season/1?")) {
+        return {
+          credits: { cast: [{ id: 1 }], crew: [] },
+          episodes: [episode(1), episode(2, { guest_stars: [{ id: 2157 }] }), episode(3)],
+        };
+      }
+      if (u.includes("/season/2?")) return { credits: { cast: [{ id: 1 }], crew: [] }, episodes: [episode(1)] };
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=2157&tmdbId=99");
+      assert.equal(res.body.ok, true);
+      assert.equal(res.body.regular, false);
+      assert.deepEqual(res.body.episodes.map((e) => e.season + "x" + e.episode), ["1x2"]);
+      assert.equal(res.body.imdbId, "tt0094540");
+    });
+  });
+
+  it("takes the whole season for a season regular, who is on no episode's own credits", async () => {
+    const env = makeEnv();
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      if (u.includes("/season/1?")) {
+        return { credits: { cast: [{ id: 2157 }], crew: [] }, episodes: [episode(1), episode(2), episode(3)] };
+      }
+      if (u.includes("/season/2?")) return { credits: { cast: [{ id: 5 }], crew: [] }, episodes: [episode(1)] };
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=2157&tmdbId=99");
+      assert.equal(res.body.regular, true);
+      assert.deepEqual(res.body.episodes.map((e) => e.season + "x" + e.episode), ["1x1", "1x2", "1x3"]);
+    });
+  });
+
+  it("counts a directing credit on an episode, not only an acting one", async () => {
+    const env = makeEnv();
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      if (u.includes("/season/1?")) {
+        return {
+          credits: { cast: [], crew: [] },
+          episodes: [episode(1), episode(2, { crew: [{ id: 525, job: "Director" }] })],
+        };
+      }
+      if (u.includes("/season/2?")) return { credits: { cast: [], crew: [] }, episodes: [episode(1)] };
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=525&tmdbId=99");
+      assert.deepEqual(res.body.episodes.map((e) => e.season + "x" + e.episode), ["1x2"]);
+    });
+  });
+
+  it("leaves specials out and keeps the rest in broadcast order", async () => {
+    const env = makeEnv();
+    let askedSeasons = [];
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      const m = u.match(/\/season\/(\d+)\?/);
+      if (m) {
+        askedSeasons.push(Number(m[1]));
+        return { credits: { cast: [{ id: 2157 }], crew: [] }, episodes: [episode(2), episode(1)] };
+      }
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=2157&tmdbId=99");
+      assert.deepEqual(askedSeasons.sort(), [1, 2], "season 0 is never asked for");
+      assert.deepEqual(res.body.episodes.map((e) => e.season + "x" + e.episode), ["1x1", "1x2", "2x1", "2x2"]);
+    });
+  });
+
+  it("answers an empty list rather than everything when the person is in none of it", async () => {
+    const env = makeEnv();
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      if (u.includes("/season/")) return { credits: { cast: [{ id: 1 }], crew: [] }, episodes: [episode(1), episode(2)] };
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=2157&tmdbId=99");
+      assert.equal(res.body.ok, true);
+      assert.deepEqual(res.body.episodes, []);
+    });
+  });
+
+  it("rejects a personId or tmdbId that is not a number", async () => {
+    const env = makeEnv();
+    assert.equal((await call(env, "/api/person-show-episodes?personId=abc&tmdbId=99")).status, 400);
+    assert.equal((await call(env, "/api/person-show-episodes?personId=1")).status, 400);
+  });
+});
+
+describe("worker: re-sharing a channel you published", () => {
+  const ep = () => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" });
+  const channelOf = (over = {}) => ({ name: "Block Party", items: [ep()], ...over });
+
+  // The bug: an unlisted re-share proved nothing, so the owner check on the
+  // record it was overwriting refused its own owner.
+  it("lets the owner re-share a channel they published, unlisted", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const again = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: {
+        channel: channelOf({ name: "Block Party II" }),
+        code: published.body.code,
+        creatorName: "alice", creatorKey: alice.creatorKey,
+      },
+    });
+    assert.equal(again.body.ok, true);
+    assert.equal(again.body.code, published.body.code);
+    assert.equal((await call(env, `/api/channel/share?code=${published.body.code}`)).body.channel.name, "Block Party II");
+  });
+
+  it("still refuses a stranger, credentials or not", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const bob = await createUser(env, "bob");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const asBob = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf({ name: "Hijacked" }), code: published.body.code, creatorName: "bob", creatorKey: bob.creatorKey },
+    });
+    assert.equal(asBob.status, 403);
+    const anonymous = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf({ name: "Hijacked" }), code: published.body.code },
+    });
+    assert.equal(anonymous.status, 403);
+    assert.equal((await call(env, `/api/channel/share?code=${published.body.code}`)).body.channel.name, "Block Party");
+  });
+
+  // Bad credentials on an unlisted share are not proof, but they must not be
+  // a refusal either -- the share still has to work, just without an owner.
+  it("treats a wrong key on an unlisted share as no proof rather than an error", async () => {
+    const env = makeEnv();
+    await createUser(env, "alice");
+    const shared = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), creatorName: "alice", creatorKey: "WRONG-KEY" },
+    });
+    assert.equal(shared.body.ok, true);
+    const fetched = await call(env, `/api/channel/share?code=${shared.body.code}`);
+    assert.equal(fetched.body.owner, "", "it did not get to claim alice");
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, [], "and it is not listed");
+  });
+});
+
+describe("worker: the generated channel poster", () => {
+  const posterFns = loadSourceFunctions("05_catalog-core.js");
+
+  // Every non-text element rendered in Nuvio and every <text> did not, while
+  // Stremio drew the lot -- the signature of a rasterizer that resolves no
+  // font at all rather than falling back. These keep the SVG to what the
+  // least capable renderer in the wild can draw.
+  it("names only fonts a bare rasterizer can resolve", () => {
+    const svg = posterFns.generateChannelPosterSvg("Tobey Maguire Spotlight");
+    const families = svg.match(/font-family="[^"]*"/g) || [];
+    assert.ok(families.length, "the poster does have text on it");
+    families.forEach((f) => {
+      assert.equal(/-apple-system|BlinkMacSystemFont|'/.test(f), false, `vendor or quoted family name: ${f}`);
+      assert.match(f, /sans-serif/, "and a generic family to fall back to");
+    });
+  });
+
+  it("uses a weight keyword rather than a numeric weight", () => {
+    const svg = posterFns.generateChannelPosterSvg("Tobey Maguire Spotlight");
+    assert.equal(/font-weight="\d/.test(svg), false);
+  });
+
+  it("draws the name's shadow without a filter, so a dropped filter cannot take the name with it", () => {
+    const svg = posterFns.generateChannelPosterSvg("Tobey Maguire Spotlight");
+    assert.equal(/<text[^>]*filter=/.test(svg), false);
+    assert.equal(/<g filter="url\(#shadow\)"/.test(svg), false);
+    assert.ok(svg.includes("TOBEY"), "and the name is in there twice -- shadow and face");
+    assert.equal((svg.match(/TOBEY/g) || []).length, 2);
+  });
+
+  it("gives every text element an explicit x and y", () => {
+    const svg = posterFns.generateChannelPosterSvg("Test");
+    (svg.match(/<text[^>]*>/g) || []).forEach((t) => {
+      assert.match(t, /\bx="/, t);
+      assert.match(t, /\by="/, t);
+    });
+  });
+});

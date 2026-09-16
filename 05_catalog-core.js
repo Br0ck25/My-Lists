@@ -368,11 +368,12 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
     <path d="M-90,-105 Q-45,-130 0,-105 T90,-105" fill="none" stroke="url(#accentGrad)" stroke-width="4.5" stroke-linecap="round" opacity="0.85" />
 
     <!-- Channel Name Rendered STRICTLY Inside the TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="170" cy="115" r="6" fill="#007AFF" opacity="0.8" />
@@ -382,7 +383,7 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
   <!-- Bottom TV Channel Pill Badge -->
   <g transform="translate(300, 780)">
     <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGrad)" />
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
   </g>
 </svg>`;
 }
@@ -475,11 +476,12 @@ function generateChannelBackdropSvg(name, backdropUrl = "") {
     <path d="M-34,-24 Q-17,-32 0,-24 T34,-24" fill="none" stroke="url(#accentGradL)" stroke-width="1.5" stroke-linecap="round" opacity="0.8" />
 
     <!-- Channel Name Rendered STRICTLY Inside TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="86" cy="25" r="2.5" fill="#007AFF" opacity="0.8" />
@@ -582,13 +584,13 @@ function generateBadgedPosterSvg({ posterUrl, airDateText, bottomText, bottomBg,
   const topBadgeSvg = safeAirDate ? `
     <g transform="translate(24, 24)">
       <rect x="0" y="0" width="${topPillWidth}" height="72" rx="16" ry="16" fill="#007aff" fill-opacity="0.95" stroke="#66b8ff" stroke-width="3.5" filter="drop-shadow(0px 6px 12px rgba(0,0,0,0.8))"/>
-      <text x="${topPillWidth / 2}" y="49" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="36" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
+      <text x="${topPillWidth / 2}" y="49" font-family="Arial, Helvetica, sans-serif" font-size="36" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
     </g>` : '';
 
   const bottomBadgeSvg = safeBottom ? `
     <g transform="translate(250, 715)">
       <rect x="${-bottomPillWidth / 2}" y="-84" width="${bottomPillWidth}" height="84" rx="20" ry="20" fill="${bottomBg || '#ff9f0a'}" fill-opacity="0.95" stroke="${bottomBorder || 'rgba(255,159,10,0.7)'}" stroke-width="4.5" filter="drop-shadow(0px 8px 16px rgba(0,0,0,0.85))"/>
-      <text x="0" y="-30" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="38" font-weight="900" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
+      <text x="0" y="-30" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="bold" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
     </g>` : '';
 
   const topGradient = safeAirDate ? `
@@ -683,7 +685,7 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   <!-- Safe Badge Pill at top -->
   <g transform="translate(250, 60)" filter="url(#safeShadow)">
     <rect x="-140" y="0" width="280" height="42" rx="21" ry="21" fill="url(#shieldGrad)"/>
-    <text x="0" y="27" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="800" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
+    <text x="0" y="27" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
   </g>
 
   <!-- Central Shield / Film Icon -->
@@ -696,21 +698,21 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   </g>
 
   <!-- Title -->
-  <text x="250" y="${titleStartY}" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="34" font-weight="800" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
+  <text x="250" y="${titleStartY}" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="bold" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
     ${titleTextSpans}
   </text>
 
   <!-- Metadata: Type & Year -->
   <g transform="translate(250, 560)">
     <rect x="-90" y="-18" width="180" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="700" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
       ${safeType}${safeYear ? ' • ' + safeYear : ''}
     </text>
   </g>
 
   <!-- Certification / Footer -->
   <g transform="translate(250, 680)">
-    <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
+    <text x="0" y="0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
       ${safeCert ? safeCert + ' • ' : ''}AGE-APPROPRIATE FILTER ACTIVE
     </text>
   </g>

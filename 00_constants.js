@@ -49,6 +49,14 @@ const SHARED_CHANNEL_BYTES_MAX = 4000000;
 // on every visit to the tab, so this is a page-weight budget as much as a
 // storage one; the oldest listing falls off when a new one arrives.
 const PUBLIC_CHANNEL_INDEX_MAX = 500;
+
+// A Spotlight channel reads one show a season at a time to find the episodes
+// its subject is actually in (see /api/person-show-episodes). These bound
+// what one show can cost and contribute: a soap with 40 seasons would
+// otherwise be 40 TMDB calls, and a series regular on a 300-episode run
+// would drown every other credit in the channel.
+const PERSON_SHOW_MAX_SEASONS = 20;
+const PERSON_SHOW_MAX_EPISODES = 400;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 10 * 1024 * 1024;        // 10 MB of serialized JSON
 

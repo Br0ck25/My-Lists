@@ -2315,11 +2315,26 @@
         return json({ ok: false, error: "That channel has nothing playable in it to share." }, 400);
       }
       const publish = !!body.publish;
+      // Who is writing, when they say so.
+      //
+      // Publishing REQUIRES it -- a listing everyone can see needs an owner
+      // who can take it down. An unlisted share does not, but it may still
+      // carry credentials, and it has to: re-sharing writes over an existing
+      // record, and one created by publishing has an owner, so a re-share
+      // that proved nothing was refused as someone else's link by the very
+      // person who owned it.
       let owner = "";
       if (publish) {
         const auth = await authenticateCreator(body.creatorName, body.creatorKey);
         if (!auth.ok) return authFailureResponse(auth);
         owner = auth.username;
+      } else if (body.creatorName && body.creatorKey) {
+        // Best-effort: bad credentials on an unlisted share are simply not
+        // proof, and fall through to the unowned path below. They cannot
+        // buy access to someone else's record either way -- the ownership
+        // check is against `owner`, which stays "" unless this succeeded.
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (auth.ok) owner = auth.username;
       }
       const description = String(body.description || "").trim().slice(0, SHARED_CHANNEL_DESCRIPTION_MAX);
       // Reusing the code someone already has is what makes "Share" on an

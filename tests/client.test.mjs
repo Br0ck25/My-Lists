@@ -5103,12 +5103,12 @@ describe("client: browsing an actor or director's filmography", () => {
     assert.match(asked[1].url, /sort=rating/);
   });
 
-  it("asks for a browsable number of credits, not just a channel's worth", async () => {
+  it("asks for a whole filmography, not just a channel's worth", async () => {
     const client = personClient();
     await client.call("browseChannelPerson", "2157", "Robin Williams");
     const asked = requestsTo(client, "/api/person-credits")[0];
-    assert.match(asked.url, /movies=40/);
-    assert.match(asked.url, /shows=12/);
+    assert.match(asked.url, /movies=120/);
+    assert.match(asked.url, /shows=60/);
   });
 
   it("adds every film into the draft, resolving each to an IMDb id first", async () => {
@@ -5117,37 +5117,39 @@ describe("client: browsing an actor or director's filmography", () => {
         const tmdbId = new URL(req.url).searchParams.get("tmdbId");
         return { json: { ok: true, imdbId: "tt000" + tmdbId } };
       },
-      "/api/show-seasons": () => ({ json: { ok: false } }),
+      "/api/person-show-episodes": () => ({ json: { ok: true, imdbId: "tt_mm", showName: "Mork & Mindy", regular: false, episodes: [] } }),
     });
     client.set("channelDraftItems", []);
     await client.call("browseChannelPerson", "2157", "Robin Williams");
     await client.call("addWholeSpotlightToDraft", null);
     const draft = client.get("channelDraftItems");
-    assert.deepEqual(plain(draft.map((it) => it.imdbId)), ["tt0001", "tt0002"]);
+    assert.deepEqual(plain(draft.map((it) => it.imdbId).sort()), ["tt0001", "tt0002"]);
     assert.equal(draft[0].kind, "movie");
     assert.equal(el(client, "channelNameInput").value, "Robin Williams Spotlight");
   });
 
-  it("keeps the server's ordering by leaving the draft on 'As listed'", async () => {
+  it("puts the picks in career order and leaves the draft on 'As listed'", async () => {
     const client = personClient({
       "/api/resolve-movie": (req) => ({ json: { ok: true, imdbId: "tt00" + new URL(req.url).searchParams.get("tmdbId") } }),
-      "/api/show-seasons": () => ({ json: { ok: false } }),
+      "/api/person-show-episodes": () => ({ json: { ok: true, imdbId: "tt_mm", showName: "Mork & Mindy", regular: false, episodes: [] } }),
     });
     client.set("channelDraftItems", []);
+    client.call("setChannelSpotlightSort", "chronological");
     await client.call("browseChannelPerson", "2157", "Robin Williams");
     await client.call("addWholeSpotlightToDraft", null);
-    assert.equal(client.call("getChannelPlayOrder"), "as-listed");
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed",
+      "the order has just been applied, so nothing may re-sort it on the next render");
     assert.deepEqual(
       plain(client.get("channelDraftItems").map((it) => it.title)),
-      ["Good Will Hunting", "Aladdin"],
-      "career order as the server returned it, not re-sorted here"
+      ["Aladdin", "Good Will Hunting"],
+      "1992 before 1997"
     );
   });
 
   it("adds to an existing draft instead of replacing what is already in it", async () => {
     const client = personClient({
       "/api/resolve-movie": (req) => ({ json: { ok: true, imdbId: "tt00" + new URL(req.url).searchParams.get("tmdbId") } }),
-      "/api/show-seasons": () => ({ json: { ok: false } }),
+      "/api/person-show-episodes": () => ({ json: { ok: true, imdbId: "tt_mm", showName: "Mork & Mindy", regular: false, episodes: [] } }),
     });
     client.set("channelDraftItems", [{ kind: "movie", imdbId: "tt_existing", title: "Already here" }]);
     await client.call("browseChannelPerson", "2157", "Robin Williams");
@@ -5162,5 +5164,210 @@ describe("client: browsing an actor or director's filmography", () => {
     assert.ok(client.get("channelPersonCredits"));
     client.call("setChannelSearchType", "tv", null);
     assert.equal(client.get("channelPersonCredits"), null);
+  });
+});
+
+// --- the spotlight builder ------------------------------------------------
+describe("client: adding a whole spotlight", () => {
+  const CREDITS = {
+    ok: true,
+    name: "Tobey Maguire",
+    poster: "https://img/tm.jpg",
+    backdrop: null,
+    movies: [
+      { tmdbId: 557, type: "movie", title: "Spider-Man", year: "2002", released: "2002-05-03", rating: 7.2, votes: 9000, poster: "", backdrop: "", role: "Peter" },
+      { tmdbId: 5, type: "movie", title: "Babylon", year: "2022", released: "2022-12-23", rating: 7.1, votes: 3000, poster: "", backdrop: "", role: "Self" },
+    ],
+    shows: [
+      { tmdbId: 99, type: "tv", title: "Roseanne", year: "1988", released: "1988-10-18", rating: 6.9, votes: 400, poster: "", backdrop: "", role: "Guest" },
+    ],
+  };
+
+  function spotlightClient(over = {}) {
+    return loadClient({
+      routes: {
+        "/api/person-credits": () => ({ json: CREDITS }),
+        "/api/resolve-movie": (req) => ({ json: { ok: true, imdbId: "tt" + new URL(req.url).searchParams.get("tmdbId") } }),
+        "/api/person-show-episodes": () => ({
+          json: {
+            ok: true, imdbId: "tt0094540", showName: "Roseanne", poster: "", backdrop: "", regular: false,
+            episodes: [{ season: 5, episode: 12, name: "Crime and Punishment", released: "1993-01-12", thumbnail: "" }],
+          },
+        }),
+        ...over,
+      },
+    });
+  }
+
+  it("adds every film and every episode the person is in, with no cap", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    const draft = client.get("channelDraftItems");
+    assert.equal(draft.length, 3, "two films and the one episode he is in");
+    assert.equal(draft.filter((it) => it.kind === "movie").length, 2);
+    assert.equal(draft.filter((it) => it.kind === "episode").length, 1);
+  });
+
+  it("asks which episodes are his rather than taking a show's opening run", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    const asked = requestsTo(client, "/api/person-show-episodes");
+    assert.equal(asked.length, 1);
+    assert.match(asked[0].url, /personId=2157/);
+    assert.match(asked[0].url, /tmdbId=99/);
+    assert.equal(requestsTo(client, "/api/show-seasons").length, 0, "never the whole show");
+    const episode = client.get("channelDraftItems").find((it) => it.kind === "episode");
+    assert.equal(episode.season, 5);
+    assert.equal(episode.episode, 12);
+  });
+
+  it("orders films and episodes together by date, not films then television", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    client.call("setChannelSpotlightSort", "chronological");
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Roseanne S5E12 — Crime and Punishment", "Spider-Man", "Babylon"],
+      "1993 before 2002 before 2022 -- the guest spot is not stranded at the end"
+    );
+  });
+
+  it("ranks by rating when that is the order asked for", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    client.call("setChannelSpotlightSort", "rating");
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Spider-Man", "Babylon", "Roseanne S5E12 — Crime and Punishment"],
+      "an episode inherits its show's rating so a show's run stays together"
+    );
+  });
+
+  it("does not leave its own sorting scaffolding on the saved picks", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    client.get("channelDraftItems").forEach((it) => {
+      assert.equal("spotlightRating" in it, false);
+    });
+  });
+
+  it("adds one show's episodes on its own when only that credit is wanted", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addPersonShowEpisodes", "99", "Roseanne", "", null);
+    const draft = client.get("channelDraftItems");
+    assert.equal(draft.length, 1);
+    assert.equal(draft[0].imdbId, "tt0094540");
+    assert.equal(requestsTo(client, "/api/resolve-movie").length, 0, "no films came along with it");
+  });
+
+  it("offers the precise action on the button and the season picker on the poster", async () => {
+    const client = spotlightClient();
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    const html = el(client, "channelEpisodePicker").innerHTML;
+    assert.match(html, /\+ Their episodes</);
+    assert.match(html, /channelPersonShowCard/);
+  });
+});
+
+describe("client: keeping hold of a share link", () => {
+  function sharedClient(shareCode) {
+    const client = loadClient({
+      routes: { "/api/channel/share": () => ({ json: { ok: true, code: "CODE1" } }) },
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+    });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [], shareCode: shareCode || "" });
+    return client;
+  }
+
+  it("copies the stored link without re-uploading the channel", async () => {
+    const client = sharedClient("CODE1");
+    await client.call("copyChannelShareLink", "ch1", null);
+    assert.equal(requestsTo(client, "/api/channel/share").length, 0, "nothing was sent");
+  });
+
+  it("does nothing for a channel that has never been shared", async () => {
+    const client = sharedClient("");
+    await client.call("copyChannelShareLink", "ch1", null);
+    assert.equal(requestsTo(client, "/api/channel/share").length, 0);
+  });
+
+  it("sends the creator's credentials when re-sharing, so its own owner is not refused", async () => {
+    const posts = [];
+    const client = loadClient({
+      routes: { "/api/channel/share": (req) => { posts.push(req.body); return { json: { ok: true, code: "CODE1" } }; } },
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [], shareCode: "CODE1", sharePublished: true });
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal(posts[0].code, "CODE1");
+    assert.equal(posts[0].creatorName, "alice");
+    assert.equal(posts[0].creatorKey, "KEY-1");
+    assert.equal(posts[0].publish, false, "re-sharing does not publish something that was not");
+  });
+
+  it("sends nothing to prove on a first, unlisted share", async () => {
+    const posts = [];
+    const client = loadClient({
+      routes: { "/api/channel/share": (req) => { posts.push(req.body); return { json: { ok: true, code: "NEW1" } }; } },
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [] });
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal("creatorKey" in posts[0], false);
+  });
+});
+
+describe("client: looking through a published channel before taking it", () => {
+  it("opens the channel's own picks rather than the one-line summary", async () => {
+    const opened = [];
+    const client = loadClient({
+      routes: {
+        "/api/channel/share": () => ({
+          json: {
+            ok: true, code: "SM90",
+            channel: {
+              name: "Saturday Morning 90s",
+              items: [
+                { kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats", epName: "Tommy", title: "Rugrats S1E1" },
+                { kind: "movie", imdbId: "tt9", season: 1, episode: 1, title: "The Rugrats Movie", showName: "The Rugrats Movie" },
+              ],
+            },
+          },
+        }),
+      },
+    });
+    client.set("openListDetailsPage", function (name, type, url, preloaded) {
+      opened.push({ name, type, url, count: preloaded.sample.length, names: preloaded.sample.map((s) => s.name) });
+    });
+    await client.call("previewDirectoryChannel", "SM90", null);
+    assert.equal(opened.length, 1);
+    assert.equal(opened[0].name, "Saturday Morning 90s");
+    assert.equal(opened[0].count, 2, "both picks, not a summary");
+    assert.match(opened[0].url, /directory:SM90/, "and under an id no saved channel can collide with");
+  });
+
+  it("does not save the previewed channel into this browser", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/share": () => ({ json: { ok: true, code: "SM90", channel: { name: "Saturday Morning 90s", items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, title: "Rugrats S1E1" }] } } }),
+      },
+    });
+    client.set("openListDetailsPage", function () {});
+    await client.call("previewDirectoryChannel", "SM90", null);
+    assert.deepEqual(plain(client.call("loadLocalChannels")), {}, "looking is not taking");
   });
 });

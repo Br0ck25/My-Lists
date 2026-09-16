@@ -264,7 +264,15 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
     );
     return;
   }
-  const personShow = e.target.closest('.channelPersonShowCard, .channelPersonShowBtn');
+  // The button is the precise action -- only the episodes this person is
+  // in -- and the poster beside it is the escape hatch to the full season
+  // picker, for when the whole show is what you actually want.
+  const personShowBtn = e.target.closest('.channelPersonShowBtn');
+  if (personShowBtn) {
+    addPersonShowEpisodes(personShowBtn.dataset.tmdbid, personShowBtn.dataset.title, personShowBtn.dataset.poster, personShowBtn);
+    return;
+  }
+  const personShow = e.target.closest('.channelPersonShowCard');
   if (personShow) {
     browseChannelShow(personShow.dataset.tmdbid, personShow.dataset.title, personShow.dataset.poster, personShow.dataset.backdrop);
     return;
@@ -9114,9 +9122,14 @@ function channelItemsInPlayOrder(items, channel) {
     .map((w) => w.it);
 }
 
-function openChannelDetailsPage(channelIdOrDivId) {
+// channelOverride is a channel this browser does not own -- one fetched from
+// Explore Channels, so it can be looked through before it is added. Every
+// lookup below is about finding a channel that IS saved here, and none of
+// them can find one that is not, so a caller holding the channel already
+// hands it straight over.
+function openChannelDetailsPage(channelIdOrDivId, channelOverride) {
   const map = loadLocalChannels();
-  let channel = map[channelIdOrDivId];
+  let channel = channelOverride || map[channelIdOrDivId];
   if (!channel) {
     for (const ch of Object.values(map)) {
       if (ch && (ch.channelId === channelIdOrDivId || ch.name === channelIdOrDivId)) {
@@ -9189,7 +9202,12 @@ function openChannelDetailsPage(channelIdOrDivId) {
   }
   if (!channel) return;
 
-  if (channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
+  // A channel reconstructed from a row is worth keeping in the in-memory
+  // map, because it IS one of this browser's channels and the map is just
+  // behind. A previewed one is not: it belongs to someone else and has not
+  // been added, so writing it here would put it in My Channels for simply
+  // having been looked at.
+  if (!channelOverride && channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
     map[channel.channelId] = channel;
     _memoryChannelsMap = map;
   }
@@ -9452,7 +9470,10 @@ function renderMyCreatedChannelsList() {
         '</div>' +
         '<div class="list-card-actions">' +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">Edit</button>' +
-          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Copy a link that rebuilds this channel anywhere">' + (ch.shareCode ? 'Re-share' : 'Share') + '</button>' +
+          (ch.shareCode
+            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Copy this channel\u2019s share link">Copy link</button>' +
+              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Push your latest edits to the link people already have">Update link</button>'
+            : '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Create a link that rebuilds this channel anywhere">Share</button>') +
           (ch.dynamic === 'next-up'
             ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshNextUpChannelSeed(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Pull in whatever you have started watching since">Refresh</button>'
             : '') +
@@ -10085,7 +10106,7 @@ async function browseChannelPerson(personId, personName) {
   box.scrollIntoView({ behavior: 'smooth', block: 'start' });
   try {
     const res = await fetch(ORIGIN + '/api/person-credits?personId=' + encodeURIComponent(personId) +
-      '&sort=' + encodeURIComponent(channelSpotlightSort) + '&movies=40&shows=12', { cache: 'no-store' });
+      '&sort=' + encodeURIComponent(channelSpotlightSort) + '&movies=120&shows=60', { cache: 'no-store' });
     const data = await res.json();
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not read that filmography.') + '</p>';
@@ -10127,7 +10148,7 @@ function channelPersonCreditCardHtml(credit, isShow) {
     ' data-backdrop="' + escapeAttr(credit.backdrop || '') + '"';
   const cardClass = isShow ? 'channelPersonShowCard' : 'channelPersonMovieCard';
   const btnClass = isShow ? 'channelPersonShowBtn' : 'channelPersonMovieBtn';
-  const btnLabel = isShow ? '+ Browse' : '+ Add';
+  const btnLabel = isShow ? '+ Their episodes' : '+ Add';
   const sub = [credit.year, credit.role].filter(Boolean).join(' \u00b7 ');
   return '<div class="custom-list-search-item ' + cardClass + '" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
     img +
@@ -10168,21 +10189,111 @@ function renderChannelPersonCredits() {
     : '';
   const shows = c.shows.length
     ? '<p style="margin:14px 0 4px; font-weight:600; font-size:0.85rem;">Television</p>' +
-      '<p style="margin:0 0 6px; color:var(--muted); font-size:0.78rem;">Tap one to pick its seasons and episodes, the same way you would from the Shows tab.</p>' +
+      '<p style="margin:0 0 6px; color:var(--muted); font-size:0.78rem;">The button adds only the episodes they are actually in. Tap the poster instead to pick seasons and episodes yourself, the same way you would from the Shows tab.</p>' +
       '<div class="poster-grid-3">' + c.shows.map((sh) => channelPersonCreditCardHtml(sh, true)).join('') + '</div>' +
       '<div id="channelEpisodeList"></div>'
     : '<div id="channelEpisodeList"></div>';
   box.innerHTML = header + movies + shows;
 }
 
-// "Add everything as a Spotlight channel" -- the one-tap path, for when the
-// whole filmography is the point and there is nothing to prune.
+// "Add everything as a Spotlight channel".
 //
-// Adds into the DRAFT rather than saving outright: a tribute is something
-// people want to tune, and the builder is already sitting right there with
-// every control for it. The order the server returned is kept as-is, so the
-// draft is left "As listed" -- arming an auto-sort here would re-sort on the
-// next render and throw that ordering away.
+// Everything means everything: every film listed above, and every episode of
+// every show listed above that this person is ACTUALLY in -- not a slice of
+// each, and not a show's opening episodes because they happened to appear in
+// one of them (see /api/person-show-episodes, which is what settles which
+// episodes those are).
+//
+// The whole lot is then ordered TOGETHER by the chosen sort. Films first and
+// television after was the old shape, and it read as broken: a 1994 guest
+// appearance played after a 2021 film in what was supposed to be career
+// order. Sorting the items rather than the credits is what puts each episode
+// where it actually belongs among the films.
+function spotlightItemSortDate(it) {
+  return channelItemAiredDateClient(it) || '';
+}
+
+function sortSpotlightItems(items, mode) {
+  const wrapped = items.map((it, i) => ({ it: it, i: i }));
+  if (mode === 'rating') {
+    // An episode has no rating of its own worth ranking by, so it inherits
+    // its show's -- which keeps a show's run together, in broadcast order,
+    // sitting where that show ranks among the films.
+    wrapped.sort((a, b) => {
+      const ra = Number(a.it.spotlightRating) || 0;
+      const rb = Number(b.it.spotlightRating) || 0;
+      if (ra !== rb) return rb - ra;
+      return a.i - b.i;
+    });
+  } else {
+    wrapped.sort((a, b) => {
+      const da = spotlightItemSortDate(a.it);
+      const db = spotlightItemSortDate(b.it);
+      if (da === db) return a.i - b.i;
+      // Undated last, never first: being unable to place something is no
+      // reason to open a tribute with it. Same call sortChannelItemsByAired
+      // makes server-side.
+      if (!da) return 1;
+      if (!db) return -1;
+      return da < db ? -1 : 1;
+    });
+  }
+  return wrapped.map((w) => {
+    const out = Object.assign({}, w.it);
+    delete out.spotlightRating;
+    return out;
+  });
+}
+
+// Adds one show's worth of a person's own episodes -- the per-show version
+// of what "Add everything" does, for when only that credit is wanted.
+async function addPersonShowEpisodes(tmdbId, showTitle, showPoster, btn) {
+  if (!channelPersonCredits) return;
+  const c = channelPersonCredits;
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Finding\u2026';
+  }
+  try {
+    const r = await fetch(ORIGIN + '/api/person-show-episodes?personId=' + encodeURIComponent(c.personId) +
+      '&tmdbId=' + encodeURIComponent(tmdbId), { cache: 'no-store' });
+    const d = await r.json();
+    if (!d.ok || !Array.isArray(d.episodes) || !d.episodes.length) {
+      if (btn) btn.textContent = 'None found';
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+      return;
+    }
+    const poster = d.poster || showPoster || '';
+    const showName = d.showName || showTitle || '';
+    const items = d.episodes.map((ep) => ({
+      kind: 'episode',
+      imdbId: channelStreamShowId(d.imdbId, tmdbId),
+      season: ep.season,
+      episode: ep.episode,
+      showName: showName,
+      epName: ep.name,
+      title: showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + ep.name,
+      released: ep.released || '',
+      thumbnail: ep.thumbnail || poster,
+      poster: poster || ep.thumbnail || '',
+      showPoster: poster,
+    }));
+    channelDraftItems = channelDraftItems.concat(items);
+    renderChannelDraftList();
+    updateChannelSaveButtonLabel();
+    if (btn) {
+      btn.textContent = '+' + items.length + ' \u2713';
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+    }
+  } catch (e) {
+    if (btn) btn.textContent = 'Failed';
+    setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function addWholeSpotlightToDraft(btn) {
   if (!channelPersonCredits) return;
   const c = channelPersonCredits;
@@ -10197,14 +10308,15 @@ async function addWholeSpotlightToDraft(btn) {
     // A film needs its IMDB id resolved one by one: a channel item's id IS
     // the stream request (see channelItemStreamId server-side), so a movie
     // with no id would play as nothing.
-    say('<p><small>Resolving ' + c.movies.length + ' film' + (c.movies.length === 1 ? '' : 's') + '\u2026</small></p>');
-    const resolvedMovies = [];
-    for (const m of c.movies) {
+    const movieItems = [];
+    for (let i = 0; i < c.movies.length; i++) {
+      const m = c.movies[i];
+      say('<p><small>Resolving films\u2026 ' + (i + 1) + ' of ' + c.movies.length + ' (' + escapeHtml(m.title) + ')</small></p>');
       try {
         const r = await fetch(ORIGIN + '/api/resolve-movie?tmdbId=' + encodeURIComponent(m.tmdbId), { cache: 'no-store' });
         const d = await r.json();
         if (!d.ok || !d.imdbId) continue;
-        resolvedMovies.push({
+        movieItems.push({
           kind: 'movie',
           imdbId: d.imdbId,
           tmdbId: m.tmdbId,
@@ -10217,34 +10329,49 @@ async function addWholeSpotlightToDraft(btn) {
           poster: m.poster || '',
           showPoster: m.poster || '',
           backdrop: m.backdrop || '',
+          spotlightRating: m.rating || 0,
         });
       } catch (e) {
         continue;
       }
     }
-    // A TV appearance is one strand of a spotlight, not the whole thing --
-    // a 200-episode sitcom would otherwise bury every film. Only the top
-    // few shows, and only a slice of each; anything more precise is what
-    // browsing a show from the grid above is for.
-    let showItems = [];
-    const topShows = c.shows.slice(0, 4);
-    if (topShows.length) {
-      const built = await buildChannelItemsFromShows(topShows.map((sh) => ({
-        tmdbId: sh.tmdbId,
-        imdbId: '',
-        name: sh.title,
-        poster: sh.poster,
-        backdrop: sh.backdrop,
-      })), {
-        maxEpisodesPerShow: 10,
-        maxItems: 120,
-        onProgress: function (i, total, show) {
-          say('<p><small>Adding TV work\u2026 ' + (i + 1) + ' of ' + total + ' (' + escapeHtml(show.name || '') + ')</small></p>');
-        },
-      });
-      showItems = built.items;
+
+    const episodeItems = [];
+    let guestShows = 0;
+    for (let i = 0; i < c.shows.length; i++) {
+      const sh = c.shows[i];
+      say('<p><small>Finding ' + escapeHtml(c.name) + '\u2019s episodes\u2026 show ' + (i + 1) + ' of ' + c.shows.length +
+        ' (' + escapeHtml(sh.title) + ')</small></p>');
+      try {
+        const r = await fetch(ORIGIN + '/api/person-show-episodes?personId=' + encodeURIComponent(c.personId) +
+          '&tmdbId=' + encodeURIComponent(sh.tmdbId), { cache: 'no-store' });
+        const d = await r.json();
+        if (!d.ok || !Array.isArray(d.episodes) || !d.episodes.length) continue;
+        if (!d.regular) guestShows++;
+        const showPoster = d.poster || sh.poster || '';
+        const showName = d.showName || sh.title || '';
+        d.episodes.forEach((ep) => {
+          episodeItems.push({
+            kind: 'episode',
+            imdbId: channelStreamShowId(d.imdbId, sh.tmdbId),
+            season: ep.season,
+            episode: ep.episode,
+            showName: showName,
+            epName: ep.name,
+            title: showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + ep.name,
+            released: ep.released || '',
+            thumbnail: ep.thumbnail || showPoster,
+            poster: showPoster || ep.thumbnail || '',
+            showPoster: showPoster,
+            spotlightRating: sh.rating || 0,
+          });
+        });
+      } catch (e) {
+        continue;
+      }
     }
-    const items = resolvedMovies.concat(showItems);
+
+    const items = sortSpotlightItems(movieItems.concat(episodeItems), channelSpotlightSort);
     if (!items.length) {
       say('<p class="testresult err">\u2717 Could not resolve any of ' + escapeHtml(c.name) + '\u2019s credits to something playable.</p>');
       return;
@@ -10254,13 +10381,17 @@ async function addWholeSpotlightToDraft(btn) {
     if (!channelDraftBackdrop) channelDraftBackdrop = c.backdrop || null;
     const nameInput = document.getElementById('channelNameInput');
     if (nameInput && !nameInput.value.trim()) nameInput.value = c.name + ' Spotlight';
+    // The items have just been put in the order that was asked for, so the
+    // draft stays "As listed" -- arming an auto-sort here would re-sort them
+    // on the next render and throw that ordering away.
     setChannelPlayOrder('as-listed');
     renderChannelDraftList();
     updateChannelSaveButtonLabel();
-    say('<p class="testresult ok" style="margin:4px 0 0;">\u2713 Added ' + resolvedMovies.length + ' film' + (resolvedMovies.length === 1 ? '' : 's') +
-      (showItems.length ? ' and ' + showItems.length + ' TV episodes' : '') +
-      ', ' + (channelSpotlightSort === 'rating' ? 'best first' : 'in career order') +
-      '. Tune the picks below, then Save.</p>');
+    say('<p class="testresult ok" style="margin:4px 0 0;">\u2713 Added ' + movieItems.length + ' film' + (movieItems.length === 1 ? '' : 's') +
+      (episodeItems.length ? ' and ' + episodeItems.length + ' episode' + (episodeItems.length === 1 ? '' : 's') : '') +
+      ', ' + (channelSpotlightSort === 'rating' ? 'best first' : 'in career order') + '.' +
+      (guestShows ? ' Guest appearances are only the episodes ' + escapeHtml(c.name) + ' is in.' : '') +
+      ' Tune the picks below, then Save.</p>');
   } catch (e) {
     say('<p class="testresult err">\u2717 Network error while building that spotlight.</p>');
   } finally {
@@ -10337,8 +10468,17 @@ async function postChannelShare(ch, opts) {
     description: o.description || '',
     publish: !!o.publish,
   };
-  if (o.publish) {
-    body.creatorName = activeCreator ? activeCreator.creatorName : '';
+  // Credentials go with a re-share too, not only with a publish.
+  //
+  // Re-sharing writes over an existing record, and a record created by
+  // PUBLISHING has an owner -- so an unlisted re-share that proved nothing
+  // was refused as "that share link belongs to someone else", by its own
+  // owner. Sent whenever they are available: an unlisted share of a channel
+  // nobody has published still needs nothing, and the server only uses them
+  // to decide who is writing.
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (signedIn && (o.publish || ch.shareCode)) {
+    body.creatorName = activeCreator.creatorName;
     body.creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   }
   const res = await fetch(ORIGIN + '/api/channel/share', {
@@ -10359,6 +10499,39 @@ function rememberChannelShare(channelId, code, published) {
   ch.shareCode = code;
   ch.sharePublished = !!published;
   saveLocalChannelsMap(map);
+}
+
+// Copies the link a channel already has, without re-uploading it.
+//
+// The modal that appears after sharing or publishing is not a place to keep
+// something: it closes, and the link goes with it. A channel that has a code
+// carries this button from then on, so the link is always one tap away.
+async function copyChannelShareLink(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch || !ch.shareCode) return;
+  const link = channelShareUrl(ch.shareCode);
+  let copied = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(link);
+      copied = true;
+    }
+  } catch (e) {
+    copied = false;
+  }
+  if (copied) {
+    if (btn) {
+      const label = btn.textContent;
+      btn.textContent = 'Copied \u2713';
+      setTimeout(() => { if (btn) btn.textContent = label; }, 1600);
+    }
+    showAddedToast('Link to "' + ch.name + '" copied.');
+    return;
+  }
+  // No clipboard (an insecure origin, or a browser that refuses): the link
+  // still has to be gettable, so it goes on screen to be selected by hand.
+  showAppAlert('Link to "' + ch.name + '"', link, true);
 }
 
 async function shareChannelById(channelId, btn) {
@@ -10555,20 +10728,56 @@ function renderChannelDirectory() {
     const thumb = art
       ? '<img src="' + escapeAttr(art) + '" alt="" loading="lazy" style="width:88px; height:56px; object-fit:cover; border-radius:6px; border:1px solid var(--border); flex:0 0 auto;">'
       : '';
+    const openAttr = ' style="cursor:pointer;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)" title="See everything in this channel"';
     return '<div class="list-card" style="margin-bottom:10px;">' +
       '<div class="list-card-header" style="gap:10px; align-items:center;">' +
-        thumb +
+        (thumb ? '<div' + openAttr + '>' + thumb + '</div>' : '') +
         '<div class="list-card-body">' +
-          '<div class="list-card-title">' + escapeHtml(e.name || 'Channel') + '</div>' +
+          '<div class="list-card-title"' + openAttr + '>' + escapeHtml(e.name || 'Channel') + '</div>' +
           (e.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(e.description) + '</div>' : '') +
           '<div class="list-card-meta"><span>' + escapeHtml(channelDirectoryMetaLine(e)) + '</span></div>' +
         '</div>' +
         '<div class="list-card-actions">' +
+          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">See all</button>' +
           '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="addDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">+ Add</button>' +
         '</div>' +
       '</div>' +
     '</div>';
   }).join('');
+}
+
+// Look through a published channel before taking it.
+//
+// A directory row is a one-line summary by design -- the index has to stay
+// cheap to read -- so seeing what is actually IN a channel means fetching
+// it. Which is the same fetch adding it makes, so a preview costs a person
+// nothing they were not about to spend anyway, and answers the question the
+// summary cannot: is this the lineup I want?
+async function previewDirectoryChannel(code, btn) {
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn && btn.tagName === 'BUTTON') {
+    btn.disabled = true;
+    btn.textContent = 'Opening\u2026';
+  }
+  try {
+    const data = await fetchSharedChannel(code);
+    if (!data.ok || !data.channel) {
+      showAppAlert('Explore Channels', data.error || 'That channel could not be read.');
+      return;
+    }
+    // A synthetic id: this channel is not saved here, and giving it one that
+    // could collide with a saved channel's would make "+ Add" on the details
+    // page act on the wrong one.
+    const preview = Object.assign({}, data.channel, { channelId: 'directory:' + code });
+    openChannelDetailsPage(preview.channelId, preview);
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while opening that channel.');
+  } finally {
+    if (btn && btn.tagName === 'BUTTON') {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
 }
 
 async function addDirectoryChannel(code, btn) {
@@ -10629,6 +10838,16 @@ function renderChannelPublishList() {
       '</div>' +
       (ch.sharePublished ? '' :
         '<input type="text" id="channelPublishDesc_' + escapeAttr(ch.channelId) + '" placeholder="One line about this channel (optional)" style="margin-top:8px; font-size:0.82rem;">') +
+      // A published channel's link lives here, on screen, rather than only
+      // in the modal that announced it -- that modal closes and takes the
+      // link with it, which is the wrong place to keep the one thing this
+      // whole panel produces.
+      (ch.shareCode
+        ? '<div class="row" style="margin-top:8px; gap:8px;">' +
+            '<input type="text" readonly value="' + escapeAttr(channelShareUrl(ch.shareCode)) + '" onclick="this.select()" style="flex:1; font-size:0.8rem;">' +
+            '<button type="button" class="secondary lc-btn" style="white-space:nowrap;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Copy</button>' +
+          '</div>'
+        : '') +
     '</div>';
   }).join('');
 }

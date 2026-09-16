@@ -99,6 +99,14 @@ const SHARED_CHANNEL_BYTES_MAX = 4000000;
 // on every visit to the tab, so this is a page-weight budget as much as a
 // storage one; the oldest listing falls off when a new one arrives.
 const PUBLIC_CHANNEL_INDEX_MAX = 500;
+
+// A Spotlight channel reads one show a season at a time to find the episodes
+// its subject is actually in (see /api/person-show-episodes). These bound
+// what one show can cost and contribute: a soap with 40 seasons would
+// otherwise be 40 TMDB calls, and a series regular on a 300-episode run
+// would drown every other credit in the channel.
+const PERSON_SHOW_MAX_SEASONS = 20;
+const PERSON_SHOW_MAX_EPISODES = 400;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 10 * 1024 * 1024;        // 10 MB of serialized JSON
 
@@ -11871,11 +11879,12 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
     <path d="M-90,-105 Q-45,-130 0,-105 T90,-105" fill="none" stroke="url(#accentGrad)" stroke-width="4.5" stroke-linecap="round" opacity="0.85" />
 
     <!-- Channel Name Rendered STRICTLY Inside the TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="170" cy="115" r="6" fill="#007AFF" opacity="0.8" />
@@ -11885,7 +11894,7 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
   <!-- Bottom TV Channel Pill Badge -->
   <g transform="translate(300, 780)">
     <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGrad)" />
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
   </g>
 </svg>`;
 }
@@ -11978,11 +11987,12 @@ function generateChannelBackdropSvg(name, backdropUrl = "") {
     <path d="M-34,-24 Q-17,-32 0,-24 T34,-24" fill="none" stroke="url(#accentGradL)" stroke-width="1.5" stroke-linecap="round" opacity="0.8" />
 
     <!-- Channel Name Rendered STRICTLY Inside TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="86" cy="25" r="2.5" fill="#007AFF" opacity="0.8" />
@@ -12085,13 +12095,13 @@ function generateBadgedPosterSvg({ posterUrl, airDateText, bottomText, bottomBg,
   const topBadgeSvg = safeAirDate ? `
     <g transform="translate(24, 24)">
       <rect x="0" y="0" width="${topPillWidth}" height="72" rx="16" ry="16" fill="#007aff" fill-opacity="0.95" stroke="#66b8ff" stroke-width="3.5" filter="drop-shadow(0px 6px 12px rgba(0,0,0,0.8))"/>
-      <text x="${topPillWidth / 2}" y="49" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="36" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
+      <text x="${topPillWidth / 2}" y="49" font-family="Arial, Helvetica, sans-serif" font-size="36" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
     </g>` : '';
 
   const bottomBadgeSvg = safeBottom ? `
     <g transform="translate(250, 715)">
       <rect x="${-bottomPillWidth / 2}" y="-84" width="${bottomPillWidth}" height="84" rx="20" ry="20" fill="${bottomBg || '#ff9f0a'}" fill-opacity="0.95" stroke="${bottomBorder || 'rgba(255,159,10,0.7)'}" stroke-width="4.5" filter="drop-shadow(0px 8px 16px rgba(0,0,0,0.85))"/>
-      <text x="0" y="-30" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="38" font-weight="900" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
+      <text x="0" y="-30" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="bold" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
     </g>` : '';
 
   const topGradient = safeAirDate ? `
@@ -12186,7 +12196,7 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   <!-- Safe Badge Pill at top -->
   <g transform="translate(250, 60)" filter="url(#safeShadow)">
     <rect x="-140" y="0" width="280" height="42" rx="21" ry="21" fill="url(#shieldGrad)"/>
-    <text x="0" y="27" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="800" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
+    <text x="0" y="27" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
   </g>
 
   <!-- Central Shield / Film Icon -->
@@ -12199,21 +12209,21 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   </g>
 
   <!-- Title -->
-  <text x="250" y="${titleStartY}" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="34" font-weight="800" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
+  <text x="250" y="${titleStartY}" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="bold" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
     ${titleTextSpans}
   </text>
 
   <!-- Metadata: Type & Year -->
   <g transform="translate(250, 560)">
     <rect x="-90" y="-18" width="180" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="700" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
       ${safeType}${safeYear ? ' • ' + safeYear : ''}
     </text>
   </g>
 
   <!-- Certification / Footer -->
   <g transform="translate(250, 680)">
-    <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
+    <text x="0" y="0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
       ${safeCert ? safeCert + ' • ' : ''}AGE-APPROPRIATE FILTER ACTIVE
     </text>
   </g>
@@ -25691,7 +25701,7 @@ function showAppAlert(title, message, isSuccess = false) {
       '</h3>' +
       '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
-    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
       '<button type="button" class="primary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">OK</button>' +
     '</div>';
@@ -25720,7 +25730,7 @@ function showAppBusy(title, message) {
       '<span class="app-spinner" aria-hidden="true"></span> ' +
       escapeHtml(title) +
     '</h3>' +
-    '<p role="status" aria-live="polite" style="margin:0; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message || '') + '</p>';
+    '<p role="status" aria-live="polite" style="margin:0; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message || '') + '</p>';
   showModal(html);
 }
 
@@ -25736,7 +25746,7 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
       '</h3>' +
       '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
-    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
       '<button type="button" class="secondary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">Cancel</button>' +
       '<button type="button" class="primary" id="appConfirmBtn" style="min-width:80px; padding:8px 16px; ' + confirmBtnStyle + '">' + escapeHtml(confirmBtnText || 'Confirm') + '</button>' +
@@ -35807,7 +35817,15 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
     );
     return;
   }
-  const personShow = e.target.closest('.channelPersonShowCard, .channelPersonShowBtn');
+  // The button is the precise action -- only the episodes this person is
+  // in -- and the poster beside it is the escape hatch to the full season
+  // picker, for when the whole show is what you actually want.
+  const personShowBtn = e.target.closest('.channelPersonShowBtn');
+  if (personShowBtn) {
+    addPersonShowEpisodes(personShowBtn.dataset.tmdbid, personShowBtn.dataset.title, personShowBtn.dataset.poster, personShowBtn);
+    return;
+  }
+  const personShow = e.target.closest('.channelPersonShowCard');
   if (personShow) {
     browseChannelShow(personShow.dataset.tmdbid, personShow.dataset.title, personShow.dataset.poster, personShow.dataset.backdrop);
     return;
@@ -44657,9 +44675,14 @@ function channelItemsInPlayOrder(items, channel) {
     .map((w) => w.it);
 }
 
-function openChannelDetailsPage(channelIdOrDivId) {
+// channelOverride is a channel this browser does not own -- one fetched from
+// Explore Channels, so it can be looked through before it is added. Every
+// lookup below is about finding a channel that IS saved here, and none of
+// them can find one that is not, so a caller holding the channel already
+// hands it straight over.
+function openChannelDetailsPage(channelIdOrDivId, channelOverride) {
   const map = loadLocalChannels();
-  let channel = map[channelIdOrDivId];
+  let channel = channelOverride || map[channelIdOrDivId];
   if (!channel) {
     for (const ch of Object.values(map)) {
       if (ch && (ch.channelId === channelIdOrDivId || ch.name === channelIdOrDivId)) {
@@ -44732,7 +44755,12 @@ function openChannelDetailsPage(channelIdOrDivId) {
   }
   if (!channel) return;
 
-  if (channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
+  // A channel reconstructed from a row is worth keeping in the in-memory
+  // map, because it IS one of this browser's channels and the map is just
+  // behind. A previewed one is not: it belongs to someone else and has not
+  // been added, so writing it here would put it in My Channels for simply
+  // having been looked at.
+  if (!channelOverride && channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
     map[channel.channelId] = channel;
     _memoryChannelsMap = map;
   }
@@ -44995,7 +45023,10 @@ function renderMyCreatedChannelsList() {
         '</div>' +
         '<div class="list-card-actions">' +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">Edit</button>' +
-          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Copy a link that rebuilds this channel anywhere">' + (ch.shareCode ? 'Re-share' : 'Share') + '</button>' +
+          (ch.shareCode
+            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Copy this channel\u2019s share link">Copy link</button>' +
+              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Push your latest edits to the link people already have">Update link</button>'
+            : '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Create a link that rebuilds this channel anywhere">Share</button>') +
           (ch.dynamic === 'next-up'
             ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshNextUpChannelSeed(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Pull in whatever you have started watching since">Refresh</button>'
             : '') +
@@ -45628,7 +45659,7 @@ async function browseChannelPerson(personId, personName) {
   box.scrollIntoView({ behavior: 'smooth', block: 'start' });
   try {
     const res = await fetch(ORIGIN + '/api/person-credits?personId=' + encodeURIComponent(personId) +
-      '&sort=' + encodeURIComponent(channelSpotlightSort) + '&movies=40&shows=12', { cache: 'no-store' });
+      '&sort=' + encodeURIComponent(channelSpotlightSort) + '&movies=120&shows=60', { cache: 'no-store' });
     const data = await res.json();
     if (!data.ok) {
       box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not read that filmography.') + '</p>';
@@ -45670,7 +45701,7 @@ function channelPersonCreditCardHtml(credit, isShow) {
     ' data-backdrop="' + escapeAttr(credit.backdrop || '') + '"';
   const cardClass = isShow ? 'channelPersonShowCard' : 'channelPersonMovieCard';
   const btnClass = isShow ? 'channelPersonShowBtn' : 'channelPersonMovieBtn';
-  const btnLabel = isShow ? '+ Browse' : '+ Add';
+  const btnLabel = isShow ? '+ Their episodes' : '+ Add';
   const sub = [credit.year, credit.role].filter(Boolean).join(' \u00b7 ');
   return '<div class="custom-list-search-item ' + cardClass + '" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
     img +
@@ -45711,21 +45742,111 @@ function renderChannelPersonCredits() {
     : '';
   const shows = c.shows.length
     ? '<p style="margin:14px 0 4px; font-weight:600; font-size:0.85rem;">Television</p>' +
-      '<p style="margin:0 0 6px; color:var(--muted); font-size:0.78rem;">Tap one to pick its seasons and episodes, the same way you would from the Shows tab.</p>' +
+      '<p style="margin:0 0 6px; color:var(--muted); font-size:0.78rem;">The button adds only the episodes they are actually in. Tap the poster instead to pick seasons and episodes yourself, the same way you would from the Shows tab.</p>' +
       '<div class="poster-grid-3">' + c.shows.map((sh) => channelPersonCreditCardHtml(sh, true)).join('') + '</div>' +
       '<div id="channelEpisodeList"></div>'
     : '<div id="channelEpisodeList"></div>';
   box.innerHTML = header + movies + shows;
 }
 
-// "Add everything as a Spotlight channel" -- the one-tap path, for when the
-// whole filmography is the point and there is nothing to prune.
+// "Add everything as a Spotlight channel".
 //
-// Adds into the DRAFT rather than saving outright: a tribute is something
-// people want to tune, and the builder is already sitting right there with
-// every control for it. The order the server returned is kept as-is, so the
-// draft is left "As listed" -- arming an auto-sort here would re-sort on the
-// next render and throw that ordering away.
+// Everything means everything: every film listed above, and every episode of
+// every show listed above that this person is ACTUALLY in -- not a slice of
+// each, and not a show's opening episodes because they happened to appear in
+// one of them (see /api/person-show-episodes, which is what settles which
+// episodes those are).
+//
+// The whole lot is then ordered TOGETHER by the chosen sort. Films first and
+// television after was the old shape, and it read as broken: a 1994 guest
+// appearance played after a 2021 film in what was supposed to be career
+// order. Sorting the items rather than the credits is what puts each episode
+// where it actually belongs among the films.
+function spotlightItemSortDate(it) {
+  return channelItemAiredDateClient(it) || '';
+}
+
+function sortSpotlightItems(items, mode) {
+  const wrapped = items.map((it, i) => ({ it: it, i: i }));
+  if (mode === 'rating') {
+    // An episode has no rating of its own worth ranking by, so it inherits
+    // its show's -- which keeps a show's run together, in broadcast order,
+    // sitting where that show ranks among the films.
+    wrapped.sort((a, b) => {
+      const ra = Number(a.it.spotlightRating) || 0;
+      const rb = Number(b.it.spotlightRating) || 0;
+      if (ra !== rb) return rb - ra;
+      return a.i - b.i;
+    });
+  } else {
+    wrapped.sort((a, b) => {
+      const da = spotlightItemSortDate(a.it);
+      const db = spotlightItemSortDate(b.it);
+      if (da === db) return a.i - b.i;
+      // Undated last, never first: being unable to place something is no
+      // reason to open a tribute with it. Same call sortChannelItemsByAired
+      // makes server-side.
+      if (!da) return 1;
+      if (!db) return -1;
+      return da < db ? -1 : 1;
+    });
+  }
+  return wrapped.map((w) => {
+    const out = Object.assign({}, w.it);
+    delete out.spotlightRating;
+    return out;
+  });
+}
+
+// Adds one show's worth of a person's own episodes -- the per-show version
+// of what "Add everything" does, for when only that credit is wanted.
+async function addPersonShowEpisodes(tmdbId, showTitle, showPoster, btn) {
+  if (!channelPersonCredits) return;
+  const c = channelPersonCredits;
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Finding\u2026';
+  }
+  try {
+    const r = await fetch(ORIGIN + '/api/person-show-episodes?personId=' + encodeURIComponent(c.personId) +
+      '&tmdbId=' + encodeURIComponent(tmdbId), { cache: 'no-store' });
+    const d = await r.json();
+    if (!d.ok || !Array.isArray(d.episodes) || !d.episodes.length) {
+      if (btn) btn.textContent = 'None found';
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+      return;
+    }
+    const poster = d.poster || showPoster || '';
+    const showName = d.showName || showTitle || '';
+    const items = d.episodes.map((ep) => ({
+      kind: 'episode',
+      imdbId: channelStreamShowId(d.imdbId, tmdbId),
+      season: ep.season,
+      episode: ep.episode,
+      showName: showName,
+      epName: ep.name,
+      title: showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + ep.name,
+      released: ep.released || '',
+      thumbnail: ep.thumbnail || poster,
+      poster: poster || ep.thumbnail || '',
+      showPoster: poster,
+    }));
+    channelDraftItems = channelDraftItems.concat(items);
+    renderChannelDraftList();
+    updateChannelSaveButtonLabel();
+    if (btn) {
+      btn.textContent = '+' + items.length + ' \u2713';
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+    }
+  } catch (e) {
+    if (btn) btn.textContent = 'Failed';
+    setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function addWholeSpotlightToDraft(btn) {
   if (!channelPersonCredits) return;
   const c = channelPersonCredits;
@@ -45740,14 +45861,15 @@ async function addWholeSpotlightToDraft(btn) {
     // A film needs its IMDB id resolved one by one: a channel item's id IS
     // the stream request (see channelItemStreamId server-side), so a movie
     // with no id would play as nothing.
-    say('<p><small>Resolving ' + c.movies.length + ' film' + (c.movies.length === 1 ? '' : 's') + '\u2026</small></p>');
-    const resolvedMovies = [];
-    for (const m of c.movies) {
+    const movieItems = [];
+    for (let i = 0; i < c.movies.length; i++) {
+      const m = c.movies[i];
+      say('<p><small>Resolving films\u2026 ' + (i + 1) + ' of ' + c.movies.length + ' (' + escapeHtml(m.title) + ')</small></p>');
       try {
         const r = await fetch(ORIGIN + '/api/resolve-movie?tmdbId=' + encodeURIComponent(m.tmdbId), { cache: 'no-store' });
         const d = await r.json();
         if (!d.ok || !d.imdbId) continue;
-        resolvedMovies.push({
+        movieItems.push({
           kind: 'movie',
           imdbId: d.imdbId,
           tmdbId: m.tmdbId,
@@ -45760,34 +45882,49 @@ async function addWholeSpotlightToDraft(btn) {
           poster: m.poster || '',
           showPoster: m.poster || '',
           backdrop: m.backdrop || '',
+          spotlightRating: m.rating || 0,
         });
       } catch (e) {
         continue;
       }
     }
-    // A TV appearance is one strand of a spotlight, not the whole thing --
-    // a 200-episode sitcom would otherwise bury every film. Only the top
-    // few shows, and only a slice of each; anything more precise is what
-    // browsing a show from the grid above is for.
-    let showItems = [];
-    const topShows = c.shows.slice(0, 4);
-    if (topShows.length) {
-      const built = await buildChannelItemsFromShows(topShows.map((sh) => ({
-        tmdbId: sh.tmdbId,
-        imdbId: '',
-        name: sh.title,
-        poster: sh.poster,
-        backdrop: sh.backdrop,
-      })), {
-        maxEpisodesPerShow: 10,
-        maxItems: 120,
-        onProgress: function (i, total, show) {
-          say('<p><small>Adding TV work\u2026 ' + (i + 1) + ' of ' + total + ' (' + escapeHtml(show.name || '') + ')</small></p>');
-        },
-      });
-      showItems = built.items;
+
+    const episodeItems = [];
+    let guestShows = 0;
+    for (let i = 0; i < c.shows.length; i++) {
+      const sh = c.shows[i];
+      say('<p><small>Finding ' + escapeHtml(c.name) + '\u2019s episodes\u2026 show ' + (i + 1) + ' of ' + c.shows.length +
+        ' (' + escapeHtml(sh.title) + ')</small></p>');
+      try {
+        const r = await fetch(ORIGIN + '/api/person-show-episodes?personId=' + encodeURIComponent(c.personId) +
+          '&tmdbId=' + encodeURIComponent(sh.tmdbId), { cache: 'no-store' });
+        const d = await r.json();
+        if (!d.ok || !Array.isArray(d.episodes) || !d.episodes.length) continue;
+        if (!d.regular) guestShows++;
+        const showPoster = d.poster || sh.poster || '';
+        const showName = d.showName || sh.title || '';
+        d.episodes.forEach((ep) => {
+          episodeItems.push({
+            kind: 'episode',
+            imdbId: channelStreamShowId(d.imdbId, sh.tmdbId),
+            season: ep.season,
+            episode: ep.episode,
+            showName: showName,
+            epName: ep.name,
+            title: showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + ep.name,
+            released: ep.released || '',
+            thumbnail: ep.thumbnail || showPoster,
+            poster: showPoster || ep.thumbnail || '',
+            showPoster: showPoster,
+            spotlightRating: sh.rating || 0,
+          });
+        });
+      } catch (e) {
+        continue;
+      }
     }
-    const items = resolvedMovies.concat(showItems);
+
+    const items = sortSpotlightItems(movieItems.concat(episodeItems), channelSpotlightSort);
     if (!items.length) {
       say('<p class="testresult err">\u2717 Could not resolve any of ' + escapeHtml(c.name) + '\u2019s credits to something playable.</p>');
       return;
@@ -45797,13 +45934,17 @@ async function addWholeSpotlightToDraft(btn) {
     if (!channelDraftBackdrop) channelDraftBackdrop = c.backdrop || null;
     const nameInput = document.getElementById('channelNameInput');
     if (nameInput && !nameInput.value.trim()) nameInput.value = c.name + ' Spotlight';
+    // The items have just been put in the order that was asked for, so the
+    // draft stays "As listed" -- arming an auto-sort here would re-sort them
+    // on the next render and throw that ordering away.
     setChannelPlayOrder('as-listed');
     renderChannelDraftList();
     updateChannelSaveButtonLabel();
-    say('<p class="testresult ok" style="margin:4px 0 0;">\u2713 Added ' + resolvedMovies.length + ' film' + (resolvedMovies.length === 1 ? '' : 's') +
-      (showItems.length ? ' and ' + showItems.length + ' TV episodes' : '') +
-      ', ' + (channelSpotlightSort === 'rating' ? 'best first' : 'in career order') +
-      '. Tune the picks below, then Save.</p>');
+    say('<p class="testresult ok" style="margin:4px 0 0;">\u2713 Added ' + movieItems.length + ' film' + (movieItems.length === 1 ? '' : 's') +
+      (episodeItems.length ? ' and ' + episodeItems.length + ' episode' + (episodeItems.length === 1 ? '' : 's') : '') +
+      ', ' + (channelSpotlightSort === 'rating' ? 'best first' : 'in career order') + '.' +
+      (guestShows ? ' Guest appearances are only the episodes ' + escapeHtml(c.name) + ' is in.' : '') +
+      ' Tune the picks below, then Save.</p>');
   } catch (e) {
     say('<p class="testresult err">\u2717 Network error while building that spotlight.</p>');
   } finally {
@@ -45880,8 +46021,17 @@ async function postChannelShare(ch, opts) {
     description: o.description || '',
     publish: !!o.publish,
   };
-  if (o.publish) {
-    body.creatorName = activeCreator ? activeCreator.creatorName : '';
+  // Credentials go with a re-share too, not only with a publish.
+  //
+  // Re-sharing writes over an existing record, and a record created by
+  // PUBLISHING has an owner -- so an unlisted re-share that proved nothing
+  // was refused as "that share link belongs to someone else", by its own
+  // owner. Sent whenever they are available: an unlisted share of a channel
+  // nobody has published still needs nothing, and the server only uses them
+  // to decide who is writing.
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (signedIn && (o.publish || ch.shareCode)) {
+    body.creatorName = activeCreator.creatorName;
     body.creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
   }
   const res = await fetch(ORIGIN + '/api/channel/share', {
@@ -45902,6 +46052,39 @@ function rememberChannelShare(channelId, code, published) {
   ch.shareCode = code;
   ch.sharePublished = !!published;
   saveLocalChannelsMap(map);
+}
+
+// Copies the link a channel already has, without re-uploading it.
+//
+// The modal that appears after sharing or publishing is not a place to keep
+// something: it closes, and the link goes with it. A channel that has a code
+// carries this button from then on, so the link is always one tap away.
+async function copyChannelShareLink(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch || !ch.shareCode) return;
+  const link = channelShareUrl(ch.shareCode);
+  let copied = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(link);
+      copied = true;
+    }
+  } catch (e) {
+    copied = false;
+  }
+  if (copied) {
+    if (btn) {
+      const label = btn.textContent;
+      btn.textContent = 'Copied \u2713';
+      setTimeout(() => { if (btn) btn.textContent = label; }, 1600);
+    }
+    showAddedToast('Link to "' + ch.name + '" copied.');
+    return;
+  }
+  // No clipboard (an insecure origin, or a browser that refuses): the link
+  // still has to be gettable, so it goes on screen to be selected by hand.
+  showAppAlert('Link to "' + ch.name + '"', link, true);
 }
 
 async function shareChannelById(channelId, btn) {
@@ -46098,20 +46281,56 @@ function renderChannelDirectory() {
     const thumb = art
       ? '<img src="' + escapeAttr(art) + '" alt="" loading="lazy" style="width:88px; height:56px; object-fit:cover; border-radius:6px; border:1px solid var(--border); flex:0 0 auto;">'
       : '';
+    const openAttr = ' style="cursor:pointer;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)" title="See everything in this channel"';
     return '<div class="list-card" style="margin-bottom:10px;">' +
       '<div class="list-card-header" style="gap:10px; align-items:center;">' +
-        thumb +
+        (thumb ? '<div' + openAttr + '>' + thumb + '</div>' : '') +
         '<div class="list-card-body">' +
-          '<div class="list-card-title">' + escapeHtml(e.name || 'Channel') + '</div>' +
+          '<div class="list-card-title"' + openAttr + '>' + escapeHtml(e.name || 'Channel') + '</div>' +
           (e.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(e.description) + '</div>' : '') +
           '<div class="list-card-meta"><span>' + escapeHtml(channelDirectoryMetaLine(e)) + '</span></div>' +
         '</div>' +
         '<div class="list-card-actions">' +
+          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">See all</button>' +
           '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="addDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">+ Add</button>' +
         '</div>' +
       '</div>' +
     '</div>';
   }).join('');
+}
+
+// Look through a published channel before taking it.
+//
+// A directory row is a one-line summary by design -- the index has to stay
+// cheap to read -- so seeing what is actually IN a channel means fetching
+// it. Which is the same fetch adding it makes, so a preview costs a person
+// nothing they were not about to spend anyway, and answers the question the
+// summary cannot: is this the lineup I want?
+async function previewDirectoryChannel(code, btn) {
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn && btn.tagName === 'BUTTON') {
+    btn.disabled = true;
+    btn.textContent = 'Opening\u2026';
+  }
+  try {
+    const data = await fetchSharedChannel(code);
+    if (!data.ok || !data.channel) {
+      showAppAlert('Explore Channels', data.error || 'That channel could not be read.');
+      return;
+    }
+    // A synthetic id: this channel is not saved here, and giving it one that
+    // could collide with a saved channel's would make "+ Add" on the details
+    // page act on the wrong one.
+    const preview = Object.assign({}, data.channel, { channelId: 'directory:' + code });
+    openChannelDetailsPage(preview.channelId, preview);
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while opening that channel.');
+  } finally {
+    if (btn && btn.tagName === 'BUTTON') {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
 }
 
 async function addDirectoryChannel(code, btn) {
@@ -46172,6 +46391,16 @@ function renderChannelPublishList() {
       '</div>' +
       (ch.sharePublished ? '' :
         '<input type="text" id="channelPublishDesc_' + escapeAttr(ch.channelId) + '" placeholder="One line about this channel (optional)" style="margin-top:8px; font-size:0.82rem;">') +
+      // A published channel's link lives here, on screen, rather than only
+      // in the modal that announced it -- that modal closes and takes the
+      // link with it, which is the wrong place to keep the one thing this
+      // whole panel produces.
+      (ch.shareCode
+        ? '<div class="row" style="margin-top:8px; gap:8px;">' +
+            '<input type="text" readonly value="' + escapeAttr(channelShareUrl(ch.shareCode)) + '" onclick="this.select()" style="flex:1; font-size:0.8rem;">' +
+            '<button type="button" class="secondary lc-btn" style="white-space:nowrap;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Copy</button>' +
+          '</div>'
+        : '') +
     '</div>';
   }).join('');
 }
@@ -64570,7 +64799,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
   <image x="100" y="300" width="400" height="240" preserveAspectRatio="xMidYMid meet" href="${dataUri}"/>
   <g transform="translate(300, 780)">
     <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGradP)"/>
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
   </g>
 </svg>`;
 
@@ -65390,8 +65619,12 @@ function generateSearchVariations(query) {
       const personId = (url.searchParams.get("personId") || "").trim();
       if (!/^[0-9]+$/.test(personId)) return json({ ok: false, error: "Missing personId." }, 400);
       const sort = url.searchParams.get("sort") === "rating" ? "rating" : "chronological";
-      const movieLimit = Math.min(Math.max(parseInt(url.searchParams.get("movies") || "12", 10) || 12, 0), 40);
-      const showLimit = Math.min(Math.max(parseInt(url.searchParams.get("shows") || "4", 10) || 4, 0), 12);
+      // A filmography is the whole point here, so the ceilings are a career
+      // rather than a shelf. Popularity still decides the ORDER these are
+      // cut in (see byWeight below), so asking for fewer gives the best of
+      // them rather than an arbitrary slice.
+      const movieLimit = Math.min(Math.max(parseInt(url.searchParams.get("movies") || "12", 10) || 12, 0), 120);
+      const showLimit = Math.min(Math.max(parseInt(url.searchParams.get("shows") || "4", 10) || 4, 0), 60);
       try {
         ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
         const [personRes, creditsRes] = await Promise.all([
@@ -65470,6 +65703,108 @@ function generateSearchVariations(query) {
           backdrop: (movies[0] && movies[0].backdrop) || (shows[0] && shows[0].backdrop) || null,
           movies,
           shows,
+        }, 200, { "Cache-Control": "public, max-age=86400" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/person-show-episodes?personId=<id>&tmdbId=<show id>
+    //   -> { ok, imdbId, showName, poster, backdrop, regular, episodes: [...] }
+    //
+    // The episodes of one show that a given person is ACTUALLY in.
+    //
+    // A Spotlight channel used to take a show's first N episodes whenever a
+    // person had any TV credit on it, so Tobey Maguire's single guest
+    // appearance in Roseanne put ten Roseanne episodes into the channel --
+    // nine of which he is not in. TMDB does not answer "which episodes" in
+    // one call, but it does carry the two facts that settle it:
+    //
+    //   * a season's own `credits.cast` is that season's REGULARS, who are
+    //     in every episode of it without being listed on each one;
+    //   * each episode's `guest_stars` and `crew` name everyone else --
+    //     which is where a one-episode guest, and a director, turn up.
+    //
+    // So: a regular contributes the whole season, and anyone else
+    // contributes exactly the episodes that name them.
+    if (path === "/api/person-show-episodes") {
+      const personId = (url.searchParams.get("personId") || "").trim();
+      const tmdbId = (url.searchParams.get("tmdbId") || "").trim();
+      if (!/^[0-9]+$/.test(personId) || !/^[0-9]+$/.test(tmdbId)) {
+        return json({ ok: false, error: "Missing personId or tmdbId." }, 400);
+      }
+      const wantedPerson = parseInt(personId, 10);
+      try {
+        const showRes = await fetch(
+          `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+        );
+        if (!showRes.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${showRes.status}).` });
+        const show = await showRes.json();
+        const imdbId = (show.external_ids && show.external_ids.imdb_id) || `tmdb:${tmdbId}`;
+        const showPoster = show.poster_path ? `https://image.tmdb.org/t/p/w500${show.poster_path}` : "";
+        const showBackdrop = show.backdrop_path ? `https://image.tmdb.org/t/p/w780${show.backdrop_path}` : "";
+        // Specials (season 0) are left out: they are recaps, gag reels and
+        // clip shows as often as they are episodes, and a channel built out
+        // of them plays badly.
+        const seasons = (show.seasons || [])
+          .filter((s) => s && s.season_number > 0)
+          .map((s) => s.season_number)
+          .slice(0, PERSON_SHOW_MAX_SEASONS);
+        let anyRegular = false;
+        const perSeason = await mapWithConcurrency(seasons, 4, async (seasonNumber) => {
+          try {
+            const sRes = await fetch(
+              `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/season/${seasonNumber}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=credits`,
+              { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+            );
+            if (!sRes.ok) return [];
+            const sData = await sRes.json();
+            const seasonCast = (sData.credits && Array.isArray(sData.credits.cast)) ? sData.credits.cast : [];
+            const seasonCrew = (sData.credits && Array.isArray(sData.credits.crew)) ? sData.credits.crew : [];
+            const isRegular =
+              seasonCast.some((c) => c && c.id === wantedPerson) ||
+              seasonCrew.some((c) => c && c.id === wantedPerson && /^(creator|executive producer)$/i.test(String(c.job || "")));
+            if (isRegular) anyRegular = true;
+            const out = [];
+            for (const ep of (sData.episodes || [])) {
+              if (!ep || !Number.isInteger(ep.episode_number)) continue;
+              if (!isRegular) {
+                const named =
+                  (ep.guest_stars || []).some((g) => g && g.id === wantedPerson) ||
+                  (ep.crew || []).some((c) => c && c.id === wantedPerson);
+                if (!named) continue;
+              }
+              const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+              out.push({
+                season: seasonNumber,
+                episode: ep.episode_number,
+                name: ep.name || `Episode ${ep.episode_number}`,
+                released: ep.air_date || "",
+                thumbnail: stillUrl,
+              });
+            }
+            return out;
+          } catch {
+            return [];
+          }
+        });
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 1 + seasons.length));
+        const episodes = [];
+        for (const run of perSeason) episodes.push(...run);
+        episodes.sort((a, b) => (a.season - b.season) || (a.episode - b.episode));
+        return json({
+          ok: true,
+          imdbId,
+          showName: show.name || "",
+          poster: showPoster,
+          backdrop: showBackdrop,
+          // True when the person is a season regular somewhere in this show,
+          // which is what "every episode of that season" above is standing
+          // on -- surfaced so the client can say which of the two answers
+          // it got rather than presenting a guess as a fact.
+          regular: anyRegular,
+          episodes: episodes.slice(0, PERSON_SHOW_MAX_EPISODES),
         }, 200, { "Cache-Control": "public, max-age=86400" });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
@@ -72447,11 +72782,26 @@ function generateSearchVariations(query) {
         return json({ ok: false, error: "That channel has nothing playable in it to share." }, 400);
       }
       const publish = !!body.publish;
+      // Who is writing, when they say so.
+      //
+      // Publishing REQUIRES it -- a listing everyone can see needs an owner
+      // who can take it down. An unlisted share does not, but it may still
+      // carry credentials, and it has to: re-sharing writes over an existing
+      // record, and one created by publishing has an owner, so a re-share
+      // that proved nothing was refused as someone else's link by the very
+      // person who owned it.
       let owner = "";
       if (publish) {
         const auth = await authenticateCreator(body.creatorName, body.creatorKey);
         if (!auth.ok) return authFailureResponse(auth);
         owner = auth.username;
+      } else if (body.creatorName && body.creatorKey) {
+        // Best-effort: bad credentials on an unlisted share are simply not
+        // proof, and fall through to the unowned path below. They cannot
+        // buy access to someone else's record either way -- the ownership
+        // check is against `owner`, which stays "" unless this succeeded.
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (auth.ok) owner = auth.username;
       }
       const description = String(body.description || "").trim().slice(0, SHARED_CHANNEL_DESCRIPTION_MAX);
       // Reusing the code someone already has is what makes "Share" on an
