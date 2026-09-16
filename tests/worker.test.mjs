@@ -11169,17 +11169,27 @@ describe("worker: channel video ids are real stream requests", () => {
     assert.equal(meta.videos[0].title, "Breaking Bad S2E5 — Breakage");
   });
 
-  it("answers null for a dynamic channel when there is nothing in progress", async () => {
+  it("answers null for a dynamic channel with no live lineup and no seed either", async () => {
     assert.equal(await channelMeta([], { dynamic: "next-up" }, { continueWatching: [] }), null);
     assert.equal(await channelMeta([], { dynamic: "next-up" }, {}), null);
   });
 
-  it("ignores a dynamic channel's own stored picks -- they can only be stale", async () => {
-    const stale = [ep({ season: 1, episode: 1, title: "saved months ago" })];
-    const meta = await channelMeta(stale, { dynamic: "next-up" }, {
+  it("prefers the live derivation over the seed the builder stored", async () => {
+    const seed = [ep({ season: 1, episode: 1, title: "seeded when it was saved" })];
+    const meta = await channelMeta(seed, { dynamic: "next-up" }, {
       continueWatching: [{ showId: "tt0903747", showTitle: "Breaking Bad", seasonNum: 1, episodeNum: 2, name: "Cat's in the Bag" }],
     });
     assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0903747:1:2"]);
+  });
+
+  // The case that made this channel come back blank: resolveConfig only
+  // hands over continueWatching for a config that PROVED whose it is, so
+  // for a config with no personal shelf the live derivation is empty every
+  // time and the seed is the only lineup the channel will ever have.
+  it("falls back to the seed when the config cannot prove whose tracking to read", async () => {
+    const seed = [ep({ season: 1, episode: 1, title: "seeded when it was saved" })];
+    const meta = await channelMeta(seed, { dynamic: "next-up" }, {});
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["seeded when it was saved"]);
   });
 
   it("drops a Continue Watching row it cannot turn into a stream request", async () => {

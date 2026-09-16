@@ -4970,14 +4970,61 @@ describe("client: the dynamic Next Up channel", () => {
     assert.match(el(client, "channelNextUpStatus").innerHTML, /Creator Profile/);
   });
 
-  it("saves a channel with no picks of its own", () => {
-    const client = loadClient({ routes: {} });
+  it("seeds itself from Continue Watching, so it plays before the server can help", () => {
+    const client = loadClient({
+      routes: {},
+      storage: {
+        "myListAddon:localCustomLists": JSON.stringify({
+          "continue-watching": {
+            slug: "continue-watching", name: "Continue Watching", type: "series",
+            items: [
+              { id: "1", type: "episode", name: "Breakage", showId: "tt0903747", showTitle: "Breaking Bad", showPoster: "https://img/bb.jpg", seasonNum: 2, episodeNum: 5 },
+              { id: "2", type: "episode", name: "The One", showId: "tt0108778", showTitle: "Friends", seasonNum: 5, episodeNum: 13 },
+            ],
+          },
+        }),
+      },
+    });
     client.set("activeCreator", { creatorName: "alice" });
     client.call("createNextUpChannel", null);
     const saved = Object.values(client.call("loadLocalChannels"));
     assert.equal(saved.length, 1);
     assert.equal(saved[0].dynamic, "next-up");
-    assert.deepEqual(plain(saved[0].items), [], "the Worker fills this in per request");
+    assert.deepEqual(
+      plain(saved[0].items.map((it) => it.imdbId + ":" + it.season + ":" + it.episode)),
+      ["tt0903747:2:5", "tt0108778:5:13"]
+    );
+    assert.equal(saved[0].items[0].title, "Breaking Bad S2E5 \u2014 Breakage");
+  });
+
+  it("saves with no picks when nothing is in progress, rather than refusing", () => {
+    const client = loadClient({ routes: {} });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("createNextUpChannel", null);
+    const saved = Object.values(client.call("loadLocalChannels"));
+    assert.equal(saved.length, 1);
+    assert.deepEqual(plain(saved[0].items), []);
+  });
+
+  it("drops a Continue Watching row it could not turn into a stream request", () => {
+    const client = loadClient({
+      routes: {},
+      storage: {
+        "myListAddon:localCustomLists": JSON.stringify({
+          "continue-watching": {
+            slug: "continue-watching", name: "Continue Watching", type: "series",
+            items: [
+              { id: "1", type: "episode", name: "no show id", showId: "", seasonNum: 1, episodeNum: 1 },
+              { id: "2", type: "episode", name: "no season", showId: "tt1", seasonNum: null, episodeNum: 1 },
+              { id: "3", type: "episode", name: "fine", showId: "tt1", showTitle: "Fine", seasonNum: 3, episodeNum: 4 },
+              { id: "4", type: "episode", name: "same again", showId: "tt1", showTitle: "Fine", seasonNum: 3, episodeNum: 4 },
+            ],
+          },
+        }),
+      },
+    });
+    const seeded = client.call("channelNextUpSeedItems");
+    assert.deepEqual(plain(seeded.map((it) => it.imdbId + ":" + it.season + ":" + it.episode)), ["tt1:3:4"]);
   });
 
   it("opens the one that exists instead of adding a second", () => {
@@ -4986,5 +5033,134 @@ describe("client: the dynamic Next Up channel", () => {
     client.call("createNextUpChannel", null);
     client.call("createNextUpChannel", null);
     assert.equal(Object.keys(client.call("loadLocalChannels")).length, 1);
+  });
+});
+
+// --- browsing a person's filmography -------------------------------------
+//
+// Tapping an actor or director opens what they have been in BELOW the
+// search, the same way tapping a show opens its seasons -- so a tribute can
+// be pruned before it is saved rather than committed whole in one click.
+describe("client: browsing an actor or director's filmography", () => {
+  const CREDITS = {
+    ok: true,
+    name: "Robin Williams",
+    poster: "https://img/rw.jpg",
+    backdrop: "https://img/rw-bd.jpg",
+    movies: [
+      { tmdbId: 1, type: "movie", title: "Good Will Hunting", year: "1997", released: "1997-12-05", rating: 8.2, votes: 9000, poster: "https://img/gwh.jpg", backdrop: "", role: "Sean" },
+      { tmdbId: 2, type: "movie", title: "Aladdin", year: "1992", released: "1992-11-25", rating: 7.7, votes: 8000, poster: "https://img/al.jpg", backdrop: "", role: "Genie" },
+    ],
+    shows: [
+      { tmdbId: 90, type: "tv", title: "Mork & Mindy", year: "1978", released: "1978-09-14", rating: 7.1, votes: 300, poster: "https://img/mm.jpg", backdrop: "", role: "Mork" },
+    ],
+  };
+
+  function personClient(extraRoutes = {}) {
+    return loadClient({
+      routes: {
+        "/api/person-search": () => ({
+          json: { ok: true, results: [{ personId: 2157, name: "Robin Williams", department: "Acting", knownFor: "Aladdin", poster: "https://img/rw.jpg" }] },
+        }),
+        "/api/person-credits": () => ({ json: CREDITS }),
+        ...extraRoutes,
+      },
+    });
+  }
+
+  it("puts a person's search card behind the same browse gesture a show's card uses", async () => {
+    const client = personClient();
+    client.set("channelSearchType", "person");
+    el(client, "channelSearchInput").value = "robin williams";
+    await client.call("runChannelTitleSearch");
+    const html = el(client, "channelSearchResult").innerHTML;
+    assert.match(html, /channelPersonCard/);
+    assert.match(html, /channelPersonBtn/);
+    assert.match(html, /data-personid="2157"/);
+    assert.match(html, /\+ Browse</, "not an immediate 'build me a channel'");
+  });
+
+  it("lists the films and the television separately, each with its own control", async () => {
+    const client = personClient();
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    const html = el(client, "channelEpisodePicker").innerHTML;
+    assert.match(html, /Good Will Hunting/);
+    assert.match(html, /Aladdin/);
+    assert.match(html, /Mork &amp; Mindy/, "a title's ampersand is escaped, not injected");
+    assert.match(html, /channelPersonMovieBtn/);
+    assert.match(html, /channelPersonShowBtn/);
+    assert.match(html, /Add everything as a Spotlight channel/);
+    assert.match(html, /2 films and 1 show/);
+  });
+
+  it("asks the server again when the order changes, rather than re-sorting one page", async () => {
+    const client = personClient();
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    assert.equal(requestsTo(client, "/api/person-credits").length, 1);
+    await client.call("setChannelSpotlightSortAndReload", "rating");
+    const asked = requestsTo(client, "/api/person-credits");
+    assert.equal(asked.length, 2);
+    assert.match(asked[1].url, /sort=rating/);
+  });
+
+  it("asks for a browsable number of credits, not just a channel's worth", async () => {
+    const client = personClient();
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    const asked = requestsTo(client, "/api/person-credits")[0];
+    assert.match(asked.url, /movies=40/);
+    assert.match(asked.url, /shows=12/);
+  });
+
+  it("adds every film into the draft, resolving each to an IMDb id first", async () => {
+    const client = personClient({
+      "/api/resolve-movie": (req) => {
+        const tmdbId = new URL(req.url).searchParams.get("tmdbId");
+        return { json: { ok: true, imdbId: "tt000" + tmdbId } };
+      },
+      "/api/show-seasons": () => ({ json: { ok: false } }),
+    });
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    await client.call("addWholeSpotlightToDraft", null);
+    const draft = client.get("channelDraftItems");
+    assert.deepEqual(plain(draft.map((it) => it.imdbId)), ["tt0001", "tt0002"]);
+    assert.equal(draft[0].kind, "movie");
+    assert.equal(el(client, "channelNameInput").value, "Robin Williams Spotlight");
+  });
+
+  it("keeps the server's ordering by leaving the draft on 'As listed'", async () => {
+    const client = personClient({
+      "/api/resolve-movie": (req) => ({ json: { ok: true, imdbId: "tt00" + new URL(req.url).searchParams.get("tmdbId") } }),
+      "/api/show-seasons": () => ({ json: { ok: false } }),
+    });
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    await client.call("addWholeSpotlightToDraft", null);
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Good Will Hunting", "Aladdin"],
+      "career order as the server returned it, not re-sorted here"
+    );
+  });
+
+  it("adds to an existing draft instead of replacing what is already in it", async () => {
+    const client = personClient({
+      "/api/resolve-movie": (req) => ({ json: { ok: true, imdbId: "tt00" + new URL(req.url).searchParams.get("tmdbId") } }),
+      "/api/show-seasons": () => ({ json: { ok: false } }),
+    });
+    client.set("channelDraftItems", [{ kind: "movie", imdbId: "tt_existing", title: "Already here" }]);
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    await client.call("addWholeSpotlightToDraft", null);
+    assert.equal(client.get("channelDraftItems")[0].imdbId, "tt_existing");
+    assert.equal(client.get("channelDraftItems").length, 3);
+  });
+
+  it("forgets the filmography when the search type changes under it", async () => {
+    const client = personClient();
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    assert.ok(client.get("channelPersonCredits"));
+    client.call("setChannelSearchType", "tv", null);
+    assert.equal(client.get("channelPersonCredits"), null);
   });
 });

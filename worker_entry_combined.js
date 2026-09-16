@@ -13888,8 +13888,20 @@ async function readChannelLivePool(payload, opts) {
 // Worker last rebuilt from the list it was imported from, and keeps its
 // stored picks as the fallback for before that first rebuild lands.
 async function channelSourceItems(payload, opts) {
-  if (payload.dynamic === "next-up") return channelNextUpItems(opts.continueWatching);
   const stored = Array.isArray(payload.items) ? payload.items : [];
+  if (payload.dynamic === "next-up") {
+    // The live answer when there is one, and the seed the builder stored
+    // otherwise.
+    //
+    // The fallback is not belt-and-braces: resolveConfig only hands over
+    // continueWatching for a config that PROVED whose it is, and a config
+    // with no personal shelf in it never does -- so for those the live
+    // derivation is empty every time and the seed is the only lineup the
+    // channel will ever have. Returning nothing there is what made this
+    // channel come back blank.
+    const live = channelNextUpItems(opts.continueWatching);
+    return live.length ? live : stored;
+  }
   if (payload.liveSync && payload.sourceUrl) {
     const live = await readChannelLivePool(payload, opts).catch(() => null);
     if (live && live.length) return live;
@@ -35588,6 +35600,9 @@ function setChannelSearchType(type, btn) {
   const box = document.getElementById('channelSearchResult');
   const epBox = document.getElementById('channelEpisodePicker');
   if (epBox) epBox.innerHTML = '';
+  // The picker below is about to be reused for a different kind of thing,
+  // so the filmography it may be holding stops being what is on screen.
+  channelPersonCredits = null;
   const q = input ? input.value.trim() : '';
   if (q) {
     runChannelTitleSearch();
@@ -35654,6 +35669,14 @@ function renderChannelTitleResults(results, searchType = 'tv') {
 }
 
 document.getElementById('channelSearchResult').addEventListener('click', (e) => {
+  // A person card behaves like a show card: tapping the photo (or the
+  // button) opens what they have been in, below, rather than committing to
+  // a whole channel in one click.
+  const personTarget = e.target.closest('.channelPersonCard, .channelPersonBtn');
+  if (personTarget) {
+    browseChannelPerson(personTarget.dataset.personid, personTarget.dataset.personname);
+    return;
+  }
   const showTarget = e.target.closest('.channelTitleCard, .channelTitleBtn');
   if (showTarget) {
     browseChannelShow(showTarget.dataset.tmdbid, showTarget.dataset.title, showTarget.dataset.poster, showTarget.dataset.backdrop);
@@ -35775,6 +35798,25 @@ async function browseChannelShow(tmdbId, showName, showPoster, showBackdrop) {
 }
 
 document.getElementById('channelEpisodePicker').addEventListener('click', (e) => {
+  const personMovie = e.target.closest('.channelPersonMovieCard, .channelPersonMovieBtn');
+  if (personMovie) {
+    addMovieToChannelDraft(
+      personMovie.dataset.tmdbid, personMovie.dataset.title, personMovie.dataset.year,
+      personMovie.dataset.poster, personMovie.dataset.backdrop,
+      personMovie.querySelector('.channelPersonMovieBtn') || personMovie
+    );
+    return;
+  }
+  const personShow = e.target.closest('.channelPersonShowCard, .channelPersonShowBtn');
+  if (personShow) {
+    browseChannelShow(personShow.dataset.tmdbid, personShow.dataset.title, personShow.dataset.poster, personShow.dataset.backdrop);
+    return;
+  }
+  const personAddAll = e.target.closest('.channelPersonAddAllBtn');
+  if (personAddAll) {
+    addWholeSpotlightToDraft(personAddAll);
+    return;
+  }
   const seasonBtn = e.target.closest('.channelSeasonBtn');
   if (seasonBtn) {
     loadChannelSeasonEpisodes(
@@ -44954,6 +44996,9 @@ function renderMyCreatedChannelsList() {
         '<div class="list-card-actions">' +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">Edit</button>' +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Copy a link that rebuilds this channel anywhere">' + (ch.shareCode ? 'Re-share' : 'Share') + '</button>' +
+          (ch.dynamic === 'next-up'
+            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshNextUpChannelSeed(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Pull in whatever you have started watching since">Refresh</button>'
+            : '') +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalChannel(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, &quot;' + escapeJsAttr(ch.name) + '&quot;)">Delete</button>' +
           addBtnHtml +
         '</div>' +
@@ -45293,6 +45338,82 @@ async function importChannelFromLink(btn) {
 // empty.
 const NEXT_UP_CHANNEL_NAME = 'Next Up';
 
+// The picks a Next Up channel is SEEDED with, out of this browser's own
+// Continue Watching list.
+//
+// The Worker re-derives the lineup per request and that stays the channel's
+// real answer -- but it can only do so for an install config that proved
+// which account it speaks for (see trackOwner in resolveConfig), and a
+// config with no personal shelf in it does not. A channel that stored
+// nothing therefore came back EMPTY for exactly the people most likely to
+// try it first. Seeding fixes that: the channel works the moment it is
+// saved, and the Worker's live answer replaces the seed whenever it has one.
+function channelNextUpSeedItems() {
+  let cw = [];
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    const list = map && map['continue-watching'];
+    cw = (list && Array.isArray(list.items)) ? list.items : [];
+  } catch (e) {
+    cw = [];
+  }
+  const out = [];
+  const seen = {};
+  cw.forEach((it) => {
+    if (!it) return;
+    const showId = String(it.showId || it.imdbId || '').trim();
+    const season = Number(it.seasonNum);
+    const episode = Number(it.episodeNum);
+    if (!showId || !Number.isInteger(season) || !Number.isInteger(episode)) return;
+    const key = showId + ':' + season + ':' + episode;
+    if (seen[key]) return;
+    seen[key] = true;
+    const showName = String(it.showTitle || '').trim();
+    const epName = String(it.name || '').trim() || ('Episode ' + episode);
+    const poster = it.showPoster || it.poster || '';
+    out.push({
+      kind: 'episode',
+      imdbId: showId,
+      season: season,
+      episode: episode,
+      showName: showName,
+      epName: epName,
+      title: showName ? (showName + ' S' + season + 'E' + episode + ' — ' + epName) : epName,
+      released: it.released || '',
+      thumbnail: poster,
+      poster: poster,
+      showPoster: poster,
+    });
+  });
+  return out;
+}
+
+// Re-seeds a saved Next Up channel from Continue Watching as it stands now,
+// and rewrites the catalog row that carries it. What the card's Refresh
+// button does.
+function refreshNextUpChannelSeed(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch || ch.dynamic !== 'next-up') return 0;
+  const items = channelNextUpSeedItems();
+  ch.items = items;
+  saveLocalChannelsMap(map);
+  const payload = Object.assign({}, ch, { items: items });
+  const rows = [...document.querySelectorAll('#lists .entry')];
+  rows.forEach((row) => {
+    [...row.querySelectorAll('.url')].forEach((u) => {
+      if (String(u.value || '').indexOf(channelId) !== -1) u.value = 'channel:v1:' + JSON.stringify(payload);
+    });
+  });
+  if (typeof saveState === 'function') saveState();
+  renderMyCreatedChannelsList();
+  if (btn) {
+    btn.textContent = items.length + ' up next ✓';
+    setTimeout(() => { if (btn) btn.textContent = 'Refresh'; }, 1800);
+  }
+  return items.length;
+}
+
 function createNextUpChannel(btn) {
   const status = document.getElementById('channelNextUpStatus');
   const say = (html) => { if (status) status.innerHTML = html; };
@@ -45316,9 +45437,11 @@ function createNextUpChannel(btn) {
       name: NEXT_UP_CHANNEL_NAME,
       poster: null,
       backdrop: null,
-      // No picks by design. The Worker fills this in per request; anything
-      // stored here would only ever be stale.
-      items: [],
+      // A seed, not the answer. The Worker re-derives the lineup on every
+      // request and that replaces this -- but only for a config that can
+      // prove whose it is, so this is what the channel plays until then and
+      // what it falls back to if that proof is ever missing.
+      items: channelNextUpSeedItems(),
       shuffle: false,
       autoSort: '',
       sortByAired: false,
@@ -45330,8 +45453,11 @@ function createNextUpChannel(btn) {
     renderMyCreatedChannelsList();
     renderChannelMergeList();
     showAddedToast('"' + NEXT_UP_CHANNEL_NAME + '" added to your Catalogs.');
-    say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + NEXT_UP_CHANNEL_NAME + '" added. It fills itself in from Continue Watching every time you open it.</p>');
-    setTimeout(() => { if (status) status.innerHTML = ''; }, 6000);
+    const seeded = payload.items.length;
+    say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + NEXT_UP_CHANNEL_NAME + '" added with ' + seeded +
+      ' show' + (seeded === 1 ? '' : 's') + ' up next, and it refreshes itself from Continue Watching as you watch.' +
+      (seeded ? '' : ' Nothing is in progress yet — it fills in once you have started something.') + '</p>');
+    setTimeout(() => { if (status) status.innerHTML = ''; }, 8000);
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -45468,62 +45594,155 @@ function renderChannelPersonResults(results) {
   }
   const cards = results.map((p) => {
     const img = p.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(p.poster) + '" alt="" loading="lazy">'
-      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No photo</div>';
-    return '<div class="custom-list-search-item" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0;">' +
+      ? '<img class="preview-thumb" src="' + escapeAttr(p.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No photo</div>';
+    const data = ' data-personid="' + escapeAttr(String(p.personId)) + '" data-personname="' + escapeAttr(p.name) + '"';
+    return '<div class="custom-list-search-item channelPersonCard" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
       img +
       '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(p.name) + '">' + escapeHtml(p.name) + '</div>' +
       '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; width:100%;" title="' + escapeAttr(p.knownFor || p.department || '') + '">' +
         escapeHtml(p.knownFor || p.department || '') +
       '</div>' +
-      '<button type="button" class="lc-btn secondary" style="width:100%; padding:4px 6px; font-size:0.75rem;"' +
-        ' onclick="buildSpotlightChannel(&quot;' + escapeJsAttr(String(p.personId)) + '&quot;, &quot;' + escapeJsAttr(p.name) + '&quot;, this)">+ Spotlight</button>' +
+      '<button type="button" class="lc-btn secondary channelPersonBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' + data + '>+ Browse</button>' +
       '</div>';
   }).join('');
-  box.innerHTML =
-    '<div style="display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap;">' +
-      '<label for="channelSpotlightSortSelect" style="font-size:0.8rem; font-weight:600;">Spotlight order:</label>' +
-      '<select id="channelSpotlightSortSelect" onchange="setChannelSpotlightSort(this.value)" style="font-size:0.82rem; padding:5px 8px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">' +
-        '<option value="chronological"' + (channelSpotlightSort === 'chronological' ? ' selected' : '') + '>Chronologically (watch a career unfold)</option>' +
-        '<option value="rating"' + (channelSpotlightSort === 'rating' ? ' selected' : '') + '>Best first (by rating)</option>' +
-      '</select>' +
-    '</div>' +
-    '<div class="poster-grid-3" style="margin-top:10px;">' + cards + '</div>';
+  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cards + '</div>';
 }
 
-// Builds the channel into the DRAFT rather than saving it outright: a
-// tribute is something people want to tune -- drop the one film they have
-// seen too often, reorder the ending -- and the builder is already sitting
-// right there with every one of those controls.
-async function buildSpotlightChannel(personId, personName, btn) {
+// --- browsing one person's filmography ----------------------------------
+//
+// The same shape as browsing a show: tap the card and everything they have
+// been in opens BELOW, where each title can be added on its own -- rather
+// than the whole channel being committed in one click, which gave no way to
+// drop the one film you have seen too often.
+//
+// A film is added directly. A TV credit hands off to browseChannelShow, so
+// picking seasons and episodes of a show someone was in is the same journey
+// as picking them from the Shows tab, with the same controls.
+let channelPersonCredits = null;
+
+async function browseChannelPerson(personId, personName) {
+  const box = document.getElementById('channelEpisodePicker');
+  if (!box) return;
+  box.innerHTML = '<p><small>Loading ' + escapeHtml(personName || 'their') + '\u2019s filmography\u2026</small></p>';
+  box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  try {
+    const res = await fetch(ORIGIN + '/api/person-credits?personId=' + encodeURIComponent(personId) +
+      '&sort=' + encodeURIComponent(channelSpotlightSort) + '&movies=40&shows=12', { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not read that filmography.') + '</p>';
+      return;
+    }
+    channelPersonCredits = {
+      personId: String(personId),
+      name: data.name || personName || '',
+      poster: data.poster || null,
+      backdrop: data.backdrop || null,
+      movies: data.movies || [],
+      shows: data.shows || [],
+    };
+    renderChannelPersonCredits();
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">\u2717 Network error loading that filmography.</p>';
+  }
+}
+
+// The sort is a property of the whole filmography, so changing it re-asks
+// the server rather than re-ordering here: which credits make the cut is
+// decided by popularity and only their ORDER is the sort, so sorting a
+// fetched page locally would be sorting the wrong forty titles.
+function setChannelSpotlightSortAndReload(value) {
+  setChannelSpotlightSort(value);
+  if (channelPersonCredits) browseChannelPerson(channelPersonCredits.personId, channelPersonCredits.name);
+}
+
+function channelPersonCreditCardHtml(credit, isShow) {
+  const poster = credit.poster || '';
+  const img = poster
+    ? '<img class="preview-thumb" src="' + escapeAttr(poster) + '" alt="" loading="lazy">'
+    : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
+  const data =
+    ' data-tmdbid="' + escapeAttr(String(credit.tmdbId)) + '"' +
+    ' data-title="' + escapeAttr(credit.title) + '"' +
+    ' data-year="' + escapeAttr(credit.year || '') + '"' +
+    ' data-poster="' + escapeAttr(poster) + '"' +
+    ' data-backdrop="' + escapeAttr(credit.backdrop || '') + '"';
+  const cardClass = isShow ? 'channelPersonShowCard' : 'channelPersonMovieCard';
+  const btnClass = isShow ? 'channelPersonShowBtn' : 'channelPersonMovieBtn';
+  const btnLabel = isShow ? '+ Browse' : '+ Add';
+  const sub = [credit.year, credit.role].filter(Boolean).join(' \u00b7 ');
+  return '<div class="custom-list-search-item ' + cardClass + '" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
+    img +
+    '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(credit.title) + '">' +
+      escapeHtml(credit.title) +
+    '</div>' +
+    '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; width:100%;" title="' + escapeAttr(sub) + '">' + escapeHtml(sub) + '</div>' +
+    '<button type="button" class="lc-btn secondary ' + btnClass + '" style="width:100%; padding:4px 6px; font-size:0.75rem;"' + data + '>' + btnLabel + '</button>' +
+    '</div>';
+}
+
+function renderChannelPersonCredits() {
+  const box = document.getElementById('channelEpisodePicker');
+  if (!box || !channelPersonCredits) return;
+  const c = channelPersonCredits;
+  if (!c.movies.length && !c.shows.length) {
+    box.innerHTML = '<p class="testresult err">\u2717 TMDB has no credits we can build a channel from for ' + escapeHtml(c.name) + '.</p>';
+    return;
+  }
+  const header =
+    '<div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px;">' +
+      '<p style="margin:0; font-weight:600; font-size:0.9rem; flex:1; min-width:160px;">' +
+        escapeHtml(c.name) + ' \u2014 ' + c.movies.length + ' film' + (c.movies.length === 1 ? '' : 's') +
+        (c.shows.length ? ' and ' + c.shows.length + ' show' + (c.shows.length === 1 ? '' : 's') : '') +
+      '</p>' +
+      '<label for="channelSpotlightSortSelect" style="font-size:0.8rem; font-weight:600;">Order:</label>' +
+      '<select id="channelSpotlightSortSelect" onchange="setChannelSpotlightSortAndReload(this.value)" style="font-size:0.82rem; padding:5px 8px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">' +
+        '<option value="chronological"' + (channelSpotlightSort === 'chronological' ? ' selected' : '') + '>Career order</option>' +
+        '<option value="rating"' + (channelSpotlightSort === 'rating' ? ' selected' : '') + '>Best first</option>' +
+      '</select>' +
+    '</div>' +
+    '<div class="actions" style="flex-wrap:wrap; margin-bottom:10px;">' +
+      '<button type="button" class="secondary channelPersonAddAllBtn">Add everything as a Spotlight channel</button>' +
+    '</div>';
+  const movies = c.movies.length
+    ? '<p style="margin:10px 0 4px; font-weight:600; font-size:0.85rem;">Films</p>' +
+      '<div class="poster-grid-3">' + c.movies.map((m) => channelPersonCreditCardHtml(m, false)).join('') + '</div>'
+    : '';
+  const shows = c.shows.length
+    ? '<p style="margin:14px 0 4px; font-weight:600; font-size:0.85rem;">Television</p>' +
+      '<p style="margin:0 0 6px; color:var(--muted); font-size:0.78rem;">Tap one to pick its seasons and episodes, the same way you would from the Shows tab.</p>' +
+      '<div class="poster-grid-3">' + c.shows.map((sh) => channelPersonCreditCardHtml(sh, true)).join('') + '</div>' +
+      '<div id="channelEpisodeList"></div>'
+    : '<div id="channelEpisodeList"></div>';
+  box.innerHTML = header + movies + shows;
+}
+
+// "Add everything as a Spotlight channel" -- the one-tap path, for when the
+// whole filmography is the point and there is nothing to prune.
+//
+// Adds into the DRAFT rather than saving outright: a tribute is something
+// people want to tune, and the builder is already sitting right there with
+// every control for it. The order the server returned is kept as-is, so the
+// draft is left "As listed" -- arming an auto-sort here would re-sort on the
+// next render and throw that ordering away.
+async function addWholeSpotlightToDraft(btn) {
+  if (!channelPersonCredits) return;
+  const c = channelPersonCredits;
   const box = document.getElementById('channelEpisodePicker');
   const say = (html) => { if (box) box.innerHTML = html; };
   const originalLabel = btn ? btn.textContent : '';
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Building…';
+    btn.textContent = 'Building\u2026';
   }
   try {
-    say('<p><small>Reading ' + escapeHtml(personName) + '’s filmography…</small></p>');
-    const res = await fetch(ORIGIN + '/api/person-credits?personId=' + encodeURIComponent(personId) +
-      '&sort=' + encodeURIComponent(channelSpotlightSort), { cache: 'no-store' });
-    const data = await res.json();
-    if (!data.ok) {
-      say('<p class="testresult err">✗ ' + escapeHtml(data.error || 'Could not read that filmography.') + '</p>');
-      return;
-    }
-    const movies = data.movies || [];
-    const shows = data.shows || [];
-    if (!movies.length && !shows.length) {
-      say('<p class="testresult err">✗ TMDB has no credits we can build a channel from for ' + escapeHtml(personName) + '.</p>');
-      return;
-    }
-    // Movies need their IMDB id resolved one by one -- a channel item's id
-    // IS the stream request (see channelItemStreamId server-side), so a
-    // movie with no id would play as nothing.
-    say('<p><small>Resolving ' + movies.length + ' film' + (movies.length === 1 ? '' : 's') + '…</small></p>');
+    // A film needs its IMDB id resolved one by one: a channel item's id IS
+    // the stream request (see channelItemStreamId server-side), so a movie
+    // with no id would play as nothing.
+    say('<p><small>Resolving ' + c.movies.length + ' film' + (c.movies.length === 1 ? '' : 's') + '\u2026</small></p>');
     const resolvedMovies = [];
-    for (const m of movies) {
+    for (const m of c.movies) {
       try {
         const r = await fetch(ORIGIN + '/api/resolve-movie?tmdbId=' + encodeURIComponent(m.tmdbId), { cache: 'no-store' });
         const d = await r.json();
@@ -45546,52 +45765,47 @@ async function buildSpotlightChannel(personId, personName, btn) {
         continue;
       }
     }
+    // A TV appearance is one strand of a spotlight, not the whole thing --
+    // a 200-episode sitcom would otherwise bury every film. Only the top
+    // few shows, and only a slice of each; anything more precise is what
+    // browsing a show from the grid above is for.
     let showItems = [];
-    if (shows.length) {
-      const built = await buildChannelItemsFromShows(shows.map((sh) => ({
+    const topShows = c.shows.slice(0, 4);
+    if (topShows.length) {
+      const built = await buildChannelItemsFromShows(topShows.map((sh) => ({
         tmdbId: sh.tmdbId,
         imdbId: '',
         name: sh.title,
         poster: sh.poster,
         backdrop: sh.backdrop,
       })), {
-        // A TV appearance is one strand of a spotlight, not the whole
-        // thing -- a 200-episode sitcom would otherwise bury every film.
         maxEpisodesPerShow: 10,
         maxItems: 120,
         onProgress: function (i, total, show) {
-          say('<p><small>Adding TV work… ' + (i + 1) + ' of ' + total + ' (' + escapeHtml(show.name || '') + ')</small></p>');
+          say('<p><small>Adding TV work\u2026 ' + (i + 1) + ' of ' + total + ' (' + escapeHtml(show.name || '') + ')</small></p>');
         },
       });
       showItems = built.items;
     }
     const items = resolvedMovies.concat(showItems);
     if (!items.length) {
-      say('<p class="testresult err">✗ Could not resolve any of ' + escapeHtml(personName) + '’s credits to something playable.</p>');
+      say('<p class="testresult err">\u2717 Could not resolve any of ' + escapeHtml(c.name) + '\u2019s credits to something playable.</p>');
       return;
     }
-    openBuildCustomChannel();
-    channelDraftItems = items;
-    channelDraftPoster = data.poster || (movies[0] && movies[0].poster) || null;
-    channelDraftBackdrop = data.backdrop || null;
+    channelDraftItems = channelDraftItems.concat(items);
+    if (!channelDraftPoster) channelDraftPoster = c.poster || (c.movies[0] && c.movies[0].poster) || null;
+    if (!channelDraftBackdrop) channelDraftBackdrop = c.backdrop || null;
     const nameInput = document.getElementById('channelNameInput');
-    if (nameInput) nameInput.value = personName + ' Spotlight';
-    // The server already ordered the credits by the chosen sort, so the
-    // draft is left "as listed" -- arming an auto-sort here would re-sort
-    // them on the next render and throw that ordering away.
+    if (nameInput && !nameInput.value.trim()) nameInput.value = c.name + ' Spotlight';
     setChannelPlayOrder('as-listed');
     renderChannelDraftList();
     updateChannelSaveButtonLabel();
-    const epBox = document.getElementById('channelEpisodePicker');
-    if (epBox) {
-      epBox.innerHTML = '<p class="testresult ok" style="margin:4px 0 0;">✓ ' + escapeHtml(personName) + ' Spotlight: ' +
-        resolvedMovies.length + ' film' + (resolvedMovies.length === 1 ? '' : 's') +
-        (showItems.length ? ' and ' + showItems.length + ' TV episodes' : '') +
-        ', ' + (channelSpotlightSort === 'rating' ? 'best first' : 'in career order') +
-        '. Tune it below, then Save.</p>';
-    }
+    say('<p class="testresult ok" style="margin:4px 0 0;">\u2713 Added ' + resolvedMovies.length + ' film' + (resolvedMovies.length === 1 ? '' : 's') +
+      (showItems.length ? ' and ' + showItems.length + ' TV episodes' : '') +
+      ', ' + (channelSpotlightSort === 'rating' ? 'best first' : 'in career order') +
+      '. Tune the picks below, then Save.</p>');
   } catch (e) {
-    say('<p class="testresult err">✗ Network error while building that spotlight.</p>');
+    say('<p class="testresult err">\u2717 Network error while building that spotlight.</p>');
   } finally {
     if (btn) {
       btn.disabled = false;

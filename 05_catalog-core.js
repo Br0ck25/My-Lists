@@ -2385,8 +2385,20 @@ async function readChannelLivePool(payload, opts) {
 // Worker last rebuilt from the list it was imported from, and keeps its
 // stored picks as the fallback for before that first rebuild lands.
 async function channelSourceItems(payload, opts) {
-  if (payload.dynamic === "next-up") return channelNextUpItems(opts.continueWatching);
   const stored = Array.isArray(payload.items) ? payload.items : [];
+  if (payload.dynamic === "next-up") {
+    // The live answer when there is one, and the seed the builder stored
+    // otherwise.
+    //
+    // The fallback is not belt-and-braces: resolveConfig only hands over
+    // continueWatching for a config that PROVED whose it is, and a config
+    // with no personal shelf in it never does -- so for those the live
+    // derivation is empty every time and the seed is the only lineup the
+    // channel will ever have. Returning nothing there is what made this
+    // channel come back blank.
+    const live = channelNextUpItems(opts.continueWatching);
+    return live.length ? live : stored;
+  }
   if (payload.liveSync && payload.sourceUrl) {
     const live = await readChannelLivePool(payload, opts).catch(() => null);
     if (live && live.length) return live;

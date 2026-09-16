@@ -38,17 +38,27 @@ it did.
 
 **Channels that build themselves**
 
-- **Next Up channel.** One button under My Channels. It stores no picks at all: the lineup is
-  re-derived from your Continue Watching on every request, so pressing play always serves the next
-  unwatched episode across everything you have on the go, and it follows what you are actually
-  watching instead of freezing the day it was made. Needs a Creator Profile with Auto-track
-  playback on, since there is no other way for the add-on to know what you have seen.
+- **Next Up channel.** One button under My Channels. The lineup is re-derived from your Continue
+  Watching on the server on every request, so pressing play always serves the next unwatched
+  episode across everything you have on the go, and the channel follows what you are actually
+  watching instead of freezing the day it was made. It is also **seeded** from this browser's own
+  Continue Watching when you create it: the Worker can only re-derive a lineup for an install
+  config that has proved which account it speaks for, and a config with no personal shelf in it
+  never does — so without a seed the channel came back *empty* for exactly the people most likely
+  to try it first. The seed is what it plays until the live answer arrives, and what it falls back
+  to if that proof is ever missing. **Refresh** on the channel's card pulls in whatever you have
+  started watching since.
 - **Quick Channel Wizard.** Three dropdowns in Quick Add — network or studio, era, genre or mood —
   and a finished 24/7 channel compiled from the top shows that match. No blank canvas to fill in.
 - **Spotlight channels.** **Actors & Directors** joins Shows and Movies as a search type in the
-  builder. Pick someone and their best films and TV work compile into one channel, sorted
-  chronologically (a career unfolding) or best-first. Directing and creating credits count, not
-  only acting ones, so a Nolan or a Miyazaki spotlight is the films they *made*.
+  builder. Tapping a result opens their whole filmography *below the search*, exactly the way
+  tapping a show opens its seasons — films and television listed separately, each film addable on
+  its own, and each show opening into the same season-and-episode picker you get from the Shows
+  tab. **Add everything as a Spotlight channel** is still one click for when the whole filmography
+  is the point. Sorted chronologically (a career unfolding) or best-first, and the order comes from
+  the server so changing it re-asks rather than re-sorting one page — which credits make the cut is
+  decided by popularity, and only their order is the sort. Directing and creating credits count,
+  not only acting ones, so a Nolan or a Miyazaki spotlight is the films they *made*.
 - **Live Cloud Sync.** Importing a Trakt/MDBList/Simkl/TMDB list used to take a one-time snapshot,
   frozen for good. A channel can now keep the source URL instead: the Worker rebuilds its pool from
   that list in the background, so a public list gaining a title gains it here too. The rebuild never
