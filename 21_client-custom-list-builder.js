@@ -1672,7 +1672,13 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   if (type === 'episode') {
     const d = window._currentItemDetails;
     if (d && d.id) updateContinueWatching(d.id).catch(() => {});
-    if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
+    // Everything on the item page that reads Watch History, not just the
+    // season last expanded: the episode toggled may have been the last one
+    // its season -- or the whole show -- was waiting on, and its own season
+    // is not always the one _currentSeasonNum points at.
+    if (typeof refreshItemWatchState === 'function') {
+      refreshItemWatchState();
+    } else if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
       updateSeasonWatchedButton(window._currentSeasonNum);
     }
   } else if (type === 'movie' && existingIdx < 0) {
@@ -2115,6 +2121,9 @@ window.markShowWatched = async function(imdbId) {
       seasonBtn.classList.add('primary');
     }
   });
+  // The "x/8 episodes" line beside each of those buttons is read off Watch
+  // History, which this just rewrote for every aired episode of the show.
+  if (typeof updateSeasonEpisodeCounts === 'function') updateSeasonEpisodeCounts();
 };
 
 // One-way add to Watch History as watched -- unlike toggleBatchWatchStatus

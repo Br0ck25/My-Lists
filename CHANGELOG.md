@@ -6,6 +6,33 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ✅ A show's page says how much of each season you have watched, and "watched" means what has aired
+
+- **Every season header now reads `3/8 episodes`** instead of `8 episodes` — how many of that season are in
+  your Watch History, beside how many there are. `0/8` for a season you have not started, `8/8` in the accent
+  colour once it is finished.
+- **It moves as you do.** Marking an episode from the grid, a season from its button, or the whole show
+  updates every count on the page, without reopening it.
+- **A show you are caught up on mid-season now reads as watched.** The Mark Show Watched button says **Mark
+  Show Unwatched** once every episode that has *aired* has been watched, rather than waiting for a season
+  finale that has not gone out yet. Same for the season button beside it.
+- **Why it was wrong**: "fully watched" was counted against TMDB's `episode_count`, which includes the
+  episodes still to come. Watching 5 of a 10-episode season with episode 6 a month away came out as 5/10 —
+  unwatched — so the button offered to mark episodes already seen. The exact episode list settles it, but
+  it was only loaded after a season was expanded or the show was marked watched wholesale.
+- **No extra requests**: `/api/details` already carries the show's next unaired episode
+  (`nextEpisodeSeasonNumber` / `nextEpisodeNumber` / `nextEpisodeAirDate`), which places every season around
+  it — a later season has aired nothing, the season it falls in has aired everything before that episode,
+  an earlier one is out in full. An episode list, once loaded, still wins over it.
+- **Marking the last aired episode watched now flips the show's button** where it used to sit on "Mark Show
+  Watched" until the page was reopened, and it repaints every season's button rather than only the one last
+  expanded.
+- **A show rebuilt from an episode group keeps its old behaviour.** An anime unpacked into its own seasons is
+  not numbered the way TMDB numbers it, so the show-level pointer is not applied to it.
+- **Fixed: one show's episode lists answering for another's.** The season and episode caches were keyed by
+  season and episode number, never cleared between shows, so the last show's season 1 decided what had aired
+  in this one's. They are cleared when a show's page opens, and on sign-out.
+
 ### 🔀 A Channel's Play order is a menu of arrangements, and a pick you move stays moved
 
 - **Replaces the two checkboxes** added below with one **Play order** dropdown in the Channel builder:

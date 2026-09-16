@@ -1978,19 +1978,100 @@ function isEpisodeAired(ep) {
 // showing it as watched -- or letting a click claim it is -- states something
 // about the person's viewing that is not true.
 //
-// Two sources, most specific first. Once a season's episode grid has been
+// Three sources, most specific first. Once a season's episode grid has been
 // loaded (toggleSeasonEpisodes, or markSeasonWatched's own fetch) the episode
-// list is exact. Before that, only the season's own TMDB air_date is known: a
-// season dated in the future cannot have aired episodes, and one dated in the
-// past may be part-way through. A season with no air date at all is unknown,
-// and unknown is treated as "aired" -- the button keeps working exactly as it
-// did rather than being disabled on a guess.
+// list is exact. Failing that, the show's next unaired episode places the
+// seasons around it (seasonAiredCountFromNextEpisode). Failing that too, only
+// the season's own TMDB air_date is known: a season dated in the future cannot
+// have aired episodes, and one dated in the past may be part-way through. A
+// season with no air date at all is unknown, and unknown is treated as
+// "aired" -- the button keeps working exactly as it did rather than being
+// disabled on a guess.
 function seasonHasAiredEpisodes(seasonNum, seasonMeta) {
   const eps = window._seasonEpisodesMap && window._seasonEpisodesMap[seasonNum];
   if (Array.isArray(eps) && eps.length) return eps.some((ep) => isEpisodeAired(ep));
+  const fromNext = seasonAiredCountFromNextEpisode(seasonNum, seasonMeta);
+  if (fromNext != null) return fromNext > 0;
   const airDate = seasonMeta && (seasonMeta.air_date || seasonMeta.airDate);
   if (airDate) return isEpisodeAired(airDate);
   return true;
+}
+
+// Where the show's next unaired episode sits, read as "how many episodes of
+// THIS season have aired". /api/details already carries that pointer --
+// nextEpisodeSeasonNumber / nextEpisodeNumber / nextEpisodeAirDate, straight
+// off TMDB's next_episode_to_air -- so the seasons around it are settled
+// without fetching a single episode list: a later season has aired nothing,
+// the season the pointer falls in has aired everything BEFORE that episode,
+// and an earlier season is out in full.
+//
+// null means "this says nothing": a finished show, a show between seasons
+// with no dated next episode, or a show whose seasons were renumbered (see
+// showSeasonsAreTmdbNumbered). The caller falls back to season air dates.
+function seasonAiredCountFromNextEpisode(seasonNum, seasonMeta, details) {
+  const d = details || (typeof window !== 'undefined' ? window._currentItemDetails : null);
+  if (!d || !showSeasonsAreTmdbNumbered(d)) return null;
+  const nextSeason = Number(d.nextEpisodeSeasonNumber);
+  const nextEp = Number(d.nextEpisodeNumber);
+  if (!d.nextEpisodeAirDate || !(nextSeason > 0) || !(nextEp > 0)) return null;
+  // A pointer at an episode that is already out dates nothing -- the show has
+  // moved on since the payload was built.
+  if (typeof isEpisodeAired === 'function' && isEpisodeAired(d.nextEpisodeAirDate)) return null;
+  const sNum = Number(seasonNum);
+  if (!isFinite(sNum)) return null;
+  if (sNum > nextSeason) return 0;
+  if (sNum === nextSeason) return nextEp - 1;
+  const total = Number(seasonMeta && seasonMeta.episode_count);
+  return total > 0 ? total : null;
+}
+
+// Whether a show's seasonsData is numbered the way TMDB numbers it. An anime
+// unpacked out of a TMDB episode group -- or a show rebuilt from Cinemeta --
+// is handed its own season numbering (resolveUnpackedShowData,
+// 07_source-fetchers-tmdb-simkl.js), which the show-level pointer above counts
+// in TMDB's numbers and so cannot be lined up against. Those rebuilt payloads
+// are the only ones carrying the episodeCount alias, which is what says so.
+function showSeasonsAreTmdbNumbered(d) {
+  const seasons = d && Array.isArray(d.seasonsData) ? d.seasonsData : null;
+  if (!seasons || !seasons.length) return false;
+  return !seasons.some((s) => s && s.episodeCount != null);
+}
+
+// How many episodes of one season have aired -- the denominator every "is
+// this season finished" question actually means, and the one the season
+// header's "3/8 episodes" counts against. Same three sources as
+// seasonHasAiredEpisodes above, most specific first: the season's real
+// episode list once it has been loaded, then the show's next-episode
+// pointer, then the season's own air date with episode_count standing in for
+// "all of it is out".
+function seasonAiredEpisodeCount(seasonNum, seasonMeta, details) {
+  const sNum = Number(seasonNum);
+  const total = Number(seasonMeta && seasonMeta.episode_count);
+  const totalKnown = total > 0 ? total : 0;
+
+  const eps = window._seasonEpisodesMap && window._seasonEpisodesMap[sNum];
+  if (Array.isArray(eps) && eps.length) {
+    return eps.filter((ep) => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep)).length;
+  }
+
+  const fromNext = seasonAiredCountFromNextEpisode(sNum, seasonMeta, details);
+  if (fromNext != null) return totalKnown ? Math.min(fromNext, totalKnown) : fromNext;
+
+  const airDate = seasonMeta && (seasonMeta.air_date || seasonMeta.airDate);
+  if (airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(airDate)) return 0;
+  return totalKnown;
+}
+
+// The season's own TMDB record off the open show, or a stand-in built from
+// what the caller knows. isSeasonFullyWatched is handed a season number and
+// an episode count, not the season object the aired-count helpers read.
+function seasonMetaFor(d, seasonNum, episodeCount) {
+  const sNum = Number(seasonNum);
+  const found = d && Array.isArray(d.seasonsData)
+    ? d.seasonsData.find((s) => s && Number(s.season_number) === sNum)
+    : null;
+  if (found) return found;
+  return { season_number: sNum, episode_count: Number(episodeCount) || 0 };
 }
 
 // The date an upcoming season starts, for the button that says so.
@@ -2183,8 +2264,12 @@ window.openSelectListModalFromItemModal = function() {
   openSelectListModal(d.id, isSeries ? 'series' : 'movie', d.title || '', d.poster || '');
 };
 
-function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
-  if (!showId || seasonNum == null) return false;
+// The distinct episode numbers of one season that Watch History holds. Split
+// out of isSeasonFullyWatched so the "3/8 episodes" count on the season
+// header and the Mark Season Watched button beside it read the same tally and
+// cannot disagree about what has been watched.
+function watchedEpisodeNumbersInSeason(showId, seasonNum) {
+  if (!showId || seasonNum == null) return new Set();
   const sNum = Number(seasonNum);
   const d = window._currentItemDetails;
   const showIdsToCheck = new Set([
@@ -2200,33 +2285,62 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
   try {
     const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     const hist = map['watch-history'];
-    if (!hist || !Array.isArray(hist.items)) return false;
+    if (!hist || !Array.isArray(hist.items)) return new Set();
 
-    const watchedEps = hist.items.filter((it) => {
-      if (!it || it.type !== 'episode' || Number(it.seasonNum) !== sNum) return false;
-      if (it.showId && showIdsToCheck.has(String(it.showId))) return true;
-      if (d && d.title && it.showTitle && it.showTitle.toLowerCase() === d.title.toLowerCase()) return true;
-      return false;
+    const nums = new Set();
+    hist.items.forEach((it) => {
+      if (!it || it.type !== 'episode' || Number(it.seasonNum) !== sNum) return;
+      const isThisShow = (it.showId && showIdsToCheck.has(String(it.showId))) ||
+        !!(d && d.title && it.showTitle && it.showTitle.toLowerCase() === d.title.toLowerCase());
+      if (!isThisShow) return;
+      const epNum = it.episodeNum != null ? Number(it.episodeNum) : null;
+      if (epNum == null || !isFinite(epNum)) return;
+      nums.add(epNum);
     });
-
-    const distinctEps = new Set(watchedEps.map(it => it.episodeNum != null ? Number(it.episodeNum) : null).filter(n => n != null));
-
-    if (distinctEps.size === 0) return false;
-
-    if (window._seasonEpisodesMap && window._seasonEpisodesMap[sNum]) {
-      const aired = window._seasonEpisodesMap[sNum].filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
-      if (aired.length > 0) return distinctEps.size >= aired.length;
-    }
-
-    if (episodeCount && episodeCount > 0) {
-      return distinctEps.size >= episodeCount;
-    }
-    return false;
+    return nums;
   } catch (e) {
-    return false;
+    return new Set();
   }
 }
+window.watchedEpisodeNumbersInSeason = watchedEpisodeNumbersInSeason;
+
+function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
+  if (!showId || seasonNum == null) return false;
+  const sNum = Number(seasonNum);
+  const d = window._currentItemDetails;
+  const distinctEps = watchedEpisodeNumbersInSeason(showId, sNum);
+  if (distinctEps.size === 0) return false;
+
+  // Counted against what has AIRED, not against everything TMDB lists for the
+  // season. episode_count includes the episodes still to come, so a show
+  // part-way through its current season could not be read as caught up until
+  // its finale -- which is what left Mark Show Watched offering to mark a
+  // show whose every aired episode was already watched.
+  const aired = seasonAiredEpisodeCount(sNum, seasonMetaFor(d, sNum, episodeCount), d);
+  if (aired > 0) return distinctEps.size >= aired;
+  return false;
+}
 window.isSeasonFullyWatched = isSeasonFullyWatched;
+
+// "3/8 episodes" -- how much of a season is in Watch History, beside how much
+// of it there is. Returned as state rather than a string so the header can
+// also show, at a glance, that a season is finished.
+function seasonEpisodeCountState(d, seasonMeta) {
+  const sNum = Number(seasonMeta && seasonMeta.season_number);
+  const total = Number(seasonMeta && seasonMeta.episode_count);
+  if (!(total > 0)) return { label: '', watched: 0, total: 0, complete: false };
+  // Capped at the season's own length: Watch History can still hold an
+  // episode TMDB has since dropped from the season, and "9/8 episodes" reads
+  // as a bug rather than as the leftover it is.
+  const watched = Math.min(watchedEpisodeNumbersInSeason(d && d.id, sNum).size, total);
+  return {
+    label: watched + '/' + total + ' episode' + (total === 1 ? '' : 's'),
+    watched: watched,
+    total: total,
+    complete: watched >= total,
+  };
+}
+window.seasonEpisodeCountState = seasonEpisodeCountState;
 
 function updateSeasonWatchedButton(seasonNum) {
   const d = window._currentItemDetails;
@@ -2237,8 +2351,78 @@ function updateSeasonWatchedButton(seasonNum) {
   document.querySelectorAll('.btn-mark-season-watched[data-season="' + sNum + '"]').forEach(btn => {
     applySeasonWatchedButton(btn, state);
   });
+  updateSeasonEpisodeCounts(sNum);
 }
 window.updateSeasonWatchedButton = updateSeasonWatchedButton;
+
+// Repaints the "3/8 episodes" line on the season header. With a season
+// number for a change to that one season, with nothing for a change that
+// could have touched any of them.
+function updateSeasonEpisodeCounts(seasonNum) {
+  const d = window._currentItemDetails;
+  if (!d || typeof document === 'undefined' || !document.querySelectorAll) return;
+  const only = (seasonNum == null) ? null : Number(seasonNum);
+  document.querySelectorAll('.season-header-episodes[data-season]').forEach((el) => {
+    const sNum = Number(el.dataset ? el.dataset.season : el.getAttribute('data-season'));
+    if (only != null && sNum !== only) return;
+    const seasonMeta = (d.seasonsData || []).find((s) => Number(s.season_number) === sNum);
+    if (!seasonMeta) return;
+    const state = seasonEpisodeCountState(d, seasonMeta);
+    if (!state.label) return;
+    el.textContent = state.label;
+    if (el.classList && el.classList.toggle) el.classList.toggle('is-complete', state.complete);
+  });
+}
+window.updateSeasonEpisodeCounts = updateSeasonEpisodeCounts;
+
+// One description of the item page's Mark Show Watched button, for the same
+// reason seasonWatchedButtonState exists: four places set it, and each one
+// spelling out its own label and classes is how they came to disagree.
+function showWatchedButtonState(watched) {
+  return watched
+    ? { label: '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched', className: 'secondary' }
+    : { label: 'Mark Show Watched', className: 'primary' };
+}
+
+function applyShowWatchedButton(btn, watched) {
+  if (!btn) return;
+  const state = showWatchedButtonState(watched);
+  btn.innerHTML = state.label;
+  if (btn.classList) {
+    btn.classList.remove('primary', 'secondary');
+    btn.classList.add(state.className);
+  }
+}
+window.applyShowWatchedButton = applyShowWatchedButton;
+
+// Re-derives that button from what is on disk. Marking the last aired
+// episode watched from the episode grid used to leave it reading "Mark Show
+// Watched" until the page was reopened, because nothing but markShowWatched
+// itself ever touched it.
+function updateShowWatchedButton(watched) {
+  const btn = (typeof document !== 'undefined' && document.getElementById)
+    ? document.getElementById('btnMarkShowWatched') : null;
+  if (!btn) return;
+  applyShowWatchedButton(btn, typeof watched === 'boolean' ? watched : isShowFullyWatched(window._currentItemDetails));
+}
+window.updateShowWatchedButton = updateShowWatchedButton;
+
+// Everything on the item page that is read off Watch History: every season's
+// button and count, and the show's own button. One call after a change beats
+// call sites that each remembered a different subset of it -- and a single
+// episode toggle can move all three, since the episode may have been the
+// last one the season, or the show, was waiting on.
+function refreshItemWatchState() {
+  const d = window._currentItemDetails;
+  if (d && Array.isArray(d.seasonsData)) {
+    d.seasonsData.forEach((s) => {
+      if (!s || Number(s.season_number) === 0) return;
+      updateSeasonWatchedButton(Number(s.season_number));
+    });
+  }
+  updateShowWatchedButton();
+}
+window.refreshItemWatchState = refreshItemWatchState;
 
 window.markSeasonWatched = async function(seasonNum, btn) {
   const d = window._currentItemDetails;
@@ -2325,19 +2509,12 @@ window.markSeasonWatched = async function(seasonNum, btn) {
     }
 
     // Update overall show watched button if present
-    const btnShow = document.getElementById('btnMarkShowWatched');
-    if (btnShow) {
-      const showWatched = (d.seasonsData && Array.isArray(d.seasonsData)) ? allSeasonsWatched : isShowFullyWatched(d);
-      if (showWatched) {
-        btnShow.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched';
-        btnShow.classList.remove('primary');
-        btnShow.classList.add('secondary');
-      } else {
-        btnShow.innerHTML = 'Mark Show Watched';
-        btnShow.classList.remove('secondary');
-        btnShow.classList.add('primary');
-      }
-    }
+    updateShowWatchedButton((d.seasonsData && Array.isArray(d.seasonsData)) ? allSeasonsWatched : isShowFullyWatched(d));
+    // This path sets the season's button straight from the write it just
+    // made rather than going through updateSeasonWatchedButton, so the count
+    // beside it has to be repainted here. All of them, since repainting one
+    // costs the same as repainting the lot.
+    updateSeasonEpisodeCounts();
   } catch (err) {
     if (btn) {
       btn.disabled = false;
@@ -2617,6 +2794,12 @@ async function openItemDetailsModal(id, type, opts) {
     // title/poster/seasonsData without re-fetching -- previously read at
     // window._currentItemDetails elsewhere but never actually set here.
     window._currentItemDetails = d;
+    // Both caches are keyed by season (and by episode number within one), not
+    // by show, so leaving the last show's entries standing meant ITS season 1
+    // answered "how many episodes of season 1 have aired" for this one -- the
+    // question behind every count and every watched check below.
+    window._seasonEpisodesMap = {};
+    window._episodeDataCache = {};
     
     // Formatting helpers
     let dateStr = d.releaseYear || '';
@@ -2667,6 +2850,7 @@ async function openItemDetailsModal(id, type, opts) {
         // poster rather than leaving a blank placeholder box.
         const sPoster = season.poster_path ? 'https://image.tmdb.org/t/p/w200' + season.poster_path : (d.poster || '');
         const seasonBtnState = seasonWatchedButtonState(d, season);
+        const seasonCount = seasonEpisodeCountState(d, season);
         seasonsHtml +=
           '<div class="season-card">' +
             '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeJsAttr(d.id) + '&quot;)">' +
@@ -2674,7 +2858,7 @@ async function openItemDetailsModal(id, type, opts) {
                 (sPoster ? '<img src="' + escapeAttr(sPoster) + '" class="season-header-poster" alt="">' : '<div class="season-header-poster-placeholder"></div>') +
                 '<div class="season-header-info">' +
                   '<h4 class="season-header-title">' + escapeHtml(season.name) + '</h4>' +
-                  '<div class="season-header-episodes">' + season.episode_count + ' episodes</div>' +
+                  '<div class="season-header-episodes' + (seasonCount.complete ? ' is-complete' : '') + '" data-season="' + season.season_number + '">' + escapeHtml(seasonCount.label) + '</div>' +
                 '</div>' +
               '</div>' +
               '<div class="season-header-actions">' +
@@ -2695,6 +2879,11 @@ async function openItemDetailsModal(id, type, opts) {
     }
 
     const storylinesHtml = renderItemStorylinesWatchOrder(d, type);
+    // "Watched" for a show means everything that has AIRED is watched, which
+    // is what isShowFullyWatched answers -- so a show caught up on every
+    // episode out so far opens offering to mark it UNwatched, rather than
+    // offering to mark what the person has already seen.
+    const showBtnState = showWatchedButtonState(isShowFullyWatched(d));
 
     body.innerHTML = 
       '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap;">' +
@@ -2708,8 +2897,8 @@ async function openItemDetailsModal(id, type, opts) {
           '<div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-top:20px;">' +
             '<button type="button" class="lc-btn primary" onclick="openSelectListModalFromItemModal()">+ Add to list</button>' +
             (((d.seasonsData && d.seasonsData.length > 0) || type === 'series') ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isShowFullyWatched(d) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
-                (isShowFullyWatched(d) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched') +
+              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + showBtnState.className + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
+                showBtnState.label +
               '</button>'
               :
               '<button type="button" id="btnMarkWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="toggleMovieWatchStatusFromModal()">' +

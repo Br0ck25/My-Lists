@@ -3001,6 +3001,9 @@ ${seoHeadHtml}
     color: var(--muted);
     font-size: 0.9rem;
   }
+  .season-header-episodes.is-complete {
+    color: var(--brand);
+  }
   .season-header-actions {
     flex-shrink: 0;
     margin-left: 12px;

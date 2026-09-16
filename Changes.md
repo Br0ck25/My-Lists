@@ -1,5 +1,86 @@
 # Changes Log
 
+## 2026-09-16 - Season watch counts on a show's page, and "watched" measured against what has aired
+
+### Files Changed
+`09_page-shell.js`, `19_client-search-and-likes.js`, `21_client-custom-list-builder.js`,
+`22_client-creator-profile.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`, `Changes.md`,
+`FUNCTION-MAP.md`, `tests/client.test.mjs`
+
+### What prompted it
+
+Two asks about a show's item page. First: the season header says how many episodes a season has, so say how
+many of them have been watched too -- `3/8`, `8/8`, `0/8`. Second: when every episode that has aired is
+watched and the next one is still to come, Mark Show Watched should read Mark Show **Un**watched, because
+there is nothing left to mark.
+
+The second one is the same bug the first one would have made visible. "Fully watched" was counted against
+TMDB's `episode_count`, which counts the episodes still to come as well. Five episodes watched out of a
+ten-episode season with episode 6 a month away came out as 5/10 -- not caught up -- so the button offered to
+mark watched what had already been watched, and pressing it would have flipped the season to unwatched.
+
+`isSeasonFullyWatched` already knew better when `window._seasonEpisodesMap` held the season's real episode
+list, but that only arrives after a season is expanded or Mark Show Watched fetches every season. On the
+render that matters -- opening the page -- there was nothing but `episode_count`.
+
+### Where the aired count comes from
+
+`/api/details` already returns the show's next unaired episode: `nextEpisodeSeasonNumber`,
+`nextEpisodeNumber`, `nextEpisodeAirDate` (TMDB's `next_episode_to_air`, plus the server's own fallbacks).
+That single pointer places every season around it with no further request:
+
+| Season vs. the pointer | Aired |
+|---|---|
+| after it | nothing |
+| the one it falls in | everything before that episode (`nextEpisodeNumber - 1`) |
+| before it | the whole season (`episode_count`) |
+
+`seasonAiredEpisodeCount` reads three sources, most specific first: the loaded episode list, then that
+pointer, then the season's own air date with `episode_count` standing in for "all of it is out". It is now
+the denominator `isSeasonFullyWatched` compares against, and `seasonHasAiredEpisodes` -- which decides
+whether a season button says "Airs Mar 4" -- consults the same pointer.
+
+The pointer is counted in TMDB's season numbers, so it is not applied to a show whose seasons were
+renumbered: an anime unpacked out of an episode group, or a series rebuilt from Cinemeta
+(`resolveUnpackedShowData`, 07_source-fetchers-tmdb-simkl.js). Those payloads are the only ones carrying the
+`episodeCount` alias, which is what `showSeasonsAreTmdbNumbered` keys off.
+
+### The count itself
+
+`watchedEpisodeNumbersInSeason` is the episode tally split out of `isSeasonFullyWatched`, so the "3/8" on a
+season header and the button beside it cannot disagree about what has been watched.
+`seasonEpisodeCountState` turns it into the label and a `complete` flag (the accent colour at 8/8), capped at
+the season's own length so an episode TMDB has since dropped cannot render "9/8".
+
+`updateSeasonEpisodeCounts` repaints the labels -- one season, or all of them -- and hangs off
+`updateSeasonWatchedButton`, so every path that already refreshed a season button refreshes its count too.
+
+### The show button
+
+`showWatchedButtonState` / `applyShowWatchedButton` / `updateShowWatchedButton` give that button one
+description, the way `seasonWatchedButtonState` already did for the season buttons. Three places set it and
+each spelled out its own label and classes.
+
+`refreshItemWatchState` (every season button, every count, the show button) is what an episode toggle now
+calls, in place of repainting only `_currentSeasonNum`'s season button: the episode toggled may have been the
+last one the show was waiting on, and its season is not always the one that global points at.
+
+### One show's episode lists answering for another's
+
+`_seasonEpisodesMap` and `_episodeDataCache` are keyed by season number and episode number, not by show, and
+nothing cleared them between shows. Open a show, expand season 1, open a different show: that first show's
+season 1 was still what "how many episodes of season 1 have aired" read. Both are cleared when a show's page
+opens, and `_seasonEpisodesMap` joins `_episodeDataCache` in the sign-out reset.
+
+### Tests
+
+`tests/client.test.mjs` (15) -- the aired count from the pointer, in the airing season and either side of it;
+a season and a show reading as caught up at 5 of 5 aired and not at 4; a loaded episode list overriding the
+pointer; a renumbered show ignoring it; the button repainted from disk; the labels at 0/8, 3/8 and 8/8,
+deduplicated, capped, and blank when a season has no episode count; and the page itself rendered, which is
+both asks end to end -- `8/8`, `8/8`, `5/10` across the season headers with Mark Show **Un**watched above
+them, and Mark Show Watched again one aired episode short.
+
 ## 2026-09-15 - A Channel's Play order is a menu of arrangements, not a rule applied over the top
 
 ### Files Changed

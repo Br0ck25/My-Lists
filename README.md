@@ -46,6 +46,12 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 ### Continue Watching & Background Watch Sync
 - Automatically tracks watch progress and next unwatched episode per show.
 - Mark titles as watched/unwatched directly from the UI or scrobble integrations.
+- **A show's page counts each season's progress** -- `3/8 episodes`, `0/8` for one you have not started,
+  `8/8` (in the accent colour) once it is done -- and updates as you mark episodes, a season, or the whole
+  show watched.
+- **"Watched" means everything that has aired.** A show you are caught up on mid-season reads as watched
+  and offers **Mark Show Unwatched**, instead of offering to mark episodes you have already seen because
+  the rest of the season is still to come.
 - **Airing Next** lists the next upcoming episode of every show you have watched, soonest first. The **x** on
   a poster takes one show off that shelf without changing a thing about what you have watched -- and watching
   another episode of it puts it back by itself. Settings -> Account & Sync lists what you have removed if you
