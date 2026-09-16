@@ -393,6 +393,28 @@ async function handleFetch(request, env, ctx) {
       );
     }
 
+    // /channel/<code> -- what a channel share link actually points at.
+    //
+    // A redirect rather than its own page: everything needed to accept a
+    // shared channel (the local channel store, the Catalogs rows, the
+    // Channels tab) already lives on the builder page, so this hands the
+    // code to it in the fragment and handleInitialDeepLink takes it from
+    // there. The fragment, not the query string, because a fragment is
+    // never sent to the server or written into its logs -- an unlisted
+    // channel's code is the only thing protecting it.
+    m = path.match(/^\/channel\/([A-Za-z0-9_-]{1,64})$/);
+    if (m) {
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: `${url.origin}/configure#channel=${encodeURIComponent(m[1])}`,
+          "Cache-Control": "no-store",
+          ...corsHeaders(),
+        },
+      });
+    }
+
     // bare /configure (no config yet) -> same builder, empty/default state
     if (path === "/configure") {
       ctx.waitUntil(bumpStat(env, "pageviews"));
@@ -1094,7 +1116,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
         if (metaType !== "series") return jsonPublic({ meta: null });
         const wantedChannelId = id.slice("channel_".length);
         try {
-          const { entries } = await resolveConfig(config, env);
+          // watchHistory/continueWatching feed the channel flags that read
+          // the account rather than the payload -- "Hide watched" and the
+          // dynamic Next Up channel. resolveConfig only fills them in for a
+          // config that PROVED whose it is (see trackOwner there), so an
+          // unverified config simply gets a channel with neither applied.
+          const { entries, watchHistory, continueWatching, tmdbKey, mdblistKey, traktKey, traktAccessToken } = await resolveConfig(config, env);
           let matchedEntry = null;
           for (const e of entries) {
             if (e.enabled === false) continue;
@@ -1110,7 +1137,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
             if (matchedEntry) break;
           }
           if (!matchedEntry) return jsonPublic({ meta: null });
-          const meta = buildChannelMeta(matchedEntry, url.origin);
+          const meta = await buildChannelMeta(matchedEntry, url.origin, {
+            env, ctx, origin: url.origin,
+            watchHistory, continueWatching,
+            tmdbKey, mdblistKey, traktKey, traktAccessToken,
+          });
           return jsonPublic({ meta: meta || null });
         } catch (err) {
           return jsonPublic({ meta: null, error: safeErrorMessage(err) });
@@ -1984,6 +2015,230 @@ function generateSearchVariations(query) {
         return json({ ok: true, channel: channelPayload }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
         return json({ ok: false, error: err.message || "Failed to build network channel preset." }, 500);
+      }
+    }
+
+    // /api/person-search?q=<name>
+    //   -> { ok, results: [{ personId, name, department, knownFor, poster }] }
+    //
+    // The third search type in the Channel builder, alongside Shows and
+    // Movies. Searching a PERSON is a different question from searching a
+    // title -- "everything Robin Williams was in" rather than one film -- so
+    // it gets its own endpoint rather than another branch of title-search,
+    // whose whole response shape is built around a title.
+    if (path === "/api/person-search") {
+      const q = (url.searchParams.get("q") || "").trim();
+      if (!q) return json({ ok: true, results: [] });
+      try {
+        ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
+        const res = await fetch(
+          `https://api.themoviedb.org/3/search/person?api_key=${encodeURIComponent(TMDB_API_KEY)}&query=${encodeURIComponent(q)}&include_adult=false&page=1`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 3600, cacheEverything: true } }
+        );
+        if (!res.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${res.status}).` });
+        const data = await res.json();
+        const results = (data.results || [])
+          .filter((p) => p && p.id && !p.adult)
+          .slice(0, 20)
+          .map((p) => ({
+            personId: p.id,
+            name: p.name || "",
+            department: p.known_for_department || "",
+            // The two or three titles TMDB thinks this person is known for,
+            // shown under the name because "Chris Evans" alone is not enough
+            // to pick the right one out of a search result.
+            knownFor: (p.known_for || [])
+              .map((k) => k && (k.title || k.name))
+              .filter(Boolean)
+              .slice(0, 3)
+              .join(", "),
+            poster: p.profile_path ? `https://image.tmdb.org/t/p/w200${p.profile_path}` : null,
+          }));
+        return json({ ok: true, results }, 200, { "Cache-Control": "public, max-age=3600" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/person-credits?personId=<id>&sort=chronological|rating&movies=N&shows=N
+    //   -> { ok, name, poster, backdrop, movies: [...], shows: [...] }
+    //
+    // What a Spotlight channel is built from. Acting credits and directing/
+    // creating credits both count -- a Nolan or a Miyazaki spotlight is the
+    // films they MADE, and TMDB files those under crew rather than cast.
+    //
+    // Both lists come back already cut and ordered, because the ordering is
+    // the whole feature: "chronological" walks a career forward, "rating"
+    // opens with the best of it.
+    if (path === "/api/person-credits") {
+      const personId = (url.searchParams.get("personId") || "").trim();
+      if (!/^[0-9]+$/.test(personId)) return json({ ok: false, error: "Missing personId." }, 400);
+      const sort = url.searchParams.get("sort") === "rating" ? "rating" : "chronological";
+      const movieLimit = Math.min(Math.max(parseInt(url.searchParams.get("movies") || "12", 10) || 12, 0), 40);
+      const showLimit = Math.min(Math.max(parseInt(url.searchParams.get("shows") || "4", 10) || 4, 0), 12);
+      try {
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
+        const [personRes, creditsRes] = await Promise.all([
+          fetch(
+            `https://api.themoviedb.org/3/person/${encodeURIComponent(personId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+          ),
+          fetch(
+            `https://api.themoviedb.org/3/person/${encodeURIComponent(personId)}/combined_credits?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+          ),
+        ]);
+        if (!creditsRes.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${creditsRes.status}).` });
+        const person = personRes.ok ? await personRes.json() : {};
+        const credits = await creditsRes.json();
+        const DIRECTING_JOBS = /^(director|writer|creator|screenplay|executive producer)$/i;
+        const seen = new Set();
+        const collect = (list, isCrew) => {
+          const out = [];
+          for (const c of (list || [])) {
+            if (!c || !c.id || c.adult) continue;
+            if (isCrew && !DIRECTING_JOBS.test(String(c.job || ""))) continue;
+            const mediaType = c.media_type === "tv" ? "tv" : "movie";
+            const key = `${mediaType}:${c.id}`;
+            if (seen.has(key)) continue;
+            // A talk-show or awards-ceremony appearance is a credit but not
+            // a title anyone wants in a tribute channel, and TMDB marks
+            // those 10767/10763 (talk / news). Same for a person's own
+            // documentary interviews showing up with no votes at all.
+            const genres = Array.isArray(c.genre_ids) ? c.genre_ids : [];
+            if (genres.includes(10767) || genres.includes(10763)) continue;
+            const votes = Number(c.vote_count) || 0;
+            if (votes < 20) continue;
+            seen.add(key);
+            const date = c.release_date || c.first_air_date || "";
+            out.push({
+              tmdbId: c.id,
+              type: mediaType,
+              title: c.title || c.name || "",
+              year: String(date).slice(0, 4),
+              released: date || "",
+              rating: typeof c.vote_average === "number" ? Math.round(c.vote_average * 10) / 10 : 0,
+              votes: votes,
+              poster: c.poster_path ? `https://image.tmdb.org/t/p/w500${c.poster_path}` : null,
+              backdrop: c.backdrop_path ? `https://image.tmdb.org/t/p/w780${c.backdrop_path}` : null,
+              role: isCrew ? (c.job || "Crew") : (c.character || "Cast"),
+            });
+          }
+          return out;
+        };
+        const all = [...collect(credits.cast, false), ...collect(credits.crew, true)];
+        const order = (a, b) => {
+          if (sort === "rating") {
+            if (b.rating !== a.rating) return b.rating - a.rating;
+            return b.votes - a.votes;
+          }
+          // Chronological, and an undated credit goes last rather than
+          // opening the channel -- the same call sortChannelItemsByAired
+          // makes for the same reason.
+          if (!a.year) return 1;
+          if (!b.year) return -1;
+          if (a.year !== b.year) return a.year < b.year ? -1 : 1;
+          return b.votes - a.votes;
+        };
+        // Popularity picks WHICH credits make the cut; the chosen sort then
+        // decides what order they play in. Ranking by the sort itself would
+        // make "chronological" mean "their earliest 12 credits", which for
+        // most careers is the student films.
+        const byWeight = (a, b) => (b.rating * 10 + Math.log10(b.votes + 1)) - (a.rating * 10 + Math.log10(a.votes + 1));
+        const movies = all.filter((c) => c.type === "movie").sort(byWeight).slice(0, movieLimit).sort(order);
+        const shows = all.filter((c) => c.type === "tv").sort(byWeight).slice(0, showLimit).sort(order);
+        return json({
+          ok: true,
+          name: person.name || "",
+          poster: person.profile_path ? `https://image.tmdb.org/t/p/w500${person.profile_path}` : null,
+          backdrop: (movies[0] && movies[0].backdrop) || (shows[0] && shows[0].backdrop) || null,
+          movies,
+          shows,
+        }, 200, { "Cache-Control": "public, max-age=86400" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/wizard-channel-shows?networkId=&era=&genres=&limit=
+    //   -> { ok, name, shows: [...], networkLogo }
+    //
+    // The Quick Channel Wizard's one server call. Same shape of answer as
+    // /api/quick-channel-shows (the client builds the channel from it the
+    // same way), but the pool is a TMDB discover query crossing a network
+    // with an era and a genre rather than a network on its own.
+    if (path === "/api/wizard-channel-shows") {
+      const networkId = (url.searchParams.get("networkId") || "").trim();
+      const era = (url.searchParams.get("era") || "").trim();
+      const genres = (url.searchParams.get("genres") || "").trim();
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "8", 10) || 8, 1), 24);
+      if (networkId && !/^[0-9]+$/.test(networkId)) return json({ ok: false, error: "Bad networkId." }, 400);
+      if (genres && !/^[0-9]+(,[0-9]+)*$/.test(genres)) return json({ ok: false, error: "Bad genres." }, 400);
+      const eraMatch = era.match(/^([0-9]{4})-([0-9]{4})$/);
+      try {
+        let params = `api_key=${encodeURIComponent(TMDB_API_KEY)}&sort_by=popularity.desc&include_adult=false&include_null_first_air_dates=false`;
+        if (networkId) params += `&with_networks=${encodeURIComponent(networkId)}`;
+        if (genres) params += `&with_genres=${encodeURIComponent(genres)}`;
+        if (eraMatch) {
+          params += `&first_air_date.gte=${eraMatch[1]}-01-01&first_air_date.lte=${eraMatch[2]}-12-31`;
+        }
+        // Enough votes that the result is a show people have heard of. A
+        // network-plus-era-plus-genre query can otherwise bottom out in
+        // one-episode pilots that never aired, which makes a wizard channel
+        // feel broken rather than curated.
+        params += "&vote_count.gte=50";
+        const discovered = [];
+        let pagesFetched = 0;
+        for (let page = 1; page <= 3 && discovered.length < limit * 3; page++) {
+          pagesFetched++;
+          const res = await fetch(
+            `https://api.themoviedb.org/3/discover/tv?${params}&page=${page}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 3600, cacheEverything: true } }
+          );
+          if (!res.ok) break;
+          const data = await res.json();
+          discovered.push(...(data.results || []));
+          if (page >= (data.total_pages || 1)) break;
+        }
+        if (!discovered.length) {
+          return json({ ok: false, error: "Nothing matched that combination. Try widening the era or the genre." });
+        }
+        let networkLogo = null;
+        if (networkId) {
+          try {
+            const networkRes = await fetch(
+              `https://api.themoviedb.org/3/network/${encodeURIComponent(networkId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+              { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+            );
+            if (networkRes.ok) {
+              const networkData = await networkRes.json();
+              // A fixed pixel size, never "original" -- see the same note on
+              // /api/quick-channel-shows, where an SVG logo silently failed
+              // to render as a poster.
+              if (networkData.logo_path) networkLogo = `${url.origin}/api/channel-logo?path=${encodeURIComponent(networkData.logo_path)}`;
+            }
+          } catch {
+            // best-effort; the client falls back to a show poster
+          }
+        }
+        const candidates = discovered.slice(0, limit * 2);
+        const resolved = await mapWithConcurrency(candidates, 8, async (show) => {
+          const details = await fetchTmdbDetails(show.id, "tv", TMDB_API_KEY);
+          if (!details.imdbId) return null;
+          return {
+            imdbId: details.imdbId,
+            tmdbId: show.id,
+            name: show.name,
+            poster: show.poster_path ? `https://image.tmdb.org/t/p/w500${show.poster_path}` : null,
+            backdrop: show.backdrop_path ? `https://image.tmdb.org/t/p/w780${show.backdrop_path}` : null,
+          };
+        });
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", pagesFetched + (networkId ? 1 : 0) + candidates.length));
+        const shows = resolved.filter(Boolean).slice(0, limit);
+        if (!shows.length) return json({ ok: false, error: "Couldn't resolve any of those shows to IMDB." });
+        return json({ ok: true, shows, networkLogo });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 

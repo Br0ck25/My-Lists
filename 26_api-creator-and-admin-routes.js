@@ -2286,6 +2286,184 @@
       });
     }
 
+    // --- Sharing a channel, and the Explore Channels directory -----------
+    //
+    // A channel is thousands of episodes; a link is a few hundred characters.
+    // So a share link carries a short code and the channel itself lives here
+    // under channelshare:{code}, which is also what the directory indexes.
+    //
+    // Two levels, deliberately distinct:
+    //   * a SHARE is unlisted and needs no account -- anyone with the code
+    //     can rebuild the channel, nobody can find it who was not given it.
+    //   * PUBLISHING adds it to the Explore Channels directory, and that
+    //     does need a Creator Profile: a listing everyone can see needs an
+    //     owner who can take it down again.
+
+    // /api/channel/share  (POST)
+    //   { channel, description?, publish?, creatorName?, creatorKey? }
+    //     -> { ok, code, url, published }
+    if (path === "/api/channel/share" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const channel = sanitizeSharedChannel(body.channel);
+      if (!channel) {
+        return json({ ok: false, error: "That channel has nothing playable in it to share." }, 400);
+      }
+      const publish = !!body.publish;
+      let owner = "";
+      if (publish) {
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (!auth.ok) return authFailureResponse(auth);
+        owner = auth.username;
+      }
+      const description = String(body.description || "").trim().slice(0, SHARED_CHANNEL_DESCRIPTION_MAX);
+      // Reusing the code someone already has is what makes "Share" on an
+      // edited channel update the link they handed out rather than mint a
+      // second one beside it. Only the owner of a PUBLISHED code may do
+      // that; an unlisted code is its own proof, the same way the link is.
+      let code = String(body.code || "").trim().slice(0, 64);
+      if (code && !/^[A-Za-z0-9_-]+$/.test(code)) code = "";
+      let existing = null;
+      if (code) {
+        try {
+          const raw = await env.CONFIGS.get(`channelshare:${code}`);
+          existing = raw ? JSON.parse(raw) : null;
+        } catch {
+          existing = null;
+        }
+        if (existing && existing.owner && existing.owner !== owner) {
+          return json({ ok: false, error: "That share link belongs to someone else." }, 403);
+        }
+        if (!existing) code = "";
+      }
+      if (!code) code = generateShortId();
+      const record = {
+        code: code,
+        channel: channel,
+        description: description,
+        owner: owner || (existing && existing.owner) || "",
+        published: publish || !!(existing && existing.published),
+        publishedAt: (existing && existing.publishedAt) || Date.now(),
+        updatedAt: Date.now(),
+      };
+      const serialized = JSON.stringify(record);
+      if (serialized.length > SHARED_CHANNEL_BYTES_MAX) {
+        return json({
+          ok: false,
+          error: "That channel is too large to share. Trim it down and try again.",
+        }, 413);
+      }
+      try {
+        await env.CONFIGS.put(`channelshare:${code}`, serialized);
+      } catch {
+        return json({ ok: false, error: "Couldn't save that share link. Please try again." }, 500);
+      }
+      if (record.published) {
+        await upsertPublicChannelIndex(env, code, record).catch(() => {});
+      }
+      ctx.waitUntil(bumpStat(env, publish ? "channels:published" : "channels:shared"));
+      return json({
+        ok: true,
+        code: code,
+        url: `${url.origin}/channel/${code}`,
+        published: record.published,
+      });
+    }
+
+    // /api/channel/share?code=...  (GET) -> { ok, channel, description, owner }
+    //
+    // The import half. Unauthenticated by design: the code IS the
+    // credential for an unlisted channel, and a published one is public.
+    if (path === "/api/channel/share" && request.method === "GET") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      const code = String(url.searchParams.get("code") || "").trim();
+      if (!code || !/^[A-Za-z0-9_-]{1,64}$/.test(code)) {
+        return json({ ok: false, error: "That doesn't look like a channel share link." }, 400);
+      }
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      if (!record || !record.channel) {
+        return json({ ok: false, error: "That channel link has expired or was removed." }, 404);
+      }
+      // Sanitized again on the way out, not only on the way in: a record
+      // written by an older build of this Worker has only been through
+      // whatever that build checked.
+      const channel = sanitizeSharedChannel(record.channel);
+      if (!channel) return json({ ok: false, error: "That channel link is no longer readable." }, 404);
+      return json({
+        ok: true,
+        code: code,
+        channel: channel,
+        description: record.description || "",
+        owner: record.owner || "",
+        published: !!record.published,
+      }, 200, { "Cache-Control": "public, max-age=60" });
+    }
+
+    // /api/channel/directory  (GET)  ?limit=
+    //   -> { ok, channels: [summary, ...] }
+    //
+    // Explore Channels. One index key rather than a KV scan: the directory
+    // is read on every visit to the tab and a prefix scan plus one GET per
+    // entry would be dozens of round trips for a page of cards.
+    if (path === "/api/channel/directory" && request.method === "GET") {
+      if (!env || !env.CONFIGS) return json({ ok: true, channels: [] });
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "60", 10) || 60, 1), PUBLIC_CHANNEL_INDEX_MAX);
+      const index = await readPublicChannelIndex(env);
+      return json({
+        ok: true,
+        total: index.length,
+        channels: index.slice(0, limit),
+      }, 200, { "Cache-Control": "public, max-age=120" });
+    }
+
+    // /api/channel/unpublish  (POST)  { code, creatorName, creatorKey }
+    //
+    // Takes a channel out of the directory. The stored channel itself stays,
+    // so a link already handed out keeps working -- "stop advertising this"
+    // and "break everyone's link" are different asks.
+    if (path === "/api/channel/unpublish" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+      const code = String(body.code || "").trim();
+      if (!code || !/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Missing code." }, 400);
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      if (!record) return json({ ok: false, error: "No such channel." }, 404);
+      if (record.owner && record.owner !== auth.username) {
+        return json({ ok: false, error: "That channel belongs to someone else." }, 403);
+      }
+      record.published = false;
+      record.updatedAt = Date.now();
+      try {
+        await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(record));
+      } catch {}
+      await removePublicChannelIndex(env, code).catch(() => {});
+      return json({ ok: true });
+    }
+
     // /api/creator/lists/delete  (POST)  { creatorName, creatorKey, slug }
     if (path === "/api/creator/lists/delete" && request.method === "POST") {
       let body;

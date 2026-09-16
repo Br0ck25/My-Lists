@@ -33,6 +33,22 @@ const CURATED_RECOMMENDATION_LIMIT = 40;
 // trade one bug for a worse, invisible one.
 const PUBLISHED_LIST_ITEMS_MAX = 10000;
 const PUBLISHED_LIST_NAME_MAX = 200;
+
+// --- shared channels ----------------------------------------------------
+//
+// A shared channel is stored whole under one KV key, so it needs a ceiling
+// that KV itself does not give it in any useful form: 25MB is the hard
+// limit, but a 25MB record is also a 25MB read on every import and every
+// directory card built from it. 4MB is roughly a 5,000-episode channel with
+// full artwork -- the largest thing this add-on can actually build -- and
+// is rejected rather than truncated, for the reason PUBLISHED_LIST_ITEMS_MAX
+// already spells out: quietly storing a shortened channel is a worse bug
+// than refusing an oversized one.
+const SHARED_CHANNEL_BYTES_MAX = 4000000;
+// How many channels the Explore Channels directory holds. One KV key, read
+// on every visit to the tab, so this is a page-weight budget as much as a
+// storage one; the oldest listing falls off when a new one arrives.
+const PUBLIC_CHANNEL_INDEX_MAX = 500;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 10 * 1024 * 1024;        // 10 MB of serialized JSON
 

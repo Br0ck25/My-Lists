@@ -4635,3 +4635,356 @@ describe("client: air times", () => {
     assert.match(badge, /8 PM CT/, "a tile restored from local storage knows its own hour");
   });
 });
+
+// The DOM stub creates an element the first time it is asked for by id, so a
+// test that wants to fill a box in has to ask through document rather than
+// reach into the id map.
+function el(client, id) {
+  return client.document.getElementById(id);
+}
+
+// The bundle builds its objects inside the vm, so they carry that realm's
+// Object/Array prototypes and a strict deepEqual against a literal written
+// here fails on the prototype alone, however equal the contents. Comparing
+// the JSON of both sides is what the assertion actually means.
+function plain(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+// --- the Channel builder's broadcast panel -------------------------------
+//
+// Five flags that shape how a channel plays rather than what is in it. The
+// risk they all share is not the logic but the PLUMBING: a channel is
+// rebuilt field by field in three separate places (saveLocalChannel,
+// saveLocalChannelsMap, ensureAllChannelsSyncedFromRows), so a flag that
+// only two of them know about is a flag that silently disappears on the
+// next save. These tests are mostly about that round trip.
+describe("client: a channel's broadcast schedule and smart rules", () => {
+  function builder(draft = []) {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", draft);
+    client.set("channelDraftStoryLocked", []);
+    client.set("channelDraftSourceUrl", "");
+    client.set("channelDraftDynamic", "");
+    return client;
+  }
+
+  const epOf = (imdbId, season, episode, showName) => ({
+    kind: "episode", imdbId, season, episode, showName,
+    epName: `E${episode}`, title: `${showName} S${season}E${episode}`,
+  });
+
+  it("turns a time of day plus a zone into minutes past midnight UTC", () => {
+    const client = builder();
+    assert.equal(client.call("channelTurnoverToUtcMinutes", "00:00", "utc"), 0);
+    assert.equal(client.call("channelTurnoverToUtcMinutes", "06:30", "utc"), 390);
+    assert.equal(client.call("channelTurnoverToUtcMinutes", "", "utc"), 0, "a blank box is midnight, not NaN");
+    assert.equal(client.call("channelTurnoverToUtcMinutes", "99:99", "utc"), 23 * 60 + 59, "a hand-typed impossible time is clamped");
+    // Local depends on the runner's own zone, so this asserts the relation
+    // rather than a fixed number.
+    const shift = new Date().getTimezoneOffset();
+    assert.equal(
+      client.call("channelTurnoverToUtcMinutes", "00:00", "local"),
+      ((shift % 1440) + 1440) % 1440
+    );
+  });
+
+  it("renders minutes back to the time box they came from", () => {
+    const client = builder();
+    assert.equal(client.call("channelMinutesToTimeString", 0), "00:00");
+    assert.equal(client.call("channelMinutesToTimeString", 390), "06:30");
+    assert.equal(client.call("channelMinutesToTimeString", 1439), "23:59");
+  });
+
+  it("groups a draft by show the same way the Worker does", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      epOf("tt1", 1, 2, "Simpsons"),
+      epOf("tt2", 1, 1, "King of the Hill"),
+    ]);
+    const groups = client.call("channelDraftShowGroups");
+    assert.deepEqual(plain(groups.map((g) => [g.key, g.count])), [["tt1", 2], ["tt2", 1]]);
+  });
+
+  it("carries every flag through a save and back out again", () => {
+    const client = builder();
+    const payload = {
+      channelId: "ch1", name: "Block Party", items: [epOf("tt1", 1, 1, "Simpsons")],
+      dailyRotate: true, rotateShows: 6, rotateEpisodes: 2,
+      rotateTurnover: 300, rotateTurnoverTime: "00:00", rotateTurnoverZone: "local",
+      hideWatched: true, storyLocked: ["tt1"],
+      liveSync: true, sourceUrl: "https://trakt.tv/users/x/lists/y",
+      dynamic: "", shareCode: "AbC123", sharePublished: true,
+    };
+    client.call("saveLocalChannel", payload);
+    const saved = client.call("loadLocalChannels").ch1;
+    for (const key of [
+      "dailyRotate", "rotateShows", "rotateEpisodes", "rotateTurnover",
+      "rotateTurnoverTime", "rotateTurnoverZone", "hideWatched",
+      "liveSync", "sourceUrl", "shareCode", "sharePublished",
+    ]) {
+      assert.deepEqual(plain(saved[key]), payload[key], `${key} survived the save`);
+    }
+    assert.deepEqual(plain(saved.storyLocked), ["tt1"]);
+  });
+
+  it("keeps the flags through a SECOND save, which is where a dropped field shows up", () => {
+    const client = builder();
+    client.call("saveLocalChannel", {
+      channelId: "ch1", name: "Block Party", items: [epOf("tt1", 1, 1, "Simpsons")],
+      dailyRotate: true, rotateShows: 6, hideWatched: true, storyLocked: ["tt1"],
+    });
+    // saveLocalChannelsMap rebuilds every record, so a field it does not know
+    // about is lost here rather than on the first write.
+    client.call("saveLocalChannelsMap", client.call("loadLocalChannels"));
+    const saved = client.call("loadLocalChannels").ch1;
+    assert.equal(saved.dailyRotate, true);
+    assert.equal(saved.rotateShows, 6);
+    assert.equal(saved.hideWatched, true);
+    assert.deepEqual(plain(saved.storyLocked), ["tt1"]);
+  });
+
+  it("normalizes anything missing rather than writing undefined into the payload", () => {
+    const client = builder();
+    const f = plain(client.call("channelBroadcastFields", {}));
+    assert.deepEqual(f, {
+      dailyRotate: false, rotateShows: 0, rotateEpisodes: 0, rotateTurnover: 0,
+      rotateTurnoverTime: "", rotateTurnoverZone: "utc", hideWatched: false,
+      storyLocked: [], liveSync: false, sourceUrl: "", dynamic: "",
+    });
+    assert.deepEqual(plain(client.call("channelBroadcastFields", null).storyLocked), []);
+  });
+
+  it("drops a Story Lock for a show that is no longer in the channel", () => {
+    const client = builder([epOf("tt1", 1, 1, "Simpsons"), epOf("tt1", 1, 2, "Simpsons")]);
+    client.set("channelDraftStoryLocked", ["tt1", "tt_removed"]);
+    client.call("renderChannelStoryLock");
+    assert.deepEqual(plain(client.get("channelDraftStoryLocked")), ["tt1"]);
+  });
+
+  it("offers no Story Lock for a one-episode show or a movie", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      { kind: "movie", imdbId: "tt9", title: "The Matrix", showName: "The Matrix" },
+    ]);
+    client.set("channelDraftStoryLocked", []);
+    client.call("renderChannelStoryLock");
+    assert.equal(el(client, "channelStoryLockSection").innerHTML, "");
+  });
+
+  it("toggles a lock on and off without ever duplicating it", () => {
+    const client = builder();
+    client.call("toggleChannelStoryLock", "tt1", true);
+    client.call("toggleChannelStoryLock", "tt1", true);
+    assert.deepEqual(plain(client.get("channelDraftStoryLocked")), ["tt1"]);
+    client.call("toggleChannelStoryLock", "tt1", false);
+    assert.deepEqual(plain(client.get("channelDraftStoryLocked")), []);
+  });
+});
+
+describe("client: the Channel builder's interleaved play order", () => {
+  function withDraft(items) {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", items);
+    client.set("channelDraftStoryLocked", []);
+    return client;
+  }
+  const epOf = (imdbId, episode, showName) => ({
+    kind: "episode", imdbId, season: 1, episode, showName,
+    epName: `E${episode}`, title: `${showName} E${episode}`,
+  });
+
+  it("deals one episode of each show in turn", () => {
+    const client = withDraft([
+      epOf("tt1", 1, "Simpsons"), epOf("tt1", 2, "Simpsons"), epOf("tt1", 3, "Simpsons"),
+      epOf("tt2", 1, "King of the Hill"), epOf("tt2", 2, "King of the Hill"),
+      epOf("tt3", 1, "Malcolm"),
+    ]);
+    client.call("sortChannelDraftItems", "interleave");
+    assert.deepEqual(plain(client.get("channelDraftItems").map((it) => it.title)), [
+      "Simpsons E1", "King of the Hill E1", "Malcolm E1",
+      "Simpsons E2", "King of the Hill E2",
+      "Simpsons E3",
+    ]);
+  });
+
+  it("is idempotent, so the builder and the Worker cannot fight over it", () => {
+    const client = withDraft([
+      epOf("tt1", 1, "A"), epOf("tt2", 1, "B"), epOf("tt1", 2, "A"), epOf("tt2", 2, "B"),
+    ]);
+    client.call("sortChannelDraftItems", "interleave");
+    const once = plain(client.get("channelDraftItems").map((it) => it.title));
+    client.call("sortChannelDraftItems", "interleave");
+    assert.deepEqual(plain(client.get("channelDraftItems").map((it) => it.title)), once);
+  });
+
+  it("counts as a remembered sort, so picks added later are interleaved too", () => {
+    const client = withDraft([]);
+    el(client, "channelPlayOrderSelect").value = "interleave";
+    assert.equal(client.call("channelDraftAutoSortKey"), "interleave");
+    client.set("channelDraftItems", [
+      epOf("tt1", 1, "A"), epOf("tt1", 2, "A"), epOf("tt2", 1, "B"),
+    ]);
+    client.call("applyChannelDraftAutoSort");
+    assert.deepEqual(plain(client.get("channelDraftItems").map((it) => it.title)), ["A E1", "B E1", "A E2"]);
+  });
+});
+
+describe("client: channel share links", () => {
+  const load = (routes = {}) => loadClient({ routes, storage: { "myListAddon:creatorKey": "KEY-1" } });
+
+  it("reads the code out of a link, a scheme, a fragment or a bare code", () => {
+    const client = load();
+    assert.equal(client.call("parseChannelShareCode", "https://example.com/channel/AbC-123"), "AbC-123");
+    assert.equal(client.call("parseChannelShareCode", "https://example.com/configure#channel=AbC-123"), "AbC-123");
+    assert.equal(client.call("parseChannelShareCode", "channel:share:AbC-123"), "AbC-123");
+    assert.equal(client.call("parseChannelShareCode", "  AbC-123  "), "AbC-123");
+    assert.equal(client.call("parseChannelShareCode", "not a code at all"), "");
+    assert.equal(client.call("parseChannelShareCode", ""), "");
+  });
+
+  it("sends the play rules with the picks, and never the local bookkeeping", () => {
+    const client = load();
+    const payload = client.call("channelSharePayload", {
+      channelId: "ch1", name: "Block Party", items: [], shuffle: true,
+      autoSort: "interleave", dailyRotate: true, rotateShows: 6, hideWatched: true,
+      storyLocked: ["tt1"], createdAt: 1, updatedAt: 2, shareCode: "OLD",
+    });
+    assert.equal(payload.autoSort, "interleave");
+    assert.equal(payload.dailyRotate, true);
+    assert.equal(payload.rotateShows, 6);
+    assert.equal(payload.hideWatched, true);
+    assert.deepEqual(plain(payload.storyLocked), ["tt1"]);
+    assert.equal("channelId" in payload, false, "the receiver mints its own id");
+    assert.equal("createdAt" in payload, false);
+    assert.equal("shareCode" in payload, false);
+  });
+
+  it("re-shares under the code it already has rather than minting a second link", async () => {
+    const posts = [];
+    const client = load({
+      "/api/channel/share": (req) => {
+        posts.push(req.body);
+        return { json: { ok: true, code: req.body.code || "NEW1", url: "https://example.com/channel/NEW1" } };
+      },
+    });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [] });
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal(posts[0].code, "", "nothing to reuse the first time");
+    assert.equal(client.call("loadLocalChannels").ch1.shareCode, "NEW1");
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal(posts[1].code, "NEW1", "the second share updates the same link");
+  });
+
+  it("does not send a Creator Key with an unlisted share", async () => {
+    const posts = [];
+    const client = load({
+      "/api/channel/share": (req) => { posts.push(req.body); return { json: { ok: true, code: "C1" } }; },
+    });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [] });
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal(posts[0].publish, false);
+    assert.equal("creatorKey" in posts[0], false);
+  });
+
+  it("adds a shared channel under a fresh id, and never as someone else's listing", () => {
+    const client = load();
+    const id = client.call("acceptSharedChannel", {
+      name: "Saturday Morning 90s", items: [], dailyRotate: true, rotateShows: 4, sharePublished: true,
+    }, "CODE1");
+    const saved = client.call("loadLocalChannels")[id];
+    assert.equal(saved.name, "Saturday Morning 90s");
+    assert.equal(saved.rotateShows, 4);
+    assert.equal(saved.shareCode, "CODE1");
+    assert.equal(saved.sharePublished, false, "a copy is not the published listing");
+  });
+
+  it("imports the channel behind a pasted link", async () => {
+    const client = load({
+      "/api/channel/share": () => ({ json: { ok: true, channel: { name: "80s VHS Sci-Fi Vault", items: [] } } }),
+    });
+    el(client, "channelShareCodeInput").value = "https://example.com/channel/VHS1";
+    await client.call("importSharedChannel", null);
+    const asked = requestsTo(client, "/api/channel/share");
+    assert.equal(asked.length, 1);
+    assert.match(asked[0].url, /code=VHS1/);
+    assert.ok(
+      Object.values(client.call("loadLocalChannels")).some((ch) => ch.name === "80s VHS Sci-Fi Vault"),
+      "the channel landed locally"
+    );
+  });
+
+  it("says so rather than calling the server when the pasted text is not a code", async () => {
+    const client = load();
+    el(client, "channelShareCodeInput").value = "just some words";
+    await client.call("importSharedChannel", null);
+    assert.equal(requestsTo(client, "/api/channel/share").length, 0);
+    assert.match(el(client, "channelShareImportStatus").innerHTML, /does not look like/);
+  });
+});
+
+describe("client: the Explore Channels directory", () => {
+  it("filters the listing it has already fetched rather than re-asking", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/directory": () => ({
+          json: {
+            ok: true,
+            channels: [
+              { code: "a", name: "Saturday Morning 90s", description: "cartoons", owner: "alice", itemCount: 300, showCount: 12, dailyRotate: true },
+              { code: "b", name: "Comedy Central 2000s", description: "sitcoms", owner: "bob", itemCount: 200, showCount: 8 },
+            ],
+          },
+        }),
+      },
+    });
+    await client.call("loadChannelDirectory", true);
+    assert.equal(requestsTo(client, "/api/channel/directory").length, 1);
+    const feed = el(client, "channelDirectoryFeed");
+    assert.match(feed.innerHTML, /Saturday Morning 90s/);
+    assert.match(feed.innerHTML, /Comedy Central 2000s/);
+
+    el(client, "channelDirectorySearchInput").value = "cartoons";
+    client.call("renderChannelDirectory");
+    assert.match(feed.innerHTML, /Saturday Morning 90s/);
+    assert.equal(/Comedy Central 2000s/.test(feed.innerHTML), false);
+    assert.equal(requestsTo(client, "/api/channel/directory").length, 1, "filtering is local");
+  });
+
+  it("describes a dynamic listing by what it does, not by a pick count it has not got", async () => {
+    const client = loadClient({ routes: {} });
+    const line = client.call("channelDirectoryMetaLine", {
+      code: "c", name: "Next Up", dynamic: "next-up", itemCount: 0, showCount: 0, owner: "alice",
+    });
+    assert.match(line, /watch history/);
+    assert.equal(/0 episodes/.test(line), false);
+  });
+});
+
+describe("client: the dynamic Next Up channel", () => {
+  it("refuses to make one while signed out, since it has no history to read", () => {
+    const client = loadClient({ routes: {} });
+    client.set("activeCreator", null);
+    client.call("createNextUpChannel", null);
+    assert.deepEqual(plain(client.call("loadLocalChannels")), {});
+    assert.match(el(client, "channelNextUpStatus").innerHTML, /Creator Profile/);
+  });
+
+  it("saves a channel with no picks of its own", () => {
+    const client = loadClient({ routes: {} });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("createNextUpChannel", null);
+    const saved = Object.values(client.call("loadLocalChannels"));
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].dynamic, "next-up");
+    assert.deepEqual(plain(saved[0].items), [], "the Worker fills this in per request");
+  });
+
+  it("opens the one that exists instead of adding a second", () => {
+    const client = loadClient({ routes: {} });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("createNextUpChannel", null);
+    client.call("createNextUpChannel", null);
+    assert.equal(Object.keys(client.call("loadLocalChannels")).length, 1);
+  });
+});

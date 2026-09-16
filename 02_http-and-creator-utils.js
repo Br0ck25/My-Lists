@@ -4538,3 +4538,55 @@ async function readCreatorUserListsD1(env, username) {
     return null;
   }
 }
+
+// --- the Explore Channels directory index -------------------------------
+//
+// One KV key holding the whole directory, newest listing first. A prefix
+// scan over channelshare: would also work, but the tab reads this on every
+// visit and a scan plus one GET per entry is dozens of round trips to draw
+// one page of cards -- so each listing's one-line summary is denormalized
+// into this index and the full channel stays one code lookup away.
+//
+// Read-modify-write on a single key, with no compare-and-swap available in
+// KV: two people publishing in the same instant can cost one of the two
+// listings. That is the same trade index:publiclists makes, and it is
+// tolerable for the same reason -- the channel itself is stored under its
+// own key and is never at risk, only its row in this directory, and
+// re-publishing puts the row back.
+const PUBLIC_CHANNEL_INDEX_KEY = "index:publicchannels";
+
+async function readPublicChannelIndex(env) {
+  if (!env || !env.CONFIGS) return [];
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_CHANNEL_INDEX_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.entries) ? parsed.entries : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writePublicChannelIndex(env, entries) {
+  if (!env || !env.CONFIGS) return;
+  await env.CONFIGS.put(
+    PUBLIC_CHANNEL_INDEX_KEY,
+    JSON.stringify({ entries: entries.slice(0, PUBLIC_CHANNEL_INDEX_MAX), updatedAt: Date.now() })
+  );
+}
+
+async function upsertPublicChannelIndex(env, code, record) {
+  const entries = await readPublicChannelIndex(env);
+  const summary = sharedChannelSummary(code, record);
+  const without = entries.filter((e) => e && e.code !== code);
+  // Newest first, and an update moves a listing back to the front -- a
+  // channel someone has just reworked is the one worth showing.
+  await writePublicChannelIndex(env, [summary, ...without]);
+}
+
+async function removePublicChannelIndex(env, code) {
+  const entries = await readPublicChannelIndex(env);
+  const without = entries.filter((e) => e && e.code !== code);
+  if (without.length === entries.length) return;
+  await writePublicChannelIndex(env, without);
+}

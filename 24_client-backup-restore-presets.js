@@ -2496,6 +2496,14 @@ tryAutoRestoreCreatorProfile();
 // link, or a plain page refresh lands back on that exact page instead of
 // always falling back to whatever tab was last active.
 (function handleInitialDeepLink() {
+  // A channel share link (/channel/<code>) redirects here carrying the code
+  // in the fragment. Checked first and returned on, because it is the one
+  // deep link that does something to this browser's own data rather than
+  // opening a page -- see handleChannelShareDeepLink.
+  if (typeof handleChannelShareDeepLink === 'function' && /[#&?]channel=/.test(location.hash || '')) {
+    handleChannelShareDeepLink();
+    return;
+  }
   if (SERVER_DEEP_LINK_LIST) {
     openListDetailsPage(SERVER_DEEP_LINK_LIST.name, SERVER_DEEP_LINK_LIST.type, SERVER_DEEP_LINK_LIST.url, SERVER_DEEP_LINK_LIST, { skipPushState: true });
     return;

@@ -6,6 +6,71 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 📺 Channels: broadcast scheduling, smart rules, sharing and a directory
+
+Ten additions, all of them in the Channels tab. The three that change how an existing channel
+*could* play are opt-in and off by default, so every channel saved before this plays exactly as
+it did.
+
+**Play order and scheduling**
+
+- **Interleaved (round-robin) play order.** A new entry in the **Play order** dropdown deals one
+  episode from each show in turn, then rounds again —
+  `Simpsons S1E1 ➔ King of the Hill S1E1 ➔ Malcolm S1E1 ➔ Simpsons S1E2`. That is what a 90s
+  prime-time block actually felt like, and the opposite of playing fifty episodes of one show
+  before the next one starts. Like the other sorts it is re-applied as picks are added, and it is
+  idempotent, so the builder and the Worker cannot fight over it.
+- **Daily Broadcast Schedule, for any channel.** Quick Add's network channels have always rotated
+  24 shows × 3 episodes out of a much bigger pool; that is now a panel under the play-order
+  dropdown for any channel you build, with three dials: **shows per day**, **episodes per block**,
+  and the **time of day the lineup turns over** (UTC or your own local time, rather than always
+  midnight UTC — which is the previous evening everywhere west of Greenwich). Load a 1,000-episode
+  pool of sitcoms and it reads like a cable channel with fresh programming every morning.
+- **Story Lock.** Shuffling suits a procedural — Seinfeld, The Office, Law & Order — and ruins a
+  serialized one. Tick a show as story-locked and it always advances to its next episode in order,
+  picking up the next day where the last block left off, while every other show keeps shuffling
+  around it. The positions it occupies still move, so it stays spread through the day rather than
+  stuck in one block.
+- **Hide watched.** With Auto-track playback on, a channel can suppress episodes already in your
+  Watch History. Applied *before* the daily rotation, so an episode you have seen costs the channel
+  nothing rather than a slot in today's lineup — and once the whole pool has been seen the channel
+  comes back rather than going dark.
+
+**Channels that build themselves**
+
+- **Next Up channel.** One button under My Channels. It stores no picks at all: the lineup is
+  re-derived from your Continue Watching on every request, so pressing play always serves the next
+  unwatched episode across everything you have on the go, and it follows what you are actually
+  watching instead of freezing the day it was made. Needs a Creator Profile with Auto-track
+  playback on, since there is no other way for the add-on to know what you have seen.
+- **Quick Channel Wizard.** Three dropdowns in Quick Add — network or studio, era, genre or mood —
+  and a finished 24/7 channel compiled from the top shows that match. No blank canvas to fill in.
+- **Spotlight channels.** **Actors & Directors** joins Shows and Movies as a search type in the
+  builder. Pick someone and their best films and TV work compile into one channel, sorted
+  chronologically (a career unfolding) or best-first. Directing and creating credits count, not
+  only acting ones, so a Nolan or a Miyazaki spotlight is the films they *made*.
+- **Live Cloud Sync.** Importing a Trakt/MDBList/Simkl/TMDB list used to take a one-time snapshot,
+  frozen for good. A channel can now keep the source URL instead: the Worker rebuilds its pool from
+  that list in the background, so a public list gaining a title gains it here too. The rebuild never
+  sits on the request's critical path — a request serves the stored pool and schedules the refresh.
+
+**Sharing**
+
+- **One-click share links.** **Share** on any channel copies a link that rebuilds it anywhere —
+  every pick, its play order and its broadcast schedule. A channel is thousands of episodes and a
+  link is a few hundred characters, so the link carries a short code and the channel is stored
+  behind it; opening the link hands the code over in the URL *fragment*, which never reaches a
+  server log. Re-sharing an edited channel updates the link people already have rather than minting
+  a second one beside it.
+- **Explore Channels.** A new tab listing channels other people have published — add one to your own
+  setup in a single click, then edit it however you like. Publishing needs a Creator Profile so
+  every listing has an owner who can take it down again; **Unpublish** removes the listing and
+  leaves links already handed out working. Sharing privately needs no account at all.
+
+Everything arriving from someone else's channel is rebuilt field by field before it is stored or
+rendered: art that is not an `http(s)` URL is dropped, a Story Lock for a show the shared picks do
+not contain is dropped, and Live Cloud Sync travels only with a real list URL behind it.
+
 ### 🐛 Fixed: air times did not appear, and a channel pick could show yesterday's date
 
 - **Air times were missing on shows you had recently opened.** The details cache is keyed by id, type and

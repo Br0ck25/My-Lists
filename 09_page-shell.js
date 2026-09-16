@@ -1258,6 +1258,66 @@ ${seoHeadHtml}
     gap: 8px;
     margin-top: 8px;
   }
+  /* --- Channel broadcast schedule, Story Lock & the Quick Channel wizard -- */
+  .channel-rule-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    user-select: none;
+    line-height: 1.35;
+  }
+  .channel-rule-row input[type="checkbox"] {
+    margin: 2px 0 0;
+    flex: 0 0 auto;
+  }
+  .channel-dial {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .channel-dial input,
+  .channel-dial select {
+    width: auto;
+    min-width: 76px;
+    font-size: 0.82rem;
+    padding: 5px 8px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .channel-storylock-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 6px 12px;
+    margin-top: 6px;
+  }
+  .channel-wizard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .channel-wizard-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .channel-wizard-grid select {
+    font-size: 0.85rem;
+    padding: 6px 10px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
   @media (min-width: 641px) {
     .channel-season-grid {
       grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
