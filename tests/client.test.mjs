@@ -5736,3 +5736,73 @@ describe("client: the Explore Channels directory ordering and likes", () => {
     );
   });
 });
+
+describe("client: dragging a pick while the draft is filtered", () => {
+  const epOf = (imdbId, episode, showName) => ({
+    kind: "episode", imdbId, season: 1, episode, showName,
+    epName: "E" + episode, title: showName + " E" + episode,
+  });
+  const SAMPLE = [
+    epOf("tt1", 1, "Rugrats"),
+    epOf("tt2", 1, "Doug"),
+    epOf("tt1", 2, "Rugrats"),
+    epOf("tt2", 2, "Doug"),
+  ];
+
+  // The card order the DOM would be in after a drag. reorderChannelDraftFromDom
+  // reads it back out of the rendered cards, so the stub has to hand back the
+  // same data-idx attributes a real render would.
+  function withRenderedOrder(client, indices) {
+    const list = client.document.getElementById("channelDraftList");
+    list.querySelectorAll = (sel) =>
+      sel === ".channel-pick" ? indices.map((i) => ({ dataset: { idx: String(i) } })) : [];
+    list.querySelector = () => null;
+  }
+
+  it("keeps every hidden pick when a visible one is dragged", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", SAMPLE);
+    client.set("channelDraftFilter", "doug");
+    // Doug sits at slots 1 and 3; dragging swaps the two visible cards.
+    withRenderedOrder(client, [3, 1]);
+    client.call("reorderChannelDraftFromDom");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Rugrats E1", "Doug E2", "Rugrats E2", "Doug E1"],
+      "the two Rugrats picks the filter was hiding are still in their own slots"
+    );
+    assert.equal(client.get("channelDraftItems").length, 4, "nothing was dropped");
+  });
+
+  it("is a plain reorder when nothing is filtered out", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", SAMPLE);
+    client.set("channelDraftFilter", "");
+    withRenderedOrder(client, [3, 2, 1, 0]);
+    client.call("reorderChannelDraftFromDom");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Doug E2", "Rugrats E2", "Doug E1", "Rugrats E1"]
+    );
+  });
+
+  it("ignores a stale index rather than writing undefined into the draft", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", SAMPLE);
+    withRenderedOrder(client, [0, 99, 1]);
+    client.call("reorderChannelDraftFromDom");
+    assert.equal(client.get("channelDraftItems").length, 4);
+    assert.ok(client.get("channelDraftItems").every(Boolean));
+  });
+
+  it("leaves the draft alone when there is nothing rendered to read", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", SAMPLE);
+    withRenderedOrder(client, []);
+    client.call("reorderChannelDraftFromDom");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Rugrats E1", "Doug E1", "Rugrats E2", "Doug E2"]
+    );
+  });
+});

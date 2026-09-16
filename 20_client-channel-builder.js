@@ -1039,9 +1039,10 @@ function renderChannelDraftList() {
   renderChannelDraftGroupOptions();
   updateChannelDraftSelectionCount();
   renderChannelDraftStats();
-  // Hold-to-drag is what reorders a pick, and it must not fight the
-  // checkboxes -- see the selecting branch above.
-  if (!channelDraftSelectMode) initChannelHoldDrag();
+  // Bound unconditionally: the binding happens once and the handler itself
+  // stands down while selecting, so skipping the call here would only mean
+  // never binding at all if the first render happened to be in Select mode.
+  initChannelHoldDrag();
   renderChannelPosterPicker();
   renderChannelCrossoverSuggestions();
   // The schedule hint counts the draft's shows and Story Lock lists them,
@@ -7848,6 +7849,10 @@ function initChannelHoldDrag() {
 
   // Pointer events for desktop & unified pointer handling
   container.addEventListener('pointerdown', (e) => {
+    // Bound once and never removed, so Select mode has to be checked here:
+    // a hold-drag and a tap-to-select are the same gesture on a touch
+    // screen, and while selecting, selecting wins.
+    if (channelDraftSelectMode) return;
     if (e.target.closest('.channelRemovePickBtn, .channelPosInput')) return;
     const card = e.target.closest('.channel-pick');
     if (!card) return;
@@ -7942,12 +7947,30 @@ function getChannelDragAfterElement(container, x, y) {
   return closest;
 }
 
+// Rebuilds the draft order from the cards on screen after a drag.
+//
+// Only the cards ON SCREEN, which is the whole difficulty: with a filter
+// active those are a SUBSET, and rebuilding the list from them would drop
+// every pick the filter is hiding -- silently, irreversibly, on one
+// accidental drag of a channel someone spent an evening assembling.
+//
+// So the drag permutes the picks among the SLOTS they already occupied in
+// the full list, and everything else stays exactly where it is. With no
+// filter the slots are 0..N-1 and this is the plain reorder it always was.
 function reorderChannelDraftFromDom() {
   const container = document.getElementById('channelDraftList');
   const rows = [...container.querySelectorAll('.channel-pick')];
   if (rows.length) {
-    clearChannelDraftAutoSort();
-    channelDraftItems = rows.map((row) => channelDraftItems[parseInt(row.dataset.idx, 10)]).filter(Boolean);
+    const order = rows
+      .map((row) => parseInt(row.dataset.idx, 10))
+      .filter((n) => Number.isInteger(n) && n >= 0 && n < channelDraftItems.length);
+    if (order.length) {
+      clearChannelDraftAutoSort();
+      const slots = order.slice().sort((a, b) => a - b);
+      const next = channelDraftItems.slice();
+      order.forEach((fromIdx, n) => { next[slots[n]] = channelDraftItems[fromIdx]; });
+      channelDraftItems = next;
+    }
   }
   renderChannelDraftList();
 }
