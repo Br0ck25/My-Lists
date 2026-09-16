@@ -1646,15 +1646,36 @@ async function fetchPublishedListCatalog(entry, env) {
     });
 }
 
-// NOTE: mixing movies into a channel is a known soft spot -- when someone
-// taps a movie "episode", wako/Stremio requests its stream as
-// /stream/series/<movie's plain imdb id>.json (type "series", since that's
-// the parent meta's type, Stremio doesn't re-derive per-video type). Most
-// stream add-ons branch their whole handler on that type param before even
-// looking at the id, so a movie embedded this way may not return streams on
-// every stream add-on -- Torrentio-style ones tend to be fairly lenient
-// about id shape, but this isn't guaranteed across the board. Worth testing
-// directly against whichever stream add-on the person actually uses.
+// --- a movie inside a channel: a known limit ---------------------------
+//
+// A channel's meta is a SERIES, and Stremio does not re-derive a type per
+// video: tapping a movie in one asks every stream add-on for
+// /stream/series/<the movie's own imdb id>.json. Most stream add-ons branch
+// their whole handler on that type param before they ever look at the id, so
+// the request is answered with nothing. Reported from the field as "Stremio
+// cannot find the movie, PenguPlay finds no stream", while Nuvio, which
+// resolves the id itself, plays it fine; Torrentio-style add-ons are lenient
+// about id shape, which is why this works for some people and not others.
+//
+// Nothing here can change that. The type comes from the parent meta, and no
+// id shape gets around it: tt123:1:1 points at a season 1 episode 1 that does
+// not exist, and a bare number or a private prefix matches no idPrefixes
+// anywhere so no add-on is even asked. Attaching metadata to the video does
+// not change what a third-party add-on is asked for either.
+//
+// Tried and removed: answering that request here with a stream whose
+// externalUrl deep-linked to the movie's own page. Stremio Web treats an
+// externalUrl as leaving the app -- it routes through a stremio.com/warning
+// interstitial and then hands the stremio:// scheme to the OS -- so it was a
+// dead end where it was tested, and looked like a working option while not
+// being one.
+//
+// What does work is left to the person: play the movie from its own page, or
+// use a client that resolves the id itself. The two ways to fix this properly
+// both cost something the add-on should not spend on its own -- proxying the
+// person's own stream add-on (which means holding their debrid key) or
+// splitting a channel's movies into a separate movie-typed row (which takes
+// them out of the channel's play order).
 //
 // A stable string->int hash (not cryptographic, just needs to be a decent
 // spread) so each channel's shuffle looks independent of every other
@@ -1873,16 +1894,27 @@ function buildChannelMeta(entry, origin) {
     // surfaced during debugging) -- its deserializer likely expects a full
     // ISO 8601 *datetime* here and can silently fail to parse the whole
     // meta object on a bare date, unlike a loose JS parser that wouldn't
-    // care. Pinning to midnight UTC costs nothing (we only ever had a date
-    // to begin with) and matches the shape a known-working reference
-    // implementation's meta responses use.
+    // care. Giving it a datetime costs nothing, since we only ever had a
+    // date to begin with.
+    //
+    // 11:00 UTC, not midnight: a client renders this in the VIEWER's
+    // timezone, and midnight UTC is the previous evening everywhere west of
+    // Greenwich -- which is why a 1996 movie in a channel read "Dec 31,
+    // 1995" across the Americas.
+    //
+    // An instant at hour H shows as the date we meant in every zone whose
+    // offset is in [-H, 24-H). World offsets span UTC-12 to UTC+14, 26 hours,
+    // so no single instant covers all of them and two hours' worth are always
+    // wrong. H=11 covers UTC-11 to UTC+12:59 -- every inhabited zone except
+    // UTC+13/+14 (NZ daylight, Samoa, Tonga, Kiribati) -- and is one better
+    // than midday, which also slips in New Zealand.
     const releaseDate = it.released || (it.year ? `${it.year}-01-01` : undefined);
     return {
       id: channelItemStreamId(it),
       title: it.title,
       season: 1,
       episode: i + 1,
-      released: releaseDate ? `${releaseDate}T00:00:00.000Z` : undefined,
+      released: releaseDate ? `${releaseDate}T11:00:00.000Z` : undefined,
       thumbnail: it.thumbnail || it.poster || payload.poster || undefined,
     };
   });

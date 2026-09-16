@@ -2553,6 +2553,281 @@ describe("client: season watched detection (isSeasonFullyWatched)", () => {
   });
 });
 
+// A show part-way through a season could not be read as caught up until its
+// finale: every "is this watched" check counted against TMDB's episode_count,
+// which includes the episodes still to come. /api/details already says where
+// the next unaired episode is, so the answer needs no extra fetch -- these
+// pin down that the pointer is read, and that it is NOT read for a show whose
+// seasons were renumbered out of a TMDB episode group.
+describe("client: a season is measured by what has aired", () => {
+  const dayOffset = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+  const FUTURE = dayOffset(30);
+
+  // Season 3 lists 10 episodes; 5 are out and episode 6 airs in a month.
+  const AIRING = {
+    id: "tt_airing",
+    tmdbId: "999",
+    title: "Airing Show",
+    seasonsData: [
+      { season_number: 1, name: "Season 1", episode_count: 8, air_date: "2021-01-01" },
+      { season_number: 2, name: "Season 2", episode_count: 8, air_date: "2022-01-01" },
+      { season_number: 3, name: "Season 3", episode_count: 10, air_date: dayOffset(-60) },
+    ],
+    nextEpisodeAirDate: FUTURE,
+    nextEpisodeSeasonNumber: 3,
+    nextEpisodeNumber: 6,
+  };
+  const S3 = AIRING.seasonsData[2];
+
+  const watched = (seasonNum, upTo) => Array.from({ length: upTo }, (_, i) => ({
+    id: "tt_airing:" + seasonNum + ":" + (i + 1),
+    type: "episode",
+    showId: "tt_airing",
+    showTitle: "Airing Show",
+    seasonNum,
+    episodeNum: i + 1,
+  }));
+
+  function seeded(items, details) {
+    const client = loadClient();
+    client.set("_fullyWatchedShowIds", new Set());
+    client.set("_seasonEpisodesMap", {});
+    client.set("_currentItemDetails", details || AIRING);
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: items } });
+    return client;
+  }
+
+  it("counts the episodes before the next unaired one, not the whole season", () => {
+    const client = seeded([]);
+    assert.equal(client.call("seasonAiredEpisodeCount", 3, S3, AIRING), 5,
+      "5 of season 3's 10 episodes are out");
+    assert.equal(client.call("seasonAiredEpisodeCount", 1, AIRING.seasonsData[0], AIRING), 8,
+      "an earlier season is out in full");
+  });
+
+  it("reads a season as fully watched once every aired episode of it is", () => {
+    assert.equal(seeded(watched(3, 5)).call("isSeasonFullyWatched", "tt_airing", 3, 10), true,
+      "5 of the 5 aired episodes is caught up");
+    assert.equal(seeded(watched(3, 4)).call("isSeasonFullyWatched", "tt_airing", 3, 10), false,
+      "an aired episode still unwatched is not");
+  });
+
+  it("reads the show as fully watched when the only episodes left have not aired", () => {
+    const caughtUp = seeded([...watched(1, 8), ...watched(2, 8), ...watched(3, 5)]);
+    assert.equal(caughtUp.call("isShowFullyWatched", AIRING), true,
+      "every episode that exists to watch has been watched");
+
+    const behind = seeded([...watched(1, 8), ...watched(2, 8), ...watched(3, 4)]);
+    assert.equal(behind.call("isShowFullyWatched", AIRING), false,
+      "one aired episode short is not caught up");
+  });
+
+  it("treats a season that starts after the next episode as not aired at all", () => {
+    const client = seeded([]);
+    const s4 = { season_number: 4, name: "Season 4", episode_count: 8, air_date: FUTURE };
+    assert.equal(client.call("seasonAiredEpisodeCount", 4, s4, AIRING), 0);
+    assert.equal(client.call("seasonHasAiredEpisodes", 4, s4), false);
+  });
+
+  it("ignores the pointer once the season's real episode list is loaded", () => {
+    const client = seeded(watched(3, 5));
+    // TMDB re-dated episode 6 to yesterday; the loaded list is the truth.
+    client.set("_seasonEpisodesMap", {
+      3: Array.from({ length: 10 }, (_, i) => ({
+        id: 3000 + i, episode_number: i + 1, name: "E" + (i + 1),
+        air_date: i < 6 ? dayOffset(-10) : FUTURE,
+      })),
+    });
+    assert.equal(client.call("seasonAiredEpisodeCount", 3, S3, AIRING), 6);
+    assert.equal(client.call("isSeasonFullyWatched", "tt_airing", 3, 10), false,
+      "6 have aired now, and only 5 are watched");
+  });
+
+  it("ignores the pointer for a show whose seasons were renumbered", () => {
+    // An anime unpacked out of a TMDB episode group numbers its own seasons,
+    // so a pointer counted in TMDB's numbers cannot be lined up against them.
+    const unpacked = {
+      id: "tt_unpacked",
+      title: "Unpacked Show",
+      seasonsData: [
+        { season_number: 1, season: 1, name: "Part 1", episode_count: 12, episodeCount: 12 },
+        { season_number: 2, season: 2, name: "Part 2", episode_count: 12, episodeCount: 12 },
+      ],
+      nextEpisodeAirDate: FUTURE,
+      nextEpisodeSeasonNumber: 1,
+      nextEpisodeNumber: 20,
+    };
+    const client = seeded([], unpacked);
+    assert.equal(client.call("seasonAiredCountFromNextEpisode", 2, unpacked.seasonsData[1], unpacked), null,
+      "the pointer says nothing about a renumbered season");
+    assert.equal(client.call("seasonAiredEpisodeCount", 2, unpacked.seasonsData[1], unpacked), 12,
+      "which leaves the season's own episode count");
+  });
+
+  it("repaints Mark Show Watched from what is on disk", () => {
+    const client = seeded([...watched(1, 8), ...watched(2, 8), ...watched(3, 5)]);
+    client.call("updateShowWatchedButton");
+    const btn = client.__byId.get("btnMarkShowWatched");
+    assert.match(btn.innerHTML, /Mark Show Unwatched/,
+      "caught up on everything aired reads as watched");
+    assert.equal(btn.className, "secondary");
+  });
+});
+
+describe("client: the season header counts what has been watched", () => {
+  const SHOW = {
+    id: "tt_counts",
+    title: "Counted Show",
+    seasonsData: [{ season_number: 1, name: "Season 1", episode_count: 8, air_date: "2021-01-01" }],
+  };
+  const S1 = SHOW.seasonsData[0];
+
+  function seeded(upTo) {
+    const client = loadClient();
+    client.set("_fullyWatchedShowIds", new Set());
+    client.set("_seasonEpisodesMap", {});
+    client.set("_currentItemDetails", SHOW);
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history",
+        items: Array.from({ length: upTo }, (_, i) => ({
+          id: "tt_counts:1:" + (i + 1),
+          type: "episode",
+          showId: "tt_counts",
+          showTitle: "Counted Show",
+          seasonNum: 1,
+          episodeNum: i + 1,
+        })),
+      },
+    });
+    return client;
+  }
+
+  it("reads 0/8 with nothing watched, 3/8 part-way, and 8/8 at the end", () => {
+    assert.equal(seeded(0).call("seasonEpisodeCountState", SHOW, S1).label, "0/8 episodes");
+    assert.equal(seeded(3).call("seasonEpisodeCountState", SHOW, S1).label, "3/8 episodes");
+    assert.equal(seeded(8).call("seasonEpisodeCountState", SHOW, S1).label, "8/8 episodes");
+  });
+
+  it("flags only a finished season as complete", () => {
+    assert.equal(seeded(7).call("seasonEpisodeCountState", SHOW, S1).complete, false);
+    assert.equal(seeded(8).call("seasonEpisodeCountState", SHOW, S1).complete, true);
+  });
+
+  it("counts an episode once however many times it was logged", () => {
+    const client = seeded(0);
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history",
+        items: [1, 1, 2].map((n, i) => ({
+          id: "tt_counts:1:" + n + ":" + i,
+          type: "episode",
+          showId: "tt_counts",
+          showTitle: "Counted Show",
+          seasonNum: 1,
+          episodeNum: n,
+        })),
+      },
+    });
+    assert.equal(client.call("seasonEpisodeCountState", SHOW, S1).label, "2/8 episodes");
+  });
+
+  it("never reads past the season's own length", () => {
+    // Watch History can hold an episode TMDB has since dropped from a season.
+    const client = seeded(0);
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history",
+        items: Array.from({ length: 9 }, (_, i) => ({
+          id: "tt_counts:1:" + (i + 1),
+          type: "episode",
+          showId: "tt_counts",
+          showTitle: "Counted Show",
+          seasonNum: 1,
+          episodeNum: i + 1,
+        })),
+      },
+    });
+    assert.equal(client.call("seasonEpisodeCountState", SHOW, S1).label, "8/8 episodes");
+  });
+
+  it("says nothing when the season has no episode count to count against", () => {
+    const client = seeded(3);
+    assert.equal(client.call("seasonEpisodeCountState", SHOW, { season_number: 1 }).label, "");
+  });
+});
+
+// The two asks, end to end: open a show's page and read what it renders.
+describe("client: a show's page, rendered", () => {
+  const dayOffset = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+
+  // Season 3 lists 10 episodes, 5 are out, episode 6 airs in three weeks.
+  const DETAILS = {
+    id: "tt_rendered", tmdbId: "555", title: "Rendered Show", overview: "x", poster: "", seasons: 3,
+    seasonsData: [
+      { season_number: 1, name: "Season 1", episode_count: 8, air_date: "2021-01-01" },
+      { season_number: 2, name: "Season 2", episode_count: 8, air_date: "2022-01-01" },
+      { season_number: 3, name: "Season 3", episode_count: 10, air_date: dayOffset(-60) },
+    ],
+    nextEpisodeAirDate: dayOffset(20),
+    nextEpisodeSeasonNumber: 3,
+    nextEpisodeNumber: 6,
+  };
+
+  async function render(watchedInS3) {
+    const client = loadClient({ routes: { "/api/details": () => ({ json: { ok: true, details: DETAILS } }) } });
+    const items = [];
+    const add = (season, upTo) => {
+      for (let i = 1; i <= upTo; i++) {
+        items.push({
+          id: "tt_rendered:" + season + ":" + i, type: "episode",
+          showId: "tt_rendered", showTitle: "Rendered Show", seasonNum: season, episodeNum: i,
+        });
+      }
+    };
+    add(1, 8);
+    add(2, 8);
+    add(3, watchedInS3);
+    client.set("_fullyWatchedShowIds", new Set());
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: items } });
+    await client.call("openItemDetailsModal", "tt_rendered", "series");
+    return client.get("document").getElementById("itemDetailsBody").innerHTML;
+  }
+
+  it("puts the watched count on every season header", async () => {
+    const html = await render(5);
+    const counts = [...html.matchAll(/season-header-episodes[^"]*" data-season="(\d+)">([^<]*)</g)]
+      .map((m) => m[1] + ":" + m[2]);
+    assert.deepEqual(counts, ["1:8/8 episodes", "2:8/8 episodes", "3:5/10 episodes"]);
+    assert.match(html, /season-header-episodes is-complete" data-season="1"/,
+      "a finished season is flagged for the accent colour");
+    assert.equal(/season-header-episodes is-complete" data-season="3"/.test(html), false,
+      "a season with episodes still to come is not");
+  });
+
+  it("offers Mark Show Unwatched once every aired episode has been watched", async () => {
+    const caughtUp = await render(5);
+    assert.match(caughtUp, /Mark Show Unwatched/,
+      "5 of the 5 episodes out so far -- there is nothing left to mark");
+    assert.equal(/>Mark Show Watched</.test(caughtUp), false);
+
+    const behind = await render(4);
+    assert.match(behind, />Mark Show Watched</, "one aired episode short is still unwatched");
+    assert.equal(/Mark Show Unwatched/.test(behind), false);
+  });
+
+  it("starts at 0/8 for a show nothing has been watched of", async () => {
+    const client = loadClient({ routes: { "/api/details": () => ({ json: { ok: true, details: DETAILS } }) } });
+    client.set("_fullyWatchedShowIds", new Set());
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: [] } });
+    await client.call("openItemDetailsModal", "tt_rendered", "series");
+    const html = client.get("document").getElementById("itemDetailsBody").innerHTML;
+    assert.match(html, /data-season="1">0\/8 episodes</);
+    assert.match(html, /data-season="3">0\/10 episodes</);
+    assert.match(html, />Mark Show Watched</);
+  });
+});
+
 describe("client: crossover and companion events detection in channel builder", () => {
   it("registry integrity: all TV_CROSSOVER_EVENTS have valid structures, unique IDs, and sequential parts", () => {
     const client = loadClient();
@@ -4247,5 +4522,116 @@ describe("client: a not-yet-aired episode is not something anyone watched", () =
     assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, episode_count: 8 }), true);
     assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, air_date: FUTURE }), false);
     assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, air_date: "2020-01-01" }), true);
+  });
+});
+
+// The hour behind the date. /api/details carries it as a finished string, and
+// the page has to print it against episodes that reach it from three different
+// directions -- the show's own page, a Continue Watching entry built from
+// /api/season, an Airing Next tile restored from local storage.
+describe("client: air times", () => {
+  const dayOffset = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+
+  const DETAILS = {
+    id: "tt_air", tmdbId: "777", title: "Air Show", overview: "x", poster: "", seasons: 3,
+    seasonsData: [{ season_number: 3, name: "Season 3", episode_count: 10, air_date: dayOffset(-60) }],
+    nextEpisodeAirDate: dayOffset(3), nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 6,
+    airTime: {
+      time: "21:00", timezone: "America/New_York", label: "9 PM ET", days: ["Sunday"],
+      next: { season: 3, number: 6, airdate: dayOffset(3), time: "21:30", label: "9:30 PM ET" },
+    },
+    nextEpisodeAirTimeLabel: "9:30 PM ET",
+  };
+
+  const EPISODES = [
+    { id: 1, episode_number: 5, season_number: 3, name: "Already Out", air_date: dayOffset(-4), overview: "" },
+    { id: 2, episode_number: 6, season_number: 3, name: "Next One", air_date: dayOffset(3), overview: "" },
+    { id: 3, episode_number: 7, season_number: 3, name: "Later One", air_date: dayOffset(10), overview: "" },
+    { id: 4, episode_number: 8, season_number: 3, name: "Tonight", air_date: dayOffset(0), overview: "" },
+  ];
+
+  async function openShow(details) {
+    const client = loadClient({
+      routes: {
+        "/api/details": () => ({ json: { ok: true, details: details || DETAILS } }),
+        "/api/season": () => ({ json: { ok: true, season: { episodes: EPISODES } } }),
+      },
+    });
+    client.set("_fullyWatchedShowIds", new Set());
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: [] } });
+    await client.call("openItemDetailsModal", "tt_air", "series");
+    client.set("_episodeDataCache", Object.fromEntries(EPISODES.map((e) => [e.episode_number, e])));
+    client.set("_currentSeasonNum", 3);
+    return client;
+  }
+
+  function episodeModalTimes(client, epNum) {
+    let html = "";
+    client.set("showModal", (inner) => { html = inner; });
+    client.call("openEpisodeDetails", epNum);
+    return [...html.matchAll(/color:var\(--brand\);">([^<]*)</g)].map((m) => m[1]);
+  }
+
+  it("puts the hour under the date, for tonight's episode and every later one", async () => {
+    const client = await openShow();
+    assert.deepEqual(episodeModalTimes(client, 8), ["9 PM ET"], "an episode airing today is exactly when this matters");
+    assert.deepEqual(episodeModalTimes(client, 7), ["9 PM ET"], "a later episode gets the show's regular slot");
+  });
+
+  it("gives the next episode its own slot where it was dated apart", async () => {
+    const client = await openShow();
+    assert.deepEqual(episodeModalTimes(client, 6), ["9:30 PM ET"]);
+  });
+
+  it("says nothing against an episode that has already gone out", async () => {
+    const client = await openShow();
+    assert.deepEqual(episodeModalTimes(client, 5), [], "a time is a thing you are still waiting for");
+  });
+
+  it("prints the date alone when TVmaze had no slot for the show", async () => {
+    const noTime = { ...DETAILS, airTime: { time: null, timezone: null, label: "", days: [], next: null }, nextEpisodeAirTimeLabel: null };
+    const client = await openShow(noTime);
+    assert.deepEqual(episodeModalTimes(client, 6), [], "a streaming drop has no hour to invent");
+  });
+
+  it("remembers the show's slot for shelves that never see its details", async () => {
+    const client = await openShow();
+    // Continue Watching entries are built from /api/season and carry no air
+    // time of their own; the store is what answers for them.
+    assert.equal(client.call("showAirTimeLabel", "tt_air", 3, 7), "9 PM ET");
+    assert.equal(client.call("showAirTimeLabel", "tt_air", 3, 6), "9:30 PM ET", "the next episode keeps its own");
+    assert.equal(client.call("showAirTimeLabel", "777", 3, 7), "9 PM ET", "found by TMDB id too");
+    assert.equal(client.call("showAirTimeLabel", "tmdb:777", 3, 7), "9 PM ET");
+    assert.equal(client.call("showAirTimeLabel", "tt_air:3:7", 3, 7), "9 PM ET", "an episode id is still that show");
+    assert.equal(client.call("showAirTimeLabel", "tt_unknown", 3, 7), "", "a show nobody has details for says nothing");
+  });
+
+  it("stops trusting a remembered slot once it is a week old", async () => {
+    const client = await openShow();
+    const store = client.call("loadAirTimeStore");
+    Object.keys(store).forEach((k) => { store[k].at = Date.now() - (8 * 24 * 60 * 60 * 1000); });
+    assert.equal(client.call("showAirTimeLabel", "tt_air", 3, 7), "", "a show can be moved to a new night");
+  });
+
+  it("puts the hour under the day on a poster badge, and never on an aired one", async () => {
+    const client = await openShow();
+    const next = client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(3), showId: "tt_air", seasonNum: 3, episodeNum: 6 });
+    assert.match(next, /class="cw-date-badge cw-date-badge-timed"/);
+    assert.match(next, /<span class="cw-date-badge-time">9:30 PM ET<\/span>/);
+    assert.match(next, /title="Airs on [\d-]+ at 9:30 PM ET"/);
+
+    const unknown = client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(2), showId: "tt_nobody" });
+    assert.match(unknown, /class="cw-date-badge"/, "no time is still a date badge");
+    assert.equal(/cw-date-badge-time/.test(unknown), false);
+
+    assert.equal(client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(-2), showId: "tt_air" }), "",
+      "an episode that has aired gets no badge at all");
+    assert.equal(client.call("watchItemAirDateBadgeHtml", { showId: "tt_air" }), "");
+  });
+
+  it("prefers the time stored on an entry over the one remembered for its show", async () => {
+    const client = await openShow();
+    const badge = client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(3), airTime: "8 PM CT", showId: "tt_air", seasonNum: 3, episodeNum: 6 });
+    assert.match(badge, /8 PM CT/, "a tile restored from local storage knows its own hour");
   });
 });

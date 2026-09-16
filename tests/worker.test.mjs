@@ -10981,3 +10981,197 @@ describe("worker: channel video ids are real stream requests", () => {
     assert.deepEqual(Array.from(meta.videos, (v) => v.episode), items.map((_, i) => i + 1));
   });
 });
+
+// TMDB has no episode air time at all, so the hour behind every "Airs Tuesday"
+// comes from TVmaze (fetchShowAirTime, 07_source-fetchers-tmdb-simkl.js).
+// These pin down what is asked of it, what is made of the answer, and that a
+// show it has never heard of -- or a streaming service with no slot -- degrades
+// to the date alone rather than to a guess.
+// A payload that gains a field is a payload whose stored copies are now the
+// wrong shape. The details cache is keyed by id/type/region only, so without a
+// shape segment a deploy keeps serving pre-change copies for up to two hours --
+// which is exactly why air times shipped and then did not appear.
+describe("worker: the details cache key tracks the payload shape", () => {
+  it("carries a shape version that a field change can move", () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "07_source-fetchers-tmdb-simkl.js"), "utf8");
+    const declared = /const ITEM_DETAILS_SHAPE = "(v\d+)"/.exec(src);
+    assert.ok(declared, "ITEM_DETAILS_SHAPE must be declared");
+    assert.match(src, /tmdb:itemdetails:\$\{ITEM_DETAILS_SHAPE\}:/,
+      "the key has to actually use it, or bumping it retires nothing");
+  });
+
+  it("puts a show opened before a shape change on a different key than after it", () => {
+    const keyFor = (shape) => `tmdb:itemdetails:${shape}:tt17371078:series:US`;
+    assert.notEqual(keyFor("v1"), keyFor("v2"),
+      "an entry written by the old code must be unreachable to the new code");
+  });
+});
+
+describe("worker: episode air times", () => {
+  function loadAirTimeSource(fetchStub) {
+    const sandbox = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "07_source-fetchers-tmdb-simkl.js");
+    sandbox.fetch = fetchStub;
+    return sandbox;
+  }
+
+  const jsonRes = (body, ok = true) => ({ ok, json: async () => body });
+
+  const BROADCAST_SHOW = {
+    id: 82,
+    name: "Air Show",
+    schedule: { time: "21:00", days: ["Sunday"] },
+    network: { name: "HBO", country: { name: "United States", code: "US", timezone: "America/New_York" } },
+    webChannel: null,
+    _links: { self: { href: "https://api.tvmaze.com/shows/82" } },
+  };
+
+  it("turns a show's slot into the string a listing prints", async () => {
+    const calls = [];
+    const sb = loadAirTimeSource(async (url) => {
+      calls.push(String(url));
+      return jsonRes(BROADCAST_SHOW);
+    });
+    const out = await sb.fetchShowAirTimeUncached("tt0944947");
+    assert.equal(out.label, "9 PM ET");
+    assert.equal(out.time, "21:00");
+    assert.equal(out.timezone, "America/New_York");
+    assert.equal(out.next, null, "a show with no next episode link is one fetch");
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /^https:\/\/api\.tvmaze\.com\/lookup\/shows\?imdb=tt0944947$/);
+  });
+
+  it("takes the next episode's own slot when TVmaze dates it apart from the regular one", async () => {
+    const sb = loadAirTimeSource(async (url) => {
+      if (String(url).includes("/lookup/shows")) {
+        return jsonRes({
+          ...BROADCAST_SHOW,
+          _links: { ...BROADCAST_SHOW._links, nextepisode: { href: "https://api.tvmaze.com/episodes/999" } },
+        });
+      }
+      return jsonRes({ season: 3, number: 6, airdate: "2026-10-04", airtime: "21:30" });
+    });
+    const out = await sb.fetchShowAirTimeUncached("tt0944947");
+    assert.equal(out.label, "9 PM ET", "the regular slot is still what other episodes get");
+    assert.deepEqual(
+      { season: out.next.season, number: out.next.number, label: out.next.label },
+      { season: 3, number: 6, label: "9:30 PM ET" },
+      "a premiere that runs long gets its own time"
+    );
+
+    // Which of the two an episode gets is one rule, so the Worker's Stremio
+    // description and the page cannot print different times for it.
+    assert.equal(sb.airTimeLabelForNextEpisode(out, { nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 6 }), "9:30 PM ET");
+    assert.equal(sb.airTimeLabelForNextEpisode(out, { nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 7 }), "9 PM ET",
+      "a different episode falls back to the regular slot");
+    assert.equal(sb.airTimeLabelForNextEpisode(null, { nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 6 }), null);
+  });
+
+  it("says nothing for a streaming show with no broadcast slot", async () => {
+    const sb = loadAirTimeSource(async () => jsonRes({
+      id: 41220, name: "Streamer", schedule: { time: "", days: ["Friday"] },
+      network: null, webChannel: { name: "Apple TV", country: null }, _links: {},
+    }));
+    const out = await sb.fetchShowAirTimeUncached("tt11280740");
+    assert.equal(out.label, "", "no invented hour for something that just appears");
+    assert.equal(out.time, null);
+  });
+
+  it("degrades to nothing when TVmaze has never heard of the show, or is down", async () => {
+    const missing = loadAirTimeSource(async () => ({ ok: false, json: async () => null }));
+    const out = await missing.fetchShowAirTimeUncached("tt0000001");
+    // Field by field rather than deep-compared: the object comes out of the
+    // vm's own realm and is never reference-equal to a plain one out here.
+    assert.equal(out.label, "");
+    assert.equal(out.time, null);
+    assert.equal(out.timezone, null);
+    assert.equal(out.next, null);
+    assert.equal(out.days.length, 0);
+
+    const broken = loadAirTimeSource(async () => { throw new Error("network down"); });
+    assert.equal((await broken.fetchShowAirTimeUncached("tt0944947")).label, "",
+      "an air time is never worth failing a details lookup over");
+
+    // A tmdb: id has no IMDb id to look up, and must not cost a request.
+    let called = 0;
+    const noImdb = loadAirTimeSource(async () => { called++; return jsonRes(BROADCAST_SHOW); });
+    assert.equal((await noImdb.fetchShowAirTimeUncached("tmdb:1396")).label, "");
+    assert.equal(called, 0);
+  });
+
+  it("follows the next-episode link only while it points at TVmaze", async () => {
+    const seen = [];
+    const sb = loadAirTimeSource(async (url) => {
+      seen.push(String(url));
+      if (String(url).includes("/lookup/shows")) {
+        return jsonRes({ ...BROADCAST_SHOW, _links: { nextepisode: { href: "https://example.invalid/episodes/999" } } });
+      }
+      return jsonRes({ season: 1, number: 1, airtime: "06:00" });
+    });
+    const out = await sb.fetchShowAirTimeUncached("tt0944947");
+    assert.equal(seen.length, 1, "a link off TVmaze is not a link this follows");
+    assert.equal(out.next, null);
+  });
+
+  it("counts its fetches for the batch budget", async () => {
+    const sb = loadAirTimeSource(async (url) => String(url).includes("/lookup/shows")
+      ? jsonRes({ ...BROADCAST_SHOW, _links: { nextepisode: { href: "https://api.tvmaze.com/episodes/999" } } })
+      : jsonRes({ season: 1, number: 1, airtime: "21:00" }));
+    const meter = { spent: 0 };
+    await sb.fetchShowAirTimeUncached("tt0944947", meter);
+    assert.equal(meter.spent, 2, "/api/details/batch has to see these to stay inside a free Worker's budget");
+  });
+});
+
+// A movie inside a channel is a known limit, not something this repo can fix.
+// A channel's meta is a series and Stremio does not re-derive a type per
+// video, so tapping a movie asks every stream add-on for
+// /stream/series/<the movie's own imdb id>.json, which strict add-ons answer
+// with nothing. These pin down what the add-on does, and deliberately does
+// NOT do, about it.
+describe("worker: a movie inside a channel", () => {
+  const channelFns = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+
+  const MOVIE = { kind: "movie", imdbId: "tt0133093", title: "The Matrix", year: 1999 };
+  const EPISODE = { kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" };
+  const channelEntry = (items, over = {}) => ({
+    id: "ch1", type: "series", name: "My Channel", enabled: true,
+    url: "channel:v1:" + JSON.stringify({ channelId: "ch1", name: "My Channel", items }),
+    ...over,
+  });
+
+  it("emits the movie's plain id and claims no stream resource for it", async () => {
+    // The id stays as it is: that is what Nuvio resolves to play the movie
+    // today. And no stream resource is declared -- answering that request here
+    // with a deep link to the movie's own page was tried and removed, because
+    // Stremio Web treats an externalUrl as leaving the app, so it was a dead
+    // end that looked like a working option.
+    const meta = channelFns.buildChannelMeta(channelEntry([EPISODE, MOVIE]), "https://example.com");
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:5:13", "tt0133093"]);
+
+    const manifest = channelFns.buildManifest([channelEntry([EPISODE, MOVIE])], "https://example.com");
+    assert.equal((manifest.resources || []).some((r) => r && r.name === "stream"), false,
+      "this add-on has no streams of its own and must not be asked for any");
+
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const saved = await call(env, "/api/save", { method: "POST", json: { entries: [channelEntry([EPISODE, MOVIE])] } });
+    const res = await call(env, `/${saved.body.id}/stream/series/tt0133093.json`);
+    assert.notEqual(res.status, 200, "and must not serve a stream route either");
+  });
+
+  it("dates a pick so it reads the same on every clock", () => {
+    // Midnight UTC is the previous evening anywhere west of Greenwich, which
+    // is how a 1996 movie in a channel came out as "Dec 31, 1995" in the US.
+    const meta = channelFns.buildChannelMeta(channelEntry([MOVIE, { ...EPISODE, released: "2009-02-19" }]), "https://example.com");
+    const dates = Array.from(meta.videos, (v) => v.released);
+    assert.deepEqual(dates, ["1999-01-01T11:00:00.000Z", "2009-02-19T11:00:00.000Z"]);
+    // World offsets span 26 hours, so no instant is right in all of them; this
+    // one holds from UTC-11 (American Samoa) to UTC+12:45 (Chatham).
+    dates.forEach((iso) => {
+      for (const offsetHours of [-11, -8, -5, -3, 0, 1, 5.5, 8, 10, 12, 12.75]) {
+        const shifted = new Date(new Date(iso).getTime() + offsetHours * 3600000);
+        assert.equal(shifted.toISOString().slice(0, 10), iso.slice(0, 10),
+          `${iso} slips a day at UTC${offsetHours >= 0 ? "+" : ""}${offsetHours}`);
+      }
+    });
+  });
+});

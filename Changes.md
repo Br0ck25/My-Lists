@@ -1,5 +1,289 @@
 # Changes Log
 
+## 2026-09-16 - Air times that did not appear, and a date that read a day early
+
+### Files Changed
+`05_catalog-core.js`, `07_source-fetchers-tmdb-simkl.js`, `worker_entry_combined.js`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`
+
+### Air times shipped and then did not show
+
+Reported with a screenshot: The Ark S3E8, "Airs Tomorrow", date shown, no time. TVmaze has that show --
+`schedule.time` 22:00, `America/New_York`, i.e. 10 PM ET -- so the data was there and the page was not
+printing it.
+
+The cause is the details cache, not the air-time code. `fetchTmdbItemDetails` keys on
+`tmdb:itemdetails:<id>:<type>:<region>` and nothing else: entries live two hours fresh in isolate memory
+and a week in KV. A show opened shortly BEFORE the air-time deploy had a copy stored without an `airTime`
+field, and after the deploy that copy was still fresh and still served -- correct-looking, just missing the
+new field, for up to two hours.
+
+The key now carries `ITEM_DETAILS_SHAPE`, bumped to `v2` for this payload change. Every entry written by
+the old code is on a key the new code never asks for, so the fix lands on deploy rather than two hours
+later. The convention is written down where the constant is declared: a field added to or removed from the
+details payload bumps it.
+
+### A 1996 movie that read "Dec 31, 1995"
+
+Visible in the same report's channel screenshot. `buildChannelMeta` emits each pick's date as
+`<date>T00:00:00.000Z`, and a client renders that in the VIEWER's timezone -- so midnight UTC is the
+previous evening across the whole of the Americas.
+
+It is now 11:00 UTC. An instant at hour H shows as the intended date wherever the offset is in [-H, 24-H);
+world offsets span UTC-12 to UTC+14, 26 hours, so no instant covers all of them and two hours' worth are
+always wrong. H=11 covers UTC-11 to UTC+12:59 -- every inhabited zone except UTC+13/+14 -- and is one
+better than midday, which also slips in New Zealand. The first attempt here WAS midday; the test written
+alongside it caught the New Zealand case.
+
+### Tests
+
+`tests/worker.test.mjs` (3) -- the shape segment declared and actually used in the key, an old shape
+landing on a different key than the new one, and a pick's date holding across eleven offsets from UTC-11
+to UTC+12:45.
+
+## 2026-09-16 - A movie in a Channel: tried, reverted, documented as a limit
+
+### Files Changed
+`05_catalog-core.js`, `25_api-catalog-routes.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`
+
+### What prompted it
+
+Reported: a movie added to a Channel cannot be played in Stremio, and PenguPlay finds no stream for it,
+while Nuvio plays it.
+
+### The cause, which was already written down
+
+`05_catalog-core.js` carried a NOTE calling this "a known soft spot": a Channel's meta is a SERIES, and
+Stremio does not re-derive a type per video, so tapping a movie in one requests
+`/stream/series/<the movie's plain imdb id>.json`. Most stream add-ons branch their whole handler on that
+type param before they look at the id at all. The note guessed that lenient, Torrentio-style add-ons would
+cope and others might not -- which is exactly the split the report describes. Nuvio resolves the id itself
+(it renders from this add-on's full metadata, see the /meta route's own comment) and so was never affected.
+
+### What can and cannot be fixed
+
+Nothing here can make a third-party stream add-on answer a series-typed request for a movie. The id cannot
+be reshaped into something they would answer either: `tt123:1:1` points at a season 1 episode 1 that does
+not exist, and a bare number or a private prefix matches no `idPrefixes` anywhere, so no add-on is asked at
+all.
+
+What can be fixed is that the request is a DEAD END. This add-on answers that one id itself, with a single
+stream whose `externalUrl` is `stremio:///detail/movie/<id>/<id>` -- handled by Stremio itself, so it moves
+within the app to the movie's own page, where every stream add-on is asked for it as a movie and finds it.
+One tap instead of nothing.
+
+The video's id is left exactly as it was (`channelItemStreamId` still returns the movie's plain id), because
+that is what Nuvio resolves today. This is an extra answer, not a different question.
+
+### Keeping it off everyone else's playback
+
+A `stream` resource is declared for every id matching its `idPrefixes`, so declaring it unconditionally
+would have Stremio call this Worker on every episode anyone plays anywhere, for an answer that is always
+empty. `channelMovieStreamIndex` builds the set of movie ids reachable from a config's enabled Channels, and
+`buildManifest` declares the resource only when that set is non-empty.
+
+The route matches the id against that same set rather than parsing it. An id with no season and episode is
+not proof of a movie -- a show's own bare id is a real request Stremio makes -- and offering the link there
+would be a dead link of a different kind.
+
+### Reverted, on the report that it did not work
+
+The deep link was tested in Stremio Web and does not work there. An `externalUrl` is treated as *leaving*
+Stremio: it routes through a `stremio.com/warning` interstitial ("It seems you are leaving Stremio") and
+then hands the `stremio://` scheme to the operating system. It may work in the desktop app, but where it
+was tested it was a dead end -- and a dead end that looks like a working option is worse than an empty
+stream list, which at least reads as "nothing here".
+
+So the stream resource, the route, and `channelMovieStreamIndex` are all removed, and the code comment now
+records the limit and what was tried, so the next person does not try the same thing.
+
+Asked which of the three real options to take -- proxy the person's own stream add-on (reliable, but this
+add-on would hold their debrid key), split a channel's movies into their own movie-typed row (reliable, but
+out of the channel's play order), or remove the dead link and document -- the answer was to remove and
+document.
+
+### Tests
+
+`tests/worker.test.mjs` (2) -- the channel meta still emitting the movie's plain id (what Nuvio resolves)
+with no stream resource declared and no stream route served, and a pick's date holding across offsets.
+
+## 2026-09-16 - Episode air times, from the one source that actually has them
+
+### Files Changed
+`02_http-and-creator-utils.js`, `07_source-fetchers-tmdb-simkl.js`, `09_page-shell.js`,
+`17_client-my-lists-and-trakt-oauth.js`, `19_client-search-and-likes.js`,
+`21_client-custom-list-builder.js`, `23_client-list-management.js`, `worker_entry_combined.js`,
+`README.md`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/helpers-unit.test.mjs`,
+`tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### What prompted it
+
+Asked for: the air time beside or under the air date -- `9 PM ET`, `9:30 PM ET` -- for episodes airing
+today or later.
+
+### Why it needed a new source
+
+TMDB has no episode air time anywhere in its TV payloads. It dates an episode and stops. Every "Airs
+Tuesday" in this add-on has been a day with no hour behind it for that reason, and no amount of squeezing
+TMDB was going to produce one.
+
+Three candidates were checked against real payloads before picking:
+
+| Source | Has the time? | Cost |
+|---|---|---|
+| TMDB | no | already paid |
+| Cinemeta (already used here) | no -- `released` is the date at 05:00Z, i.e. midnight ET, not the broadcast hour | already paid |
+| Trakt | yes (`airs.time` + `airs.timezone`) | needs `TRAKT_CLIENT_ID`, which is an optional secret |
+| TVmaze | yes (`schedule.time` + the network country's IANA zone, and per-episode `airtime`) | **no API key at all** |
+
+Cinemeta was checked directly: Game of Thrones' episodes come back as `2019-05-20T05:00:00.000Z` -- a date
+shifted to midnight ET, not the 9 PM it actually aired. Trakt has the right data but behind a key a
+self-hoster may not have set, which would have made this feature silently absent for them. TVmaze needs
+nothing configured, so that is what this uses.
+
+### What is fetched, and when
+
+`fetchShowAirTime` is only ever called for a show with an episode still to come -- gated on TMDB's
+`next_episode_to_air` as well as the strictly-future `isUnairedFuture`, because that flag does not fire for
+an episode airing TODAY and today is exactly when someone wants to know the hour. A finished show costs
+nothing: nothing displays a time against an episode that has already aired.
+
+One call (`/lookup/shows?imdb=`) gives the show's regular slot and its network country's timezone. A second,
+tiny one follows `_links.nextepisode` when there is one, because the next episode is what every "Airs
+Tomorrow" badge is about and the one most likely to sit outside the regular slot. Measured against the live
+API: an ended show costs 1 fetch, a running one 2, and both are cached for twelve hours in memory and a week
+in KV, behind the same circuit breaker every other provider here sits behind.
+
+`airTimeLabelForNextEpisode` is the single rule for choosing between the two labels, so the Worker's own
+Stremio description and the page cannot print different times for the same episode.
+
+### The label
+
+`formatAirTimeLabel` (02, beside `formatAirDateBadge`) turns `"21:00"` + `"America/New_York"` into
+`9 PM ET`. Minutes are dropped on the hour the way a listing writes it. North American zones are spelled
+`ET`/`CT`/`MT`/`PT` from a small table rather than `EDT`/`EST`: a slot is 9 ET all year, and a label that
+flips twice a year reads as though the time moved. Everywhere else asks `Intl` for the zone's own short
+name on the day, and anything it cannot name recognisably (`GMT+5:30`) is dropped rather than printed.
+
+The Worker ships the finished string, so the page never carries a timezone database.
+
+### Getting it to the page
+
+The air time is a fact about a SHOW, but it has to print beside episodes that reach the page from three
+directions: the show's own page (has the details payload), an Airing Next tile (built from details, then
+stored), and a Continue Watching entry (built from `/api/season`, which has never seen one). Threading a new
+field through all of those -- and through everything already in every browser's local storage -- would have
+been a migration.
+
+So it is remembered per show instead. `rememberShowAirTime` is called from the two places a details payload
+passes through (opening a show's page, and the Airing Next refresh, which sees every upcoming show), writing
+a small entry under every id that show is known by. `showAirTimeLabel` reads it back by whichever id the
+caller happens to hold, and expires an entry after a week -- a show can be moved to a new night. Airing Next
+tiles also store the label directly, so a cold start knows the hour before the shelf refreshes.
+
+### One badge, five shelves
+
+The "Airs Tomorrow" pill was hand-written markup in five places (three in 17, one each in 21 and 23), which
+would have meant teaching five renderers about air times. They now share `airDateBadgeHtml` /
+`watchItemAirDateBadgeHtml`, and the hour goes on a second line inside the same pill rather than making it
+wider -- these sit on posters barely 100px across.
+
+### Tests
+
+`tests/helpers-unit.test.mjs` (6) -- the label: on the hour and off it, midnight and noon, the North
+American table, a zone outside it, and the empty answers (no time, unusable zone, junk input).
+
+`tests/worker.test.mjs` (6) -- what is asked of TVmaze and what is made of it: a broadcast slot, a next
+episode dated apart from it, a streaming show with no slot, a 404 and a thrown fetch both degrading to the
+date alone, a `tmdb:` id costing no request, a next-episode link off TVmaze not being followed, and the
+fetch meter the batch budget reads.
+
+`tests/client.test.mjs` (8) -- the hour under the date for tonight's episode and later ones, the next
+episode's own slot, nothing against an episode already out, nothing at all when TVmaze had none, the per-show
+store found by every id and expiring after a week, and the badge with and without a time.
+
+## 2026-09-16 - Season watch counts on a show's page, and "watched" measured against what has aired
+
+### Files Changed
+`09_page-shell.js`, `19_client-search-and-likes.js`, `21_client-custom-list-builder.js`,
+`22_client-creator-profile.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`, `Changes.md`,
+`FUNCTION-MAP.md`, `tests/client.test.mjs`
+
+### What prompted it
+
+Two asks about a show's item page. First: the season header says how many episodes a season has, so say how
+many of them have been watched too -- `3/8`, `8/8`, `0/8`. Second: when every episode that has aired is
+watched and the next one is still to come, Mark Show Watched should read Mark Show **Un**watched, because
+there is nothing left to mark.
+
+The second one is the same bug the first one would have made visible. "Fully watched" was counted against
+TMDB's `episode_count`, which counts the episodes still to come as well. Five episodes watched out of a
+ten-episode season with episode 6 a month away came out as 5/10 -- not caught up -- so the button offered to
+mark watched what had already been watched, and pressing it would have flipped the season to unwatched.
+
+`isSeasonFullyWatched` already knew better when `window._seasonEpisodesMap` held the season's real episode
+list, but that only arrives after a season is expanded or Mark Show Watched fetches every season. On the
+render that matters -- opening the page -- there was nothing but `episode_count`.
+
+### Where the aired count comes from
+
+`/api/details` already returns the show's next unaired episode: `nextEpisodeSeasonNumber`,
+`nextEpisodeNumber`, `nextEpisodeAirDate` (TMDB's `next_episode_to_air`, plus the server's own fallbacks).
+That single pointer places every season around it with no further request:
+
+| Season vs. the pointer | Aired |
+|---|---|
+| after it | nothing |
+| the one it falls in | everything before that episode (`nextEpisodeNumber - 1`) |
+| before it | the whole season (`episode_count`) |
+
+`seasonAiredEpisodeCount` reads three sources, most specific first: the loaded episode list, then that
+pointer, then the season's own air date with `episode_count` standing in for "all of it is out". It is now
+the denominator `isSeasonFullyWatched` compares against, and `seasonHasAiredEpisodes` -- which decides
+whether a season button says "Airs Mar 4" -- consults the same pointer.
+
+The pointer is counted in TMDB's season numbers, so it is not applied to a show whose seasons were
+renumbered: an anime unpacked out of an episode group, or a series rebuilt from Cinemeta
+(`resolveUnpackedShowData`, 07_source-fetchers-tmdb-simkl.js). Those payloads are the only ones carrying the
+`episodeCount` alias, which is what `showSeasonsAreTmdbNumbered` keys off.
+
+### The count itself
+
+`watchedEpisodeNumbersInSeason` is the episode tally split out of `isSeasonFullyWatched`, so the "3/8" on a
+season header and the button beside it cannot disagree about what has been watched.
+`seasonEpisodeCountState` turns it into the label and a `complete` flag (the accent colour at 8/8), capped at
+the season's own length so an episode TMDB has since dropped cannot render "9/8".
+
+`updateSeasonEpisodeCounts` repaints the labels -- one season, or all of them -- and hangs off
+`updateSeasonWatchedButton`, so every path that already refreshed a season button refreshes its count too.
+
+### The show button
+
+`showWatchedButtonState` / `applyShowWatchedButton` / `updateShowWatchedButton` give that button one
+description, the way `seasonWatchedButtonState` already did for the season buttons. Three places set it and
+each spelled out its own label and classes.
+
+`refreshItemWatchState` (every season button, every count, the show button) is what an episode toggle now
+calls, in place of repainting only `_currentSeasonNum`'s season button: the episode toggled may have been the
+last one the show was waiting on, and its season is not always the one that global points at.
+
+### One show's episode lists answering for another's
+
+`_seasonEpisodesMap` and `_episodeDataCache` are keyed by season number and episode number, not by show, and
+nothing cleared them between shows. Open a show, expand season 1, open a different show: that first show's
+season 1 was still what "how many episodes of season 1 have aired" read. Both are cleared when a show's page
+opens, and `_seasonEpisodesMap` joins `_episodeDataCache` in the sign-out reset.
+
+### Tests
+
+`tests/client.test.mjs` (15) -- the aired count from the pointer, in the airing season and either side of it;
+a season and a show reading as caught up at 5 of 5 aired and not at 4; a loaded episode list overriding the
+pointer; a renumbered show ignoring it; the button repainted from disk; the labels at 0/8, 3/8 and 8/8,
+deduplicated, capped, and blank when a season has no episode count; and the page itself rendered, which is
+both asks end to end -- `8/8`, `8/8`, `5/10` across the season headers with Mark Show **Un**watched above
+them, and Mark Show Watched again one aired episode short.
+
 ## 2026-09-15 - A Channel's Play order is a menu of arrangements, not a rule applied over the top
 
 ### Files Changed

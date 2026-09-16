@@ -1263,6 +1263,9 @@ function clearLocalAccountData() {
   window._watchedIndexLength = 0;
   window._currentItemDetails = null;
   window._episodeDataCache = {};
+  // Same reason, and it is what the season counts and every "has this aired"
+  // check read: left in place it answers for whatever show was open last.
+  window._seasonEpisodesMap = {};
   window._currentListDetailsAllItems = [];
 
   // Caches held by other modules that key off the same data.

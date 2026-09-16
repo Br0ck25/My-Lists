@@ -1223,10 +1223,19 @@ function livePreviewPosterHtml(m) {
     const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
 
     if (showAirDate && !m.hideDateBadge && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
-      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
-      if (badgeText) {
-        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(effectiveAirDate) + '">' + escapeHtml(badgeText) + '</div>';
-      }
+      // Built rather than passed straight through: this renderer resolves the
+      // date, season and episode itself from the tile plus its Airing Next
+      // match, and those resolved values are what the air time has to be
+      // looked up against.
+      dateBadge = typeof watchItemAirDateBadgeHtml === 'function'
+        ? watchItemAirDateBadgeHtml({
+            airDate: effectiveAirDate,
+            airTime: m.airTime || (airingMatch && airingMatch.airTime) || '',
+            showId: m.showId || m.id,
+            seasonNum: mSeason,
+            episodeNum: currentEpNum,
+          })
+        : '';
     }
 
     const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (m.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));

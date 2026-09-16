@@ -3749,6 +3749,81 @@ function isEpisodeAired(airDateStr) {
   return d.getTime() < today.getTime();
 }
 
+// --- Air times --------------------------------------------------------------
+//
+// The hour behind an air date. TMDB has no episode air TIME at all -- it dates
+// an episode and stops -- so every "Airs Tuesday" in this add-on was a day
+// with no hour behind it. TVmaze has both (see fetchShowAirTime,
+// 07_source-fetchers-tmdb-simkl.js); these turn what it returns into the
+// string a listing would print.
+//
+// Shared by the Worker and the page, which is why they live here beside
+// formatAirDateBadge rather than in a client file: /api/details ships the
+// finished label so the browser never has to know a timezone database.
+
+// "21:00" -> "9 PM", "21:30" -> "9:30 PM". The minutes are dropped on the hour
+// exactly the way a TV listing writes it.
+function formatAirClockTime(time) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(time == null ? "" : time).trim());
+  if (!m) return "";
+  const h24 = Number(m[1]);
+  const mins = Number(m[2]);
+  if (!(h24 >= 0 && h24 <= 23) || !(mins >= 0 && mins <= 59)) return "";
+  const suffix = h24 < 12 ? "AM" : "PM";
+  const h12 = (h24 % 12 === 0) ? 12 : (h24 % 12);
+  return mins === 0 ? (h12 + " " + suffix) : (h12 + ":" + String(mins).padStart(2, "0") + " " + suffix);
+}
+
+// The short name a schedule is spoken in. North America is spelled out because
+// "9 PM ET" is the convention there and it does not move with daylight saving
+// the way "EDT"/"EST" do -- a slot is "9 ET" all year, and a listing that
+// flips label twice a year reads like a different time. Everywhere else asks
+// Intl for the zone's own short name on the day, which is right wherever the
+// abbreviation genuinely changes.
+const AIR_TIME_ZONE_LABELS = {
+  "America/New_York": "ET",
+  "America/Detroit": "ET",
+  "America/Toronto": "ET",
+  "America/Nassau": "ET",
+  "America/Chicago": "CT",
+  "America/Winnipeg": "CT",
+  "America/Mexico_City": "CT",
+  "America/Denver": "MT",
+  "America/Edmonton": "MT",
+  "America/Phoenix": "MST",
+  "America/Los_Angeles": "PT",
+  "America/Vancouver": "PT",
+  "America/Anchorage": "AKT",
+  "Pacific/Honolulu": "HST",
+  "America/Halifax": "AT",
+  "America/St_Johns": "NT",
+};
+
+function airTimeZoneLabel(timezone) {
+  const tz = String(timezone == null ? "" : timezone).trim();
+  if (!tz) return "";
+  if (AIR_TIME_ZONE_LABELS[tz]) return AIR_TIME_ZONE_LABELS[tz];
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" }).formatToParts(new Date());
+    const name = (parts.find((part) => part.type === "timeZoneName") || {}).value || "";
+    // A real abbreviation ("JST", "CET") or the offset form Intl falls back to
+    // ("GMT+9"). Either tells a reader this is not their own clock, which is
+    // the whole job of the label; anything else is dropped.
+    return (/^[A-Z]{2,5}$/.test(name) || /^GMT[+-]\d{1,2}(:\d{2})?$/.test(name)) ? name : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+// "21:00" + "America/New_York" -> "9 PM ET". An empty string means there is no
+// air time to show, which every caller treats as "print the date alone".
+function formatAirTimeLabel(time, timezone) {
+  const clock = formatAirClockTime(time);
+  if (!clock) return "";
+  const zone = airTimeZoneLabel(timezone);
+  return zone ? (clock + " " + zone) : clock;
+}
+
 function formatAirDateBadge(airDateStr) {
   if (!airDateStr) return '';
   const parts = String(airDateStr).split(/[-T\s]/);

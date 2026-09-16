@@ -182,7 +182,14 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKe
             isSeasonFinale: !!details.isSeasonFinale,
             seasonFinaleAirDate: details.seasonFinaleAirDate || undefined,
             seasonFinaleEpisodeNumber: details.seasonFinaleEpisodeNumber || undefined,
-            description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
+            // "Airs 2026-09-27 at 8 PM ET" where TVmaze knows the slot, and
+            // the date alone where it does not -- a Stremio row is the one
+            // place this add-on shows an air date with no page behind it to
+            // open for the rest.
+            airTime: details.nextEpisodeAirTimeLabel || undefined,
+            description: epLabel
+              ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}${details.nextEpisodeAirTimeLabel ? ` at ${details.nextEpisodeAirTimeLabel}` : ""}`
+              : (details.overview || undefined),
             trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
           });
         }
@@ -2434,6 +2441,121 @@ async function resolveUnpackedShowData(tmdbId, imdbId, standardSeasons, apiKey, 
 // the same shared, canonical-key cache Trakt already uses
 // (fetchWithPerUserCacheAndCircuitBreaker) -- unlike the catalog/chart
 // fetchers above, this function IS reachable with a personal TMDB key
+// --- Episode air times (TVmaze) ---------------------------------------------
+//
+// TMDB dates an episode and stops: there is no air time anywhere in its TV
+// payloads, which is why every "Airs Tuesday" in this add-on has been a day
+// with no hour behind it. TVmaze carries both -- a show's regular slot
+// (schedule.time, in its network country's IANA timezone) and each episode's
+// own airtime -- and it needs no API key, so a self-hosted Worker gets this
+// with nothing to configure and nothing to pay for.
+//
+// It is only ever asked about a show with an episode still to come (see the
+// call in fetchTmdbItemDetailsUncached), which is the only case anything
+// displays, and the answer is cached for twelve hours: a broadcast slot is a
+// fact about a season, not about a day.
+const TVMAZE_API_BASE = "https://api.tvmaze.com";
+
+async function fetchShowAirTimeUncached(imdbId, meter) {
+  const spend = () => { if (meter) meter.spent++; };
+  // A shape rather than null, so a show TVmaze has never heard of caches as
+  // "asked, nothing there" instead of being looked up again on every hit.
+  const nothing = { time: null, timezone: null, label: "", days: [], next: null };
+  const baseImdb = String(imdbId || "").split(":")[0].trim();
+  if (!baseImdb.startsWith("tt")) return nothing;
+
+  try {
+    spend();
+    const res = await fetch(TVMAZE_API_BASE + "/lookup/shows?imdb=" + encodeURIComponent(baseImdb), {
+      headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+      cf: { cacheTtl: 43200, cacheEverything: true },
+    });
+    if (!res.ok) return nothing;
+    const show = await res.json();
+    if (!show || typeof show !== "object") return nothing;
+
+    // A broadcast network carries the country its schedule is quoted in; a
+    // streaming service usually does not, and usually has no time at all --
+    // which is the honest answer for something that drops at midnight in
+    // whatever zone you happen to be in.
+    const timezone =
+      (show.network && show.network.country && show.network.country.timezone) ||
+      (show.webChannel && show.webChannel.country && show.webChannel.country.timezone) ||
+      "";
+    const time = (show.schedule && show.schedule.time) || "";
+    const out = {
+      time: time || null,
+      timezone: timezone || null,
+      label: formatAirTimeLabel(time, timezone),
+      days: (show.schedule && Array.isArray(show.schedule.days)) ? show.schedule.days : [],
+      next: null,
+    };
+
+    // The next episode is the one every "Airs Tomorrow" badge is about, and
+    // the one most likely to sit outside the regular slot -- a feature-length
+    // premiere, a finale moved an hour later. One more small fetch buys the
+    // exact answer for it; every other upcoming episode keeps the show's
+    // regular slot, which is what a listing would print for them anyway.
+    const nextHref = show._links && show._links.nextepisode && show._links.nextepisode.href;
+    if (nextHref && String(nextHref).startsWith(TVMAZE_API_BASE + "/")) {
+      try {
+        spend();
+        const epRes = await fetch(String(nextHref), {
+          headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+          cf: { cacheTtl: 43200, cacheEverything: true },
+        });
+        if (epRes.ok) {
+          const ep = await epRes.json();
+          if (ep && typeof ep.season === "number" && typeof ep.number === "number") {
+            out.next = {
+              season: ep.season,
+              number: ep.number,
+              airdate: ep.airdate || null,
+              time: ep.airtime || null,
+              label: formatAirTimeLabel(ep.airtime || time, timezone),
+            };
+          }
+        }
+      } catch {}
+    }
+    return out;
+  } catch {
+    return nothing;
+  }
+}
+
+// Which of the two labels an upcoming episode gets: its own, when TVmaze
+// dates that exact episode apart from the show's regular slot, and the regular
+// slot otherwise. One rule, so the Worker's Stremio description and the page
+// cannot print different times for the same episode.
+function airTimeLabelForNextEpisode(airTime, nextEpInfo) {
+  if (!airTime) return null;
+  const next = airTime.next;
+  if (next && next.label &&
+      nextEpInfo && Number(nextEpInfo.nextEpisodeSeasonNumber) === Number(next.season) &&
+      Number(nextEpInfo.nextEpisodeNumber) === Number(next.number)) {
+    return next.label;
+  }
+  return airTime.label || null;
+}
+
+async function fetchShowAirTime(imdbId, env, ctx, meter) {
+  const baseImdb = String(imdbId || "").split(":")[0].trim();
+  if (!baseImdb.startsWith("tt")) return null;
+  const cacheKey = `tvmaze:airtime:${baseImdb}`;
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 43200,
+    staleTtlSec: 604800,
+    providerLabel: "TVmaze Air Times",
+    env: env,
+    ctx: ctx,
+    kvKey: cacheKey,
+    kvTtlSec: 604800,
+    fetchFn: () => fetchShowAirTimeUncached(baseImdb, meter),
+  });
+}
+
 // (see /api/details in 25_api-catalog-routes.js, and handleSubtitlesTrack
 // in 26_api-creator-and-admin-routes.js, both of which pass
 // `tmdbKey || TMDB_API_KEY`). Every one of its internal fetch() calls
@@ -2451,10 +2573,25 @@ async function resolveUnpackedShowData(tmdbId, imdbId, standardSeasons, apiKey, 
 // and so never touches it, which is what lets the batch route keep spending
 // one invocation on a whole warm refresh while still fitting a free Worker's
 // 50-fetch budget when the ids are cold. Every other caller passes nothing.
+// The SHAPE of what this function returns, as a cache key segment. Bump it
+// whenever a field is added to or removed from the details payload.
+//
+// Entries live for two hours fresh in isolate memory and a week in KV, keyed
+// only by id/type/region, so a deploy that adds a field kept serving payloads
+// written WITHOUT it -- correct-looking, just missing the new thing, for up to
+// two hours after the code that fills it went live. That is exactly how air
+// times shipped and then did not appear: the stored copy of a show someone had
+// just opened had no airTime in it, and nothing about the key said the shape
+// had moved on. Changing the key retires every old entry at once, at the cost
+// of one cold lookup per title.
+//
+// v2: airTime / nextEpisodeAirTimeLabel (episode air times).
+const ITEM_DETAILS_SHAPE = "v2";
+
 async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache, env, ctx, meter) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
-  const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
+  const cacheKey = `tmdb:itemdetails:${ITEM_DETAILS_SHAPE}:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
 
   const upgradeIfUnpacked = async (d) => {
     if (!d || !Array.isArray(d.seasonsData)) return d;
@@ -2769,6 +2906,16 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
 
   const isUnairedFuture = !!(nextEpInfo && nextEpInfo.nextEpisodeAirDate && nextEpInfo.nextEpisodeAirDate > today);
 
+  // The hour behind the date, for a show that still has one to come. Gated on
+  // next_episode_to_air as well as isUnairedFuture because that flag is
+  // strictly future -- an episode airing TODAY does not set it, and today is
+  // exactly when someone wants to know what time it is on. A finished show is
+  // never looked up: its air time is a fact about the past, and nothing
+  // displays a time against an episode that has already gone out.
+  const airTime = (type === "tv" && (match.next_episode_to_air || isUnairedFuture))
+    ? await fetchShowAirTime(realImdbId, env, ctx, meter)
+    : null;
+
   if (type === "tv" && isUnairedFuture && nextEpInfo.nextEpisodeSeasonNumber) {
     const targetSeason = Array.isArray(match.seasons)
       ? match.seasons.find((s) => s && s.season_number === nextEpInfo.nextEpisodeSeasonNumber)
@@ -2826,6 +2973,12 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     cast: cast,
     director: director,
     ...nextEpInfo,
+    // The show's regular slot, for every upcoming episode, and the exact slot
+    // of the next one where TVmaze dates it separately. Both are finished
+    // strings ("9 PM ET"): the page never has to carry a timezone database to
+    // print one.
+    airTime: airTime || null,
+    nextEpisodeAirTimeLabel: airTimeLabelForNextEpisode(airTime, nextEpInfo),
     isSeasonPremiere: isSeasonPremiere,
     isSeasonFinale: isSeasonFinale,
     seasonFinaleAirDate: seasonFinaleAirDate,

@@ -41,11 +41,29 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 ### Virtual TV Channel Builder
 - Create synthetic linear TV channels and scheduled playlists combining hand-picked episodes from different TV shows and whole movies into a single row.
 - Built-in channel logo generator, custom poster rendering (`/api/channel-poster`), and quick-add channel presets.
+- **Known limit — a movie in a channel may have no streams.** A channel is a *series* to Stremio, and it
+  does not work out a type per video, so tapping a movie in one asks stream add-ons for it under
+  `series` rather than `movie`. Lenient add-ons (Torrentio-style) and Nuvio cope; strict ones (PenguPlay)
+  return nothing. Nothing inside the add-on can change what Stremio asks for, so the movie is best opened
+  from its own page.
 - A **Play order** dropdown arranges a channel's picks: by air date (oldest or newest first, from each episode's TMDB air date and each movie's release date), by show then season and episode, A-Z by title, or shuffled once. Each sorts the list in place, so the order you see is the order it plays -- and a sort is re-applied as you add more picks. Drag a pick by hand and it stays put. **Shuffle daily** is the one live mode: the channel reshuffles itself every 24 hours.
 
 ### Continue Watching & Background Watch Sync
 - Automatically tracks watch progress and next unwatched episode per show.
 - Mark titles as watched/unwatched directly from the UI or scrobble integrations.
+- **A show's page counts each season's progress** -- `3/8 episodes`, `0/8` for one you have not started,
+  `8/8` (in the accent colour) once it is done -- and updates as you mark episodes, a season, or the whole
+  show watched.
+- **"Watched" means everything that has aired.** A show you are caught up on mid-season reads as watched
+  and offers **Mark Show Unwatched**, instead of offering to mark episodes you have already seen because
+  the rest of the season is still to come.
+- **Air times, not just air dates.** An episode airing today or later shows the hour it is on -- `9 PM ET`,
+  `9:30 PM ET` -- under the date on its page and under the day on its Continue Watching / Airing Next
+  badge. TMDB has no episode air time at all, so it comes from [TVmaze](https://www.tvmaze.com/api), which
+  needs **no API key and no configuration**: the show's regular slot, plus the next episode's own where
+  TVmaze dates it apart (a premiere running long, a finale moved an hour). It is only looked up for a show
+  with an episode still to come, and cached for twelve hours. A streaming show with no broadcast slot, or
+  one TVmaze has never heard of, simply shows the date on its own.
 - **Airing Next** lists the next upcoming episode of every show you have watched, soonest first. The **x** on
   a poster takes one show off that shelf without changing a thing about what you have watched -- and watching
   another episode of it puts it back by itself. Settings -> Account & Sync lists what you have removed if you

@@ -6,6 +6,87 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 Fixed: air times did not appear, and a channel pick could show yesterday's date
+
+- **Air times were missing on shows you had recently opened.** The details cache is keyed by id, type and
+  region only — nothing about the shape of what it stores — so after the air-time deploy it kept handing
+  back copies written *before* it, with no air time in them, for up to two hours. The key now carries a
+  payload-shape version that a field change moves, which retires every stale copy at once.
+- **A movie in a Channel could show the previous day's date** — a 1996 film reading `Dec 31, 1995`. The
+  date was pinned to midnight UTC, which is the previous evening everywhere west of Greenwich. It is now
+  11:00 UTC, which holds the intended date from UTC-11 to UTC+12:45. (World offsets span 26 hours, so no
+  single instant is right in all of them; this one is wrong only at UTC+13/+14.)
+
+### 🎬 Known limit, documented: a movie in a Channel may have no streams in strict add-ons
+
+- **What happens**: a movie added to a Channel plays in Nuvio and in lenient add-ons (Torrentio-style), and
+  shows no streams in strict ones (PenguPlay). A Channel's metadata is a *series*, and Stremio does not
+  work out a type per video — so tapping a movie asks every stream add-on for
+  `/stream/series/<the movie's own IMDb id>.json`, and add-ons that branch on that `type` before reading
+  the id answer with nothing.
+- **This cannot be fixed from inside the add-on.** The type comes from the parent metadata, and no id shape
+  gets around it: `tt123:1:1` points at a season 1 episode 1 that does not exist, and a bare number or a
+  private prefix matches no `idPrefixes` anywhere, so no add-on is even asked.
+- **Tried and removed**: answering that request with a link to the movie's own page. Stremio Web treats an
+  external link as *leaving* Stremio — it routes through a `stremio.com/warning` interstitial and then
+  hands the `stremio://` scheme to the operating system — so it was a dead end that looked like a working
+  option. It is gone rather than left in place looking useful.
+- **What works today**: open the movie from its own page, or use a client that resolves the id itself.
+  The two ways to fix this properly each cost something real — proxying your own stream add-on (which means
+  this add-on holding your debrid key) or splitting a Channel's movies into a separate movie row (which
+  takes them out of the Channel's play order) — so neither is done on the add-on's own initiative.
+
+### 🕒 Episode air times: `9 PM ET` under the air date
+
+- **An episode airing today or later now shows the hour it is on**, under the date on its own page and
+  under the day on its Continue Watching / Airing Next badge — `9 PM ET`, `9:30 PM ET`. An episode that
+  has already gone out shows no time: it is a thing you are waiting for.
+- **TMDB has no episode air time at all** — it dates an episode and stops, which is why every "Airs
+  Tuesday" in this add-on has been a day with no hour behind it. The time comes from
+  [TVmaze](https://www.tvmaze.com/api) instead, which needs **no API key**, so a self-hosted Worker gets
+  this with nothing to configure and nothing to pay for.
+- **The show's regular slot, plus the next episode's own** where TVmaze dates it apart from it — a
+  premiere running long, a finale moved an hour. Every other upcoming episode gets the regular slot, which
+  is what a listing prints for them anyway.
+- **Only a show with an episode still to come is ever looked up**, and the answer is cached for twelve
+  hours (a week in KV): a broadcast slot is a fact about a season, not about a day. A finished show costs
+  nothing, because nothing displays a time against an episode that has already aired.
+- **North American slots are named the way a schedule is spoken** — `ET`, `CT`, `MT`, `PT` — rather
+  than `EDT`/`EST`, which flip twice a year and read as though the time moved. Elsewhere the zone's own
+  short name is used.
+- **Nothing is invented.** A streaming show with no broadcast slot, a show TVmaze has never heard of, or
+  TVmaze being down all come out the same way: the date on its own, exactly as before. An air time is
+  never worth failing a details lookup over.
+- **Stremio rows say it too**: an Airing Next row's description now reads
+  `Next Episode: S03E06 · Airs 2026-10-04 at 9:30 PM ET`.
+
+### ✅ A show's page says how much of each season you have watched, and "watched" means what has aired
+
+- **Every season header now reads `3/8 episodes`** instead of `8 episodes` — how many of that season are in
+  your Watch History, beside how many there are. `0/8` for a season you have not started, `8/8` in the accent
+  colour once it is finished.
+- **It moves as you do.** Marking an episode from the grid, a season from its button, or the whole show
+  updates every count on the page, without reopening it.
+- **A show you are caught up on mid-season now reads as watched.** The Mark Show Watched button says **Mark
+  Show Unwatched** once every episode that has *aired* has been watched, rather than waiting for a season
+  finale that has not gone out yet. Same for the season button beside it.
+- **Why it was wrong**: "fully watched" was counted against TMDB's `episode_count`, which includes the
+  episodes still to come. Watching 5 of a 10-episode season with episode 6 a month away came out as 5/10 —
+  unwatched — so the button offered to mark episodes already seen. The exact episode list settles it, but
+  it was only loaded after a season was expanded or the show was marked watched wholesale.
+- **No extra requests**: `/api/details` already carries the show's next unaired episode
+  (`nextEpisodeSeasonNumber` / `nextEpisodeNumber` / `nextEpisodeAirDate`), which places every season around
+  it — a later season has aired nothing, the season it falls in has aired everything before that episode,
+  an earlier one is out in full. An episode list, once loaded, still wins over it.
+- **Marking the last aired episode watched now flips the show's button** where it used to sit on "Mark Show
+  Watched" until the page was reopened, and it repaints every season's button rather than only the one last
+  expanded.
+- **A show rebuilt from an episode group keeps its old behaviour.** An anime unpacked into its own seasons is
+  not numbered the way TMDB numbers it, so the show-level pointer is not applied to it.
+- **Fixed: one show's episode lists answering for another's.** The season and episode caches were keyed by
+  season and episode number, never cleared between shows, so the last show's season 1 decided what had aired
+  in this one's. They are cleared when a show's page opens, and on sign-out.
+
 ### 🔀 A Channel's Play order is a menu of arrangements, and a pick you move stays moved
 
 - **Replaces the two checkboxes** added below with one **Play order** dropdown in the Channel builder:
