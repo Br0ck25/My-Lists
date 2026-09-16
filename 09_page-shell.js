@@ -1291,6 +1291,14 @@ ${seoHeadHtml}
     border: 1px solid var(--border);
     border-radius: 8px;
   }
+  .channel-pick-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 8px;
+  }
+  .channel-pick-selected img {
+    opacity: 0.72;
+  }
   .channel-storylock-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
@@ -3617,6 +3625,7 @@ ${seoHeadHtml}
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeMovieBtn" onclick="switchListDetailsType('movie')">Movies</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeSeriesBtn" onclick="switchListDetailsType('series')">Shows</button>
+        <button type="button" class="subnav-pill generic-type-pill" id="detailTypeLineupBtn" onclick="switchListDetailsType('lineup')" style="display:none;">On today</button>
         <button type="button" class="subnav-pill" id="cwClearHistoryBtn" onclick="clearContinueWatchingAll()" style="display:none; color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear All</button>
       </div>
       <div id="whSortControls" style="display:flex; align-items:center; gap:8px;">

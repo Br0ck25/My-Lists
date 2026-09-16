@@ -42,8 +42,18 @@
           <button type="button" class="primary lc-btn" onclick="openBuildCustomChannel()">+ New Channel</button>
         </div>
       </div>
-      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
       <div id="channelNextUpStatus" style="margin-bottom:8px;"></div>
+      <div class="row" id="myChannelsToolbar" style="gap:8px; margin-bottom:10px;">
+        <input type="text" id="myChannelsSearchInput" placeholder="Search your channels..." oninput="setMyChannelsSearch(this.value)" style="flex:1; font-size:0.85rem;">
+        <select id="myChannelsSortSelect" onchange="setMyChannelsSort(this.value)" style="font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="recent">Recently updated</option>
+          <option value="created">Recently created</option>
+          <option value="name">Name (A&ndash;Z)</option>
+          <option value="size">Most episodes</option>
+        </select>
+      </div>
+      <div id="myChannelsUndoBar" style="display:none; margin-bottom:10px;"></div>
       <div id="myCreatedChannelsList"><p style="color:var(--muted); font-size:0.85rem;"><small>No channels created yet. Tap <strong>+ New Channel</strong> above or add a popular network in <strong>Quick Add</strong>.</small></p></div>
     </div>
 
@@ -199,8 +209,14 @@
       <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">
         24/7 channels built and published by other people &mdash; &ldquo;Saturday Morning 90s&rdquo;, &ldquo;80s VHS Sci-Fi Vault&rdquo;, whatever anyone has put together. Add one to your own setup in a single click, then edit it however you like.
       </p>
-      <div class="row" style="margin-bottom:10px;">
-        <input type="text" id="channelDirectorySearchInput" placeholder="Filter by name, description or creator..." oninput="renderChannelDirectory()">
+      <div class="row" style="margin-bottom:10px; gap:8px;">
+        <input type="text" id="channelDirectorySearchInput" placeholder="Filter by name, description or creator..." oninput="renderChannelDirectory()" style="flex:1;">
+        <select id="channelDirectorySortSelect" onchange="setChannelDirectorySort(this.value)" style="font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="newest">Newest</option>
+          <option value="added">Most added</option>
+          <option value="liked">Most liked</option>
+          <option value="name">Name (A&ndash;Z)</option>
+        </select>
       </div>
       <div id="channelDirectoryFeed"><p style="color:var(--muted); font-size:0.85rem;"><small>Loading published channels&hellip;</small></p></div>
     </div>
@@ -269,7 +285,24 @@
 
       <div id="channelCrossoverSuggestions" style="display:none; margin-top:14px;"></div>
 
-      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel:</p>
+      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel: <span id="channelDraftCountBadge" style="color:var(--muted); font-weight:500;"></span></p>
+      <div id="channelDraftStats" style="margin:0 0 8px; color:var(--muted); font-size:0.78rem;"></div>
+      <div class="row" style="gap:8px; margin-bottom:8px;">
+        <input type="text" id="channelDraftFilterInput" placeholder="Filter these picks by show or episode name..." oninput="setChannelDraftFilter(this.value)" style="flex:1; font-size:0.85rem;">
+        <button type="button" class="secondary lc-btn" id="channelDraftSelectModeBtn" style="white-space:nowrap;" onclick="toggleChannelDraftSelectMode()">Select</button>
+      </div>
+      <div id="channelDraftBulkBar" style="display:none; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:8px; padding:8px; border:1px solid var(--border); border-radius:8px; background:var(--surface);">
+        <span id="channelDraftSelectionCount" style="font-size:0.8rem; font-weight:600;">0 selected</span>
+        <button type="button" class="secondary lc-btn" onclick="selectAllChannelDraftShown(true)">Select shown</button>
+        <button type="button" class="secondary lc-btn" onclick="selectAllChannelDraftShown(false)">Clear</button>
+        <select id="channelDraftSelectShowSelect" onchange="selectChannelDraftByGroup(this.value); this.selectedIndex = 0;" style="font-size:0.82rem; padding:5px 8px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="">Select a whole show or season&hellip;</option>
+        </select>
+        <span style="flex:1;"></span>
+        <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('top')">To top</button>
+        <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('bottom')">To bottom</button>
+        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeChannelDraftSelection()">Remove selected</button>
+      </div>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove all</button>
@@ -351,6 +384,9 @@
       </div>
 
       <div class="row" style="margin-top:12px;">
+        <input type="text" id="channelDescriptionInput" placeholder="One line about this channel (optional) &mdash; shown wherever you share it" style="flex:1; font-size:0.85rem;" maxlength="400">
+      </div>
+      <div class="row" style="margin-top:8px;">
         <input type="text" id="channelNameInput" placeholder="Channel name (e.g. Comedy Night)" style="flex:1;">
         <button type="button" class="primary" id="channelSaveBtn" onclick="saveChannel()">Save</button>
         <button type="button" id="channelCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditChannel()">Cancel</button>

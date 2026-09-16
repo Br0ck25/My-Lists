@@ -11878,3 +11878,280 @@ describe("worker: the generated channel poster", () => {
     });
   });
 });
+
+// --- today's lineup, as an endpoint --------------------------------------
+//
+// The builder page asks the Worker what a channel is running rather than
+// keeping a second copy of the seeded shuffle. These pin down that the
+// answer is the same one the meta route would give, and that the endpoint
+// is honest about the two rules it cannot apply.
+describe("worker: the channel lineup endpoint", () => {
+  const ep = (over = {}) => ({
+    kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13", ...over,
+  });
+  const channelUrl = (over = {}) =>
+    "channel:v1:" + JSON.stringify({ channelId: "ch1", name: "Block Party", items: [ep()], ...over });
+  const lineup = (env, over = {}, body = {}) =>
+    call(env, "/api/channel-lineup", { method: "POST", json: { url: channelUrl(over), ...body } });
+
+  it("answers with the picks in the order they will play", async () => {
+    const env = makeEnv();
+    const items = [1, 2, 3].map((e) => ep({ season: 1, episode: e, title: "E" + e }));
+    const res = await lineup(env, { items });
+    assert.equal(res.body.ok, true);
+    assert.deepEqual(res.body.items.map((i) => i.title), ["E1", "E2", "E3"]);
+    assert.equal(res.body.rotating, false);
+  });
+
+  it("gives the same lineup the meta route would serve, from the same seed", async () => {
+    const env = makeEnv();
+    const items = [];
+    for (let show = 1; show <= 8; show++) {
+      for (let e = 1; e <= 5; e++) items.push(ep({ imdbId: "tt" + show, season: 1, episode: e, title: `s${show}e${e}` }));
+    }
+    const over = { items, dailyRotate: true, rotateShows: 3, rotateEpisodes: 2 };
+    const fromEndpoint = await lineup(env, over);
+    const entry = { id: "ch1", type: "series", name: "Block Party", url: channelUrl(over) };
+    const channelFns = loadSourceFunctions("05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+    const meta = await channelFns.buildChannelMeta(entry, "https://example.com");
+    // Joined, not deep-compared: meta.videos comes from the vm realm
+    // loadSourceFunctions evaluates in, and a strict deepEqual against an
+    // array built here fails on the prototype alone however equal they are.
+    assert.equal(
+      fromEndpoint.body.items.map((i) => `${i.imdbId}:${i.season}:${i.episode}`).join(","),
+      meta.videos.map((v) => v.id).join(","),
+      "one lineup, one function -- not two copies of a PRNG"
+    );
+  });
+
+  it("reports the dials it actually used, not the ones that were asked for", async () => {
+    const env = makeEnv();
+    const items = [];
+    for (let show = 1; show <= 60; show++) items.push(ep({ imdbId: "tt" + show, season: 1, episode: 1 }));
+    const res = await lineup(env, { items, dailyRotate: true, rotateShows: 9999, rotateEpisodes: 9999 });
+    assert.equal(res.body.rotating, true);
+    assert.equal(res.body.plan.shows, 48, "clamped, and the page is told the clamped number");
+    assert.equal(res.body.plan.episodes, 12);
+    assert.equal(res.body.poolSize, 60);
+  });
+
+  it("says which rules it could not apply rather than showing a lineup that differs", async () => {
+    const env = makeEnv();
+    const hidden = await lineup(env, { hideWatched: true });
+    assert.deepEqual(hidden.body.unappliedRules, ["hideWatched"]);
+    const dynamic = await lineup(env, { items: [ep()], dynamic: "next-up" });
+    assert.deepEqual(dynamic.body.unappliedRules, ["dynamic"]);
+    const plain = await lineup(env, {});
+    assert.deepEqual(plain.body.unappliedRules, []);
+  });
+
+  it("refuses anything that is not a channel", async () => {
+    const env = makeEnv();
+    const res = await call(env, "/api/channel-lineup", { method: "POST", json: { url: "https://mdblist.com/lists/a/b" } });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.ok, false);
+  });
+});
+
+describe("worker: liking and ranking published channels", () => {
+  const ep = () => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" });
+  const channelOf = (over = {}) => ({ name: "Saturday Morning 90s", items: [ep()], ...over });
+
+  async function publish(env, creator, over = {}, description = "") {
+    const res = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(over), publish: true, description, creatorName: creator.name, creatorKey: creator.key },
+    });
+    return res.body.code;
+  }
+
+  it("counts one like per identity, however many times it is sent", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey });
+    const ip = nextIp();
+    const first = await call(env, "/api/channel/like", { method: "POST", ip, json: { code, action: "like" } });
+    assert.equal(first.body.likes, 1);
+    const again = await call(env, "/api/channel/like", { method: "POST", ip, json: { code, action: "like" } });
+    assert.equal(again.body.likes, 1, "the same voter does not count twice");
+    const other = await call(env, "/api/channel/like", { method: "POST", ip: nextIp(), json: { code, action: "like" } });
+    assert.equal(other.body.likes, 2);
+  });
+
+  it("takes a like back", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey });
+    const ip = nextIp();
+    await call(env, "/api/channel/like", { method: "POST", ip, json: { code, action: "like" } });
+    const undone = await call(env, "/api/channel/like", { method: "POST", ip, json: { code, action: "unlike" } });
+    assert.equal(undone.body.likes, 0);
+    assert.equal(undone.body.liked, false);
+  });
+
+  it("will not let an unlisted channel be voted on, or say whether it exists", async () => {
+    const env = makeEnv();
+    const shared = await call(env, "/api/channel/share", { method: "POST", json: { channel: channelOf() } });
+    const onShared = await call(env, "/api/channel/like", { method: "POST", json: { code: shared.body.code, action: "like" } });
+    const onNothing = await call(env, "/api/channel/like", { method: "POST", json: { code: "NOSUCHCODE", action: "like" } });
+    assert.equal(onShared.status, 404);
+    assert.equal(onNothing.status, 404);
+    assert.equal(onShared.body.error, onNothing.body.error, "the same answer either way -- anything else is an oracle");
+  });
+
+  it("shows the count on the directory row", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey });
+    await call(env, "/api/channel/like", { method: "POST", json: { code, action: "like" } });
+    const listing = await call(env, "/api/channel/directory");
+    assert.equal(listing.body.channels[0].likes, 1);
+  });
+
+  it("keeps likes and adds when the channel is re-published", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey });
+    await call(env, "/api/channel/like", { method: "POST", json: { code, action: "like" } });
+    await call(env, "/api/channel/added", { method: "POST", json: { code } });
+    await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf({ name: "Reworked" }), code, publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const row = (await call(env, "/api/channel/directory")).body.channels[0];
+    assert.equal(row.name, "Reworked");
+    assert.equal(row.likes, 1, "editing a channel is not a reason to lose its votes");
+    assert.equal(row.adds, 1);
+  });
+
+  it("orders by newest, most liked, most added or name on request", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const first = await publish(env, { name: "alice", key: alice.creatorKey }, { name: "Alpha" });
+    const second = await publish(env, { name: "alice", key: alice.creatorKey }, { name: "Zulu" });
+    await call(env, "/api/channel/like", { method: "POST", json: { code: first, action: "like" } });
+    await call(env, "/api/channel/added", { method: "POST", json: { code: second } });
+    await call(env, "/api/channel/added", { method: "POST", json: { code: second } });
+
+    const names = async (sort) =>
+      (await call(env, `/api/channel/directory?sort=${sort}`)).body.channels.map((c) => c.name);
+    assert.deepEqual(await names("newest"), ["Zulu", "Alpha"]);
+    assert.deepEqual(await names("liked"), ["Alpha", "Zulu"]);
+    assert.deepEqual(await names("added"), ["Zulu", "Alpha"]);
+    assert.deepEqual(await names("name"), ["Alpha", "Zulu"]);
+  });
+
+  it("counts an add only for a channel that is listed", async () => {
+    const env = makeEnv();
+    const shared = await call(env, "/api/channel/share", { method: "POST", json: { channel: channelOf() } });
+    const res = await call(env, "/api/channel/added", { method: "POST", json: { code: shared.body.code } });
+    assert.equal(res.body.ok, true, "best effort -- it never fails an add");
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, []);
+  });
+
+  it("publishes the channel's own description when none is typed", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey }, { description: "Cartoons, all morning." });
+    const row = (await call(env, "/api/channel/directory")).body.channels[0];
+    assert.equal(row.description, "Cartoons, all morning.");
+    // And it survives being taken out of the directory, which is the whole
+    // point of it living on the channel rather than on the listing.
+    const fetched = await call(env, `/api/channel/share?code=${code}`);
+    assert.equal(fetched.body.channel.description, "Cartoons, all morning.");
+  });
+});
+
+describe("worker: an operator can moderate the channel directory", () => {
+  const ep = () => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" });
+  const channelOf = (over = {}) => ({ name: "Saturday Morning 90s", items: [ep()], ...over });
+  const ADMIN = { Cookie: "" };
+
+  async function adminCookie(env) {
+    const res = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const setCookie = res.headers.get("Set-Cookie") || "";
+    return setCookie.split(";")[0];
+  }
+
+  it("refuses everything without an admin session", async () => {
+    const env = makeEnv();
+    assert.equal((await call(env, "/admin/api/published-channels")).status, 401);
+    assert.equal((await call(env, "/admin/api/channel-moderate", { method: "POST", json: { code: "X" } })).status, 401);
+  });
+
+  it("lists what the directory is showing", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const cookie = await adminCookie(env);
+    const res = await call(env, "/admin/api/published-channels", { cookie });
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.channels.length, 1);
+    assert.equal(res.body.channels[0].name, "Saturday Morning 90s");
+    assert.equal(res.body.channels[0].listed, true);
+  });
+
+  it("also lists a channel that was quietly unlisted, which the directory cannot show", async () => {
+    const env = makeEnv();
+    await call(env, "/api/channel/share", { method: "POST", json: { channel: channelOf({ name: "Unlisted one" }) } });
+    const cookie = await adminCookie(env);
+    const listed = await call(env, "/admin/api/published-channels?scope=listed", { cookie });
+    assert.deepEqual(listed.body.channels, []);
+    const all = await call(env, "/admin/api/published-channels?scope=all", { cookie });
+    assert.equal(all.body.channels.length, 1);
+    assert.equal(all.body.channels[0].listed, false);
+  });
+
+  it("unlists a channel and leaves the links working", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const cookie = await adminCookie(env);
+    const res = await call(env, "/admin/api/channel-moderate", {
+      method: "POST", cookie, json: { code: published.body.code, action: "unlist" },
+    });
+    assert.equal(res.body.ok, true);
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, []);
+    assert.equal((await call(env, `/api/channel/share?code=${published.body.code}`)).body.ok, true);
+  });
+
+  it("deletes a channel outright, so every link to it stops working", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const code = published.body.code;
+    await call(env, "/api/channel/like", { method: "POST", json: { code, action: "like" } });
+    const cookie = await adminCookie(env);
+    const res = await call(env, "/admin/api/channel-moderate", { method: "POST", cookie, json: { code, action: "delete" } });
+    assert.equal(res.body.ok, true);
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, []);
+    assert.equal((await call(env, `/api/channel/share?code=${code}`)).status, 404);
+    // The like ledger goes with it, rather than being inherited by whoever
+    // mints the same code next.
+    assert.equal(env.CONFIGS._store.has(`channellikevoters:${code}`), false);
+  });
+
+  it("defaults to unlisting rather than deleting when the action is not recognised", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const cookie = await adminCookie(env);
+    await call(env, "/admin/api/channel-moderate", {
+      method: "POST", cookie, json: { code: published.body.code, action: "something-else" },
+    });
+    assert.equal((await call(env, `/api/channel/share?code=${published.body.code}`)).body.ok, true,
+      "the safer of the two actions is the one an unknown verb gets");
+  });
+});

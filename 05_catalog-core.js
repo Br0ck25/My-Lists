@@ -1867,6 +1867,8 @@ function sanitizeSharedChannelItem(raw) {
   if (!channelItemStreamId(item)) return null;
   const released = sharedChannelString(raw.released, 10);
   if (released) item.released = released;
+  const runtime = typeof raw.runtime === "number" ? raw.runtime : parseInt(raw.runtime, 10);
+  if (Number.isInteger(runtime) && runtime > 0 && runtime < 1000) item.runtime = runtime;
   const poster = sharedChannelImageUrl(raw.poster);
   const thumbnail = sharedChannelImageUrl(raw.thumbnail);
   const showPoster = sharedChannelImageUrl(raw.showPoster);
@@ -1895,6 +1897,11 @@ function sanitizeSharedChannel(raw) {
   const itemKeys = new Set(items.map(channelItemShowKey));
   const out = {
     name: sharedChannelString(raw.name, SHARED_CHANNEL_NAME_MAX) || "Shared Channel",
+    // The channel's own description, not the directory listing's. They used
+    // to be the same string, stored only on the listing -- so unpublishing a
+    // channel deleted the sentence describing it, and a channel shared by
+    // link had nowhere to carry one at all.
+    description: sharedChannelString(raw.description, SHARED_CHANNEL_DESCRIPTION_MAX),
     poster: sharedChannelImageUrl(raw.poster) || null,
     backdrop: sharedChannelImageUrl(raw.backdrop) || null,
     items: items,
@@ -1938,7 +1945,12 @@ function sharedChannelSummary(code, record) {
   return {
     code: code,
     name: channel.name || "Shared Channel",
-    description: record.description || "",
+    // The listing's own line when it has one, and the channel's otherwise --
+    // so a channel that describes itself needs nothing typed again to be
+    // published, and keeps that sentence when it is unpublished.
+    description: record.description || channel.description || "",
+    likes: Number(record.likes) || 0,
+    adds: Number(record.adds) || 0,
     poster: channel.poster || null,
     backdrop: channel.backdrop || null,
     itemCount: (channel.items || []).length,
@@ -2420,17 +2432,15 @@ function channelItemStreamId(it) {
   return `${showId}:${season}:${episode}`;
 }
 
-async function buildChannelMeta(entry, origin, opts = {}) {
-  const payload = parseChannelPayload(entry.url);
-  if (!payload) return null;
-  // payload.channelId/payload.name (not entry.id/entry.name) are the real
-  // identity -- see the same note in fetchChannelCatalog above.
-  const channelId = payload.channelId || entry.id;
-  const name = payload.name || entry.name;
-
-  // Where today's picks come from: the channel's own saved items, a Live
-  // Cloud Sync pool rebuilt from the source list, or -- for a dynamic
-  // channel -- the account's own tracking. See channelSourceItems.
+// Today's lineup for one channel payload: the picks, in the order they will
+// actually play, after the pool, the rules and the arrangement have all been
+// applied.
+//
+// Split out of buildChannelMeta so the builder page can show what a rotating
+// channel is running right now (see /api/channel-lineup). The alternative --
+// a second copy of the seeded shuffle on the client -- is the kind of thing
+// that drifts by one episode after some later edit and is never noticed.
+async function resolveChannelLineup(payload, opts = {}) {
   const sourceItems = await channelSourceItems(payload, opts);
 
   // "Randomize play order" (set once in the Channel builder, stored on the
@@ -2461,7 +2471,7 @@ async function buildChannelMeta(entry, origin, opts = {}) {
     ? new Date(opts.now)
     : (opts.now && typeof opts.now.getTime === "function" ? opts.now : new Date());
   const day = channelRotationDay(now, plan.turnover);
-  const seed = day + hashStringToInt(channelId);
+  const seed = day + hashStringToInt(String(payload.channelId || payload.name || ""));
   const lockedKeys = channelStoryLockedKeys(payload);
   // Anything that cannot produce a real stream id (see channelItemStreamId
   // above) is dropped HERE, before the rotation or the shuffle runs, so a
@@ -2502,6 +2512,20 @@ async function buildChannelMeta(entry, origin, opts = {}) {
   // into an actual prime-time block instead of five blocks back to back.
   if (payload.sortByAired) items = sortChannelItemsByAired(items);
   else if (payload.autoSort === "interleave") items = interleaveChannelItems(items);
+  return { items, sourceItems, plan, day, seed };
+}
+
+async function buildChannelMeta(entry, origin, opts = {}) {
+  const payload = parseChannelPayload(entry.url);
+  if (!payload) return null;
+  // payload.channelId/payload.name (not entry.id/entry.name) are the real
+  // identity -- see the same note in fetchChannelCatalog above.
+  const channelId = payload.channelId || entry.id;
+  const name = payload.name || entry.name;
+  const lineup = await resolveChannelLineup(payload, opts);
+  if (!lineup) return null;
+  const items = lineup.items;
+  const sourceItems = lineup.sourceItems;
   const videos = items.map((it, i) => {
     // TMDB's air_date/release_date (and our own year-only fallback for
     // movies) are bare "YYYY-MM-DD" dates. Stremio Web's core is compiled

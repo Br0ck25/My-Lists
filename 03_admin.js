@@ -2376,6 +2376,23 @@ async function renderAdminDashboard(env) {
       <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteAnonBtn" onclick="runDeletePublishedLists()">Delete these lists</button>
       <span id="deleteAnonStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
+
+    <div class="admin-card" style="margin-top:12px;">
+      <h3 style="margin:0 0 6px; font-size:0.95rem;">Published channels</h3>
+      <p style="margin:0 0 10px; color:#8E8E93; font-size:0.82rem;">
+        The Explore Channels directory. Publishing a channel is owner-only, so without this panel
+        a channel could only be withdrawn by whoever put it there.
+        <strong>Unlist</strong> removes it from the directory and leaves existing share links working &mdash;
+        the same thing its owner&rsquo;s own Unpublish does. <strong>Delete</strong> removes the stored channel,
+        so every link to it stops working.
+      </p>
+      <div class="row" style="margin-bottom:8px;">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="browseChannelsBtn" onclick="loadPublishedChannels('listed')">Browse the directory</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="browseChannelsAllBtn" onclick="loadPublishedChannels('all')">Browse every stored channel</button>
+        <span id="publishedChannelStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      </div>
+      <div id="publishedChannelResults"></div>
+    </div>
   </div>
 
   <!-- A form, not a link: logging out is a state change, and /admin/logout
@@ -3077,6 +3094,103 @@ async function renderAdminDashboard(env) {
       btn.disabled = false;
       moreBtn.disabled = false;
     }
+
+    // --- published channels ---------------------------------------------
+    //
+    // Two scopes. "listed" is the directory itself -- one cheap read of the
+    // index, and what the public actually sees. "all" walks the
+    // channelshare: keyspace, which also holds channels that were published,
+    // reported and then quietly unlisted, and any row a lost index write
+    // orphaned. An operator needs both.
+    async function loadPublishedChannels(scope) {
+      const status = document.getElementById('publishedChannelStatus');
+      const results = document.getElementById('publishedChannelResults');
+      const btn = document.getElementById(scope === 'all' ? 'browseChannelsAllBtn' : 'browseChannelsBtn');
+      if (btn) btn.disabled = true;
+      status.textContent = 'Loading\u2026';
+      try {
+        const res = await fetch('/admin/api/published-channels?scope=' + encodeURIComponent(scope) + '&limit=100');
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          if (btn) btn.disabled = false;
+          return;
+        }
+        const channels = data.channels || [];
+        if (!channels.length) {
+          results.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">Nothing to show.</p>';
+          status.textContent = '';
+          if (btn) btn.disabled = false;
+          return;
+        }
+        const rows = channels.map(function (C) {
+          const code = escapeHtmlAdmin(C.code);
+          return '<tr data-channel-row="' + code + '">' +
+            '<td style="padding:4px 8px 4px 0;"><code>' + code + '</code></td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(C.name || '') + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(C.owner || '\u2014') + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(C.itemCount) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(C.likes) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + (C.listed ? 'listed' : 'unlisted') + '</td>' +
+            '<td style="padding:4px 8px 4px 0;"><a href="' + escapeHtmlAdmin(C.url || '') + '" target="_blank" rel="noopener">open</a></td>' +
+            '<td style="padding:4px 0; white-space:nowrap;">' +
+              '<button type="button" class="admin-select" data-channel-action="unlist" data-code="' + code + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem; margin-right:4px;">Unlist</button>' +
+              '<button type="button" class="admin-select" data-channel-action="delete" data-code="' + code + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem; color:#FF3B30; border-color:rgba(255,59,48,0.35);">Delete</button>' +
+            '</td>' +
+            '</tr>';
+        }).join('');
+        results.innerHTML = '<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+          '<thead><tr style="color:#8E8E93; text-align:left;">' +
+          '<th style="padding-right:8px;">Code</th><th style="padding-right:8px;">Name</th>' +
+          '<th style="padding-right:8px;">Owner</th>' +
+          '<th style="padding-right:8px; text-align:right;">Items</th>' +
+          '<th style="padding-right:8px; text-align:right;">Likes</th>' +
+          '<th style="padding-right:8px;">State</th><th></th><th></th>' +
+          '</tr></thead><tbody>' + rows + '</tbody></table>';
+        status.textContent = channels.length + ' channel' + (channels.length === 1 ? '' : 's') + ' shown' +
+          (data.done ? '. That is all of them.' : ', more available.');
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      if (btn) btn.disabled = false;
+    }
+
+    // Both actions confirm by name before they run. Delete says plainly that
+    // it breaks every link, because that is the part an operator reaching
+    // for "take this down" may not have meant.
+    document.getElementById('publishedChannelResults').addEventListener('click', async function (ev) {
+      const btn = ev.target.closest('[data-channel-action]');
+      if (!btn) return;
+      const action = btn.getAttribute('data-channel-action');
+      const code = btn.getAttribute('data-code');
+      const row = btn.closest('tr');
+      const name = row ? (row.children[1].textContent || code) : code;
+      const question = action === 'delete'
+        ? 'Delete the stored channel "' + name + '"? Every share link to it stops working. This cannot be undone.'
+        : 'Remove "' + name + '" from the Explore Channels directory? Links already handed out keep working.';
+      if (!confirm(question)) return;
+      const status = document.getElementById('publishedChannelStatus');
+      btn.disabled = true;
+      status.textContent = 'Working\u2026';
+      try {
+        const res = await fetch('/admin/api/channel-moderate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: code, action: action }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          return;
+        }
+        status.textContent = (action === 'delete' ? 'Deleted ' : 'Unlisted ') + name + '.';
+        if (row) row.remove();
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+        btn.disabled = false;
+      }
+    });
 
     // "Select" fills the slug box rather than deleting directly: a one-click
     // delete next to a browse list is how the wrong list gets removed.

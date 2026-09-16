@@ -6,6 +6,61 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🛠️ Channels: nine things that make one easier to build, find and moderate
+
+**Editing a big channel**
+
+- **Bulk select.** A channel with 800 picks was drag-one-at-a-time, type-a-position, or Remove all.
+  **Select** turns the draft into checkboxes: tap anywhere on a card, pick out a whole show or one
+  season from a menu, then **Remove selected**, **To top** or **To bottom**. Selection is by index
+  and every move rebuilds it, because an index that survives a reorder is an index pointing at the
+  wrong pick.
+- **A filter over the draft**, matching show, episode title and the S/E people actually type
+  (`s5e12`). Bulk actions only ever act on what is on screen, so a filter cannot quietly reach a
+  pick you cannot see.
+- **A duplicate warning.** Adding a show from two different places, or splicing the same crossover
+  in twice, used to just work — and you found out later, by which point the duplicate is somewhere
+  in eight hundred rows.
+
+**Knowing what you built**
+
+- **Runtimes are stored** on each pick (from TMDB, where it has them), which is what the hours
+  count below is made of — and the groundwork for anything schedule-shaped later.
+- **A stats line**, under the draft and on each channel's card: `12 shows · 800 episodes ·
+  ~412 hours · 1989–2004 · 24 shows × 3 a day · 3 story-locked · hides watched`. The hours are
+  marked with a `~` whenever some picks predate runtimes being stored, rather than being quietly
+  wrong.
+- **"On today"**, a new tab beside Movies and Shows on a channel's See All page: the lineup the
+  Worker would serve *right now*, numbered in playing order. You could set 24 shows × 3 episodes
+  and, until now, only find out what that produced by opening the channel in Stremio. The Worker
+  answers it through the same function the meta route uses — a second copy of the seeded shuffle on
+  the page is the kind of thing that drifts by one episode and is never noticed.
+
+**Finding and keeping channels**
+
+- **A description on the channel itself.** It used to live only on the directory listing, so
+  unpublishing a channel deleted the sentence describing it and a channel shared by link had
+  nowhere to carry one. Publishing now uses the channel's own line when none is typed.
+- **My Channels sorts and searches** — by recently updated, created, name or size, and findable by
+  name, description, or a show inside it, which is usually how people remember one. **Deleting a
+  channel can be undone** for a minute afterwards, which every catalog row could already do and the
+  one action that can discard 800 hand-picked episodes could not.
+- **Explore Channels has likes and ordering**: newest, most added, most liked, or by name. "Most
+  added" ranks by how many people actually took a channel, which is a better signal than a vote
+  because taking one costs something. Likes use the same one-identity-one-vote ledger lists use,
+  and the count is always derived from that ledger rather than incremented, so it cannot drift
+  upward on its own. Editing and re-publishing a channel keeps its votes.
+
+**Moderation**
+
+- **An operator can now moderate the channel directory.** Publishing was owner-only with no
+  operator path at all: if someone published something abusive, the only person who could take it
+  down was the person who put it there — worse than the standard published *lists* have held since
+  they existed. The admin dashboard now lists the directory (and, separately, every stored channel,
+  including ones quietly unlisted or orphaned by a lost index write), with two distinct actions:
+  **Unlist** removes the directory listing and leaves existing share links working, and **Delete**
+  removes the stored channel so every link to it stops working, taking its like ledger with it.
+
 ### 🔧 Channels: fixes from the first round of use
 
 - **A Spotlight channel took episodes its subject is not in.** Tobey Maguire's single guest

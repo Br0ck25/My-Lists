@@ -1663,6 +1663,9 @@ function ledgerKeyToListId(ledgerKey) {
   if (ledgerKey.startsWith("extlikevoters:")) {
     return "ext:" + ledgerKey.slice("extlikevoters:".length);
   }
+  if (ledgerKey.startsWith("channellikevoters:")) {
+    return "ch:" + ledgerKey.slice("channellikevoters:".length);
+  }
   return ledgerKey;
 }
 
@@ -1676,6 +1679,9 @@ function listIdToLedgerKey(listId) {
   }
   if (listId.startsWith("ext:")) {
     return "extlikevoters:" + listId.slice(4);
+  }
+  if (listId.startsWith("ch:")) {
+    return "channellikevoters:" + listId.slice(3);
   }
   return "listlikevoters:" + listId;
 }
@@ -4577,11 +4583,39 @@ async function writePublicChannelIndex(env, entries) {
 
 async function upsertPublicChannelIndex(env, code, record) {
   const entries = await readPublicChannelIndex(env);
+  const previous = entries.find((e) => e && e.code === code);
   const summary = sharedChannelSummary(code, record);
+  // Likes and adds are counted against the listing, not the channel, and
+  // re-publishing an edited channel must not reset them -- so they are
+  // carried across rather than rebuilt from the record.
+  if (previous) {
+    summary.likes = Number(previous.likes) || summary.likes || 0;
+    summary.adds = Number(previous.adds) || summary.adds || 0;
+    summary.publishedAt = previous.publishedAt || summary.publishedAt;
+  }
   const without = entries.filter((e) => e && e.code !== code);
   // Newest first, and an update moves a listing back to the front -- a
   // channel someone has just reworked is the one worth showing.
   await writePublicChannelIndex(env, [summary, ...without]);
+}
+
+// Writes one field onto one listing, leaving the rest of the index alone.
+//
+// Read-modify-write on a single key with no compare-and-swap, same as every
+// other write here -- so this touches as little as it can and never rebuilds
+// a row from the channel record, which a concurrent publish may have moved on
+// from. A listing that has since been withdrawn is simply not updated.
+async function updatePublicChannelIndexEntry(env, code, patch) {
+  const entries = await readPublicChannelIndex(env);
+  let found = false;
+  const next = entries.map((e) => {
+    if (!e || e.code !== code) return e;
+    found = true;
+    return Object.assign({}, e, patch);
+  });
+  if (!found) return false;
+  await writePublicChannelIndex(env, next);
+  return true;
 }
 
 async function removePublicChannelIndex(env, code) {
@@ -4589,4 +4623,24 @@ async function removePublicChannelIndex(env, code) {
   const without = entries.filter((e) => e && e.code !== code);
   if (without.length === entries.length) return;
   await writePublicChannelIndex(env, without);
+}
+
+
+// How the Explore Channels directory is ordered.
+//
+// The index is stored newest-first and is small enough to sort on read, so
+// the ordering is a read-time choice rather than several stored orders that
+// could disagree. "added" ranks by how many people actually took a channel,
+// which is a better signal than a like: taking one costs something.
+function sortPublicChannelIndex(entries, sort) {
+  const list = entries.slice();
+  if (sort === "liked") {
+    list.sort((a, b) => (Number(b.likes) || 0) - (Number(a.likes) || 0) || (Number(b.adds) || 0) - (Number(a.adds) || 0));
+  } else if (sort === "added") {
+    list.sort((a, b) => (Number(b.adds) || 0) - (Number(a.adds) || 0) || (Number(b.likes) || 0) - (Number(a.likes) || 0));
+  } else if (sort === "name") {
+    list.sort((a, b) => String(a.name || "").toLowerCase().localeCompare(String(b.name || "").toLowerCase()));
+  }
+  // "newest" is the order the index is already kept in, so it sorts nothing.
+  return list;
 }

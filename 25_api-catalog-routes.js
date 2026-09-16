@@ -1830,6 +1830,7 @@ function generateSearchVariations(query) {
             name: e.name,
             released: e.air_date || null,
             thumbnail: e.still_path || null,
+            runtime: Number.isInteger(e.runtime) ? e.runtime : null,
           }));
           return json({ ok: true, episodes });
         }
@@ -1851,6 +1852,7 @@ function generateSearchVariations(query) {
               name: e.name,
               released: e.air_date || null,
               thumbnail: e.still_path || null,
+              runtime: Number.isInteger(e.runtime) ? e.runtime : null,
             }));
             return json({ ok: true, episodes });
           }
@@ -1862,6 +1864,12 @@ function generateSearchVariations(query) {
           name: e.name,
           released: e.air_date || null,
           thumbnail: e.still_path ? `https://image.tmdb.org/t/p/w780${e.still_path}` : null,
+          // Minutes, when TMDB has them. Carried onto the channel pick so a
+          // channel can say how many hours of television it holds -- and so
+          // a schedule can one day be built from real block lengths rather
+          // than an assumed half hour. Often null, which is why nothing
+          // downstream may require it.
+          runtime: Number.isInteger(e.runtime) ? e.runtime : null,
         }));
         return json({ ok: true, episodes });
       } catch (err) {
@@ -2015,6 +2023,58 @@ function generateSearchVariations(query) {
         return json({ ok: true, channel: channelPayload }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
       } catch (err) {
         return json({ ok: false, error: err.message || "Failed to build network channel preset." }, 500);
+      }
+    }
+
+    // /api/channel-lineup  (POST)  { url, watchHistory?, continueWatching? }
+    //   -> { ok, items, rotating, plan, generatedAt }
+    //
+    // What this channel is running RIGHT NOW -- the same lineup the meta
+    // route would serve, produced by the same function (resolveChannelLineup)
+    // rather than by a second copy of the seeded shuffle living on the page.
+    //
+    // POST, like /api/preview and for the same reason: a channel's url is its
+    // whole payload and routinely exceeds what a query string can carry.
+    //
+    // Unauthenticated, and it reads nothing it is not given: "Hide watched"
+    // and a dynamic channel both depend on an account's tracking, and this
+    // route has no way to prove whose it is -- so a preview of one of those
+    // shows the channel WITHOUT those rules applied and says so, rather than
+    // quietly reading somebody's history on an unproven claim.
+    if (path === "/api/channel-lineup" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const payload = parseChannelPayload(body.url || "");
+      if (!payload) return json({ ok: false, error: "That is not a channel." }, 400);
+      try {
+        const lineup = await resolveChannelLineup(payload, {
+          env, ctx, origin: url.origin,
+          now: typeof body.now === "number" ? body.now : undefined,
+        });
+        if (!lineup) return json({ ok: true, items: [], rotating: !!payload.dailyRotate, plan: null });
+        const needsAccount = !!(payload.hideWatched || payload.dynamic);
+        return json({
+          ok: true,
+          rotating: !!payload.dailyRotate,
+          // Named so the page can say "24 shows x 3 episodes" from the same
+          // numbers the Worker clamped, not from what the inputs say.
+          plan: lineup.plan,
+          poolSize: lineup.sourceItems.length,
+          // The two rules this route cannot honour, so the page can label
+          // the preview honestly instead of showing a lineup that differs
+          // from what will actually play.
+          unappliedRules: needsAccount
+            ? [payload.hideWatched ? "hideWatched" : null, payload.dynamic ? "dynamic" : null].filter(Boolean)
+            : [],
+          generatedAt: Date.now(),
+          items: lineup.items,
+        }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) }, 500, { "Cache-Control": "no-store" });
       }
     }
 
@@ -2237,6 +2297,7 @@ function generateSearchVariations(query) {
                 name: ep.name || `Episode ${ep.episode_number}`,
                 released: ep.air_date || "",
                 thumbnail: stillUrl,
+                runtime: Number.isInteger(ep.runtime) ? ep.runtime : null,
               });
             }
             return out;
@@ -2490,7 +2551,7 @@ function generateSearchVariations(query) {
         ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const details = await fetchTmdbDetails(tmdbId, "movie", TMDB_API_KEY);
         if (!details.imdbId) return json({ ok: false, error: "Couldn't resolve an IMDB id for this movie." });
-        return json({ ok: true, imdbId: details.imdbId });
+        return json({ ok: true, imdbId: details.imdbId, runtime: Number.isInteger(details.runtime) ? details.runtime : null });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }

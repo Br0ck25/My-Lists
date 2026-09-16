@@ -1649,6 +1649,88 @@ function renderWatchHistoryGrid() {
 }
 window.renderWatchHistoryGrid = renderWatchHistoryGrid;
 
+
+// --- "On today": what this channel is actually running --------------------
+//
+// A rotating channel stores a pool much bigger than a day, and until now the
+// only way to see which shows and episodes today's lineup had drawn from it
+// was to open the channel in Stremio. So you could set 24 shows x 3 episodes
+// and have no idea what that produced.
+//
+// The Worker answers it (see /api/channel-lineup), which matters: the
+// rotation is a seeded shuffle, and a second copy of that PRNG living on
+// this page is the kind of thing that drifts by one episode after some later
+// edit and is never noticed. This asks the same function the meta route uses.
+async function renderChannelLineupTab(params) {
+  const gridEl = document.getElementById('detailGrid');
+  const statusEl = document.getElementById('detailStatus');
+  const subEl = document.getElementById('detailSubtitle');
+  if (!gridEl) return;
+  const listUrl = (params && params.listUrl) || '';
+  const channelId = listUrl.startsWith('channel:id:') ? listUrl.slice('channel:id:'.length) : '';
+  const channel = channelId && typeof loadLocalChannels === 'function' ? loadLocalChannels()[channelId] : null;
+  if (!channel) {
+    if (statusEl) statusEl.innerHTML = '<small>This channel is not saved in this browser, so there is nothing to look up.</small>';
+    return;
+  }
+  gridEl.innerHTML = '';
+  if (statusEl) statusEl.innerHTML = '<small>Working out what is on&hellip;</small>';
+  try {
+    const res = await fetch(ORIGIN + '/api/channel-lineup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'channel:v1:' + JSON.stringify(channel) }),
+      cache: 'no-store',
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      if (statusEl) statusEl.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Could not work out this channel’s lineup.') + '</p>';
+      return;
+    }
+    const items = data.items || [];
+    if (!items.length) {
+      if (statusEl) statusEl.innerHTML = '<small>Nothing is scheduled for this channel right now.</small>';
+      return;
+    }
+    const tiles = items.map((it, idx) => {
+      const seasonEp = (it.season != null && it.episode != null && it.kind !== 'movie')
+        ? ('S' + it.season + 'E' + it.episode) : '';
+      const showName = it.showName || it.title || 'Untitled';
+      return {
+        id: (typeof channelItemId === 'function' ? channelItemId(it, idx) : (it.imdbId || String(idx))),
+        type: it.kind === 'movie' ? 'movie' : 'series',
+        // The running order IS the answer here, so each tile is numbered:
+        // "12." is the twelfth thing this channel plays today.
+        name: (idx + 1) + '. ' + showName + (seasonEp ? ' ' + seasonEp : ''),
+        subtitle: it.epName || '',
+        title: it.title || showName,
+        poster: it.thumbnail || it.poster || it.showPoster || channel.poster || '',
+        thumbnail: it.thumbnail || it.poster || '',
+        year: it.released ? String(it.released).slice(0, 4) : '',
+        listUrl: listUrl,
+        listName: channel.name || '',
+      };
+    });
+    if (typeof renderPosterGridChunked === 'function') renderPosterGridChunked(gridEl, tiles);
+    const bits = [items.length + ' playing today'];
+    if (data.rotating && data.plan) {
+      bits.push('out of ' + data.poolSize + ', ' + data.plan.shows + ' shows × ' + data.plan.episodes + ' episodes');
+    }
+    // An honest label rather than a lineup that differs from what will play:
+    // this endpoint is unauthenticated and cannot read anyone's history, so
+    // a channel whose rules depend on one is previewed without them.
+    if ((data.unappliedRules || []).length) {
+      bits.push('shown without ' + (data.unappliedRules.indexOf('dynamic') !== -1
+        ? 'your Continue Watching'
+        : 'the watched-episode filter') + ', which only applies once installed');
+    }
+    if (subEl) subEl.textContent = bits.join(' · ');
+    if (statusEl) statusEl.innerHTML = '';
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = '<p class="testresult err">✗ Network error working out this channel’s lineup.</p>';
+  }
+}
+
 window.switchListDetailsType = function(newType) {
   if (!window._currentListDetailsParams) return;
   const p = window._currentListDetailsParams;
@@ -1658,9 +1740,19 @@ window.switchListDetailsType = function(newType) {
   const aBtn = document.getElementById('detailTypeAllBtn');
   const mBtn = document.getElementById('detailTypeMovieBtn');
   const sBtn = document.getElementById('detailTypeSeriesBtn');
+  const lBtn = document.getElementById('detailTypeLineupBtn');
   if (aBtn) aBtn.classList.toggle('active', newType === 'all');
   if (mBtn) mBtn.classList.toggle('active', newType === 'movie');
   if (sBtn) sBtn.classList.toggle('active', newType === 'series');
+  if (lBtn) lBtn.classList.toggle('active', newType === 'lineup');
+
+  // "On today" is not a filter over what is loaded -- it is a different
+  // question, answered by the Worker: out of this channel's whole pool,
+  // which picks is it actually running right now? See renderChannelLineupTab.
+  if (newType === 'lineup') {
+    if (typeof renderChannelLineupTab === 'function') renderChannelLineupTab(p);
+    return;
+  }
 
   // If this is a dual-type chart (separate endpoint for movies vs series)
   let isDualTypeChart = false;
@@ -2349,6 +2441,16 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         const aBtn = document.getElementById('detailTypeAllBtn');
         const mBtn = document.getElementById('detailTypeMovieBtn');
         const sBtn = document.getElementById('detailTypeSeriesBtn');
+        const lBtn = document.getElementById('detailTypeLineupBtn');
+        // Only a channel has a "today", and only one saved in this browser
+        // can be asked about -- a directory preview is somebody else's
+        // channel and is not in the local store to look up.
+        const lineupChannelId = (listUrl && listUrl.startsWith('channel:id:')) ? listUrl.slice('channel:id:'.length) : '';
+        const canShowLineup = !!(lineupChannelId && typeof loadLocalChannels === 'function' && loadLocalChannels()[lineupChannelId]);
+        if (lBtn) {
+          lBtn.style.display = canShowLineup ? '' : 'none';
+          lBtn.classList.remove('active');
+        }
         const isExternalProvider = isExternalHistory || (listUrl && (listUrl.includes('trakt:watchlist') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/watchlist')) || listUrl.includes('mdblist:watchlist')));
         if (isDualTypeChart && !isExternalProvider) {
           // On dual-type charts (Catalogs Quick Add & Discover), hide 'All' and show only 'Movies' & 'Shows'

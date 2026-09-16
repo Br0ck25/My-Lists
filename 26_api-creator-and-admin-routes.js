@@ -2336,7 +2336,7 @@
         const auth = await authenticateCreator(body.creatorName, body.creatorKey);
         if (auth.ok) owner = auth.username;
       }
-      const description = String(body.description || "").trim().slice(0, SHARED_CHANNEL_DESCRIPTION_MAX);
+      const description = (String(body.description || "").trim() || channel.description || "").slice(0, SHARED_CHANNEL_DESCRIPTION_MAX);
       // Reusing the code someone already has is what makes "Share" on an
       // edited channel update the link they handed out rather than mint a
       // second one beside it. Only the owner of a PUBLISHED code may do
@@ -2434,12 +2434,107 @@
     if (path === "/api/channel/directory" && request.method === "GET") {
       if (!env || !env.CONFIGS) return json({ ok: true, channels: [] });
       const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "60", 10) || 60, 1), PUBLIC_CHANNEL_INDEX_MAX);
-      const index = await readPublicChannelIndex(env);
+      const sort = String(url.searchParams.get("sort") || "newest");
+      const index = sortPublicChannelIndex(await readPublicChannelIndex(env), sort);
       return json({
         ok: true,
         total: index.length,
+        sort,
         channels: index.slice(0, limit),
       }, 200, { "Cache-Control": "public, max-age=120" });
+    }
+
+    // /api/channel/like  (POST)  { code, action: "like"|"unlike", creatorName?, creatorKey? }
+    //   -> { ok, likes, liked }
+    //
+    // The same one-identity-one-vote machinery lists use (applyLikeVote /
+    // likeVoterId): a signed-in visitor votes as themselves, everyone else
+    // as a per-channel hash of their IP, and the count is always DERIVED
+    // from the ledger rather than incremented -- so it cannot drift upward
+    // on its own.
+    //
+    // Only a PUBLISHED channel is likeable. An unlisted share is reachable
+    // by anyone holding its code, and letting those be voted on would mint
+    // a permanent ledger key for every link ever handed out.
+    if (path === "/api/channel/like" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Channel not found." }, 404);
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      // The same answer for "no such channel" and "not published",
+      // deliberately: a distinguishable response is an oracle for which
+      // unlisted codes exist.
+      if (!record || !record.published) return json({ ok: false, error: "Channel not found." }, 404);
+
+      let voterName = "";
+      if (body.creatorName && body.creatorKey) {
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (auth.ok) voterName = auth.username;
+      }
+      const voterId = await likeVoterId(request, env, voterName, `channel:${code}`);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
+      const liked = body.action !== "unlike";
+      const { count, capped } = await applyLikeVote(env, `channellikevoters:${code}`, voterId, liked);
+
+      // The count is denormalised onto both the record and the directory
+      // row, because the directory reads one key and must not open a ledger
+      // per listing. Re-read before writing, and write only this one field:
+      // the record may have been re-published while the ledger was being
+      // updated, and putting a stale snapshot back would take the channel
+      // with it.
+      try {
+        const freshRaw = await env.CONFIGS.get(`channelshare:${code}`);
+        if (freshRaw) {
+          const fresh = JSON.parse(freshRaw);
+          if ((fresh.likes || 0) !== count) {
+            fresh.likes = count;
+            await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(fresh));
+          }
+        }
+      } catch {
+        // The ledger already holds the vote; the denormalised copy catches
+        // up on the next one rather than this failing the request.
+      }
+      await updatePublicChannelIndexEntry(env, code, { likes: count }).catch(() => {});
+      return json({ ok: true, likes: count, liked, capped: capped || undefined }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/added  (POST)  { code }
+    //
+    // "Someone took this channel." Counted so the directory can rank by what
+    // people actually use rather than only by what they upvote -- taking a
+    // channel costs something, so it is the better signal of the two.
+    //
+    // Deliberately not a vote: it is a counter, it only goes up, and it is
+    // best-effort. Nothing is shown to the caller and nothing fails if it
+    // does not land.
+    if (path === "/api/channel/added" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: true });
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: true });
+      const entries = await readPublicChannelIndex(env);
+      const row = entries.find((e) => e && e.code === code);
+      if (!row) return json({ ok: true });
+      await updatePublicChannelIndexEntry(env, code, { adds: (Number(row.adds) || 0) + 1 }).catch(() => {});
+      return json({ ok: true }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/channel/unpublish  (POST)  { code, creatorName, creatorKey }
@@ -5635,6 +5730,164 @@
         publicIndex,
         databaseStats,
       }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/published-channels  (GET)  ?limit=&cursor=
+    //   -> { ok, count, channels: [...], cursor, done }
+    //
+    // The operator's view of the Explore Channels directory.
+    //
+    // Publishing a channel was owner-only with no operator path at all: if
+    // someone published something abusive, the only person who could take it
+    // down was the person who put it there. Published LISTS have had
+    // /admin/api/published-lists for exactly this reason; this is the same
+    // door for channels.
+    //
+    // Two sources, deliberately. The directory index is what the public
+    // actually sees and is one cheap read. The channelshare: keyspace is
+    // everything ever stored, listed or not -- which is where a channel that
+    // was published, reported, and then quietly unpublished still lives, and
+    // where an index write that lost a race leaves an orphan. An operator
+    // needs to be able to see both.
+    if (path === "/admin/api/published-channels" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-storage" });
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 200);
+      const scope = url.searchParams.get("scope") === "all" ? "all" : "listed";
+
+      if (scope === "listed") {
+        const index = await readPublicChannelIndex(env);
+        return json({
+          ok: true,
+          scope,
+          count: index.length,
+          channels: index.slice(0, limit).map((e) => Object.assign({}, e, {
+            url: `${url.origin}/channel/${e.code}`,
+            listed: true,
+          })),
+          done: index.length <= limit,
+          cursor: null,
+        }, 200, { "Cache-Control": "no-store" });
+      }
+
+      const cursor = url.searchParams.get("cursor") || "";
+      let listed;
+      try {
+        listed = await env.CONFIGS.list({ prefix: "channelshare:", limit, ...(cursor ? { cursor } : {}) });
+      } catch {
+        return json({ ok: false, error: "Could not read the stored channels right now." }, 500, { "Cache-Control": "no-store" });
+      }
+      const channels = await Promise.all((listed.keys || []).map(async (k) => {
+        const code = k.name.slice("channelshare:".length);
+        let record = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          record = raw ? JSON.parse(raw) : null;
+        } catch {
+          record = null;
+        }
+        if (!record) {
+          return { code, name: "(unreadable record)", listed: false, url: `${url.origin}/channel/${code}` };
+        }
+        const channel = record.channel || {};
+        return {
+          code,
+          name: channel.name || "(untitled)",
+          description: record.description || channel.description || "",
+          owner: record.owner || "",
+          listed: !!record.published,
+          itemCount: Array.isArray(channel.items) ? channel.items.length : 0,
+          likes: Number(record.likes) || 0,
+          publishedAt: record.publishedAt || null,
+          updatedAt: record.updatedAt || null,
+          url: `${url.origin}/channel/${code}`,
+        };
+      }));
+      return json({
+        ok: true,
+        scope,
+        count: channels.length,
+        channels,
+        cursor: listed.list_complete ? null : (listed.cursor || null),
+        done: !!listed.list_complete,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/channel-moderate  (POST)  { code, action: "unlist"|"delete" }
+    //
+    // Two different acts, kept apart on purpose.
+    //
+    // "unlist" takes the channel out of the directory and leaves the stored
+    // record alone, so a link already handed out keeps working -- the same
+    // thing the owner's own Unpublish does, which is the right response to
+    // "this does not belong in a public directory".
+    //
+    // "delete" removes the record itself, so every link to it stops working.
+    // That is the response to content that should not exist at all, and it
+    // takes the like ledger with it rather than leaving one behind for
+    // whoever mints the same code next.
+    if (path === "/admin/api/channel-moderate" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-storage" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Missing code." }, 400);
+      const action = body.action === "delete" ? "delete" : "unlist";
+
+      // The directory row goes either way, and its removal is checked
+      // rather than assumed: reporting success on a takedown that left the
+      // channel advertised is the failure mode worth designing against.
+      let removedFromIndex = true;
+      try {
+        await removePublicChannelIndex(env, code);
+      } catch {
+        removedFromIndex = false;
+      }
+
+      if (action === "delete") {
+        try {
+          await env.CONFIGS.delete(`channelshare:${code}`);
+          await env.CONFIGS.delete(`channellikevoters:${code}`);
+        } catch {
+          return json({
+            ok: false,
+            error: "Couldn't finish removing that channel. It may still be reachable -- please try again.",
+          }, 500, { "Cache-Control": "no-store" });
+        }
+        if (!removedFromIndex) {
+          return json({
+            ok: false,
+            error: "The channel was deleted but its directory listing could not be removed. Please try again.",
+          }, 500, { "Cache-Control": "no-store" });
+        }
+        return json({ ok: true, action, code }, 200, { "Cache-Control": "no-store" });
+      }
+
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        if (raw) {
+          const record = JSON.parse(raw);
+          record.published = false;
+          record.updatedAt = Date.now();
+          await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(record));
+        }
+      } catch {
+        return json({
+          ok: false,
+          error: "Couldn't mark that channel unlisted. Please try again.",
+        }, 500, { "Cache-Control": "no-store" });
+      }
+      if (!removedFromIndex) {
+        return json({ ok: false, error: "That channel is still listed. Please try again." }, 500, { "Cache-Control": "no-store" });
+      }
+      return json({ ok: true, action, code }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/published-lists  (GET)  ?limit=&cursor=

@@ -4748,6 +4748,7 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
     const client = builder();
     const f = plain(client.call("channelBroadcastFields", {}));
     assert.deepEqual(f, {
+      description: "",
       dailyRotate: false, rotateShows: 0, rotateEpisodes: 0, rotateTurnover: 0,
       rotateTurnoverTime: "", rotateTurnoverZone: "utc", hideWatched: false,
       storyLocked: [], liveSync: false, sourceUrl: "", dynamic: "",
@@ -5369,5 +5370,369 @@ describe("client: looking through a published channel before taking it", () => {
     client.set("openListDetailsPage", function () {});
     await client.call("previewDirectoryChannel", "SM90", null);
     assert.deepEqual(plain(client.call("loadLocalChannels")), {}, "looking is not taking");
+  });
+});
+
+// --- working on a big draft ----------------------------------------------
+describe("client: bulk editing a channel draft", () => {
+  const epOf = (imdbId, season, episode, showName) => ({
+    kind: "episode", imdbId, season, episode, showName,
+    epName: "E" + episode, title: showName + " S" + season + "E" + episode,
+  });
+
+  function draft(items) {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", items);
+    client.set("channelDraftSelection", []);
+    client.set("channelDraftFilter", "");
+    client.set("channelDraftSelectMode", false);
+    client.set("channelDraftStoryLocked", []);
+    return client;
+  }
+
+  const SAMPLE = [
+    epOf("tt1", 1, 1, "Rugrats"),
+    epOf("tt1", 1, 2, "Rugrats"),
+    epOf("tt1", 2, 1, "Rugrats"),
+    epOf("tt2", 1, 1, "Doug"),
+    epOf("tt2", 1, 2, "Doug"),
+  ];
+
+  it("narrows to what the filter matches, by show, episode or S/E", () => {
+    const client = draft(SAMPLE);
+    client.call("setChannelDraftFilter", "doug");
+    assert.deepEqual(plain(client.call("channelDraftVisibleIndices")), [3, 4]);
+    client.call("setChannelDraftFilter", "s2e1");
+    assert.deepEqual(plain(client.call("channelDraftVisibleIndices")), [2]);
+    client.call("setChannelDraftFilter", "");
+    assert.deepEqual(plain(client.call("channelDraftVisibleIndices")), [0, 1, 2, 3, 4]);
+  });
+
+  it("selects only what is on screen, so a filter cannot act on hidden picks", () => {
+    const client = draft(SAMPLE);
+    client.call("setChannelDraftFilter", "doug");
+    client.call("selectAllChannelDraftShown", true);
+    assert.deepEqual(plain(client.get("channelDraftSelection")).sort(), [3, 4]);
+  });
+
+  it("selects a whole show, or one season of it", () => {
+    const client = draft(SAMPLE);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt1"]));
+    assert.deepEqual(plain(client.get("channelDraftSelection")).sort(), [0, 1, 2]);
+    client.call("selectAllChannelDraftShown", false);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt1", 1]));
+    assert.deepEqual(plain(client.get("channelDraftSelection")).sort(), [0, 1]);
+  });
+
+  it("removes the selection and forgets it", () => {
+    const client = draft(SAMPLE);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt1"]));
+    client.call("removeChannelDraftSelection");
+    assert.deepEqual(plain(client.get("channelDraftItems").map((it) => it.title)), ["Doug S1E1", "Doug S1E2"]);
+    assert.deepEqual(plain(client.get("channelDraftSelection")), []);
+  });
+
+  it("moves the selection to the top and keeps pointing at it afterwards", () => {
+    const client = draft(SAMPLE);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt2"]));
+    client.call("moveChannelDraftSelection", "top");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Doug S1E1", "Doug S1E2", "Rugrats S1E1", "Rugrats S1E2", "Rugrats S2E1"]
+    );
+    assert.deepEqual(plain(client.get("channelDraftSelection")), [0, 1],
+      "an index that survived the move would be pointing at the wrong pick");
+  });
+
+  it("moves the selection to the bottom", () => {
+    const client = draft(SAMPLE);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt1", 1]));
+    client.call("moveChannelDraftSelection", "bottom");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Rugrats S2E1", "Doug S1E1", "Doug S1E2", "Rugrats S1E1", "Rugrats S1E2"]
+    );
+    assert.deepEqual(plain(client.get("channelDraftSelection")), [3, 4]);
+  });
+
+  it("disarms a remembered sort, so a bulk move is not undone on the next render", () => {
+    const client = draft(SAMPLE);
+    el(client, "channelPlayOrderSelect").value = "title-az";
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt2"]));
+    client.call("moveChannelDraftSelection", "top");
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed");
+  });
+
+  it("clears the filter and the selection when the builder moves to another channel", () => {
+    const client = draft(SAMPLE);
+    client.call("setChannelDraftFilter", "doug");
+    client.call("toggleChannelDraftSelectMode");
+    client.call("selectAllChannelDraftShown", true);
+    client.call("resetChannelDraftWorkspace");
+    assert.equal(client.get("channelDraftFilter"), "");
+    assert.equal(client.get("channelDraftSelectMode"), false);
+    assert.deepEqual(plain(client.get("channelDraftSelection")), []);
+  });
+});
+
+describe("client: what a channel adds up to", () => {
+  const epOf = (imdbId, episode, showName, runtime, released) => ({
+    kind: "episode", imdbId, season: 1, episode, showName, epName: "E" + episode,
+    title: showName + " E" + episode, runtime, released,
+  });
+
+  it("counts shows, episodes, hours and the years it spans", () => {
+    const client = loadClient({ routes: {} });
+    const summary = client.call("channelDraftSummary", [
+      epOf("tt1", 1, "Rugrats", 30, "1991-08-11"),
+      epOf("tt1", 2, "Rugrats", 30, "1992-09-13"),
+      epOf("tt2", 1, "Doug", 60, "1994-01-01"),
+    ], {});
+    assert.equal(summary.shows, 2);
+    assert.equal(summary.episodes, 3);
+    assert.equal(summary.hours, 2);
+    assert.equal(summary.estimated, false);
+    assert.equal(summary.firstYear, "1991");
+    assert.equal(summary.lastYear, "1994");
+  });
+
+  it("marks the hours as an estimate when some picks have no runtime", () => {
+    const client = loadClient({ routes: {} });
+    const summary = client.call("channelDraftSummary", [
+      epOf("tt1", 1, "Rugrats", 30, "1991-08-11"),
+      epOf("tt1", 2, "Rugrats", 0, "1992-09-13"),
+    ], {});
+    assert.equal(summary.estimated, true);
+    assert.match(client.call("channelSummaryLine", summary), /~1 hour/);
+  });
+
+  it("falls back to half an hour when nothing at all is known", () => {
+    const client = loadClient({ routes: {} });
+    const summary = client.call("channelDraftSummary", [
+      epOf("tt1", 1, "Rugrats", 0, ""),
+      epOf("tt1", 2, "Rugrats", 0, ""),
+    ], {});
+    assert.equal(summary.hours, 1);
+    assert.equal(summary.firstYear, "");
+  });
+
+  it("names the rules a channel is running under", () => {
+    const client = loadClient({ routes: {} });
+    const line = client.call("channelSummaryLine", client.call("channelDraftSummary", [
+      epOf("tt1", 1, "Rugrats", 30, "1991-08-11"),
+    ], { dailyRotate: true, rotateShows: 6, rotateEpisodes: 2, hideWatched: true, storyLocked: ["tt1"], liveSync: true }));
+    assert.match(line, /6 shows × 2 a day/);
+    assert.match(line, /1 story-locked/);
+    assert.match(line, /hides watched/);
+    assert.match(line, /live cloud sync/);
+  });
+
+  it("says nothing at all for an empty channel", () => {
+    const client = loadClient({ routes: {} });
+    assert.equal(client.call("channelSummaryLine", client.call("channelDraftSummary", [], {})), "");
+  });
+});
+
+describe("client: adding something already in the channel", () => {
+  it("counts what is already there by id or by show name", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", [
+      { kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" },
+      { kind: "episode", imdbId: "tt1", season: 1, episode: 2, showName: "Rugrats" },
+    ]);
+    assert.equal(client.call("channelDraftCountForShow", "tt1", ""), 2);
+    assert.equal(client.call("channelDraftCountForShow", "", "Rugrats"), 2);
+    assert.equal(client.call("channelDraftCountForShow", "tt9", "Doug"), 0);
+    assert.equal(client.call("channelDraftCountForShow", "", ""), 0);
+  });
+
+  it("does not stop the caller when there is no dialog to ask with", () => {
+    const client = loadClient({ routes: {} });
+    client.set("showAppConfirm", undefined);
+    assert.equal(client.call("guardChannelDraftDuplicate", "Rugrats", 2, function () {}), false);
+  });
+
+  it("does not stop the caller when there is no duplicate to warn about", () => {
+    const client = loadClient({ routes: {} });
+    assert.equal(client.call("guardChannelDraftDuplicate", "Rugrats", 0, function () {}), false);
+  });
+
+  it("stops the caller and re-runs it only if the warning is accepted", () => {
+    const client = loadClient({ routes: {} });
+    let accepted = 0;
+    let onConfirm = null;
+    client.set("showAppConfirm", function (title, message, label, cb) { onConfirm = cb; });
+    const stopped = client.call("guardChannelDraftDuplicate", "Rugrats", 2, function () { accepted++; });
+    assert.equal(stopped, true, "the caller stops while the dialog is up");
+    assert.equal(accepted, 0);
+    onConfirm();
+    assert.equal(accepted, 1, "and only confirming runs it again");
+  });
+
+  it("adds nothing while the duplicate warning is unanswered", async () => {
+    const client = loadClient({
+      routes: { "/api/resolve-movie": () => ({ json: { ok: true, imdbId: "tt_new" } }) },
+    });
+    // A dialog nobody answers -- which is the case a promise-based guard
+    // could never represent, because it would simply hang here.
+    client.set("showAppConfirm", function () {});
+    client.set("channelDraftItems", [{ kind: "movie", imdbId: "tt9", tmdbId: "603", title: "The Matrix", showName: "The Matrix" }]);
+    await client.call("addMovieToChannelDraft", "603", "The Matrix", "1999", "", "", null);
+    assert.equal(client.get("channelDraftItems").length, 1, "the duplicate was not added");
+    assert.equal(requestsTo(client, "/api/resolve-movie").length, 0, "and nothing was even asked for");
+  });
+
+  it("adds the duplicate once the warning is accepted", async () => {
+    const client = loadClient({
+      routes: { "/api/resolve-movie": () => ({ json: { ok: true, imdbId: "tt_new" } }) },
+    });
+    client.set("showAppConfirm", function (title, message, label, onConfirm) { onConfirm(); });
+    client.set("channelDraftItems", [{ kind: "movie", imdbId: "tt9", tmdbId: "603", title: "The Matrix", showName: "The Matrix" }]);
+    await client.call("addMovieToChannelDraft", "603", "The Matrix", "1999", "", "", null);
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(client.get("channelDraftItems").length, 2);
+  });
+
+  it("adds a movie the channel does not have without asking", async () => {
+    const client = loadClient({
+      routes: { "/api/resolve-movie": () => ({ json: { ok: true, imdbId: "tt_new", runtime: 136 } }) },
+    });
+    client.set("channelDraftItems", []);
+    await client.call("addMovieToChannelDraft", "603", "The Matrix", "1999", "", "", null);
+    const draft = client.get("channelDraftItems");
+    assert.equal(draft.length, 1);
+    assert.equal(draft[0].runtime, 136, "and its runtime came along, for the hours count");
+  });
+});
+
+describe("client: managing the My Channels list", () => {
+  function withChannels(client, channels) {
+    channels.forEach((ch) => client.call("saveLocalChannel", ch));
+    return client;
+  }
+  const chan = (id, name, over = {}) => ({
+    channelId: id, name, items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" }], ...over,
+  });
+
+  it("sorts by name, size or when it was touched", () => {
+    const client = loadClient({ routes: {} });
+    const all = [
+      chan("a", "Zulu", { items: [] }),
+      chan("b", "Alpha", { items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1 }, { kind: "episode", imdbId: "tt1", season: 1, episode: 2 }] }),
+    ];
+    client.call("setMyChannelsSort", "name");
+    assert.deepEqual(plain(client.call("sortMyChannels", all).map((c) => c.name)), ["Alpha", "Zulu"]);
+    client.call("setMyChannelsSort", "size");
+    assert.deepEqual(plain(client.call("sortMyChannels", all).map((c) => c.name)), ["Alpha", "Zulu"]);
+  });
+
+  it("finds a channel by its name, its description, or a show inside it", () => {
+    const client = loadClient({ routes: {} });
+    const all = [
+      chan("a", "Saturday Morning", { description: "cartoons all day" }),
+      chan("b", "Late Night", { items: [{ kind: "episode", imdbId: "tt2", season: 1, episode: 1, showName: "Seinfeld" }] }),
+    ];
+    client.call("setMyChannelsSearch", "saturday");
+    assert.deepEqual(plain(client.call("filterMyChannels", all).map((c) => c.name)), ["Saturday Morning"]);
+    client.call("setMyChannelsSearch", "cartoons");
+    assert.deepEqual(plain(client.call("filterMyChannels", all).map((c) => c.name)), ["Saturday Morning"]);
+    client.call("setMyChannelsSearch", "seinfeld");
+    assert.deepEqual(plain(client.call("filterMyChannels", all).map((c) => c.name)), ["Late Night"]);
+    client.call("setMyChannelsSearch", "");
+    assert.equal(client.call("filterMyChannels", all).length, 2);
+  });
+
+  it("puts a deleted channel back, picks and all", () => {
+    const client = withChannels(loadClient({ routes: {} }), [chan("ch1", "Saturday Morning")]);
+    const before = JSON.stringify(client.call("loadLocalChannels").ch1);
+    client.set("showAppConfirm", function (title, message, label, onConfirm) { onConfirm(); });
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning");
+    assert.equal(client.call("loadLocalChannels").ch1, undefined);
+    client.call("undoChannelDelete");
+    const after = client.call("loadLocalChannels").ch1;
+    assert.equal(after.name, "Saturday Morning");
+    assert.equal(after.items.length, JSON.parse(before).items.length);
+  });
+
+  it("offers the undo only until it is used", () => {
+    const client = withChannels(loadClient({ routes: {} }), [chan("ch1", "Saturday Morning")]);
+    client.set("showAppConfirm", function (title, message, label, onConfirm) { onConfirm(); });
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning");
+    assert.match(el(client, "myChannelsUndoBar").innerHTML, /Undo/);
+    client.call("undoChannelDelete");
+    assert.equal(el(client, "myChannelsUndoBar").innerHTML, "");
+    // A second Undo has nothing to put back and must not resurrect anything.
+    client.call("undoChannelDelete");
+    assert.equal(Object.keys(client.call("loadLocalChannels")).length, 1);
+  });
+});
+
+describe("client: the Explore Channels directory ordering and likes", () => {
+  const rows = [
+    { code: "a", name: "Alpha", likes: 1, adds: 0, itemCount: 10, showCount: 2 },
+    { code: "b", name: "Zulu", likes: 0, adds: 5, itemCount: 20, showCount: 3 },
+  ];
+
+  it("re-asks the server when the order changes rather than re-sorting one page", async () => {
+    const client = loadClient({
+      routes: { "/api/channel/directory": () => ({ json: { ok: true, channels: rows } }) },
+    });
+    await client.call("loadChannelDirectory", true);
+    assert.equal(requestsTo(client, "/api/channel/directory").length, 1);
+    await client.call("setChannelDirectorySort", "liked");
+    const asked = requestsTo(client, "/api/channel/directory");
+    assert.equal(asked.length, 2);
+    assert.match(asked[1].url, /sort=liked/);
+  });
+
+  it("does nothing when the order picked is the one already showing", async () => {
+    const client = loadClient({
+      routes: { "/api/channel/directory": () => ({ json: { ok: true, channels: rows } }) },
+    });
+    await client.call("loadChannelDirectory", true);
+    await client.call("setChannelDirectorySort", "newest");
+    assert.equal(requestsTo(client, "/api/channel/directory").length, 1);
+  });
+
+  it("fills the heart in before the round trip and keeps the server's answer", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/directory": () => ({ json: { ok: true, channels: rows.map((r) => Object.assign({}, r)) } }),
+        "/api/channel/like": () => ({ json: { ok: true, likes: 2, liked: true } }),
+      },
+    });
+    await client.call("loadChannelDirectory", true);
+    await client.call("toggleChannelDirectoryLike", "a", null);
+    assert.equal(client.get("_channelDirectoryLiked").a, true);
+    assert.match(el(client, "channelDirectoryFeed").innerHTML, /2/);
+  });
+
+  it("puts the heart back when the server refuses", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/directory": () => ({ json: { ok: true, channels: rows.map((r) => Object.assign({}, r)) } }),
+        "/api/channel/like": () => ({ status: 404, json: { ok: false, error: "Channel not found." } }),
+      },
+    });
+    await client.call("loadChannelDirectory", true);
+    await client.call("toggleChannelDirectoryLike", "a", null);
+    assert.equal(!!client.get("_channelDirectoryLiked").a, false);
+  });
+
+  it("tells the server a channel was taken, and never lets that fail the add", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/directory": () => ({ json: { ok: true, channels: rows.map((r) => Object.assign({}, r)) } }),
+        "/api/channel/share": () => ({ json: { ok: true, code: "a", channel: { name: "Alpha", items: [] } } }),
+        "/api/channel/added": () => ({ status: 500, json: { ok: false } }),
+      },
+    });
+    await client.call("loadChannelDirectory", true);
+    await client.call("addDirectoryChannel", "a", null);
+    assert.equal(requestsTo(client, "/api/channel/added").length, 1);
+    assert.ok(
+      Object.values(client.call("loadLocalChannels")).some((ch) => ch.name === "Alpha"),
+      "the channel landed even though the counter call failed"
+    );
   });
 });
