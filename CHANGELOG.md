@@ -6,6 +6,30 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🕒 Episode air times: `9 PM ET` under the air date
+
+- **An episode airing today or later now shows the hour it is on**, under the date on its own page and
+  under the day on its Continue Watching / Airing Next badge — `9 PM ET`, `9:30 PM ET`. An episode that
+  has already gone out shows no time: it is a thing you are waiting for.
+- **TMDB has no episode air time at all** — it dates an episode and stops, which is why every "Airs
+  Tuesday" in this add-on has been a day with no hour behind it. The time comes from
+  [TVmaze](https://www.tvmaze.com/api) instead, which needs **no API key**, so a self-hosted Worker gets
+  this with nothing to configure and nothing to pay for.
+- **The show's regular slot, plus the next episode's own** where TVmaze dates it apart from it — a
+  premiere running long, a finale moved an hour. Every other upcoming episode gets the regular slot, which
+  is what a listing prints for them anyway.
+- **Only a show with an episode still to come is ever looked up**, and the answer is cached for twelve
+  hours (a week in KV): a broadcast slot is a fact about a season, not about a day. A finished show costs
+  nothing, because nothing displays a time against an episode that has already aired.
+- **North American slots are named the way a schedule is spoken** — `ET`, `CT`, `MT`, `PT` — rather
+  than `EDT`/`EST`, which flip twice a year and read as though the time moved. Elsewhere the zone's own
+  short name is used.
+- **Nothing is invented.** A streaming show with no broadcast slot, a show TVmaze has never heard of, or
+  TVmaze being down all come out the same way: the date on its own, exactly as before. An air time is
+  never worth failing a details lookup over.
+- **Stremio rows say it too**: an Airing Next row's description now reads
+  `Next Episode: S03E06 · Airs 2026-10-04 at 9:30 PM ET`.
+
 ### ✅ A show's page says how much of each season you have watched, and "watched" means what has aired
 
 - **Every season header now reads `3/8 episodes`** instead of `8 episodes` — how many of that season are in

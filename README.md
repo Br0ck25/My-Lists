@@ -52,6 +52,13 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 - **"Watched" means everything that has aired.** A show you are caught up on mid-season reads as watched
   and offers **Mark Show Unwatched**, instead of offering to mark episodes you have already seen because
   the rest of the season is still to come.
+- **Air times, not just air dates.** An episode airing today or later shows the hour it is on -- `9 PM ET`,
+  `9:30 PM ET` -- under the date on its page and under the day on its Continue Watching / Airing Next
+  badge. TMDB has no episode air time at all, so it comes from [TVmaze](https://www.tvmaze.com/api), which
+  needs **no API key and no configuration**: the show's regular slot, plus the next episode's own where
+  TVmaze dates it apart (a premiere running long, a finale moved an hour). It is only looked up for a show
+  with an episode still to come, and cached for twelve hours. A streaming show with no broadcast slot, or
+  one TVmaze has never heard of, simply shows the date on its own.
 - **Airing Next** lists the next upcoming episode of every show you have watched, soonest first. The **x** on
   a poster takes one show off that shelf without changing a thing about what you have watched -- and watching
   another episode of it puts it back by itself. Settings -> Account & Sync lists what you have removed if you

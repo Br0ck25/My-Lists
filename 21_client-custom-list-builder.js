@@ -3310,6 +3310,10 @@ async function refreshAiringNext(force) {
   function airingEntryFrom(showId, d) {
     if (!d || !d.nextEpisodeAirDate) return null;
     if (typeof isEpisodeAired === 'function' && isEpisodeAired(d.nextEpisodeAirDate)) return null;
+    // This shelf is the one place every upcoming show's details pass through,
+    // so it is where the per-show air times are filled in for the shelves that
+    // never see a details payload of their own (Continue Watching).
+    if (typeof rememberShowAirTime === 'function') rememberShowAirTime(d);
     const known = knownByShow.get(showId);
     const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
     const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
@@ -3334,6 +3338,10 @@ async function refreshAiringNext(force) {
       isSeasonFinale: isFinale,
       seasonFinaleAirDate: d.seasonFinaleAirDate || null,
       seasonFinaleEpisodeNumber: d.seasonFinaleEpisodeNumber || null,
+      // Stored on the entry as well as in the per-show store, so a tile
+      // restored from local storage on a cold start still knows the hour
+      // without waiting for the shelf to refresh.
+      airTime: d.nextEpisodeAirTimeLabel || (d.airTime && d.airTime.label) || null,
       isUnaired: true,
     };
   }
@@ -3669,10 +3677,7 @@ function buildAiringNextCardHtml() {
     const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
     let dateBadge = '';
     if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-      if (badgeText) {
-        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
-      }
+      dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
     }
     const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
     const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -3762,6 +3767,10 @@ function openAiringNextDetailsPage() {
       isAdult: typeof isAdultOrNsfw === 'function' ? isAdultOrNsfw(it) : !!it.adult,
       isAdultPosterFiltered: typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled() && (it.isAdult || (typeof isAdultOrNsfw === 'function' && isAdultOrNsfw(it))),
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,
       isSeasonFinale: it.isSeasonFinale,

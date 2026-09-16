@@ -1,5 +1,100 @@
 # Changes Log
 
+## 2026-09-16 - Episode air times, from the one source that actually has them
+
+### Files Changed
+`02_http-and-creator-utils.js`, `07_source-fetchers-tmdb-simkl.js`, `09_page-shell.js`,
+`17_client-my-lists-and-trakt-oauth.js`, `19_client-search-and-likes.js`,
+`21_client-custom-list-builder.js`, `23_client-list-management.js`, `worker_entry_combined.js`,
+`README.md`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/helpers-unit.test.mjs`,
+`tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### What prompted it
+
+Asked for: the air time beside or under the air date -- `9 PM ET`, `9:30 PM ET` -- for episodes airing
+today or later.
+
+### Why it needed a new source
+
+TMDB has no episode air time anywhere in its TV payloads. It dates an episode and stops. Every "Airs
+Tuesday" in this add-on has been a day with no hour behind it for that reason, and no amount of squeezing
+TMDB was going to produce one.
+
+Three candidates were checked against real payloads before picking:
+
+| Source | Has the time? | Cost |
+|---|---|---|
+| TMDB | no | already paid |
+| Cinemeta (already used here) | no -- `released` is the date at 05:00Z, i.e. midnight ET, not the broadcast hour | already paid |
+| Trakt | yes (`airs.time` + `airs.timezone`) | needs `TRAKT_CLIENT_ID`, which is an optional secret |
+| TVmaze | yes (`schedule.time` + the network country's IANA zone, and per-episode `airtime`) | **no API key at all** |
+
+Cinemeta was checked directly: Game of Thrones' episodes come back as `2019-05-20T05:00:00.000Z` -- a date
+shifted to midnight ET, not the 9 PM it actually aired. Trakt has the right data but behind a key a
+self-hoster may not have set, which would have made this feature silently absent for them. TVmaze needs
+nothing configured, so that is what this uses.
+
+### What is fetched, and when
+
+`fetchShowAirTime` is only ever called for a show with an episode still to come -- gated on TMDB's
+`next_episode_to_air` as well as the strictly-future `isUnairedFuture`, because that flag does not fire for
+an episode airing TODAY and today is exactly when someone wants to know the hour. A finished show costs
+nothing: nothing displays a time against an episode that has already aired.
+
+One call (`/lookup/shows?imdb=`) gives the show's regular slot and its network country's timezone. A second,
+tiny one follows `_links.nextepisode` when there is one, because the next episode is what every "Airs
+Tomorrow" badge is about and the one most likely to sit outside the regular slot. Measured against the live
+API: an ended show costs 1 fetch, a running one 2, and both are cached for twelve hours in memory and a week
+in KV, behind the same circuit breaker every other provider here sits behind.
+
+`airTimeLabelForNextEpisode` is the single rule for choosing between the two labels, so the Worker's own
+Stremio description and the page cannot print different times for the same episode.
+
+### The label
+
+`formatAirTimeLabel` (02, beside `formatAirDateBadge`) turns `"21:00"` + `"America/New_York"` into
+`9 PM ET`. Minutes are dropped on the hour the way a listing writes it. North American zones are spelled
+`ET`/`CT`/`MT`/`PT` from a small table rather than `EDT`/`EST`: a slot is 9 ET all year, and a label that
+flips twice a year reads as though the time moved. Everywhere else asks `Intl` for the zone's own short
+name on the day, and anything it cannot name recognisably (`GMT+5:30`) is dropped rather than printed.
+
+The Worker ships the finished string, so the page never carries a timezone database.
+
+### Getting it to the page
+
+The air time is a fact about a SHOW, but it has to print beside episodes that reach the page from three
+directions: the show's own page (has the details payload), an Airing Next tile (built from details, then
+stored), and a Continue Watching entry (built from `/api/season`, which has never seen one). Threading a new
+field through all of those -- and through everything already in every browser's local storage -- would have
+been a migration.
+
+So it is remembered per show instead. `rememberShowAirTime` is called from the two places a details payload
+passes through (opening a show's page, and the Airing Next refresh, which sees every upcoming show), writing
+a small entry under every id that show is known by. `showAirTimeLabel` reads it back by whichever id the
+caller happens to hold, and expires an entry after a week -- a show can be moved to a new night. Airing Next
+tiles also store the label directly, so a cold start knows the hour before the shelf refreshes.
+
+### One badge, five shelves
+
+The "Airs Tomorrow" pill was hand-written markup in five places (three in 17, one each in 21 and 23), which
+would have meant teaching five renderers about air times. They now share `airDateBadgeHtml` /
+`watchItemAirDateBadgeHtml`, and the hour goes on a second line inside the same pill rather than making it
+wider -- these sit on posters barely 100px across.
+
+### Tests
+
+`tests/helpers-unit.test.mjs` (6) -- the label: on the hour and off it, midnight and noon, the North
+American table, a zone outside it, and the empty answers (no time, unusable zone, junk input).
+
+`tests/worker.test.mjs` (6) -- what is asked of TVmaze and what is made of it: a broadcast slot, a next
+episode dated apart from it, a streaming show with no slot, a 404 and a thrown fetch both degrading to the
+date alone, a `tmdb:` id costing no request, a next-episode link off TVmaze not being followed, and the
+fetch meter the batch budget reads.
+
+`tests/client.test.mjs` (8) -- the hour under the date for tonight's episode and later ones, the next
+episode's own slot, nothing against an episode already out, nothing at all when TVmaze had none, the per-show
+store found by every id and expiring after a week, and the badge with and without a time.
+
 ## 2026-09-16 - Season watch counts on a show's page, and "watched" measured against what has aired
 
 ### Files Changed

@@ -1831,6 +1831,18 @@ ${seoHeadHtml}
     white-space: nowrap;
     text-transform: uppercase;
   }
+  /* The hour under the day, inside the same pill -- a second line rather than
+     a longer one, because these sit on a poster barely 100px wide. */
+  .cw-date-badge-timed {
+    text-align: center;
+    max-width: calc(100% - 8px);
+  }
+  .cw-date-badge-time {
+    display: block;
+    font-weight: 700;
+    font-size: 0.95em;
+    opacity: 0.92;
+  }
   .cw-date-badge-premiere {
     background: #2fa84f;
     top: auto;

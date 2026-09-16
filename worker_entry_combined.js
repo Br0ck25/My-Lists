@@ -6112,6 +6112,81 @@ function isEpisodeAired(airDateStr) {
   return d.getTime() < today.getTime();
 }
 
+// --- Air times --------------------------------------------------------------
+//
+// The hour behind an air date. TMDB has no episode air TIME at all -- it dates
+// an episode and stops -- so every "Airs Tuesday" in this add-on was a day
+// with no hour behind it. TVmaze has both (see fetchShowAirTime,
+// 07_source-fetchers-tmdb-simkl.js); these turn what it returns into the
+// string a listing would print.
+//
+// Shared by the Worker and the page, which is why they live here beside
+// formatAirDateBadge rather than in a client file: /api/details ships the
+// finished label so the browser never has to know a timezone database.
+
+// "21:00" -> "9 PM", "21:30" -> "9:30 PM". The minutes are dropped on the hour
+// exactly the way a TV listing writes it.
+function formatAirClockTime(time) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(time == null ? "" : time).trim());
+  if (!m) return "";
+  const h24 = Number(m[1]);
+  const mins = Number(m[2]);
+  if (!(h24 >= 0 && h24 <= 23) || !(mins >= 0 && mins <= 59)) return "";
+  const suffix = h24 < 12 ? "AM" : "PM";
+  const h12 = (h24 % 12 === 0) ? 12 : (h24 % 12);
+  return mins === 0 ? (h12 + " " + suffix) : (h12 + ":" + String(mins).padStart(2, "0") + " " + suffix);
+}
+
+// The short name a schedule is spoken in. North America is spelled out because
+// "9 PM ET" is the convention there and it does not move with daylight saving
+// the way "EDT"/"EST" do -- a slot is "9 ET" all year, and a listing that
+// flips label twice a year reads like a different time. Everywhere else asks
+// Intl for the zone's own short name on the day, which is right wherever the
+// abbreviation genuinely changes.
+const AIR_TIME_ZONE_LABELS = {
+  "America/New_York": "ET",
+  "America/Detroit": "ET",
+  "America/Toronto": "ET",
+  "America/Nassau": "ET",
+  "America/Chicago": "CT",
+  "America/Winnipeg": "CT",
+  "America/Mexico_City": "CT",
+  "America/Denver": "MT",
+  "America/Edmonton": "MT",
+  "America/Phoenix": "MST",
+  "America/Los_Angeles": "PT",
+  "America/Vancouver": "PT",
+  "America/Anchorage": "AKT",
+  "Pacific/Honolulu": "HST",
+  "America/Halifax": "AT",
+  "America/St_Johns": "NT",
+};
+
+function airTimeZoneLabel(timezone) {
+  const tz = String(timezone == null ? "" : timezone).trim();
+  if (!tz) return "";
+  if (AIR_TIME_ZONE_LABELS[tz]) return AIR_TIME_ZONE_LABELS[tz];
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" }).formatToParts(new Date());
+    const name = (parts.find((part) => part.type === "timeZoneName") || {}).value || "";
+    // A real abbreviation ("JST", "CET") or the offset form Intl falls back to
+    // ("GMT+9"). Either tells a reader this is not their own clock, which is
+    // the whole job of the label; anything else is dropped.
+    return (/^[A-Z]{2,5}$/.test(name) || /^GMT[+-]\d{1,2}(:\d{2})?$/.test(name)) ? name : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+// "21:00" + "America/New_York" -> "9 PM ET". An empty string means there is no
+// air time to show, which every caller treats as "print the date alone".
+function formatAirTimeLabel(time, timezone) {
+  const clock = formatAirClockTime(time);
+  if (!clock) return "";
+  const zone = airTimeZoneLabel(timezone);
+  return zone ? (clock + " " + zone) : clock;
+}
+
 function formatAirDateBadge(airDateStr) {
   if (!airDateStr) return '';
   const parts = String(airDateStr).split(/[-T\s]/);
@@ -14442,7 +14517,14 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKe
             isSeasonFinale: !!details.isSeasonFinale,
             seasonFinaleAirDate: details.seasonFinaleAirDate || undefined,
             seasonFinaleEpisodeNumber: details.seasonFinaleEpisodeNumber || undefined,
-            description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
+            // "Airs 2026-09-27 at 8 PM ET" where TVmaze knows the slot, and
+            // the date alone where it does not -- a Stremio row is the one
+            // place this add-on shows an air date with no page behind it to
+            // open for the rest.
+            airTime: details.nextEpisodeAirTimeLabel || undefined,
+            description: epLabel
+              ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}${details.nextEpisodeAirTimeLabel ? ` at ${details.nextEpisodeAirTimeLabel}` : ""}`
+              : (details.overview || undefined),
             trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
           });
         }
@@ -16694,6 +16776,121 @@ async function resolveUnpackedShowData(tmdbId, imdbId, standardSeasons, apiKey, 
 // the same shared, canonical-key cache Trakt already uses
 // (fetchWithPerUserCacheAndCircuitBreaker) -- unlike the catalog/chart
 // fetchers above, this function IS reachable with a personal TMDB key
+// --- Episode air times (TVmaze) ---------------------------------------------
+//
+// TMDB dates an episode and stops: there is no air time anywhere in its TV
+// payloads, which is why every "Airs Tuesday" in this add-on has been a day
+// with no hour behind it. TVmaze carries both -- a show's regular slot
+// (schedule.time, in its network country's IANA timezone) and each episode's
+// own airtime -- and it needs no API key, so a self-hosted Worker gets this
+// with nothing to configure and nothing to pay for.
+//
+// It is only ever asked about a show with an episode still to come (see the
+// call in fetchTmdbItemDetailsUncached), which is the only case anything
+// displays, and the answer is cached for twelve hours: a broadcast slot is a
+// fact about a season, not about a day.
+const TVMAZE_API_BASE = "https://api.tvmaze.com";
+
+async function fetchShowAirTimeUncached(imdbId, meter) {
+  const spend = () => { if (meter) meter.spent++; };
+  // A shape rather than null, so a show TVmaze has never heard of caches as
+  // "asked, nothing there" instead of being looked up again on every hit.
+  const nothing = { time: null, timezone: null, label: "", days: [], next: null };
+  const baseImdb = String(imdbId || "").split(":")[0].trim();
+  if (!baseImdb.startsWith("tt")) return nothing;
+
+  try {
+    spend();
+    const res = await fetch(TVMAZE_API_BASE + "/lookup/shows?imdb=" + encodeURIComponent(baseImdb), {
+      headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+      cf: { cacheTtl: 43200, cacheEverything: true },
+    });
+    if (!res.ok) return nothing;
+    const show = await res.json();
+    if (!show || typeof show !== "object") return nothing;
+
+    // A broadcast network carries the country its schedule is quoted in; a
+    // streaming service usually does not, and usually has no time at all --
+    // which is the honest answer for something that drops at midnight in
+    // whatever zone you happen to be in.
+    const timezone =
+      (show.network && show.network.country && show.network.country.timezone) ||
+      (show.webChannel && show.webChannel.country && show.webChannel.country.timezone) ||
+      "";
+    const time = (show.schedule && show.schedule.time) || "";
+    const out = {
+      time: time || null,
+      timezone: timezone || null,
+      label: formatAirTimeLabel(time, timezone),
+      days: (show.schedule && Array.isArray(show.schedule.days)) ? show.schedule.days : [],
+      next: null,
+    };
+
+    // The next episode is the one every "Airs Tomorrow" badge is about, and
+    // the one most likely to sit outside the regular slot -- a feature-length
+    // premiere, a finale moved an hour later. One more small fetch buys the
+    // exact answer for it; every other upcoming episode keeps the show's
+    // regular slot, which is what a listing would print for them anyway.
+    const nextHref = show._links && show._links.nextepisode && show._links.nextepisode.href;
+    if (nextHref && String(nextHref).startsWith(TVMAZE_API_BASE + "/")) {
+      try {
+        spend();
+        const epRes = await fetch(String(nextHref), {
+          headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+          cf: { cacheTtl: 43200, cacheEverything: true },
+        });
+        if (epRes.ok) {
+          const ep = await epRes.json();
+          if (ep && typeof ep.season === "number" && typeof ep.number === "number") {
+            out.next = {
+              season: ep.season,
+              number: ep.number,
+              airdate: ep.airdate || null,
+              time: ep.airtime || null,
+              label: formatAirTimeLabel(ep.airtime || time, timezone),
+            };
+          }
+        }
+      } catch {}
+    }
+    return out;
+  } catch {
+    return nothing;
+  }
+}
+
+// Which of the two labels an upcoming episode gets: its own, when TVmaze
+// dates that exact episode apart from the show's regular slot, and the regular
+// slot otherwise. One rule, so the Worker's Stremio description and the page
+// cannot print different times for the same episode.
+function airTimeLabelForNextEpisode(airTime, nextEpInfo) {
+  if (!airTime) return null;
+  const next = airTime.next;
+  if (next && next.label &&
+      nextEpInfo && Number(nextEpInfo.nextEpisodeSeasonNumber) === Number(next.season) &&
+      Number(nextEpInfo.nextEpisodeNumber) === Number(next.number)) {
+    return next.label;
+  }
+  return airTime.label || null;
+}
+
+async function fetchShowAirTime(imdbId, env, ctx, meter) {
+  const baseImdb = String(imdbId || "").split(":")[0].trim();
+  if (!baseImdb.startsWith("tt")) return null;
+  const cacheKey = `tvmaze:airtime:${baseImdb}`;
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 43200,
+    staleTtlSec: 604800,
+    providerLabel: "TVmaze Air Times",
+    env: env,
+    ctx: ctx,
+    kvKey: cacheKey,
+    kvTtlSec: 604800,
+    fetchFn: () => fetchShowAirTimeUncached(baseImdb, meter),
+  });
+}
+
 // (see /api/details in 25_api-catalog-routes.js, and handleSubtitlesTrack
 // in 26_api-creator-and-admin-routes.js, both of which pass
 // `tmdbKey || TMDB_API_KEY`). Every one of its internal fetch() calls
@@ -17029,6 +17226,16 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
 
   const isUnairedFuture = !!(nextEpInfo && nextEpInfo.nextEpisodeAirDate && nextEpInfo.nextEpisodeAirDate > today);
 
+  // The hour behind the date, for a show that still has one to come. Gated on
+  // next_episode_to_air as well as isUnairedFuture because that flag is
+  // strictly future -- an episode airing TODAY does not set it, and today is
+  // exactly when someone wants to know what time it is on. A finished show is
+  // never looked up: its air time is a fact about the past, and nothing
+  // displays a time against an episode that has already gone out.
+  const airTime = (type === "tv" && (match.next_episode_to_air || isUnairedFuture))
+    ? await fetchShowAirTime(realImdbId, env, ctx, meter)
+    : null;
+
   if (type === "tv" && isUnairedFuture && nextEpInfo.nextEpisodeSeasonNumber) {
     const targetSeason = Array.isArray(match.seasons)
       ? match.seasons.find((s) => s && s.season_number === nextEpInfo.nextEpisodeSeasonNumber)
@@ -17086,6 +17293,12 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     cast: cast,
     director: director,
     ...nextEpInfo,
+    // The show's regular slot, for every upcoming episode, and the exact slot
+    // of the next one where TVmaze dates it separately. Both are finished
+    // strings ("9 PM ET"): the page never has to carry a timezone database to
+    // print one.
+    airTime: airTime || null,
+    nextEpisodeAirTimeLabel: airTimeLabelForNextEpisode(airTime, nextEpInfo),
     isSeasonPremiere: isSeasonPremiere,
     isSeasonFinale: isSeasonFinale,
     seasonFinaleAirDate: seasonFinaleAirDate,
@@ -20291,6 +20504,18 @@ ${seoHeadHtml}
     pointer-events: none;
     white-space: nowrap;
     text-transform: uppercase;
+  }
+  /* The hour under the day, inside the same pill -- a second line rather than
+     a longer one, because these sit on a poster barely 100px wide. */
+  .cw-date-badge-timed {
+    text-align: center;
+    max-width: calc(100% - 8px);
+  }
+  .cw-date-badge-time {
+    display: block;
+    font-weight: 700;
+    font-size: 0.95em;
+    opacity: 0.92;
   }
   .cw-date-badge-premiere {
     background: #2fa84f;
@@ -26112,6 +26337,10 @@ function openMdblistAiringNextDetailsPage() {
       subtitle: label.subtitle,
       poster: it.poster,
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId || it.id,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: isPremiere,
       isSeasonFinale: isFinale,
@@ -26248,8 +26477,7 @@ function renderMyMdblistLists(lists) {
             const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
             let dateBadge = '';
             if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-              const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-              if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+              dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
             }
             const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
             const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -26919,6 +27147,10 @@ function openTraktAiringNextDetailsPage() {
       subtitle: label.subtitle,
       poster: it.poster,
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId || it.id,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: isPremiere,
       isSeasonFinale: isFinale,
@@ -27060,8 +27292,7 @@ function renderMyPrivateTraktLists(lists) {
             const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
             let dateBadge = '';
             if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-              const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-              if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+              dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
             }
             const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
             const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -27726,6 +27957,10 @@ function openSimklAiringNextDetailsPage() {
       subtitle: label.subtitle,
       poster: it.poster,
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId || it.id,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: isPremiere,
       isSeasonFinale: isFinale,
@@ -27858,10 +28093,7 @@ function renderMySimklLists(lists) {
           const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
           let dateBadge = '';
           if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-            const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-            if (badgeText) {
-              dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
-            }
+            dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
           }
           const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
           const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -32066,6 +32298,152 @@ function episodeWatchButtonHtml(ep, isWatched) {
     '</button>';
 }
 
+// --- Air times --------------------------------------------------------------
+//
+// /api/details carries a show's air time as a finished string ("9 PM ET") when
+// TVmaze has one (fetchShowAirTime, 07_source-fetchers-tmdb-simkl.js). It is a
+// fact about the SHOW, but it has to be printed beside episodes that reach the
+// page from somewhere else entirely -- a Continue Watching entry built from
+// /api/season, an Airing Next tile restored from local storage, an episode
+// grid. Threading a new field through all of those, and through everything
+// already stored in every browser, would have been a migration.
+//
+// So it is remembered per show instead, from any details payload that passes
+// through, and looked up by show id wherever a date is printed. A show nobody
+// has details for simply prints its date alone, exactly as before.
+const AIR_TIME_STORE_KEY = 'myListAddon:airTimes';
+const AIR_TIME_STORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const AIR_TIME_STORE_MAX = 300;
+
+function loadAirTimeStore() {
+  if (window._airTimeStore) return window._airTimeStore;
+  let parsed = {};
+  try {
+    parsed = JSON.parse(localStorage.getItem(AIR_TIME_STORE_KEY) || '{}') || {};
+  } catch (e) {
+    parsed = {};
+  }
+  window._airTimeStore = (parsed && typeof parsed === 'object') ? parsed : {};
+  return window._airTimeStore;
+}
+
+function saveAirTimeStore(store) {
+  window._airTimeStore = store;
+  try {
+    // Oldest out first past the cap. A broadcast slot is small, but this is
+    // written from a shelf refresh that can touch sixty shows at once.
+    const keys = Object.keys(store);
+    if (keys.length > AIR_TIME_STORE_MAX) {
+      keys.sort((a, b) => (store[a] && store[a].at || 0) - (store[b] && store[b].at || 0));
+      keys.slice(0, keys.length - AIR_TIME_STORE_MAX).forEach((k) => { delete store[k]; });
+    }
+    localStorage.setItem(AIR_TIME_STORE_KEY, JSON.stringify(store));
+  } catch (e) {}
+}
+
+// Every id the same show is known by here, because what asks for its air time
+// later may only have one of them: a tile carries the id its shelf was built
+// from, not the one /api/details answered to.
+function showAirTimeAliases(d) {
+  if (!d) return [];
+  const ids = [d.id, d.imdbId, d.tmdbId, (d.tmdbId ? 'tmdb:' + d.tmdbId : null)];
+  const out = new Set();
+  ids.forEach((id) => {
+    if (id == null || id === '') return;
+    const str = String(id);
+    out.add(str);
+    // A composite episode id ("tt123:2:4") is still that show.
+    if (str.includes(':') && !str.startsWith('tmdb:')) out.add(str.split(':')[0]);
+  });
+  return [...out];
+}
+
+function rememberShowAirTime(d) {
+  if (!d) return;
+  const airTime = d.airTime || null;
+  const label = (airTime && airTime.label) || '';
+  const nextLabel = d.nextEpisodeAirTimeLabel || '';
+  if (!label && !nextLabel) return;
+  const entry = {
+    label: label,
+    nextLabel: nextLabel,
+    nextSeason: (d.nextEpisodeSeasonNumber != null) ? Number(d.nextEpisodeSeasonNumber) : null,
+    nextNumber: (d.nextEpisodeNumber != null) ? Number(d.nextEpisodeNumber) : null,
+    at: Date.now(),
+  };
+  const store = loadAirTimeStore();
+  showAirTimeAliases(d).forEach((id) => { store[id] = entry; });
+  saveAirTimeStore(store);
+}
+window.rememberShowAirTime = rememberShowAirTime;
+
+// The air time to print for one episode of one show. The next episode gets its
+// own slot where TVmaze dated it apart from the regular one -- a premiere
+// running long, a finale moved an hour -- and everything else gets the show's
+// regular slot, which is what a listing prints for them too.
+function showAirTimeLabel(showId, seasonNum, episodeNum) {
+  if (showId == null || showId === '') return '';
+  const store = loadAirTimeStore();
+  const str = String(showId);
+  const entry = store[str] ||
+    (str.includes(':') && !str.startsWith('tmdb:') ? store[str.split(':')[0]] : null) ||
+    (str.startsWith('tmdb:') ? store[str.slice(5)] : store['tmdb:' + str]);
+  if (!entry || !entry.at || (Date.now() - entry.at) > AIR_TIME_STORE_TTL_MS) return '';
+  if (entry.nextLabel && seasonNum != null && episodeNum != null &&
+      Number(entry.nextSeason) === Number(seasonNum) && Number(entry.nextNumber) === Number(episodeNum)) {
+    return entry.nextLabel;
+  }
+  return entry.label || entry.nextLabel || '';
+}
+window.showAirTimeLabel = showAirTimeLabel;
+
+// The air time for an episode of the show whose page is open, which knows its
+// own details payload and does not need the store at all. Empty for anything
+// that has already gone out: a time is a thing you are waiting for.
+function episodeAirTimeLabel(d, ep) {
+  if (!d || !ep) return '';
+  if (typeof isEpisodeAired === 'function' && isEpisodeAired(ep)) return '';
+  const sNum = (ep.season_number != null) ? Number(ep.season_number) : Number(window._currentSeasonNum);
+  const eNum = Number(ep.episode_number);
+  if (d.nextEpisodeAirTimeLabel &&
+      Number(d.nextEpisodeSeasonNumber) === sNum && Number(d.nextEpisodeNumber) === eNum) {
+    return d.nextEpisodeAirTimeLabel;
+  }
+  if (d.airTime && d.airTime.label) return d.airTime.label;
+  return showAirTimeLabel(d.id, sNum, eNum);
+}
+window.episodeAirTimeLabel = episodeAirTimeLabel;
+
+// The "Airs Tomorrow" pill on a poster, with the hour under the day when one
+// is known. Five shelves rendered this markup by hand and each had to be
+// taught the time separately, so they share it now.
+function airDateBadgeHtml(airDate, timeLabel, extraClass) {
+  if (!airDate) return '';
+  const dateText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(airDate) : '';
+  if (!dateText) return '';
+  const cls = 'cw-date-badge' + (extraClass ? ' ' + extraClass : '') + (timeLabel ? ' cw-date-badge-timed' : '');
+  const title = 'Airs on ' + airDate + (timeLabel ? ' at ' + timeLabel : '');
+  return '<div class="' + cls + '" title="' + escapeAttr(title) + '">' +
+    escapeHtml(dateText) +
+    (timeLabel ? '<span class="cw-date-badge-time">' + escapeHtml(timeLabel) + '</span>' : '') +
+    '</div>';
+}
+window.airDateBadgeHtml = airDateBadgeHtml;
+
+// The same pill for a Continue Watching / Airing Next entry, which is the
+// shape every shelf here holds. The entry's own airTime wins where it has one
+// (an Airing Next tile stores it), and the per-show store answers for
+// everything else -- a Continue Watching entry is built from /api/season and
+// has never seen a details payload.
+function watchItemAirDateBadgeHtml(it) {
+  if (!it || !it.airDate) return '';
+  if (typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate)) return '';
+  const timeLabel = it.airTime ||
+    (typeof showAirTimeLabel === 'function' ? showAirTimeLabel(it.showId || it.id, it.seasonNum, it.episodeNum) : '');
+  return airDateBadgeHtml(it.airDate, timeLabel);
+}
+window.watchItemAirDateBadgeHtml = watchItemAirDateBadgeHtml;
+
 function formatAirDateBadge(airDateStr) {
   if (!airDateStr) return '';
   const parts = String(airDateStr).split(/[-T\s]/);
@@ -32107,8 +32485,14 @@ function openEpisodeDetails(epNum) {
   const runtime = ep.runtime ? ep.runtime + ' min' : '';
   const date = ep.air_date ? ep.air_date : '';
   
+  // Under the date, not beside it: this is the one place with room to print
+  // the slot in full, and an episode still to come is the only one it is shown
+  // against (episodeAirTimeLabel returns nothing once an episode is out).
+  const airTimeLabel = typeof episodeAirTimeLabel === 'function' ? episodeAirTimeLabel(d, ep) : '';
+
   let infoHtml = '';
   if (date) infoHtml += '<div style="margin-bottom:6px;">' + escapeHtml(date) + '</div>';
+  if (airTimeLabel) infoHtml += '<div style="margin-bottom:6px; color:var(--brand);">' + escapeHtml(airTimeLabel) + '</div>';
   if (runtime) infoHtml += '<div style="margin-bottom:6px;">' + escapeHtml(runtime) + '</div>';
   if (ep.vote_average) infoHtml += '<div style="margin-bottom:6px;">\u2605 ' + escapeHtml(Number(ep.vote_average).toFixed(1)) + ' TMDB</div>';
   
@@ -32712,6 +33096,10 @@ async function openItemDetailsModal(id, type, opts) {
     // question behind every count and every watched check below.
     window._seasonEpisodesMap = {};
     window._episodeDataCache = {};
+    // Kept for every shelf that prints this show's air date without ever
+    // holding its details -- Continue Watching, Airing Next (see
+    // rememberShowAirTime).
+    rememberShowAirTime(d);
     
     // Formatting helpers
     let dateStr = d.releaseYear || '';
@@ -47284,6 +47672,10 @@ async function refreshAiringNext(force) {
   function airingEntryFrom(showId, d) {
     if (!d || !d.nextEpisodeAirDate) return null;
     if (typeof isEpisodeAired === 'function' && isEpisodeAired(d.nextEpisodeAirDate)) return null;
+    // This shelf is the one place every upcoming show's details pass through,
+    // so it is where the per-show air times are filled in for the shelves that
+    // never see a details payload of their own (Continue Watching).
+    if (typeof rememberShowAirTime === 'function') rememberShowAirTime(d);
     const known = knownByShow.get(showId);
     const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
     const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
@@ -47308,6 +47700,10 @@ async function refreshAiringNext(force) {
       isSeasonFinale: isFinale,
       seasonFinaleAirDate: d.seasonFinaleAirDate || null,
       seasonFinaleEpisodeNumber: d.seasonFinaleEpisodeNumber || null,
+      // Stored on the entry as well as in the per-show store, so a tile
+      // restored from local storage on a cold start still knows the hour
+      // without waiting for the shelf to refresh.
+      airTime: d.nextEpisodeAirTimeLabel || (d.airTime && d.airTime.label) || null,
       isUnaired: true,
     };
   }
@@ -47643,10 +48039,7 @@ function buildAiringNextCardHtml() {
     const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
     let dateBadge = '';
     if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-      if (badgeText) {
-        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
-      }
+      dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
     }
     const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
     const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -47736,6 +48129,10 @@ function openAiringNextDetailsPage() {
       isAdult: typeof isAdultOrNsfw === 'function' ? isAdultOrNsfw(it) : !!it.adult,
       isAdultPosterFiltered: typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled() && (it.isAdult || (typeof isAdultOrNsfw === 'function' && isAdultOrNsfw(it))),
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,
       isSeasonFinale: it.isSeasonFinale,
@@ -55306,10 +55703,19 @@ function livePreviewPosterHtml(m) {
     const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
 
     if (showAirDate && !m.hideDateBadge && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
-      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
-      if (badgeText) {
-        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(effectiveAirDate) + '">' + escapeHtml(badgeText) + '</div>';
-      }
+      // Built rather than passed straight through: this renderer resolves the
+      // date, season and episode itself from the tile plus its Airing Next
+      // match, and those resolved values are what the air time has to be
+      // looked up against.
+      dateBadge = typeof watchItemAirDateBadgeHtml === 'function'
+        ? watchItemAirDateBadgeHtml({
+            airDate: effectiveAirDate,
+            airTime: m.airTime || (airingMatch && airingMatch.airTime) || '',
+            showId: m.showId || m.id,
+            seasonNum: mSeason,
+            episodeNum: currentEpNum,
+          })
+        : '';
     }
 
     const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (m.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));

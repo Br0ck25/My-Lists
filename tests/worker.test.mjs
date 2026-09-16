@@ -10981,3 +10981,123 @@ describe("worker: channel video ids are real stream requests", () => {
     assert.deepEqual(Array.from(meta.videos, (v) => v.episode), items.map((_, i) => i + 1));
   });
 });
+
+// TMDB has no episode air time at all, so the hour behind every "Airs Tuesday"
+// comes from TVmaze (fetchShowAirTime, 07_source-fetchers-tmdb-simkl.js).
+// These pin down what is asked of it, what is made of the answer, and that a
+// show it has never heard of -- or a streaming service with no slot -- degrades
+// to the date alone rather than to a guess.
+describe("worker: episode air times", () => {
+  function loadAirTimeSource(fetchStub) {
+    const sandbox = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "07_source-fetchers-tmdb-simkl.js");
+    sandbox.fetch = fetchStub;
+    return sandbox;
+  }
+
+  const jsonRes = (body, ok = true) => ({ ok, json: async () => body });
+
+  const BROADCAST_SHOW = {
+    id: 82,
+    name: "Air Show",
+    schedule: { time: "21:00", days: ["Sunday"] },
+    network: { name: "HBO", country: { name: "United States", code: "US", timezone: "America/New_York" } },
+    webChannel: null,
+    _links: { self: { href: "https://api.tvmaze.com/shows/82" } },
+  };
+
+  it("turns a show's slot into the string a listing prints", async () => {
+    const calls = [];
+    const sb = loadAirTimeSource(async (url) => {
+      calls.push(String(url));
+      return jsonRes(BROADCAST_SHOW);
+    });
+    const out = await sb.fetchShowAirTimeUncached("tt0944947");
+    assert.equal(out.label, "9 PM ET");
+    assert.equal(out.time, "21:00");
+    assert.equal(out.timezone, "America/New_York");
+    assert.equal(out.next, null, "a show with no next episode link is one fetch");
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /^https:\/\/api\.tvmaze\.com\/lookup\/shows\?imdb=tt0944947$/);
+  });
+
+  it("takes the next episode's own slot when TVmaze dates it apart from the regular one", async () => {
+    const sb = loadAirTimeSource(async (url) => {
+      if (String(url).includes("/lookup/shows")) {
+        return jsonRes({
+          ...BROADCAST_SHOW,
+          _links: { ...BROADCAST_SHOW._links, nextepisode: { href: "https://api.tvmaze.com/episodes/999" } },
+        });
+      }
+      return jsonRes({ season: 3, number: 6, airdate: "2026-10-04", airtime: "21:30" });
+    });
+    const out = await sb.fetchShowAirTimeUncached("tt0944947");
+    assert.equal(out.label, "9 PM ET", "the regular slot is still what other episodes get");
+    assert.deepEqual(
+      { season: out.next.season, number: out.next.number, label: out.next.label },
+      { season: 3, number: 6, label: "9:30 PM ET" },
+      "a premiere that runs long gets its own time"
+    );
+
+    // Which of the two an episode gets is one rule, so the Worker's Stremio
+    // description and the page cannot print different times for it.
+    assert.equal(sb.airTimeLabelForNextEpisode(out, { nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 6 }), "9:30 PM ET");
+    assert.equal(sb.airTimeLabelForNextEpisode(out, { nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 7 }), "9 PM ET",
+      "a different episode falls back to the regular slot");
+    assert.equal(sb.airTimeLabelForNextEpisode(null, { nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 6 }), null);
+  });
+
+  it("says nothing for a streaming show with no broadcast slot", async () => {
+    const sb = loadAirTimeSource(async () => jsonRes({
+      id: 41220, name: "Streamer", schedule: { time: "", days: ["Friday"] },
+      network: null, webChannel: { name: "Apple TV", country: null }, _links: {},
+    }));
+    const out = await sb.fetchShowAirTimeUncached("tt11280740");
+    assert.equal(out.label, "", "no invented hour for something that just appears");
+    assert.equal(out.time, null);
+  });
+
+  it("degrades to nothing when TVmaze has never heard of the show, or is down", async () => {
+    const missing = loadAirTimeSource(async () => ({ ok: false, json: async () => null }));
+    const out = await missing.fetchShowAirTimeUncached("tt0000001");
+    // Field by field rather than deep-compared: the object comes out of the
+    // vm's own realm and is never reference-equal to a plain one out here.
+    assert.equal(out.label, "");
+    assert.equal(out.time, null);
+    assert.equal(out.timezone, null);
+    assert.equal(out.next, null);
+    assert.equal(out.days.length, 0);
+
+    const broken = loadAirTimeSource(async () => { throw new Error("network down"); });
+    assert.equal((await broken.fetchShowAirTimeUncached("tt0944947")).label, "",
+      "an air time is never worth failing a details lookup over");
+
+    // A tmdb: id has no IMDb id to look up, and must not cost a request.
+    let called = 0;
+    const noImdb = loadAirTimeSource(async () => { called++; return jsonRes(BROADCAST_SHOW); });
+    assert.equal((await noImdb.fetchShowAirTimeUncached("tmdb:1396")).label, "");
+    assert.equal(called, 0);
+  });
+
+  it("follows the next-episode link only while it points at TVmaze", async () => {
+    const seen = [];
+    const sb = loadAirTimeSource(async (url) => {
+      seen.push(String(url));
+      if (String(url).includes("/lookup/shows")) {
+        return jsonRes({ ...BROADCAST_SHOW, _links: { nextepisode: { href: "https://example.invalid/episodes/999" } } });
+      }
+      return jsonRes({ season: 1, number: 1, airtime: "06:00" });
+    });
+    const out = await sb.fetchShowAirTimeUncached("tt0944947");
+    assert.equal(seen.length, 1, "a link off TVmaze is not a link this follows");
+    assert.equal(out.next, null);
+  });
+
+  it("counts its fetches for the batch budget", async () => {
+    const sb = loadAirTimeSource(async (url) => String(url).includes("/lookup/shows")
+      ? jsonRes({ ...BROADCAST_SHOW, _links: { nextepisode: { href: "https://api.tvmaze.com/episodes/999" } } })
+      : jsonRes({ season: 1, number: 1, airtime: "21:00" }));
+    const meter = { spent: 0 };
+    await sb.fetchShowAirTimeUncached("tt0944947", meter);
+    assert.equal(meter.spent, 2, "/api/details/batch has to see these to stay inside a free Worker's budget");
+  });
+});

@@ -4524,3 +4524,114 @@ describe("client: a not-yet-aired episode is not something anyone watched", () =
     assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, air_date: "2020-01-01" }), true);
   });
 });
+
+// The hour behind the date. /api/details carries it as a finished string, and
+// the page has to print it against episodes that reach it from three different
+// directions -- the show's own page, a Continue Watching entry built from
+// /api/season, an Airing Next tile restored from local storage.
+describe("client: air times", () => {
+  const dayOffset = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+
+  const DETAILS = {
+    id: "tt_air", tmdbId: "777", title: "Air Show", overview: "x", poster: "", seasons: 3,
+    seasonsData: [{ season_number: 3, name: "Season 3", episode_count: 10, air_date: dayOffset(-60) }],
+    nextEpisodeAirDate: dayOffset(3), nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 6,
+    airTime: {
+      time: "21:00", timezone: "America/New_York", label: "9 PM ET", days: ["Sunday"],
+      next: { season: 3, number: 6, airdate: dayOffset(3), time: "21:30", label: "9:30 PM ET" },
+    },
+    nextEpisodeAirTimeLabel: "9:30 PM ET",
+  };
+
+  const EPISODES = [
+    { id: 1, episode_number: 5, season_number: 3, name: "Already Out", air_date: dayOffset(-4), overview: "" },
+    { id: 2, episode_number: 6, season_number: 3, name: "Next One", air_date: dayOffset(3), overview: "" },
+    { id: 3, episode_number: 7, season_number: 3, name: "Later One", air_date: dayOffset(10), overview: "" },
+    { id: 4, episode_number: 8, season_number: 3, name: "Tonight", air_date: dayOffset(0), overview: "" },
+  ];
+
+  async function openShow(details) {
+    const client = loadClient({
+      routes: {
+        "/api/details": () => ({ json: { ok: true, details: details || DETAILS } }),
+        "/api/season": () => ({ json: { ok: true, season: { episodes: EPISODES } } }),
+      },
+    });
+    client.set("_fullyWatchedShowIds", new Set());
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: [] } });
+    await client.call("openItemDetailsModal", "tt_air", "series");
+    client.set("_episodeDataCache", Object.fromEntries(EPISODES.map((e) => [e.episode_number, e])));
+    client.set("_currentSeasonNum", 3);
+    return client;
+  }
+
+  function episodeModalTimes(client, epNum) {
+    let html = "";
+    client.set("showModal", (inner) => { html = inner; });
+    client.call("openEpisodeDetails", epNum);
+    return [...html.matchAll(/color:var\(--brand\);">([^<]*)</g)].map((m) => m[1]);
+  }
+
+  it("puts the hour under the date, for tonight's episode and every later one", async () => {
+    const client = await openShow();
+    assert.deepEqual(episodeModalTimes(client, 8), ["9 PM ET"], "an episode airing today is exactly when this matters");
+    assert.deepEqual(episodeModalTimes(client, 7), ["9 PM ET"], "a later episode gets the show's regular slot");
+  });
+
+  it("gives the next episode its own slot where it was dated apart", async () => {
+    const client = await openShow();
+    assert.deepEqual(episodeModalTimes(client, 6), ["9:30 PM ET"]);
+  });
+
+  it("says nothing against an episode that has already gone out", async () => {
+    const client = await openShow();
+    assert.deepEqual(episodeModalTimes(client, 5), [], "a time is a thing you are still waiting for");
+  });
+
+  it("prints the date alone when TVmaze had no slot for the show", async () => {
+    const noTime = { ...DETAILS, airTime: { time: null, timezone: null, label: "", days: [], next: null }, nextEpisodeAirTimeLabel: null };
+    const client = await openShow(noTime);
+    assert.deepEqual(episodeModalTimes(client, 6), [], "a streaming drop has no hour to invent");
+  });
+
+  it("remembers the show's slot for shelves that never see its details", async () => {
+    const client = await openShow();
+    // Continue Watching entries are built from /api/season and carry no air
+    // time of their own; the store is what answers for them.
+    assert.equal(client.call("showAirTimeLabel", "tt_air", 3, 7), "9 PM ET");
+    assert.equal(client.call("showAirTimeLabel", "tt_air", 3, 6), "9:30 PM ET", "the next episode keeps its own");
+    assert.equal(client.call("showAirTimeLabel", "777", 3, 7), "9 PM ET", "found by TMDB id too");
+    assert.equal(client.call("showAirTimeLabel", "tmdb:777", 3, 7), "9 PM ET");
+    assert.equal(client.call("showAirTimeLabel", "tt_air:3:7", 3, 7), "9 PM ET", "an episode id is still that show");
+    assert.equal(client.call("showAirTimeLabel", "tt_unknown", 3, 7), "", "a show nobody has details for says nothing");
+  });
+
+  it("stops trusting a remembered slot once it is a week old", async () => {
+    const client = await openShow();
+    const store = client.call("loadAirTimeStore");
+    Object.keys(store).forEach((k) => { store[k].at = Date.now() - (8 * 24 * 60 * 60 * 1000); });
+    assert.equal(client.call("showAirTimeLabel", "tt_air", 3, 7), "", "a show can be moved to a new night");
+  });
+
+  it("puts the hour under the day on a poster badge, and never on an aired one", async () => {
+    const client = await openShow();
+    const next = client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(3), showId: "tt_air", seasonNum: 3, episodeNum: 6 });
+    assert.match(next, /class="cw-date-badge cw-date-badge-timed"/);
+    assert.match(next, /<span class="cw-date-badge-time">9:30 PM ET<\/span>/);
+    assert.match(next, /title="Airs on [\d-]+ at 9:30 PM ET"/);
+
+    const unknown = client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(2), showId: "tt_nobody" });
+    assert.match(unknown, /class="cw-date-badge"/, "no time is still a date badge");
+    assert.equal(/cw-date-badge-time/.test(unknown), false);
+
+    assert.equal(client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(-2), showId: "tt_air" }), "",
+      "an episode that has aired gets no badge at all");
+    assert.equal(client.call("watchItemAirDateBadgeHtml", { showId: "tt_air" }), "");
+  });
+
+  it("prefers the time stored on an entry over the one remembered for its show", async () => {
+    const client = await openShow();
+    const badge = client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(3), airTime: "8 PM CT", showId: "tt_air", seasonNum: 3, episodeNum: 6 });
+    assert.match(badge, /8 PM CT/, "a tile restored from local storage knows its own hour");
+  });
+});
