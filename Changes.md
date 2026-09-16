@@ -1,5 +1,58 @@
 # Changes Log
 
+## 2026-09-16 - A movie in a Channel is no longer a dead end in Stremio
+
+### Files Changed
+`05_catalog-core.js`, `25_api-catalog-routes.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`
+
+### What prompted it
+
+Reported: a movie added to a Channel cannot be played in Stremio, and PenguPlay finds no stream for it,
+while Nuvio plays it.
+
+### The cause, which was already written down
+
+`05_catalog-core.js` carried a NOTE calling this "a known soft spot": a Channel's meta is a SERIES, and
+Stremio does not re-derive a type per video, so tapping a movie in one requests
+`/stream/series/<the movie's plain imdb id>.json`. Most stream add-ons branch their whole handler on that
+type param before they look at the id at all. The note guessed that lenient, Torrentio-style add-ons would
+cope and others might not -- which is exactly the split the report describes. Nuvio resolves the id itself
+(it renders from this add-on's full metadata, see the /meta route's own comment) and so was never affected.
+
+### What can and cannot be fixed
+
+Nothing here can make a third-party stream add-on answer a series-typed request for a movie. The id cannot
+be reshaped into something they would answer either: `tt123:1:1` points at a season 1 episode 1 that does
+not exist, and a bare number or a private prefix matches no `idPrefixes` anywhere, so no add-on is asked at
+all.
+
+What can be fixed is that the request is a DEAD END. This add-on answers that one id itself, with a single
+stream whose `externalUrl` is `stremio:///detail/movie/<id>/<id>` -- handled by Stremio itself, so it moves
+within the app to the movie's own page, where every stream add-on is asked for it as a movie and finds it.
+One tap instead of nothing.
+
+The video's id is left exactly as it was (`channelItemStreamId` still returns the movie's plain id), because
+that is what Nuvio resolves today. This is an extra answer, not a different question.
+
+### Keeping it off everyone else's playback
+
+A `stream` resource is declared for every id matching its `idPrefixes`, so declaring it unconditionally
+would have Stremio call this Worker on every episode anyone plays anywhere, for an answer that is always
+empty. `channelMovieStreamIndex` builds the set of movie ids reachable from a config's enabled Channels, and
+`buildManifest` declares the resource only when that set is non-empty.
+
+The route matches the id against that same set rather than parsing it. An id with no season and episode is
+not proof of a movie -- a show's own bare id is a real request Stremio makes -- and offering the link there
+would be a dead link of a different kind.
+
+### Tests
+
+`tests/worker.test.mjs` (7) -- the index picking up movies and ignoring episodes, disabled channels and
+non-channel entries; the resource declared only with a movie present; the route answering that one id and
+returning an empty list for an episode, a movie in nobody's channel, the movie type, and a show's bare id;
+a TMDB-only movie id; and the channel meta still emitting the movie's plain id.
+
 ## 2026-09-16 - Episode air times, from the one source that actually has them
 
 ### Files Changed

@@ -6,6 +6,25 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🎬 Fixed: a movie in a Channel had no streams in Stremio
+
+- **Reported**: a movie added to a Channel could not be played in Stremio — PenguPlay found no stream for
+  it — while Nuvio played it fine.
+- **Why**: a Channel's metadata is a *series*, and Stremio does not work out a type per video. Tapping a
+  movie in one asks every stream add-on for `/stream/series/<the movie's own IMDb id>.json`. Most stream
+  add-ons branch on that `type` before they ever look at the id, so the request comes back empty.
+  Torrentio-style add-ons tend to be lenient about id shape, which is why this worked for some people and
+  not others; Nuvio resolves the id itself, which is why it never broke.
+- **Nothing can make a third-party add-on answer a series request for a movie.** What this does is stop
+  that request being a dead end: the add-on now answers that one id itself, with a **link straight to the
+  movie's own page**, where every stream add-on is asked for it as a movie and finds it. One tap instead
+  of nothing.
+- **The video's id is unchanged**, so Nuvio keeps resolving and playing it directly as it does today.
+- **Declared only where it is needed.** The `stream` resource appears in your manifest only if one of your
+  enabled Channels actually contains a movie — otherwise Stremio would call this add-on for every episode
+  anyone plays, to be told "no streams" every time. Episodes, movies in nobody's Channel, and a show's own
+  bare id all get an empty list.
+
 ### 🕒 Episode air times: `9 PM ET` under the air date
 
 - **An episode airing today or later now shows the hour it is on**, under the date on its own page and

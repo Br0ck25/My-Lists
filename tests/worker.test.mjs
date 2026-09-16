@@ -11101,3 +11101,108 @@ describe("worker: episode air times", () => {
     assert.equal(meter.spent, 2, "/api/details/batch has to see these to stay inside a free Worker's budget");
   });
 });
+
+// A channel's meta is a series, and Stremio does not re-derive a type per
+// video: tapping a movie in one asks every stream add-on for
+// /stream/series/<the movie's own imdb id>.json. Add-ons that branch on that
+// type before reading the id answer nothing, which is the reported "Stremio
+// cannot find the movie, PenguPlay finds no stream". This add-on answers that
+// one id itself, with a link to the movie's own page.
+describe("worker: a movie inside a channel", () => {
+  const channelFns = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+
+  const MOVIE = { kind: "movie", imdbId: "tt0133093", title: "The Matrix", year: 1999 };
+  const EPISODE = { kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" };
+  const channelEntry = (items, over = {}) => ({
+    id: "ch1", type: "series", name: "My Channel", enabled: true,
+    url: "channel:v1:" + JSON.stringify({ channelId: "ch1", name: "My Channel", items }),
+    ...over,
+  });
+
+  async function savedConfig(env, entries) {
+    const saved = await call(env, "/api/save", { method: "POST", json: { entries } });
+    return saved.body.id;
+  }
+
+  it("indexes only the movies, and only from channels that are on", () => {
+    const withMovie = channelFns.channelMovieStreamIndex([channelEntry([EPISODE, MOVIE])]);
+    assert.deepEqual([...withMovie.keys()], ["tt0133093"]);
+    assert.equal(withMovie.get("tt0133093").title, "The Matrix");
+
+    assert.equal(channelFns.channelMovieStreamIndex([channelEntry([EPISODE])]).size, 0,
+      "a channel of episodes needs nothing from this add-on");
+    assert.equal(channelFns.channelMovieStreamIndex([channelEntry([MOVIE], { enabled: false })]).size, 0);
+    assert.equal(channelFns.channelMovieStreamIndex([{ id: "x", url: "mdblist:https://mdblist.com/lists/a/b" }]).size, 0,
+      "a list is not a channel");
+    assert.equal(channelFns.channelMovieStreamIndex([]).size, 0);
+  });
+
+  it("declares the stream resource only where it has something to answer", () => {
+    const resourceFor = (entries) =>
+      (channelFns.buildManifest(entries, "https://example.com").resources || []).find((r) => r && r.name === "stream") || null;
+
+    // Field by field: the object comes out of the vm's own realm and is
+    // never reference-equal to a plain one out here.
+    const declared = resourceFor([channelEntry([EPISODE, MOVIE])]);
+    assert.equal(declared.name, "stream");
+    assert.deepEqual([...declared.types], ["series"]);
+    assert.deepEqual([...declared.idPrefixes], ["tt", "tmdb:"]);
+    assert.equal(resourceFor([channelEntry([EPISODE])]), null,
+      "otherwise Stremio would call this add-on on every episode anyone plays, for an always-empty answer");
+    assert.equal(resourceFor([]), null);
+  });
+
+  it("answers that one id with a link to the movie's own page", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const id = await savedConfig(env, [channelEntry([EPISODE, MOVIE])]);
+
+    const res = await call(env, `/${id}/stream/series/tt0133093.json`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.streams.length, 1);
+    const stream = res.body.streams[0];
+    assert.equal(stream.externalUrl, "stremio:///detail/movie/tt0133093/tt0133093",
+      "stremio:/// is handled by Stremio itself, so this moves within the app");
+    assert.match(stream.title, /The Matrix/, "the entry says which movie it opens");
+  });
+
+  it("offers nothing for an episode, a movie in nobody's channel, or the wrong type", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const id = await savedConfig(env, [channelEntry([EPISODE, MOVIE])]);
+
+    for (const path of [
+      `/${id}/stream/series/tt0108778:5:13.json`,
+      `/${id}/stream/series/tt9999999.json`,
+      `/${id}/stream/movie/tt0133093.json`,
+    ]) {
+      const res = await call(env, path);
+      assert.equal(res.status, 200, path);
+      assert.deepEqual(res.body.streams, [], path + " must not be offered a link");
+    }
+  });
+
+  it("never claims a show id just because it carries no season and episode", async () => {
+    // An id with no :S:E is not proof of a movie. Matching this person's own
+    // channels rather than parsing the id is what keeps a show's bare id --
+    // which is a real request Stremio makes -- from getting a dead link.
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const id = await savedConfig(env, [channelEntry([EPISODE, MOVIE])]);
+    const res = await call(env, `/${id}/stream/series/tt0108778.json`);
+    assert.deepEqual(res.body.streams, []);
+  });
+
+  it("still emits the movie's plain id in the channel meta", () => {
+    // Unchanged on purpose: Nuvio resolves that id itself and plays the movie
+    // today. The fix is an extra answer, not a different id.
+    const meta = channelFns.buildChannelMeta(channelEntry([EPISODE, MOVIE]), "https://example.com");
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:5:13", "tt0133093"]);
+  });
+
+  it("covers a movie a channel only knows by TMDB id", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const tmdbMovie = { kind: "movie", imdbId: "tmdb:603", title: "The Matrix", year: 1999 };
+    const id = await savedConfig(env, [channelEntry([tmdbMovie])]);
+    const res = await call(env, `/${id}/stream/series/${encodeURIComponent("tmdb:603")}.json`);
+    assert.equal(res.body.streams.length, 1);
+    assert.equal(res.body.streams[0].externalUrl, "stremio:///detail/movie/tmdb%3A603/tmdb%3A603");
+  });
+});

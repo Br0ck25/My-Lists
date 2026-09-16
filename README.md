@@ -41,6 +41,10 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 ### Virtual TV Channel Builder
 - Create synthetic linear TV channels and scheduled playlists combining hand-picked episodes from different TV shows and whole movies into a single row.
 - Built-in channel logo generator, custom poster rendering (`/api/channel-poster`), and quick-add channel presets.
+- **Movies in a channel play too.** A channel is a series to Stremio, so it asks stream add-ons for a movie
+  in one under the wrong type and they find nothing (Nuvio, which resolves the id itself, is unaffected).
+  The add-on answers that one request with a link to the movie's own page, where every stream add-on finds
+  it. Nothing is declared unless one of your enabled channels actually contains a movie.
 - A **Play order** dropdown arranges a channel's picks: by air date (oldest or newest first, from each episode's TMDB air date and each movie's release date), by show then season and episode, A-Z by title, or shuffled once. Each sorts the list in place, so the order you see is the order it plays -- and a sort is re-applied as you add more picks. Drag a pick by hand and it stays put. **Shuffle daily** is the one live mode: the channel reshuffles itself every 24 hours.
 
 ### Continue Watching & Background Watch Sync
