@@ -23954,93 +23954,6 @@ if ('serviceWorker' in navigator) {
   <div class="lists-subpanel" id="catalogsSubQuickAdd" style="display:none;">
     <div id="catalogsQuickAddContainer">
 
-    <!-- Quick List Wizard Panel -->
-    <div class="panel" style="margin-bottom:14px;">
-      <div class="shelf-header" style="margin-bottom:8px;">
-        <h2 class="shelf-title">Quick List Wizard</h2>
-      </div>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem; line-height:1.45;">Pick a network or studio, an era and a mood to quickly build curated catalog lists &mdash; separate lists for movies and shows, not combined.</p>
-      <div class="channel-wizard-grid">
-        <label>Network or studio
-          <select id="catalogWizardNetwork">
-            <option value="">Any network or studio</option>
-            <option value="49">HBO</option>
-            <option value="88">FX</option>
-            <option value="80">Adult Swim</option>
-            <option value="13">Nickelodeon</option>
-            <option value="56">Cartoon Network</option>
-            <option value="54">Disney Channel / Disney</option>
-            <option value="4">BBC One</option>
-            <option value="67">Showtime</option>
-            <option value="174">AMC</option>
-            <option value="47">Comedy Central</option>
-            <option value="213">Netflix</option>
-            <option value="1024">Prime Video</option>
-            <option value="2552">Apple TV+</option>
-            <option value="2739">Disney+</option>
-            <option value="19">FOX</option>
-            <option value="6">NBC</option>
-            <option value="16">CBS</option>
-            <option value="2">ABC</option>
-            <option value="71">The CW</option>
-            <option value="149">Syfy</option>
-            <option value="wb">Warner Bros. Pictures</option>
-            <option value="universal">Universal Pictures</option>
-            <option value="paramount">Paramount Pictures</option>
-            <option value="sony">Sony Pictures</option>
-            <option value="a24">A24</option>
-            <option value="lionsgate">Lionsgate</option>
-            <option value="mgm">MGM</option>
-          </select>
-        </label>
-        <label>Era
-          <select id="catalogWizardEra">
-            <option value="">Any era</option>
-            <option value="1970-1979">70s</option>
-            <option value="1980-1989">80s</option>
-            <option value="1990-1999">90s classics</option>
-            <option value="2000-2009">2000s</option>
-            <option value="2010-2014">Early 2010s</option>
-            <option value="2015-2099">Modern (2015+)</option>
-          </select>
-        </label>
-        <label>Genre or mood
-          <select id="catalogWizardGenre">
-            <option value="">Any genre</option>
-            <option value="80,9648">Crime &amp; thrillers</option>
-            <option value="16">Cartoons &amp; Animation</option>
-            <option value="35">Chill comedy</option>
-            <option value="18">Drama</option>
-            <option value="10765">Sci-fi &amp; fantasy</option>
-            <option value="10759">Action &amp; adventure</option>
-            <option value="10751">Family</option>
-            <option value="99">Documentary</option>
-            <option value="10762">Kids</option>
-            <option value="9648">Mystery</option>
-            <option value="27">Horror</option>
-            <option value="10749">Romance</option>
-          </select>
-        </label>
-        <label>Titles in list
-          <select id="catalogWizardSize">
-            <option value="10">Top 10 titles</option>
-            <option value="20" selected>Top 20 titles</option>
-            <option value="30">Top 30 titles</option>
-            <option value="50">Top 50 titles</option>
-          </select>
-        </label>
-      </div>
-      <div class="row" style="margin-top:8px; gap:8px; flex-wrap:wrap;">
-        <input type="text" id="catalogWizardNameInput" placeholder="List name (left blank, we will name it for you)" style="flex:1; min-width:200px;">
-        <div class="actions" style="gap:6px; flex-wrap:wrap;">
-          <button type="button" class="primary lc-btn" onclick="runCatalogListWizard('movie', this)">+ Movie List</button>
-          <button type="button" class="primary lc-btn" onclick="runCatalogListWizard('series', this)">+ Show List</button>
-          <button type="button" class="secondary lc-btn" onclick="runCatalogListWizard('both', this)">+ Both (2 Lists)</button>
-        </div>
-      </div>
-      <div id="catalogWizardStatus" style="margin-top:8px;"></div>
-    </div>
-
     <!-- Combined Charts Shelf -->
     <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
       <div class="shelf-header" style="margin-bottom:8px;">
@@ -47247,174 +47160,6 @@ async function runChannelWizard(btn) {
   }
 }
 
-<<<<<<< HEAD
-// --- the Quick List Wizard (Catalogs Quick Add) --------------------------
-//
-// Network/studio x era x genre -> separate lists for movies and shows
-// (not combined). The server answers with resolved titles from TMDB,
-// and the client adds them directly to the user's Catalogs as customlist:v1:
-// rows, saving them into local custom lists so they can also be edited.
-function catalogWizardName(customSuffix) {
-  const typed = (document.getElementById('catalogWizardNameInput') || {}).value;
-  if (typed && typed.trim()) {
-    const t = typed.trim();
-    return customSuffix ? (t.toLowerCase().endsWith(customSuffix.toLowerCase()) ? t : t + ' ' + customSuffix) : t;
-  }
-  const pick = (id) => {
-    const sel = document.getElementById(id);
-    if (!sel || !sel.value) return '';
-    return sel.options[sel.selectedIndex].textContent.trim();
-  };
-  const network = pick('catalogWizardNetwork');
-  const era = pick('catalogWizardEra');
-  const genre = pick('catalogWizardGenre');
-  const parts = [era, network, genre].filter(Boolean);
-  const base = parts.length ? parts.join(' ') : 'My List';
-  return customSuffix ? base + ' ' + customSuffix : base;
-}
-
-async function fetchWizardTitles(type, networkId, era, genres, limit) {
-  let params = 'type=' + encodeURIComponent(type) + '&limit=' + encodeURIComponent(limit);
-  if (networkId) params += '&networkId=' + encodeURIComponent(networkId);
-  if (era) params += '&era=' + encodeURIComponent(era);
-  if (genres) params += '&genres=' + encodeURIComponent(genres);
-  const res = await fetch(ORIGIN + '/api/wizard-channel-shows?' + params, { cache: 'no-store' });
-  const data = await res.json();
-  if (!data.ok || !Array.isArray(data.items || data.shows) || !(data.items || data.shows).length) {
-    throw new Error(data.error || 'Nothing matched that combination.');
-  }
-  return data.items || data.shows;
-}
-
-function addCatalogWizardList(name, items, type) {
-  const channelId = generateChannelId();
-  const baseSlug = (typeof slugify === 'function' ? slugify(name) : name.toLowerCase().replace(/[^a-z0-9]+/g, '-')) || 'list';
-  let slug = baseSlug;
-  const localMap = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
-  let n = 2;
-  while (localMap[slug]) {
-    slug = baseSlug + '-' + n;
-    n++;
-  }
-  const cleanItems = items.map((it) => ({
-    imdbId: it.imdbId,
-    title: it.name || it.title || 'Untitled',
-    year: it.year || undefined,
-    poster: it.poster || undefined,
-    type: type,
-  }));
-  const payload = {
-    listId: channelId,
-    localSlug: slug,
-    listSlug: slug,
-    name: name,
-    type: type,
-    items: cleanItems,
-    shuffle: false,
-  };
-  if (typeof saveLocalCustomListsMap === 'function') {
-    localMap[slug] = {
-      slug: slug,
-      name: name,
-      type: type,
-      items: cleanItems,
-      visibility: 'unlisted',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-    saveLocalCustomListsMap(localMap);
-    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
-  }
-  addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
-  saveState();
-}
-
-async function runCatalogListWizard(targetType, btn) {
-  const statusBox = document.getElementById('catalogWizardStatus');
-  const say = (html) => { if (statusBox) statusBox.innerHTML = html; };
-  const networkId = (document.getElementById('catalogWizardNetwork') || {}).value || '';
-  const era = (document.getElementById('catalogWizardEra') || {}).value || '';
-  const genres = (document.getElementById('catalogWizardGenre') || {}).value || '';
-  const limit = parseInt((document.getElementById('catalogWizardSize') || {}).value, 10) || 20;
-
-  if (!networkId && !era && !genres) {
-    say('<p class="testresult err" style="margin:4px 0 0;">✗ Choose at least one of network/studio, era or genre first.</p>');
-    return;
-  }
-
-  const originalLabel = btn ? btn.textContent : '';
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = 'Building…';
-  }
-
-  try {
-    if (targetType === 'both') {
-      say('<p><small>Finding top movies and shows for your lists…</small></p>');
-      const movieName = catalogWizardName('(Movies)');
-      const showName = catalogWizardName('(Shows)');
-
-      let movieItems = [];
-      let showItems = [];
-      let movieErr = null;
-      let showErr = null;
-
-      try {
-        movieItems = await fetchWizardTitles('movie', networkId, era, genres, limit);
-      } catch (err) {
-        movieErr = err.message;
-      }
-
-      try {
-        showItems = await fetchWizardTitles('series', networkId, era, genres, limit);
-      } catch (err) {
-        showErr = err.message;
-      }
-
-      if (!movieItems.length && !showItems.length) {
-        say('<p class="testresult err" style="margin:4px 0 0;">✗ ' + escapeHtml(movieErr || showErr || 'Nothing matched that combination.') + '</p>');
-        return;
-      }
-
-      const addedDesc = [];
-      if (movieItems.length) {
-        addCatalogWizardList(movieName, movieItems, 'movie');
-        addedDesc.push(movieItems.length + ' movies ("' + escapeHtml(movieName) + '")');
-      }
-      if (showItems.length) {
-        addCatalogWizardList(showName, showItems, 'series');
-        addedDesc.push(showItems.length + ' shows ("' + escapeHtml(showName) + '")');
-      }
-
-      if (typeof renderLivePreview === 'function') renderLivePreview();
-      showAddedToast('Added separate lists: ' + addedDesc.join(' and ') + ' to Catalogs.');
-      say('<p class="testresult ok" style="margin:4px 0 0;">✓ Built ' + addedDesc.join(' and ') + ' as separate catalog rows (not combined).</p>');
-    } else {
-      const isMovie = targetType === 'movie';
-      const suffix = isMovie ? '(Movies)' : '(Shows)';
-      const listName = catalogWizardName(suffix);
-      say('<p><small>Finding top ' + (isMovie ? 'movies' : 'shows') + ' for ' + escapeHtml(listName) + '…</small></p>');
-
-      const items = await fetchWizardTitles(targetType, networkId, era, genres, limit);
-      addCatalogWizardList(listName, items, targetType);
-      if (typeof renderLivePreview === 'function') renderLivePreview();
-      showAddedToast('List "' + listName + '" added to your Catalogs.');
-      say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + escapeHtml(listName) + '" built from ' + items.length + ' ' + (isMovie ? 'movies' : 'shows') + ' and added to your Catalogs.</p>');
-    }
-    const nameInput = document.getElementById('catalogWizardNameInput');
-    if (nameInput) nameInput.value = '';
-  } catch (e) {
-    say('<p class="testresult err" style="margin:4px 0 0;">✗ ' + escapeHtml(e.message || 'Network error while building lists.') + '</p>');
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = originalLabel;
-    }
-  }
-}
-
-=======
->>>>>>> 506bceecdaae12428b121ad4ef9a36141fcf8c8b
 // --- Spotlight channels (an actor, a director, a creator) ---------------
 //
 // Searching a PERSON answers a different question from searching a title,
@@ -68036,14 +67781,6 @@ function generateSearchVariations(query) {
       }
     }
 
-<<<<<<< HEAD
-    // /api/wizard-channel-shows?networkId=&era=&genres=&limit=&type=
-    //   -> { ok, name, shows: [...], items: [...], networkLogo }
-    //
-    // The Quick Wizard's server call for building TV channels and catalog
-    // lists. Supports type=series (default) and type=movie. Discovers top
-    // matching titles from TMDB by crossing network/studio, era and genre.
-=======
     // /api/wizard-channel-shows?networkId=&era=&genres=&limit=
     //   -> { ok, name, shows: [...], networkLogo }
     //
@@ -68051,103 +67788,10 @@ function generateSearchVariations(query) {
     // /api/quick-channel-shows (the client builds the channel from it the
     // same way), but the pool is a TMDB discover query crossing a network
     // with an era and a genre rather than a network on its own.
->>>>>>> 506bceecdaae12428b121ad4ef9a36141fcf8c8b
     if (path === "/api/wizard-channel-shows") {
       const networkId = (url.searchParams.get("networkId") || "").trim();
       const era = (url.searchParams.get("era") || "").trim();
       const genres = (url.searchParams.get("genres") || "").trim();
-<<<<<<< HEAD
-      const type = (url.searchParams.get("type") || "series").trim().toLowerCase();
-      const isMovie = type === "movie";
-      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "8", 10) || 8, 1), 50);
-      if (networkId && !/^[0-9a-zA-Z_-]+$/.test(networkId)) return json({ ok: false, error: "Bad networkId." }, 400);
-      if (genres && !/^[0-9]+(,[0-9]+)*$/.test(genres)) return json({ ok: false, error: "Bad genres." }, 400);
-      const eraMatch = era.match(/^([0-9]{4})-([0-9]{4})$/);
-      try {
-        const studioMap = {
-          "49": { name: "HBO", tvNetwork: "49", movieCompany: "3268|9993", movieProvider: "1899" },
-          "88": { name: "FX", tvNetwork: "88", movieCompany: "88" },
-          "80": { name: "Adult Swim", tvNetwork: "80", movieCompany: "80|56" },
-          "13": { name: "Nickelodeon", tvNetwork: "13", movieCompany: "2348" },
-          "56": { name: "Cartoon Network", tvNetwork: "56", movieCompany: "56" },
-          "54": { name: "Disney Channel", tvNetwork: "54", movieCompany: "2" },
-          "4": { name: "BBC One", tvNetwork: "4", movieCompany: "3341" },
-          "67": { name: "Showtime", tvNetwork: "67", movieCompany: "67" },
-          "174": { name: "AMC", tvNetwork: "174", movieCompany: "127928|174" },
-          "47": { name: "Comedy Central", tvNetwork: "47", movieCompany: "47" },
-          "213": { name: "Netflix", tvNetwork: "213", movieCompany: "178464", movieProvider: "8" },
-          "1024": { name: "Prime Video", tvNetwork: "1024", movieCompany: "20580", movieProvider: "9" },
-          "2552": { name: "Apple TV+", tvNetwork: "2552", movieCompany: "194232", movieProvider: "350" },
-          "2739": { name: "Disney+", tvNetwork: "2739", movieCompany: "2", movieProvider: "337" },
-          "19": { name: "FOX", tvNetwork: "19", movieCompany: "25" },
-          "6": { name: "NBC", tvNetwork: "6", movieCompany: "33" },
-          "16": { name: "CBS", tvNetwork: "16", movieCompany: "4" },
-          "2": { name: "ABC", tvNetwork: "2", movieCompany: "2" },
-          "71": { name: "The CW", tvNetwork: "71", movieCompany: "174" },
-          "149": { name: "Syfy", tvNetwork: "149", movieCompany: "149|33" },
-          "wb": { name: "Warner Bros. Pictures", movieCompany: "174", tvCompany: "1957" },
-          "universal": { name: "Universal Pictures", movieCompany: "33", tvCompany: "2672" },
-          "paramount": { name: "Paramount Pictures", movieCompany: "4", tvNetwork: "436" },
-          "sony": { name: "Sony Pictures", movieCompany: "5", tvCompany: "11073" },
-          "a24": { name: "A24", movieCompany: "41077", tvCompany: "41077" },
-          "lionsgate": { name: "Lionsgate", movieCompany: "35", tvCompany: "35" },
-          "mgm": { name: "MGM", movieCompany: "21", tvCompany: "21" }
-        };
-
-        let params = `api_key=${encodeURIComponent(TMDB_API_KEY)}&sort_by=popularity.desc&include_adult=false`;
-        if (isMovie) {
-          if (networkId) {
-            const studio = studioMap[networkId];
-            if (studio && studio.movieCompany) {
-              params += `&with_companies=${encodeURIComponent(studio.movieCompany)}`;
-            } else if (studio && studio.movieProvider) {
-              params += `&with_watch_providers=${encodeURIComponent(studio.movieProvider)}&watch_region=US&with_watch_monetization_types=flatrate`;
-            } else if (/^[0-9]+$/.test(networkId)) {
-              params += `&with_companies=${encodeURIComponent(networkId)}`;
-            }
-          }
-          if (genres) {
-            const movieGenres = genres.split(",").map((g) => {
-              const tr = g.trim();
-              if (tr === "10765") return "878,14";
-              if (tr === "10759") return "28,12";
-              if (tr === "10762") return "10751,16";
-              if (tr === "9648") return "9648,53";
-              return tr;
-            }).filter(Boolean).join(",");
-            if (movieGenres) params += `&with_genres=${encodeURIComponent(movieGenres)}`;
-          }
-          if (eraMatch) {
-            params += `&primary_release_date.gte=${eraMatch[1]}-01-01&primary_release_date.lte=${eraMatch[2]}-12-31`;
-          }
-          params += "&vote_count.gte=30";
-        } else {
-          params += "&include_null_first_air_dates=false";
-          if (networkId) {
-            const studio = studioMap[networkId];
-            if (studio && studio.tvNetwork) {
-              params += `&with_networks=${encodeURIComponent(studio.tvNetwork)}`;
-            } else if (studio && studio.tvCompany) {
-              params += `&with_companies=${encodeURIComponent(studio.tvCompany)}`;
-            } else if (/^[0-9]+$/.test(networkId)) {
-              params += `&with_networks=${encodeURIComponent(networkId)}`;
-            }
-          }
-          if (genres) params += `&with_genres=${encodeURIComponent(genres)}`;
-          if (eraMatch) {
-            params += `&first_air_date.gte=${eraMatch[1]}-01-01&first_air_date.lte=${eraMatch[2]}-12-31`;
-          }
-          params += "&vote_count.gte=30";
-        }
-
-        const discoverEndpoint = isMovie ? "discover/movie" : "discover/tv";
-        const discovered = [];
-        let pagesFetched = 0;
-        for (let page = 1; page <= 4 && discovered.length < limit * 3; page++) {
-          pagesFetched++;
-          const res = await fetch(
-            `https://api.themoviedb.org/3/${discoverEndpoint}?${params}&page=${page}`,
-=======
       const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "8", 10) || 8, 1), 24);
       if (networkId && !/^[0-9]+$/.test(networkId)) return json({ ok: false, error: "Bad networkId." }, 400);
       if (genres && !/^[0-9]+(,[0-9]+)*$/.test(genres)) return json({ ok: false, error: "Bad genres." }, 400);
@@ -68170,7 +67814,6 @@ function generateSearchVariations(query) {
           pagesFetched++;
           const res = await fetch(
             `https://api.themoviedb.org/3/discover/tv?${params}&page=${page}`,
->>>>>>> 506bceecdaae12428b121ad4ef9a36141fcf8c8b
             { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 3600, cacheEverything: true } }
           );
           if (!res.ok) break;
@@ -68182,11 +67825,7 @@ function generateSearchVariations(query) {
           return json({ ok: false, error: "Nothing matched that combination. Try widening the era or the genre." });
         }
         let networkLogo = null;
-<<<<<<< HEAD
-        if (networkId && /^[0-9]+$/.test(networkId) && !isMovie) {
-=======
         if (networkId) {
->>>>>>> 506bceecdaae12428b121ad4ef9a36141fcf8c8b
           try {
             const networkRes = await fetch(
               `https://api.themoviedb.org/3/network/${encodeURIComponent(networkId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
@@ -68194,37 +67833,6 @@ function generateSearchVariations(query) {
             );
             if (networkRes.ok) {
               const networkData = await networkRes.json();
-<<<<<<< HEAD
-              if (networkData.logo_path) networkLogo = `${url.origin}/api/channel-logo?path=${encodeURIComponent(networkData.logo_path)}`;
-            }
-          } catch {
-            // best-effort; fallback to poster
-          }
-        }
-        const candidates = discovered.slice(0, Math.min(limit * 2, 60));
-        const resolved = await mapWithConcurrency(candidates, 8, async (item) => {
-          const details = await fetchTmdbDetails(item.id, isMovie ? "movie" : "tv", TMDB_API_KEY);
-          if (!details.imdbId) return null;
-          const itemTitle = isMovie ? (item.title || item.name) : item.name;
-          const releaseDate = isMovie ? item.release_date : item.first_air_date;
-          const year = (releaseDate || "").slice(0, 4);
-          return {
-            imdbId: details.imdbId,
-            tmdbId: item.id,
-            name: itemTitle,
-            title: itemTitle,
-            year: year || undefined,
-            type: isMovie ? "movie" : "series",
-            kind: isMovie ? "movie" : "series",
-            poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
-            backdrop: item.backdrop_path ? `https://image.tmdb.org/t/p/w780${item.backdrop_path}` : null,
-          };
-        });
-        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", pagesFetched + (networkId ? 1 : 0) + candidates.length));
-        const finalTitles = resolved.filter(Boolean).slice(0, limit);
-        if (!finalTitles.length) return json({ ok: false, error: "Couldn't resolve any of those titles to IMDB." });
-        return json({ ok: true, items: finalTitles, shows: finalTitles, networkLogo });
-=======
               // A fixed pixel size, never "original" -- see the same note on
               // /api/quick-channel-shows, where an SVG logo silently failed
               // to render as a poster.
@@ -68250,7 +67858,6 @@ function generateSearchVariations(query) {
         const shows = resolved.filter(Boolean).slice(0, limit);
         if (!shows.length) return json({ ok: false, error: "Couldn't resolve any of those shows to IMDB." });
         return json({ ok: true, shows, networkLogo });
->>>>>>> 506bceecdaae12428b121ad4ef9a36141fcf8c8b
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }
