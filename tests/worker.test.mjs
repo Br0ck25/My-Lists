@@ -11226,6 +11226,127 @@ describe("worker: channel video ids are real stream requests", () => {
     assert.deepEqual([...ids].sort(), items.map((it) => `tt0108778:${it.season}:${it.episode}`).sort());
     assert.deepEqual(Array.from(meta.videos, (v) => v.episode), items.map((_, i) => i + 1));
   });
+
+  // --- pairing glue: two halves of one story play together --------------
+  //
+  // Every ordering step above can split a two-parter: the rotation deals a
+  // block that ends between them, the shuffle scatters them, the interleaver
+  // drops four other shows in the gap.
+  const twoParter = (over = {}) => [
+    ep({ imdbId: "tt9100", season: 3, episode: 26, epName: "The Best of Both Worlds, Part I", title: "p1", ...over }),
+    ep({ imdbId: "tt9100", season: 3, episode: 27, epName: "The Best of Both Worlds, Part II", title: "p2", ...over }),
+  ];
+
+  const titlesOf = (meta) => Array.from(meta.videos, (v) => v.title);
+
+  it("plays the second half straight after the first, wherever the shuffle put them", async () => {
+    const filler = [];
+    for (let e = 1; e <= 12; e++) filler.push(ep({ imdbId: "tt9200", season: 1, episode: e, epName: `Filler ${e}`, title: `f${e}` }));
+    const meta = await channelMeta([...twoParter(), ...filler], { shuffle: true, pairParts: true });
+    const titles = titlesOf(meta);
+    assert.equal(titles.indexOf("p2"), titles.indexOf("p1") + 1, "part II plays immediately after part I");
+    assert.equal(titles.filter((t) => t === "p2").length, 1, "and only once");
+  });
+
+  it("plays a story from its first part even when the second was the one drawn", async () => {
+    // The pool holds both, the rotation only asked for one episode of that
+    // show, and the one it landed on is part II. The back half of a story on
+    // its own is worse than a minute of extra runtime.
+    const meta = await channelMeta(twoParter(), { pairParts: true, shuffle: false });
+    assert.deepEqual(titlesOf(meta), ["p1", "p2"]);
+    const reversed = await channelMeta(twoParter().reverse(), { pairParts: true });
+    assert.deepEqual(titlesOf(reversed), ["p1", "p2"], "part order, not the order they were listed in");
+  });
+
+  it("leaves a channel that has not asked for it exactly as it was", async () => {
+    const meta = await channelMeta(twoParter().reverse(), {});
+    assert.deepEqual(titlesOf(meta), ["p2", "p1"]);
+  });
+
+  it("reads Pt. II, (2) and part 3 as the same kind of thing", async () => {
+    const roman = await channelMeta([
+      ep({ imdbId: "tt9300", season: 1, episode: 2, epName: "Time's Arrow, Pt. II", title: "b" }),
+      ep({ imdbId: "tt9300", season: 1, episode: 1, epName: "Time's Arrow Pt. I", title: "a" }),
+    ], { pairParts: true });
+    assert.deepEqual(titlesOf(roman), ["a", "b"]);
+    const bracketed = await channelMeta([
+      ep({ imdbId: "tt9301", season: 2, episode: 9, epName: "The Rural Juror (2)", title: "b" }),
+      ep({ imdbId: "tt9301", season: 2, episode: 8, epName: "The Rural Juror (1)", title: "a" }),
+    ], { pairParts: true });
+    assert.deepEqual(titlesOf(bracketed), ["a", "b"]);
+  });
+
+  it("does not glue two shows, two seasons or two different stories together", async () => {
+    const meta = await channelMeta([
+      ep({ imdbId: "tt9400", season: 1, episode: 1, epName: "Kidnapped, Part 1", title: "showA-s1" }),
+      // Same story name, different season: a remake ten years later is not
+      // the other half of anything.
+      ep({ imdbId: "tt9400", season: 9, episode: 1, epName: "Kidnapped, Part 2", title: "showA-s9" }),
+      // Same season, same part numbering, different story.
+      ep({ imdbId: "tt9400", season: 1, episode: 5, epName: "Something Else, Part 2", title: "showA-other" }),
+      // Same story name, different show.
+      ep({ imdbId: "tt9401", season: 1, episode: 2, epName: "Kidnapped, Part 2", title: "showB" }),
+    ], { pairParts: true });
+    assert.deepEqual(titlesOf(meta), ["showA-s1", "showA-s9", "showA-other", "showB"], "nothing moved");
+  });
+
+  it("honours a pairing made by hand whether or not the toggle is on", async () => {
+    // Two halves of a crossover, one on each show -- which no title-based
+    // detection can see, and which is why the builder can pair by hand.
+    const crossover = [
+      ep({ imdbId: "tt9500", season: 4, episode: 8, epName: "Invasion!", title: "flash" }),
+      ep({ imdbId: "tt9600", season: 2, episode: 7, epName: "Medusa", title: "supergirl" }),
+      ep({ imdbId: "tt9700", season: 1, episode: 1, epName: "Elsewhere", title: "other" }),
+    ];
+    const meta = await channelMeta([crossover[2], crossover[1], crossover[0]], {
+      pairedGroups: [["tt9500:4:8", "tt9600:2:7"]],
+    });
+    const titles = titlesOf(meta);
+    assert.equal(titles.indexOf("supergirl"), titles.indexOf("flash") + 1);
+    assert.deepEqual(titles, ["other", "flash", "supergirl"], "the pair plays where its first-drawn member was");
+  });
+
+  it("caps one story at six episodes rather than gluing a whole season into one block", async () => {
+    const chapters = [];
+    for (let e = 1; e <= 9; e++) {
+      chapters.push(ep({ imdbId: "tt9800", season: 1, episode: e, epName: `The Long Story, Part ${e}`, title: `c${e}` }));
+    }
+    const meta = await channelMeta(chapters, { pairParts: true });
+    const titles = titlesOf(meta);
+    assert.deepEqual(titles.slice(0, 6), ["c1", "c2", "c3", "c4", "c5", "c6"]);
+    assert.equal(titles.length, 9, "the rest still play, they are just not glued on");
+  });
+
+  it("keeps a pair together through a rotation that would have split it", async () => {
+    // One episode per show per day, so a two-parter could only ever land
+    // half of itself -- exactly the case the rule exists for.
+    const pool = [...twoParter()];
+    for (let s = 2; s <= 6; s++) {
+      for (let e = 1; e <= 4; e++) pool.push(ep({ imdbId: `tt91${s}`, season: 1, episode: e, epName: `E${e}`, title: `s${s}e${e}` }));
+    }
+    for (let day = 0; day < 6; day++) {
+      const meta = await channelMeta(pool, { dailyRotate: true, rotateShows: 6, rotateEpisodes: 1, pairParts: true }, {
+        now: day * 86400000,
+      });
+      const titles = titlesOf(meta);
+      const at1 = titles.indexOf("p1");
+      const at2 = titles.indexOf("p2");
+      if (at1 === -1 && at2 === -1) continue;
+      assert.notEqual(at1, -1, "part I is never left out when part II is on");
+      assert.equal(at2, at1 + 1, `day ${day}: the parts stay adjacent`);
+    }
+  });
+
+  it("still plays the rest of a story when one part is not in the channel at all", async () => {
+    const meta = await channelMeta([
+      ep({ imdbId: "tt9900", season: 1, episode: 1, epName: "A Story, Part 1", title: "a" }),
+      // no part 2
+      ep({ imdbId: "tt9900", season: 1, episode: 3, epName: "A Story, Part 3", title: "c" }),
+    ], { pairParts: true, shuffle: true });
+    const titles = titlesOf(meta);
+    assert.equal(titles.indexOf("c"), titles.indexOf("a") + 1);
+    assert.equal(titles.length, 2);
+  });
 });
 
 // TMDB has no episode air time at all, so the hour behind every "Airs Tuesday"
@@ -11487,6 +11608,35 @@ describe("worker: channel share links", () => {
     const created = await share(env, { channel: channelOf({ storyLocked: ["tt0108778", "tt_not_here"] }) });
     const fetched = await read(env, created.body.code);
     assert.deepEqual(fetched.body.channel.storyLocked, ["tt0108778"]);
+  });
+
+  it("carries the rules that make a channel keep itself up to date", async () => {
+    const env = makeEnv();
+    const created = await share(env, {
+      channel: channelOf({ pairParts: true, autoNewEpisodes: true, newEpisodesAtTop: true }),
+    });
+    const fetched = await read(env, created.body.code);
+    assert.equal(fetched.body.channel.pairParts, true);
+    assert.equal(fetched.body.channel.autoNewEpisodes, true, "a copy keeps up with its shows too");
+    assert.equal(fetched.body.channel.newEpisodesAtTop, true);
+  });
+
+  it("drops a hand-made pairing whose other half did not come through", async () => {
+    const env = makeEnv();
+    const created = await share(env, {
+      channel: channelOf({
+        items: [ep(), ep({ season: 5, episode: 14 })],
+        pairedGroups: [
+          ["tt0108778:5:13", "tt0108778:5:14"],
+          ["tt0108778:5:13", "tt0108778:9:99"],
+          ["tt0108778:5:13"],
+          "not even an array",
+        ],
+      }),
+    });
+    const fetched = await read(env, created.body.code);
+    assert.equal(fetched.body.channel.pairedGroups.length, 1, "a rule about one episode is not a pairing");
+    assert.deepEqual(fetched.body.channel.pairedGroups[0], ["tt0108778:5:13", "tt0108778:5:14"]);
   });
 
   it("keeps Live Cloud Sync only when a real list url comes with it", async () => {
@@ -11896,6 +12046,161 @@ describe("worker: the generated channel poster", () => {
 // keeping a second copy of the seeded shuffle. These pin down that the
 // answer is the same one the meta route would give, and that the endpoint
 // is honest about the two rules it cannot apply.
+// A channel is a snapshot of a show, and a show keeps going. "Automatically
+// add new episodes" is what stops a channel of The Last of Us from being
+// stuck on season 1 forever -- the Worker re-checks each show the channel
+// carries, in the background, and folds in whatever has aired since.
+describe("worker: channels that keep up with their shows", () => {
+  const newEpFns = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+
+  const ep = (over = {}) => ({ kind: "episode", imdbId: "tt700", season: 1, episode: 1, ...over });
+
+  it("reads the high-water mark per show, which is what makes the check cheap", () => {
+    const marks = newEpFns.channelShowWatermarks([
+      ep({ imdbId: "tt700", season: 1, episode: 1, showName: "Show A", showPoster: "p.jpg" }),
+      ep({ imdbId: "tt700", season: 3, episode: 7 }),
+      ep({ imdbId: "tt701", season: 2, episode: 4 }),
+      { kind: "movie", imdbId: "tt702", season: 1, episode: 1 },
+      ep({ imdbId: "", season: 1, episode: 1 }),
+    ]);
+    assert.equal([...marks.keys()].join(","), "tt700,tt701", "movies and unusable ids are not shows to check");
+    assert.equal(marks.get("tt700").maxSeason, 3);
+    assert.equal(marks.get("tt700").showName, "Show A");
+    assert.equal(marks.get("tt700").showPoster, "p.jpg");
+    assert.ok(marks.get("tt700").have.has("3:7"));
+  });
+
+  it("changes its signature when the channel is edited, so a cached answer is not reused", () => {
+    const base = [ep({ season: 1, episode: 1 })];
+    const sig = (items) => newEpFns.channelNewEpisodeSignature(newEpFns.channelShowWatermarks(items));
+    assert.equal(sig(base), sig([ep({ season: 1, episode: 1 })]), "same channel, same signature");
+    assert.notEqual(sig(base), sig([...base, ep({ season: 1, episode: 2 })]), "an episode added by hand");
+    assert.notEqual(sig(base), sig([...base, ep({ imdbId: "tt701", season: 1, episode: 1 })]), "a show added");
+  });
+
+  it("puts new episodes where the channel says, and never twice", () => {
+    const stored = [ep({ season: 1, episode: 1, title: "old" })];
+    const fresh = [
+      ep({ season: 1, episode: 2, title: "new" }),
+      ep({ season: 1, episode: 1, title: "already have this" }),
+    ];
+    const atEnd = newEpFns.mergeChannelNewEpisodes(stored, fresh, false);
+    assert.equal(atEnd.map((it) => it.title).join(","), "old,new");
+    const atTop = newEpFns.mergeChannelNewEpisodes(stored, fresh, true);
+    assert.equal(atTop.map((it) => it.title).join(","), "new,old");
+    assert.equal(newEpFns.mergeChannelNewEpisodes(stored, [], true).map((it) => it.title).join(","), "old");
+  });
+
+  it("orders what it found newest first, so 'at the top' means the newest one", () => {
+    const sorted = newEpFns.sortChannelNewEpisodes([
+      ep({ season: 1, episode: 1, released: "2024-01-01", title: "oldest" }),
+      ep({ season: 2, episode: 5, released: "2026-05-05", title: "newest" }),
+      ep({ season: 2, episode: 1, released: "2025-02-02", title: "middle" }),
+    ]);
+    assert.equal(sorted.map((it) => it.title).join(","), "newest,middle,oldest");
+  });
+
+  // The TMDB side, with the network stubbed: what it asks for matters as
+  // much as what it returns, since this runs for every show in a channel.
+  const stubTmdb = (seasons, episodesBySeason) => {
+    const calls = [];
+    newEpFns.fetch = async (url) => {
+      calls.push(String(url));
+      const u = String(url);
+      if (u.includes("/find/")) return { ok: true, json: async () => ({ tv_results: [{ id: 42, poster_path: "/p.jpg" }] }) };
+      const season = u.match(/\/season\/([0-9]+)\?/);
+      if (season) {
+        return { ok: true, json: async () => ({ episodes: episodesBySeason[season[1]] || [] }) };
+      }
+      return {
+        ok: true,
+        json: async () => ({ name: "The Show", poster_path: "/p.jpg", seasons: seasons.map((n) => ({ season_number: n })) }),
+      };
+    };
+    return calls;
+  };
+
+  it("asks only about seasons at or past the one the channel already carries", async () => {
+    const calls = stubTmdb([1, 2, 3, 4, 5], {});
+    const marks = newEpFns.channelShowWatermarks([ep({ season: 4, episode: 1 })]);
+    await newEpFns.fetchShowEpisodesAfter(marks.get("tt700"), "key", "2026-09-17");
+    const seasonCalls = calls.filter((u) => u.includes("/season/")).map((u) => u.match(/\/season\/([0-9]+)\?/)[1]);
+    assert.equal(seasonCalls.join(","), "4,5", "seasons 1-3 cannot hold anything new");
+  });
+
+  it("returns what aired and not what is merely announced", async () => {
+    stubTmdb([1], {
+      1: [
+        { episode_number: 1, name: "Have this", air_date: "2025-01-01" },
+        { episode_number: 2, name: "Aired since", air_date: "2026-01-01", still_path: "/s.jpg" },
+        { episode_number: 3, name: "Next month", air_date: "2026-12-01" },
+        { episode_number: 4, name: "No date at all", air_date: "" },
+      ],
+    });
+    const marks = newEpFns.channelShowWatermarks([ep({ season: 1, episode: 1 })]);
+    const found = await newEpFns.fetchShowEpisodesAfter(marks.get("tt700"), "key", "2026-09-17");
+    assert.equal(found.map((it) => it.epName).join(","), "Aired since");
+    const only = found[0];
+    assert.equal(only.imdbId, "tt700");
+    assert.equal(only.season, 1);
+    assert.equal(only.episode, 2);
+    assert.equal(only.title, "The Show S1E2 — Aired since");
+    assert.equal(newEpFns.channelItemStreamId(only), "tt700:1:2", "it has to be playable");
+  });
+
+  it("caches the answer, empty or not, rather than re-checking on every request", async () => {
+    stubTmdb([1], { 1: [{ episode_number: 1, name: "Have this", air_date: "2025-01-01" }] });
+    const env = { CONFIGS: makeKv() };
+    const payload = { channelId: "ch-new", items: [ep({ season: 1, episode: 1 })] };
+    const written = await newEpFns.refreshChannelNewEpisodes(payload, { env, tmdbKey: "key" });
+    assert.equal(written.length, 0, "nothing new, which is an answer");
+    const raw = JSON.parse(await env.CONFIGS.get("channelnew:ch-new"));
+    assert.equal(raw.items.length, 0);
+    assert.ok(raw.updatedAt > 0);
+    const cached = await newEpFns.readChannelNewEpisodes(payload, { env });
+    assert.equal(cached.length, 0, "served from KV, no second round of TMDB calls");
+  });
+
+  it("throws away a cached answer that was computed against a different channel", async () => {
+    const env = { CONFIGS: makeKv() };
+    const payload = { channelId: "ch-edit", items: [ep({ season: 1, episode: 1 })] };
+    stubTmdb([1], { 1: [{ episode_number: 1, name: "Have this", air_date: "2025-01-01" }] });
+    await newEpFns.refreshChannelNewEpisodes(payload, { env, tmdbKey: "key" });
+    const edited = { channelId: "ch-edit", items: [...payload.items, ep({ season: 1, episode: 2 })] };
+    const scheduled = [];
+    const stale = await newEpFns.readChannelNewEpisodes(edited, {
+      env,
+      ctx: { waitUntil: (p) => scheduled.push(p) },
+    });
+    assert.equal(stale, null, "an answer about the old picks would re-add an episode the channel now has");
+    assert.equal(scheduled.length, 1, "and a rebuild is scheduled off the request's critical path");
+    await Promise.all(scheduled);
+  });
+
+  it("plays the new episodes it found, at the end or at the top as the channel says", async () => {
+    const env = { CONFIGS: makeKv() };
+    const stored = [
+      ep({ season: 1, episode: 1, title: "S1E1" }),
+      ep({ season: 1, episode: 2, title: "S1E2" }),
+    ];
+    stubTmdb([1], {
+      1: [
+        { episode_number: 1, name: "one", air_date: "2025-01-01" },
+        { episode_number: 2, name: "two", air_date: "2025-01-08" },
+        { episode_number: 3, name: "three", air_date: "2025-01-15" },
+      ],
+    });
+    const payload = { channelId: "ch-play", name: "Keeps up", items: stored, autoNewEpisodes: true };
+    await newEpFns.refreshChannelNewEpisodes(payload, { env, tmdbKey: "key" });
+    const atEnd = await newEpFns.channelSourceItems(payload, { env });
+    assert.equal(atEnd.map((it) => it.epName || it.title).join(","), "S1E1,S1E2,three");
+    const atTop = await newEpFns.channelSourceItems({ ...payload, newEpisodesAtTop: true }, { env });
+    assert.equal(atTop.map((it) => it.epName || it.title).join(","), "three,S1E1,S1E2");
+    const off = await newEpFns.channelSourceItems({ ...payload, autoNewEpisodes: false }, { env });
+    assert.equal(off.map((it) => it.title).join(","), "S1E1,S1E2", "a channel that did not ask gets nothing");
+  });
+});
+
 describe("worker: the channel lineup endpoint", () => {
   const ep = (over = {}) => ({
     kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13", ...over,

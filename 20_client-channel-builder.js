@@ -8382,6 +8382,10 @@ function shuffleChannelDraft() {
 // custom channel exactly the cadence those already had.
 const CHANNEL_DEFAULT_ROTATE_SHOWS = 24;
 const CHANNEL_DEFAULT_ROTATE_EPISODES = 3;
+// The Worker's CHANNEL_PART_GROUP_MAX, which is what actually enforces this;
+// saying so here means the builder refuses a seventh episode rather than
+// silently storing a pairing that plays as six.
+const CHANNEL_DRAFT_PAIR_MAX = 6;
 
 // The draft's own copy of the three fields that have no input of their own:
 // Story Lock is a rendered list, and the last two are stamped on by whatever
@@ -8390,6 +8394,10 @@ const CHANNEL_DEFAULT_ROTATE_EPISODES = 3;
 let channelDraftStoryLocked = [];
 let channelDraftSourceUrl = '';
 let channelDraftDynamic = '';
+// Pairs made by hand in the draft: arrays of stream ids, the same keys the
+// Worker glues by. Stored as ids rather than positions because every sort,
+// filter and drag in this builder moves positions around.
+let channelDraftPairedGroups = [];
 
 // The client twin of the Worker's channelItemShowKey (05_catalog-core.js).
 // Both sides have to agree on this exactly: it is the key a Story Lock is
@@ -8416,6 +8424,12 @@ function channelBroadcastFields(src) {
     rotateTurnoverZone: o.rotateTurnoverZone === 'local' ? 'local' : 'utc',
     hideWatched: !!o.hideWatched,
     storyLocked: Array.isArray(o.storyLocked) ? o.storyLocked.slice() : [],
+    pairParts: !!o.pairParts,
+    pairedGroups: Array.isArray(o.pairedGroups)
+      ? o.pairedGroups.filter((g) => Array.isArray(g) && g.length > 1).map((g) => g.slice())
+      : [],
+    autoNewEpisodes: !!o.autoNewEpisodes,
+    newEpisodesAtTop: !!o.newEpisodesAtTop,
     liveSync: !!o.liveSync,
     sourceUrl: o.sourceUrl || '',
     dynamic: o.dynamic || '',
@@ -8537,7 +8551,108 @@ function updateChannelBroadcastControls() {
         (available && shows > available ? ' This channel only has ' + available + ' shows in it so far.' : '');
     }
   }
+  updateChannelNewEpisodeControls();
+  updateChannelPairControls();
   renderChannelStoryLock();
+}
+
+// The sub-rule only exists while the rule above it is on: "put new episodes
+// at the top" of a channel that is not collecting any is a switch with
+// nothing behind it.
+function updateChannelNewEpisodeControls() {
+  const check = document.getElementById('channelAutoNewEpisodesCheck');
+  const row = document.getElementById('channelNewEpisodesRow');
+  const hint = document.getElementById('channelAutoNewEpisodesHint');
+  const on = !!(check && check.checked);
+  if (row) row.style.display = on ? 'block' : 'none';
+  if (!hint) return;
+  if (!on) {
+    hint.textContent = 'Off — this channel plays the picks below and nothing else.';
+    return;
+  }
+  const shows = channelDraftShowGroups().filter((g) => !g.isMovie).length;
+  const topCheck = document.getElementById('channelNewEpisodesTopCheck');
+  const where = topCheck && topCheck.checked ? 'at the top' : 'at the end';
+  hint.textContent = 'Episodes that air from now on are added ' + where + ' on their own, for ' +
+    (shows ? (shows + ' show' + (shows === 1 ? '' : 's')) : 'the shows') +
+    ' in this channel. Checked in the background a couple of times a day; already-aired episodes only.';
+}
+
+// Everything the hand-made pairs need on screen: the count, a way to drop
+// them all, and the pruning that keeps them honest when picks are removed.
+function updateChannelPairControls() {
+  const keys = {};
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftPairKey(it);
+    if (key) keys[key] = true;
+  });
+  // A pair whose other half has been removed is not a pair. Dropped here
+  // rather than saved forward, the same way a Story Lock on a removed show
+  // is.
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys[k]))
+    .filter((g) => g.length > 1);
+  const hint = document.getElementById('channelPairPartsHint');
+  if (!hint) return;
+  const base = 'Finds “Part 1” / “Pt. II” / “(2)” in episode titles. Whenever one part is on today, the rest play straight after it instead of turning up tomorrow.';
+  const made = channelDraftPairedGroups.length;
+  hint.textContent = made
+    ? (base + ' ' + made + ' pair' + (made === 1 ? '' : 's') + ' made by hand below — those play together whether this is ticked or not.')
+    : (base + ' Select picks below and hit Pair to link any two by hand.');
+}
+
+// The client twin of the Worker's channelItemStreamId: the key a pairing is
+// stored under on both sides.
+function channelDraftPairKey(it) {
+  if (!it) return '';
+  const showId = String(it.imdbId || '').trim();
+  if (!showId) return '';
+  if (it.kind === 'movie') return showId;
+  if (it.season == null || it.episode == null) return '';
+  return showId + ':' + it.season + ':' + it.episode;
+}
+
+// "Pair" over the selection: these picks play back to back, in the order
+// they are listed in the channel, wherever the first of them is drawn.
+//
+// A pick can only belong to one pair, so selecting a pick that is already in
+// one replaces that pair rather than leaving it in two places with two
+// different answers about what plays next.
+function pairChannelDraftSelection() {
+  const keys = [];
+  channelDraftSelection.slice().sort((a, b) => a - b).forEach((i) => {
+    const key = channelDraftPairKey(channelDraftItems[i]);
+    if (key && keys.indexOf(key) === -1) keys.push(key);
+  });
+  if (keys.length < 2) {
+    showAddedToast('Pick at least two episodes to pair.');
+    return;
+  }
+  if (keys.length > CHANNEL_DRAFT_PAIR_MAX) {
+    showAddedToast('A pairing can hold at most ' + CHANNEL_DRAFT_PAIR_MAX + ' episodes.');
+    return;
+  }
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys.indexOf(k) === -1))
+    .filter((g) => g.length > 1);
+  channelDraftPairedGroups.push(keys);
+  renderChannelDraftList();
+  showAddedToast(keys.length + ' episodes will play back to back.');
+}
+
+function unpairChannelDraftSelection() {
+  const keys = [];
+  channelDraftSelection.forEach((i) => {
+    const key = channelDraftPairKey(channelDraftItems[i]);
+    if (key) keys.push(key);
+  });
+  if (!keys.length) return;
+  const before = channelDraftPairedGroups.length;
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys.indexOf(k) === -1))
+    .filter((g) => g.length > 1);
+  renderChannelDraftList();
+  showAddedToast(before === channelDraftPairedGroups.length ? 'None of those were paired.' : 'Pairing removed.');
 }
 
 // Reads the whole section back as the payload fields the Worker understands.
@@ -8550,6 +8665,9 @@ function readChannelBroadcastSettings() {
   const timeStr = (timeInput && timeInput.value) || '00:00';
   const liveCheck = document.getElementById('channelLiveSyncCheck');
   const hideCheck = document.getElementById('channelHideWatchedCheck');
+  const pairCheck = document.getElementById('channelPairPartsCheck');
+  const newEpCheck = document.getElementById('channelAutoNewEpisodesCheck');
+  const newEpTopCheck = document.getElementById('channelNewEpisodesTopCheck');
   const descInput = document.getElementById('channelDescriptionInput');
   return {
     description: descInput ? String(descInput.value || '').trim().slice(0, 400) : '',
@@ -8561,6 +8679,13 @@ function readChannelBroadcastSettings() {
     rotateTurnoverZone: zone,
     hideWatched: !!(hideCheck && hideCheck.checked),
     storyLocked: channelDraftStoryLocked.slice(),
+    pairParts: !!(pairCheck && pairCheck.checked),
+    pairedGroups: channelDraftPairedGroups.map((g) => g.slice()),
+    autoNewEpisodes: !!(newEpCheck && newEpCheck.checked),
+    // Only meaningful with the line above on, and stored as 0 when it is
+    // off for the same reason the rotation dials are: a flag with nothing
+    // behind it reads as a rule the channel does not actually have.
+    newEpisodesAtTop: !!(newEpCheck && newEpCheck.checked && newEpTopCheck && newEpTopCheck.checked),
     // Live Cloud Sync has nothing to sync FROM unless this channel was
     // imported from a list, so it can only ever be on for one that was.
     liveSync: !!(channelDraftSourceUrl && liveCheck && liveCheck.checked),
@@ -8576,6 +8701,7 @@ function applyChannelBroadcastSettings(channel) {
   const descInput = document.getElementById('channelDescriptionInput');
   if (descInput) descInput.value = f.description;
   channelDraftStoryLocked = f.storyLocked;
+  channelDraftPairedGroups = f.pairedGroups;
   channelDraftSourceUrl = f.sourceUrl;
   channelDraftDynamic = f.dynamic;
   const check = document.getElementById('channelDailyRotateCheck');
@@ -8596,6 +8722,12 @@ function applyChannelBroadcastSettings(channel) {
   }
   const hideCheck = document.getElementById('channelHideWatchedCheck');
   if (hideCheck) hideCheck.checked = f.hideWatched;
+  const pairCheck = document.getElementById('channelPairPartsCheck');
+  if (pairCheck) pairCheck.checked = f.pairParts;
+  const newEpCheck = document.getElementById('channelAutoNewEpisodesCheck');
+  if (newEpCheck) newEpCheck.checked = f.autoNewEpisodes;
+  const newEpTopCheck = document.getElementById('channelNewEpisodesTopCheck');
+  if (newEpTopCheck) newEpTopCheck.checked = f.newEpisodesAtTop;
   const liveRow = document.getElementById('channelLiveSyncRow');
   const liveCheck = document.getElementById('channelLiveSyncCheck');
   if (liveCheck) liveCheck.checked = f.liveSync;
@@ -8821,6 +8953,9 @@ function channelDraftSummary(items, settings) {
   }
   if ((s.storyLocked || []).length) rules.push((s.storyLocked || []).length + ' story-locked');
   if (s.hideWatched) rules.push('hides watched');
+  if (s.pairParts) rules.push('parts stay together');
+  else if ((s.pairedGroups || []).length) rules.push((s.pairedGroups || []).length + ' paired');
+  if (s.autoNewEpisodes) rules.push('auto-adds new episodes' + (s.newEpisodesAtTop ? ' at the top' : ''));
   if (s.liveSync) rules.push('live cloud sync');
   return {
     shows: shows.size,
@@ -10053,6 +10188,9 @@ function renderMyCreatedChannelsList() {
     if (orderLabel) metaBits.push(orderLabel);
     if (ch.hideWatched) metaBits.push('hides watched');
     if ((ch.storyLocked || []).length) metaBits.push((ch.storyLocked || []).length + ' story-locked');
+    if (ch.pairParts) metaBits.push('parts stay together');
+    else if ((ch.pairedGroups || []).length) metaBits.push((ch.pairedGroups || []).length + ' paired');
+    if (ch.autoNewEpisodes) metaBits.push('auto-adds new episodes' + (ch.newEpisodesAtTop ? ' at the top' : ''));
     if (ch.liveSync) metaBits.push('live cloud sync');
     if (ch.sharePublished) metaBits.push('published');
     const metaText = metaBits.map(escapeHtml).join(' &middot; ');

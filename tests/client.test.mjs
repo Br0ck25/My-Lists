@@ -4664,6 +4664,8 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
     const client = loadClient({ routes: {} });
     client.set("channelDraftItems", draft);
     client.set("channelDraftStoryLocked", []);
+    client.set("channelDraftPairedGroups", []);
+    client.set("channelDraftSelection", []);
     client.set("channelDraftSourceUrl", "");
     client.set("channelDraftDynamic", "");
     return client;
@@ -4713,6 +4715,8 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
       dailyRotate: true, rotateShows: 6, rotateEpisodes: 2,
       rotateTurnover: 300, rotateTurnoverTime: "00:00", rotateTurnoverZone: "local",
       hideWatched: true, storyLocked: ["tt1"],
+      pairParts: true, pairedGroups: [["tt1:1:1", "tt1:1:2"]],
+      autoNewEpisodes: true, newEpisodesAtTop: true,
       liveSync: true, sourceUrl: "https://trakt.tv/users/x/lists/y",
       dynamic: "", shareCode: "AbC123", sharePublished: true,
     };
@@ -4721,11 +4725,13 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
     for (const key of [
       "dailyRotate", "rotateShows", "rotateEpisodes", "rotateTurnover",
       "rotateTurnoverTime", "rotateTurnoverZone", "hideWatched",
+      "pairParts", "autoNewEpisodes", "newEpisodesAtTop",
       "liveSync", "sourceUrl", "shareCode", "sharePublished",
     ]) {
       assert.deepEqual(plain(saved[key]), payload[key], `${key} survived the save`);
     }
     assert.deepEqual(plain(saved.storyLocked), ["tt1"]);
+    assert.deepEqual(plain(saved.pairedGroups), [["tt1:1:1", "tt1:1:2"]]);
   });
 
   it("keeps the flags through a SECOND save, which is where a dropped field shows up", () => {
@@ -4733,6 +4739,7 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
     client.call("saveLocalChannel", {
       channelId: "ch1", name: "Block Party", items: [epOf("tt1", 1, 1, "Simpsons")],
       dailyRotate: true, rotateShows: 6, hideWatched: true, storyLocked: ["tt1"],
+      pairParts: true, pairedGroups: [["tt1:1:1", "tt1:1:2"]], autoNewEpisodes: true,
     });
     // saveLocalChannelsMap rebuilds every record, so a field it does not know
     // about is lost here rather than on the first write.
@@ -4742,6 +4749,9 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
     assert.equal(saved.rotateShows, 6);
     assert.equal(saved.hideWatched, true);
     assert.deepEqual(plain(saved.storyLocked), ["tt1"]);
+    assert.equal(saved.pairParts, true);
+    assert.equal(saved.autoNewEpisodes, true);
+    assert.deepEqual(plain(saved.pairedGroups), [["tt1:1:1", "tt1:1:2"]]);
   });
 
   it("normalizes anything missing rather than writing undefined into the payload", () => {
@@ -4751,9 +4761,70 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
       description: "",
       dailyRotate: false, rotateShows: 0, rotateEpisodes: 0, rotateTurnover: 0,
       rotateTurnoverTime: "", rotateTurnoverZone: "utc", hideWatched: false,
-      storyLocked: [], liveSync: false, sourceUrl: "", dynamic: "",
+      storyLocked: [], pairParts: false, pairedGroups: [],
+      autoNewEpisodes: false, newEpisodesAtTop: false,
+      liveSync: false, sourceUrl: "", dynamic: "",
     });
     assert.deepEqual(plain(client.call("channelBroadcastFields", null).storyLocked), []);
+  });
+
+  it("pairs the selection by stream id, in the order the channel lists them", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      epOf("tt1", 1, 2, "Simpsons"),
+      epOf("tt2", 1, 1, "King of the Hill"),
+    ]);
+    client.set("channelDraftSelection", [2, 0]);
+    client.call("pairChannelDraftSelection");
+    assert.deepEqual(plain(client.get("channelDraftPairedGroups")), [["tt1:1:1", "tt2:1:1"]],
+      "listed order, not the order they were ticked in");
+  });
+
+  it("refuses a pairing of one, and one of more than six", () => {
+    const draft = [];
+    for (let e = 1; e <= 8; e++) draft.push(epOf("tt1", 1, e, "Simpsons"));
+    const client = builder(draft);
+    client.set("channelDraftSelection", [0]);
+    client.call("pairChannelDraftSelection");
+    assert.equal(client.get("channelDraftPairedGroups").length, 0, "one episode is not a pair");
+    client.set("channelDraftSelection", [0, 1, 2, 3, 4, 5, 6]);
+    client.call("pairChannelDraftSelection");
+    assert.equal(client.get("channelDraftPairedGroups").length, 0, "seven is past what the Worker will glue");
+  });
+
+  it("lets a pick belong to one pairing only", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      epOf("tt1", 1, 2, "Simpsons"),
+      epOf("tt1", 1, 3, "Simpsons"),
+    ]);
+    client.set("channelDraftSelection", [0, 1]);
+    client.call("pairChannelDraftSelection");
+    client.set("channelDraftSelection", [1, 2]);
+    client.call("pairChannelDraftSelection");
+    assert.deepEqual(plain(client.get("channelDraftPairedGroups")), [["tt1:1:2", "tt1:1:3"]],
+      "the first pairing is left with one member, so it is not a pairing any more");
+  });
+
+  it("unpairs whatever is selected and leaves the rest alone", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      epOf("tt1", 1, 2, "Simpsons"),
+      epOf("tt2", 1, 1, "King of the Hill"),
+      epOf("tt2", 1, 2, "King of the Hill"),
+    ]);
+    client.set("channelDraftPairedGroups", [["tt1:1:1", "tt1:1:2"], ["tt2:1:1", "tt2:1:2"]]);
+    client.set("channelDraftSelection", [0]);
+    client.call("unpairChannelDraftSelection");
+    assert.deepEqual(plain(client.get("channelDraftPairedGroups")), [["tt2:1:1", "tt2:1:2"]]);
+  });
+
+  it("drops a pairing whose other half has been removed from the channel", () => {
+    const client = builder([epOf("tt1", 1, 1, "Simpsons")]);
+    client.set("channelDraftPairedGroups", [["tt1:1:1", "tt1:1:2"]]);
+    client.call("updateChannelPairControls");
+    assert.deepEqual(plain(client.get("channelDraftPairedGroups")), [],
+      "a rule about one episode is not a pairing");
   });
 
   it("drops a Story Lock for a show that is no longer in the channel", () => {

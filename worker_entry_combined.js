@@ -13414,6 +13414,13 @@ const CHANNEL_ROTATION_EPISODES_PER_SHOW = 3;
 const CHANNEL_ROTATION_MAX_SHOWS_PER_DAY = 48;
 const CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW = 12;
 
+// How many episodes one multi-part story may glue together (see
+// glueMultiPartEpisodes). Two- and three-parters are the norm and a
+// five-network crossover is the outer edge of the real world; a cap stops a
+// mis-detection -- a show whose every episode is titled "Chapter One",
+// "Chapter Two" -- from gluing a whole season into one unbreakable block.
+const CHANNEL_PART_GROUP_MAX = 6;
+
 // --- channel video ids -------------------------------------------------
 //
 // A channel video's `id` IS the stream request: Stremio asks every stream
@@ -13514,6 +13521,10 @@ function sortChannelItemsByAired(items) {
 const SHARED_CHANNEL_ITEMS_MAX = 5000;
 const SHARED_CHANNEL_NAME_MAX = 200;
 const SHARED_CHANNEL_DESCRIPTION_MAX = 400;
+// Hand-made pairings a shared channel may carry. Generous next to the number
+// of multi-parters in any real channel, and small enough that the field
+// cannot be used to inflate a share.
+const SHARED_CHANNEL_PAIRS_MAX = 200;
 
 function sharedChannelString(value, max) {
   return String(value == null ? "" : value).trim().slice(0, max);
@@ -13561,6 +13572,30 @@ function sanitizeSharedChannelItem(raw) {
 
 // A channel as it is safe to store and hand back out. Returns null when
 // there is nothing playable left, which is what the routes answer 400 on.
+// Pairs survive a share only where both halves do: every key is checked
+// against the picks that actually came through, and a group left with fewer
+// than two members is dropped rather than travelling as a rule about one
+// episode.
+function sanitizeSharedPairedGroups(raw, items) {
+  const keys = new Set();
+  for (const it of items) {
+    const key = channelItemStreamId(it);
+    if (key) keys.add(key);
+  }
+  const out = [];
+  for (const group of (Array.isArray(raw) ? raw : []).slice(0, SHARED_CHANNEL_PAIRS_MAX)) {
+    if (!Array.isArray(group)) continue;
+    const kept = [];
+    for (const k of group) {
+      const key = sharedChannelString(k, 60);
+      if (key && keys.has(key) && kept.indexOf(key) === -1) kept.push(key);
+      if (kept.length >= CHANNEL_PART_GROUP_MAX) break;
+    }
+    if (kept.length > 1) out.push(kept);
+  }
+  return out;
+}
+
 function sanitizeSharedChannel(raw) {
   if (!raw || typeof raw !== "object") return null;
   const items = (Array.isArray(raw.items) ? raw.items : [])
@@ -13595,6 +13630,17 @@ function sanitizeSharedChannel(raw) {
     storyLocked: (Array.isArray(raw.storyLocked) ? raw.storyLocked : [])
       .map((k) => sharedChannelString(k, 120))
       .filter((k) => k && itemKeys.has(k)),
+    pairParts: !!raw.pairParts,
+    // A channel that keeps up with its shows keeps doing so for whoever
+    // takes a copy -- it is the whole point of the flag, and it costs the
+    // receiving side nothing until they actually open the channel.
+    autoNewEpisodes: !!raw.autoNewEpisodes,
+    newEpisodesAtTop: !!raw.newEpisodesAtTop,
+    // Hand-made pairs, kept only for episodes the shared picks actually
+    // contain -- the same rule Story Lock follows above, for the same
+    // reason: a shared channel should never arrive carrying rules about
+    // titles it has not got.
+    pairedGroups: sanitizeSharedPairedGroups(raw.pairedGroups, items),
     dynamic: dynamic,
   };
   if (out.dailyRotate) {
@@ -13758,6 +13804,164 @@ function resequenceLockedShows(shuffled, sourceOrder, lockedKeys) {
 
 function shuffleChannelItems(items, seed, lockedKeys) {
   return resequenceLockedShows(seededShuffle(items, seed), items, lockedKeys);
+}
+
+// --- pairing glue: multi-part episodes stay together ---------------------
+//
+// A rotation deals a contiguous block out of a show's run and a shuffle
+// scatters it, and neither knows that "The Best of Both Worlds, Part I" is
+// half a story. Part II landing tomorrow -- or three hours later, after four
+// other shows -- is the one ordering result nobody wants.
+//
+// "Keep multi-part episodes together" turns on the detection below; a pair
+// made by hand in the builder always applies, toggle or not, because it was
+// asked for explicitly. Either way the rule is the same: the first part of a
+// story to be drawn brings the rest of it along, immediately after, in part
+// order.
+
+// Roman numerals up to the group cap. Deliberately not a general parser:
+// this only ever reads the "II" in "Part II", and a show with a Part XLII is
+// not a show this needs to get right.
+const CHANNEL_PART_ROMAN = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10 };
+
+// Splits an episode title into the story it belongs to and which part of it
+// this is: "The Best of Both Worlds, Part II" -> { base: "the best of both
+// worlds", part: 2 }. Returns null for a title that names no part, which is
+// almost every episode ever made.
+function channelPartTitleSplit(rawName) {
+  const name = String(rawName == null ? "" : rawName).trim();
+  if (!name) return null;
+  // "... Part 2", "... Pt. II", "... part two" is not matched on purpose:
+  // a spelled-out number is rare and the words are common enough in a
+  // title ("Part of the Family") to be worth leaving alone.
+  const worded = name.match(/^(.*?)[\s,:;–—-]*\(?\s*(?:part|pt\.?)\s*([0-9]{1,2}|[ivxIVX]{1,4})\s*\)?[\s.]*$/i);
+  if (worded) {
+    const raw = worded[2].toLowerCase();
+    const part = /^[0-9]+$/.test(raw) ? parseInt(raw, 10) : (CHANNEL_PART_ROMAN[raw] || 0);
+    if (part > 0 && worded[1].trim()) return { base: channelPartBaseKey(worded[1]), part: part };
+    return null;
+  }
+  // The other form TMDB carries: a bare "(1)" / "(2)" suffix.
+  const bracketed = name.match(/^(.*?)[\s,:;–—-]*\(([0-9]{1,2})\)[\s.]*$/);
+  if (bracketed) {
+    const part = parseInt(bracketed[2], 10);
+    if (part > 0 && bracketed[1].trim()) return { base: channelPartBaseKey(bracketed[1]), part: part };
+  }
+  return null;
+}
+
+// Two halves of one story have to agree on their name to be recognized as
+// halves, and they routinely differ in punctuation alone ("Worlds, Part I"
+// vs "Worlds Part II"), so the comparison is made on letters and digits.
+function channelPartBaseKey(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// The key a pairing is stored and looked up under: the item's stream id, so
+// a pair made in the builder survives the channel being re-sorted, re-saved
+// or shared, none of which keep array positions.
+function channelItemPairKey(it) {
+  return channelItemStreamId(it);
+}
+
+// Pairs the builder stored by hand, as arrays of stream ids.
+function channelManualPairGroups(payload) {
+  const raw = Array.isArray(payload && payload.pairedGroups) ? payload.pairedGroups : [];
+  const out = [];
+  for (const group of raw) {
+    if (!Array.isArray(group)) continue;
+    const keys = [];
+    for (const k of group) {
+      const key = String(k || "").trim();
+      if (key && keys.indexOf(key) === -1) keys.push(key);
+      if (keys.length >= CHANNEL_PART_GROUP_MAX) break;
+    }
+    if (keys.length > 1) out.push(keys);
+  }
+  return out;
+}
+
+// Every multi-part story in a pool, as a lookup from each member's key to
+// the whole story in part order.
+//
+// A manual pair wins over a detected one for the same episode: it was asked
+// for by hand, against a title the detection can only guess at.
+function channelPartGroups(payload, poolItems) {
+  const byKey = new Map();
+  for (const it of poolItems) {
+    const key = channelItemPairKey(it);
+    if (key && !byKey.has(key)) byKey.set(key, it);
+  }
+  const lookup = new Map();
+  const claim = (members) => {
+    if (members.length < 2) return;
+    const capped = members.slice(0, CHANNEL_PART_GROUP_MAX);
+    if (capped.some((it) => lookup.has(channelItemPairKey(it)))) return;
+    for (const it of capped) lookup.set(channelItemPairKey(it), capped);
+  };
+  for (const keys of channelManualPairGroups(payload)) {
+    const members = keys.map((k) => byKey.get(k)).filter(Boolean);
+    claim(members);
+  }
+  if (!payload.pairParts) return lookup;
+  // Detected pairs: same show, same season, same story name, different part
+  // numbers. Season matters -- a remake's "Part 1" ten seasons later is a
+  // different story with the same name.
+  const stories = new Map();
+  for (const it of poolItems) {
+    if (!it || it.kind === "movie") continue;
+    const key = channelItemPairKey(it);
+    if (!key) continue;
+    const split = channelPartTitleSplit(it.epName);
+    if (!split) continue;
+    const season = channelItemNumber(it.season);
+    const storyKey = `${channelItemShowKey(it)}|${season === null ? "" : season}|${split.base}`;
+    if (!stories.has(storyKey)) stories.set(storyKey, []);
+    stories.get(storyKey).push({ item: it, part: split.part });
+  }
+  for (const entries of stories.values()) {
+    const seenParts = new Set();
+    const members = [];
+    for (const e of entries.slice().sort((a, b) => a.part - b.part)) {
+      if (seenParts.has(e.part)) continue;
+      seenParts.add(e.part);
+      members.push(e.item);
+    }
+    claim(members);
+  }
+  return lookup;
+}
+
+// Applies those groups to a finished lineup.
+//
+// Wherever the first-drawn member of a story appears, the WHOLE story is
+// played there, in part order, and its other members are dropped from
+// wherever else they landed. A part that was not drawn at all is pulled in
+// from the pool: a channel that gave you Part 1 and made you wait a day for
+// Part 2 is the exact complaint this answers. A part that is not in the pool
+// (never added, or filtered out by "Hide watched") simply is not there, and
+// the rest still play together.
+//
+// Drawing Part 2 first plays the story from Part 1, for the same reason:
+// the back half of a story on its own is worse than a minute of extra
+// runtime.
+function glueMultiPartEpisodes(items, poolItems, payload) {
+  const groups = channelPartGroups(payload, poolItems);
+  if (!groups.size) return items;
+  const played = new Set();
+  const out = [];
+  for (const it of items) {
+    const members = groups.get(channelItemPairKey(it));
+    if (!members) {
+      out.push(it);
+      continue;
+    }
+    const storyId = channelItemPairKey(members[0]);
+    if (played.has(storyId)) continue;
+    played.add(storyId);
+    for (const member of members) out.push(member);
+  }
+  return out;
 }
 
 // The dials behind a daily broadcast schedule. Quick Add's network channels
@@ -14080,6 +14284,236 @@ async function readChannelLivePool(payload, opts) {
   return usable ? cached.items : null;
 }
 
+// --- self-maintaining channels: new episodes arrive on their own ---------
+//
+// A channel is a snapshot: add The Last of Us today and the channel still
+// carries exactly those episodes a year later, while the show has moved on
+// without it. "Automatically add new episodes" closes that gap -- the Worker
+// re-checks each show the channel carries and folds in whatever has aired
+// since, at the top of the channel or at the end, as the channel says.
+//
+// Same shape as Live Cloud Sync above, and for the same reasons: the work is
+// dozens of TMDB calls, so it happens on a background task with nobody
+// waiting on it, the result is cached in KV, and a request serves what is
+// stored and schedules the refresh rather than paying for it.
+const CHANNEL_NEW_EPISODE_TTL_MS = 12 * 60 * 60 * 1000;
+const CHANNEL_NEW_EPISODE_MAX_SHOWS = 30;
+const CHANNEL_NEW_EPISODE_MAX_SEASONS = 2;
+const CHANNEL_NEW_EPISODE_MAX_ITEMS = 300;
+const CHANNEL_NEW_EPISODE_IN_FLIGHT = new Set();
+
+function channelNewEpisodeKey(channelId) {
+  return `channelnew:${channelId}`;
+}
+
+// What the channel already has, per show: the highest season it carries and
+// every season:episode in it. The high-water mark is what makes the check
+// cheap -- only seasons at or past it can hold anything new, so a channel of
+// ten-season shows still costs one or two season calls each.
+function channelShowWatermarks(items) {
+  const marks = new Map();
+  for (const it of items || []) {
+    if (!it || it.kind === "movie") continue;
+    const showId = channelItemShowId(it.imdbId);
+    const season = channelItemNumber(it.season);
+    const episode = channelItemNumber(it.episode);
+    if (!showId || season === null || episode === null) continue;
+    if (!marks.has(showId)) {
+      marks.set(showId, {
+        showId: showId,
+        showName: it.showName || "",
+        showPoster: it.showPoster || it.poster || "",
+        maxSeason: season,
+        have: new Set(),
+      });
+    }
+    const mark = marks.get(showId);
+    if (season > mark.maxSeason) mark.maxSeason = season;
+    if (!mark.showName && it.showName) mark.showName = it.showName;
+    if (!mark.showPoster && (it.showPoster || it.poster)) mark.showPoster = it.showPoster || it.poster;
+    mark.have.add(`${season}:${episode}`);
+  }
+  return marks;
+}
+
+// Whether a cached answer still belongs to the channel that asked for it.
+// Editing the channel -- adding a show, adding a season by hand -- changes
+// the marks, and an answer computed against the old ones would re-add
+// episodes the channel now carries itself.
+function channelNewEpisodeSignature(marks) {
+  const parts = [];
+  for (const mark of marks.values()) parts.push(`${mark.showId}:${mark.maxSeason}:${mark.have.size}`);
+  return String(hashStringToInt(parts.sort().join("|")));
+}
+
+// Everything one show has aired that this channel does not already carry.
+// Unaired episodes are left alone: TMDB lists next month's episode the day
+// it is announced, and a channel slot that plays nothing is worse than a
+// channel that is a week behind.
+async function fetchShowEpisodesAfter(mark, tmdbKey, today) {
+  const idForTmdb = mark.showId.startsWith("tmdb:") ? mark.showId.slice(5) : "";
+  let tmdbId = idForTmdb;
+  if (!tmdbId) {
+    const findRes = await fetch(
+      `https://api.themoviedb.org/3/find/${encodeURIComponent(mark.showId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`,
+      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+    );
+    if (!findRes.ok) return [];
+    const findData = await findRes.json();
+    const match = (findData.tv_results || [])[0];
+    if (!match) return [];
+    tmdbId = String(match.id);
+  }
+  const showRes = await fetch(
+    `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}?api_key=${encodeURIComponent(tmdbKey)}`,
+    { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 21600, cacheEverything: true } }
+  );
+  if (!showRes.ok) return [];
+  const fullShow = await showRes.json();
+  const showName = mark.showName || fullShow.name || "";
+  const showPoster = mark.showPoster ||
+    (fullShow.poster_path ? `https://image.tmdb.org/t/p/w500${fullShow.poster_path}` : "");
+  const seasons = (fullShow.seasons || [])
+    .filter((s) => s && s.season_number >= mark.maxSeason)
+    .sort((a, b) => a.season_number - b.season_number)
+    .slice(0, CHANNEL_NEW_EPISODE_MAX_SEASONS);
+  const out = [];
+  for (const s of seasons) {
+    const sRes = await fetch(
+      `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/season/${s.season_number}?api_key=${encodeURIComponent(tmdbKey)}`,
+      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 21600, cacheEverything: true } }
+    );
+    if (!sRes.ok) continue;
+    const sData = await sRes.json();
+    for (const ep of (sData.episodes || [])) {
+      const season = channelItemNumber(s.season_number);
+      const episode = channelItemNumber(ep && ep.episode_number);
+      if (season === null || episode === null) continue;
+      if (mark.have.has(`${season}:${episode}`)) continue;
+      const aired = String(ep.air_date || "");
+      if (!aired || aired > today) continue;
+      const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+      const epName = ep.name || `Episode ${episode}`;
+      out.push({
+        kind: "episode",
+        imdbId: mark.showId,
+        season: season,
+        episode: episode,
+        showName: showName,
+        epName: epName,
+        title: `${showName} S${season}E${episode} — ${epName}`,
+        released: aired,
+        thumbnail: stillUrl || showPoster,
+        poster: showPoster || stillUrl,
+        showPoster: showPoster,
+      });
+    }
+  }
+  return out;
+}
+
+// Newest first, so "put new episodes at top" puts the newest one at the very
+// top rather than the oldest of the new ones.
+function sortChannelNewEpisodes(items) {
+  return items.slice().sort((a, b) => {
+    const da = String(a.released || "");
+    const db = String(b.released || "");
+    if (da !== db) return db < da ? -1 : 1;
+    const sa = channelItemNumber(a.season) || 0;
+    const sb = channelItemNumber(b.season) || 0;
+    if (sa !== sb) return sb - sa;
+    return (channelItemNumber(b.episode) || 0) - (channelItemNumber(a.episode) || 0);
+  });
+}
+
+async function buildChannelNewEpisodes(marks, keys) {
+  const tmdbKey = (keys && keys.tmdbKey) || TMDB_API_KEY;
+  const today = new Date().toISOString().slice(0, 10);
+  const shortlist = [...marks.values()].slice(0, CHANNEL_NEW_EPISODE_MAX_SHOWS);
+  const perShow = await mapWithConcurrency(shortlist, 4, async (mark) => {
+    try {
+      return await fetchShowEpisodesAfter(mark, tmdbKey, today);
+    } catch {
+      return [];
+    }
+  });
+  const found = [];
+  for (const run of perShow) {
+    for (const it of run) found.push(it);
+  }
+  return sortChannelNewEpisodes(found).slice(0, CHANNEL_NEW_EPISODE_MAX_ITEMS);
+}
+
+async function refreshChannelNewEpisodes(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  if (CHANNEL_NEW_EPISODE_IN_FLIGHT.has(payload.channelId)) return null;
+  CHANNEL_NEW_EPISODE_IN_FLIGHT.add(payload.channelId);
+  try {
+    const marks = channelShowWatermarks(Array.isArray(payload.items) ? payload.items : []);
+    if (!marks.size) return null;
+    const items = await buildChannelNewEpisodes(marks, {
+      tmdbKey: opts.tmdbKey || "",
+    });
+    await env.CONFIGS.put(
+      channelNewEpisodeKey(payload.channelId),
+      JSON.stringify({
+        signature: channelNewEpisodeSignature(marks),
+        items: items,
+        updatedAt: Date.now(),
+      }),
+      { expirationTtl: 2592000 }
+    );
+    return items;
+  } finally {
+    CHANNEL_NEW_EPISODE_IN_FLIGHT.delete(payload.channelId);
+  }
+}
+
+// An empty answer is cached like any other -- a channel whose shows are all
+// finished would otherwise re-check every single request forever.
+async function readChannelNewEpisodes(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  let cached = null;
+  try {
+    const raw = await env.CONFIGS.get(channelNewEpisodeKey(payload.channelId));
+    if (raw) cached = JSON.parse(raw);
+  } catch {
+    cached = null;
+  }
+  const marks = channelShowWatermarks(Array.isArray(payload.items) ? payload.items : []);
+  const usable = !!(cached && Array.isArray(cached.items) &&
+    cached.signature === channelNewEpisodeSignature(marks));
+  const stale = !usable || (Date.now() - (cached.updatedAt || 0)) > CHANNEL_NEW_EPISODE_TTL_MS;
+  if (stale && opts.ctx && typeof opts.ctx.waitUntil === "function") {
+    opts.ctx.waitUntil(refreshChannelNewEpisodes(payload, opts).catch(() => {}));
+  }
+  return usable ? cached.items : null;
+}
+
+// Folds the newly-aired episodes into the channel's own picks. Anything the
+// channel already carries is dropped from the new side rather than played
+// twice -- the cached answer can be a few hours older than an edit that
+// added the same episode by hand.
+function mergeChannelNewEpisodes(stored, fresh, atTop) {
+  if (!Array.isArray(fresh) || !fresh.length) return stored;
+  const have = new Set();
+  for (const it of stored) {
+    const key = channelItemStreamId(it);
+    if (key) have.add(key);
+  }
+  const added = [];
+  for (const it of fresh) {
+    const key = channelItemStreamId(it);
+    if (!key || have.has(key)) continue;
+    have.add(key);
+    added.push(it);
+  }
+  if (!added.length) return stored;
+  return atTop ? added.concat(stored) : stored.concat(added);
+}
+
 // The pool a channel draws today's lineup from, before any ordering.
 //
 // Three shapes: a normal channel plays the picks stored on it; a dynamic
@@ -14102,11 +14536,20 @@ async function channelSourceItems(payload, opts) {
     const live = channelNextUpItems(opts.continueWatching);
     return live.length ? live : stored;
   }
+  let base = stored;
   if (payload.liveSync && payload.sourceUrl) {
     const live = await readChannelLivePool(payload, opts).catch(() => null);
-    if (live && live.length) return live;
+    if (live && live.length) base = live;
   }
-  return stored;
+  // "Automatically add new episodes" folds in whatever has aired since the
+  // channel was built. It sits after Live Cloud Sync rather than instead of
+  // it: one keeps up with the LIST a channel came from, the other with the
+  // SHOWS in it, and a channel can reasonably want both.
+  if (payload.autoNewEpisodes) {
+    const fresh = await readChannelNewEpisodes(payload, opts).catch(() => null);
+    if (fresh && fresh.length) base = mergeChannelNewEpisodes(base, fresh, !!payload.newEpisodesAtTop);
+  }
+  return base;
 }
 
 // The full stream id for one channel item, or "" if it cannot be formed.
@@ -14201,6 +14644,11 @@ async function resolveChannelLineup(payload, opts = {}) {
   // into an actual prime-time block instead of five blocks back to back.
   if (payload.sortByAired) items = sortChannelItemsByAired(items);
   else if (payload.autoSort === "interleave") items = interleaveChannelItems(items);
+  // Last of all, because every step above can separate two halves of one
+  // story: the rotation deals a block that ends between them, the shuffle
+  // scatters them, the interleaver puts four other shows in between. Gluing
+  // here is the only place that cannot be undone by a later step.
+  items = glueMultiPartEpisodes(items, playableItems, payload);
   return { items, sourceItems, plan, day, seed };
 }
 
@@ -24166,6 +24614,8 @@ if ('serviceWorker' in navigator) {
           <option value="">Select a whole show or season&hellip;</option>
         </select>
         <span style="flex:1;"></span>
+        <button type="button" class="secondary lc-btn" onclick="pairChannelDraftSelection()" title="Play these picks back to back, in this order">Pair</button>
+        <button type="button" class="secondary lc-btn" onclick="unpairChannelDraftSelection()" title="Drop any hand-made pairing on these picks">Unpair</button>
         <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('top')">To top</button>
         <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('bottom')">To bottom</button>
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeChannelDraftSelection()">Remove selected</button>
@@ -24219,7 +24669,25 @@ if ('serviceWorker' in navigator) {
           <input type="checkbox" id="channelHideWatchedCheck">
           <span>Hide watched &mdash; skip episodes already in my Watch History</span>
         </label>
-        <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Needs Auto-track playback signed in. Once every pick has been seen, the whole channel comes back rather than going dark.</p>
+        <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Needs Auto-track playback signed in. Once every pick has been seen, the whole channel comes back rather than going dark. Leave it off to keep watched episodes in the rotation.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelPairPartsCheck" onchange="updateChannelBroadcastControls()">
+          <span>Keep multi-part episodes together</span>
+        </label>
+        <p id="channelPairPartsHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Finds &ldquo;Part 1&rdquo; / &ldquo;Pt. II&rdquo; / &ldquo;(2)&rdquo; in episode titles. Whenever one part is on today, the rest play straight after it instead of turning up tomorrow.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelAutoNewEpisodesCheck" onchange="updateChannelBroadcastControls()">
+          <span>Automatically add new episodes</span>
+        </label>
+        <div id="channelNewEpisodesRow" style="display:none; margin:6px 0 0 24px;">
+          <label class="channel-rule-row">
+            <input type="checkbox" id="channelNewEpisodesTopCheck">
+            <span>Put new episodes at the top</span>
+          </label>
+        </div>
+        <p id="channelAutoNewEpisodesHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Off &mdash; this channel plays the picks below and nothing else.</p>
 
         <div id="channelLiveSyncRow" style="display:none; margin-top:10px;">
           <label class="channel-rule-row">
@@ -44198,6 +44666,10 @@ function shuffleChannelDraft() {
 // custom channel exactly the cadence those already had.
 const CHANNEL_DEFAULT_ROTATE_SHOWS = 24;
 const CHANNEL_DEFAULT_ROTATE_EPISODES = 3;
+// The Worker's CHANNEL_PART_GROUP_MAX, which is what actually enforces this;
+// saying so here means the builder refuses a seventh episode rather than
+// silently storing a pairing that plays as six.
+const CHANNEL_DRAFT_PAIR_MAX = 6;
 
 // The draft's own copy of the three fields that have no input of their own:
 // Story Lock is a rendered list, and the last two are stamped on by whatever
@@ -44206,6 +44678,10 @@ const CHANNEL_DEFAULT_ROTATE_EPISODES = 3;
 let channelDraftStoryLocked = [];
 let channelDraftSourceUrl = '';
 let channelDraftDynamic = '';
+// Pairs made by hand in the draft: arrays of stream ids, the same keys the
+// Worker glues by. Stored as ids rather than positions because every sort,
+// filter and drag in this builder moves positions around.
+let channelDraftPairedGroups = [];
 
 // The client twin of the Worker's channelItemShowKey (05_catalog-core.js).
 // Both sides have to agree on this exactly: it is the key a Story Lock is
@@ -44232,6 +44708,12 @@ function channelBroadcastFields(src) {
     rotateTurnoverZone: o.rotateTurnoverZone === 'local' ? 'local' : 'utc',
     hideWatched: !!o.hideWatched,
     storyLocked: Array.isArray(o.storyLocked) ? o.storyLocked.slice() : [],
+    pairParts: !!o.pairParts,
+    pairedGroups: Array.isArray(o.pairedGroups)
+      ? o.pairedGroups.filter((g) => Array.isArray(g) && g.length > 1).map((g) => g.slice())
+      : [],
+    autoNewEpisodes: !!o.autoNewEpisodes,
+    newEpisodesAtTop: !!o.newEpisodesAtTop,
     liveSync: !!o.liveSync,
     sourceUrl: o.sourceUrl || '',
     dynamic: o.dynamic || '',
@@ -44353,7 +44835,108 @@ function updateChannelBroadcastControls() {
         (available && shows > available ? ' This channel only has ' + available + ' shows in it so far.' : '');
     }
   }
+  updateChannelNewEpisodeControls();
+  updateChannelPairControls();
   renderChannelStoryLock();
+}
+
+// The sub-rule only exists while the rule above it is on: "put new episodes
+// at the top" of a channel that is not collecting any is a switch with
+// nothing behind it.
+function updateChannelNewEpisodeControls() {
+  const check = document.getElementById('channelAutoNewEpisodesCheck');
+  const row = document.getElementById('channelNewEpisodesRow');
+  const hint = document.getElementById('channelAutoNewEpisodesHint');
+  const on = !!(check && check.checked);
+  if (row) row.style.display = on ? 'block' : 'none';
+  if (!hint) return;
+  if (!on) {
+    hint.textContent = 'Off — this channel plays the picks below and nothing else.';
+    return;
+  }
+  const shows = channelDraftShowGroups().filter((g) => !g.isMovie).length;
+  const topCheck = document.getElementById('channelNewEpisodesTopCheck');
+  const where = topCheck && topCheck.checked ? 'at the top' : 'at the end';
+  hint.textContent = 'Episodes that air from now on are added ' + where + ' on their own, for ' +
+    (shows ? (shows + ' show' + (shows === 1 ? '' : 's')) : 'the shows') +
+    ' in this channel. Checked in the background a couple of times a day; already-aired episodes only.';
+}
+
+// Everything the hand-made pairs need on screen: the count, a way to drop
+// them all, and the pruning that keeps them honest when picks are removed.
+function updateChannelPairControls() {
+  const keys = {};
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftPairKey(it);
+    if (key) keys[key] = true;
+  });
+  // A pair whose other half has been removed is not a pair. Dropped here
+  // rather than saved forward, the same way a Story Lock on a removed show
+  // is.
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys[k]))
+    .filter((g) => g.length > 1);
+  const hint = document.getElementById('channelPairPartsHint');
+  if (!hint) return;
+  const base = 'Finds “Part 1” / “Pt. II” / “(2)” in episode titles. Whenever one part is on today, the rest play straight after it instead of turning up tomorrow.';
+  const made = channelDraftPairedGroups.length;
+  hint.textContent = made
+    ? (base + ' ' + made + ' pair' + (made === 1 ? '' : 's') + ' made by hand below — those play together whether this is ticked or not.')
+    : (base + ' Select picks below and hit Pair to link any two by hand.');
+}
+
+// The client twin of the Worker's channelItemStreamId: the key a pairing is
+// stored under on both sides.
+function channelDraftPairKey(it) {
+  if (!it) return '';
+  const showId = String(it.imdbId || '').trim();
+  if (!showId) return '';
+  if (it.kind === 'movie') return showId;
+  if (it.season == null || it.episode == null) return '';
+  return showId + ':' + it.season + ':' + it.episode;
+}
+
+// "Pair" over the selection: these picks play back to back, in the order
+// they are listed in the channel, wherever the first of them is drawn.
+//
+// A pick can only belong to one pair, so selecting a pick that is already in
+// one replaces that pair rather than leaving it in two places with two
+// different answers about what plays next.
+function pairChannelDraftSelection() {
+  const keys = [];
+  channelDraftSelection.slice().sort((a, b) => a - b).forEach((i) => {
+    const key = channelDraftPairKey(channelDraftItems[i]);
+    if (key && keys.indexOf(key) === -1) keys.push(key);
+  });
+  if (keys.length < 2) {
+    showAddedToast('Pick at least two episodes to pair.');
+    return;
+  }
+  if (keys.length > CHANNEL_DRAFT_PAIR_MAX) {
+    showAddedToast('A pairing can hold at most ' + CHANNEL_DRAFT_PAIR_MAX + ' episodes.');
+    return;
+  }
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys.indexOf(k) === -1))
+    .filter((g) => g.length > 1);
+  channelDraftPairedGroups.push(keys);
+  renderChannelDraftList();
+  showAddedToast(keys.length + ' episodes will play back to back.');
+}
+
+function unpairChannelDraftSelection() {
+  const keys = [];
+  channelDraftSelection.forEach((i) => {
+    const key = channelDraftPairKey(channelDraftItems[i]);
+    if (key) keys.push(key);
+  });
+  if (!keys.length) return;
+  const before = channelDraftPairedGroups.length;
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys.indexOf(k) === -1))
+    .filter((g) => g.length > 1);
+  renderChannelDraftList();
+  showAddedToast(before === channelDraftPairedGroups.length ? 'None of those were paired.' : 'Pairing removed.');
 }
 
 // Reads the whole section back as the payload fields the Worker understands.
@@ -44366,6 +44949,9 @@ function readChannelBroadcastSettings() {
   const timeStr = (timeInput && timeInput.value) || '00:00';
   const liveCheck = document.getElementById('channelLiveSyncCheck');
   const hideCheck = document.getElementById('channelHideWatchedCheck');
+  const pairCheck = document.getElementById('channelPairPartsCheck');
+  const newEpCheck = document.getElementById('channelAutoNewEpisodesCheck');
+  const newEpTopCheck = document.getElementById('channelNewEpisodesTopCheck');
   const descInput = document.getElementById('channelDescriptionInput');
   return {
     description: descInput ? String(descInput.value || '').trim().slice(0, 400) : '',
@@ -44377,6 +44963,13 @@ function readChannelBroadcastSettings() {
     rotateTurnoverZone: zone,
     hideWatched: !!(hideCheck && hideCheck.checked),
     storyLocked: channelDraftStoryLocked.slice(),
+    pairParts: !!(pairCheck && pairCheck.checked),
+    pairedGroups: channelDraftPairedGroups.map((g) => g.slice()),
+    autoNewEpisodes: !!(newEpCheck && newEpCheck.checked),
+    // Only meaningful with the line above on, and stored as 0 when it is
+    // off for the same reason the rotation dials are: a flag with nothing
+    // behind it reads as a rule the channel does not actually have.
+    newEpisodesAtTop: !!(newEpCheck && newEpCheck.checked && newEpTopCheck && newEpTopCheck.checked),
     // Live Cloud Sync has nothing to sync FROM unless this channel was
     // imported from a list, so it can only ever be on for one that was.
     liveSync: !!(channelDraftSourceUrl && liveCheck && liveCheck.checked),
@@ -44392,6 +44985,7 @@ function applyChannelBroadcastSettings(channel) {
   const descInput = document.getElementById('channelDescriptionInput');
   if (descInput) descInput.value = f.description;
   channelDraftStoryLocked = f.storyLocked;
+  channelDraftPairedGroups = f.pairedGroups;
   channelDraftSourceUrl = f.sourceUrl;
   channelDraftDynamic = f.dynamic;
   const check = document.getElementById('channelDailyRotateCheck');
@@ -44412,6 +45006,12 @@ function applyChannelBroadcastSettings(channel) {
   }
   const hideCheck = document.getElementById('channelHideWatchedCheck');
   if (hideCheck) hideCheck.checked = f.hideWatched;
+  const pairCheck = document.getElementById('channelPairPartsCheck');
+  if (pairCheck) pairCheck.checked = f.pairParts;
+  const newEpCheck = document.getElementById('channelAutoNewEpisodesCheck');
+  if (newEpCheck) newEpCheck.checked = f.autoNewEpisodes;
+  const newEpTopCheck = document.getElementById('channelNewEpisodesTopCheck');
+  if (newEpTopCheck) newEpTopCheck.checked = f.newEpisodesAtTop;
   const liveRow = document.getElementById('channelLiveSyncRow');
   const liveCheck = document.getElementById('channelLiveSyncCheck');
   if (liveCheck) liveCheck.checked = f.liveSync;
@@ -44637,6 +45237,9 @@ function channelDraftSummary(items, settings) {
   }
   if ((s.storyLocked || []).length) rules.push((s.storyLocked || []).length + ' story-locked');
   if (s.hideWatched) rules.push('hides watched');
+  if (s.pairParts) rules.push('parts stay together');
+  else if ((s.pairedGroups || []).length) rules.push((s.pairedGroups || []).length + ' paired');
+  if (s.autoNewEpisodes) rules.push('auto-adds new episodes' + (s.newEpisodesAtTop ? ' at the top' : ''));
   if (s.liveSync) rules.push('live cloud sync');
   return {
     shows: shows.size,
@@ -45869,6 +46472,9 @@ function renderMyCreatedChannelsList() {
     if (orderLabel) metaBits.push(orderLabel);
     if (ch.hideWatched) metaBits.push('hides watched');
     if ((ch.storyLocked || []).length) metaBits.push((ch.storyLocked || []).length + ' story-locked');
+    if (ch.pairParts) metaBits.push('parts stay together');
+    else if ((ch.pairedGroups || []).length) metaBits.push((ch.pairedGroups || []).length + ' paired');
+    if (ch.autoNewEpisodes) metaBits.push('auto-adds new episodes' + (ch.newEpisodesAtTop ? ' at the top' : ''));
     if (ch.liveSync) metaBits.push('live cloud sync');
     if (ch.sharePublished) metaBits.push('published');
     const metaText = metaBits.map(escapeHtml).join(' &middot; ');

@@ -300,6 +300,8 @@
           <option value="">Select a whole show or season&hellip;</option>
         </select>
         <span style="flex:1;"></span>
+        <button type="button" class="secondary lc-btn" onclick="pairChannelDraftSelection()" title="Play these picks back to back, in this order">Pair</button>
+        <button type="button" class="secondary lc-btn" onclick="unpairChannelDraftSelection()" title="Drop any hand-made pairing on these picks">Unpair</button>
         <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('top')">To top</button>
         <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('bottom')">To bottom</button>
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeChannelDraftSelection()">Remove selected</button>
@@ -353,7 +355,25 @@
           <input type="checkbox" id="channelHideWatchedCheck">
           <span>Hide watched &mdash; skip episodes already in my Watch History</span>
         </label>
-        <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Needs Auto-track playback signed in. Once every pick has been seen, the whole channel comes back rather than going dark.</p>
+        <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Needs Auto-track playback signed in. Once every pick has been seen, the whole channel comes back rather than going dark. Leave it off to keep watched episodes in the rotation.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelPairPartsCheck" onchange="updateChannelBroadcastControls()">
+          <span>Keep multi-part episodes together</span>
+        </label>
+        <p id="channelPairPartsHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Finds &ldquo;Part 1&rdquo; / &ldquo;Pt. II&rdquo; / &ldquo;(2)&rdquo; in episode titles. Whenever one part is on today, the rest play straight after it instead of turning up tomorrow.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelAutoNewEpisodesCheck" onchange="updateChannelBroadcastControls()">
+          <span>Automatically add new episodes</span>
+        </label>
+        <div id="channelNewEpisodesRow" style="display:none; margin:6px 0 0 24px;">
+          <label class="channel-rule-row">
+            <input type="checkbox" id="channelNewEpisodesTopCheck">
+            <span>Put new episodes at the top</span>
+          </label>
+        </div>
+        <p id="channelAutoNewEpisodesHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Off &mdash; this channel plays the picks below and nothing else.</p>
 
         <div id="channelLiveSyncRow" style="display:none; margin-top:10px;">
           <label class="channel-rule-row">

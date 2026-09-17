@@ -6,6 +6,37 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 📺 Channels: pairing glue, and channels that keep themselves up to date
+
+- **"Keep multi-part episodes together."** Every ordering step a channel has had until now could split a
+  two-parter: the daily rotation deals a block that ends between the halves, the shuffle scatters
+  them, the interleaver drops four other shows into the gap. The new toggle reads episode titles for
+  `Part 1` / `Pt. II` / `(2)` and glues each story back into one run -- whenever any part of it is
+  drawn, the whole story plays there, in part order. Drawing Part 2 first plays the story from Part 1
+  rather than handing you the back half of it, and a part the channel does not have is simply not
+  there while the rest still play together. Same show, same season and the same story name are all
+  required, so a remake nine seasons later and another show's episode of the same name are left
+  alone, and one story is capped at six episodes so a show whose every episode is "Chapter One" cannot
+  glue a season into one block.
+- **Pair by hand, for what a title cannot show.** A crossover event runs across two *different* shows
+  under two different names, which no title-based rule can see. Select the picks in the builder and
+  hit **Pair**: they play back to back wherever the first of them is drawn, toggle or not, because
+  you asked for it explicitly. **Unpair** undoes it, a pick can only belong to one pairing, and a
+  pairing whose other half is removed from the channel is dropped rather than saved forward -- the
+  same rule Story Lock follows.
+- **"Automatically add new episodes."** A channel has always been a snapshot: add The Last of Us today
+  and the channel still holds exactly those episodes a year later while the show moves on without it.
+  With this on, the Worker re-checks each show the channel carries and folds in whatever has aired
+  since, **at the top** or at the end as the channel says. It costs a request nothing: the check runs
+  on a background task with nobody waiting on it, the answer is cached for twelve hours (an empty
+  answer too, so a channel of finished shows stops re-checking), and it is thrown away the moment the
+  channel is edited, since an answer about the old picks would re-add an episode the channel now has
+  by hand. Only seasons at or past the highest one a channel already carries are asked about, so a
+  channel of ten-season shows costs one or two TMDB calls each -- and only episodes that have actually
+  aired are added, because a slot playing next month's announcement plays nothing at all.
+- Both flags travel with a share link and into the directory, and both appear in the channel's rule
+  line next to the ones already there.
+
 ### 🩹 Channels: On Today, corrected
 
 - **A rotating channel put one show on the air instead of twenty-four.** The builder writes `0` for
