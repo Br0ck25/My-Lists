@@ -2404,6 +2404,18 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   );
   const isMixedList = type === 'mixed' || isDualTypeChart || isExternalHistory || (preloaded && preloaded.sample && preloaded.sample.some((it) => it.type === 'series' || it.showId) && preloaded.sample.some((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'))) || (listUrl && (listUrl.includes('watchlist') || listUrl.includes('continue-watching') || listUrl.startsWith('autotrack:')));
 
+  // A channel saved in this browser -- the only thing that HAS a "today" to
+  // show, and the only one whose payload is here to ask about. A directory
+  // preview is somebody else's channel and is not in the local store.
+  const lineupChannelId = (listUrl && listUrl.startsWith('channel:id:')) ? listUrl.slice('channel:id:'.length) : '';
+  const canShowLineup = !!(lineupChannelId && typeof loadLocalChannels === 'function' && loadLocalChannels()[lineupChannelId]);
+  // Whether the Movies/Shows pills have anything to divide. A channel of
+  // only episodes has nothing to filter, but it still has a lineup -- which
+  // is why the bar can no longer be gated on being mixed.
+  const channelHasBothTypes = !!(preloaded && preloaded.sample &&
+    preloaded.sample.some((it) => it && it.type === 'movie') &&
+    preloaded.sample.some((it) => it && it.type !== 'movie'));
+
   const whControls = document.getElementById('whFilterControls');
   const whSortControls = document.getElementById('whSortControls');
   const genericTypeControls = document.getElementById('genericTypeFilterControls');
@@ -2429,7 +2441,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       filterBar.querySelectorAll('.wh-filter-pill').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.whFilter === curFilter);
       });
-    } else if (isDualTypeChart || isMixedList) {
+    } else if (isDualTypeChart || isMixedList || canShowLineup) {
       filterBar.style.display = 'flex';
       if (whControls) whControls.style.display = 'none';
       if (whSortControls) whSortControls.style.display = 'none';
@@ -2442,17 +2454,19 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         const mBtn = document.getElementById('detailTypeMovieBtn');
         const sBtn = document.getElementById('detailTypeSeriesBtn');
         const lBtn = document.getElementById('detailTypeLineupBtn');
-        // Only a channel has a "today", and only one saved in this browser
-        // can be asked about -- a directory preview is somebody else's
-        // channel and is not in the local store to look up.
-        const lineupChannelId = (listUrl && listUrl.startsWith('channel:id:')) ? listUrl.slice('channel:id:'.length) : '';
-        const canShowLineup = !!(lineupChannelId && typeof loadLocalChannels === 'function' && loadLocalChannels()[lineupChannelId]);
         if (lBtn) {
           lBtn.style.display = canShowLineup ? '' : 'none';
           lBtn.classList.remove('active');
         }
         const isExternalProvider = isExternalHistory || (listUrl && (listUrl.includes('trakt:watchlist') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/watchlist')) || listUrl.includes('mdblist:watchlist')));
-        if (isDualTypeChart && !isExternalProvider) {
+        if (canShowLineup && !channelHasBothTypes) {
+          // One kind of thing in this channel, so All/Movies/Shows would be
+          // three pills that all show the same list. "On today" is the only
+          // one with anything to say.
+          if (aBtn) aBtn.style.display = 'none';
+          if (mBtn) mBtn.style.display = 'none';
+          if (sBtn) sBtn.style.display = 'none';
+        } else if (isDualTypeChart && !isExternalProvider) {
           // On dual-type charts (Catalogs Quick Add & Discover), hide 'All' and show only 'Movies' & 'Shows'
           if (aBtn) aBtn.style.display = 'none';
           if (mBtn) {

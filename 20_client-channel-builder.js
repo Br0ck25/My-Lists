@@ -937,40 +937,6 @@ function beginMyChannelReorder() {
   if (myChannelsSort !== 'manual') seedMyChannelsManualOrder();
 }
 
-function moveMyChannel(channelId, dir) {
-  beginMyChannelReorder();
-  const visible = visibleMyChannelIds();
-  const from = visible.indexOf(channelId);
-  if (from === -1) return;
-  const to = from + dir;
-  if (to < 0 || to >= visible.length) return;
-  visible.splice(from, 1);
-  visible.splice(to, 0, channelId);
-  applyMyChannelOrder(visible);
-}
-
-function moveMyChannelTo(input) {
-  const card = input.closest('.list-card[data-channel-id]');
-  if (!card) return;
-  const channelId = card.getAttribute('data-channel-id');
-  const visible = visibleMyChannelIds();
-  const from = visible.indexOf(channelId);
-  const typed = parseInt(input.value, 10);
-  if (from === -1 || !Number.isInteger(typed)) {
-    renderMyCreatedChannelsList();
-    return;
-  }
-  const to = Math.min(Math.max(typed, 1), visible.length) - 1;
-  if (to === from) {
-    renderMyCreatedChannelsList();
-    return;
-  }
-  beginMyChannelReorder();
-  visible.splice(from, 1);
-  visible.splice(to, 0, channelId);
-  applyMyChannelOrder(visible);
-}
-
 // Drag-to-reorder. Mouse goes through HTML5 drag-and-drop and touch/pen
 // through Pointer Events, which is the same split My Lists uses and for the
 // same reason: native drag-and-drop generally does not fire on touch at all.
@@ -1053,22 +1019,6 @@ function initMyChannelsDrag() {
   });
 }
 
-// The row of controls at the top of each channel card.
-function myChannelOrderRowHtml(channelId, index, total) {
-  return '<div class="channel-order-row">' +
-    '<input type="number" class="channel-order-pos" min="1" max="' + total + '" value="' + (index + 1) + '"' +
-      ' title="Type a position to move this channel there" aria-label="Position in your channels"' +
-      ' onchange="moveMyChannelTo(this)">' +
-    '<span class="channel-drag-handle" draggable="true" title="Drag to rearrange" aria-hidden="true">&#9776;</span>' +
-    '<button type="button" class="channel-order-btn" title="Move up" aria-label="Move up"' +
-      (index === 0 ? ' disabled' : '') +
-      ' onclick="moveMyChannel(&quot;' + escapeJsAttr(channelId) + '&quot;, -1)">&#8593;</button>' +
-    '<button type="button" class="channel-order-btn" title="Move down" aria-label="Move down"' +
-      (index === total - 1 ? ' disabled' : '') +
-      ' onclick="moveMyChannel(&quot;' + escapeJsAttr(channelId) + '&quot;, 1)">&#8595;</button>' +
-    '</div>';
-}
-
 function deleteLocalChannel(channelId, fallbackName) {
   const map = loadLocalChannels();
   const channel = map[channelId];
@@ -1085,6 +1035,17 @@ function deleteLocalChannel(channelId, fallbackName) {
   if (!name || name === 'Channel') name = (channel && channel.name) || 'Channel';
 
   const performDelete = () => {
+    // A published channel is withdrawn from the directory as it goes.
+    //
+    // Deleting only removed this browser's copy, so a listing stayed up
+    // advertising a channel its owner had deleted -- and with the local
+    // record gone the code went too, leaving nothing to unpublish WITH.
+    // Fired before the record is dropped, for the code; the publish panel
+    // lists any that slip through anyway (see renderChannelPublishList), so
+    // this is a best effort rather than the only chance.
+    if (channel && channel.shareCode && channel.sharePublished) {
+      unpublishChannelByCode(channel.shareCode).catch(() => {});
+    }
     // Kept whole before it goes, so Undo can put back the channel AND its
     // place in Catalogs. A catalog row has had removeEntryWithUndo since
     // long before this; deleting a channel -- which can be eight hundred
@@ -9698,6 +9659,7 @@ function switchChannelsSubmenu(name, btn) {
   } else if (name === 'explore') {
     loadChannelDirectory(false);
     renderChannelPublishList();
+    loadOrphanedPublishedChannels();
   } else if (name === 'import') {
     renderChannelMergeList();
   }
@@ -10072,7 +10034,7 @@ function renderMyCreatedChannelsList() {
     return;
   }
 
-  box.innerHTML = shown.map((ch, orderIndex) => {
+  box.innerHTML = shown.map((ch) => {
     const isAdded = [...document.querySelectorAll('#lists .entry .url')].some((u) => u.value.includes(ch.channelId));
     const allItems = ch.items || [];
     const totalEpisodes = allItems.length;
@@ -10192,10 +10154,12 @@ function renderMyCreatedChannelsList() {
     '</button>';
 
     return '<div class="list-card" style="margin-bottom:12px;" data-channel-id="' + escapeAttr(ch.channelId) + '">' +
-      myChannelOrderRowHtml(ch.channelId, orderIndex, shown.length) +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' + escapeHtml(ch.name) + '</div>' +
+          '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' +
+            '<span class="drag-handle-list channel-drag-handle" draggable="true" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
+            escapeHtml(ch.name) +
+          '</div>' +
           (ch.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(ch.description) + '</div>' : '') +
           '<div class="list-card-meta">' +
             '<span>' + metaText + '</span>' +
@@ -11487,32 +11451,17 @@ function renderChannelDirectory() {
     feed.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No published channel matches that.</small></p>';
     return;
   }
-  feed.innerHTML = shown.map((e) => {
-    const art = e.backdrop || e.poster || '';
-    const thumb = art
-      ? '<img src="' + escapeAttr(art) + '" alt="" loading="lazy" style="width:88px; height:56px; object-fit:cover; border-radius:6px; border:1px solid var(--border); flex:0 0 auto;">'
-      : '';
-    const openAttr = ' style="cursor:pointer;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)" title="See everything in this channel"';
-    return '<div class="list-card" style="margin-bottom:10px;">' +
-      '<div class="list-card-header" style="gap:10px; align-items:center;">' +
-        (thumb ? '<div' + openAttr + '>' + thumb + '</div>' : '') +
-        '<div class="list-card-body">' +
-          '<div class="list-card-title"' + openAttr + '>' + escapeHtml(e.name || 'Channel') + '</div>' +
-          (e.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(e.description) + '</div>' : '') +
-          '<div class="list-card-meta"><span>' + escapeHtml(channelDirectoryMetaLine(e)) + '</span></div>' +
-        '</div>' +
-        '<div class="list-card-actions">' +
-          '<button type="button" class="lc-btn searchLikeExternalBtn' + (_channelDirectoryLiked[e.code] ? ' liked' : '') + '"' +
-            ' aria-label="Like this channel" title="Like this channel"' +
-            ' onclick="toggleChannelDirectoryLike(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">' +
-            (_channelDirectoryLiked[e.code] ? '♥' : '♡') + (e.likes ? ' ' + e.likes : '') +
-          '</button>' +
-          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">See all</button>' +
-          '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="addDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">+ Add</button>' +
-        '</div>' +
-      '</div>' +
-    '</div>';
-  }).join('');
+  feed.innerHTML = shown.map((e) => channelListingCardHtml(
+    e,
+    '<button type="button" class="lc-btn searchLikeExternalBtn' + (_channelDirectoryLiked[e.code] ? ' liked' : '') + '"' +
+      ' aria-label="Like this channel" title="Like this channel"' +
+      ' onclick="toggleChannelDirectoryLike(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">' +
+      (_channelDirectoryLiked[e.code] ? '\u2665' : '\u2661') + (e.likes ? ' ' + e.likes : '') +
+    '</button>' +
+    '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">See all</button>' +
+    '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="addDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">+ Add</button>',
+    ''
+  )).join('');
 }
 
 // Look through a published channel before taking it.
@@ -11618,6 +11567,93 @@ async function addDirectoryChannel(code, btn) {
 
 // The "publish one of your own" half of the Explore tab: every saved channel
 // with a control to list it, or take it back down.
+// One card, drawn the way Explore Channels draws one.
+//
+// The publish panel and the directory show the same thing -- a channel, as
+// other people will see it -- so they are built by the same function and
+// differ only in the buttons on the right. Two card shapes for one object is
+// how a description ends up shown in one place and not the other.
+function channelListingCardHtml(entry, actionsHtml, extraHtml) {
+  const art = entry.backdrop || entry.poster || '';
+  const thumb = art
+    ? '<img src="' + escapeAttr(art) + '" alt="" loading="lazy" style="width:88px; height:56px; object-fit:cover; border-radius:6px; border:1px solid var(--border); flex:0 0 auto;">'
+    : '';
+  const openAttr = entry.code
+    ? ' style="cursor:pointer;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(entry.code) + '&quot;, this)" title="See everything in this channel"'
+    : '';
+  return '<div class="list-card" style="margin-bottom:10px;">' +
+    '<div class="list-card-header" style="gap:10px; align-items:center;">' +
+      (thumb ? '<div' + openAttr + '>' + thumb + '</div>' : '') +
+      '<div class="list-card-body">' +
+        '<div class="list-card-title"' + openAttr + '>' + escapeHtml(entry.name || 'Channel') + '</div>' +
+        (entry.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(entry.description) + '</div>' : '') +
+        '<div class="list-card-meta"><span>' + escapeHtml(channelDirectoryMetaLine(entry)) + '</span></div>' +
+      '</div>' +
+      '<div class="list-card-actions">' + actionsHtml + '</div>' +
+    '</div>' +
+    (extraHtml || '') +
+  '</div>';
+}
+
+// A saved channel, described the way a directory row describes one -- so the
+// panel can preview what publishing it would actually look like.
+function channelAsListingEntry(ch) {
+  const items = ch.items || [];
+  const showKeys = {};
+  items.forEach((it) => { const k = channelDraftShowKey(it); if (k) showKeys[k] = true; });
+  return {
+    code: ch.sharePublished ? ch.shareCode : '',
+    name: ch.name,
+    description: ch.description || '',
+    poster: ch.poster || null,
+    backdrop: ch.backdrop || null,
+    itemCount: items.length,
+    showCount: Object.keys(showKeys).length,
+    dailyRotate: !!ch.dailyRotate,
+    shuffle: !!ch.shuffle,
+    autoSort: ch.autoSort || '',
+    dynamic: ch.dynamic || '',
+    owner: ch.sharePublished && typeof activeCreator !== 'undefined' && activeCreator ? activeCreator.creatorName : '',
+    likes: 0,
+    adds: 0,
+  };
+}
+
+let _orphanedPublishedChannels = [];
+
+// Listings this account still has up whose channel is gone from this
+// browser. Fetched rather than inferred: the local store is exactly what
+// cannot answer this, because the record that knew the code is the one that
+// was deleted.
+async function loadOrphanedPublishedChannels() {
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (!signedIn) {
+    _orphanedPublishedChannels = [];
+    return;
+  }
+  try {
+    const res = await fetch(ORIGIN + '/api/channel/mine', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: localStorage.getItem('myListAddon:creatorKey') || '',
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) return;
+    const mine = loadLocalChannels();
+    const known = {};
+    Object.values(mine).forEach((ch) => { if (ch && ch.shareCode) known[ch.shareCode] = true; });
+    _orphanedPublishedChannels = (data.channels || []).filter((e) => e && !known[e.code]);
+  } catch (e) {
+    // Leave whatever was last known rather than clearing the list on a
+    // hiccup -- an orphan that vanishes from the panel is an orphan nobody
+    // can take down.
+  }
+  renderChannelPublishList();
+}
+
 function renderChannelPublishList() {
   const box = document.getElementById('channelPublishList');
   if (!box) return;
@@ -11627,41 +11663,42 @@ function renderChannelPublishList() {
     return;
   }
   const channels = Object.values(ensureAllChannelsSyncedFromRows(loadLocalChannels()));
-  if (!channels.length) {
-    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No channels yet — build one first.</small></p>';
-    return;
-  }
   channels.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  box.innerHTML = channels.map((ch) => {
-    const count = (ch.items || []).length;
-    const meta = ch.dynamic === 'next-up'
-      ? 'follows your watch history'
-      : (count + ' episode' + (count === 1 ? '' : 's'));
+
+  const mine = channels.map((ch) => {
     const action = ch.sharePublished
       ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="unpublishChannelFromDirectory(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Unpublish</button>'
       : '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="publishChannelToDirectory(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Publish</button>';
-    return '<div class="list-card" style="margin-bottom:10px;">' +
-      '<div class="list-card-header">' +
-        '<div class="list-card-body">' +
-          '<div class="list-card-title">' + escapeHtml(ch.name) + '</div>' +
-          '<div class="list-card-meta"><span>' + escapeHtml(meta) + (ch.sharePublished ? ' · listed in Explore Channels' : '') + '</span></div>' +
-        '</div>' +
-        '<div class="list-card-actions">' + action + '</div>' +
-      '</div>' +
+    const extra =
       (ch.sharePublished ? '' :
-        '<input type="text" id="channelPublishDesc_' + escapeAttr(ch.channelId) + '" placeholder="One line about this channel (optional)" style="margin-top:8px; font-size:0.82rem;">') +
+        '<input type="text" id="channelPublishDesc_' + escapeAttr(ch.channelId) + '" placeholder="One line about this channel (optional)" style="margin-top:8px; font-size:0.82rem;" value="' + escapeAttr(ch.description || '') + '">') +
       // A published channel's link lives here, on screen, rather than only
       // in the modal that announced it -- that modal closes and takes the
-      // link with it, which is the wrong place to keep the one thing this
-      // whole panel produces.
+      // link with it.
       (ch.shareCode
         ? '<div class="row" style="margin-top:8px; gap:8px;">' +
-            '<input type="text" readonly value="' + escapeAttr(channelShareUrl(ch.shareCode)) + '" onclick="this.select()" style="flex:1; font-size:0.8rem;">' +
-            '<button type="button" class="secondary lc-btn" style="white-space:nowrap;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Copy</button>' +
+            '<input type="text" readonly value="' + escapeAttr(channelShareUrl(ch.shareCode)) + '" onclick="this.select()" style="font-size:0.8rem;">' +
+            '<button type="button" class="secondary lc-btn" style="flex:none; width:auto; white-space:nowrap;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Copy</button>' +
           '</div>'
-        : '') +
-    '</div>';
+        : '');
+    return channelListingCardHtml(channelAsListingEntry(ch), action, extra);
   }).join('');
+
+  // Listings with no channel left behind them. Shown apart from the rest
+  // because there is nothing to edit, publish or copy -- only to withdraw.
+  const orphans = _orphanedPublishedChannels.map((entry) => channelListingCardHtml(
+    entry,
+    '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="unpublishOrphanedChannel(&quot;' + escapeJsAttr(entry.code) + '&quot;, this)">Unpublish</button>',
+    ''
+  )).join('');
+
+  box.innerHTML =
+    (channels.length ? mine : '<p style="color:var(--muted); font-size:0.85rem;"><small>No channels yet \u2014 build one first.</small></p>') +
+    (orphans
+      ? '<p style="margin:16px 0 6px; font-weight:600; font-size:0.85rem;">Still listed, but no longer on this device</p>' +
+        '<p style="margin:0 0 8px; color:var(--muted); font-size:0.78rem;">You published these and the channel has since been deleted here. They are still in Explore Channels until you take them down.</p>' +
+        orphans
+      : '');
 }
 
 async function publishChannelToDirectory(channelId, btn) {
@@ -11701,6 +11738,23 @@ async function publishChannelToDirectory(channelId, btn) {
   }
 }
 
+// Withdraws one listing by its code. The one place that call lives, so
+// deleting a channel, unpublishing from the panel, and clearing an orphaned
+// listing all do exactly the same thing.
+async function unpublishChannelByCode(code) {
+  if (!code) return { ok: false, error: 'No code.' };
+  const res = await fetch(ORIGIN + '/api/channel/unpublish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      code: code,
+      creatorName: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : '',
+      creatorKey: localStorage.getItem('myListAddon:creatorKey') || '',
+    }),
+  });
+  return res.json();
+}
+
 async function unpublishChannelFromDirectory(channelId, btn) {
   const map = loadLocalChannels();
   const ch = map[channelId];
@@ -11711,16 +11765,7 @@ async function unpublishChannelFromDirectory(channelId, btn) {
     btn.textContent = 'Removing…';
   }
   try {
-    const res = await fetch(ORIGIN + '/api/channel/unpublish', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        code: ch.shareCode,
-        creatorName: activeCreator ? activeCreator.creatorName : '',
-        creatorKey: localStorage.getItem('myListAddon:creatorKey') || '',
-      }),
-    });
-    const data = await res.json();
+    const data = await unpublishChannelByCode(ch.shareCode);
     if (!data.ok) {
       showAppAlert('Explore Channels', data.error || 'Could not remove that listing.');
       return;
@@ -11728,6 +11773,33 @@ async function unpublishChannelFromDirectory(channelId, btn) {
     // Only the LISTING goes. The share link keeps working, because "stop
     // advertising this" and "break everyone's link" are different asks.
     rememberChannelShare(channelId, ch.shareCode, false);
+    renderChannelPublishList();
+    loadChannelDirectory(true);
+    loadOrphanedPublishedChannels();
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while removing that listing.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// A listing whose channel is no longer in this browser. Nothing local is
+// left to update, so this only withdraws it and redraws the panel.
+async function unpublishOrphanedChannel(code, btn) {
+  const originalLabel = btn ? btn.textContent : 'Unpublish';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Removing…';
+  }
+  try {
+    const data = await unpublishChannelByCode(code);
+    if (!data.ok) {
+      showAppAlert('Explore Channels', data.error || 'Could not remove that listing.');
+      return;
+    }
     renderChannelPublishList();
     loadChannelDirectory(true);
   } catch (e) {

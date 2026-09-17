@@ -1291,47 +1291,8 @@ ${seoHeadHtml}
     border: 1px solid var(--border);
     border-radius: 8px;
   }
-  /* Rearranging My Channels -- the same controls a catalog row has, sized
-     for a card rather than a table row. */
-  .channel-order-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 8px;
-  }
-  .channel-order-pos {
-    width: 46px;
-    min-width: 46px;
-    flex: none;
-    min-height: 30px;
-    padding: 3px 4px;
-    text-align: center;
-    font-size: 0.8rem;
-    font-weight: 700;
-  }
-  .channel-order-btn {
-    min-height: 30px;
-    padding: 2px 10px;
-    font-size: 0.85rem;
-    border-radius: 8px;
-    background: var(--surface);
-    color: var(--text);
-    border: 1px solid var(--border);
-    flex: none;
-    width: auto;
-  }
-  .channel-order-btn:disabled {
-    opacity: 0.4;
-    cursor: default;
-  }
-  .channel-drag-handle {
-    cursor: grab;
-    font-size: 1rem;
-    color: var(--muted);
-    padding: 2px 6px;
-    user-select: none;
-    touch-action: none;
-  }
+  /* Rearranging My Channels. The handle itself is .drag-handle-list, the
+     same one a list card uses; this is only what marks the card in flight. */
   .list-card.dragging {
     opacity: 0.55;
     outline: 2px dashed var(--accent);

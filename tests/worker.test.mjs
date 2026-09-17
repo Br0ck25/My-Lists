@@ -12155,3 +12155,67 @@ describe("worker: an operator can moderate the channel directory", () => {
       "the safer of the two actions is the one an unknown verb gets");
   });
 });
+
+describe("worker: finding your own listings again", () => {
+  const ep = () => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" });
+  const channelOf = (over = {}) => ({ name: "Saturday Morning 90s", items: [ep()], ...over });
+
+  // The recovery path for a listing whose local channel was deleted: the
+  // record that knew the code is exactly the one that is gone, so the
+  // browser cannot answer this and the server has to.
+  it("lists what this creator currently has published", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const mine = await call(env, "/api/channel/mine", {
+      method: "POST", json: { creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    assert.equal(mine.body.ok, true);
+    assert.equal(mine.body.channels.length, 1);
+    assert.equal(mine.body.channels[0].code, published.body.code);
+    assert.equal(mine.body.channels[0].name, "Saturday Morning 90s");
+  });
+
+  it("shows one creator nothing of another's", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const bob = await createUser(env, "bob");
+    await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const mine = await call(env, "/api/channel/mine", {
+      method: "POST", json: { creatorName: "bob", creatorKey: bob.creatorKey },
+    });
+    assert.deepEqual(mine.body.channels, []);
+  });
+
+  it("refuses without credentials", async () => {
+    const env = makeEnv();
+    await createUser(env, "alice");
+    const res = await call(env, "/api/channel/mine", {
+      method: "POST", json: { creatorName: "alice", creatorKey: "WRONG" },
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it("stops listing one that has been withdrawn", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    await call(env, "/api/channel/unpublish", {
+      method: "POST",
+      json: { code: published.body.code, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const mine = await call(env, "/api/channel/mine", {
+      method: "POST", json: { creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    assert.deepEqual(mine.body.channels, []);
+  });
+});

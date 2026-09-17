@@ -6,6 +6,27 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🩹 Channels: four fixes
+
+- **My Channels now rearranges the way My Lists does** — a drag handle in the card's title, and
+  nothing else. The number box and up/down arrows are gone; the two lists sit one tab apart and
+  should not offer two different ways to do the same thing.
+- **"Publish one of your own" is drawn the way Explore Channels draws a channel** — artwork, title,
+  description and the same meta line. Both are built by one function now, which is what stops a
+  description appearing in one place and not the other.
+- **Deleting a published channel left it published.** Deleting removed this browser's copy only, so
+  the directory kept advertising a channel its owner had deleted — and because the local record was
+  the only thing that knew the share code, there was no longer anything to unpublish *with*.
+  Deleting now withdraws the listing as it goes, and because that is a network call that can fail,
+  the publish panel also lists **listings you still have up with no channel behind them**, each with
+  its own Unpublish. (A new `/api/channel/mine` answers that: the browser cannot, since the record
+  that knew the code is the one that was deleted.)
+- **"On today" never appeared on a channel of only shows, or only movies.** The tab lived inside the
+  branch that draws the Movies/Shows filter, and that branch only ran for a list with *both* kinds
+  in it — so a channel qualified by accident. It now appears for any channel saved in this browser,
+  and on a single-type channel the All/Movies/Shows pills are hidden, since three pills showing the
+  same list are three pills with nothing to say.
+
 ### 🧰 Channels: a fixed toolbar, and a list you can arrange
 
 - **The search boxes under My Channels and Explore Channels had collapsed.** Both inputs and the

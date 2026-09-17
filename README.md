@@ -57,7 +57,7 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 - **Live Cloud Sync.** A channel imported from a Trakt, MDBList, Simkl or TMDB list can keep following that list instead of taking a one-time snapshot: the Worker rebuilds its pool in the background, so titles the list gains turn up in the channel on their own.
 - **Built for big channels.** A filter over the picks, a **Select** mode with select-a-whole-show / select-a-season and bulk remove-or-move, and a warning before you add something the channel already has.
 - **A stats line on every channel** -- shows, episodes, hours, the years it spans, and the rules it runs under -- plus an **On today** tab on a channel's See All page showing the lineup the server would serve right now.
-- **My Channels sorts, searches and rearranges** -- drag a channel, nudge it with the arrows, or type it a position, exactly as a catalog row does -- and deleting a channel can be undone for a minute afterwards.
+- **My Channels sorts, searches and rearranges** -- drag a channel by its handle, the same way a list is reordered -- and deleting a channel can be undone for a minute afterwards.
 - **Share links and the Explore Channels directory.** **Share** on any channel copies a link that rebuilds it anywhere -- every pick, its play order and its broadcast schedule -- and **Copy link** keeps that link one tap away afterwards. Publishing (with a Creator Profile) lists it in **Explore Channels**, where tapping a channel shows everything in it before you add it, and the directory can be ordered by newest, most added, most liked or name.
 
 ### Continue Watching & Background Watch Sync

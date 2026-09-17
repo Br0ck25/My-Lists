@@ -2537,6 +2537,31 @@
       return json({ ok: true }, 200, { "Cache-Control": "no-store" });
     }
 
+    // /api/channel/mine  (POST)  { creatorName, creatorKey } -> { ok, channels }
+    //
+    // Everything this creator currently has listed in the directory.
+    //
+    // Exists because a listing can outlive the local channel it came from:
+    // deleting a channel in the builder removes this browser's copy, and if
+    // the withdrawal did not also land -- offline, signed out, a failed
+    // request -- the listing stayed up with nothing left on the device that
+    // knew its code. That is an advertised channel its own owner could no
+    // longer take down. This is how they find it again.
+    if (path === "/api/channel/mine" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true, channels: [] });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+      const entries = await readPublicChannelIndex(env);
+      const mine = entries.filter((e) => e && e.owner === auth.username);
+      return json({ ok: true, channels: mine }, 200, { "Cache-Control": "no-store" });
+    }
+
     // /api/channel/unpublish  (POST)  { code, creatorName, creatorKey }
     //
     // Takes a channel out of the directory. The stored channel itself stays,

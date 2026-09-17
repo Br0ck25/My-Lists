@@ -5819,6 +5819,9 @@ describe("client: rearranging the channels list", () => {
     ...over,
   });
 
+  // Reordering reads the cards ON SCREEN, so the container is stubbed the
+  // way a render would leave it: one .list-card per visible channel, in the
+  // order shown.
   function withChannels(channels, shownIds) {
     const client = loadClient({ routes: {} });
     channels.forEach((ch) => client.call("saveLocalChannel", ch));
@@ -5829,79 +5832,38 @@ describe("client: rearranging the channels list", () => {
     return client;
   }
 
-  const orderOf = (client) => {
-    const map = client.call("loadLocalChannels");
-    return client
-      .call("sortMyChannels", Object.values(map), "manual")
+  const orderOf = (client) =>
+    client.call("sortMyChannels", Object.values(client.call("loadLocalChannels")), "manual")
       .map((c) => c.channelId);
-  };
 
-  it("moves a channel down and writes the new arrangement", () => {
-    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo"), chan("c", "Charlie")], ["a", "b", "c"]);
-    client.call("moveMyChannel", "a", 1);
-    assert.deepEqual(plain(orderOf(client)), ["b", "a", "c"]);
-  });
-
-  it("moves a channel up", () => {
-    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo"), chan("c", "Charlie")], ["a", "b", "c"]);
-    client.call("moveMyChannel", "c", -1);
-    assert.deepEqual(plain(orderOf(client)), ["a", "c", "b"]);
-  });
-
-  it("will not move the first one up or the last one down", () => {
-    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
-    client.call("moveMyChannel", "a", -1);
-    client.call("moveMyChannel", "b", 1);
-    assert.deepEqual(plain(orderOf(client)), ["a", "b"]);
+  it("stores the order a drag leaves the cards in", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo"), chan("c", "Charlie")]);
+    client.call("applyMyChannelOrder", ["c", "a", "b"]);
+    assert.deepEqual(plain(orderOf(client)), ["c", "a", "b"]);
   });
 
   it("switches the ordering to the hand-made one, so the list does not re-sort out from under it", () => {
-    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")]);
     client.call("setMyChannelsSort", "name");
-    client.call("moveMyChannel", "b", -1);
+    client.call("applyMyChannelOrder", ["b", "a"]);
     assert.equal(client.get("myChannelsSort"), "manual");
     assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
   });
 
   it("adopts the arrangement that was on screen rather than one nobody was looking at", () => {
-    // Shown by name: Alpha, Bravo, Charlie. Stored order is the reverse.
+    // Shown by name: Alpha, Bravo, Charlie. The stored order is the reverse.
     const client = withChannels(
       [chan("c", "Charlie", { order: 1 }), chan("b", "Bravo", { order: 2 }), chan("a", "Alpha", { order: 3 })],
       ["a", "b", "c"]
     );
     client.call("setMyChannelsSort", "name");
-    client.call("moveMyChannel", "a", 1);
-    assert.deepEqual(plain(orderOf(client)), ["b", "a", "c"],
-      "the drop landed where it looked like it would, not into the old stored order");
+    client.call("beginMyChannelReorder");
+    assert.deepEqual(plain(orderOf(client)), ["a", "b", "c"],
+      "the visible arrangement became the starting point for the drag");
   });
 
-  it("takes a typed position", () => {
-    const client = withChannels(
-      [chan("a", "Alpha"), chan("b", "Bravo"), chan("c", "Charlie"), chan("d", "Delta")],
-      ["a", "b", "c", "d"]
-    );
-    const card = { getAttribute: () => "d" };
-    client.call("moveMyChannelTo", { value: "1", closest: () => card });
-    assert.deepEqual(plain(orderOf(client)), ["d", "a", "b", "c"]);
-  });
-
-  it("clamps a typed position instead of losing the channel", () => {
-    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
-    const card = { getAttribute: () => "a" };
-    client.call("moveMyChannelTo", { value: "99", closest: () => card });
-    assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
-    assert.equal(Object.keys(client.call("loadLocalChannels")).length, 2);
-  });
-
-  it("ignores a position that is not a number", () => {
-    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
-    const card = { getAttribute: () => "a" };
-    client.call("moveMyChannelTo", { value: "", closest: () => card });
-    assert.equal(Object.keys(client.call("loadLocalChannels")).length, 2);
-  });
-
-  // The filtered case, which is where rebuilding an order from a partial
-  // view would quietly reshuffle everything the filter was hiding.
+  // The filtered case, where rebuilding an order from a partial view would
+  // quietly reshuffle everything the filter was hiding.
   it("leaves channels the filter hides exactly where they were", () => {
     const client = withChannels(
       [chan("a", "Alpha", { order: 1 }), chan("b", "Bravo", { order: 2 }),
@@ -5909,32 +5871,161 @@ describe("client: rearranging the channels list", () => {
       ["b", "d"]
     );
     client.set("myChannelsSort", "manual");
-    // Only Bravo and Delta are on screen; swapping them must not disturb
-    // Alpha at slot 1 or Charlie at slot 3.
     client.call("applyMyChannelOrder", ["d", "b"]);
     assert.deepEqual(plain(orderOf(client)), ["a", "d", "c", "b"]);
   });
 
   it("puts a channel with no arrangement yet at the end, not in the middle", () => {
     const client = withChannels(
-      [chan("a", "Alpha", { order: 1 }), chan("b", "Bravo", { order: 2 }), chan("fresh", "Fresh")],
-      ["a", "b", "fresh"]
+      [chan("a", "Alpha", { order: 1 }), chan("b", "Bravo", { order: 2 }), chan("fresh", "Fresh")]
     );
     assert.deepEqual(plain(orderOf(client)), ["a", "b", "fresh"]);
   });
 
   it("keeps a channel's place when it is edited and saved again", () => {
-    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
-    client.call("moveMyChannel", "b", -1);
-    assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")]);
+    client.call("applyMyChannelOrder", ["b", "a"]);
     client.call("saveLocalChannel", chan("b", "Bravo renamed"));
     assert.deepEqual(plain(orderOf(client)), ["b", "a"], "editing is not a reason to lose your arrangement");
   });
 
   it("survives the whole map being rewritten, which is where a dropped field shows up", () => {
-    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
-    client.call("moveMyChannel", "b", -1);
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")]);
+    client.call("applyMyChannelOrder", ["b", "a"]);
     client.call("saveLocalChannelsMap", client.call("loadLocalChannels"));
     assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
+  });
+});
+
+describe("client: a published channel that is deleted locally", () => {
+  const chan = (over = {}) => ({
+    channelId: "ch1", name: "Saturday Morning 90s",
+    items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" }],
+    ...over,
+  });
+
+  function signedInClient(routes = {}) {
+    const client = loadClient({
+      routes: { "/api/channel/unpublish": () => ({ json: { ok: true } }), ...routes },
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.set("showAppConfirm", function (title, message, label, onConfirm) { onConfirm(); });
+    return client;
+  }
+
+  it("withdraws the directory listing as the channel goes", async () => {
+    const client = signedInClient();
+    client.call("saveLocalChannel", chan({ shareCode: "SM90", sharePublished: true }));
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning 90s");
+    await new Promise((r) => setTimeout(r, 0));
+    const asked = requestsTo(client, "/api/channel/unpublish");
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].body.code, "SM90");
+  });
+
+  it("does not call unpublish for a channel that was never published", async () => {
+    const client = signedInClient();
+    client.call("saveLocalChannel", chan({ shareCode: "SM90", sharePublished: false }));
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning 90s");
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(requestsTo(client, "/api/channel/unpublish").length, 0);
+  });
+
+  it("deletes the channel even when the withdrawal fails", async () => {
+    const client = signedInClient({
+      "/api/channel/unpublish": () => ({ status: 500, json: { ok: false, error: "nope" } }),
+    });
+    client.call("saveLocalChannel", chan({ shareCode: "SM90", sharePublished: true }));
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning 90s");
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(client.call("loadLocalChannels").ch1, undefined, "the delete is not held hostage by the listing");
+  });
+
+  it("finds the listings this account still has up with no channel behind them", async () => {
+    const client = signedInClient({
+      "/api/channel/mine": () => ({
+        json: {
+          ok: true,
+          channels: [
+            { code: "GONE", name: "Deleted one", owner: "alice", itemCount: 12, showCount: 3 },
+            { code: "KEPT", name: "Still here", owner: "alice", itemCount: 9, showCount: 2 },
+          ],
+        },
+      }),
+    });
+    client.call("saveLocalChannel", chan({ channelId: "ch1", shareCode: "KEPT", sharePublished: true }));
+    await client.call("loadOrphanedPublishedChannels");
+    assert.deepEqual(plain(client.get("_orphanedPublishedChannels").map((e) => e.code)), ["GONE"],
+      "only the one with nothing left behind it");
+    assert.match(el(client, "channelPublishList").innerHTML, /Deleted one/);
+    assert.match(el(client, "channelPublishList").innerHTML, /no longer on this device/);
+  });
+
+  it("asks for nothing while signed out", async () => {
+    const client = loadClient({ routes: {} });
+    client.set("activeCreator", null);
+    await client.call("loadOrphanedPublishedChannels");
+    assert.deepEqual(plain(client.get("_orphanedPublishedChannels")), []);
+  });
+
+  it("withdraws an orphaned listing by its code alone", async () => {
+    const client = signedInClient({ "/api/channel/mine": () => ({ json: { ok: true, channels: [] } }) });
+    await client.call("unpublishOrphanedChannel", "GONE", null);
+    const asked = requestsTo(client, "/api/channel/unpublish");
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].body.code, "GONE");
+    assert.equal(asked[0].body.creatorName, "alice");
+  });
+
+  it("keeps the last known orphans when the lookup fails, rather than hiding them", async () => {
+    const client = signedInClient({
+      "/api/channel/mine": () => ({ status: 500, json: { ok: false } }),
+    });
+    client.set("_orphanedPublishedChannels", [{ code: "GONE", name: "Deleted one" }]);
+    await client.call("loadOrphanedPublishedChannels");
+    assert.deepEqual(plain(client.get("_orphanedPublishedChannels").map((e) => e.code)), ["GONE"]);
+  });
+});
+
+describe("client: one card shape for a channel listing", () => {
+  it("draws a publishable channel the way the directory draws one", () => {
+    const client = loadClient({ routes: {} });
+    const html = client.call("channelListingCardHtml", {
+      code: "SM90", name: "Saturday Morning 90s", description: "Cartoons, all morning.",
+      backdrop: "https://img/bd.jpg", itemCount: 300, showCount: 12, dailyRotate: true, owner: "alice",
+    }, "<button>Publish</button>", "");
+    assert.match(html, /Saturday Morning 90s/);
+    assert.match(html, /Cartoons, all morning\./);
+    assert.match(html, /300 episodes/);
+    assert.match(html, /12 shows/);
+    assert.match(html, /daily lineup/);
+    assert.match(html, /img\/bd\.jpg/);
+    assert.match(html, /<button>Publish<\/button>/);
+  });
+
+  it("describes a saved channel the same way, from its own fields", () => {
+    const client = loadClient({ routes: {} });
+    const entry = client.call("channelAsListingEntry", {
+      channelId: "ch1", name: "Block Party", description: "Sitcoms.",
+      items: [
+        { kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" },
+        { kind: "episode", imdbId: "tt2", season: 1, episode: 1, showName: "Doug" },
+      ],
+      dailyRotate: true, sharePublished: false, shareCode: "X",
+    });
+    assert.equal(entry.name, "Block Party");
+    assert.equal(entry.description, "Sitcoms.");
+    assert.equal(entry.itemCount, 2);
+    assert.equal(entry.showCount, 2);
+    assert.equal(entry.code, "", "an unpublished channel has no listing to open");
+  });
+
+  it("offers the preview only once a channel is actually listed", () => {
+    const client = loadClient({ routes: {} });
+    const unlisted = client.call("channelListingCardHtml", { name: "Draft", itemCount: 1, showCount: 1 }, "", "");
+    assert.equal(/previewDirectoryChannel/.test(unlisted), false);
+    const listed = client.call("channelListingCardHtml", { code: "C1", name: "Listed", backdrop: "https://i/x.jpg", itemCount: 1, showCount: 1 }, "", "");
+    assert.match(listed, /previewDirectoryChannel/);
   });
 });
