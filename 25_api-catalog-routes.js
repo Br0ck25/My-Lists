@@ -2327,106 +2327,39 @@ function generateSearchVariations(query) {
       }
     }
 
-    // /api/wizard-channel-shows?networkId=&era=&genres=&limit=&type=
-    //   -> { ok, name, shows: [...], items: [...], networkLogo }
+    // /api/wizard-channel-shows?networkId=&era=&genres=&limit=
+    //   -> { ok, name, shows: [...], networkLogo }
     //
-    // The Quick Wizard's server call for building TV channels and catalog
-    // lists. Supports type=series (default) and type=movie. Discovers top
-    // matching titles from TMDB by crossing network/studio, era and genre.
+    // The Quick Channel Wizard's one server call. Same shape of answer as
+    // /api/quick-channel-shows (the client builds the channel from it the
+    // same way), but the pool is a TMDB discover query crossing a network
+    // with an era and a genre rather than a network on its own.
     if (path === "/api/wizard-channel-shows") {
       const networkId = (url.searchParams.get("networkId") || "").trim();
       const era = (url.searchParams.get("era") || "").trim();
       const genres = (url.searchParams.get("genres") || "").trim();
-      const type = (url.searchParams.get("type") || "series").trim().toLowerCase();
-      const isMovie = type === "movie";
-      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "8", 10) || 8, 1), 50);
-      if (networkId && !/^[0-9a-zA-Z_-]+$/.test(networkId)) return json({ ok: false, error: "Bad networkId." }, 400);
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "8", 10) || 8, 1), 24);
+      if (networkId && !/^[0-9]+$/.test(networkId)) return json({ ok: false, error: "Bad networkId." }, 400);
       if (genres && !/^[0-9]+(,[0-9]+)*$/.test(genres)) return json({ ok: false, error: "Bad genres." }, 400);
       const eraMatch = era.match(/^([0-9]{4})-([0-9]{4})$/);
       try {
-        const studioMap = {
-          "49": { name: "HBO", tvNetwork: "49", movieCompany: "3268|9993", movieProvider: "1899" },
-          "88": { name: "FX", tvNetwork: "88", movieCompany: "88" },
-          "80": { name: "Adult Swim", tvNetwork: "80", movieCompany: "80|56" },
-          "13": { name: "Nickelodeon", tvNetwork: "13", movieCompany: "2348" },
-          "56": { name: "Cartoon Network", tvNetwork: "56", movieCompany: "56" },
-          "54": { name: "Disney Channel", tvNetwork: "54", movieCompany: "2" },
-          "4": { name: "BBC One", tvNetwork: "4", movieCompany: "3341" },
-          "67": { name: "Showtime", tvNetwork: "67", movieCompany: "67" },
-          "174": { name: "AMC", tvNetwork: "174", movieCompany: "127928|174" },
-          "47": { name: "Comedy Central", tvNetwork: "47", movieCompany: "47" },
-          "213": { name: "Netflix", tvNetwork: "213", movieCompany: "178464", movieProvider: "8" },
-          "1024": { name: "Prime Video", tvNetwork: "1024", movieCompany: "20580", movieProvider: "9" },
-          "2552": { name: "Apple TV+", tvNetwork: "2552", movieCompany: "194232", movieProvider: "350" },
-          "2739": { name: "Disney+", tvNetwork: "2739", movieCompany: "2", movieProvider: "337" },
-          "19": { name: "FOX", tvNetwork: "19", movieCompany: "25" },
-          "6": { name: "NBC", tvNetwork: "6", movieCompany: "33" },
-          "16": { name: "CBS", tvNetwork: "16", movieCompany: "4" },
-          "2": { name: "ABC", tvNetwork: "2", movieCompany: "2" },
-          "71": { name: "The CW", tvNetwork: "71", movieCompany: "174" },
-          "149": { name: "Syfy", tvNetwork: "149", movieCompany: "149|33" },
-          "wb": { name: "Warner Bros. Pictures", movieCompany: "174", tvCompany: "1957" },
-          "universal": { name: "Universal Pictures", movieCompany: "33", tvCompany: "2672" },
-          "paramount": { name: "Paramount Pictures", movieCompany: "4", tvNetwork: "436" },
-          "sony": { name: "Sony Pictures", movieCompany: "5", tvCompany: "11073" },
-          "a24": { name: "A24", movieCompany: "41077", tvCompany: "41077" },
-          "lionsgate": { name: "Lionsgate", movieCompany: "35", tvCompany: "35" },
-          "mgm": { name: "MGM", movieCompany: "21", tvCompany: "21" }
-        };
-
-        let params = `api_key=${encodeURIComponent(TMDB_API_KEY)}&sort_by=popularity.desc&include_adult=false`;
-        if (isMovie) {
-          if (networkId) {
-            const studio = studioMap[networkId];
-            if (studio && studio.movieCompany) {
-              params += `&with_companies=${encodeURIComponent(studio.movieCompany)}`;
-            } else if (studio && studio.movieProvider) {
-              params += `&with_watch_providers=${encodeURIComponent(studio.movieProvider)}&watch_region=US&with_watch_monetization_types=flatrate`;
-            } else if (/^[0-9]+$/.test(networkId)) {
-              params += `&with_companies=${encodeURIComponent(networkId)}`;
-            }
-          }
-          if (genres) {
-            const movieGenres = genres.split(",").map((g) => {
-              const tr = g.trim();
-              if (tr === "10765") return "878,14";
-              if (tr === "10759") return "28,12";
-              if (tr === "10762") return "10751,16";
-              if (tr === "9648") return "9648,53";
-              return tr;
-            }).filter(Boolean).join(",");
-            if (movieGenres) params += `&with_genres=${encodeURIComponent(movieGenres)}`;
-          }
-          if (eraMatch) {
-            params += `&primary_release_date.gte=${eraMatch[1]}-01-01&primary_release_date.lte=${eraMatch[2]}-12-31`;
-          }
-          params += "&vote_count.gte=30";
-        } else {
-          params += "&include_null_first_air_dates=false";
-          if (networkId) {
-            const studio = studioMap[networkId];
-            if (studio && studio.tvNetwork) {
-              params += `&with_networks=${encodeURIComponent(studio.tvNetwork)}`;
-            } else if (studio && studio.tvCompany) {
-              params += `&with_companies=${encodeURIComponent(studio.tvCompany)}`;
-            } else if (/^[0-9]+$/.test(networkId)) {
-              params += `&with_networks=${encodeURIComponent(networkId)}`;
-            }
-          }
-          if (genres) params += `&with_genres=${encodeURIComponent(genres)}`;
-          if (eraMatch) {
-            params += `&first_air_date.gte=${eraMatch[1]}-01-01&first_air_date.lte=${eraMatch[2]}-12-31`;
-          }
-          params += "&vote_count.gte=30";
+        let params = `api_key=${encodeURIComponent(TMDB_API_KEY)}&sort_by=popularity.desc&include_adult=false&include_null_first_air_dates=false`;
+        if (networkId) params += `&with_networks=${encodeURIComponent(networkId)}`;
+        if (genres) params += `&with_genres=${encodeURIComponent(genres)}`;
+        if (eraMatch) {
+          params += `&first_air_date.gte=${eraMatch[1]}-01-01&first_air_date.lte=${eraMatch[2]}-12-31`;
         }
-
-        const discoverEndpoint = isMovie ? "discover/movie" : "discover/tv";
+        // Enough votes that the result is a show people have heard of. A
+        // network-plus-era-plus-genre query can otherwise bottom out in
+        // one-episode pilots that never aired, which makes a wizard channel
+        // feel broken rather than curated.
+        params += "&vote_count.gte=50";
         const discovered = [];
         let pagesFetched = 0;
-        for (let page = 1; page <= 4 && discovered.length < limit * 3; page++) {
+        for (let page = 1; page <= 3 && discovered.length < limit * 3; page++) {
           pagesFetched++;
           const res = await fetch(
-            `https://api.themoviedb.org/3/${discoverEndpoint}?${params}&page=${page}`,
+            `https://api.themoviedb.org/3/discover/tv?${params}&page=${page}`,
             { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 3600, cacheEverything: true } }
           );
           if (!res.ok) break;
@@ -2438,7 +2371,7 @@ function generateSearchVariations(query) {
           return json({ ok: false, error: "Nothing matched that combination. Try widening the era or the genre." });
         }
         let networkLogo = null;
-        if (networkId && /^[0-9]+$/.test(networkId) && !isMovie) {
+        if (networkId) {
           try {
             const networkRes = await fetch(
               `https://api.themoviedb.org/3/network/${encodeURIComponent(networkId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
@@ -2446,35 +2379,31 @@ function generateSearchVariations(query) {
             );
             if (networkRes.ok) {
               const networkData = await networkRes.json();
+              // A fixed pixel size, never "original" -- see the same note on
+              // /api/quick-channel-shows, where an SVG logo silently failed
+              // to render as a poster.
               if (networkData.logo_path) networkLogo = `${url.origin}/api/channel-logo?path=${encodeURIComponent(networkData.logo_path)}`;
             }
           } catch {
-            // best-effort; fallback to poster
+            // best-effort; the client falls back to a show poster
           }
         }
-        const candidates = discovered.slice(0, Math.min(limit * 2, 60));
-        const resolved = await mapWithConcurrency(candidates, 8, async (item) => {
-          const details = await fetchTmdbDetails(item.id, isMovie ? "movie" : "tv", TMDB_API_KEY);
+        const candidates = discovered.slice(0, limit * 2);
+        const resolved = await mapWithConcurrency(candidates, 8, async (show) => {
+          const details = await fetchTmdbDetails(show.id, "tv", TMDB_API_KEY);
           if (!details.imdbId) return null;
-          const itemTitle = isMovie ? (item.title || item.name) : item.name;
-          const releaseDate = isMovie ? item.release_date : item.first_air_date;
-          const year = (releaseDate || "").slice(0, 4);
           return {
             imdbId: details.imdbId,
-            tmdbId: item.id,
-            name: itemTitle,
-            title: itemTitle,
-            year: year || undefined,
-            type: isMovie ? "movie" : "series",
-            kind: isMovie ? "movie" : "series",
-            poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
-            backdrop: item.backdrop_path ? `https://image.tmdb.org/t/p/w780${item.backdrop_path}` : null,
+            tmdbId: show.id,
+            name: show.name,
+            poster: show.poster_path ? `https://image.tmdb.org/t/p/w500${show.poster_path}` : null,
+            backdrop: show.backdrop_path ? `https://image.tmdb.org/t/p/w780${show.backdrop_path}` : null,
           };
         });
         ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", pagesFetched + (networkId ? 1 : 0) + candidates.length));
-        const finalTitles = resolved.filter(Boolean).slice(0, limit);
-        if (!finalTitles.length) return json({ ok: false, error: "Couldn't resolve any of those titles to IMDB." });
-        return json({ ok: true, items: finalTitles, shows: finalTitles, networkLogo });
+        const shows = resolved.filter(Boolean).slice(0, limit);
+        if (!shows.length) return json({ ok: false, error: "Couldn't resolve any of those shows to IMDB." });
+        return json({ ok: true, shows, networkLogo });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }
