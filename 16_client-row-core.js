@@ -1128,10 +1128,36 @@ function showAppAlert(title, message, isSuccess = false) {
       '</h3>' +
       '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
-    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
       '<button type="button" class="primary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">OK</button>' +
     '</div>';
+  showModal(html);
+}
+
+// The third member of the showAppAlert/showAppConfirm family: a dialog for
+// the gap between confirming something slow and hearing how it went.
+//
+// Reset Account Data is the case that asked for it. It clears this browser,
+// then waits on a server round trip that empties the account -- one to two
+// seconds during which the confirm dialog had already closed, the lists on
+// screen had already emptied, and nothing said why or whether anything was
+// still happening. A person watching that has no way to tell a reset in
+// progress from one that silently failed, and clicking Reset again during it
+// is the obvious thing to try.
+//
+// Deliberately has no buttons: there is nothing to decide, and the caller
+// replaces it with showAppAlert (or another showModal) when the work
+// finishes. Escape and a backdrop click still dismiss it, like any other
+// dialog -- dismissing the status of an action does not cancel the action,
+// and the caller's own result dialog still arrives.
+function showAppBusy(title, message) {
+  const html =
+    '<h3 style="margin:0 0 12px; font-size:1.1rem; display:flex; align-items:center; gap:10px;">' +
+      '<span class="app-spinner" aria-hidden="true"></span> ' +
+      escapeHtml(title) +
+    '</h3>' +
+    '<p role="status" aria-live="polite" style="margin:0; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message || '') + '</p>';
   showModal(html);
 }
 
@@ -1147,7 +1173,7 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
       '</h3>' +
       '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
-    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
       '<button type="button" class="secondary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">Cancel</button>' +
       '<button type="button" class="primary" id="appConfirmBtn" style="min-width:80px; padding:8px 16px; ' + confirmBtnStyle + '">' + escapeHtml(confirmBtnText || 'Confirm') + '</button>' +
@@ -1772,6 +1798,12 @@ function renderDiscoverChartsList(type, forceRefresh) {
     if (window._CHARTS_STREAMING_ALL) {
       window._CHARTS_STREAMING_ALL.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'My Lists Addon'); });
     }
+    // Empty until the feature is public -- 09_page-shell.js bakes in an empty
+    // array rather than the real one while NEW_ON_STREAMING_IN_QUICK_ADD is
+    // false, so this loop is a no-op instead of needing its own gate.
+    if (window._CHARTS_NEW_ON_STREAMING) {
+      window._CHARTS_NEW_ON_STREAMING.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'New on Streaming'); });
+    }
   }
 
   if (type === 'curated' || type === 'all') {
@@ -1985,8 +2017,11 @@ function channelSourceRowHtml(u) {
     if (payload.dailyRotate) {
       summary = items.length + '-episode pool \u2014 shows ' + CHANNEL_ROTATION_SHOWS_PER_DAY + ' shows \u00d7 ' +
         CHANNEL_ROTATION_EPISODES_PER_SHOW + ' episodes each, refreshed daily';
-    } else if (payload.shuffle) {
-      summary += ' \u2014 shuffled daily';
+      const rotatedOrder = channelPlayOrderLabel(payload);
+      if (rotatedOrder && rotatedOrder !== 'shuffled daily') summary += ', ' + rotatedOrder;
+    } else {
+      const order = channelPlayOrderLabel(payload);
+      if (order) summary += ' \u2014 ' + order;
     }
   }
   return '<div class="source-row">' +
@@ -2412,6 +2447,12 @@ ${buildAddAllCombinedChartsJs()}
 ${buildAddAllFnJs("addAllKidsCharts", buildAddAllPairsCallsJs(KIDS_LISTS, "Kids", ""))}
 ${buildAddAllFnJs("addAllHolidayCharts", buildAddAllPairsCallsJs(HOLIDAY_LISTS, "Holidays", ""))}
 ${buildAddAllFnJs("addAllGenreCharts", buildAddAllPairsCallsJs(GENRE_LISTS, "Genres", ""))}
+// Always DEFINED, so the click handler below resolves whether or not the shelf
+// exists -- but empty while the shelf is hidden. Generating the calls
+// unconditionally put every row's name and source url in the page source of a
+// feature nobody is supposed to be able to add yet, which is most of what
+// shipping it dark was for.
+${buildAddAllFnJs("addAllNewOnStreaming", NEW_ON_STREAMING_IN_QUICK_ADD ? buildAddAllPairsCallsJs(NEW_ON_STREAMING_LISTS, "New on Streaming", "") : "")}
 
 function addAllHiddenGems() {
   addRow("Hidden Gems", "tmdb:hidden-gems", "movie", true, "Hidden Gems");
@@ -2436,6 +2477,7 @@ document.addEventListener('click', (e) => {
   else if (action === 'kids') addAllKidsCharts();
   else if (action === 'holidays') addAllHolidayCharts();
   else if (action === 'genres') addAllGenreCharts();
+  else if (action === 'new-on-streaming') addAllNewOnStreaming();
 });
 
 // Adds a blank source row to an existing entry -- this is how a normal

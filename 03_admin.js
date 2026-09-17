@@ -2029,6 +2029,7 @@ async function renderAdminDashboard(env) {
     <button type="button" class="subnav-pill" data-sub-tab="creators" onclick="switchAdminSubTab('creators')">Creator Accounts</button>
     <button type="button" class="subnav-pill" data-sub-tab="feedback" onclick="switchAdminSubTab('feedback')">Feedback</button>
     <button type="button" class="subnav-pill" data-sub-tab="netflixpreview" onclick="switchAdminSubTab('netflixpreview')">Provider Preview</button>
+    <button type="button" class="subnav-pill" data-sub-tab="newonstreaming" onclick="switchAdminSubTab('newonstreaming')">New on Streaming</button>
     <button type="button" class="subnav-pill" data-sub-tab="maintenance" onclick="switchAdminSubTab('maintenance')">Maintenance</button>
   </div>
 
@@ -2255,6 +2256,56 @@ async function renderAdminDashboard(env) {
     <div id="netflixPreviewShows" style="margin-top:28px;"></div>
   </div>
 
+  <div class="admin-tab-panel" data-admin-panel="newonstreaming">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it just has no Quick Add card and no Discover entry until it is turned on for everyone.</p>
+    <p style="color:#8E8E93; margin:0 0 16px; font-size:0.82rem;">Nothing upstream publishes the date a title landed on a service, so this add-on watches for it: every cron tick walks a slice of each provider&rsquo;s catalog, and a title that was not in the table already is an arrival. That means the list is only as old as the sweep &mdash; the first full pass is <em>seeded</em> (dated by each title&rsquo;s own release, because there was nothing to compare against yet) and every pass after it records real arrivals. Watch the <strong>observed</strong> number below: while it is zero, the ordering is still release dates.</p>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Sweep status</div>
+      <div id="nosStatus" style="font-size:0.85rem; color:#8E8E93;">Loading&hellip;</div>
+      <div style="margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button type="button" class="secondary lc-btn" onclick="loadNewOnStreaming()">Refresh</button>
+        <label style="font-size:0.85rem; color:#8E8E93;">Units
+          <input type="number" id="nosSweepUnits" class="admin-select" style="margin-right:0; width:70px;" value="12" min="1" max="40">
+        </label>
+        <label style="font-size:0.85rem; color:#8E8E93; display:inline-flex; align-items:center; gap:6px;">
+          <input type="checkbox" id="nosSweepBump" checked style="width:15px; height:15px;"> also re-bump episodes
+        </label>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="nosSweepBtn" onclick="runNewOnStreamingSweep()">Run a sweep now</button>
+        <span id="nosSweepStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">One unit is one provider, one type, one page of 20 &mdash; the same slice the cron takes. A pass reads every catalogue to its end (the depth is measured from TMDB, not configured), and the pass that completes is what lets titles no longer on a service be marked gone. Running a sweep here advances the same cursor the cron uses, so it brings the walk in sooner rather than duplicating it. Capped at 40 units a click because this spends the request&rsquo;s own subrequest allowance, not the cron&rsquo;s.</p>
+    </div>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Rows collected</div>
+      <div class="table-wrap">
+        <table>
+          <tr><th>Service</th><th>Type</th><th>Pages</th><th>Titles</th><th>Seeded</th><th>Observed</th><th>Gone</th><th>Newest</th></tr>
+          <tbody id="nosByServiceBody"><tr><td colspan="8">Loading&hellip;</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Preview the catalog</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Read through the same code that serves the row to Stremio, so this is the actual shelf and not a second implementation of it. Order is always most recently arrived first.</p>
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap;">
+        <select class="admin-select" id="nosPreviewType" onchange="loadNewOnStreamingPreview()">
+          <option value="movie">Movies</option>
+          <option value="series">Shows</option>
+        </select>
+        <select class="admin-select" id="nosPreviewService" onchange="loadNewOnStreamingPreview()">
+          <option value="">All services</option>
+        </select>
+        <button type="button" class="secondary lc-btn" onclick="loadNewOnStreamingPreview()">Load preview</button>
+        <span id="nosPreviewStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+      <div style="margin-bottom:12px; font-size:0.82rem; color:#8E8E93;">Catalog URL: <code id="nosPreviewSource">tmdb:new-on-streaming</code> &mdash; paste this into <strong>Catalogs &rarr; + New Catalog</strong> on the main site to install this exact row into Stremio or Nuvio while it is still hidden.</div>
+      <div id="nosPreviewResults"></div>
+    </div>
+  </div>
+
   <div class="admin-tab-panel" data-admin-panel="maintenance">
     <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">One-off, click-to-run maintenance actions -- everything here is also reachable as a raw <code>POST</code> request for anyone using <code>wrangler</code>/curl, but these buttons are the point-and-click way to run the same thing entirely from this dashboard, no terminal required.</p>
 
@@ -2325,6 +2376,23 @@ async function renderAdminDashboard(env) {
       <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteAnonBtn" onclick="runDeletePublishedLists()">Delete these lists</button>
       <span id="deleteAnonStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
+
+    <div class="admin-card" style="margin-top:12px;">
+      <h3 style="margin:0 0 6px; font-size:0.95rem;">Published channels</h3>
+      <p style="margin:0 0 10px; color:#8E8E93; font-size:0.82rem;">
+        The Explore Channels directory. Publishing a channel is owner-only, so without this panel
+        a channel could only be withdrawn by whoever put it there.
+        <strong>Unlist</strong> removes it from the directory and leaves existing share links working &mdash;
+        the same thing its owner&rsquo;s own Unpublish does. <strong>Delete</strong> removes the stored channel,
+        so every link to it stops working.
+      </p>
+      <div class="row" style="margin-bottom:8px;">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="browseChannelsBtn" onclick="loadPublishedChannels('listed')">Browse the directory</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="browseChannelsAllBtn" onclick="loadPublishedChannels('all')">Browse every stored channel</button>
+        <span id="publishedChannelStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      </div>
+      <div id="publishedChannelResults"></div>
+    </div>
   </div>
 
   <!-- A form, not a link: logging out is a state change, and /admin/logout
@@ -2349,6 +2417,7 @@ async function renderAdminDashboard(env) {
       creators: 'management',
       feedback: 'management',
       netflixpreview: 'management',
+      newonstreaming: 'management',
       maintenance: 'management',
     };
 
@@ -2397,6 +2466,7 @@ async function renderAdminDashboard(env) {
       if (tabId === 'feedback' && !window._feedbackLoadedOnce) { window._feedbackLoadedOnce = true; loadFeedback(); }
       if (tabId === 'apiusage' && !window._apiUsageLoadedOnce) { window._apiUsageLoadedOnce = true; loadApiUsage(); }
       if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
+      if (tabId === 'newonstreaming' && !window._newOnStreamingLoadedOnce) { window._newOnStreamingLoadedOnce = true; loadNewOnStreaming(); }
     }
 
     function restoreAdminActiveTab() {
@@ -3025,6 +3095,103 @@ async function renderAdminDashboard(env) {
       moreBtn.disabled = false;
     }
 
+    // --- published channels ---------------------------------------------
+    //
+    // Two scopes. "listed" is the directory itself -- one cheap read of the
+    // index, and what the public actually sees. "all" walks the
+    // channelshare: keyspace, which also holds channels that were published,
+    // reported and then quietly unlisted, and any row a lost index write
+    // orphaned. An operator needs both.
+    async function loadPublishedChannels(scope) {
+      const status = document.getElementById('publishedChannelStatus');
+      const results = document.getElementById('publishedChannelResults');
+      const btn = document.getElementById(scope === 'all' ? 'browseChannelsAllBtn' : 'browseChannelsBtn');
+      if (btn) btn.disabled = true;
+      status.textContent = 'Loading\u2026';
+      try {
+        const res = await fetch('/admin/api/published-channels?scope=' + encodeURIComponent(scope) + '&limit=100');
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          if (btn) btn.disabled = false;
+          return;
+        }
+        const channels = data.channels || [];
+        if (!channels.length) {
+          results.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">Nothing to show.</p>';
+          status.textContent = '';
+          if (btn) btn.disabled = false;
+          return;
+        }
+        const rows = channels.map(function (C) {
+          const code = escapeHtmlAdmin(C.code);
+          return '<tr data-channel-row="' + code + '">' +
+            '<td style="padding:4px 8px 4px 0;"><code>' + code + '</code></td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(C.name || '') + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(C.owner || '\u2014') + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(C.itemCount) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(C.likes) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + (C.listed ? 'listed' : 'unlisted') + '</td>' +
+            '<td style="padding:4px 8px 4px 0;"><a href="' + escapeHtmlAdmin(C.url || '') + '" target="_blank" rel="noopener">open</a></td>' +
+            '<td style="padding:4px 0; white-space:nowrap;">' +
+              '<button type="button" class="admin-select" data-channel-action="unlist" data-code="' + code + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem; margin-right:4px;">Unlist</button>' +
+              '<button type="button" class="admin-select" data-channel-action="delete" data-code="' + code + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem; color:#FF3B30; border-color:rgba(255,59,48,0.35);">Delete</button>' +
+            '</td>' +
+            '</tr>';
+        }).join('');
+        results.innerHTML = '<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+          '<thead><tr style="color:#8E8E93; text-align:left;">' +
+          '<th style="padding-right:8px;">Code</th><th style="padding-right:8px;">Name</th>' +
+          '<th style="padding-right:8px;">Owner</th>' +
+          '<th style="padding-right:8px; text-align:right;">Items</th>' +
+          '<th style="padding-right:8px; text-align:right;">Likes</th>' +
+          '<th style="padding-right:8px;">State</th><th></th><th></th>' +
+          '</tr></thead><tbody>' + rows + '</tbody></table>';
+        status.textContent = channels.length + ' channel' + (channels.length === 1 ? '' : 's') + ' shown' +
+          (data.done ? '. That is all of them.' : ', more available.');
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      if (btn) btn.disabled = false;
+    }
+
+    // Both actions confirm by name before they run. Delete says plainly that
+    // it breaks every link, because that is the part an operator reaching
+    // for "take this down" may not have meant.
+    document.getElementById('publishedChannelResults').addEventListener('click', async function (ev) {
+      const btn = ev.target.closest('[data-channel-action]');
+      if (!btn) return;
+      const action = btn.getAttribute('data-channel-action');
+      const code = btn.getAttribute('data-code');
+      const row = btn.closest('tr');
+      const name = row ? (row.children[1].textContent || code) : code;
+      const question = action === 'delete'
+        ? 'Delete the stored channel "' + name + '"? Every share link to it stops working. This cannot be undone.'
+        : 'Remove "' + name + '" from the Explore Channels directory? Links already handed out keep working.';
+      if (!confirm(question)) return;
+      const status = document.getElementById('publishedChannelStatus');
+      btn.disabled = true;
+      status.textContent = 'Working\u2026';
+      try {
+        const res = await fetch('/admin/api/channel-moderate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: code, action: action }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          return;
+        }
+        status.textContent = (action === 'delete' ? 'Deleted ' : 'Unlisted ') + name + '.';
+        if (row) row.remove();
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+        btn.disabled = false;
+      }
+    });
+
     // "Select" fills the slug box rather than deleting directly: a one-click
     // delete next to a browse list is how the wrong list gets removed.
     document.getElementById('anonListResults').addEventListener('click', function (ev) {
@@ -3313,6 +3480,180 @@ async function renderAdminDashboard(env) {
         ).join('');
       } catch (e) {
         statusEl.textContent = 'Could not search -- check your connection.';
+      }
+    }
+
+
+    // --- New on Streaming ---------------------------------------------------
+    //
+    // The whole test surface for a catalog that is deliberately not on the
+    // site yet: what the sweep has collected, a way to push it along, and a
+    // preview that goes through the real fetchNewOnStreaming rather than
+    // re-deriving the shelf here (a second implementation would be the one
+    // thing guaranteed to disagree with what Stremio gets).
+    let nosProviders = [];
+
+    function nosEpochToDay(sec) {
+      const n = Number(sec) || 0;
+      if (!n) return '--';
+      try {
+        return new Date(n * 1000).toISOString().slice(0, 10);
+      } catch (e) {
+        return '--';
+      }
+    }
+
+    async function loadNewOnStreaming() {
+      const statusEl = document.getElementById('nosStatus');
+      const bodyEl = document.getElementById('nosByServiceBody');
+      statusEl.textContent = 'Loading…';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming');
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not load status.';
+          return;
+        }
+        const st = data.status || {};
+        nosProviders = st.providers || [];
+
+        const bits = [];
+        bits.push('<div>D1: ' + (st.d1Bound
+          ? (st.tableReady
+            ? '<span style="color:#30d158;">bound, streaming_events ready</span>'
+            : '<span style="color:#FF3B30;">bound, but the table is missing</span>')
+          : '<span style="color:#FF3B30;">not bound -- this catalog is D1-only</span>') + '</div>');
+        if (st.error) {
+          bits.push('<div style="color:#FF3B30;">' + escapeHtmlAdmin(st.error) + '</div>');
+        }
+        bits.push('<div>Region swept: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong></div>');
+        bits.push('<div>Visible to users: ' + (st.inQuickAdd
+          ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
+          : '<span style="color:#FF9500;">no -- admin only (NEW_ON_STREAMING_IN_QUICK_ADD is false)</span>') + '</div>');
+        const cursor = st.cursor || { page: 1, idx: 0, walk: 0, passErrors: 0 };
+        const perPass = st.passPages || 0;
+        const done = perPass ? Math.min(perPass, ((cursor.page - 1) * st.combos) + cursor.idx) : 0;
+        const pct = perPass ? Math.floor((done / perPass) * 100) : 0;
+        bits.push('<div>Pass size: <strong>' + (perPass || '?') + '</strong> pages ('
+          + st.depthsKnown + ' of ' + st.combos + ' catalogues measured)'
+          + (perPass && st.unitsPerTick ? ' &mdash; about ' + (Math.round((perPass / st.unitsPerTick) * 6 / 6) * 1) + ' ticks, ~' + (Math.round((perPass / st.unitsPerTick) * 6 / 60 * 10) / 10) + ' h a full pass' : '')
+          + '</div>');
+        bits.push('<div>Walk: generation <strong>' + cursor.walk + '</strong>, at page ' + cursor.page + ', catalogue ' + cursor.idx + ' of ' + st.combos + ' (' + pct + '% through this pass), ' + st.unitsPerTick + ' pages a tick</div>');
+        if (cursor.passErrors) {
+          bits.push('<div style="color:#FF9500;">' + cursor.passErrors + ' page(s) failed so far this pass &mdash; removals are skipped for a pass that could not be read.</div>');
+        }
+        bits.push('<div>' + (cursor.walk === 0
+          ? '<span style="color:#FF9500;">Still on the seeding pass</span> -- dates are the titles&rsquo; own release dates until this first pass finishes.'
+          : '<span style="color:#30d158;">Past the seeding pass</span> -- arrivals found from here on are observed, not inferred.') + '</div>');
+        const totals = st.totals || {};
+        bits.push('<div>Titles: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows &mdash; ' + (totals.seeded || 0) + ' seeded, <strong>' + (totals.observed || 0) + ' observed</strong>, ' + (totals.removed || 0) + ' marked gone</div>');
+        if (st.lastSweep) {
+          bits.push('<div>Last sweep: ' + nosEpochToDay(st.lastSweep.at) + ' &mdash; ' + (st.lastSweep.units || 0) + ' pages, ' + (st.lastSweep.added || 0) + ' new rows, ' + (st.lastSweep.returned || 0) + ' returned, ' + (st.lastSweep.resolved || 0) + ' IMDb lookups, ' + (st.lastSweep.errors || 0) + ' errors' + (st.lastSweep.reason ? ' (' + escapeHtmlAdmin(st.lastSweep.reason) + ')' : '') + '</div>');
+          const rm = st.lastSweep.removal;
+          if (rm) {
+            bits.push('<div>' + (rm.ran
+              ? 'Last completed pass marked <strong>' + rm.marked + '</strong> title(s) gone (of ' + rm.live + ' on record).'
+              : '<span style="color:#FF9500;">Removals held back: ' + escapeHtmlAdmin(rm.reason || 'not yet applicable') + '</span>') + '</div>');
+          }
+        } else {
+          bits.push('<div style="color:#FF9500;">No sweep has completed yet.</div>');
+        }
+        if (st.lastBump) {
+          bits.push('<div>Last episode re-bump: ' + nosEpochToDay(st.lastBump.at) + ' &mdash; ' + (st.lastBump.checked || 0) + ' shows checked, ' + (st.lastBump.bumped || 0) + ' moved to the top</div>');
+        }
+        statusEl.innerHTML = bits.join('');
+
+        const rows = st.byService || [];
+        bodyEl.innerHTML = rows.length
+          ? rows.map(function (r) {
+              return '<tr><td>' + escapeHtmlAdmin(r.service) + '</td><td>' + escapeHtmlAdmin(r.kind) + '</td><td>' + (r.measured ? r.pages : '?') + '</td><td>' + r.count + '</td><td>' + r.seeded + '</td><td>' + r.observed + '</td><td>' + r.removed + '</td><td>' + nosEpochToDay(r.newest) + '</td></tr>';
+            }).join('')
+          : '<tr><td colspan="8">Nothing collected yet -- run a sweep.</td></tr>';
+
+        const sel = document.getElementById('nosPreviewService');
+        if (sel && sel.options.length <= 1) {
+          nosProviders.forEach(function (p) {
+            const opt = document.createElement('option');
+            opt.value = p.key;
+            opt.textContent = p.name;
+            sel.appendChild(opt);
+          });
+        }
+      } catch (e) {
+        statusEl.textContent = 'Could not load -- check your connection.';
+      }
+    }
+
+    async function runNewOnStreamingSweep() {
+      const btn = document.getElementById('nosSweepBtn');
+      const statusEl = document.getElementById('nosSweepStatus');
+      const units = parseInt(document.getElementById('nosSweepUnits').value, 10) || 12;
+      const bump = document.getElementById('nosSweepBump').checked;
+      btn.disabled = true;
+      statusEl.textContent = 'Sweeping… this can take a minute on a first pass.';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming/sweep', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units: units, bump: bump }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Sweep failed.';
+          btn.disabled = false;
+          return;
+        }
+        const sw = data.sweep || {};
+        if (!sw.ran) {
+          statusEl.textContent = sw.reason || 'The sweep did not run.';
+        } else {
+          let msg = sw.units + ' pages, ' + sw.seen + ' titles seen, ' + sw.added + ' new rows, ' + sw.returned + ' returned, ' + sw.touched + ' already known';
+          if (sw.wrapped) msg += '; pass complete';
+          if (sw.removal && sw.removal.ran && sw.removal.marked) msg += ', ' + sw.removal.marked + ' marked gone';
+          if (data.bump && data.bump.ran) msg += '; ' + data.bump.bumped + ' shows re-bumped';
+          if (sw.errors) msg += '; ' + sw.errors + ' errors (see the Worker log)';
+          statusEl.textContent = msg;
+        }
+        await loadNewOnStreaming();
+      } catch (e) {
+        statusEl.textContent = 'Could not run -- check your connection.';
+      }
+      btn.disabled = false;
+    }
+
+    async function loadNewOnStreamingPreview() {
+      const statusEl = document.getElementById('nosPreviewStatus');
+      const resultsEl = document.getElementById('nosPreviewResults');
+      const sourceEl = document.getElementById('nosPreviewSource');
+      const type = document.getElementById('nosPreviewType').value;
+      const service = document.getElementById('nosPreviewService').value;
+      statusEl.textContent = 'Loading…';
+      resultsEl.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming/preview?type=' + encodeURIComponent(type) + (service ? '&services=' + encodeURIComponent(service) : ''));
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not load preview.';
+          return;
+        }
+        sourceEl.textContent = data.source;
+        statusEl.textContent = (data.totalItems != null ? data.totalItems + ' titles in this row' : '');
+        if (!data.items.length) {
+          resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">Empty -- the sweep has not collected anything for this service and type yet.</p>';
+          return;
+        }
+        resultsEl.innerHTML =
+          '<div class="table-wrap"><table><tr><th>#</th><th>Poster</th><th>Title</th><th>Year</th><th>Id</th></tr>' +
+          data.items.map(function (it, i) {
+            return '<tr><td>' + (i + 1) + '</td>' +
+              '<td>' + (it.poster ? '<img src="' + escapeHtmlAdmin(it.poster) + '" alt="" style="width:40px; border-radius:4px;">' : '') + '</td>' +
+              '<td>' + escapeHtmlAdmin(it.name || '') + '</td>' +
+              '<td>' + escapeHtmlAdmin(it.releaseInfo || '') + '</td>' +
+              '<td style="color:#8E8E93;">' + escapeHtmlAdmin(it.id || '') + '</td></tr>';
+          }).join('') +
+          '</table></div>';
+      } catch (e) {
+        statusEl.textContent = 'Could not load -- check your connection.';
       }
     }
 

@@ -83,6 +83,30 @@ const CURATED_RECOMMENDATION_LIMIT = 40;
 // trade one bug for a worse, invisible one.
 const PUBLISHED_LIST_ITEMS_MAX = 10000;
 const PUBLISHED_LIST_NAME_MAX = 200;
+
+// --- shared channels ----------------------------------------------------
+//
+// A shared channel is stored whole under one KV key, so it needs a ceiling
+// that KV itself does not give it in any useful form: 25MB is the hard
+// limit, but a 25MB record is also a 25MB read on every import and every
+// directory card built from it. 4MB is roughly a 5,000-episode channel with
+// full artwork -- the largest thing this add-on can actually build -- and
+// is rejected rather than truncated, for the reason PUBLISHED_LIST_ITEMS_MAX
+// already spells out: quietly storing a shortened channel is a worse bug
+// than refusing an oversized one.
+const SHARED_CHANNEL_BYTES_MAX = 4000000;
+// How many channels the Explore Channels directory holds. One KV key, read
+// on every visit to the tab, so this is a page-weight budget as much as a
+// storage one; the oldest listing falls off when a new one arrives.
+const PUBLIC_CHANNEL_INDEX_MAX = 500;
+
+// A Spotlight channel reads one show a season at a time to find the episodes
+// its subject is actually in (see /api/person-show-episodes). These bound
+// what one show can cost and contribute: a soap with 40 seasons would
+// otherwise be 40 TMDB calls, and a series regular on a 300-episode run
+// would drown every other credit in the channel.
+const PERSON_SHOW_MAX_SEASONS = 20;
+const PERSON_SHOW_MAX_EPISODES = 400;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 10 * 1024 * 1024;        // 10 MB of serialized JSON
 
@@ -305,6 +329,167 @@ const CRON_EPISODE_CHECK_MAX = 150;
 // leaving 9,700 for the charts, which covers all 47 of them; at a free
 // Worker's 48 it is 24 fetches -> 12 shows a tick, which is 2,880 checks a day.
 const CRON_EPISODE_CHECK_SHARE = 0.5;
+
+// --- New on Streaming -------------------------------------------------------
+//
+// The catalog behind tmdb:new-on-streaming[:service]: what actually arrived on
+// a streaming service, newest first, with a show pushed back to the top when
+// a new episode airs.
+//
+// It cannot be a discover query, and that is the whole reason any of this
+// exists. TMDB's with_watch_providers answers "is this on Netflix right now";
+// nothing in TMDB, Trakt or Simkl answers "when did it get there". The closest
+// existing row in this add-on, tmdb:genre:stream-releases, sorts by
+// primary_release_date instead -- which is why it shows theatrical-era titles
+// and completely misses a 1998 film being added to Hulu this morning.
+//
+// So the add-on observes it. Each cron tick walks a slice of a provider's
+// catalog; a title that was not in streaming_events already is an arrival, and
+// the moment it is first seen is the date the shelf sorts on. That date is
+// only ever as good as the observation, which is why the sweep is written to
+// be cheap enough to run constantly rather than accurate in one pass.
+//
+// Provider ids are the ones already verified for TMDB_CHART_PATHS (see
+// tmdbProviderChartPaths, 07_source-fetchers-tmdb-simkl.js): TMDB carries more
+// than one entry for some services, a wrong id fails silently by showing the
+// wrong catalog under the right label, and these were confirmed through the
+// admin dashboard's Provider Preview tab. Do NOT hand-edit them from memory --
+// re-verify through that tab, the same rule that block already carries.
+const NEW_ON_STREAMING_PROVIDERS = [
+  { key: "netflix", name: "Netflix", tmdbId: 8 },
+  { key: "primevideo", name: "Prime Video", tmdbId: 9 },
+  { key: "disney", name: "Disney+", tmdbId: 337 },
+  { key: "hbomax", name: "HBO Max", tmdbId: 1899 },
+  { key: "hulu", name: "Hulu", tmdbId: 15 },
+  { key: "appletv", name: "Apple TV+", tmdbId: 350 },
+  { key: "paramount", name: "Paramount+", tmdbId: 2303 },
+  { key: "peacock", name: "Peacock", tmdbId: 387 },
+];
+
+// Which watch_region the sweep observes. One region is not a simplification
+// that can be lifted by adding entries here: each extra region multiplies the
+// walk by the number of providers again, and a region nobody has selected is
+// a full catalog walk spent on nobody. A reader whose own region is not swept
+// is served the first entry's rows instead of an empty shelf -- stated plainly
+// in the catalog's own error path rather than silently.
+const NEW_ON_STREAMING_REGIONS = ["US"];
+
+// The walk reads each provider catalog to its END, and the depth is LEARNED
+// rather than configured: every discover response carries total_pages, so the
+// sweep records how deep each provider+kind actually goes and walks exactly
+// that far.
+//
+// It shipped with a fixed 40-page horizon instead, and that quietly broke the
+// feature's whole premise. Sorted by release date descending, 40 pages is the
+// ~800 most recently RELEASED titles -- one to three years. A 2010 film added
+// to Netflix today sits far outside that window, so the sweep never fetched
+// the page it was on and the title never entered the table at all: not as an
+// arrival, not even as a seeded row. The list could only ever report new
+// releases arriving, which is the case that needed it least, and is exactly
+// the failure this feature was built to fix.
+//
+// This is the only hard bound left, and it is TMDB's, not a choice: discover
+// stops paginating at page 500 (10,000 titles). No single service's flatrate
+// catalogue in one region comes near it.
+const NEW_ON_STREAMING_MAX_PAGES_PER_CATALOG = 500;
+
+// Sweep units (one provider + kind + page) per tick.
+//
+// Raised from 12 now that a pass covers whole catalogues rather than their
+// first 40 pages. A pass is roughly 1,000-1,500 pages in total across the
+// eight services and both types -- the sweep measures the real number and the
+// admin panel reports it -- so 40 a tick brings a full pass in around three
+// hours on the recommended */6 schedule. That is the detection latency for a
+// back-catalogue arrival and, now, for a removal.
+//
+// It is not how long the shelf takes to look right: the walk is page-major
+// (see newOnStreamingCombos), so the first 16 units are page 1 of every
+// provider and kind and the newest titles everywhere are in within one tick.
+// The hours after that only add depth.
+//
+// The budget check uses NEW_ON_STREAMING_SWEEP_FETCHES (21) as a per-page
+// ceiling, so 40 pages reserves 840 against the ~1,175 the sweep is given.
+// That ceiling is only ever paid on a first walk; once IMDb ids are cached a
+// page costs one fetch.
+const NEW_ON_STREAMING_PAGES_PER_TICK = 40;
+
+// Budget ceiling for one sweep unit: the discover page itself, plus an IMDb
+// resolution for each of its 20 items. Like CRON_CHART_WARM_FETCHES this is a
+// ceiling and not an average -- the sweep asks D1 which of the page's TMDB ids
+// it already has and resolves only the rest, so a page of titles already in
+// the table costs the single discover fetch. A first walk pays the full 21.
+const NEW_ON_STREAMING_SWEEP_FETCHES = 21;
+
+// Share of the budget the sweep may claim -- and specifically, a share of the
+// reserve the EPISODE sweep is handed but cannot reach.
+//
+// The episode half is given CRON_EPISODE_CHECK_SHARE of the tick (5,000 at the
+// default) while CRON_EPISODE_CHECK_MAX caps what it can actually spend at 300,
+// so 4,700 fetches are reserved every tick by something that will never ask for
+// them. Taking this from there rather than from the pre-warm's share is what
+// keeps the guarantee the pre-warm already had: on the default budget the
+// entire chart list still warms in ONE tick, so no chart is ever left for the
+// next one. Take it from the pre-warm instead and 35 of the 40 charts fit,
+// which is a working feature quietly degraded to pay for a new one.
+//
+// At the default that is 1,175 fetches -- comfortably more than the 252 a
+// 12-unit tick can spend at its own ceiling. On a free Worker the episode
+// reserve is 24 and fully reachable, so this comes out at 0 and the sweep
+// skips itself with one log line, exactly as chart pre-warming does.
+const CRON_NEW_ON_STREAMING_SHARE = 0.25;
+
+// How far back an episode counts as "just aired" for the re-bump pass, how
+// many discover pages of candidates it collects per provider, and how many
+// shows it may resolve exactly per tick.
+//
+// The window is wider than a week so a show is not missed when a tick is
+// dropped; re-bumping a show to a date it already holds is a no-op, so overlap
+// is free.
+//
+// Three pages rather than one because the candidate scan is popularity-ordered
+// and a busy service can have well over twenty shows airing inside the window
+// -- at one page, a mid-list show's new episode would simply never be seen.
+// Widening the candidate list is nearly free: candidates are then narrowed to
+// the shows this add-on already carries, and the per-show answer is KV-cached
+// for six hours, so the pages cost 3 fetches each and most of the resolutions
+// cost none.
+const NEW_ON_STREAMING_EPISODE_WINDOW_DAYS = 10;
+const NEW_ON_STREAMING_EPISODE_SCAN_PAGES = 3;
+const NEW_ON_STREAMING_EPISODE_SHOWS_PER_TICK = 40;
+
+// --- Marking a title as gone ------------------------------------------------
+//
+// A completed pass has visited every page of every catalogue, so a row it did
+// not see is a title that is no longer there. That is the only evidence
+// available, and it is worth being careful with: the cost of a false removal
+// is a title vanishing from the shelf, and then -- when the next pass finds it
+// again -- reappearing at the top as an arrival that never happened.
+//
+// Three guards, in increasing order of how badly things have to be going:
+//
+//   GRACE_WALKS   a row must be missed by this many CONSECUTIVE completed
+//                 passes before it is marked gone. Two passes is several hours
+//                 of TMDB consistently not listing it, which no ordinary
+//                 hiccup survives.
+//   MAX_PASS_ERRORS  a pass that could not read this many pages did not
+//                 establish that anything is absent; it marks nothing.
+//   MAX_REMOVAL_SHARE  and if a pass somehow still concludes that more than
+//                 this fraction of everything on record has vanished at once,
+//                 the conclusion is wrong. It marks nothing and says so
+//                 loudly, because that is a provider or an API having a bad
+//                 day, not a quarter of the catalogue leaving overnight.
+const NEW_ON_STREAMING_REMOVAL_GRACE_WALKS = 2;
+const NEW_ON_STREAMING_MAX_PASS_ERRORS = 20;
+const NEW_ON_STREAMING_MAX_REMOVAL_SHARE = 0.25;
+
+// Ships dark. The sweep, the catalog and the /lists route are live as soon as
+// this deploys -- tmdb:new-on-streaming resolves, installs into Stremio and
+// pages like any other row -- but the Quick Add shelf and the Discover
+// entries stay hidden until this is true, so the list can be tested from the
+// admin dashboard against real data before anyone else can add it. Flipping
+// this to true is the entire "move it to the live site" step; nothing else
+// about the feature changes.
+const NEW_ON_STREAMING_IN_QUICK_ADD = false;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
@@ -784,6 +969,26 @@ const D1_SCHEMA_MANIFEST = [
   {
     migration: "0010", kind: "table", name: "creator_tracking_meta",
     consequence: "Tracking metadata and conflict versioning fall back to creatorsynctracking:* KV blob.",
+  },
+  {
+    migration: "0011", kind: "table", name: "streaming_events",
+    consequence: "New on Streaming has nowhere to record provider arrivals, so the sweep writes nothing and the catalog stays empty. Unlike the rest of this manifest there is no KV fallback: the dates in this table are observed over time and cannot be refetched, so every tick that runs without it is history not collected.",
+  },
+  {
+    migration: "0011", kind: "index", name: "idx_streaming_events_feed",
+    consequence: "Every page of the New on Streaming shelf sorts the whole table instead of walking an index. Slower, not broken.",
+  },
+  {
+    migration: "0011", kind: "index", name: "idx_streaming_events_tmdb",
+    consequence: "The sweep's \"which of these titles do I already have\" lookup scans the table once per page walked, and so does the episode re-bump. Slower, not broken.",
+  },
+  {
+    migration: "0012", kind: "column", table: "creator_show_states", name: "airing_removed_season",
+    consequence: "Removing a show from Airing Next stops sticking: the removal cannot be stored on the account, so it holds only in the browser that made it and any other device puts the show back. Everything else about tracking keeps working -- the Worker checks for this column and writes the older statement without it.",
+  },
+  {
+    migration: "0012", kind: "column", table: "creator_show_states", name: "airing_removed_episode",
+    consequence: "The other half of the pair above; without it a stored removal has no episode to be superseded by, so watching another episode could not bring the show back.",
   },
 ];
 
@@ -3845,6 +4050,9 @@ function ledgerKeyToListId(ledgerKey) {
   if (ledgerKey.startsWith("extlikevoters:")) {
     return "ext:" + ledgerKey.slice("extlikevoters:".length);
   }
+  if (ledgerKey.startsWith("channellikevoters:")) {
+    return "ch:" + ledgerKey.slice("channellikevoters:".length);
+  }
   return ledgerKey;
 }
 
@@ -3858,6 +4066,9 @@ function listIdToLedgerKey(listId) {
   }
   if (listId.startsWith("ext:")) {
     return "extlikevoters:" + listId.slice(4);
+  }
+  if (listId.startsWith("ch:")) {
+    return "channellikevoters:" + listId.slice(3);
   }
   return "listlikevoters:" + listId;
 }
@@ -5931,6 +6142,81 @@ function isEpisodeAired(airDateStr) {
   return d.getTime() < today.getTime();
 }
 
+// --- Air times --------------------------------------------------------------
+//
+// The hour behind an air date. TMDB has no episode air TIME at all -- it dates
+// an episode and stops -- so every "Airs Tuesday" in this add-on was a day
+// with no hour behind it. TVmaze has both (see fetchShowAirTime,
+// 07_source-fetchers-tmdb-simkl.js); these turn what it returns into the
+// string a listing would print.
+//
+// Shared by the Worker and the page, which is why they live here beside
+// formatAirDateBadge rather than in a client file: /api/details ships the
+// finished label so the browser never has to know a timezone database.
+
+// "21:00" -> "9 PM", "21:30" -> "9:30 PM". The minutes are dropped on the hour
+// exactly the way a TV listing writes it.
+function formatAirClockTime(time) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(time == null ? "" : time).trim());
+  if (!m) return "";
+  const h24 = Number(m[1]);
+  const mins = Number(m[2]);
+  if (!(h24 >= 0 && h24 <= 23) || !(mins >= 0 && mins <= 59)) return "";
+  const suffix = h24 < 12 ? "AM" : "PM";
+  const h12 = (h24 % 12 === 0) ? 12 : (h24 % 12);
+  return mins === 0 ? (h12 + " " + suffix) : (h12 + ":" + String(mins).padStart(2, "0") + " " + suffix);
+}
+
+// The short name a schedule is spoken in. North America is spelled out because
+// "9 PM ET" is the convention there and it does not move with daylight saving
+// the way "EDT"/"EST" do -- a slot is "9 ET" all year, and a listing that
+// flips label twice a year reads like a different time. Everywhere else asks
+// Intl for the zone's own short name on the day, which is right wherever the
+// abbreviation genuinely changes.
+const AIR_TIME_ZONE_LABELS = {
+  "America/New_York": "ET",
+  "America/Detroit": "ET",
+  "America/Toronto": "ET",
+  "America/Nassau": "ET",
+  "America/Chicago": "CT",
+  "America/Winnipeg": "CT",
+  "America/Mexico_City": "CT",
+  "America/Denver": "MT",
+  "America/Edmonton": "MT",
+  "America/Phoenix": "MST",
+  "America/Los_Angeles": "PT",
+  "America/Vancouver": "PT",
+  "America/Anchorage": "AKT",
+  "Pacific/Honolulu": "HST",
+  "America/Halifax": "AT",
+  "America/St_Johns": "NT",
+};
+
+function airTimeZoneLabel(timezone) {
+  const tz = String(timezone == null ? "" : timezone).trim();
+  if (!tz) return "";
+  if (AIR_TIME_ZONE_LABELS[tz]) return AIR_TIME_ZONE_LABELS[tz];
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" }).formatToParts(new Date());
+    const name = (parts.find((part) => part.type === "timeZoneName") || {}).value || "";
+    // A real abbreviation ("JST", "CET") or the offset form Intl falls back to
+    // ("GMT+9"). Either tells a reader this is not their own clock, which is
+    // the whole job of the label; anything else is dropped.
+    return (/^[A-Z]{2,5}$/.test(name) || /^GMT[+-]\d{1,2}(:\d{2})?$/.test(name)) ? name : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+// "21:00" + "America/New_York" -> "9 PM ET". An empty string means there is no
+// air time to show, which every caller treats as "print the date alone".
+function formatAirTimeLabel(time, timezone) {
+  const clock = formatAirClockTime(time);
+  if (!clock) return "";
+  const zone = airTimeZoneLabel(timezone);
+  return zone ? (clock + " " + zone) : clock;
+}
+
 function formatAirDateBadge(airDateStr) {
   if (!airDateStr) return '';
   const parts = String(airDateStr).split(/[-T\s]/);
@@ -6058,6 +6344,39 @@ async function d1ReplaceRowsById(env, table, username, keyColumn, keepIds) {
   );
 }
 
+// Whether this database has migration 0012's airing-removal columns on
+// creator_show_states.
+//
+// Every other column this file writes has been there since the table was
+// created, so a write could assume the whole shape. These two arrived later,
+// and an operator who deploys the Worker without running the migration would
+// otherwise have EVERY tracking write fail on "no such column" -- not just
+// the new feature, but Watch History, Continue Watching and Airing Next with
+// it. So the write asks first and falls back to the older statement, which is
+// exactly what a database without the migration used to receive.
+//
+// Only a positive answer is cached. A negative one is re-checked on the next
+// write, so applying the migration takes effect without waiting for isolates
+// to recycle; the cost while it is missing is one extra tiny read per save,
+// on a deployment that is already being told to migrate by /admin.
+let _d1AiringRemovalColumns = false;
+async function d1HasAiringRemovalColumns(env) {
+  if (_d1AiringRemovalColumns) return true;
+  try {
+    const row = await env.DB.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='creator_show_states'"
+    ).first();
+    // Same word-boundary match checkD1Schema uses, and for the same reason:
+    // sqlite_master's stored DDL is what ALTER TABLE ADD COLUMN updates.
+    _d1AiringRemovalColumns = /(^|[(,\s])airing_removed_season\s/i.test(String((row && row.sql) || ""));
+  } catch (e) {
+    // Unreadable right now -- treat it as absent and write the older shape,
+    // which is always accepted. Never cached, so the next write asks again.
+    _d1AiringRemovalColumns = false;
+  }
+  return _d1AiringRemovalColumns;
+}
+
 async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   if (!env || !env.DB || !username || !trackingData) return false;
   try {
@@ -6104,16 +6423,30 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       )
     );
 
-    // 2. Show states (fullyWatchedShowIds & dismissedContinueWatching)
+    // 2. Show states (fullyWatchedShowIds, dismissedContinueWatching &
+    //    removedAiringNext)
     const fullyWatched = Array.isArray(trackingData.fullyWatchedShowIds) ? trackingData.fullyWatchedShowIds.map(String) : [];
     const dismissed = trackingData.dismissedContinueWatching && typeof trackingData.dismissedContinueWatching === "object"
       ? trackingData.dismissedContinueWatching
       : {};
+    // A payload that does not mention Airing Next removals at all (an older
+    // browser, or one of the scrobble paths writing a blob it built itself)
+    // has no opinion about them, which is not the same as "there are none".
+    // In that case the columns are left out of the statement entirely, so an
+    // ON CONFLICT update keeps whatever is stored instead of nulling it.
+    const removedAiring = trackingData.removedAiringNext && typeof trackingData.removedAiringNext === "object"
+      ? trackingData.removedAiringNext
+      : null;
+    const writeAiringRemoval = !!removedAiring && await d1HasAiringRemovalColumns(env);
 
     // Deferred to the end and narrowed to the rows that are actually gone --
     // see d1ReplaceRowsById.
     const prunes = [];
-    const allShows = new Set([...fullyWatched, ...Object.keys(dismissed)]);
+    const allShows = new Set([
+      ...fullyWatched,
+      ...Object.keys(dismissed),
+      ...(writeAiringRemoval ? Object.keys(removedAiring) : []),
+    ]);
     if (isIntentionalRemoval) {
       prunes.push(...await d1ReplaceRowsById(env, "creator_show_states", username, "show_id", allShows));
     }
@@ -6122,6 +6455,29 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       const dis = dismissed[sid];
       const disSeason = dis && Number.isFinite(Number(dis.seasonNum)) ? Number(dis.seasonNum) : null;
       const disEpisode = dis && Number.isFinite(Number(dis.episodeNum)) ? Number(dis.episodeNum) : null;
+      if (writeAiringRemoval) {
+        const rem = removedAiring[sid];
+        // Stored as the two numbers rather than a flag, because the numbers
+        // ARE the record: they say which watched episode the removal was
+        // made at, and a later one supersedes it. A removal recorded with
+        // nothing watched is 0/0, which any real episode passes.
+        const remSeason = rem ? (Number.isFinite(Number(rem.seasonNum)) ? Number(rem.seasonNum) : 0) : null;
+        const remEpisode = rem ? (Number.isFinite(Number(rem.episodeNum)) ? Number(rem.episodeNum) : 0) : null;
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO creator_show_states (username, show_id, is_fully_watched, dismissed_season, dismissed_episode, airing_removed_season, airing_removed_episode, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(username, show_id) DO UPDATE SET
+               is_fully_watched = excluded.is_fully_watched,
+               dismissed_season = excluded.dismissed_season,
+               dismissed_episode = excluded.dismissed_episode,
+               airing_removed_season = excluded.airing_removed_season,
+               airing_removed_episode = excluded.airing_removed_episode,
+               updated_at = excluded.updated_at`
+          ).bind(username, sid, isFw, disSeason, disEpisode, remSeason, remEpisode, meta.updatedAt)
+        );
+        continue;
+      }
       stmts.push(
         env.DB.prepare(
           `INSERT INTO creator_show_states (username, show_id, is_fully_watched, dismissed_season, dismissed_episode, updated_at)
@@ -6458,12 +6814,23 @@ async function readCreatorTrackingD1(env, username) {
 
     const fullyWatchedShowIds = [];
     const dismissedContinueWatching = {};
+    const removedAiringNext = {};
     for (const s of stateRows) {
       if (s.is_fully_watched) fullyWatchedShowIds.push(s.show_id);
       if (s.dismissed_season != null || s.dismissed_episode != null) {
         dismissedContinueWatching[s.show_id] = {
           seasonNum: s.dismissed_season != null ? s.dismissed_season : 0,
           episodeNum: s.dismissed_episode != null ? s.dismissed_episode : 0,
+        };
+      }
+      // Undefined rather than null on a database that has not had migration
+      // 0012 applied -- SELECT * simply does not return a column that is not
+      // there -- so this reads as "no removals" instead of throwing, which is
+      // the same degraded-but-working answer the write side falls back to.
+      if (s.airing_removed_season != null || s.airing_removed_episode != null) {
+        removedAiringNext[s.show_id] = {
+          seasonNum: s.airing_removed_season != null ? s.airing_removed_season : 0,
+          episodeNum: s.airing_removed_episode != null ? s.airing_removed_episode : 0,
         };
       }
     }
@@ -6479,6 +6846,7 @@ async function readCreatorTrackingD1(env, username) {
       airingNext,
       fullyWatchedShowIds,
       dismissedContinueWatching,
+      removedAiringNext,
       curatedRecommendations: curatedRecs,
       trackPlayback: Boolean(metaRow.track_playback),
       removeWatchedFromWatchlist: Boolean(metaRow.remove_watched_watchlist),
@@ -6562,6 +6930,106 @@ async function readCreatorUserListsD1(env, username) {
     console.error("D1 read error (readCreatorUserListsD1):", err);
     return null;
   }
+}
+
+// --- the Explore Channels directory index -------------------------------
+//
+// One KV key holding the whole directory, newest listing first. A prefix
+// scan over channelshare: would also work, but the tab reads this on every
+// visit and a scan plus one GET per entry is dozens of round trips to draw
+// one page of cards -- so each listing's one-line summary is denormalized
+// into this index and the full channel stays one code lookup away.
+//
+// Read-modify-write on a single key, with no compare-and-swap available in
+// KV: two people publishing in the same instant can cost one of the two
+// listings. That is the same trade index:publiclists makes, and it is
+// tolerable for the same reason -- the channel itself is stored under its
+// own key and is never at risk, only its row in this directory, and
+// re-publishing puts the row back.
+const PUBLIC_CHANNEL_INDEX_KEY = "index:publicchannels";
+
+async function readPublicChannelIndex(env) {
+  if (!env || !env.CONFIGS) return [];
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_CHANNEL_INDEX_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.entries) ? parsed.entries : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writePublicChannelIndex(env, entries) {
+  if (!env || !env.CONFIGS) return;
+  await env.CONFIGS.put(
+    PUBLIC_CHANNEL_INDEX_KEY,
+    JSON.stringify({ entries: entries.slice(0, PUBLIC_CHANNEL_INDEX_MAX), updatedAt: Date.now() })
+  );
+}
+
+async function upsertPublicChannelIndex(env, code, record) {
+  const entries = await readPublicChannelIndex(env);
+  const previous = entries.find((e) => e && e.code === code);
+  const summary = sharedChannelSummary(code, record);
+  // Likes and adds are counted against the listing, not the channel, and
+  // re-publishing an edited channel must not reset them -- so they are
+  // carried across rather than rebuilt from the record.
+  if (previous) {
+    summary.likes = Number(previous.likes) || summary.likes || 0;
+    summary.adds = Number(previous.adds) || summary.adds || 0;
+    summary.publishedAt = previous.publishedAt || summary.publishedAt;
+  }
+  const without = entries.filter((e) => e && e.code !== code);
+  // Newest first, and an update moves a listing back to the front -- a
+  // channel someone has just reworked is the one worth showing.
+  await writePublicChannelIndex(env, [summary, ...without]);
+}
+
+// Writes one field onto one listing, leaving the rest of the index alone.
+//
+// Read-modify-write on a single key with no compare-and-swap, same as every
+// other write here -- so this touches as little as it can and never rebuilds
+// a row from the channel record, which a concurrent publish may have moved on
+// from. A listing that has since been withdrawn is simply not updated.
+async function updatePublicChannelIndexEntry(env, code, patch) {
+  const entries = await readPublicChannelIndex(env);
+  let found = false;
+  const next = entries.map((e) => {
+    if (!e || e.code !== code) return e;
+    found = true;
+    return Object.assign({}, e, patch);
+  });
+  if (!found) return false;
+  await writePublicChannelIndex(env, next);
+  return true;
+}
+
+async function removePublicChannelIndex(env, code) {
+  const entries = await readPublicChannelIndex(env);
+  const without = entries.filter((e) => e && e.code !== code);
+  if (without.length === entries.length) return;
+  await writePublicChannelIndex(env, without);
+}
+
+
+// How the Explore Channels directory is ordered.
+//
+// The index is stored newest-first and is small enough to sort on read, so
+// the ordering is a read-time choice rather than several stored orders that
+// could disagree. "added" ranks by how many people actually took a channel,
+// which is a better signal than a like: taking one costs something.
+function sortPublicChannelIndex(entries, sort) {
+  const list = entries.slice();
+  if (sort === "liked") {
+    list.sort((a, b) => (Number(b.likes) || 0) - (Number(a.likes) || 0) || (Number(b.adds) || 0) - (Number(a.adds) || 0));
+  } else if (sort === "added") {
+    list.sort((a, b) => (Number(b.adds) || 0) - (Number(a.adds) || 0) || (Number(b.likes) || 0) - (Number(a.likes) || 0));
+  } else if (sort === "name") {
+    list.sort((a, b) => String(a.name || "").toLowerCase().localeCompare(String(b.name || "").toLowerCase()));
+  }
+  // "newest" is the order the index is already kept in, so it sorts nothing.
+  return list;
 }
 // --- Admin stats (page views, install links generated) -----------------
 //
@@ -8594,6 +9062,7 @@ async function renderAdminDashboard(env) {
     <button type="button" class="subnav-pill" data-sub-tab="creators" onclick="switchAdminSubTab('creators')">Creator Accounts</button>
     <button type="button" class="subnav-pill" data-sub-tab="feedback" onclick="switchAdminSubTab('feedback')">Feedback</button>
     <button type="button" class="subnav-pill" data-sub-tab="netflixpreview" onclick="switchAdminSubTab('netflixpreview')">Provider Preview</button>
+    <button type="button" class="subnav-pill" data-sub-tab="newonstreaming" onclick="switchAdminSubTab('newonstreaming')">New on Streaming</button>
     <button type="button" class="subnav-pill" data-sub-tab="maintenance" onclick="switchAdminSubTab('maintenance')">Maintenance</button>
   </div>
 
@@ -8820,6 +9289,56 @@ async function renderAdminDashboard(env) {
     <div id="netflixPreviewShows" style="margin-top:28px;"></div>
   </div>
 
+  <div class="admin-tab-panel" data-admin-panel="newonstreaming">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it just has no Quick Add card and no Discover entry until it is turned on for everyone.</p>
+    <p style="color:#8E8E93; margin:0 0 16px; font-size:0.82rem;">Nothing upstream publishes the date a title landed on a service, so this add-on watches for it: every cron tick walks a slice of each provider&rsquo;s catalog, and a title that was not in the table already is an arrival. That means the list is only as old as the sweep &mdash; the first full pass is <em>seeded</em> (dated by each title&rsquo;s own release, because there was nothing to compare against yet) and every pass after it records real arrivals. Watch the <strong>observed</strong> number below: while it is zero, the ordering is still release dates.</p>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Sweep status</div>
+      <div id="nosStatus" style="font-size:0.85rem; color:#8E8E93;">Loading&hellip;</div>
+      <div style="margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button type="button" class="secondary lc-btn" onclick="loadNewOnStreaming()">Refresh</button>
+        <label style="font-size:0.85rem; color:#8E8E93;">Units
+          <input type="number" id="nosSweepUnits" class="admin-select" style="margin-right:0; width:70px;" value="12" min="1" max="40">
+        </label>
+        <label style="font-size:0.85rem; color:#8E8E93; display:inline-flex; align-items:center; gap:6px;">
+          <input type="checkbox" id="nosSweepBump" checked style="width:15px; height:15px;"> also re-bump episodes
+        </label>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="nosSweepBtn" onclick="runNewOnStreamingSweep()">Run a sweep now</button>
+        <span id="nosSweepStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">One unit is one provider, one type, one page of 20 &mdash; the same slice the cron takes. A pass reads every catalogue to its end (the depth is measured from TMDB, not configured), and the pass that completes is what lets titles no longer on a service be marked gone. Running a sweep here advances the same cursor the cron uses, so it brings the walk in sooner rather than duplicating it. Capped at 40 units a click because this spends the request&rsquo;s own subrequest allowance, not the cron&rsquo;s.</p>
+    </div>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Rows collected</div>
+      <div class="table-wrap">
+        <table>
+          <tr><th>Service</th><th>Type</th><th>Pages</th><th>Titles</th><th>Seeded</th><th>Observed</th><th>Gone</th><th>Newest</th></tr>
+          <tbody id="nosByServiceBody"><tr><td colspan="8">Loading&hellip;</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Preview the catalog</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Read through the same code that serves the row to Stremio, so this is the actual shelf and not a second implementation of it. Order is always most recently arrived first.</p>
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap;">
+        <select class="admin-select" id="nosPreviewType" onchange="loadNewOnStreamingPreview()">
+          <option value="movie">Movies</option>
+          <option value="series">Shows</option>
+        </select>
+        <select class="admin-select" id="nosPreviewService" onchange="loadNewOnStreamingPreview()">
+          <option value="">All services</option>
+        </select>
+        <button type="button" class="secondary lc-btn" onclick="loadNewOnStreamingPreview()">Load preview</button>
+        <span id="nosPreviewStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+      <div style="margin-bottom:12px; font-size:0.82rem; color:#8E8E93;">Catalog URL: <code id="nosPreviewSource">tmdb:new-on-streaming</code> &mdash; paste this into <strong>Catalogs &rarr; + New Catalog</strong> on the main site to install this exact row into Stremio or Nuvio while it is still hidden.</div>
+      <div id="nosPreviewResults"></div>
+    </div>
+  </div>
+
   <div class="admin-tab-panel" data-admin-panel="maintenance">
     <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">One-off, click-to-run maintenance actions -- everything here is also reachable as a raw <code>POST</code> request for anyone using <code>wrangler</code>/curl, but these buttons are the point-and-click way to run the same thing entirely from this dashboard, no terminal required.</p>
 
@@ -8890,6 +9409,23 @@ async function renderAdminDashboard(env) {
       <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteAnonBtn" onclick="runDeletePublishedLists()">Delete these lists</button>
       <span id="deleteAnonStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
+
+    <div class="admin-card" style="margin-top:12px;">
+      <h3 style="margin:0 0 6px; font-size:0.95rem;">Published channels</h3>
+      <p style="margin:0 0 10px; color:#8E8E93; font-size:0.82rem;">
+        The Explore Channels directory. Publishing a channel is owner-only, so without this panel
+        a channel could only be withdrawn by whoever put it there.
+        <strong>Unlist</strong> removes it from the directory and leaves existing share links working &mdash;
+        the same thing its owner&rsquo;s own Unpublish does. <strong>Delete</strong> removes the stored channel,
+        so every link to it stops working.
+      </p>
+      <div class="row" style="margin-bottom:8px;">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="browseChannelsBtn" onclick="loadPublishedChannels('listed')">Browse the directory</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="browseChannelsAllBtn" onclick="loadPublishedChannels('all')">Browse every stored channel</button>
+        <span id="publishedChannelStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      </div>
+      <div id="publishedChannelResults"></div>
+    </div>
   </div>
 
   <!-- A form, not a link: logging out is a state change, and /admin/logout
@@ -8914,6 +9450,7 @@ async function renderAdminDashboard(env) {
       creators: 'management',
       feedback: 'management',
       netflixpreview: 'management',
+      newonstreaming: 'management',
       maintenance: 'management',
     };
 
@@ -8962,6 +9499,7 @@ async function renderAdminDashboard(env) {
       if (tabId === 'feedback' && !window._feedbackLoadedOnce) { window._feedbackLoadedOnce = true; loadFeedback(); }
       if (tabId === 'apiusage' && !window._apiUsageLoadedOnce) { window._apiUsageLoadedOnce = true; loadApiUsage(); }
       if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
+      if (tabId === 'newonstreaming' && !window._newOnStreamingLoadedOnce) { window._newOnStreamingLoadedOnce = true; loadNewOnStreaming(); }
     }
 
     function restoreAdminActiveTab() {
@@ -9590,6 +10128,103 @@ async function renderAdminDashboard(env) {
       moreBtn.disabled = false;
     }
 
+    // --- published channels ---------------------------------------------
+    //
+    // Two scopes. "listed" is the directory itself -- one cheap read of the
+    // index, and what the public actually sees. "all" walks the
+    // channelshare: keyspace, which also holds channels that were published,
+    // reported and then quietly unlisted, and any row a lost index write
+    // orphaned. An operator needs both.
+    async function loadPublishedChannels(scope) {
+      const status = document.getElementById('publishedChannelStatus');
+      const results = document.getElementById('publishedChannelResults');
+      const btn = document.getElementById(scope === 'all' ? 'browseChannelsAllBtn' : 'browseChannelsBtn');
+      if (btn) btn.disabled = true;
+      status.textContent = 'Loading\u2026';
+      try {
+        const res = await fetch('/admin/api/published-channels?scope=' + encodeURIComponent(scope) + '&limit=100');
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          if (btn) btn.disabled = false;
+          return;
+        }
+        const channels = data.channels || [];
+        if (!channels.length) {
+          results.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">Nothing to show.</p>';
+          status.textContent = '';
+          if (btn) btn.disabled = false;
+          return;
+        }
+        const rows = channels.map(function (C) {
+          const code = escapeHtmlAdmin(C.code);
+          return '<tr data-channel-row="' + code + '">' +
+            '<td style="padding:4px 8px 4px 0;"><code>' + code + '</code></td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(C.name || '') + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(C.owner || '\u2014') + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(C.itemCount) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(C.likes) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + (C.listed ? 'listed' : 'unlisted') + '</td>' +
+            '<td style="padding:4px 8px 4px 0;"><a href="' + escapeHtmlAdmin(C.url || '') + '" target="_blank" rel="noopener">open</a></td>' +
+            '<td style="padding:4px 0; white-space:nowrap;">' +
+              '<button type="button" class="admin-select" data-channel-action="unlist" data-code="' + code + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem; margin-right:4px;">Unlist</button>' +
+              '<button type="button" class="admin-select" data-channel-action="delete" data-code="' + code + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem; color:#FF3B30; border-color:rgba(255,59,48,0.35);">Delete</button>' +
+            '</td>' +
+            '</tr>';
+        }).join('');
+        results.innerHTML = '<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+          '<thead><tr style="color:#8E8E93; text-align:left;">' +
+          '<th style="padding-right:8px;">Code</th><th style="padding-right:8px;">Name</th>' +
+          '<th style="padding-right:8px;">Owner</th>' +
+          '<th style="padding-right:8px; text-align:right;">Items</th>' +
+          '<th style="padding-right:8px; text-align:right;">Likes</th>' +
+          '<th style="padding-right:8px;">State</th><th></th><th></th>' +
+          '</tr></thead><tbody>' + rows + '</tbody></table>';
+        status.textContent = channels.length + ' channel' + (channels.length === 1 ? '' : 's') + ' shown' +
+          (data.done ? '. That is all of them.' : ', more available.');
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      if (btn) btn.disabled = false;
+    }
+
+    // Both actions confirm by name before they run. Delete says plainly that
+    // it breaks every link, because that is the part an operator reaching
+    // for "take this down" may not have meant.
+    document.getElementById('publishedChannelResults').addEventListener('click', async function (ev) {
+      const btn = ev.target.closest('[data-channel-action]');
+      if (!btn) return;
+      const action = btn.getAttribute('data-channel-action');
+      const code = btn.getAttribute('data-code');
+      const row = btn.closest('tr');
+      const name = row ? (row.children[1].textContent || code) : code;
+      const question = action === 'delete'
+        ? 'Delete the stored channel "' + name + '"? Every share link to it stops working. This cannot be undone.'
+        : 'Remove "' + name + '" from the Explore Channels directory? Links already handed out keep working.';
+      if (!confirm(question)) return;
+      const status = document.getElementById('publishedChannelStatus');
+      btn.disabled = true;
+      status.textContent = 'Working\u2026';
+      try {
+        const res = await fetch('/admin/api/channel-moderate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: code, action: action }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          return;
+        }
+        status.textContent = (action === 'delete' ? 'Deleted ' : 'Unlisted ') + name + '.';
+        if (row) row.remove();
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+        btn.disabled = false;
+      }
+    });
+
     // "Select" fills the slug box rather than deleting directly: a one-click
     // delete next to a browse list is how the wrong list gets removed.
     document.getElementById('anonListResults').addEventListener('click', function (ev) {
@@ -9878,6 +10513,180 @@ async function renderAdminDashboard(env) {
         ).join('');
       } catch (e) {
         statusEl.textContent = 'Could not search -- check your connection.';
+      }
+    }
+
+
+    // --- New on Streaming ---------------------------------------------------
+    //
+    // The whole test surface for a catalog that is deliberately not on the
+    // site yet: what the sweep has collected, a way to push it along, and a
+    // preview that goes through the real fetchNewOnStreaming rather than
+    // re-deriving the shelf here (a second implementation would be the one
+    // thing guaranteed to disagree with what Stremio gets).
+    let nosProviders = [];
+
+    function nosEpochToDay(sec) {
+      const n = Number(sec) || 0;
+      if (!n) return '--';
+      try {
+        return new Date(n * 1000).toISOString().slice(0, 10);
+      } catch (e) {
+        return '--';
+      }
+    }
+
+    async function loadNewOnStreaming() {
+      const statusEl = document.getElementById('nosStatus');
+      const bodyEl = document.getElementById('nosByServiceBody');
+      statusEl.textContent = 'Loading…';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming');
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not load status.';
+          return;
+        }
+        const st = data.status || {};
+        nosProviders = st.providers || [];
+
+        const bits = [];
+        bits.push('<div>D1: ' + (st.d1Bound
+          ? (st.tableReady
+            ? '<span style="color:#30d158;">bound, streaming_events ready</span>'
+            : '<span style="color:#FF3B30;">bound, but the table is missing</span>')
+          : '<span style="color:#FF3B30;">not bound -- this catalog is D1-only</span>') + '</div>');
+        if (st.error) {
+          bits.push('<div style="color:#FF3B30;">' + escapeHtmlAdmin(st.error) + '</div>');
+        }
+        bits.push('<div>Region swept: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong></div>');
+        bits.push('<div>Visible to users: ' + (st.inQuickAdd
+          ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
+          : '<span style="color:#FF9500;">no -- admin only (NEW_ON_STREAMING_IN_QUICK_ADD is false)</span>') + '</div>');
+        const cursor = st.cursor || { page: 1, idx: 0, walk: 0, passErrors: 0 };
+        const perPass = st.passPages || 0;
+        const done = perPass ? Math.min(perPass, ((cursor.page - 1) * st.combos) + cursor.idx) : 0;
+        const pct = perPass ? Math.floor((done / perPass) * 100) : 0;
+        bits.push('<div>Pass size: <strong>' + (perPass || '?') + '</strong> pages ('
+          + st.depthsKnown + ' of ' + st.combos + ' catalogues measured)'
+          + (perPass && st.unitsPerTick ? ' &mdash; about ' + (Math.round((perPass / st.unitsPerTick) * 6 / 6) * 1) + ' ticks, ~' + (Math.round((perPass / st.unitsPerTick) * 6 / 60 * 10) / 10) + ' h a full pass' : '')
+          + '</div>');
+        bits.push('<div>Walk: generation <strong>' + cursor.walk + '</strong>, at page ' + cursor.page + ', catalogue ' + cursor.idx + ' of ' + st.combos + ' (' + pct + '% through this pass), ' + st.unitsPerTick + ' pages a tick</div>');
+        if (cursor.passErrors) {
+          bits.push('<div style="color:#FF9500;">' + cursor.passErrors + ' page(s) failed so far this pass &mdash; removals are skipped for a pass that could not be read.</div>');
+        }
+        bits.push('<div>' + (cursor.walk === 0
+          ? '<span style="color:#FF9500;">Still on the seeding pass</span> -- dates are the titles&rsquo; own release dates until this first pass finishes.'
+          : '<span style="color:#30d158;">Past the seeding pass</span> -- arrivals found from here on are observed, not inferred.') + '</div>');
+        const totals = st.totals || {};
+        bits.push('<div>Titles: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows &mdash; ' + (totals.seeded || 0) + ' seeded, <strong>' + (totals.observed || 0) + ' observed</strong>, ' + (totals.removed || 0) + ' marked gone</div>');
+        if (st.lastSweep) {
+          bits.push('<div>Last sweep: ' + nosEpochToDay(st.lastSweep.at) + ' &mdash; ' + (st.lastSweep.units || 0) + ' pages, ' + (st.lastSweep.added || 0) + ' new rows, ' + (st.lastSweep.returned || 0) + ' returned, ' + (st.lastSweep.resolved || 0) + ' IMDb lookups, ' + (st.lastSweep.errors || 0) + ' errors' + (st.lastSweep.reason ? ' (' + escapeHtmlAdmin(st.lastSweep.reason) + ')' : '') + '</div>');
+          const rm = st.lastSweep.removal;
+          if (rm) {
+            bits.push('<div>' + (rm.ran
+              ? 'Last completed pass marked <strong>' + rm.marked + '</strong> title(s) gone (of ' + rm.live + ' on record).'
+              : '<span style="color:#FF9500;">Removals held back: ' + escapeHtmlAdmin(rm.reason || 'not yet applicable') + '</span>') + '</div>');
+          }
+        } else {
+          bits.push('<div style="color:#FF9500;">No sweep has completed yet.</div>');
+        }
+        if (st.lastBump) {
+          bits.push('<div>Last episode re-bump: ' + nosEpochToDay(st.lastBump.at) + ' &mdash; ' + (st.lastBump.checked || 0) + ' shows checked, ' + (st.lastBump.bumped || 0) + ' moved to the top</div>');
+        }
+        statusEl.innerHTML = bits.join('');
+
+        const rows = st.byService || [];
+        bodyEl.innerHTML = rows.length
+          ? rows.map(function (r) {
+              return '<tr><td>' + escapeHtmlAdmin(r.service) + '</td><td>' + escapeHtmlAdmin(r.kind) + '</td><td>' + (r.measured ? r.pages : '?') + '</td><td>' + r.count + '</td><td>' + r.seeded + '</td><td>' + r.observed + '</td><td>' + r.removed + '</td><td>' + nosEpochToDay(r.newest) + '</td></tr>';
+            }).join('')
+          : '<tr><td colspan="8">Nothing collected yet -- run a sweep.</td></tr>';
+
+        const sel = document.getElementById('nosPreviewService');
+        if (sel && sel.options.length <= 1) {
+          nosProviders.forEach(function (p) {
+            const opt = document.createElement('option');
+            opt.value = p.key;
+            opt.textContent = p.name;
+            sel.appendChild(opt);
+          });
+        }
+      } catch (e) {
+        statusEl.textContent = 'Could not load -- check your connection.';
+      }
+    }
+
+    async function runNewOnStreamingSweep() {
+      const btn = document.getElementById('nosSweepBtn');
+      const statusEl = document.getElementById('nosSweepStatus');
+      const units = parseInt(document.getElementById('nosSweepUnits').value, 10) || 12;
+      const bump = document.getElementById('nosSweepBump').checked;
+      btn.disabled = true;
+      statusEl.textContent = 'Sweeping… this can take a minute on a first pass.';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming/sweep', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units: units, bump: bump }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Sweep failed.';
+          btn.disabled = false;
+          return;
+        }
+        const sw = data.sweep || {};
+        if (!sw.ran) {
+          statusEl.textContent = sw.reason || 'The sweep did not run.';
+        } else {
+          let msg = sw.units + ' pages, ' + sw.seen + ' titles seen, ' + sw.added + ' new rows, ' + sw.returned + ' returned, ' + sw.touched + ' already known';
+          if (sw.wrapped) msg += '; pass complete';
+          if (sw.removal && sw.removal.ran && sw.removal.marked) msg += ', ' + sw.removal.marked + ' marked gone';
+          if (data.bump && data.bump.ran) msg += '; ' + data.bump.bumped + ' shows re-bumped';
+          if (sw.errors) msg += '; ' + sw.errors + ' errors (see the Worker log)';
+          statusEl.textContent = msg;
+        }
+        await loadNewOnStreaming();
+      } catch (e) {
+        statusEl.textContent = 'Could not run -- check your connection.';
+      }
+      btn.disabled = false;
+    }
+
+    async function loadNewOnStreamingPreview() {
+      const statusEl = document.getElementById('nosPreviewStatus');
+      const resultsEl = document.getElementById('nosPreviewResults');
+      const sourceEl = document.getElementById('nosPreviewSource');
+      const type = document.getElementById('nosPreviewType').value;
+      const service = document.getElementById('nosPreviewService').value;
+      statusEl.textContent = 'Loading…';
+      resultsEl.innerHTML = '';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming/preview?type=' + encodeURIComponent(type) + (service ? '&services=' + encodeURIComponent(service) : ''));
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not load preview.';
+          return;
+        }
+        sourceEl.textContent = data.source;
+        statusEl.textContent = (data.totalItems != null ? data.totalItems + ' titles in this row' : '');
+        if (!data.items.length) {
+          resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">Empty -- the sweep has not collected anything for this service and type yet.</p>';
+          return;
+        }
+        resultsEl.innerHTML =
+          '<div class="table-wrap"><table><tr><th>#</th><th>Poster</th><th>Title</th><th>Year</th><th>Id</th></tr>' +
+          data.items.map(function (it, i) {
+            return '<tr><td>' + (i + 1) + '</td>' +
+              '<td>' + (it.poster ? '<img src="' + escapeHtmlAdmin(it.poster) + '" alt="" style="width:40px; border-radius:4px;">' : '') + '</td>' +
+              '<td>' + escapeHtmlAdmin(it.name || '') + '</td>' +
+              '<td>' + escapeHtmlAdmin(it.releaseInfo || '') + '</td>' +
+              '<td style="color:#8E8E93;">' + escapeHtmlAdmin(it.id || '') + '</td></tr>';
+          }).join('') +
+          '</table></div>';
+      } catch (e) {
+        statusEl.textContent = 'Could not load -- check your connection.';
       }
     }
 
@@ -10621,6 +11430,11 @@ function detectSource(input) {
   if (s.startsWith("tmdb:kids:")) return "tmdb-kids";
   if (s.startsWith("tmdb:holiday:")) return "tmdb-holiday";
   if (s.startsWith("tmdb:genre:")) return "tmdb-genre";
+  // Bare, or with a "+"-separated service selection after a colon --
+  // "tmdb:new-on-streaming", "tmdb:new-on-streaming:netflix+hulu". Matched
+  // before nothing else because it shares no prefix with the entries above;
+  // it is listed here so the tmdb: family stays in one place.
+  if (s === "tmdb:new-on-streaming" || s.startsWith("tmdb:new-on-streaming:")) return "tmdb-new-on-streaming";
   if (s.startsWith("trakt:chart:")) return "trakt-chart";
   if (s.startsWith("simkl:chart:")) return "simkl-chart";
   if (s.startsWith("simkl:user:")) return "simkl-user";
@@ -10997,6 +11811,11 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     else if (source === "tmdb-kids") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbKids(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:kids:".length)); }
     else if (source === "tmdb-holiday") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbHoliday(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:holiday:".length)); }
     else if (source === "tmdb-genre") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdbGenre(entry, skip, TMDB_API_KEY, entry.url.trim().slice("tmdb:genre:".length), keys.region); }
+    // No trackSharedApiUse: this one reads D1 and makes no provider call at
+    // all. Its TMDB spend happens on the cron tick (sweepNewOnStreaming),
+    // where it is already counted against the sweep's own budget rather than
+    // against whoever happened to open the shelf.
+    else if (source === "tmdb-new-on-streaming") { result = await fetchNewOnStreaming(entry, skip, keys); }
     else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length), keys.env, keys.ctx); }
     else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length), keys.env, keys.ctx); }
     else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length), keys.tmdbKey, keys.env, keys.ctx); }
@@ -11228,11 +12047,12 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
     <path d="M-90,-105 Q-45,-130 0,-105 T90,-105" fill="none" stroke="url(#accentGrad)" stroke-width="4.5" stroke-linecap="round" opacity="0.85" />
 
     <!-- Channel Name Rendered STRICTLY Inside the TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="170" cy="115" r="6" fill="#007AFF" opacity="0.8" />
@@ -11242,7 +12062,7 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
   <!-- Bottom TV Channel Pill Badge -->
   <g transform="translate(300, 780)">
     <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGrad)" />
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
   </g>
 </svg>`;
 }
@@ -11335,11 +12155,12 @@ function generateChannelBackdropSvg(name, backdropUrl = "") {
     <path d="M-34,-24 Q-17,-32 0,-24 T34,-24" fill="none" stroke="url(#accentGradL)" stroke-width="1.5" stroke-linecap="round" opacity="0.8" />
 
     <!-- Channel Name Rendered STRICTLY Inside TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="86" cy="25" r="2.5" fill="#007AFF" opacity="0.8" />
@@ -11442,13 +12263,13 @@ function generateBadgedPosterSvg({ posterUrl, airDateText, bottomText, bottomBg,
   const topBadgeSvg = safeAirDate ? `
     <g transform="translate(24, 24)">
       <rect x="0" y="0" width="${topPillWidth}" height="72" rx="16" ry="16" fill="#007aff" fill-opacity="0.95" stroke="#66b8ff" stroke-width="3.5" filter="drop-shadow(0px 6px 12px rgba(0,0,0,0.8))"/>
-      <text x="${topPillWidth / 2}" y="49" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="36" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
+      <text x="${topPillWidth / 2}" y="49" font-family="Arial, Helvetica, sans-serif" font-size="36" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
     </g>` : '';
 
   const bottomBadgeSvg = safeBottom ? `
     <g transform="translate(250, 715)">
       <rect x="${-bottomPillWidth / 2}" y="-84" width="${bottomPillWidth}" height="84" rx="20" ry="20" fill="${bottomBg || '#ff9f0a'}" fill-opacity="0.95" stroke="${bottomBorder || 'rgba(255,159,10,0.7)'}" stroke-width="4.5" filter="drop-shadow(0px 8px 16px rgba(0,0,0,0.85))"/>
-      <text x="0" y="-30" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="38" font-weight="900" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
+      <text x="0" y="-30" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="bold" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
     </g>` : '';
 
   const topGradient = safeAirDate ? `
@@ -11543,7 +12364,7 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   <!-- Safe Badge Pill at top -->
   <g transform="translate(250, 60)" filter="url(#safeShadow)">
     <rect x="-140" y="0" width="280" height="42" rx="21" ry="21" fill="url(#shieldGrad)"/>
-    <text x="0" y="27" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="800" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
+    <text x="0" y="27" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
   </g>
 
   <!-- Central Shield / Film Icon -->
@@ -11556,21 +12377,21 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   </g>
 
   <!-- Title -->
-  <text x="250" y="${titleStartY}" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="34" font-weight="800" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
+  <text x="250" y="${titleStartY}" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="bold" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
     ${titleTextSpans}
   </text>
 
   <!-- Metadata: Type & Year -->
   <g transform="translate(250, 560)">
     <rect x="-90" y="-18" width="180" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="700" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
       ${safeType}${safeYear ? ' • ' + safeYear : ''}
     </text>
   </g>
 
   <!-- Certification / Footer -->
   <g transform="translate(250, 680)">
-    <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
+    <text x="0" y="0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
       ${safeCert ? safeCert + ' • ' : ''}AGE-APPROPRIATE FILTER ACTIVE
     </text>
   </g>
@@ -11659,7 +12480,12 @@ function fetchChannelCatalog(entry, origin) {
   const isLandscapeShelf = entry.posterShape === "landscape";
   for (const rawUrl of rawUrls) {
     const payload = parseChannelPayload(rawUrl);
-    if (!payload || !payload.items || !payload.items.length) continue;
+    // A dynamic channel (Next Up) deliberately stores no picks of its own --
+    // its lineup is derived per request in buildChannelMeta -- so "no items"
+    // is not the same as "nothing to show" for one of those. The shelf tile
+    // here carries no episodes either way, only the channel's name and art.
+    if (!payload) continue;
+    if (!payload.dynamic && (!payload.items || !payload.items.length)) continue;
     const channelId = payload.channelId || entry.id;
     const name = payload.name || entry.name;
     
@@ -12506,15 +13332,36 @@ async function fetchPublishedListCatalog(entry, env) {
     });
 }
 
-// NOTE: mixing movies into a channel is a known soft spot -- when someone
-// taps a movie "episode", wako/Stremio requests its stream as
-// /stream/series/<movie's plain imdb id>.json (type "series", since that's
-// the parent meta's type, Stremio doesn't re-derive per-video type). Most
-// stream add-ons branch their whole handler on that type param before even
-// looking at the id, so a movie embedded this way may not return streams on
-// every stream add-on -- Torrentio-style ones tend to be fairly lenient
-// about id shape, but this isn't guaranteed across the board. Worth testing
-// directly against whichever stream add-on the person actually uses.
+// --- a movie inside a channel: a known limit ---------------------------
+//
+// A channel's meta is a SERIES, and Stremio does not re-derive a type per
+// video: tapping a movie in one asks every stream add-on for
+// /stream/series/<the movie's own imdb id>.json. Most stream add-ons branch
+// their whole handler on that type param before they ever look at the id, so
+// the request is answered with nothing. Reported from the field as "Stremio
+// cannot find the movie, PenguPlay finds no stream", while Nuvio, which
+// resolves the id itself, plays it fine; Torrentio-style add-ons are lenient
+// about id shape, which is why this works for some people and not others.
+//
+// Nothing here can change that. The type comes from the parent meta, and no
+// id shape gets around it: tt123:1:1 points at a season 1 episode 1 that does
+// not exist, and a bare number or a private prefix matches no idPrefixes
+// anywhere so no add-on is even asked. Attaching metadata to the video does
+// not change what a third-party add-on is asked for either.
+//
+// Tried and removed: answering that request here with a stream whose
+// externalUrl deep-linked to the movie's own page. Stremio Web treats an
+// externalUrl as leaving the app -- it routes through a stremio.com/warning
+// interstitial and then hands the stremio:// scheme to the OS -- so it was a
+// dead end where it was tested, and looked like a working option while not
+// being one.
+//
+// What does work is left to the person: play the movie from its own page, or
+// use a client that resolves the id itself. The two ways to fix this properly
+// both cost something the add-on should not spend on its own -- proxying the
+// person's own stream add-on (which means holding their debrid key) or
+// splitting a channel's movies into a separate movie-typed row (which takes
+// them out of the channel's play order).
 //
 // A stable string->int hash (not cryptographic, just needs to be a decent
 // spread) so each channel's shuffle looks independent of every other
@@ -12559,40 +13406,629 @@ function seededShuffle(arr, seed) {
 const CHANNEL_ROTATION_SHOWS_PER_DAY = 24;
 const CHANNEL_ROTATION_EPISODES_PER_SHOW = 3;
 
-function buildChannelMeta(entry, origin) {
-  const payload = parseChannelPayload(entry.url);
-  if (!payload || !payload.items.length) return null;
-  // payload.channelId/payload.name (not entry.id/entry.name) are the real
-  // identity -- see the same note in fetchChannelCatalog above.
-  const channelId = payload.channelId || entry.id;
-  const name = payload.name || entry.name;
-  // "Randomize play order" (set once in the Channel builder, stored on the
-  // payload) reshuffles once a day rather than on every single request --
-  // same reasoning as Hidden Gems' daily reshuffle (see daysSinceEpochUTC
-  // below): the order stays put if someone reopens the channel later the
-  // same day (mid-binge), but looks freshly shuffled again tomorrow.
-  //
-  // dailyRotate is a step further, set by Quick Add Channel: the payload
-  // stores a much bigger pool than what's ever actually shown, and this
-  // picks a fresh, structured day's lineup from that pool -- a handful of
-  // different shows with a few episodes each (see the constants above),
-  // not a flat random slice that could easily skew to dozens of episodes
-  // of one show and none of many others. Stable within a day, different
-  // the next.
-  const seed = daysSinceEpochUTC(new Date()) + hashStringToInt(channelId);
-  let items;
-  if (payload.dailyRotate) {
-    const byShow = new Map();
-    payload.items.forEach((it) => {
-      const key = it.imdbId || it.kind + ":" + it.title;
-      if (!byShow.has(key)) byShow.set(key, []);
-      byShow.get(key).push(it);
-    });
-    const showKeys = seededShuffle([...byShow.keys()], seed).slice(0, CHANNEL_ROTATION_SHOWS_PER_DAY);
-    items = [];
-    showKeys.forEach((key, i) => {
-      const showEpisodes = byShow.get(key);
-      const perShow = Math.min(CHANNEL_ROTATION_EPISODES_PER_SHOW, showEpisodes.length);
+// How far a custom channel's own broadcast-schedule dials may be turned
+// (see channelRotationPlan below). The ceilings are not arbitrary: 48 shows
+// x 12 episodes is 576 videos in one day's meta response, already well past
+// anything watchable, and a client has to parse the whole thing before it
+// can render the channel at all.
+const CHANNEL_ROTATION_MAX_SHOWS_PER_DAY = 48;
+const CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW = 12;
+
+// How many episodes one multi-part story may glue together (see
+// glueMultiPartEpisodes). Two- and three-parters are the norm and a
+// five-network crossover is the outer edge of the real world; a cap stops a
+// mis-detection -- a show whose every episode is titled "Chapter One",
+// "Chapter Two" -- from gluing a whole season into one unbreakable block.
+const CHANNEL_PART_GROUP_MAX = 6;
+
+// --- channel video ids -------------------------------------------------
+//
+// A channel video's `id` IS the stream request: Stremio asks every stream
+// add-on for /stream/<type>/<video.id>.json, and that id is the only thing
+// it sends. The `season`/`episode` fields set below are the channel's own
+// running order for display and never reach a stream add-on at all.
+//
+// So a malformed id here is not a dead link that someone notices -- it is a
+// silently WRONG episode. The three helpers below exist to make that
+// impossible to emit.
+
+// The show half of a channel item's stream id. "tt..." is the form every
+// add-on understands; a TMDB fallback has to carry the "tmdb:" prefix this
+// add-on's manifest declares (see buildManifest's idPrefixes), because a
+// BARE number matches no idPrefix anywhere and no add-on is ever even asked
+// for it. Anything else is unusable and the item it belongs to gets dropped.
+function channelItemShowId(rawId) {
+  const id = String(rawId == null ? "" : rawId).trim();
+  if (/^tt[0-9]+$/.test(id)) return id;
+  if (/^tmdb:[0-9]+$/.test(id)) return id;
+  if (/^[0-9]+$/.test(id)) return `tmdb:${id}`;
+  return "";
+}
+
+// A season or episode number exactly as stored, or null when the item does
+// not carry a real one. `parseInt(x, 10) || 1` used to stand in for this and
+// could not tell "no season at all" from season 0 -- both came out as 1. An
+// item missing either number therefore resolved to `<show>:1:1`, so a stream
+// add-on was pointed at that show's S01E01 while the video still displayed
+// the title of the episode we meant. Dropping the item instead turns a wrong
+// episode (which nobody can report, because it looks like it played) into a
+// missing one (which they can).
+function channelItemNumber(value) {
+  const n = typeof value === "number" ? value : parseInt(value, 10);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+// The date one channel item first aired, as a sortable "YYYY-MM-DD" string,
+// or "" when the item carries none.
+//
+// Nothing has to be looked up for this: every pick already stores it. An
+// episode's `released` is TMDB's own `air_date` for that exact episode --
+// /api/show-episodes hands it to the Channel builder, and
+// compactChannelItemForStorage keeps it on the saved item -- and a movie's
+// is its release date, falling back to the year the builder stored when
+// that was all TMDB gave. That is the same fallback the video's own
+// `released` below uses, so the running order matches the dates a client
+// displays next to each item.
+//
+// Zero-padded ISO dates sort correctly as plain strings, so no Date parsing
+// (and therefore no timezone) is involved.
+function channelItemAiredDate(it) {
+  if (!it) return "";
+  const raw = String(it.released == null ? "" : it.released).trim();
+  const m = raw.match(/^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?/);
+  if (m) return `${m[1]}-${m[2] || "01"}-${m[3] || "01"}`;
+  const year = parseInt(it.year, 10);
+  if (Number.isInteger(year) && year > 0) return `${String(year).padStart(4, "0")}-01-01`;
+  return "";
+}
+
+// "Sort by air date", the other half of the Channel builder's one-or-the-
+// other play-order choice (see buildChannelMeta): oldest first, across every
+// show in the channel, so a multi-show channel plays in the order the
+// episodes actually went out rather than show by show.
+//
+// An item with no date it can be placed by goes to the end rather than to
+// the front (where an empty string would sort), keeping the order it was
+// saved in -- being unable to date something is not a reason to open the
+// channel with it. Ties keep their saved order too, which is what puts a
+// double-header of two episodes aired the same night back in broadcast
+// order.
+function sortChannelItemsByAired(items) {
+  return items
+    .map((it, i) => ({ it, i, aired: channelItemAiredDate(it) }))
+    .sort((a, b) => {
+      if (a.aired === b.aired) return a.i - b.i;
+      if (!a.aired) return 1;
+      if (!b.aired) return -1;
+      return a.aired < b.aired ? -1 : 1;
+    })
+    .map((w) => w.it);
+}
+
+// --- sharing a channel --------------------------------------------------
+//
+// A channel someone shares, or publishes to the Explore Channels directory,
+// is stored server-side under a short code rather than packed into the link
+// itself: a full channel is thousands of episodes and megabytes of JSON, and
+// no URL survives that. What travels is the code.
+//
+// Everything that comes back out of that store is rebuilt field by field
+// here rather than round-tripped whole. A shared channel is a stranger's
+// JSON that this add-on then renders, saves into another person's browser
+// and serves back as a catalog, so the shape it is allowed to have is
+// spelled out in one place -- and a field this version does not know about
+// is dropped rather than carried.
+const SHARED_CHANNEL_ITEMS_MAX = 5000;
+const SHARED_CHANNEL_NAME_MAX = 200;
+const SHARED_CHANNEL_DESCRIPTION_MAX = 400;
+// Hand-made pairings a shared channel may carry. Generous next to the number
+// of multi-parters in any real channel, and small enough that the field
+// cannot be used to inflate a share.
+const SHARED_CHANNEL_PAIRS_MAX = 200;
+
+function sharedChannelString(value, max) {
+  return String(value == null ? "" : value).trim().slice(0, max);
+}
+
+// Only http(s) art is kept. A shared channel's poster is rendered straight
+// into an <img>, so a "javascript:" or "data:" URL from a stranger has no
+// business surviving the trip.
+function sharedChannelImageUrl(value) {
+  const url = sharedChannelString(value, 600);
+  return /^https?:\/\//i.test(url) ? url : "";
+}
+
+function sanitizeSharedChannelItem(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const kind = raw.kind === "movie" ? "movie" : "episode";
+  const item = {
+    kind: kind,
+    imdbId: sharedChannelString(raw.imdbId, 40),
+    season: channelItemNumber(raw.season),
+    episode: channelItemNumber(raw.episode),
+    showName: sharedChannelString(raw.showName, 200),
+    epName: sharedChannelString(raw.epName, 200),
+    title: sharedChannelString(raw.title, 300),
+  };
+  if (kind === "movie") {
+    item.season = item.season === null ? 1 : item.season;
+    item.episode = item.episode === null ? 1 : item.episode;
+  }
+  if (!channelItemStreamId(item)) return null;
+  const released = sharedChannelString(raw.released, 10);
+  if (released) item.released = released;
+  const runtime = typeof raw.runtime === "number" ? raw.runtime : parseInt(raw.runtime, 10);
+  if (Number.isInteger(runtime) && runtime > 0 && runtime < 1000) item.runtime = runtime;
+  const poster = sharedChannelImageUrl(raw.poster);
+  const thumbnail = sharedChannelImageUrl(raw.thumbnail);
+  const showPoster = sharedChannelImageUrl(raw.showPoster);
+  const backdrop = sharedChannelImageUrl(raw.backdrop);
+  if (poster) item.poster = poster;
+  if (thumbnail) item.thumbnail = thumbnail;
+  if (showPoster) item.showPoster = showPoster;
+  if (backdrop) item.backdrop = backdrop;
+  return item;
+}
+
+// A channel as it is safe to store and hand back out. Returns null when
+// there is nothing playable left, which is what the routes answer 400 on.
+// Pairs survive a share only where both halves do: every key is checked
+// against the picks that actually came through, and a group left with fewer
+// than two members is dropped rather than travelling as a rule about one
+// episode.
+function sanitizeSharedPairedGroups(raw, items) {
+  const keys = new Set();
+  for (const it of items) {
+    const key = channelItemStreamId(it);
+    if (key) keys.add(key);
+  }
+  const out = [];
+  for (const group of (Array.isArray(raw) ? raw : []).slice(0, SHARED_CHANNEL_PAIRS_MAX)) {
+    if (!Array.isArray(group)) continue;
+    const kept = [];
+    for (const k of group) {
+      const key = sharedChannelString(k, 60);
+      if (key && keys.has(key) && kept.indexOf(key) === -1) kept.push(key);
+      if (kept.length >= CHANNEL_PART_GROUP_MAX) break;
+    }
+    if (kept.length > 1) out.push(kept);
+  }
+  return out;
+}
+
+function sanitizeSharedChannel(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const items = (Array.isArray(raw.items) ? raw.items : [])
+    .slice(0, SHARED_CHANNEL_ITEMS_MAX)
+    .map(sanitizeSharedChannelItem)
+    .filter(Boolean);
+  const dynamic = raw.dynamic === "next-up" ? "next-up" : "";
+  // A dynamic channel is the one shape allowed to arrive with no picks --
+  // it has none by design. Everything else with nothing playable in it is
+  // not a channel.
+  if (!items.length && !dynamic) return null;
+  const plan = channelRotationPlan(raw);
+  const itemKeys = new Set(items.map(channelItemShowKey));
+  const out = {
+    name: sharedChannelString(raw.name, SHARED_CHANNEL_NAME_MAX) || "Shared Channel",
+    // The channel's own description, not the directory listing's. They used
+    // to be the same string, stored only on the listing -- so unpublishing a
+    // channel deleted the sentence describing it, and a channel shared by
+    // link had nowhere to carry one at all.
+    description: sharedChannelString(raw.description, SHARED_CHANNEL_DESCRIPTION_MAX),
+    poster: sharedChannelImageUrl(raw.poster) || null,
+    backdrop: sharedChannelImageUrl(raw.backdrop) || null,
+    items: items,
+    shuffle: !!raw.shuffle,
+    autoSort: sharedChannelString(raw.autoSort, 32),
+    sortByAired: !!raw.sortByAired,
+    dailyRotate: !!raw.dailyRotate,
+    hideWatched: !!raw.hideWatched,
+    // Locks for shows the shared picks no longer contain are dropped, so a
+    // shared channel never arrives carrying rules about titles it has not
+    // got.
+    storyLocked: (Array.isArray(raw.storyLocked) ? raw.storyLocked : [])
+      .map((k) => sharedChannelString(k, 120))
+      .filter((k) => k && itemKeys.has(k)),
+    pairParts: !!raw.pairParts,
+    // A channel that keeps up with its shows keeps doing so for whoever
+    // takes a copy -- it is the whole point of the flag, and it costs the
+    // receiving side nothing until they actually open the channel.
+    autoNewEpisodes: !!raw.autoNewEpisodes,
+    newEpisodesAtTop: !!raw.newEpisodesAtTop,
+    // Hand-made pairs, kept only for episodes the shared picks actually
+    // contain -- the same rule Story Lock follows above, for the same
+    // reason: a shared channel should never arrive carrying rules about
+    // titles it has not got.
+    pairedGroups: sanitizeSharedPairedGroups(raw.pairedGroups, items),
+    dynamic: dynamic,
+  };
+  if (out.dailyRotate) {
+    out.rotateShows = plan.shows;
+    out.rotateEpisodes = plan.episodes;
+    out.rotateTurnover = plan.turnover;
+    out.rotateTurnoverTime = sharedChannelString(raw.rotateTurnoverTime, 5);
+    out.rotateTurnoverZone = raw.rotateTurnoverZone === "local" ? "local" : "utc";
+  }
+  // Live Cloud Sync travels only when there is a real list URL behind it --
+  // the receiving end rebuilds the pool from that URL, so an unusable one
+  // would just leave the flag on with nothing to sync.
+  const sourceUrl = sharedChannelString(raw.sourceUrl, 600);
+  if (raw.liveSync && /^https?:\/\//i.test(sourceUrl)) {
+    out.liveSync = true;
+    out.sourceUrl = sourceUrl;
+  }
+  return out;
+}
+
+// The one-line record the Explore Channels directory lists. Deliberately
+// tiny: the directory is a single index that has to stay cheap to read, and
+// the full channel is one code lookup away.
+function sharedChannelSummary(code, record) {
+  const channel = record.channel || {};
+  const showKeys = new Set((channel.items || []).map(channelItemShowKey));
+  return {
+    code: code,
+    name: channel.name || "Shared Channel",
+    // The listing's own line when it has one, and the channel's otherwise --
+    // so a channel that describes itself needs nothing typed again to be
+    // published, and keeps that sentence when it is unpublished.
+    description: record.description || channel.description || "",
+    likes: Number(record.likes) || 0,
+    adds: Number(record.adds) || 0,
+    poster: channel.poster || null,
+    backdrop: channel.backdrop || null,
+    itemCount: (channel.items || []).length,
+    showCount: showKeys.size,
+    dailyRotate: !!channel.dailyRotate,
+    shuffle: !!channel.shuffle,
+    autoSort: channel.autoSort || "",
+    dynamic: channel.dynamic || "",
+    owner: record.owner || "",
+    publishedAt: record.publishedAt || 0,
+  };
+}
+
+// --- how a channel's day is put together -------------------------------
+//
+// Five payload flags shape a channel's lineup, and they are deliberately
+// separate from the picks themselves so none of them rewrites what someone
+// saved:
+//
+//   dailyRotate  a pool bigger than a day, cut into a fresh day's lineup
+//                (Quick Add's networks, and now any custom channel that
+//                asks for a broadcast schedule)
+//   autoSort     a static arrangement, applied to the lineup after it is
+//                picked -- "interleave" is the one the Worker acts on
+//   storyLocked  shows that must advance in sequence through a shuffle or
+//                a rotation instead of jumping around
+//   hideWatched  drop picks the account has already seen, until it has
+//                seen them all
+//   dynamic      a channel with no stored picks at all, re-derived per
+//                request from the account's own tracking
+//
+// Everything below is the machinery for those. A payload carrying none of
+// them plays exactly as it did before any of this existed.
+
+// The show one channel item belongs to, as a stable grouping key. The daily
+// rotation has always grouped by this expression; it is pulled out here so
+// Story Lock, the interleaver and "Hide watched" group a channel the SAME
+// way -- an item that rotates as part of "The Simpsons" has to lock and
+// interleave as part of it too.
+function channelItemShowKey(it) {
+  if (!it) return "";
+  return it.imdbId || `${it.kind || "episode"}:${it.title || ""}`;
+}
+
+// Broadcast order within one show. Only ever applied to a show that is
+// story-locked, and only to that show's own run -- it never reorders one
+// show against another.
+function sortChannelItemsSequential(list) {
+  return list.slice().sort((a, b) => {
+    const sa = channelItemNumber(a.season);
+    const sb = channelItemNumber(b.season);
+    if (sa !== sb) return (sa === null ? 0 : sa) - (sb === null ? 0 : sb);
+    const ea = channelItemNumber(a.episode);
+    const eb = channelItemNumber(b.episode);
+    return (ea === null ? 0 : ea) - (eb === null ? 0 : eb);
+  });
+}
+
+// Round-robin across shows: one pick from each show in turn, then round
+// again -- Simpsons S1E1, King of the Hill S1E1, Malcolm S1E1, Simpsons
+// S1E2, and so on. What a 90s prime-time block actually felt like, and the
+// opposite of playing fifty episodes of one show before the next one starts.
+//
+// Shows keep the order they first appear in and each show's own run keeps
+// the order it arrived in, so this only changes WHEN each pick plays. It
+// never reorders a show against itself, which is what makes it safe to run
+// over a story-locked show, and it is idempotent -- interleaving an already
+// interleaved lineup is a no-op, so the builder applying it to the saved
+// order and the Worker applying it again here cannot fight.
+function interleaveChannelItems(items) {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length < 2) return list;
+  const runs = new Map();
+  for (const it of list) {
+    const key = channelItemShowKey(it);
+    if (!runs.has(key)) runs.set(key, []);
+    runs.get(key).push(it);
+  }
+  if (runs.size < 2) return list;
+  const lists = [...runs.values()];
+  const longest = lists.reduce((n, l) => Math.max(n, l.length), 0);
+  const out = [];
+  for (let round = 0; round < longest; round++) {
+    for (const run of lists) {
+      if (round < run.length) out.push(run[round]);
+    }
+  }
+  return out;
+}
+
+// The shows a channel marks as serialized. Stored as the same show keys
+// channelItemShowKey produces, so a lock survives a show being re-added.
+function channelStoryLockedKeys(payload) {
+  const raw = Array.isArray(payload && payload.storyLocked) ? payload.storyLocked : [];
+  return new Set(raw.map((k) => String(k || "").trim()).filter(Boolean));
+}
+
+// Puts story-locked shows back into sequence after a shuffle.
+//
+// The POSITIONS a locked show occupies stay shuffled -- so it is still
+// spread through the day rather than stuck in one block -- but the episodes
+// that land in them are dealt out in broadcast order, so the show still
+// advances E1, E2, E3 wherever it turns up. That is the whole point of the
+// lock: daily variety without walking into the back half of a season.
+function resequenceLockedShows(shuffled, sourceOrder, lockedKeys) {
+  if (!lockedKeys || !lockedKeys.size) return shuffled;
+  const queues = new Map();
+  for (const it of sourceOrder) {
+    const key = channelItemShowKey(it);
+    if (!lockedKeys.has(key)) continue;
+    if (!queues.has(key)) queues.set(key, []);
+    queues.get(key).push(it);
+  }
+  if (!queues.size) return shuffled;
+  for (const [key, queue] of queues) queues.set(key, sortChannelItemsSequential(queue));
+  const cursors = new Map();
+  return shuffled.map((it) => {
+    const key = channelItemShowKey(it);
+    const queue = queues.get(key);
+    if (!queue) return it;
+    const at = cursors.get(key) || 0;
+    cursors.set(key, at + 1);
+    return queue[at] || it;
+  });
+}
+
+function shuffleChannelItems(items, seed, lockedKeys) {
+  return resequenceLockedShows(seededShuffle(items, seed), items, lockedKeys);
+}
+
+// --- pairing glue: multi-part episodes stay together ---------------------
+//
+// A rotation deals a contiguous block out of a show's run and a shuffle
+// scatters it, and neither knows that "The Best of Both Worlds, Part I" is
+// half a story. Part II landing tomorrow -- or three hours later, after four
+// other shows -- is the one ordering result nobody wants.
+//
+// "Keep multi-part episodes together" turns on the detection below; a pair
+// made by hand in the builder always applies, toggle or not, because it was
+// asked for explicitly. Either way the rule is the same: the first part of a
+// story to be drawn brings the rest of it along, immediately after, in part
+// order.
+
+// Roman numerals up to the group cap. Deliberately not a general parser:
+// this only ever reads the "II" in "Part II", and a show with a Part XLII is
+// not a show this needs to get right.
+const CHANNEL_PART_ROMAN = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10 };
+
+// Splits an episode title into the story it belongs to and which part of it
+// this is: "The Best of Both Worlds, Part II" -> { base: "the best of both
+// worlds", part: 2 }. Returns null for a title that names no part, which is
+// almost every episode ever made.
+function channelPartTitleSplit(rawName) {
+  const name = String(rawName == null ? "" : rawName).trim();
+  if (!name) return null;
+  // "... Part 2", "... Pt. II", "... part two" is not matched on purpose:
+  // a spelled-out number is rare and the words are common enough in a
+  // title ("Part of the Family") to be worth leaving alone.
+  const worded = name.match(/^(.*?)[\s,:;–—-]*\(?\s*(?:part|pt\.?)\s*([0-9]{1,2}|[ivxIVX]{1,4})\s*\)?[\s.]*$/i);
+  if (worded) {
+    const raw = worded[2].toLowerCase();
+    const part = /^[0-9]+$/.test(raw) ? parseInt(raw, 10) : (CHANNEL_PART_ROMAN[raw] || 0);
+    if (part > 0 && worded[1].trim()) return { base: channelPartBaseKey(worded[1]), part: part };
+    return null;
+  }
+  // The other form TMDB carries: a bare "(1)" / "(2)" suffix.
+  const bracketed = name.match(/^(.*?)[\s,:;–—-]*\(([0-9]{1,2})\)[\s.]*$/);
+  if (bracketed) {
+    const part = parseInt(bracketed[2], 10);
+    if (part > 0 && bracketed[1].trim()) return { base: channelPartBaseKey(bracketed[1]), part: part };
+  }
+  return null;
+}
+
+// Two halves of one story have to agree on their name to be recognized as
+// halves, and they routinely differ in punctuation alone ("Worlds, Part I"
+// vs "Worlds Part II"), so the comparison is made on letters and digits.
+function channelPartBaseKey(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// The key a pairing is stored and looked up under: the item's stream id, so
+// a pair made in the builder survives the channel being re-sorted, re-saved
+// or shared, none of which keep array positions.
+function channelItemPairKey(it) {
+  return channelItemStreamId(it);
+}
+
+// Pairs the builder stored by hand, as arrays of stream ids.
+function channelManualPairGroups(payload) {
+  const raw = Array.isArray(payload && payload.pairedGroups) ? payload.pairedGroups : [];
+  const out = [];
+  for (const group of raw) {
+    if (!Array.isArray(group)) continue;
+    const keys = [];
+    for (const k of group) {
+      const key = String(k || "").trim();
+      if (key && keys.indexOf(key) === -1) keys.push(key);
+      if (keys.length >= CHANNEL_PART_GROUP_MAX) break;
+    }
+    if (keys.length > 1) out.push(keys);
+  }
+  return out;
+}
+
+// Every multi-part story in a pool, as a lookup from each member's key to
+// the whole story in part order.
+//
+// A manual pair wins over a detected one for the same episode: it was asked
+// for by hand, against a title the detection can only guess at.
+function channelPartGroups(payload, poolItems) {
+  const byKey = new Map();
+  for (const it of poolItems) {
+    const key = channelItemPairKey(it);
+    if (key && !byKey.has(key)) byKey.set(key, it);
+  }
+  const lookup = new Map();
+  const claim = (members) => {
+    if (members.length < 2) return;
+    const capped = members.slice(0, CHANNEL_PART_GROUP_MAX);
+    if (capped.some((it) => lookup.has(channelItemPairKey(it)))) return;
+    for (const it of capped) lookup.set(channelItemPairKey(it), capped);
+  };
+  for (const keys of channelManualPairGroups(payload)) {
+    const members = keys.map((k) => byKey.get(k)).filter(Boolean);
+    claim(members);
+  }
+  if (!payload.pairParts) return lookup;
+  // Detected pairs: same show, same season, same story name, different part
+  // numbers. Season matters -- a remake's "Part 1" ten seasons later is a
+  // different story with the same name.
+  const stories = new Map();
+  for (const it of poolItems) {
+    if (!it || it.kind === "movie") continue;
+    const key = channelItemPairKey(it);
+    if (!key) continue;
+    const split = channelPartTitleSplit(it.epName);
+    if (!split) continue;
+    const season = channelItemNumber(it.season);
+    const storyKey = `${channelItemShowKey(it)}|${season === null ? "" : season}|${split.base}`;
+    if (!stories.has(storyKey)) stories.set(storyKey, []);
+    stories.get(storyKey).push({ item: it, part: split.part });
+  }
+  for (const entries of stories.values()) {
+    const seenParts = new Set();
+    const members = [];
+    for (const e of entries.slice().sort((a, b) => a.part - b.part)) {
+      if (seenParts.has(e.part)) continue;
+      seenParts.add(e.part);
+      members.push(e.item);
+    }
+    claim(members);
+  }
+  return lookup;
+}
+
+// Applies those groups to a finished lineup.
+//
+// Wherever the first-drawn member of a story appears, the WHOLE story is
+// played there, in part order, and its other members are dropped from
+// wherever else they landed. A part that was not drawn at all is pulled in
+// from the pool: a channel that gave you Part 1 and made you wait a day for
+// Part 2 is the exact complaint this answers. A part that is not in the pool
+// (never added, or filtered out by "Hide watched") simply is not there, and
+// the rest still play together.
+//
+// Drawing Part 2 first plays the story from Part 1, for the same reason:
+// the back half of a story on its own is worse than a minute of extra
+// runtime.
+function glueMultiPartEpisodes(items, poolItems, payload) {
+  const groups = channelPartGroups(payload, poolItems);
+  if (!groups.size) return items;
+  const played = new Set();
+  const out = [];
+  for (const it of items) {
+    const members = groups.get(channelItemPairKey(it));
+    if (!members) {
+      out.push(it);
+      continue;
+    }
+    const storyId = channelItemPairKey(members[0]);
+    if (played.has(storyId)) continue;
+    played.add(storyId);
+    for (const member of members) out.push(member);
+  }
+  return out;
+}
+
+// The dials behind a daily broadcast schedule. Quick Add's network channels
+// have always rotated 24 shows x 3 episodes off midnight UTC; a custom
+// channel can now say how many shows a day it runs, how many back-to-back
+// episodes make up one show's block, and what time of day the lineup turns
+// over. A payload that sets none of them keeps the network numbers, so every
+// channel saved before this reads exactly as it did.
+function channelRotationPlan(payload) {
+  const dial = (raw, lo, hi, fallback) => {
+    const n = typeof raw === "number" ? raw : parseInt(raw, 10);
+    if (!Number.isInteger(n)) return fallback;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  // A saved channel stores 0 for a dial it never set -- the builder writes 0
+  // for both counts whenever the schedule panel is closed, and an older
+  // payload has no dials at all. 0 means "use the network numbers", not "run
+  // one show a day", so it falls through to the fallback instead of being
+  // clamped up to the floor of 1.
+  const count = (raw, hi, fallback) => {
+    const n = typeof raw === "number" ? raw : parseInt(raw, 10);
+    if (!Number.isInteger(n) || n <= 0) return fallback;
+    return Math.min(hi, n);
+  };
+  return {
+    shows: count(payload.rotateShows, CHANNEL_ROTATION_MAX_SHOWS_PER_DAY, CHANNEL_ROTATION_SHOWS_PER_DAY),
+    episodes: count(payload.rotateEpisodes, CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW, CHANNEL_ROTATION_EPISODES_PER_SHOW),
+    // Minutes past midnight UTC at which today's lineup becomes tomorrow's.
+    // 0 is midnight UTC, which is what every rotating channel did before
+    // this existed; a viewer in UTC-5 stores 300 so the channel turns over
+    // at their own midnight rather than at 7pm the evening before.
+    turnover: ((dial(payload.rotateTurnover, -1439, 1439, 0) % 1440) + 1440) % 1440,
+  };
+}
+
+// Which day's lineup to serve -- days counted from the channel's own
+// turnover time rather than from midnight UTC.
+function channelRotationDay(now, turnoverMinutes) {
+  return daysSinceEpochUTC(new Date(now.getTime() - turnoverMinutes * 60000));
+}
+
+// One day's lineup out of a pool: a handful of different shows with a few
+// episodes each, rather than a flat random slice that could easily skew to
+// dozens of episodes of one show and none of many others. Stable within a
+// day, different the next.
+function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys) {
+  const byShow = new Map();
+  for (const it of playableItems) {
+    const key = channelItemShowKey(it);
+    if (!byShow.has(key)) byShow.set(key, []);
+    byShow.get(key).push(it);
+  }
+  const showKeys = seededShuffle([...byShow.keys()], seed).slice(0, plan.shows);
+  const items = [];
+  showKeys.forEach((key, i) => {
+    const isLocked = lockedKeys.has(key);
+    const showEpisodes = isLocked ? sortChannelItemsSequential(byShow.get(key)) : byShow.get(key);
+    const perShow = Math.min(plan.episodes, showEpisodes.length);
+    let start;
+    if (isLocked) {
+      // A story-locked show gets no random starting point: it picks up
+      // where yesterday's block left off and walks its run in order,
+      // wrapping back to the beginning once it reaches the end.
+      const blocks = Math.max(1, Math.ceil(showEpisodes.length / perShow));
+      start = (((day % blocks) + blocks) % blocks) * perShow;
+      if (start > showEpisodes.length - perShow) start = Math.max(0, showEpisodes.length - perShow);
+    } else {
       // A contiguous block (not scattered episodes) feels like an actual
       // evening's run of a show -- seeded per-show so different shows
       // don't all land on the same relative starting point.
@@ -12601,14 +14037,632 @@ function buildChannelMeta(entry, origin) {
         Array.from({ length: maxStart + 1 }, (_, n) => n),
         seed + i + 1
       );
-      const start = starts.length ? starts[0] : 0;
-      items.push(...showEpisodes.slice(start, start + perShow));
-    });
-  } else if (payload.shuffle) {
-    items = seededShuffle(payload.items, seed);
-  } else {
-    items = payload.items;
+      start = starts.length ? starts[0] : 0;
+    }
+    items.push(...showEpisodes.slice(start, start + perShow));
+  });
+  return items;
+}
+
+// --- hide watched -------------------------------------------------------
+//
+// A channel item stores the show's IMDB id plus the season and episode
+// numbers and never the episode's own TMDB id, so the numbers are the only
+// thing a channel pick and a watch-history entry share. Movies match on the
+// title id alone.
+function channelWatchedKey(showId, season, episode) {
+  const s = channelItemNumber(season);
+  const e = channelItemNumber(episode);
+  if (!showId || s === null || e === null) return "";
+  return `${showId}:${s}:${e}`;
+}
+
+function channelWatchedKeySet(watchHistory) {
+  const set = new Set();
+  if (!Array.isArray(watchHistory)) return set;
+  for (const w of watchHistory) {
+    if (!w) continue;
+    if (w.type === "movie" || (w.seasonNum == null && w.episodeNum == null)) {
+      const id = String(w.id || w.imdbId || "").trim();
+      if (id) set.add(id);
+      continue;
+    }
+    const key = channelWatchedKey(String(w.showId || w.imdbId || "").trim(), w.seasonNum, w.episodeNum);
+    if (key) set.add(key);
   }
+  return set;
+}
+
+function channelItemIsWatched(it, watchedKeys) {
+  if (!it || !watchedKeys.size) return false;
+  const showId = String(it.imdbId || "").trim();
+  if (!showId) return false;
+  if (it.kind === "movie") return watchedKeys.has(showId);
+  const key = channelWatchedKey(showId, it.season, it.episode);
+  return !!key && watchedKeys.has(key);
+}
+
+// --- the Next Up channel ------------------------------------------------
+//
+// The next unwatched episode of every show the account has in progress.
+//
+// Continue Watching is already exactly that list -- the Auto-Track Playback
+// scrobble and the new-episode cron both maintain it (see
+// 26_api-creator-and-admin-routes.js and checkForNewEpisodes) -- so there is
+// nothing to recompute here and not one TMDB call to make. A channel built
+// this way stores no picks of its own: it is re-derived on every request, so
+// it follows what the account is actually watching instead of freezing
+// whatever happened to be true the day it was saved.
+function channelNextUpItems(continueWatching) {
+  if (!Array.isArray(continueWatching)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const cw of continueWatching) {
+    if (!cw) continue;
+    const showId = String(cw.showId || cw.imdbId || "").trim();
+    const season = channelItemNumber(cw.seasonNum);
+    const episode = channelItemNumber(cw.episodeNum);
+    if (!showId || season === null || episode === null) continue;
+    const key = `${showId}:${season}:${episode}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const showName = String(cw.showTitle || "").trim();
+    const epName = String(cw.name || "").trim() || `Episode ${episode}`;
+    const poster = cw.showPoster || cw.poster || "";
+    out.push({
+      kind: "episode",
+      imdbId: showId,
+      season: season,
+      episode: episode,
+      showName: showName,
+      epName: epName,
+      title: showName ? `${showName} S${season}E${episode} — ${epName}` : epName,
+      released: cw.released || "",
+      poster: poster,
+      thumbnail: cw.thumbnail || poster,
+      showPoster: cw.showPoster || poster,
+    });
+  }
+  return out;
+}
+
+// --- live cloud sync ----------------------------------------------------
+//
+// Importing a Trakt/MDBList/Simkl/TMDB list used to take a one-time snapshot:
+// the episodes that existed the moment "Import channel" was pressed, frozen
+// for good. A channel with `liveSync` keeps the source URL instead, and the
+// Worker rebuilds its pool from that list in the background whenever the
+// stored pool goes stale -- so a public list gaining a title gains it here
+// too, with nothing to rebuild by hand.
+//
+// The rebuild never happens on the request's own critical path. A request
+// serves whatever pool is stored (falling back to the channel's original
+// snapshot when there is none yet) and schedules the refresh with
+// ctx.waitUntil, so the first request after a list changes is no slower than
+// any other and the next one sees the new titles.
+const CHANNEL_LIVE_POOL_TTL_MS = 6 * 60 * 60 * 1000;
+const CHANNEL_LIVE_POOL_MAX_SHOWS = 24;
+const CHANNEL_LIVE_POOL_MAX_SEASONS = 3;
+const CHANNEL_LIVE_POOL_MAX_ITEMS = 1200;
+
+function channelLivePoolKey(channelId) {
+  return `channelpool:${channelId}`;
+}
+
+// Channels whose pool this isolate is already rebuilding.
+//
+// A stale pool schedules a refresh on every request that sees it, and the
+// pool only stops being stale once the first rebuild finishes -- which is
+// dozens of TMDB calls later. Without this, a channel opened three times in
+// that window runs the whole rebuild three times. Per-isolate, so it bounds
+// the common case (one viewer, one colo, several requests) rather than
+// pretending to be a distributed lock.
+const CHANNEL_LIVE_POOL_IN_FLIGHT = new Set();
+
+// Resolves a list URL to a channel-shaped pool of episodes. Deliberately
+// capped: this runs on a background task with no one waiting on it, but it
+// is still one TMDB season call per season per show.
+async function buildChannelPoolFromListUrl(sourceUrl, keys) {
+  let metas = [];
+  try {
+    metas = await fetchCatalog({ url: sourceUrl, type: "series" }, 0, keys);
+  } catch {
+    return [];
+  }
+  const shows = (metas || []).filter((m) => m && m.id).slice(0, CHANNEL_LIVE_POOL_MAX_SHOWS);
+  if (!shows.length) return [];
+  const tmdbKey = (keys && keys.tmdbKey) || TMDB_API_KEY;
+  const perShow = await mapWithConcurrency(shows, 4, async (m) => {
+    try {
+      const findRes = await fetch(
+        `https://api.themoviedb.org/3/find/${encodeURIComponent(m.id)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+      );
+      if (!findRes.ok) return [];
+      const findData = await findRes.json();
+      const match = (findData.tv_results || [])[0];
+      if (!match) return [];
+      const showPoster = match.poster_path ? `https://image.tmdb.org/t/p/w500${match.poster_path}` : (m.poster || "");
+      const showRes = await fetch(
+        `https://api.themoviedb.org/3/tv/${encodeURIComponent(match.id)}?api_key=${encodeURIComponent(tmdbKey)}`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+      );
+      if (!showRes.ok) return [];
+      const fullShow = await showRes.json();
+      const seasons = (fullShow.seasons || [])
+        .filter((s) => s && s.season_number > 0)
+        .slice(0, CHANNEL_LIVE_POOL_MAX_SEASONS);
+      const out = [];
+      for (const s of seasons) {
+        const sRes = await fetch(
+          `https://api.themoviedb.org/3/tv/${encodeURIComponent(match.id)}/season/${s.season_number}?api_key=${encodeURIComponent(tmdbKey)}`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+        );
+        if (!sRes.ok) continue;
+        const sData = await sRes.json();
+        for (const ep of (sData.episodes || [])) {
+          const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+          const epName = ep.name || `Episode ${ep.episode_number}`;
+          out.push({
+            kind: "episode",
+            imdbId: m.id,
+            season: s.season_number,
+            episode: ep.episode_number,
+            showName: fullShow.name || m.name || "",
+            epName: epName,
+            title: `${fullShow.name || m.name || ""} S${s.season_number}E${ep.episode_number} — ${epName}`,
+            released: ep.air_date || "",
+            thumbnail: stillUrl || showPoster,
+            poster: showPoster || stillUrl,
+            showPoster: showPoster,
+          });
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  });
+  const items = [];
+  for (const run of perShow) {
+    for (const it of run) {
+      if (items.length >= CHANNEL_LIVE_POOL_MAX_ITEMS) return items;
+      items.push(it);
+    }
+  }
+  return items;
+}
+
+async function refreshChannelLivePool(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.sourceUrl || !payload.channelId) return null;
+  if (CHANNEL_LIVE_POOL_IN_FLIGHT.has(payload.channelId)) return null;
+  CHANNEL_LIVE_POOL_IN_FLIGHT.add(payload.channelId);
+  try {
+    return await refreshChannelLivePoolUncoordinated(payload, opts);
+  } finally {
+    CHANNEL_LIVE_POOL_IN_FLIGHT.delete(payload.channelId);
+  }
+}
+
+async function refreshChannelLivePoolUncoordinated(payload, opts) {
+  const env = opts.env;
+  const items = await buildChannelPoolFromListUrl(payload.sourceUrl, {
+    env: env,
+    ctx: opts.ctx,
+    origin: opts.origin || "",
+    tmdbKey: opts.tmdbKey || "",
+    mdblistKey: opts.mdblistKey || "",
+    traktKey: opts.traktKey || "",
+    traktAccessToken: opts.traktAccessToken || "",
+  });
+  if (!items.length) return null;
+  await env.CONFIGS.put(
+    channelLivePoolKey(payload.channelId),
+    JSON.stringify({ sourceUrl: payload.sourceUrl, items: items, updatedAt: Date.now() }),
+    { expirationTtl: 2592000 }
+  );
+  return items;
+}
+
+async function readChannelLivePool(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  let cached = null;
+  try {
+    const raw = await env.CONFIGS.get(channelLivePoolKey(payload.channelId));
+    if (raw) cached = JSON.parse(raw);
+  } catch {
+    cached = null;
+  }
+  const usable = cached && Array.isArray(cached.items) && cached.items.length &&
+    cached.sourceUrl === payload.sourceUrl;
+  const stale = !usable || (Date.now() - (cached.updatedAt || 0)) > CHANNEL_LIVE_POOL_TTL_MS;
+  if (stale && opts.ctx && typeof opts.ctx.waitUntil === "function") {
+    opts.ctx.waitUntil(refreshChannelLivePool(payload, opts).catch(() => {}));
+  }
+  return usable ? cached.items : null;
+}
+
+// --- self-maintaining channels: new episodes arrive on their own ---------
+//
+// A channel is a snapshot: add The Last of Us today and the channel still
+// carries exactly those episodes a year later, while the show has moved on
+// without it. "Automatically add new episodes" closes that gap -- the Worker
+// re-checks each show the channel carries and folds in whatever has aired
+// since, at the top of the channel or at the end, as the channel says.
+//
+// Same shape as Live Cloud Sync above, and for the same reasons: the work is
+// dozens of TMDB calls, so it happens on a background task with nobody
+// waiting on it, the result is cached in KV, and a request serves what is
+// stored and schedules the refresh rather than paying for it.
+const CHANNEL_NEW_EPISODE_TTL_MS = 12 * 60 * 60 * 1000;
+const CHANNEL_NEW_EPISODE_MAX_SHOWS = 30;
+const CHANNEL_NEW_EPISODE_MAX_SEASONS = 2;
+const CHANNEL_NEW_EPISODE_MAX_ITEMS = 300;
+const CHANNEL_NEW_EPISODE_IN_FLIGHT = new Set();
+
+function channelNewEpisodeKey(channelId) {
+  return `channelnew:${channelId}`;
+}
+
+// What the channel already has, per show: the highest season it carries and
+// every season:episode in it. The high-water mark is what makes the check
+// cheap -- only seasons at or past it can hold anything new, so a channel of
+// ten-season shows still costs one or two season calls each.
+function channelShowWatermarks(items) {
+  const marks = new Map();
+  for (const it of items || []) {
+    if (!it || it.kind === "movie") continue;
+    const showId = channelItemShowId(it.imdbId);
+    const season = channelItemNumber(it.season);
+    const episode = channelItemNumber(it.episode);
+    if (!showId || season === null || episode === null) continue;
+    if (!marks.has(showId)) {
+      marks.set(showId, {
+        showId: showId,
+        showName: it.showName || "",
+        showPoster: it.showPoster || it.poster || "",
+        maxSeason: season,
+        have: new Set(),
+      });
+    }
+    const mark = marks.get(showId);
+    if (season > mark.maxSeason) mark.maxSeason = season;
+    if (!mark.showName && it.showName) mark.showName = it.showName;
+    if (!mark.showPoster && (it.showPoster || it.poster)) mark.showPoster = it.showPoster || it.poster;
+    mark.have.add(`${season}:${episode}`);
+  }
+  return marks;
+}
+
+// Whether a cached answer still belongs to the channel that asked for it.
+// Editing the channel -- adding a show, adding a season by hand -- changes
+// the marks, and an answer computed against the old ones would re-add
+// episodes the channel now carries itself.
+function channelNewEpisodeSignature(marks) {
+  const parts = [];
+  for (const mark of marks.values()) parts.push(`${mark.showId}:${mark.maxSeason}:${mark.have.size}`);
+  return String(hashStringToInt(parts.sort().join("|")));
+}
+
+// Everything one show has aired that this channel does not already carry.
+// Unaired episodes are left alone: TMDB lists next month's episode the day
+// it is announced, and a channel slot that plays nothing is worse than a
+// channel that is a week behind.
+async function fetchShowEpisodesAfter(mark, tmdbKey, today) {
+  const idForTmdb = mark.showId.startsWith("tmdb:") ? mark.showId.slice(5) : "";
+  let tmdbId = idForTmdb;
+  if (!tmdbId) {
+    const findRes = await fetch(
+      `https://api.themoviedb.org/3/find/${encodeURIComponent(mark.showId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`,
+      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+    );
+    if (!findRes.ok) return [];
+    const findData = await findRes.json();
+    const match = (findData.tv_results || [])[0];
+    if (!match) return [];
+    tmdbId = String(match.id);
+  }
+  const showRes = await fetch(
+    `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}?api_key=${encodeURIComponent(tmdbKey)}`,
+    { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 21600, cacheEverything: true } }
+  );
+  if (!showRes.ok) return [];
+  const fullShow = await showRes.json();
+  const showName = mark.showName || fullShow.name || "";
+  const showPoster = mark.showPoster ||
+    (fullShow.poster_path ? `https://image.tmdb.org/t/p/w500${fullShow.poster_path}` : "");
+  const seasons = (fullShow.seasons || [])
+    .filter((s) => s && s.season_number >= mark.maxSeason)
+    .sort((a, b) => a.season_number - b.season_number)
+    .slice(0, CHANNEL_NEW_EPISODE_MAX_SEASONS);
+  const out = [];
+  for (const s of seasons) {
+    const sRes = await fetch(
+      `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/season/${s.season_number}?api_key=${encodeURIComponent(tmdbKey)}`,
+      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 21600, cacheEverything: true } }
+    );
+    if (!sRes.ok) continue;
+    const sData = await sRes.json();
+    for (const ep of (sData.episodes || [])) {
+      const season = channelItemNumber(s.season_number);
+      const episode = channelItemNumber(ep && ep.episode_number);
+      if (season === null || episode === null) continue;
+      if (mark.have.has(`${season}:${episode}`)) continue;
+      const aired = String(ep.air_date || "");
+      if (!aired || aired > today) continue;
+      const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+      const epName = ep.name || `Episode ${episode}`;
+      out.push({
+        kind: "episode",
+        imdbId: mark.showId,
+        season: season,
+        episode: episode,
+        showName: showName,
+        epName: epName,
+        title: `${showName} S${season}E${episode} — ${epName}`,
+        released: aired,
+        thumbnail: stillUrl || showPoster,
+        poster: showPoster || stillUrl,
+        showPoster: showPoster,
+      });
+    }
+  }
+  return out;
+}
+
+// Newest first, so "put new episodes at top" puts the newest one at the very
+// top rather than the oldest of the new ones.
+function sortChannelNewEpisodes(items) {
+  return items.slice().sort((a, b) => {
+    const da = String(a.released || "");
+    const db = String(b.released || "");
+    if (da !== db) return db < da ? -1 : 1;
+    const sa = channelItemNumber(a.season) || 0;
+    const sb = channelItemNumber(b.season) || 0;
+    if (sa !== sb) return sb - sa;
+    return (channelItemNumber(b.episode) || 0) - (channelItemNumber(a.episode) || 0);
+  });
+}
+
+async function buildChannelNewEpisodes(marks, keys) {
+  const tmdbKey = (keys && keys.tmdbKey) || TMDB_API_KEY;
+  const today = new Date().toISOString().slice(0, 10);
+  const shortlist = [...marks.values()].slice(0, CHANNEL_NEW_EPISODE_MAX_SHOWS);
+  const perShow = await mapWithConcurrency(shortlist, 4, async (mark) => {
+    try {
+      return await fetchShowEpisodesAfter(mark, tmdbKey, today);
+    } catch {
+      return [];
+    }
+  });
+  const found = [];
+  for (const run of perShow) {
+    for (const it of run) found.push(it);
+  }
+  return sortChannelNewEpisodes(found).slice(0, CHANNEL_NEW_EPISODE_MAX_ITEMS);
+}
+
+async function refreshChannelNewEpisodes(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  if (CHANNEL_NEW_EPISODE_IN_FLIGHT.has(payload.channelId)) return null;
+  CHANNEL_NEW_EPISODE_IN_FLIGHT.add(payload.channelId);
+  try {
+    const marks = channelShowWatermarks(Array.isArray(payload.items) ? payload.items : []);
+    if (!marks.size) return null;
+    const items = await buildChannelNewEpisodes(marks, {
+      tmdbKey: opts.tmdbKey || "",
+    });
+    await env.CONFIGS.put(
+      channelNewEpisodeKey(payload.channelId),
+      JSON.stringify({
+        signature: channelNewEpisodeSignature(marks),
+        items: items,
+        updatedAt: Date.now(),
+      }),
+      { expirationTtl: 2592000 }
+    );
+    return items;
+  } finally {
+    CHANNEL_NEW_EPISODE_IN_FLIGHT.delete(payload.channelId);
+  }
+}
+
+// An empty answer is cached like any other -- a channel whose shows are all
+// finished would otherwise re-check every single request forever.
+async function readChannelNewEpisodes(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  let cached = null;
+  try {
+    const raw = await env.CONFIGS.get(channelNewEpisodeKey(payload.channelId));
+    if (raw) cached = JSON.parse(raw);
+  } catch {
+    cached = null;
+  }
+  const marks = channelShowWatermarks(Array.isArray(payload.items) ? payload.items : []);
+  const usable = !!(cached && Array.isArray(cached.items) &&
+    cached.signature === channelNewEpisodeSignature(marks));
+  const stale = !usable || (Date.now() - (cached.updatedAt || 0)) > CHANNEL_NEW_EPISODE_TTL_MS;
+  if (stale && opts.ctx && typeof opts.ctx.waitUntil === "function") {
+    opts.ctx.waitUntil(refreshChannelNewEpisodes(payload, opts).catch(() => {}));
+  }
+  return usable ? cached.items : null;
+}
+
+// Folds the newly-aired episodes into the channel's own picks. Anything the
+// channel already carries is dropped from the new side rather than played
+// twice -- the cached answer can be a few hours older than an edit that
+// added the same episode by hand.
+function mergeChannelNewEpisodes(stored, fresh, atTop) {
+  if (!Array.isArray(fresh) || !fresh.length) return stored;
+  const have = new Set();
+  for (const it of stored) {
+    const key = channelItemStreamId(it);
+    if (key) have.add(key);
+  }
+  const added = [];
+  for (const it of fresh) {
+    const key = channelItemStreamId(it);
+    if (!key || have.has(key)) continue;
+    have.add(key);
+    added.push(it);
+  }
+  if (!added.length) return stored;
+  return atTop ? added.concat(stored) : stored.concat(added);
+}
+
+// The pool a channel draws today's lineup from, before any ordering.
+//
+// Three shapes: a normal channel plays the picks stored on it; a dynamic
+// channel (Next Up) has none and is re-derived per request from the
+// account's own tracking; a Live Cloud Sync channel prefers the pool the
+// Worker last rebuilt from the list it was imported from, and keeps its
+// stored picks as the fallback for before that first rebuild lands.
+async function channelSourceItems(payload, opts) {
+  const stored = Array.isArray(payload.items) ? payload.items : [];
+  if (payload.dynamic === "next-up") {
+    // The live answer when there is one, and the seed the builder stored
+    // otherwise.
+    //
+    // The fallback is not belt-and-braces: resolveConfig only hands over
+    // continueWatching for a config that PROVED whose it is, and a config
+    // with no personal shelf in it never does -- so for those the live
+    // derivation is empty every time and the seed is the only lineup the
+    // channel will ever have. Returning nothing there is what made this
+    // channel come back blank.
+    const live = channelNextUpItems(opts.continueWatching);
+    return live.length ? live : stored;
+  }
+  let base = stored;
+  if (payload.liveSync && payload.sourceUrl) {
+    const live = await readChannelLivePool(payload, opts).catch(() => null);
+    if (live && live.length) base = live;
+  }
+  // "Automatically add new episodes" folds in whatever has aired since the
+  // channel was built. It sits after Live Cloud Sync rather than instead of
+  // it: one keeps up with the LIST a channel came from, the other with the
+  // SHOWS in it, and a channel can reasonably want both.
+  if (payload.autoNewEpisodes) {
+    const fresh = await readChannelNewEpisodes(payload, opts).catch(() => null);
+    if (fresh && fresh.length) base = mergeChannelNewEpisodes(base, fresh, !!payload.newEpisodesAtTop);
+  }
+  return base;
+}
+
+// The full stream id for one channel item, or "" if it cannot be formed.
+function channelItemStreamId(it) {
+  if (!it) return "";
+  const showId = channelItemShowId(it.imdbId);
+  if (!showId) return "";
+  if (it.kind === "movie") return showId;
+  const season = channelItemNumber(it.season);
+  const episode = channelItemNumber(it.episode);
+  if (season === null || episode === null) return "";
+  return `${showId}:${season}:${episode}`;
+}
+
+// Today's lineup for one channel payload: the picks, in the order they will
+// actually play, after the pool, the rules and the arrangement have all been
+// applied.
+//
+// Split out of buildChannelMeta so the builder page can show what a rotating
+// channel is running right now (see /api/channel-lineup). The alternative --
+// a second copy of the seeded shuffle on the client -- is the kind of thing
+// that drifts by one episode after some later edit and is never noticed.
+async function resolveChannelLineup(payload, opts = {}) {
+  const sourceItems = await channelSourceItems(payload, opts);
+
+  // "Randomize play order" (set once in the Channel builder, stored on the
+  // payload) reshuffles once a day rather than on every single request --
+  // same reasoning as Hidden Gems' daily reshuffle (see daysSinceEpochUTC
+  // below): the order stays put if someone reopens the channel later the
+  // same day (mid-binge), but looks freshly shuffled again tomorrow.
+  //
+  // "Sort by air date" is the alternative to it (one or the other, never
+  // both) and is applied further down, after the rotation below: it needs
+  // no seed because it is the same order every day.
+  //
+  // dailyRotate is a step further -- set by Quick Add Channel, and now by
+  // any custom channel that turns on a Daily Broadcast Schedule: the
+  // payload stores a much bigger pool than what's ever actually shown, and
+  // this picks a fresh, structured day's lineup from that pool -- a handful
+  // of different shows with a few episodes each (see channelRotationPlan),
+  // not a flat random slice that could easily skew to dozens of episodes of
+  // one show and none of many others. Stable within a day, different the
+  // next.
+  const plan = channelRotationPlan(payload);
+  // Duck-typed rather than `instanceof Date`: the tests evaluate this file
+  // in a vm realm of their own, where a Date built outside it is not an
+  // instanceof the Date inside it, and the injected clock would silently be
+  // ignored. A timestamp is accepted for the same reason -- there is no
+  // realm it can be wrong in.
+  const now = typeof opts.now === "number"
+    ? new Date(opts.now)
+    : (opts.now && typeof opts.now.getTime === "function" ? opts.now : new Date());
+  const day = channelRotationDay(now, plan.turnover);
+  const seed = day + hashStringToInt(String(payload.channelId || payload.name || ""));
+  const lockedKeys = channelStoryLockedKeys(payload);
+  // Anything that cannot produce a real stream id (see channelItemStreamId
+  // above) is dropped HERE, before the rotation or the shuffle runs, so a
+  // dropped item costs the channel one slot rather than leaving a hole in
+  // the middle of a day's lineup -- and so the running order below stays
+  // 1..N with no gaps.
+  let playableItems = sourceItems.filter((it) => channelItemStreamId(it));
+  // "Hide watched" comes before the rotation for the same reason: an
+  // already-seen episode should cost the channel nothing, not a slot in
+  // today's lineup. When the whole pool has been seen the channel resets to
+  // the full pool rather than going dark -- an empty channel reads as
+  // broken, and there is nothing else left to offer.
+  if (payload.hideWatched) {
+    const watchedKeys = channelWatchedKeySet(opts.watchHistory);
+    const unwatched = playableItems.filter((it) => !channelItemIsWatched(it, watchedKeys));
+    if (unwatched.length) playableItems = unwatched;
+  }
+  if (!playableItems.length) return null;
+  let items;
+  if (payload.dailyRotate) {
+    items = rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys);
+  } else if (payload.shuffle && !payload.sortByAired) {
+    items = shuffleChannelItems(playableItems, seed, lockedKeys);
+  } else {
+    items = playableItems;
+  }
+  // "Sort by air date" is the other half of the same choice: the builder
+  // offers it and "Randomize play order" as one-or-the-other (checking
+  // either clears the other), so a payload should never arrive with both
+  // set. An older payload still can -- shuffle was the only flag that
+  // existed -- so the explicit sort wins here as well, rather than leaving
+  // the outcome to whichever branch happened to be tested first.
+  //
+  // It is applied last so it also orders a rotated day's lineup: a rotating
+  // channel picks WHICH shows and episodes play today (above), and this
+  // decides the order they play in. Interleaving sits in the same slot for
+  // the same reason -- it is what turns a rotated day's handful of shows
+  // into an actual prime-time block instead of five blocks back to back.
+  if (payload.sortByAired) items = sortChannelItemsByAired(items);
+  else if (payload.autoSort === "interleave") items = interleaveChannelItems(items);
+  // Last of all, because every step above can separate two halves of one
+  // story: the rotation deals a block that ends between them, the shuffle
+  // scatters them, the interleaver puts four other shows in between. Gluing
+  // here is the only place that cannot be undone by a later step.
+  items = glueMultiPartEpisodes(items, playableItems, payload);
+  return { items, sourceItems, plan, day, seed };
+}
+
+async function buildChannelMeta(entry, origin, opts = {}) {
+  const payload = parseChannelPayload(entry.url);
+  if (!payload) return null;
+  // payload.channelId/payload.name (not entry.id/entry.name) are the real
+  // identity -- see the same note in fetchChannelCatalog above.
+  const channelId = payload.channelId || entry.id;
+  const name = payload.name || entry.name;
+  const lineup = await resolveChannelLineup(payload, opts);
+  if (!lineup) return null;
+  const items = lineup.items;
+  const sourceItems = lineup.sourceItems;
   const videos = items.map((it, i) => {
     // TMDB's air_date/release_date (and our own year-only fallback for
     // movies) are bare "YYYY-MM-DD" dates. Stremio Web's core is compiled
@@ -12616,19 +14670,27 @@ function buildChannelMeta(entry, origin) {
     // surfaced during debugging) -- its deserializer likely expects a full
     // ISO 8601 *datetime* here and can silently fail to parse the whole
     // meta object on a bare date, unlike a loose JS parser that wouldn't
-    // care. Pinning to midnight UTC costs nothing (we only ever had a date
-    // to begin with) and matches the shape a known-working reference
-    // implementation's meta responses use.
+    // care. Giving it a datetime costs nothing, since we only ever had a
+    // date to begin with.
+    //
+    // 11:00 UTC, not midnight: a client renders this in the VIEWER's
+    // timezone, and midnight UTC is the previous evening everywhere west of
+    // Greenwich -- which is why a 1996 movie in a channel read "Dec 31,
+    // 1995" across the Americas.
+    //
+    // An instant at hour H shows as the date we meant in every zone whose
+    // offset is in [-H, 24-H). World offsets span UTC-12 to UTC+14, 26 hours,
+    // so no single instant covers all of them and two hours' worth are always
+    // wrong. H=11 covers UTC-11 to UTC+12:59 -- every inhabited zone except
+    // UTC+13/+14 (NZ daylight, Samoa, Tonga, Kiribati) -- and is one better
+    // than midday, which also slips in New Zealand.
     const releaseDate = it.released || (it.year ? `${it.year}-01-01` : undefined);
-    const realSeason = typeof it.season === "number" ? it.season : parseInt(it.season, 10) || 1;
-    const realEpisode = typeof it.episode === "number" ? it.episode : parseInt(it.episode, 10) || 1;
-    const streamId = it.kind === "movie" ? it.imdbId : `${it.imdbId}:${realSeason}:${realEpisode}`;
     return {
-      id: streamId,
+      id: channelItemStreamId(it),
       title: it.title,
       season: 1,
       episode: i + 1,
-      released: releaseDate ? `${releaseDate}T00:00:00.000Z` : undefined,
+      released: releaseDate ? `${releaseDate}T11:00:00.000Z` : undefined,
       thumbnail: it.thumbnail || it.poster || payload.poster || undefined,
     };
   });
@@ -12637,8 +14699,8 @@ function buildChannelMeta(entry, origin) {
   const isShowPoster = Boolean(payload.poster && payload.poster.startsWith("http") && !payload.poster.includes("/api/channel-"));
 
   let matchedBackdrop = (payload.backdrop && payload.backdrop.startsWith("http") && !payload.backdrop.includes("/api/channel-")) ? payload.backdrop : null;
-  if (isShowPoster && !matchedBackdrop && Array.isArray(payload.items)) {
-    const match = payload.items.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
+  if (isShowPoster && !matchedBackdrop && sourceItems.length) {
+    const match = sourceItems.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
     if (match) {
       matchedBackdrop = match.backdrop || match.showBackdrop || match.thumbnail || null;
     }
@@ -13828,7 +15890,14 @@ async function fetchSimklUserList(entry, skip, token, clientId, spec, userTmdbKe
             isSeasonFinale: !!details.isSeasonFinale,
             seasonFinaleAirDate: details.seasonFinaleAirDate || undefined,
             seasonFinaleEpisodeNumber: details.seasonFinaleEpisodeNumber || undefined,
-            description: epLabel ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}` : (details.overview || undefined),
+            // "Airs 2026-09-27 at 8 PM ET" where TVmaze knows the slot, and
+            // the date alone where it does not -- a Stremio row is the one
+            // place this add-on shows an air date with no page behind it to
+            // open for the rest.
+            airTime: details.nextEpisodeAirTimeLabel || undefined,
+            description: epLabel
+              ? `Next Episode: ${epLabel} · Airs ${details.nextEpisodeAirDate}${details.nextEpisodeAirTimeLabel ? ` at ${details.nextEpisodeAirTimeLabel}` : ""}`
+              : (details.overview || undefined),
             trailerStreams: details.trailerKey ? trailerStreamsFor(details.trailerKey) : undefined,
           });
         }
@@ -14030,7 +16099,7 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
     cleanTmdbId = cleanTmdbId.slice(5).trim();
   }
   cleanTmdbId = cleanTmdbId.split(":")[0].trim();
-  if (!cleanTmdbId) return { imdbId: null, videos: null, hasDigitalRelease: null };
+  if (!cleanTmdbId) return { imdbId: null, videos: null, hasDigitalRelease: null, runtime: null };
 
   const cacheKey = `user_cache:tmdb_detail:${kind}:${cleanTmdbId}`;
   const cached = getPerUserCache(cacheKey);
@@ -14060,7 +16129,7 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
     headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
-  if (!res.ok) return { imdbId: null, videos: null, hasDigitalRelease: null };
+  if (!res.ok) return { imdbId: null, videos: null, hasDigitalRelease: null, runtime: null };
   const data = await res.json();
   const imdbId = (data.external_ids && data.external_ids.imdb_id) || data.imdb_id || null;
   const videos = (data.videos && data.videos.results) || null;
@@ -14081,7 +16150,15 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
   }
   const adult = data.adult === true || data.is_adult === true;
   const genres = Array.isArray(data.genres) ? data.genres.map((g) => (typeof g === "string" ? g : g.name || "")) : undefined;
-  const result = { imdbId, videos, hasDigitalRelease, adult, genres };
+  // Minutes. A movie has one; TMDB gives a SHOW an episode_run_time array
+  // instead, whose first entry is the typical episode length -- which is the
+  // fallback a channel uses for an episode TMDB has no per-episode runtime
+  // for. Null when there is nothing to say, so nothing downstream may
+  // require it.
+  let runtime = null;
+  if (Number.isInteger(data.runtime)) runtime = data.runtime;
+  else if (Array.isArray(data.episode_run_time) && Number.isInteger(data.episode_run_time[0])) runtime = data.episode_run_time[0];
+  const result = { imdbId, videos, hasDigitalRelease, adult, genres, runtime };
   // Cache for 7 days (604800s)
   setPerUserCache(cacheKey, result, 604800, 2592000);
 
@@ -14806,6 +16883,978 @@ async function fetchTmdbGenre(entry, skip, apiKey, genreKey, region) {
   return res;
 }
 
+// --- New on Streaming --------------------------------------------------------
+//
+// tmdb:new-on-streaming[:service1+service2] -- what actually arrived on a
+// streaming service, newest first, with a show pushed back to the top when a
+// new episode airs. See NEW_ON_STREAMING_PROVIDERS (00_constants.js) for why
+// this cannot be a discover query and has to be observed on the cron tick
+// instead, and migrations/0011_add_streaming_events.sql for the table.
+//
+// Two halves, and they never run in the same place:
+//
+//   sweepNewOnStreaming / bumpNewOnStreamingEpisodes  spend the outbound
+//       fetches, on the cron tick, and write rows into D1.
+//
+//   fetchNewOnStreaming  serves the catalog, and makes NO outbound request at
+//       all -- one indexed D1 read, with the poster and title denormalised
+//       into the row precisely so that stays true. It is the only catalog in
+//       this add-on that cannot be slowed down by a provider having a bad day.
+
+// "netflix" -> the NEW_ON_STREAMING_PROVIDERS entry. Unknown keys return null
+// rather than throwing, so a stale saved row naming a provider that has since
+// been removed from that list degrades to "all services" instead of erroring.
+function newOnStreamingProvider(key) {
+  const k = String(key || "").toLowerCase().trim();
+  return NEW_ON_STREAMING_PROVIDERS.find((p) => p.key === k) || null;
+}
+
+// Parses the part after "tmdb:new-on-streaming". Accepts nothing (every
+// service), or ":" and a "+"-separated list of provider keys --
+// "tmdb:new-on-streaming:netflix+hulu". Returns the resolved provider keys, or
+// null meaning "all of them", which is what an empty or entirely unrecognised
+// selection collapses to.
+function parseNewOnStreamingServices(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  const keys = s
+    .split(/[+,]/)
+    .map((part) => newOnStreamingProvider(part))
+    .filter(Boolean)
+    .map((p) => p.key);
+  if (!keys.length) return null;
+  return [...new Set(keys)];
+}
+
+// The region the sweep actually has rows for. A reader in a region nobody
+// sweeps gets the first swept region's rows rather than an empty shelf -- the
+// catalog says so in its own description, and NEW_ON_STREAMING_REGIONS carries
+// the reason a second region is not free.
+function newOnStreamingRegion(region) {
+  const want = String(region || "US").toUpperCase().slice(0, 2);
+  return NEW_ON_STREAMING_REGIONS.includes(want) ? want : NEW_ON_STREAMING_REGIONS[0];
+}
+
+// "2024-03-08" -> epoch seconds, UTC. Returns 0 for anything unparseable and
+// clamps the future away: a provider catalog carries announced-but-unreleased
+// titles, and one of those seeded at its future date would sit at the top of a
+// list about what you can watch now.
+function newOnStreamingDateToEpoch(dateStr, nowSec) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dateStr || "").trim());
+  if (!m) return 0;
+  const t = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) / 1000;
+  if (!Number.isFinite(t) || t <= 0) return 0;
+  return Math.min(Math.floor(t), nowSec);
+}
+
+// One sweep unit's discover query: page `page` of one provider's catalog for
+// one kind, in one region.
+//
+// sort_by is the release date and not popularity, and that is load-bearing
+// rather than a preference. A popularity-sorted walk reorders itself between
+// the ticks that read its pages, so titles slide across page boundaries and a
+// walk both misses arrivals and re-reports old ones as new. Release dates do
+// not move, so page N holds the same titles this tick as last tick, and "not
+// in the table yet" means arrived rather than shuffled.
+//
+// with_watch_monetization_types=flatrate matches tmdbProviderChartPaths above:
+// included with the subscription, not merely rentable through the service.
+function newOnStreamingWalkPath(kind, providerId, region, page, todayIso) {
+  const common =
+    `with_watch_providers=${providerId}&watch_region=${encodeURIComponent(region)}` +
+    `&with_watch_monetization_types=flatrate&include_adult=false&page=${page}`;
+  if (kind === "tv") {
+    return `discover/tv?sort_by=first_air_date.desc&first_air_date.lte=${todayIso}&${common}`;
+  }
+  return `discover/movie?sort_by=primary_release_date.desc&primary_release_date.lte=${todayIso}&${common}`;
+}
+
+// The stable axis the walk turns on: every provider x kind x region, in a
+// fixed order. Sixteen entries, and -- unlike a page-bounded unit list -- its
+// length does not change when a catalogue grows or shrinks, which is what lets
+// a stored cursor still mean something on the next tick.
+//
+// The walk itself is PAGE-MAJOR over this list: page 1 of all sixteen, then
+// page 2 of all sixteen, and so on. Nested the other way -- provider
+// outermost, which is how this shipped -- the sweep drained every page of
+// Netflix movies before it looked at Netflix shows, and all of those before
+// the second provider, so for hours the shelf was Netflix films and nothing
+// else. Page-major means one tick fills the TOP of the shelf everywhere and
+// the rest of the pass only adds depth.
+function newOnStreamingCombos() {
+  const combos = [];
+  for (const region of NEW_ON_STREAMING_REGIONS) {
+    for (const provider of NEW_ON_STREAMING_PROVIDERS) {
+      for (const kind of ["movie", "tv"]) {
+        combos.push({ region, provider, kind, key: `${region}:${provider.key}:${kind}` });
+      }
+    }
+  }
+  return combos;
+}
+
+// Bumped whenever the walk's shape changes. The cursor describes a position in
+// it, so a position recorded under an older shape is not a position at all --
+// resuming on it would silently leave a band of the catalogue unswept. A
+// mismatch restarts the pass, which costs one repeat of ground already covered
+// (a no-op: a re-seen title only refreshes its "still present" marker).
+//
+// 3: the walk stopped being a fixed 40 pages per catalogue and started reading
+//    each one to its learned end, so `unit` (an index into a fixed-length
+//    list) became `page` + `idx`.
+const NEW_ON_STREAMING_CURSOR_LAYOUT = 3;
+
+// How deep each catalogue actually goes, learned from the total_pages every
+// discover response carries and cached in KV between ticks.
+//
+// Unknown means 1, not "skip": page 1 is always attempted, and the answer it
+// returns is the depth. That is what makes a cold start correct without a
+// configured guess -- the first sixteen units of a fresh database measure
+// every catalogue before the walk ever advances to page 2.
+async function readNewOnStreamingDepths(env) {
+  if (!env || !env.CONFIGS) return {};
+  try {
+    const raw = await env.CONFIGS.get("cron:newonstreaming:depths");
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function newOnStreamingDepthOf(depths, key) {
+  const n = parseInt(depths && depths[key], 10);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, NEW_ON_STREAMING_MAX_PAGES_PER_CATALOG) : 1;
+}
+
+// The highest page any catalogue reaches, which is where a pass ends. Computed
+// fresh each time it is needed rather than cached: on a first walk it climbs
+// from 1 to the real depth as the sixteen page-1 reads come back, and a pass
+// must not be declared complete against the value it started with.
+function newOnStreamingMaxPage(combos, depths) {
+  let max = 1;
+  for (const c of combos) max = Math.max(max, newOnStreamingDepthOf(depths, c.key));
+  return max;
+}
+
+// Total pages in one full pass -- what the admin panel reports, and the number
+// that says how long a pass takes at NEW_ON_STREAMING_PAGES_PER_TICK.
+function newOnStreamingPassPages(combos, depths) {
+  let total = 0;
+  for (const c of combos) total += newOnStreamingDepthOf(depths, c.key);
+  return total;
+}
+
+// Reads the sweep cursor. `unit` is where in newOnStreamingUnits() the next
+// tick starts; `walk` counts completed passes over the whole list, and walk 0
+// is the one that seeds -- see the `seeded` column in migration 0011.
+async function readNewOnStreamingCursor(env) {
+  const fallback = { page: 1, idx: 0, walk: 0, passErrors: 0 };
+  if (!env || !env.CONFIGS) return fallback;
+  try {
+    const raw = await env.CONFIGS.get("cron:newonstreaming:cursor");
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) || {};
+    const num = (v, min, dflt) => {
+      const n = Math.floor(Number(v));
+      return Number.isFinite(n) && n >= min ? n : dflt;
+    };
+    const walk = num(parsed.walk, 0, 0);
+    // A position recorded against a different walk shape is not a position.
+    // The walk generation is kept: a database part-way through its seeding
+    // pass is still seeding, and promoting it here would date every title it
+    // has yet to reach as an arrival that never happened.
+    if (num(parsed.layout, 0, 1) !== NEW_ON_STREAMING_CURSOR_LAYOUT) {
+      return { page: 1, idx: 0, walk, passErrors: 0 };
+    }
+    return {
+      page: num(parsed.page, 1, 1),
+      idx: num(parsed.idx, 0, 0),
+      walk,
+      passErrors: num(parsed.passErrors, 0, 0),
+    };
+  } catch (e) {
+    console.warn("[Cron] could not read the New on Streaming cursor:", e && e.message ? e.message : e);
+    return fallback;
+  }
+}
+
+// Pulls one discover page and returns TMDB's raw result objects. Kept separate
+// from fetchTmdbPagedResults because that one windows several pages onto this
+// add-on's PAGE_SIZE=100 pagination; the sweep wants exactly one TMDB page,
+// addressed by TMDB's own page number, which is what the cursor stores.
+async function fetchNewOnStreamingPage(pathAndQuery, apiKey) {
+  const src = `https://api.themoviedb.org/3/${pathAndQuery}&api_key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(src, {
+    headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+    // Deliberately short: the sweep exists to notice a catalog CHANGING, and
+    // a long edge cache would hand it the same page it already recorded.
+    cf: { cacheTtl: 300, cacheEverything: true },
+  });
+  if (!res.ok) throw new Error(`TMDB request failed (HTTP ${res.status}).`);
+  const data = await res.json();
+  const totalPages = Number.isFinite(Number(data.total_pages)) ? Number(data.total_pages) : null;
+  return { items: Array.isArray(data.results) ? data.results : [], totalPages };
+}
+
+// Which of this page's TMDB ids the table already knows about, for this region
+// and kind, across EVERY service -- not just the one being swept.
+//
+// Three different questions come out of one read. A row for this same service
+// means the title was already here and only its "still present" marker needs
+// touching -- unless that row is currently marked gone, in which case this
+// sighting is a return and dates itself today. And a row for a DIFFERENT
+// service still carries the IMDb id, which is the expensive half of recording
+// an arrival, so a title moving onto a second service costs no TMDB call.
+async function lookupNewOnStreamingKnown(env, region, kind, tmdbIds) {
+  const known = new Map();
+  if (!env || !env.DB || !tmdbIds.length) return known;
+  const placeholders = tmdbIds.map(() => "?").join(",");
+  const { results } = await env.DB.prepare(
+    `SELECT tmdb_id, imdb_id, service, removed_at FROM streaming_events
+      WHERE region = ? AND kind = ? AND tmdb_id IN (${placeholders})`
+  ).bind(region, kind, ...tmdbIds).all();
+  for (const row of (results || [])) {
+    const id = Number(row && row.tmdb_id);
+    if (!Number.isFinite(id)) continue;
+    const entry = known.get(id) || { imdbId: null, services: new Map() };
+    if (row.imdb_id) entry.imdbId = row.imdb_id;
+    if (row.service) entry.services.set(String(row.service), { removed: row.removed_at != null });
+    known.set(id, entry);
+  }
+  return known;
+}
+
+// `maxUnits` overrides NEW_ON_STREAMING_PAGES_PER_TICK. Only the admin
+// dashboard's "Run a sweep now" passes it, so a first walk can be pushed along
+// by hand instead of waiting out the cron -- the cron itself always uses the
+// constant.
+async function sweepNewOnStreaming(env, ctx, fetchBudget, maxUnits) {
+  const summary = {
+    ran: false, reason: "", units: 0, seen: 0, added: 0, returned: 0, touched: 0, resolved: 0,
+    walk: 0, page: 1, idx: 0, errors: 0, passErrors: 0, wrapped: false, passPages: 0,
+    removal: null,
+  };
+  if (!env || !env.CONFIGS) {
+    summary.reason = "no KV binding";
+    return summary;
+  }
+  if (!env.DB) {
+    // Not a warning worth repeating every six minutes on a deployment that
+    // has simply not bound D1 -- the admin dashboard says the same thing
+    // where someone can act on it, and checkD1Schema already shouts about a
+    // bound database missing the table.
+    summary.reason = "no D1 database bound (this catalog is D1-only)";
+    return summary;
+  }
+  const apiKey = (env && env.TMDB_API_KEY) || TMDB_API_KEY;
+  if (!apiKey) {
+    summary.reason = "TMDB_API_KEY is not set";
+    return summary;
+  }
+
+  // A budget of 0 is what a free Worker's split comes out at, and it means
+  // NO budget -- only an absent one means unlimited. Folding the two together
+  // (`> 0 ? fetchBudget : Infinity`) turns the tick that should skip into the
+  // one that sweeps without a ceiling.
+  const budget = Number.isFinite(fetchBudget) ? Math.max(0, fetchBudget) : Infinity;
+  const affordable = budget === Infinity
+    ? Number.MAX_SAFE_INTEGER
+    : Math.floor(budget / NEW_ON_STREAMING_SWEEP_FETCHES);
+  if (affordable < 1) {
+    // Same shape as prewarmSharedCatalogs' own free-plan notice: one line
+    // saying why, and a tick that still completes.
+    summary.reason =
+      `skipped: one sweep page costs up to ${NEW_ON_STREAMING_SWEEP_FETCHES} outbound fetches and this tick's share is ${budget}. ` +
+      "Set CRON_SUBREQUEST_BUDGET in wrangler.toml (10000 on a Workers Paid plan) to turn it on.";
+    console.warn(`[Cron] New on Streaming ${summary.reason}`);
+    return summary;
+  }
+
+  const combos = newOnStreamingCombos();
+  if (!combos.length) {
+    summary.reason = "no providers configured";
+    return summary;
+  }
+
+  const cursor = await readNewOnStreamingCursor(env);
+  const depths = await readNewOnStreamingDepths(env);
+  const perTick = Number.isFinite(maxUnits) && maxUnits > 0
+    ? Math.floor(maxUnits)
+    : NEW_ON_STREAMING_PAGES_PER_TICK;
+  const take = Math.min(affordable, perTick);
+  const nowSec = Math.floor(Date.now() / 1000);
+  const todayIso = new Date(nowSec * 1000).toISOString().slice(0, 10);
+  // Walk 0 is the first pass over every provider catalog, and everything it
+  // finds is "new" only in the sense that nobody had looked yet. Those rows
+  // are seeded: dated by the title's own release, not by this moment. Walk 1
+  // onward, a title that is not already in the table genuinely arrived.
+  const seeding = cursor.walk === 0;
+  summary.walk = cursor.walk;
+
+  let page = cursor.page;
+  let idx = cursor.idx;
+  let wrapped = false;
+  let depthsChanged = false;
+  const writes = [];
+
+  for (let n = 0; n < take; n++) {
+    const combo = combos[idx % combos.length];
+    const depth = newOnStreamingDepthOf(depths, combo.key);
+
+    // Past the end of THIS catalog while others are still deeper. Costs no
+    // fetch -- the walk just steps over it.
+    if (page <= depth) {
+      let result = null;
+      try {
+        result = await fetchNewOnStreamingPage(
+          newOnStreamingWalkPath(combo.kind, combo.provider.tmdbId, combo.region, page, todayIso),
+          apiKey
+        );
+        summary.units++;
+      } catch (e) {
+        summary.errors++;
+        console.warn(
+          `[Cron] New on Streaming sweep ${combo.provider.key}/${combo.kind} p${page} failed:`,
+          e && e.message ? e.message : e
+        );
+      }
+
+      if (result) {
+        // Every discover response carries total_pages, so the depth is
+        // re-learned on every read rather than measured once -- a catalog that
+        // grows is walked further on the very next pass, and one that shrinks
+        // stops being asked for pages that no longer exist.
+        if (Number.isFinite(result.totalPages) && result.totalPages > 0) {
+          const learned = Math.min(result.totalPages, NEW_ON_STREAMING_MAX_PAGES_PER_CATALOG);
+          if (depths[combo.key] !== learned) {
+            depths[combo.key] = learned;
+            depthsChanged = true;
+          }
+        }
+        await collectNewOnStreamingPage({
+          env, apiKey, combo, page, items: result.items,
+          nowSec, seeding, walk: cursor.walk, writes, summary,
+        });
+      }
+    }
+
+    idx++;
+    if (idx >= combos.length) {
+      idx = 0;
+      page++;
+      // Recomputed here, AFTER this round of pages has taught it something.
+      // On a fresh database the first sixteen reads lift it from 1 to the real
+      // depth; computing it once up front would have declared the pass
+      // complete after page 1 and ended seeding before it had seen anything.
+      if (page > newOnStreamingMaxPage(combos, depths)) {
+        page = 1;
+        wrapped = true;
+        break;
+      }
+    }
+  }
+
+  // The ON CONFLICT clause in collectNewOnStreamingPage is what makes a first
+  // sighting permanent: an existing, still-present row keeps its added_at, its
+  // last_event_at and its seeded flag, and only has its "still here" marker and
+  // its artwork refreshed. Re-running a sweep over ground it has already
+  // covered therefore changes no dates, which is what lets the cursor be
+  // advanced optimistically below.
+  await d1BatchInChunks(env, writes, "New on Streaming sweep");
+
+  summary.ran = true;
+  summary.wrapped = wrapped;
+  summary.page = page;
+  summary.idx = idx;
+  summary.passErrors = cursor.passErrors + summary.errors;
+  summary.passPages = newOnStreamingPassPages(combos, depths);
+
+  // A completed pass has read every page of every catalog, so a row it did not
+  // touch is a title that is no longer there. That inference is only available
+  // here, at the wrap.
+  if (wrapped) {
+    summary.removal = await applyNewOnStreamingRemovals(env, cursor.walk, summary.passErrors, nowSec);
+  }
+
+  if (depthsChanged) {
+    try {
+      await env.CONFIGS.put("cron:newonstreaming:depths", JSON.stringify(depths));
+    } catch (e) {
+      console.warn("[Cron] could not store the New on Streaming catalog depths:", e && e.message ? e.message : e);
+    }
+  }
+  try {
+    await env.CONFIGS.put(
+      "cron:newonstreaming:cursor",
+      JSON.stringify({
+        page,
+        idx,
+        walk: wrapped ? cursor.walk + 1 : cursor.walk,
+        // Errors accumulate across the ticks of ONE pass and reset with it:
+        // whether a pass may conclude that something is absent depends on how
+        // much of it could be read, not on how the last tick happened to go.
+        passErrors: wrapped ? 0 : summary.passErrors,
+        layout: NEW_ON_STREAMING_CURSOR_LAYOUT,
+      })
+    );
+  } catch (e) {
+    console.warn("[Cron] could not advance the New on Streaming cursor:", e && e.message ? e.message : e);
+  }
+  try {
+    await env.CONFIGS.put(
+      "cron:newonstreaming:lastsweep",
+      JSON.stringify({ at: nowSec, ...summary }),
+      { expirationTtl: 2592000 }
+    );
+  } catch (e) {
+    // Status display only. A tick that swept correctly but could not write
+    // its own receipt is still a tick that swept correctly.
+  }
+  return summary;
+}
+
+// Turns one discover page into upserts. Split out of the sweep loop so the
+// loop reads as the walk it is, and so the "what counts as an arrival"
+// decision sits in one place.
+async function collectNewOnStreamingPage({ env, apiKey, combo, page, items, nowSec, seeding, walk, writes, summary }) {
+  const entryType = combo.kind === "tv" ? "series" : "movie";
+  // No poster is this add-on's cheapest quality floor, and provider catalogs
+  // need one: they carry a long tail of filler that TMDB has a row for and
+  // nothing else -- no art, no votes -- which would otherwise be most of what
+  // a "newest first" shelf shows.
+  const candidates = (items || []).filter(
+    (it) => it && it.id && (it.poster_path || it.backdrop_path) && it.adult !== true
+  );
+  summary.seen += candidates.length;
+  if (!candidates.length) return;
+
+  const known = await lookupNewOnStreamingKnown(
+    env, combo.region, entryType, candidates.map((it) => Number(it.id))
+  );
+
+  // Only titles with no row anywhere cost a TMDB detail call. Everything else
+  // already carries its IMDb id in the table.
+  const needResolve = candidates.filter((it) => !(known.get(Number(it.id)) || {}).imdbId);
+  summary.resolved += needResolve.length;
+  const resolvedIds = new Map();
+  if (needResolve.length) {
+    const details = await mapWithConcurrency(needResolve, TMDB_DETAIL_RESOLVE_CONCURRENCY, async (it) => {
+      const { imdbId } = await fetchTmdbDetails(it.id, combo.kind, apiKey, env);
+      return { tmdbId: Number(it.id), imdbId };
+    });
+    for (const d of details) {
+      if (d && d.imdbId) resolvedIds.set(d.tmdbId, d.imdbId);
+    }
+  }
+
+  for (const it of candidates) {
+    const tmdbId = Number(it.id);
+    const prior = known.get(tmdbId);
+    const imdbId = (prior && prior.imdbId) || resolvedIds.get(tmdbId);
+    // Stremio and Nuvio key metas by IMDb id. A title TMDB has no external id
+    // for cannot be played from this shelf, so it is not put on it -- unlike
+    // fetchTmdbGenre, which falls back to a "tmdb:" pseudo-id because a genre
+    // browse is allowed to be a dead end and a "what can I watch tonight"
+    // shelf is not.
+    if (!imdbId) continue;
+
+    const dateStr = it.release_date || it.first_air_date || "";
+    const releaseEpoch = newOnStreamingDateToEpoch(dateStr, nowSec);
+    const priorHere = prior && prior.services.get(combo.provider.key);
+    if (priorHere) {
+      summary.touched++;
+    } else {
+      summary.added++;
+    }
+    const eventAt = seeding ? releaseEpoch : nowSec;
+    writes.push(
+      env.DB.prepare(
+        `INSERT INTO streaming_events
+           (region, service, imdb_id, tmdb_id, kind, added_at, last_event_at, event_kind,
+            seeded, last_seen_walk, name, poster, background, year)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (region, service, imdb_id) DO UPDATE SET
+           last_seen_walk = excluded.last_seen_walk,
+           tmdb_id        = excluded.tmdb_id,
+           name           = excluded.name,
+           poster         = excluded.poster,
+           background     = excluded.background,
+           year           = excluded.year,
+           -- A row that was marked gone and has turned up again is an arrival
+           -- in its own right: it IS on the service today and it was not
+           -- yesterday, which is precisely what this shelf reports. So a
+           -- returning title takes today's date and loses its seeded flag,
+           -- while a title that never left keeps every date it had.
+           added_at       = CASE WHEN streaming_events.removed_at IS NOT NULL THEN excluded.added_at ELSE streaming_events.added_at END,
+           last_event_at  = CASE WHEN streaming_events.removed_at IS NOT NULL THEN excluded.last_event_at ELSE streaming_events.last_event_at END,
+           event_kind     = CASE WHEN streaming_events.removed_at IS NOT NULL THEN 'added' ELSE streaming_events.event_kind END,
+           seeded         = CASE WHEN streaming_events.removed_at IS NOT NULL THEN 0 ELSE streaming_events.seeded END,
+           removed_at     = NULL`
+      ).bind(
+        combo.region,
+        combo.provider.key,
+        imdbId,
+        tmdbId,
+        entryType,
+        eventAt || nowSec,
+        eventAt,
+        seeding ? 1 : 0,
+        walk,
+        it.title || it.name || "",
+        it.poster_path ? `https://image.tmdb.org/t/p/w500${it.poster_path}` : (it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : null),
+        it.backdrop_path ? `https://image.tmdb.org/t/p/w1280${it.backdrop_path}` : null,
+        String(dateStr).slice(0, 4) || null
+      )
+    );
+    if (priorHere && priorHere.removed) summary.returned++;
+  }
+}
+
+// Marks rows a completed pass did not see as gone.
+//
+// last_seen_walk is stamped on every row the sweep touches, so after pass W
+// anything still carrying a generation older than W was not found. Requiring
+// NEW_ON_STREAMING_REMOVAL_GRACE_WALKS consecutive misses rather than one
+// turns "TMDB did not list it this time" into "TMDB has not listed it for
+// hours", which is the difference between a hiccup and a departure.
+//
+// Rows are marked, never deleted: the row is the history. If the title comes
+// back, the upsert above clears removed_at and dates it as the new arrival it
+// is -- and it can only do that because the row was still there.
+async function applyNewOnStreamingRemovals(env, completedWalk, passErrors, nowSec) {
+  const out = { ran: false, reason: "", marked: 0, live: 0, candidates: 0, held: [] };
+  // Generations are only meaningful once enough of them exist to be missed.
+  // Before that there is nothing a row could have failed to appear in.
+  const cutoff = completedWalk - NEW_ON_STREAMING_REMOVAL_GRACE_WALKS;
+  if (cutoff < 0) {
+    out.reason = `pass ${completedWalk}: too early to tell anything is gone (needs ${NEW_ON_STREAMING_REMOVAL_GRACE_WALKS} completed passes)`;
+    return out;
+  }
+  if (passErrors > NEW_ON_STREAMING_MAX_PASS_ERRORS) {
+    out.reason = `pass ${completedWalk} could not read ${passErrors} pages, so it did not establish that anything is absent`;
+    console.warn(`[Cron] New on Streaming removals skipped: ${out.reason}`);
+    return out;
+  }
+  try {
+    // Judged per catalogue, not across the table, and that distinction is the
+    // whole value of the guard.
+    //
+    // The failure it exists for is not an error -- it is TMDB answering 200
+    // with an empty result set for one provider, which no error count catches.
+    // A single service is an eighth of the table, so a table-wide threshold
+    // would wave through "every Netflix title left overnight" as a perfectly
+    // ordinary 12%. Measured against that service's own rows it is 100%, and
+    // obviously wrong.
+    //
+    // No region filter is needed: a pass walks every region in
+    // NEW_ON_STREAMING_REGIONS, so a completed pass has looked everywhere.
+    const { results } = await env.DB.prepare(
+      `SELECT service, kind,
+              COUNT(*) AS live,
+              SUM(CASE WHEN last_seen_walk <= ? THEN 1 ELSE 0 END) AS gone
+         FROM streaming_events
+        WHERE removed_at IS NULL
+        GROUP BY service, kind`
+    ).bind(cutoff).all();
+
+    const writes = [];
+    for (const row of (results || [])) {
+      const live = Number(row.live) || 0;
+      const gone = Number(row.gone) || 0;
+      out.live += live;
+      if (!gone) continue;
+      out.candidates += gone;
+      const share = live > 0 ? gone / live : 1;
+      if (share > NEW_ON_STREAMING_MAX_REMOVAL_SHARE) {
+        const note =
+          `${row.service}/${row.kind}: ${gone} of ${live} (${Math.round(share * 100)}%)`;
+        out.held.push(note);
+        continue;
+      }
+      writes.push(
+        env.DB.prepare(
+          `UPDATE streaming_events SET removed_at = ?
+            WHERE removed_at IS NULL AND last_seen_walk <= ? AND service = ? AND kind = ?`
+        ).bind(nowSec, cutoff, row.service, row.kind)
+      );
+      out.marked += gone;
+    }
+
+    if (out.held.length) {
+      out.reason =
+        `pass ${completedWalk} concluded that whole catalogues had emptied, which is not something that happens: ` +
+        out.held.join("; ") + ". Those were left alone -- check TMDB for that provider.";
+      console.warn(`[Cron] New on Streaming removals skipped: ${out.reason}`);
+    }
+    await d1BatchInChunks(env, writes, "New on Streaming removals");
+    out.ran = true;
+  } catch (e) {
+    out.reason = safeErrorMessage(e);
+    console.warn("[Cron] New on Streaming removals failed:", e && e.message ? e.message : e);
+  }
+  return out;
+}
+
+// D1 caps how much one batch may carry, and a sweep tick can produce a few
+// hundred statements. Chunked, and each chunk is its own transaction: a
+// failure part-way leaves the earlier chunks committed, which for this table
+// means some arrivals recorded and the rest re-found on the next pass.
+async function d1BatchInChunks(env, statements, label) {
+  if (!env || !env.DB || !statements.length) return;
+  const CHUNK = 20;
+  for (let i = 0; i < statements.length; i += CHUNK) {
+    try {
+      await env.DB.batch(statements.slice(i, i + CHUNK));
+    } catch (e) {
+      console.warn(`[Cron] ${label}: a batch of writes failed:`, e && e.message ? e.message : e);
+    }
+  }
+}
+
+// Reads one show's most recently aired episode, cached in KV for six hours.
+//
+// Six, not the thirty days fetchTmdbDetails caches an IMDb id for: an external
+// id never changes and this answer changes every week the show is airing. Six
+// hours also bounds the KV write cost: a show is re-written at most four times
+// a day however many ticks look at it, so the airing set as a whole stays in
+// the low hundreds of writes -- irrelevant on the paid plan this sweep needs
+// anyway, and the free plan never reaches here (its budget comes out at 0).
+async function fetchNewOnStreamingLatestEpisode(tmdbId, apiKey, env) {
+  const cacheKey = `nosepisode:${tmdbId}`;
+  if (env && env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(cacheKey);
+      if (raw) return JSON.parse(raw);
+    } catch (e) {}
+  }
+  const src = `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}?api_key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(src, {
+    headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+    cf: { cacheTtl: 3600, cacheEverything: true },
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const last = data && data.last_episode_to_air;
+  const out = last && last.air_date
+    ? { airDate: String(last.air_date), season: Number(last.season_number) || null, episode: Number(last.episode_number) || null }
+    : { airDate: null, season: null, episode: null };
+  if (env && env.CONFIGS) {
+    try {
+      await env.CONFIGS.put(cacheKey, JSON.stringify(out), { expirationTtl: 21600 });
+    } catch (e) {}
+  }
+  return out;
+}
+
+// The second half of the ordering: a show already on the shelf goes back to
+// the top when a new episode airs.
+//
+// Scoped to shows the table already carries, which is what keeps it cheap. The
+// discover call per provider is a candidate list, not the answer -- it says an
+// episode aired inside the window but not which day, and the shelf sorts on
+// the day. Only candidates with a row here get the detail call that answers
+// that, and the bump then applies to EVERY service carrying the show, because
+// a new episode is new wherever you watch it.
+async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
+  const summary = { ran: false, reason: "", candidates: 0, checked: 0, bumped: 0, errors: 0 };
+  if (!env || !env.CONFIGS || !env.DB) {
+    summary.reason = "needs both KV and a bound D1 database";
+    return summary;
+  }
+  const apiKey = (env && env.TMDB_API_KEY) || TMDB_API_KEY;
+  if (!apiKey) {
+    summary.reason = "TMDB_API_KEY is not set";
+    return summary;
+  }
+  const budget = Number.isFinite(fetchBudget) ? Math.max(0, fetchBudget) : Infinity;
+  // Two providers at NEW_ON_STREAMING_EPISODE_SCAN_PAGES pages each is the
+  // floor: below that the candidate scan cannot even complete, and a partial
+  // scan would report "nothing aired" rather than "I did not look".
+  if (budget < NEW_ON_STREAMING_EPISODE_SCAN_PAGES * 2) {
+    summary.reason = `skipped: this tick's share is ${budget} fetches`;
+    return summary;
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const todayIso = new Date(nowSec * 1000).toISOString().slice(0, 10);
+  const sinceIso = new Date((nowSec - NEW_ON_STREAMING_EPISODE_WINDOW_DAYS * 86400) * 1000)
+    .toISOString().slice(0, 10);
+  const region = NEW_ON_STREAMING_REGIONS[0];
+
+  // Two providers a tick, rotating. Their airing shows overlap heavily, and
+  // the answer per show is KV-cached for six hours, so sweeping all of them
+  // every tick would mostly re-read the same cache.
+  let epCursor = 0;
+  try {
+    const raw = await env.CONFIGS.get("cron:newonstreaming:epcursor");
+    const parsed = parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) epCursor = parsed % NEW_ON_STREAMING_PROVIDERS.length;
+  } catch (e) {}
+
+  const candidateIds = new Set();
+  const providersThisTick = Math.min(2, NEW_ON_STREAMING_PROVIDERS.length);
+  for (let n = 0; n < providersThisTick; n++) {
+    const provider = NEW_ON_STREAMING_PROVIDERS[(epCursor + n) % NEW_ON_STREAMING_PROVIDERS.length];
+    for (let p = 1; p <= NEW_ON_STREAMING_EPISODE_SCAN_PAGES; p++) {
+      const path =
+        `discover/tv?with_watch_providers=${provider.tmdbId}&watch_region=${encodeURIComponent(region)}` +
+        `&with_watch_monetization_types=flatrate&include_adult=false&sort_by=popularity.desc` +
+        `&air_date.gte=${sinceIso}&air_date.lte=${todayIso}&page=${p}`;
+      let page;
+      try {
+        page = await fetchNewOnStreamingPage(path, apiKey);
+      } catch (e) {
+        summary.errors++;
+        console.warn(`[Cron] New on Streaming episode scan ${provider.key} p${p} failed:`, e && e.message ? e.message : e);
+        break;
+      }
+      for (const it of page.items) {
+        if (it && it.id) candidateIds.add(Number(it.id));
+      }
+      // Past the end of what is airing on this service -- the next page cannot
+      // hold anything either.
+      if (!page.items.length) break;
+    }
+  }
+  summary.candidates = candidateIds.size;
+
+  try {
+    await env.CONFIGS.put(
+      "cron:newonstreaming:epcursor",
+      String((epCursor + providersThisTick) % NEW_ON_STREAMING_PROVIDERS.length)
+    );
+  } catch (e) {}
+
+  if (!candidateIds.size) {
+    summary.ran = true;
+    return summary;
+  }
+
+  // Which candidates the shelf actually carries, and what date each is
+  // currently sorted on -- a show whose row already sits at or past its
+  // latest episode needs no detail call and no write.
+  //
+  // Ordered by the date each row currently sorts on, oldest first, and cut at
+  // the per-tick limit. That rotates on its own: a show that gets bumped moves
+  // to today and so goes to the back of this queue, letting the ones that have
+  // not been looked at reach the front. Ordering the other way, or not at all,
+  // would mean the same handful of shows were re-resolved every tick while the
+  // rest were never reached.
+  const ids = [...candidateIds].slice(0, 200);
+  const placeholders = ids.map(() => "?").join(",");
+  let rows = [];
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT tmdb_id, MAX(last_event_at) AS ev FROM streaming_events
+        WHERE region = ? AND kind = 'series' AND tmdb_id IN (${placeholders})
+        GROUP BY tmdb_id
+        ORDER BY ev ASC
+        LIMIT ?`
+    ).bind(region, ...ids, NEW_ON_STREAMING_EPISODE_SHOWS_PER_TICK).all();
+    rows = results || [];
+  } catch (e) {
+    summary.errors++;
+    console.warn("[Cron] New on Streaming episode bump could not read the table:", e && e.message ? e.message : e);
+    return summary;
+  }
+
+  const writes = [];
+  for (const row of rows) {
+    const tmdbId = Number(row && row.tmdb_id);
+    if (!Number.isFinite(tmdbId)) continue;
+    summary.checked++;
+    let latest;
+    try {
+      latest = await fetchNewOnStreamingLatestEpisode(tmdbId, apiKey, env);
+    } catch (e) {
+      summary.errors++;
+      continue;
+    }
+    if (!latest || !latest.airDate) continue;
+    // newOnStreamingDateToEpoch clamps a future date to now rather than
+    // rejecting it, which is what should happen here: TMDB's
+    // last_episode_to_air can read a few hours ahead across timezones, and an
+    // episode airing today is exactly what this pass is for.
+    const airedAt = newOnStreamingDateToEpoch(latest.airDate, nowSec);
+    // Unparseable, or no newer than what the row already sorts on: nothing to
+    // move. The second half is what makes a re-scan of the same show free.
+    if (!airedAt || airedAt <= Number(row.ev || 0)) continue;
+    if (airedAt < nowSec - NEW_ON_STREAMING_EPISODE_WINDOW_DAYS * 86400) continue;
+    summary.bumped++;
+    writes.push(
+      env.DB.prepare(
+        `UPDATE streaming_events
+            SET last_event_at = ?, event_kind = 'episode', season = ?, episode = ?
+          WHERE region = ? AND kind = 'series' AND tmdb_id = ? AND last_event_at < ?`
+      ).bind(airedAt, latest.season, latest.episode, region, tmdbId, airedAt)
+    );
+  }
+
+  await d1BatchInChunks(env, writes, "New on Streaming episode bump");
+  summary.ran = true;
+  try {
+    await env.CONFIGS.put(
+      "cron:newonstreaming:lastbump",
+      JSON.stringify({ at: nowSec, ...summary }),
+      { expirationTtl: 2592000 }
+    );
+  } catch (e) {}
+  return summary;
+}
+
+// Serves the catalog. One indexed D1 read, no outbound fetch.
+//
+// GROUP BY imdb_id collapses a title carried by several of the selected
+// services into one row, and MAX(last_event_at) picks the most recent arrival
+// among them -- a film that has been on Netflix for a year and landed on Hulu
+// this morning IS new on streaming this morning. SQLite resolves the other
+// bare columns from the row that supplied that MAX (its documented behaviour
+// for a bare column alongside MAX/MIN), so the name and poster come from the
+// same sighting the date does.
+async function fetchNewOnStreaming(entry, skip = 0, keys = {}) {
+  const env = keys && keys.env;
+  if (!env || !env.DB) {
+    throw new Error(
+      "New on Streaming needs a D1 database. The Worker owner has to bind one as DB and run migrations/0011_add_streaming_events.sql."
+    );
+  }
+  const kind = entry && entry.type === "series" ? "series" : "movie";
+  const region = newOnStreamingRegion(keys.region);
+  const services = parseNewOnStreamingServices(
+    String((entry && entry.url) || "").trim().slice("tmdb:new-on-streaming".length).replace(/^:/, "")
+  );
+  const selected = services || NEW_ON_STREAMING_PROVIDERS.map((p) => p.key);
+  const placeholders = selected.map(() => "?").join(",");
+
+  let results = [];
+  let total = null;
+  try {
+    // COUNT(DISTINCT ...) needs a temporary b-tree over the whole matching
+    // range, which the paged read itself does not -- and it is only ever
+    // displayed on the first page. Every page after the first skips it.
+    const wantTotal = Math.max(0, skip) === 0;
+    const [page, count] = await Promise.all([
+      env.DB.prepare(
+        `SELECT imdb_id, name, poster, background, year, MAX(last_event_at) AS ev
+           FROM streaming_events
+          WHERE region = ? AND kind = ? AND removed_at IS NULL AND service IN (${placeholders})
+          GROUP BY imdb_id
+          ORDER BY ev DESC
+          LIMIT ? OFFSET ?`
+      ).bind(region, kind, ...selected, PAGE_SIZE, Math.max(0, skip)).all(),
+      wantTotal
+        ? env.DB.prepare(
+            `SELECT COUNT(DISTINCT imdb_id) AS n
+               FROM streaming_events
+              WHERE region = ? AND kind = ? AND removed_at IS NULL AND service IN (${placeholders})`
+          ).bind(region, kind, ...selected).all()
+        : null,
+    ]);
+    results = (page && page.results) || [];
+    const countRow = ((count && count.results) || [])[0];
+    if (countRow && Number.isFinite(Number(countRow.n))) total = Number(countRow.n);
+  } catch (e) {
+    // The one failure worth naming specifically: the Worker is deployed and
+    // the migration is not. Everything else stays generic.
+    const msg = String((e && e.message) || e);
+    if (/no such table/i.test(msg)) {
+      throw new Error(
+        "New on Streaming has no table to read. Run migrations/0011_add_streaming_events.sql against this Worker's D1 database."
+      );
+    }
+    throw new Error("New on Streaming could not be read from the database.");
+  }
+
+  const metas = results.map((row) => ({
+    id: row.imdb_id,
+    type: entry.type,
+    name: row.name || "",
+    poster: row.poster || `https://images.metahub.space/poster/medium/${row.imdb_id}/img`,
+    background: row.background || undefined,
+    releaseInfo: row.year || undefined,
+  }));
+  metas.totalItems = total;
+  return metas;
+}
+
+// What the admin dashboard reads: enough to tell a sweep that is working from
+// one that has never run, without opening the database by hand.
+async function newOnStreamingStatus(env) {
+  const combos = newOnStreamingCombos();
+  const depths = await readNewOnStreamingDepths(env);
+  const out = {
+    d1Bound: !!(env && env.DB),
+    tableReady: false,
+    region: NEW_ON_STREAMING_REGIONS[0],
+    providers: NEW_ON_STREAMING_PROVIDERS.map((p) => ({ key: p.key, name: p.name, tmdbId: p.tmdbId })),
+    inQuickAdd: NEW_ON_STREAMING_IN_QUICK_ADD,
+    combos: combos.length,
+    // 0 until the first pass has measured the catalogs. Reported rather than
+    // assumed, because "how big is a pass" is the number that says how long a
+    // full sweep -- and so a removal -- takes, and it is not a constant.
+    passPages: newOnStreamingPassPages(combos, depths),
+    unitsPerTick: NEW_ON_STREAMING_PAGES_PER_TICK,
+    depthsKnown: combos.filter((c) => depths[c.key] > 0).length,
+    cursor: { page: 1, idx: 0, walk: 0, passErrors: 0 },
+    lastSweep: null,
+    lastBump: null,
+    byService: [],
+    totals: { movie: 0, series: 0, seeded: 0, observed: 0, removed: 0 },
+    error: "",
+  };
+  if (env && env.CONFIGS) {
+    out.cursor = await readNewOnStreamingCursor(env);
+    for (const [kvKey, field] of [["cron:newonstreaming:lastsweep", "lastSweep"], ["cron:newonstreaming:lastbump", "lastBump"]]) {
+      try {
+        const raw = await env.CONFIGS.get(kvKey);
+        if (raw) out[field] = JSON.parse(raw);
+      } catch (e) {}
+    }
+  }
+  if (!out.d1Bound) return out;
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT service, kind,
+              SUM(CASE WHEN removed_at IS NULL THEN 1 ELSE 0 END) AS live,
+              SUM(CASE WHEN removed_at IS NULL THEN seeded ELSE 0 END) AS seeded,
+              SUM(CASE WHEN removed_at IS NOT NULL THEN 1 ELSE 0 END) AS removed,
+              MAX(CASE WHEN removed_at IS NULL THEN last_event_at ELSE 0 END) AS newest
+         FROM streaming_events
+        WHERE region = ?
+        GROUP BY service, kind`
+    ).bind(out.region).all();
+    out.tableReady = true;
+    for (const row of (results || [])) {
+      const n = Number(row.live) || 0;
+      const seeded = Number(row.seeded) || 0;
+      const removed = Number(row.removed) || 0;
+      const key = `${out.region}:${row.service}:${row.kind === "series" ? "tv" : "movie"}`;
+      out.byService.push({
+        service: String(row.service || ""),
+        kind: String(row.kind || ""),
+        count: n,
+        seeded,
+        observed: n - seeded,
+        removed,
+        pages: newOnStreamingDepthOf(depths, key),
+        measured: !!depths[key],
+        newest: Number(row.newest) || 0,
+      });
+      if (row.kind === "series") out.totals.series += n; else out.totals.movie += n;
+      out.totals.seeded += seeded;
+      out.totals.observed += n - seeded;
+      out.totals.removed += removed;
+    }
+    out.byService.sort((a, b) => a.service.localeCompare(b.service) || a.kind.localeCompare(b.kind));
+  } catch (e) {
+    out.error = /no such table/i.test(String((e && e.message) || e))
+      ? "streaming_events does not exist yet -- run migrations/0011_add_streaming_events.sql."
+      : safeErrorMessage(e);
+  }
+  return out;
+}
+
 // --- Anime Unpacking & Multi-Season Parts Resolution -------------------------
 // Fixes TMDB cataloging that compresses multi-season anime (e.g. MASHLE 24 eps,
 // Re:ZERO 85 eps, Jujutsu Kaisen 59 eps) into a single monolithic season.
@@ -15108,6 +18157,121 @@ async function resolveUnpackedShowData(tmdbId, imdbId, standardSeasons, apiKey, 
 // the same shared, canonical-key cache Trakt already uses
 // (fetchWithPerUserCacheAndCircuitBreaker) -- unlike the catalog/chart
 // fetchers above, this function IS reachable with a personal TMDB key
+// --- Episode air times (TVmaze) ---------------------------------------------
+//
+// TMDB dates an episode and stops: there is no air time anywhere in its TV
+// payloads, which is why every "Airs Tuesday" in this add-on has been a day
+// with no hour behind it. TVmaze carries both -- a show's regular slot
+// (schedule.time, in its network country's IANA timezone) and each episode's
+// own airtime -- and it needs no API key, so a self-hosted Worker gets this
+// with nothing to configure and nothing to pay for.
+//
+// It is only ever asked about a show with an episode still to come (see the
+// call in fetchTmdbItemDetailsUncached), which is the only case anything
+// displays, and the answer is cached for twelve hours: a broadcast slot is a
+// fact about a season, not about a day.
+const TVMAZE_API_BASE = "https://api.tvmaze.com";
+
+async function fetchShowAirTimeUncached(imdbId, meter) {
+  const spend = () => { if (meter) meter.spent++; };
+  // A shape rather than null, so a show TVmaze has never heard of caches as
+  // "asked, nothing there" instead of being looked up again on every hit.
+  const nothing = { time: null, timezone: null, label: "", days: [], next: null };
+  const baseImdb = String(imdbId || "").split(":")[0].trim();
+  if (!baseImdb.startsWith("tt")) return nothing;
+
+  try {
+    spend();
+    const res = await fetch(TVMAZE_API_BASE + "/lookup/shows?imdb=" + encodeURIComponent(baseImdb), {
+      headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+      cf: { cacheTtl: 43200, cacheEverything: true },
+    });
+    if (!res.ok) return nothing;
+    const show = await res.json();
+    if (!show || typeof show !== "object") return nothing;
+
+    // A broadcast network carries the country its schedule is quoted in; a
+    // streaming service usually does not, and usually has no time at all --
+    // which is the honest answer for something that drops at midnight in
+    // whatever zone you happen to be in.
+    const timezone =
+      (show.network && show.network.country && show.network.country.timezone) ||
+      (show.webChannel && show.webChannel.country && show.webChannel.country.timezone) ||
+      "";
+    const time = (show.schedule && show.schedule.time) || "";
+    const out = {
+      time: time || null,
+      timezone: timezone || null,
+      label: formatAirTimeLabel(time, timezone),
+      days: (show.schedule && Array.isArray(show.schedule.days)) ? show.schedule.days : [],
+      next: null,
+    };
+
+    // The next episode is the one every "Airs Tomorrow" badge is about, and
+    // the one most likely to sit outside the regular slot -- a feature-length
+    // premiere, a finale moved an hour later. One more small fetch buys the
+    // exact answer for it; every other upcoming episode keeps the show's
+    // regular slot, which is what a listing would print for them anyway.
+    const nextHref = show._links && show._links.nextepisode && show._links.nextepisode.href;
+    if (nextHref && String(nextHref).startsWith(TVMAZE_API_BASE + "/")) {
+      try {
+        spend();
+        const epRes = await fetch(String(nextHref), {
+          headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+          cf: { cacheTtl: 43200, cacheEverything: true },
+        });
+        if (epRes.ok) {
+          const ep = await epRes.json();
+          if (ep && typeof ep.season === "number" && typeof ep.number === "number") {
+            out.next = {
+              season: ep.season,
+              number: ep.number,
+              airdate: ep.airdate || null,
+              time: ep.airtime || null,
+              label: formatAirTimeLabel(ep.airtime || time, timezone),
+            };
+          }
+        }
+      } catch {}
+    }
+    return out;
+  } catch {
+    return nothing;
+  }
+}
+
+// Which of the two labels an upcoming episode gets: its own, when TVmaze
+// dates that exact episode apart from the show's regular slot, and the regular
+// slot otherwise. One rule, so the Worker's Stremio description and the page
+// cannot print different times for the same episode.
+function airTimeLabelForNextEpisode(airTime, nextEpInfo) {
+  if (!airTime) return null;
+  const next = airTime.next;
+  if (next && next.label &&
+      nextEpInfo && Number(nextEpInfo.nextEpisodeSeasonNumber) === Number(next.season) &&
+      Number(nextEpInfo.nextEpisodeNumber) === Number(next.number)) {
+    return next.label;
+  }
+  return airTime.label || null;
+}
+
+async function fetchShowAirTime(imdbId, env, ctx, meter) {
+  const baseImdb = String(imdbId || "").split(":")[0].trim();
+  if (!baseImdb.startsWith("tt")) return null;
+  const cacheKey = `tvmaze:airtime:${baseImdb}`;
+  return await fetchWithPerUserCacheAndCircuitBreaker({
+    cacheKey,
+    freshTtlSec: 43200,
+    staleTtlSec: 604800,
+    providerLabel: "TVmaze Air Times",
+    env: env,
+    ctx: ctx,
+    kvKey: cacheKey,
+    kvTtlSec: 604800,
+    fetchFn: () => fetchShowAirTimeUncached(baseImdb, meter),
+  });
+}
+
 // (see /api/details in 25_api-catalog-routes.js, and handleSubtitlesTrack
 // in 26_api-creator-and-admin-routes.js, both of which pass
 // `tmdbKey || TMDB_API_KEY`). Every one of its internal fetch() calls
@@ -15125,10 +18289,25 @@ async function resolveUnpackedShowData(tmdbId, imdbId, standardSeasons, apiKey, 
 // and so never touches it, which is what lets the batch route keep spending
 // one invocation on a whole warm refresh while still fitting a free Worker's
 // 50-fetch budget when the ids are cold. Every other caller passes nothing.
+// The SHAPE of what this function returns, as a cache key segment. Bump it
+// whenever a field is added to or removed from the details payload.
+//
+// Entries live for two hours fresh in isolate memory and a week in KV, keyed
+// only by id/type/region, so a deploy that adds a field kept serving payloads
+// written WITHOUT it -- correct-looking, just missing the new thing, for up to
+// two hours after the code that fills it went live. That is exactly how air
+// times shipped and then did not appear: the stored copy of a show someone had
+// just opened had no airTime in it, and nothing about the key said the shape
+// had moved on. Changing the key retires every old entry at once, at the cost
+// of one cold lookup per title.
+//
+// v2: airTime / nextEpisodeAirTimeLabel (episode air times).
+const ITEM_DETAILS_SHAPE = "v2";
+
 async function fetchTmdbItemDetails(imdbId, apiKey, fallbackType, region, bypassCache, env, ctx, meter) {
   if (!apiKey || !imdbId) return null;
   const effectiveRegion = (region || "US").toUpperCase().slice(0, 2) || "US";
-  const cacheKey = `tmdb:itemdetails:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
+  const cacheKey = `tmdb:itemdetails:${ITEM_DETAILS_SHAPE}:${String(imdbId).trim()}:${fallbackType || ""}:${effectiveRegion}`;
 
   const upgradeIfUnpacked = async (d) => {
     if (!d || !Array.isArray(d.seasonsData)) return d;
@@ -15443,6 +18622,16 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
 
   const isUnairedFuture = !!(nextEpInfo && nextEpInfo.nextEpisodeAirDate && nextEpInfo.nextEpisodeAirDate > today);
 
+  // The hour behind the date, for a show that still has one to come. Gated on
+  // next_episode_to_air as well as isUnairedFuture because that flag is
+  // strictly future -- an episode airing TODAY does not set it, and today is
+  // exactly when someone wants to know what time it is on. A finished show is
+  // never looked up: its air time is a fact about the past, and nothing
+  // displays a time against an episode that has already gone out.
+  const airTime = (type === "tv" && (match.next_episode_to_air || isUnairedFuture))
+    ? await fetchShowAirTime(realImdbId, env, ctx, meter)
+    : null;
+
   if (type === "tv" && isUnairedFuture && nextEpInfo.nextEpisodeSeasonNumber) {
     const targetSeason = Array.isArray(match.seasons)
       ? match.seasons.find((s) => s && s.season_number === nextEpInfo.nextEpisodeSeasonNumber)
@@ -15500,6 +18689,12 @@ async function fetchTmdbItemDetailsUncached(imdbId, apiKey, fallbackType, region
     cast: cast,
     director: director,
     ...nextEpInfo,
+    // The show's regular slot, for every upcoming episode, and the exact slot
+    // of the next one where TVmaze dates it separately. Both are finished
+    // strings ("9 PM ET"): the page never has to carry a timezone database to
+    // print one.
+    airTime: airTime || null,
+    nextEpisodeAirTimeLabel: airTimeLabelForNextEpisode(airTime, nextEpInfo),
     isSeasonPremiere: isSeasonPremiere,
     isSeasonFinale: isSeasonFinale,
     seasonFinaleAirDate: seasonFinaleAirDate,
@@ -16719,6 +19914,53 @@ function buildGenresHtml() {
   return buildStreamingRowsHtml(GENRE_LISTS, "", "Genres");
 }
 
+// --- New on Streaming ------------------------------------------------------
+//
+// One row per service plus an everything row, all served by the same source
+// (tmdb:new-on-streaming, 07_source-fetchers-tmdb-simkl.js) and all sorted the
+// same way: most recently arrived first, with a show pushed back to the top
+// when a new episode airs.
+//
+// Built from NEW_ON_STREAMING_PROVIDERS rather than written out, so the
+// service list has exactly one definition -- the sweep and the shelf cannot
+// disagree about which services exist, and adding a provider is one line in
+// 00_constants.js rather than a line here that someone has to remember.
+const NEW_ON_STREAMING_LISTS = [
+  { name: "New on Streaming", movieUrl: "tmdb:new-on-streaming", showUrl: "tmdb:new-on-streaming" },
+  ...NEW_ON_STREAMING_PROVIDERS.map((p) => ({
+    name: `New on ${p.name}`,
+    movieUrl: `tmdb:new-on-streaming:${p.key}`,
+    showUrl: `tmdb:new-on-streaming:${p.key}`,
+  })),
+];
+
+// Hidden until NEW_ON_STREAMING_IN_QUICK_ADD is flipped. The source itself
+// stays live the whole time -- the point of shipping it dark is to test the
+// real catalog against real swept data from the admin dashboard, which cannot
+// be done if the fetcher is off too.
+function buildNewOnStreamingHtml() {
+  if (!NEW_ON_STREAMING_IN_QUICK_ADD) return "";
+  return buildStreamingRowsHtml(NEW_ON_STREAMING_LISTS, "", "New on Streaming");
+}
+
+// The Quick Add tab wraps each group in its own titled card with an "+ Add
+// all" button, unlike the Discover tab which drops the rows in bare -- so the
+// whole card has to be gated, not just its contents, or hiding the shelf would
+// leave a titled empty box behind.
+function buildNewOnStreamingQuickAddCard() {
+  const rows = buildNewOnStreamingHtml();
+  if (!rows) return "";
+  return `
+    <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">New on Streaming</h2>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="new-on-streaming">+ Add all</button>
+      </div>
+      <p class="qa-shelf-sub">What just arrived on each service, newest first &mdash; and a show returns to the top the day a new episode airs:</p>
+      ${rows}
+    </div>`;
+}
+
 // --- Clean, shareable /lists/<slug> urls for every native/official chart ---
 //
 // "TMDB Trending" -> "TMDB-Trending" -- title case preserved, everything
@@ -16762,6 +20004,11 @@ const CHART_SLUG_ENTRIES = (() => {
     ...KIDS_LISTS,
     ...HOLIDAY_LISTS,
     ...GENRE_LISTS,
+    // Gated with the shelf itself: a /lists/New-on-Streaming page that works
+    // while nothing links to it is still a public page, and "admin only for
+    // now" has to mean the catalog is reachable by pasting its source url,
+    // not by guessing a slug.
+    ...(NEW_ON_STREAMING_IN_QUICK_ADD ? NEW_ON_STREAMING_LISTS : []),
   ].forEach((p) => add(p.name, p.movieUrl, p.showUrl));
   [...TRAKT_BOXOFFICE_LIST, SIMKL_ANIME_LIST[0]].forEach((p) => add(p.name, p.url, p.url));
   COMBINED_CHART_LISTS.forEach((p) => add(p.name, p.movieUrls.join("\n"), p.showUrls.join("\n")));
@@ -16850,6 +20097,11 @@ function renderBuilder(
   const kidsHtml = buildKidsHtml();
   const holidaysHtml = buildHolidaysHtml();
   const genresHtml = buildGenresHtml();
+  // Both empty strings until NEW_ON_STREAMING_IN_QUICK_ADD is flipped -- the
+  // catalog itself is live either way, it just has no entry in the two places
+  // a visitor would find it. See buildNewOnStreamingHtml (08).
+  const newOnStreamingHtml = buildNewOnStreamingHtml();
+  const newOnStreamingQuickAddCard = buildNewOnStreamingQuickAddCard();
   // Precomputed here (same pattern as the *Html fragments above) rather
   // than built inline inside the giant HTML template literal below --
   // this file's template literal has bitten past changes before with
@@ -17075,8 +20327,10 @@ ${seoHeadHtml}
     border-radius: 4px;
   }
 
-  /* The page has three @keyframes animations and 33 transitions and said
-     nothing about people who have asked their system not to animate. */
+  /* The page has four @keyframes animations and 33 transitions and said
+     nothing about people who have asked their system not to animate.
+     The busy spinner (.app-spinner) is covered by this too -- it stops
+     turning, and the wording beside it is what says the work is running. */
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
       animation-duration: 0.01ms !important;
@@ -18074,6 +21328,81 @@ ${seoHeadHtml}
     gap: 8px;
     margin-top: 8px;
   }
+  /* --- Channel broadcast schedule, Story Lock & the Quick Channel wizard -- */
+  .channel-rule-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    user-select: none;
+    line-height: 1.35;
+  }
+  .channel-rule-row input[type="checkbox"] {
+    margin: 2px 0 0;
+    flex: 0 0 auto;
+  }
+  .channel-dial {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .channel-dial input,
+  .channel-dial select {
+    width: auto;
+    min-width: 76px;
+    font-size: 0.82rem;
+    padding: 5px 8px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  /* Rearranging My Channels. The handle itself is .drag-handle-list, the
+     same one a list card uses; this is only what marks the card in flight. */
+  .list-card.dragging {
+    opacity: 0.55;
+    outline: 2px dashed var(--accent);
+    outline-offset: 2px;
+  }
+  .channel-pick-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 8px;
+  }
+  .channel-pick-selected img {
+    opacity: 0.72;
+  }
+  .channel-storylock-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 6px 12px;
+    margin-top: 6px;
+  }
+  .channel-wizard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .channel-wizard-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .channel-wizard-grid select {
+    font-size: 0.85rem;
+    padding: 6px 10px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
   @media (min-width: 641px) {
     .channel-season-grid {
       grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
@@ -18157,6 +21486,12 @@ ${seoHeadHtml}
   }
   .lc-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .lc-btn.primary:hover:not(:disabled) { opacity: 0.85; }
+  /* Disabled meant "ignores clicks" and looked identical to a working
+     button, which is how a season that has not aired yet -- whose button
+     now says when it does -- would otherwise read as one that is simply
+     broken. Covers every disabled .lc-btn, including the ones already
+     disabled mid-fetch. */
+  .lc-btn:disabled { opacity: 0.55; cursor: default; }
   /* The same surface 'button.secondary' gives every Connect / Disconnect /
      Copy button, spelled with two classes so it also reaches the <a>s that
      are styled as buttons. Those needed it: 'button, .actions a' (further
@@ -18640,6 +21975,18 @@ ${seoHeadHtml}
     pointer-events: none;
     white-space: nowrap;
     text-transform: uppercase;
+  }
+  /* The hour under the day, inside the same pill -- a second line rather than
+     a longer one, because these sit on a poster barely 100px wide. */
+  .cw-date-badge-timed {
+    text-align: center;
+    max-width: calc(100% - 8px);
+  }
+  .cw-date-badge-time {
+    display: block;
+    font-weight: 700;
+    font-size: 0.95em;
+    opacity: 0.92;
   }
   .cw-date-badge-premiere {
     background: #2fa84f;
@@ -19811,6 +23158,9 @@ ${seoHeadHtml}
     color: var(--muted);
     font-size: 0.9rem;
   }
+  .season-header-episodes.is-complete {
+    color: var(--brand);
+  }
   .season-header-actions {
     flex-shrink: 0;
     margin-left: 12px;
@@ -19862,6 +23212,19 @@ ${seoHeadHtml}
   .modal-card.modal-card-wide {
     max-width: 1100px;
     width: 95vw;
+  }
+  /* The one animation in here that is not decoration: it is the only signal
+     a modal gives that a slow action (Reset Account Data, generating an
+     install link) is still running rather than stuck. The spin animation was
+     referenced by name in two places and declared in none, so both spinners
+     sat perfectly still. */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .app-spinner {
+    display: inline-block; width: 20px; height: 20px; flex: none;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
   }
   .modal-close-x {
     float: right; background: var(--bg); border: 1px solid var(--border-strong);
@@ -20339,6 +23702,7 @@ ${seoHeadHtml}
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeMovieBtn" onclick="switchListDetailsType('movie')">Movies</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeSeriesBtn" onclick="switchListDetailsType('series')">Shows</button>
+        <button type="button" class="subnav-pill generic-type-pill" id="detailTypeLineupBtn" onclick="switchListDetailsType('lineup')" style="display:none;">On Today</button>
         <button type="button" class="subnav-pill" id="cwClearHistoryBtn" onclick="clearContinueWatchingAll()" style="display:none; color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear All</button>
       </div>
       <div id="whSortControls" style="display:flex; align-items:center; gap:8px;">
@@ -20506,6 +23870,7 @@ window._CHARTS_STREAMING_ALL = ${jsonForScript(STREAMING_ALL)};
 window._CHARTS_KIDS = ${jsonForScript(KIDS_LISTS)};
 window._CHARTS_HOLIDAYS = ${jsonForScript(HOLIDAY_LISTS)};
 window._CHARTS_GENRES = ${jsonForScript(GENRE_LISTS)};
+window._CHARTS_NEW_ON_STREAMING = ${jsonForScript(NEW_ON_STREAMING_IN_QUICK_ADD ? NEW_ON_STREAMING_LISTS : [])};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }
@@ -20589,6 +23954,93 @@ if ('serviceWorker' in navigator) {
   <div class="lists-subpanel" id="catalogsSubQuickAdd" style="display:none;">
     <div id="catalogsQuickAddContainer">
 
+    <!-- Quick List Wizard Panel -->
+    <div class="panel" style="margin-bottom:14px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Quick List Wizard</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem; line-height:1.45;">Pick a network or studio, an era and a mood to quickly build curated catalog lists &mdash; separate lists for movies and shows, not combined.</p>
+      <div class="channel-wizard-grid">
+        <label>Network or studio
+          <select id="catalogWizardNetwork">
+            <option value="">Any network or studio</option>
+            <option value="49">HBO</option>
+            <option value="88">FX</option>
+            <option value="80">Adult Swim</option>
+            <option value="13">Nickelodeon</option>
+            <option value="56">Cartoon Network</option>
+            <option value="54">Disney Channel / Disney</option>
+            <option value="4">BBC One</option>
+            <option value="67">Showtime</option>
+            <option value="174">AMC</option>
+            <option value="47">Comedy Central</option>
+            <option value="213">Netflix</option>
+            <option value="1024">Prime Video</option>
+            <option value="2552">Apple TV+</option>
+            <option value="2739">Disney+</option>
+            <option value="19">FOX</option>
+            <option value="6">NBC</option>
+            <option value="16">CBS</option>
+            <option value="2">ABC</option>
+            <option value="71">The CW</option>
+            <option value="149">Syfy</option>
+            <option value="wb">Warner Bros. Pictures</option>
+            <option value="universal">Universal Pictures</option>
+            <option value="paramount">Paramount Pictures</option>
+            <option value="sony">Sony Pictures</option>
+            <option value="a24">A24</option>
+            <option value="lionsgate">Lionsgate</option>
+            <option value="mgm">MGM</option>
+          </select>
+        </label>
+        <label>Era
+          <select id="catalogWizardEra">
+            <option value="">Any era</option>
+            <option value="1970-1979">70s</option>
+            <option value="1980-1989">80s</option>
+            <option value="1990-1999">90s classics</option>
+            <option value="2000-2009">2000s</option>
+            <option value="2010-2014">Early 2010s</option>
+            <option value="2015-2099">Modern (2015+)</option>
+          </select>
+        </label>
+        <label>Genre or mood
+          <select id="catalogWizardGenre">
+            <option value="">Any genre</option>
+            <option value="80,9648">Crime &amp; thrillers</option>
+            <option value="16">Cartoons &amp; Animation</option>
+            <option value="35">Chill comedy</option>
+            <option value="18">Drama</option>
+            <option value="10765">Sci-fi &amp; fantasy</option>
+            <option value="10759">Action &amp; adventure</option>
+            <option value="10751">Family</option>
+            <option value="99">Documentary</option>
+            <option value="10762">Kids</option>
+            <option value="9648">Mystery</option>
+            <option value="27">Horror</option>
+            <option value="10749">Romance</option>
+          </select>
+        </label>
+        <label>Titles in list
+          <select id="catalogWizardSize">
+            <option value="10">Top 10 titles</option>
+            <option value="20" selected>Top 20 titles</option>
+            <option value="30">Top 30 titles</option>
+            <option value="50">Top 50 titles</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px; gap:8px; flex-wrap:wrap;">
+        <input type="text" id="catalogWizardNameInput" placeholder="List name (left blank, we will name it for you)" style="flex:1; min-width:200px;">
+        <div class="actions" style="gap:6px; flex-wrap:wrap;">
+          <button type="button" class="primary lc-btn" onclick="runCatalogListWizard('movie', this)">+ Movie List</button>
+          <button type="button" class="primary lc-btn" onclick="runCatalogListWizard('series', this)">+ Show List</button>
+          <button type="button" class="secondary lc-btn" onclick="runCatalogListWizard('both', this)">+ Both (2 Lists)</button>
+        </div>
+      </div>
+      <div id="catalogWizardStatus" style="margin-top:8px;"></div>
+    </div>
+
     <!-- Combined Charts Shelf -->
     <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
       <div class="shelf-header" style="margin-bottom:8px;">
@@ -20659,6 +24111,10 @@ if ('serviceWorker' in navigator) {
       ${streamingHtml}
     </div>
 
+    <!-- New on Streaming Shelf -- renders as an empty string, card and all,
+         until NEW_ON_STREAMING_IN_QUICK_ADD is turned on (00_constants.js). -->
+    ${newOnStreamingQuickAddCard}
+
     <!-- Kids Shelf -->
     <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
       <div class="shelf-header" style="margin-bottom:8px;">
@@ -20728,6 +24184,9 @@ if ('serviceWorker' in navigator) {
 
     <!-- Streaming Catalogs Shelf -->
     ${streamingHtml}
+
+    <!-- New on Streaming Shelf -->
+    ${newOnStreamingHtml}
 
     <!-- Hidden Gems Shelf -->
     ${hiddenGemsHtml}
@@ -20946,6 +24405,7 @@ if ('serviceWorker' in navigator) {
     <button type="button" class="subnav-pill active" data-sub="my-channels" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
     <button type="button" class="subnav-pill" data-sub="storylines" onclick="switchChannelsSubmenu('storylines', this)">Storylines &amp; Universes</button>
     <button type="button" class="subnav-pill" data-sub="quickadd" onclick="switchChannelsSubmenu('quickadd', this)">Quick Add</button>
+    <button type="button" class="subnav-pill" data-sub="explore" onclick="switchChannelsSubmenu('explore', this)">Explore Channels</button>
     <button type="button" class="subnav-pill" data-sub="import" onclick="switchChannelsSubmenu('import', this)">Import</button>
   </div>
 
@@ -20978,9 +24438,24 @@ if ('serviceWorker' in navigator) {
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="shelf-title">My Channels</h2>
-        <button type="button" class="primary lc-btn" onclick="openBuildCustomChannel()">+ New Channel</button>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button type="button" class="secondary lc-btn" onclick="createNextUpChannel(this)" title="A channel that always plays the next episode of everything you have on the go">+ Next Up Channel</button>
+          <button type="button" class="primary lc-btn" onclick="openBuildCustomChannel()">+ New Channel</button>
+        </div>
       </div>
-      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
+      <div id="channelNextUpStatus" style="margin-bottom:8px;"></div>
+      <div class="row" id="myChannelsToolbar" style="margin-bottom:10px; gap:8px;">
+        <input type="text" id="myChannelsSearchInput" aria-label="Search your channels" placeholder="Search your channels..." oninput="setMyChannelsSearch(this.value)">
+        <select id="myChannelsSortSelect" aria-label="Order your channels" onchange="setMyChannelsSort(this.value)" style="flex:none; width:auto;">
+          <option value="recent">Recently updated</option>
+          <option value="created">Recently created</option>
+          <option value="name">Name (A&ndash;Z)</option>
+          <option value="size">Most episodes</option>
+          <option value="manual">My order (drag to arrange)</option>
+        </select>
+      </div>
+      <div id="myChannelsUndoBar" style="display:none; margin-bottom:10px;"></div>
       <div id="myCreatedChannelsList"><p style="color:var(--muted); font-size:0.85rem;"><small>No channels created yet. Tap <strong>+ New Channel</strong> above or add a popular network in <strong>Quick Add</strong>.</small></p></div>
     </div>
 
@@ -21016,6 +24491,77 @@ if ('serviceWorker' in navigator) {
 
   <!-- Submenu 2: Quick Add Popular Networks -->
   <div class="channels-subpanel" id="channelsSubQuickAdd" style="display:none;">
+    <div class="panel" style="margin-bottom:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Quick Channel Wizard</h2>
+      </div>
+      <p class="qa-shelf-sub">Pick a network, an era and a mood, and we will build the channel from the top shows that match &mdash; no blank canvas to fill in.</p>
+      <div class="channel-wizard-grid">
+        <label>Network or studio
+          <select id="channelWizardNetwork">
+            <option value="">Any network</option>
+            <option value="49">HBO</option>
+            <option value="88">FX</option>
+            <option value="80">Adult Swim</option>
+            <option value="13">Nickelodeon</option>
+            <option value="56">Cartoon Network</option>
+            <option value="54">Disney Channel</option>
+            <option value="4">BBC One</option>
+            <option value="67">Showtime</option>
+            <option value="174">AMC</option>
+            <option value="47">Comedy Central</option>
+            <option value="213">Netflix</option>
+            <option value="1024">Prime Video</option>
+            <option value="2552">Apple TV+</option>
+            <option value="2739">Disney+</option>
+            <option value="19">FOX</option>
+            <option value="6">NBC</option>
+            <option value="16">CBS</option>
+            <option value="2">ABC</option>
+            <option value="71">The CW</option>
+            <option value="149">Syfy</option>
+          </select>
+        </label>
+        <label>Era
+          <select id="channelWizardEra">
+            <option value="">Any era</option>
+            <option value="1970-1979">70s</option>
+            <option value="1980-1989">80s</option>
+            <option value="1990-1999">90s classics</option>
+            <option value="2000-2009">2000s</option>
+            <option value="2010-2014">Early 2010s</option>
+            <option value="2015-2099">Modern (2015+)</option>
+          </select>
+        </label>
+        <label>Genre or mood
+          <select id="channelWizardGenre">
+            <option value="">Any genre</option>
+            <option value="80,9648">Crime &amp; thrillers</option>
+            <option value="16">Saturday morning cartoons</option>
+            <option value="35">Chill comedy</option>
+            <option value="18">Drama</option>
+            <option value="10765">Sci-fi &amp; fantasy</option>
+            <option value="10759">Action &amp; adventure</option>
+            <option value="10751">Family</option>
+            <option value="99">Documentary</option>
+            <option value="10762">Kids</option>
+            <option value="9648">Mystery</option>
+          </select>
+        </label>
+        <label>Shows in the channel
+          <select id="channelWizardSize">
+            <option value="8">Top 8 shows</option>
+            <option value="12">Top 12 shows</option>
+            <option value="16">Top 16 shows</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <input type="text" id="channelWizardNameInput" placeholder="Channel name (left blank, we will name it for you)" style="flex:1;">
+        <button type="button" class="primary" onclick="runChannelWizard(this)">Build channel</button>
+      </div>
+      <div id="channelWizardStatus" style="margin-top:8px;"></div>
+    </div>
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:8px;">
         <h2 class="shelf-title">Quick Add Popular Networks</h2>
@@ -21055,6 +24601,37 @@ if ('serviceWorker' in navigator) {
     </div>
   </div>
 
+  <!-- Submenu: Explore Channels (the community directory) -->
+  <div class="channels-subpanel" id="channelsSubExplore" style="display:none;">
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Explore Channels</h2>
+        <button type="button" class="secondary lc-btn" onclick="loadChannelDirectory(true)">Refresh</button>
+      </div>
+      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">
+        24/7 channels built and published by other people &mdash; &ldquo;Saturday Morning 90s&rdquo;, &ldquo;80s VHS Sci-Fi Vault&rdquo;, whatever anyone has put together. Add one to your own setup in a single click, then edit it however you like.
+      </p>
+      <div class="row" style="margin-bottom:10px; gap:8px;">
+        <input type="text" id="channelDirectorySearchInput" aria-label="Filter published channels" placeholder="Filter by name, description or creator..." oninput="renderChannelDirectory()">
+        <select id="channelDirectorySortSelect" aria-label="Order published channels" onchange="setChannelDirectorySort(this.value)" style="flex:none; width:auto;">
+          <option value="newest">Newest</option>
+          <option value="added">Most added</option>
+          <option value="liked">Most liked</option>
+          <option value="name">Name (A&ndash;Z)</option>
+        </select>
+      </div>
+      <div id="channelDirectoryFeed"><p style="color:var(--muted); font-size:0.85rem;"><small>Loading published channels&hellip;</small></p></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Publish one of your own</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Publishing needs a Creator Profile, so a listing has an owner who can take it down again. Sharing a private link does not &mdash; use <strong>Share</strong> on any channel under My Channels for that.</p>
+      <div id="channelPublishList"></div>
+    </div>
+  </div>
+
   <!-- Submenu 3: Import & Merge Tools -->
   <div class="channels-subpanel" id="channelsSubImport" style="display:none;">
     <div class="panel">
@@ -21069,6 +24646,23 @@ if ('serviceWorker' in navigator) {
         <input type="text" id="channelImportNameInput" placeholder="Channel name (e.g. Sitcom Central)">
         <button type="button" class="secondary" onclick="importChannelFromLink(this)">Import channel</button>
       </div>
+      <label class="channel-rule-row" style="margin-top:10px;">
+        <input type="checkbox" id="channelImportLiveSyncCheck" checked>
+        <span>Live Cloud Sync &mdash; keep this channel following the list instead of taking a one-time snapshot</span>
+      </label>
+      <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">The channel remembers the list URL and rebuilds its pool in the background, so titles the list gains turn up here on their own.</p>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Add a shared channel</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Paste a channel share link (or just its code) to rebuild that exact channel here &mdash; every pick, its play order and its broadcast schedule.</p>
+      <div class="row">
+        <input type="text" id="channelShareCodeInput" placeholder="https://... /channel/AbC123 &mdash; or the code on its own" onkeydown="if(event.key==='Enter'){event.preventDefault();importSharedChannel(this);}">
+        <button type="button" class="secondary" onclick="importSharedChannel(this)">Add channel</button>
+      </div>
+      <div id="channelShareImportStatus" style="margin-top:8px;"></div>
     </div>
   </div>
 
@@ -21082,6 +24676,7 @@ if ('serviceWorker' in navigator) {
       <div class="subnav-pills-bar" id="channelSearchTypeChips" style="margin-bottom:10px;">
         <button type="button" class="subnav-pill active" id="channelSearchTypeShowsBtn" onclick="setChannelSearchType('tv', this)"><span class="check-icon">&#x2713;</span> Shows</button>
         <button type="button" class="subnav-pill" id="channelSearchTypeMoviesBtn" onclick="setChannelSearchType('movie', this)">Movies</button>
+        <button type="button" class="subnav-pill" id="channelSearchTypePeopleBtn" onclick="setChannelSearchType('person', this)">Actors &amp; Directors</button>
       </div>
       <div class="row">
         <input type="text" id="channelSearchInput" placeholder="Search a show by name..." onkeydown="if(event.key==='Enter'){event.preventDefault();runChannelTitleSearch();}">
@@ -21092,16 +24687,105 @@ if ('serviceWorker' in navigator) {
 
       <div id="channelCrossoverSuggestions" style="display:none; margin-top:14px;"></div>
 
-      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel:</p>
+      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel: <span id="channelDraftCountBadge" style="color:var(--muted); font-weight:500;"></span></p>
+      <div id="channelDraftStats" style="margin:0 0 8px; color:var(--muted); font-size:0.78rem;"></div>
+      <div class="row" style="margin-bottom:8px; gap:8px;">
+        <input type="text" id="channelDraftFilterInput" aria-label="Filter these picks" placeholder="Filter these picks by show or episode name..." oninput="setChannelDraftFilter(this.value)">
+        <button type="button" class="secondary lc-btn" id="channelDraftSelectModeBtn" style="flex:none; width:auto; white-space:nowrap;" onclick="toggleChannelDraftSelectMode()">Select</button>
+      </div>
+      <div id="channelDraftBulkBar" style="display:none; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:8px; padding:8px; border:1px solid var(--border); border-radius:8px; background:var(--surface);">
+        <span id="channelDraftSelectionCount" style="font-size:0.8rem; font-weight:600;">0 selected</span>
+        <button type="button" class="secondary lc-btn" onclick="selectAllChannelDraftShown(true)">Select shown</button>
+        <button type="button" class="secondary lc-btn" onclick="selectAllChannelDraftShown(false)">Clear</button>
+        <select id="channelDraftSelectShowSelect" onchange="selectChannelDraftByGroup(this.value); this.selectedIndex = 0;" style="font-size:0.82rem; padding:5px 8px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="">Select a whole show or season&hellip;</option>
+        </select>
+        <span style="flex:1;"></span>
+        <button type="button" class="secondary lc-btn" onclick="pairChannelDraftSelection()" title="Play these picks back to back, in this order">Pair</button>
+        <button type="button" class="secondary lc-btn" onclick="unpairChannelDraftSelection()" title="Drop any hand-made pairing on these picks">Unpair</button>
+        <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('top')">To top</button>
+        <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('bottom')">To bottom</button>
+        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeChannelDraftSelection()">Remove selected</button>
+      </div>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
-        <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft()">Shuffle picks now</button>
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove all</button>
       </div>
-      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
-        <input type="checkbox" id="channelRandomizeCheck">
-        <span style="font-size:0.85rem;">Randomize play order (reshuffles once a day)</span>
-      </label>
+      <div style="display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap;">
+        <label for="channelPlayOrderSelect" style="font-size:0.85rem; font-weight:600; white-space:nowrap;">Play order:</label>
+        <select id="channelPlayOrderSelect" onchange="applyChannelPlayOrder(this.value)" style="flex:1; min-width:210px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="as-listed">As listed (custom)</option>
+          <option value="aired-asc">Air date &mdash; oldest first</option>
+          <option value="aired-desc">Air date &mdash; newest first</option>
+          <option value="show-season-episode">Show, then season &amp; episode</option>
+          <option value="interleave">Interleaved &mdash; one episode per show, in turn</option>
+          <option value="title-az">Title A&ndash;Z</option>
+          <option value="shuffle-now">Shuffle now</option>
+          <option value="shuffle-daily">Shuffle daily (reshuffles every 24h)</option>
+        </select>
+      </div>
+      <p id="channelPlayOrderHint" style="margin:6px 0 0; color:var(--muted); font-size:0.78rem;">Picks play in the order listed above &mdash; drag one, or type a new position, to change it.</p>
+
+      <!-- Broadcast schedule & smart rules -->
+      <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+        <p style="margin:0 0 8px; font-weight:600; font-size:0.85rem;">Broadcast schedule</p>
+        <label class="channel-rule-row">
+          <input type="checkbox" id="channelDailyRotateCheck" onchange="updateChannelBroadcastControls()">
+          <span>Daily Broadcast Schedule &mdash; run a fresh lineup out of these picks every day</span>
+        </label>
+        <div id="channelDailyRotateDials" style="display:none; margin:8px 0 0 24px; flex-wrap:wrap; gap:10px;">
+          <label class="channel-dial">Shows per day
+            <input type="number" id="channelRotateShowsInput" min="1" max="48" step="1" value="24" onchange="updateChannelBroadcastControls()">
+          </label>
+          <label class="channel-dial">Episodes per block
+            <input type="number" id="channelRotateEpisodesInput" min="1" max="12" step="1" value="3" onchange="updateChannelBroadcastControls()">
+          </label>
+          <label class="channel-dial">Turns over at
+            <input type="time" id="channelRotateTurnoverTime" value="00:00" onchange="updateChannelBroadcastControls()">
+          </label>
+          <label class="channel-dial">In
+            <select id="channelRotateTurnoverZone" onchange="updateChannelBroadcastControls()">
+              <option value="utc">UTC</option>
+              <option value="local">my local time</option>
+            </select>
+          </label>
+        </div>
+        <p id="channelDailyRotateHint" style="margin:6px 0 0 24px; color:var(--muted); font-size:0.78rem;">Off &mdash; every pick in this channel plays, in the order above.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelHideWatchedCheck">
+          <span>Hide watched &mdash; skip episodes already in my Watch History</span>
+        </label>
+        <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Needs Auto-track playback signed in. Once every pick has been seen, the whole channel comes back rather than going dark. Leave it off to keep watched episodes in the rotation.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelPairPartsCheck" onchange="updateChannelBroadcastControls()">
+          <span>Keep multi-part episodes together</span>
+        </label>
+        <p id="channelPairPartsHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Finds &ldquo;Part 1&rdquo; / &ldquo;Pt. II&rdquo; / &ldquo;(2)&rdquo; in episode titles. Whenever one part is on today, the rest play straight after it instead of turning up tomorrow.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelAutoNewEpisodesCheck" onchange="updateChannelBroadcastControls()">
+          <span>Automatically add new episodes</span>
+        </label>
+        <div id="channelNewEpisodesRow" style="display:none; margin:6px 0 0 24px;">
+          <label class="channel-rule-row">
+            <input type="checkbox" id="channelNewEpisodesTopCheck">
+            <span>Put new episodes at the top</span>
+          </label>
+        </div>
+        <p id="channelAutoNewEpisodesHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Off &mdash; this channel plays the picks below and nothing else.</p>
+
+        <div id="channelLiveSyncRow" style="display:none; margin-top:10px;">
+          <label class="channel-rule-row">
+            <input type="checkbox" id="channelLiveSyncCheck">
+            <span>Live Cloud Sync &mdash; refresh this channel from its source list</span>
+          </label>
+          <p id="channelLiveSyncHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;"></p>
+        </div>
+
+        <div id="channelStoryLockSection" style="margin-top:12px;"></div>
+      </div>
 
       <!-- Channel Poster Selection Section -->
       <div id="channelPosterPickerSection" style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; display:none;">
@@ -21122,6 +24806,9 @@ if ('serviceWorker' in navigator) {
       </div>
 
       <div class="row" style="margin-top:12px;">
+        <input type="text" id="channelDescriptionInput" placeholder="One line about this channel (optional) &mdash; shown wherever you share it" style="flex:1; font-size:0.85rem;" maxlength="400">
+      </div>
+      <div class="row" style="margin-top:8px;">
         <input type="text" id="channelNameInput" placeholder="Channel name (e.g. Comedy Night)" style="flex:1;">
         <button type="button" class="primary" id="channelSaveBtn" onclick="saveChannel()">Save</button>
         <button type="button" id="channelCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditChannel()">Cancel</button>
@@ -21294,6 +24981,12 @@ if ('serviceWorker' in navigator) {
       <h2 class="panel-title">Hidden Lists</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Hide specific lists from My Lists, Airing Next, and Simkl Airing Next. A hidden list is still tracked and updated normally underneath -- only its display is suppressed, and it can be shown again here at any time.</p>
       <div id="hiddenListsSettingsSection"></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Removed from Airing Next</h2>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Shows you've taken off the Airing Next shelf. Nothing about them changed anywhere else -- every episode you marked watched is still watched -- and watching another episode of one puts it back on the shelf by itself. Put one back here at any time.</p>
+      <div id="removedAiringNextSettingsSection"></div>
     </div>
 
     <div class="panel" style="margin-top:12px;">
@@ -22826,10 +26519,36 @@ function showAppAlert(title, message, isSuccess = false) {
       '</h3>' +
       '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
-    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
       '<button type="button" class="primary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">OK</button>' +
     '</div>';
+  showModal(html);
+}
+
+// The third member of the showAppAlert/showAppConfirm family: a dialog for
+// the gap between confirming something slow and hearing how it went.
+//
+// Reset Account Data is the case that asked for it. It clears this browser,
+// then waits on a server round trip that empties the account -- one to two
+// seconds during which the confirm dialog had already closed, the lists on
+// screen had already emptied, and nothing said why or whether anything was
+// still happening. A person watching that has no way to tell a reset in
+// progress from one that silently failed, and clicking Reset again during it
+// is the obvious thing to try.
+//
+// Deliberately has no buttons: there is nothing to decide, and the caller
+// replaces it with showAppAlert (or another showModal) when the work
+// finishes. Escape and a backdrop click still dismiss it, like any other
+// dialog -- dismissing the status of an action does not cancel the action,
+// and the caller's own result dialog still arrives.
+function showAppBusy(title, message) {
+  const html =
+    '<h3 style="margin:0 0 12px; font-size:1.1rem; display:flex; align-items:center; gap:10px;">' +
+      '<span class="app-spinner" aria-hidden="true"></span> ' +
+      escapeHtml(title) +
+    '</h3>' +
+    '<p role="status" aria-live="polite" style="margin:0; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message || '') + '</p>';
   showModal(html);
 }
 
@@ -22845,7 +26564,7 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
       '</h3>' +
       '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
-    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
       '<button type="button" class="secondary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">Cancel</button>' +
       '<button type="button" class="primary" id="appConfirmBtn" style="min-width:80px; padding:8px 16px; ' + confirmBtnStyle + '">' + escapeHtml(confirmBtnText || 'Confirm') + '</button>' +
@@ -23470,6 +27189,12 @@ function renderDiscoverChartsList(type, forceRefresh) {
     if (window._CHARTS_STREAMING_ALL) {
       window._CHARTS_STREAMING_ALL.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'My Lists Addon'); });
     }
+    // Empty until the feature is public -- 09_page-shell.js bakes in an empty
+    // array rather than the real one while NEW_ON_STREAMING_IN_QUICK_ADD is
+    // false, so this loop is a no-op instead of needing its own gate.
+    if (window._CHARTS_NEW_ON_STREAMING) {
+      window._CHARTS_NEW_ON_STREAMING.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'New on Streaming'); });
+    }
   }
 
   if (type === 'curated' || type === 'all') {
@@ -23683,8 +27408,11 @@ function channelSourceRowHtml(u) {
     if (payload.dailyRotate) {
       summary = items.length + '-episode pool \u2014 shows ' + CHANNEL_ROTATION_SHOWS_PER_DAY + ' shows \u00d7 ' +
         CHANNEL_ROTATION_EPISODES_PER_SHOW + ' episodes each, refreshed daily';
-    } else if (payload.shuffle) {
-      summary += ' \u2014 shuffled daily';
+      const rotatedOrder = channelPlayOrderLabel(payload);
+      if (rotatedOrder && rotatedOrder !== 'shuffled daily') summary += ', ' + rotatedOrder;
+    } else {
+      const order = channelPlayOrderLabel(payload);
+      if (order) summary += ' \u2014 ' + order;
     }
   }
   return '<div class="source-row">' +
@@ -24110,6 +27838,12 @@ ${buildAddAllCombinedChartsJs()}
 ${buildAddAllFnJs("addAllKidsCharts", buildAddAllPairsCallsJs(KIDS_LISTS, "Kids", ""))}
 ${buildAddAllFnJs("addAllHolidayCharts", buildAddAllPairsCallsJs(HOLIDAY_LISTS, "Holidays", ""))}
 ${buildAddAllFnJs("addAllGenreCharts", buildAddAllPairsCallsJs(GENRE_LISTS, "Genres", ""))}
+// Always DEFINED, so the click handler below resolves whether or not the shelf
+// exists -- but empty while the shelf is hidden. Generating the calls
+// unconditionally put every row's name and source url in the page source of a
+// feature nobody is supposed to be able to add yet, which is most of what
+// shipping it dark was for.
+${buildAddAllFnJs("addAllNewOnStreaming", NEW_ON_STREAMING_IN_QUICK_ADD ? buildAddAllPairsCallsJs(NEW_ON_STREAMING_LISTS, "New on Streaming", "") : "")}
 
 function addAllHiddenGems() {
   addRow("Hidden Gems", "tmdb:hidden-gems", "movie", true, "Hidden Gems");
@@ -24134,6 +27868,7 @@ document.addEventListener('click', (e) => {
   else if (action === 'kids') addAllKidsCharts();
   else if (action === 'holidays') addAllHolidayCharts();
   else if (action === 'genres') addAllGenreCharts();
+  else if (action === 'new-on-streaming') addAllNewOnStreaming();
 });
 
 // Adds a blank source row to an existing entry -- this is how a normal
@@ -24381,6 +28116,10 @@ function openMdblistAiringNextDetailsPage() {
       subtitle: label.subtitle,
       poster: it.poster,
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId || it.id,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: isPremiere,
       isSeasonFinale: isFinale,
@@ -24517,8 +28256,7 @@ function renderMyMdblistLists(lists) {
             const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
             let dateBadge = '';
             if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-              const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-              if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+              dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
             }
             const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
             const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -25188,6 +28926,10 @@ function openTraktAiringNextDetailsPage() {
       subtitle: label.subtitle,
       poster: it.poster,
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId || it.id,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: isPremiere,
       isSeasonFinale: isFinale,
@@ -25329,8 +29071,7 @@ function renderMyPrivateTraktLists(lists) {
             const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
             let dateBadge = '';
             if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-              const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-              if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+              dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
             }
             const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
             const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -25995,6 +29736,10 @@ function openSimklAiringNextDetailsPage() {
       subtitle: label.subtitle,
       poster: it.poster,
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId || it.id,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: isPremiere,
       isSeasonFinale: isFinale,
@@ -26127,10 +29872,7 @@ function renderMySimklLists(lists) {
           const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
           let dateBadge = '';
           if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-            const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-            if (badgeText) {
-              dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
-            }
+            dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
           }
           const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
           const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -30151,6 +33893,336 @@ function isEpisodeAired(ep) {
   return airDate.getTime() < today.getTime();
 }
 
+// --- Not-yet-aired seasons and episodes -------------------------------------
+//
+// isEpisodeAired above is the rule for ONE episode. These three answer the
+// same question for a whole season, which is what every "Mark Season Watched"
+// control needs: a season nothing has aired from yet has nothing to mark, and
+// showing it as watched -- or letting a click claim it is -- states something
+// about the person's viewing that is not true.
+//
+// Three sources, most specific first. Once a season's episode grid has been
+// loaded (toggleSeasonEpisodes, or markSeasonWatched's own fetch) the episode
+// list is exact. Failing that, the show's next unaired episode places the
+// seasons around it (seasonAiredCountFromNextEpisode). Failing that too, only
+// the season's own TMDB air_date is known: a season dated in the future cannot
+// have aired episodes, and one dated in the past may be part-way through. A
+// season with no air date at all is unknown, and unknown is treated as
+// "aired" -- the button keeps working exactly as it did rather than being
+// disabled on a guess.
+function seasonHasAiredEpisodes(seasonNum, seasonMeta) {
+  const eps = window._seasonEpisodesMap && window._seasonEpisodesMap[seasonNum];
+  if (Array.isArray(eps) && eps.length) return eps.some((ep) => isEpisodeAired(ep));
+  const fromNext = seasonAiredCountFromNextEpisode(seasonNum, seasonMeta);
+  if (fromNext != null) return fromNext > 0;
+  const airDate = seasonMeta && (seasonMeta.air_date || seasonMeta.airDate);
+  if (airDate) return isEpisodeAired(airDate);
+  return true;
+}
+
+// Where the show's next unaired episode sits, read as "how many episodes of
+// THIS season have aired". /api/details already carries that pointer --
+// nextEpisodeSeasonNumber / nextEpisodeNumber / nextEpisodeAirDate, straight
+// off TMDB's next_episode_to_air -- so the seasons around it are settled
+// without fetching a single episode list: a later season has aired nothing,
+// the season the pointer falls in has aired everything BEFORE that episode,
+// and an earlier season is out in full.
+//
+// null means "this says nothing": a finished show, a show between seasons
+// with no dated next episode, or a show whose seasons were renumbered (see
+// showSeasonsAreTmdbNumbered). The caller falls back to season air dates.
+function seasonAiredCountFromNextEpisode(seasonNum, seasonMeta, details) {
+  const d = details || (typeof window !== 'undefined' ? window._currentItemDetails : null);
+  if (!d || !showSeasonsAreTmdbNumbered(d)) return null;
+  const nextSeason = Number(d.nextEpisodeSeasonNumber);
+  const nextEp = Number(d.nextEpisodeNumber);
+  if (!d.nextEpisodeAirDate || !(nextSeason > 0) || !(nextEp > 0)) return null;
+  // A pointer at an episode that is already out dates nothing -- the show has
+  // moved on since the payload was built.
+  if (typeof isEpisodeAired === 'function' && isEpisodeAired(d.nextEpisodeAirDate)) return null;
+  const sNum = Number(seasonNum);
+  if (!isFinite(sNum)) return null;
+  if (sNum > nextSeason) return 0;
+  if (sNum === nextSeason) return nextEp - 1;
+  const total = Number(seasonMeta && seasonMeta.episode_count);
+  return total > 0 ? total : null;
+}
+
+// Whether a show's seasonsData is numbered the way TMDB numbers it. An anime
+// unpacked out of a TMDB episode group -- or a show rebuilt from Cinemeta --
+// is handed its own season numbering (resolveUnpackedShowData,
+// 07_source-fetchers-tmdb-simkl.js), which the show-level pointer above counts
+// in TMDB's numbers and so cannot be lined up against. Those rebuilt payloads
+// are the only ones carrying the episodeCount alias, which is what says so.
+function showSeasonsAreTmdbNumbered(d) {
+  const seasons = d && Array.isArray(d.seasonsData) ? d.seasonsData : null;
+  if (!seasons || !seasons.length) return false;
+  return !seasons.some((s) => s && s.episodeCount != null);
+}
+
+// How many episodes of one season have aired -- the denominator every "is
+// this season finished" question actually means, and the one the season
+// header's "3/8 episodes" counts against. Same three sources as
+// seasonHasAiredEpisodes above, most specific first: the season's real
+// episode list once it has been loaded, then the show's next-episode
+// pointer, then the season's own air date with episode_count standing in for
+// "all of it is out".
+function seasonAiredEpisodeCount(seasonNum, seasonMeta, details) {
+  const sNum = Number(seasonNum);
+  const total = Number(seasonMeta && seasonMeta.episode_count);
+  const totalKnown = total > 0 ? total : 0;
+
+  const eps = window._seasonEpisodesMap && window._seasonEpisodesMap[sNum];
+  if (Array.isArray(eps) && eps.length) {
+    return eps.filter((ep) => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep)).length;
+  }
+
+  const fromNext = seasonAiredCountFromNextEpisode(sNum, seasonMeta, details);
+  if (fromNext != null) return totalKnown ? Math.min(fromNext, totalKnown) : fromNext;
+
+  const airDate = seasonMeta && (seasonMeta.air_date || seasonMeta.airDate);
+  if (airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(airDate)) return 0;
+  return totalKnown;
+}
+
+// The season's own TMDB record off the open show, or a stand-in built from
+// what the caller knows. isSeasonFullyWatched is handed a season number and
+// an episode count, not the season object the aired-count helpers read.
+function seasonMetaFor(d, seasonNum, episodeCount) {
+  const sNum = Number(seasonNum);
+  const found = d && Array.isArray(d.seasonsData)
+    ? d.seasonsData.find((s) => s && Number(s.season_number) === sNum)
+    : null;
+  if (found) return found;
+  return { season_number: sNum, episode_count: Number(episodeCount) || 0 };
+}
+
+// The date an upcoming season starts, for the button that says so.
+function seasonFirstAirDate(seasonNum, seasonMeta) {
+  const eps = window._seasonEpisodesMap && window._seasonEpisodesMap[seasonNum];
+  if (Array.isArray(eps) && eps.length) {
+    const dates = eps.map((ep) => (ep && (ep.air_date || ep.airDate)) || '').filter(Boolean).sort();
+    if (dates.length) return dates[0];
+  }
+  return (seasonMeta && (seasonMeta.air_date || seasonMeta.airDate)) || '';
+}
+
+// One description of what a "Mark Season Watched" button should say and do,
+// because four places set that button -- the item modal's first render,
+// updateSeasonWatchedButton, markSeasonWatched's own result, and
+// markShowWatched (21_client-custom-list-builder.js) relabelling every season
+// at once. They disagreed about the upcoming case, which is how pressing
+// Mark Show Watched left a season that has not aired reading "Mark Season
+// Unwatched" over an empty Watch History.
+function seasonWatchedButtonState(d, seasonMeta) {
+  const sNum = Number(seasonMeta && seasonMeta.season_number);
+  if (!seasonHasAiredEpisodes(sNum, seasonMeta)) {
+    const when = seasonFirstAirDate(sNum, seasonMeta);
+    const badge = when && typeof formatAirDateBadge === 'function' ? formatAirDateBadge(when) : '';
+    return {
+      upcoming: true,
+      label: badge ? 'Airs ' + escapeHtml(badge) : 'Not aired yet',
+      className: 'secondary',
+      title: when ? 'This season starts on ' + when + ' \u2014 there is nothing to mark watched yet.' : 'This season has not aired yet.',
+    };
+  }
+  const watched = isSeasonFullyWatched(d && d.id, sNum, seasonMeta && seasonMeta.episode_count);
+  return watchedSeasonButtonState(watched);
+}
+
+// The watched/unwatched half, split out because markSeasonWatched knows the
+// answer from the write it just made and must not re-derive it (see its own
+// call site).
+function watchedSeasonButtonState(watched) {
+  return watched
+    ? { upcoming: false, label: '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched', className: 'secondary', title: '' }
+    : { upcoming: false, label: 'Mark Season Watched', className: 'primary', title: '' };
+}
+
+function applySeasonWatchedButton(btn, state) {
+  if (!btn || !state) return;
+  btn.innerHTML = state.label;
+  btn.disabled = !!state.upcoming;
+  if (btn.classList) {
+    btn.classList.remove('primary', 'secondary');
+    btn.classList.add(state.className);
+  }
+  // Assigned rather than removeAttribute'd: an empty title shows no tooltip,
+  // and this keeps the helper to plain property writes so it works on any
+  // button-shaped object a caller hands it.
+  btn.title = state.title || '';
+}
+
+// The episode modal's watch button. An episode that has not aired has nothing
+// to mark, and offering the button anyway is how a future episode reached
+// Watch History -- from where it counts towards "fully watched", hides the
+// show from Continue Watching, and is pushed to the account as a real
+// viewing.
+//
+// The one exception is an episode already recorded as watched: that button
+// has to stay whatever its air date, or a mistake made before this existed
+// (or a scrobble from a preview screening) could never be undone.
+function episodeWatchButtonHtml(ep, isWatched) {
+  const hasAired = typeof isEpisodeAired !== 'function' || isEpisodeAired(ep);
+  if (hasAired || isWatched) {
+    return '<button type="button" id="btnMarkWatched" class="lc-btn ' + (isWatched ? 'secondary' : 'primary') + '" onclick="toggleEpisodeWatchStatusFromModal()">' +
+      (isWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
+      '</button>';
+  }
+  const airDate = (ep && (ep.air_date || ep.airDate)) || '';
+  const badge = (airDate && typeof formatAirDateBadge === 'function') ? formatAirDateBadge(airDate) : '';
+  return '<button type="button" id="btnMarkWatched" class="lc-btn secondary" disabled title="' +
+    escapeAttr(airDate ? ('This episode airs on ' + airDate + '.') : 'This episode has not aired yet.') + '">' +
+    (badge ? 'Airs ' + escapeHtml(badge) : 'Not aired yet') +
+    '</button>';
+}
+
+// --- Air times --------------------------------------------------------------
+//
+// /api/details carries a show's air time as a finished string ("9 PM ET") when
+// TVmaze has one (fetchShowAirTime, 07_source-fetchers-tmdb-simkl.js). It is a
+// fact about the SHOW, but it has to be printed beside episodes that reach the
+// page from somewhere else entirely -- a Continue Watching entry built from
+// /api/season, an Airing Next tile restored from local storage, an episode
+// grid. Threading a new field through all of those, and through everything
+// already stored in every browser, would have been a migration.
+//
+// So it is remembered per show instead, from any details payload that passes
+// through, and looked up by show id wherever a date is printed. A show nobody
+// has details for simply prints its date alone, exactly as before.
+const AIR_TIME_STORE_KEY = 'myListAddon:airTimes';
+const AIR_TIME_STORE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const AIR_TIME_STORE_MAX = 300;
+
+function loadAirTimeStore() {
+  if (window._airTimeStore) return window._airTimeStore;
+  let parsed = {};
+  try {
+    parsed = JSON.parse(localStorage.getItem(AIR_TIME_STORE_KEY) || '{}') || {};
+  } catch (e) {
+    parsed = {};
+  }
+  window._airTimeStore = (parsed && typeof parsed === 'object') ? parsed : {};
+  return window._airTimeStore;
+}
+
+function saveAirTimeStore(store) {
+  window._airTimeStore = store;
+  try {
+    // Oldest out first past the cap. A broadcast slot is small, but this is
+    // written from a shelf refresh that can touch sixty shows at once.
+    const keys = Object.keys(store);
+    if (keys.length > AIR_TIME_STORE_MAX) {
+      keys.sort((a, b) => (store[a] && store[a].at || 0) - (store[b] && store[b].at || 0));
+      keys.slice(0, keys.length - AIR_TIME_STORE_MAX).forEach((k) => { delete store[k]; });
+    }
+    localStorage.setItem(AIR_TIME_STORE_KEY, JSON.stringify(store));
+  } catch (e) {}
+}
+
+// Every id the same show is known by here, because what asks for its air time
+// later may only have one of them: a tile carries the id its shelf was built
+// from, not the one /api/details answered to.
+function showAirTimeAliases(d) {
+  if (!d) return [];
+  const ids = [d.id, d.imdbId, d.tmdbId, (d.tmdbId ? 'tmdb:' + d.tmdbId : null)];
+  const out = new Set();
+  ids.forEach((id) => {
+    if (id == null || id === '') return;
+    const str = String(id);
+    out.add(str);
+    // A composite episode id ("tt123:2:4") is still that show.
+    if (str.includes(':') && !str.startsWith('tmdb:')) out.add(str.split(':')[0]);
+  });
+  return [...out];
+}
+
+function rememberShowAirTime(d) {
+  if (!d) return;
+  const airTime = d.airTime || null;
+  const label = (airTime && airTime.label) || '';
+  const nextLabel = d.nextEpisodeAirTimeLabel || '';
+  if (!label && !nextLabel) return;
+  const entry = {
+    label: label,
+    nextLabel: nextLabel,
+    nextSeason: (d.nextEpisodeSeasonNumber != null) ? Number(d.nextEpisodeSeasonNumber) : null,
+    nextNumber: (d.nextEpisodeNumber != null) ? Number(d.nextEpisodeNumber) : null,
+    at: Date.now(),
+  };
+  const store = loadAirTimeStore();
+  showAirTimeAliases(d).forEach((id) => { store[id] = entry; });
+  saveAirTimeStore(store);
+}
+window.rememberShowAirTime = rememberShowAirTime;
+
+// The air time to print for one episode of one show. The next episode gets its
+// own slot where TVmaze dated it apart from the regular one -- a premiere
+// running long, a finale moved an hour -- and everything else gets the show's
+// regular slot, which is what a listing prints for them too.
+function showAirTimeLabel(showId, seasonNum, episodeNum) {
+  if (showId == null || showId === '') return '';
+  const store = loadAirTimeStore();
+  const str = String(showId);
+  const entry = store[str] ||
+    (str.includes(':') && !str.startsWith('tmdb:') ? store[str.split(':')[0]] : null) ||
+    (str.startsWith('tmdb:') ? store[str.slice(5)] : store['tmdb:' + str]);
+  if (!entry || !entry.at || (Date.now() - entry.at) > AIR_TIME_STORE_TTL_MS) return '';
+  if (entry.nextLabel && seasonNum != null && episodeNum != null &&
+      Number(entry.nextSeason) === Number(seasonNum) && Number(entry.nextNumber) === Number(episodeNum)) {
+    return entry.nextLabel;
+  }
+  return entry.label || entry.nextLabel || '';
+}
+window.showAirTimeLabel = showAirTimeLabel;
+
+// The air time for an episode of the show whose page is open, which knows its
+// own details payload and does not need the store at all. Empty for anything
+// that has already gone out: a time is a thing you are waiting for.
+function episodeAirTimeLabel(d, ep) {
+  if (!d || !ep) return '';
+  if (typeof isEpisodeAired === 'function' && isEpisodeAired(ep)) return '';
+  const sNum = (ep.season_number != null) ? Number(ep.season_number) : Number(window._currentSeasonNum);
+  const eNum = Number(ep.episode_number);
+  if (d.nextEpisodeAirTimeLabel &&
+      Number(d.nextEpisodeSeasonNumber) === sNum && Number(d.nextEpisodeNumber) === eNum) {
+    return d.nextEpisodeAirTimeLabel;
+  }
+  if (d.airTime && d.airTime.label) return d.airTime.label;
+  return showAirTimeLabel(d.id, sNum, eNum);
+}
+window.episodeAirTimeLabel = episodeAirTimeLabel;
+
+// The "Airs Tomorrow" pill on a poster, with the hour under the day when one
+// is known. Five shelves rendered this markup by hand and each had to be
+// taught the time separately, so they share it now.
+function airDateBadgeHtml(airDate, timeLabel, extraClass) {
+  if (!airDate) return '';
+  const dateText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(airDate) : '';
+  if (!dateText) return '';
+  const cls = 'cw-date-badge' + (extraClass ? ' ' + extraClass : '') + (timeLabel ? ' cw-date-badge-timed' : '');
+  const title = 'Airs on ' + airDate + (timeLabel ? ' at ' + timeLabel : '');
+  return '<div class="' + cls + '" title="' + escapeAttr(title) + '">' +
+    escapeHtml(dateText) +
+    (timeLabel ? '<span class="cw-date-badge-time">' + escapeHtml(timeLabel) + '</span>' : '') +
+    '</div>';
+}
+window.airDateBadgeHtml = airDateBadgeHtml;
+
+// The same pill for a Continue Watching / Airing Next entry, which is the
+// shape every shelf here holds. The entry's own airTime wins where it has one
+// (an Airing Next tile stores it), and the per-show store answers for
+// everything else -- a Continue Watching entry is built from /api/season and
+// has never seen a details payload.
+function watchItemAirDateBadgeHtml(it) {
+  if (!it || !it.airDate) return '';
+  if (typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate)) return '';
+  const timeLabel = it.airTime ||
+    (typeof showAirTimeLabel === 'function' ? showAirTimeLabel(it.showId || it.id, it.seasonNum, it.episodeNum) : '');
+  return airDateBadgeHtml(it.airDate, timeLabel);
+}
+window.watchItemAirDateBadgeHtml = watchItemAirDateBadgeHtml;
+
 function formatAirDateBadge(airDateStr) {
   if (!airDateStr) return '';
   const parts = String(airDateStr).split(/[-T\s]/);
@@ -30192,8 +34264,14 @@ function openEpisodeDetails(epNum) {
   const runtime = ep.runtime ? ep.runtime + ' min' : '';
   const date = ep.air_date ? ep.air_date : '';
   
+  // Under the date, not beside it: this is the one place with room to print
+  // the slot in full, and an episode still to come is the only one it is shown
+  // against (episodeAirTimeLabel returns nothing once an episode is out).
+  const airTimeLabel = typeof episodeAirTimeLabel === 'function' ? episodeAirTimeLabel(d, ep) : '';
+
   let infoHtml = '';
   if (date) infoHtml += '<div style="margin-bottom:6px;">' + escapeHtml(date) + '</div>';
+  if (airTimeLabel) infoHtml += '<div style="margin-bottom:6px; color:var(--brand);">' + escapeHtml(airTimeLabel) + '</div>';
   if (runtime) infoHtml += '<div style="margin-bottom:6px;">' + escapeHtml(runtime) + '</div>';
   if (ep.vote_average) infoHtml += '<div style="margin-bottom:6px;">\u2605 ' + escapeHtml(Number(ep.vote_average).toFixed(1)) + ' TMDB</div>';
   
@@ -30222,6 +34300,8 @@ function openEpisodeDetails(epNum) {
       return false;
     });
   }
+  const watchBtnHtml = episodeWatchButtonHtml(ep, isWatched);
+
   const innerHtml = 
     '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
     '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap; margin-top:20px;">' +
@@ -30230,11 +34310,7 @@ function openEpisodeDetails(epNum) {
       '</div>' +
       '<div style="flex: 1; min-width: 300px;">' +
         '<h1 style="margin:0 0 16px; font-size:2.5rem; font-family: serif;">E' + ep.episode_number + ' - ' + escapeHtml(ep.name) + '</h1>' +
-          '<div style="margin-bottom:20px;">' +
-            '<button type="button" id="btnMarkWatched" class="lc-btn ' + (isWatched ? 'secondary' : 'primary') + '" onclick="toggleEpisodeWatchStatusFromModal()">' +
-              (isWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark as unwatched' : 'Mark as Watched') +
-            '</button>' +
-          '</div>' +
+          '<div style="margin-bottom:20px;">' + watchBtnHtml + '</div>' +
         '<div style="margin-bottom:16px; color:var(--text); font-size:1.05rem;">' + infoHtml + '</div>' +
         '<p style="font-size:1.05rem; line-height:1.6; color:var(--text); margin-bottom: 24px;">' + escapeHtml(ep.overview || 'No overview available.') + '</p>' +
       '</div>' +
@@ -30263,8 +34339,12 @@ window.openSelectListModalFromItemModal = function() {
   openSelectListModal(d.id, isSeries ? 'series' : 'movie', d.title || '', d.poster || '');
 };
 
-function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
-  if (!showId || seasonNum == null) return false;
+// The distinct episode numbers of one season that Watch History holds. Split
+// out of isSeasonFullyWatched so the "3/8 episodes" count on the season
+// header and the Mark Season Watched button beside it read the same tally and
+// cannot disagree about what has been watched.
+function watchedEpisodeNumbersInSeason(showId, seasonNum) {
+  if (!showId || seasonNum == null) return new Set();
   const sNum = Number(seasonNum);
   const d = window._currentItemDetails;
   const showIdsToCheck = new Set([
@@ -30280,54 +34360,144 @@ function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
   try {
     const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
     const hist = map['watch-history'];
-    if (!hist || !Array.isArray(hist.items)) return false;
+    if (!hist || !Array.isArray(hist.items)) return new Set();
 
-    const watchedEps = hist.items.filter((it) => {
-      if (!it || it.type !== 'episode' || Number(it.seasonNum) !== sNum) return false;
-      if (it.showId && showIdsToCheck.has(String(it.showId))) return true;
-      if (d && d.title && it.showTitle && it.showTitle.toLowerCase() === d.title.toLowerCase()) return true;
-      return false;
+    const nums = new Set();
+    hist.items.forEach((it) => {
+      if (!it || it.type !== 'episode' || Number(it.seasonNum) !== sNum) return;
+      const isThisShow = (it.showId && showIdsToCheck.has(String(it.showId))) ||
+        !!(d && d.title && it.showTitle && it.showTitle.toLowerCase() === d.title.toLowerCase());
+      if (!isThisShow) return;
+      const epNum = it.episodeNum != null ? Number(it.episodeNum) : null;
+      if (epNum == null || !isFinite(epNum)) return;
+      nums.add(epNum);
     });
-
-    const distinctEps = new Set(watchedEps.map(it => it.episodeNum != null ? Number(it.episodeNum) : null).filter(n => n != null));
-
-    if (distinctEps.size === 0) return false;
-
-    if (window._seasonEpisodesMap && window._seasonEpisodesMap[sNum]) {
-      const aired = window._seasonEpisodesMap[sNum].filter(ep => typeof isEpisodeAired !== 'function' || isEpisodeAired(ep));
-      if (aired.length > 0) return distinctEps.size >= aired.length;
-    }
-
-    if (episodeCount && episodeCount > 0) {
-      return distinctEps.size >= episodeCount;
-    }
-    return false;
+    return nums;
   } catch (e) {
-    return false;
+    return new Set();
   }
 }
+window.watchedEpisodeNumbersInSeason = watchedEpisodeNumbersInSeason;
+
+function isSeasonFullyWatched(showId, seasonNum, episodeCount) {
+  if (!showId || seasonNum == null) return false;
+  const sNum = Number(seasonNum);
+  const d = window._currentItemDetails;
+  const distinctEps = watchedEpisodeNumbersInSeason(showId, sNum);
+  if (distinctEps.size === 0) return false;
+
+  // Counted against what has AIRED, not against everything TMDB lists for the
+  // season. episode_count includes the episodes still to come, so a show
+  // part-way through its current season could not be read as caught up until
+  // its finale -- which is what left Mark Show Watched offering to mark a
+  // show whose every aired episode was already watched.
+  const aired = seasonAiredEpisodeCount(sNum, seasonMetaFor(d, sNum, episodeCount), d);
+  if (aired > 0) return distinctEps.size >= aired;
+  return false;
+}
 window.isSeasonFullyWatched = isSeasonFullyWatched;
+
+// "3/8 episodes" -- how much of a season is in Watch History, beside how much
+// of it there is. Returned as state rather than a string so the header can
+// also show, at a glance, that a season is finished.
+function seasonEpisodeCountState(d, seasonMeta) {
+  const sNum = Number(seasonMeta && seasonMeta.season_number);
+  const total = Number(seasonMeta && seasonMeta.episode_count);
+  if (!(total > 0)) return { label: '', watched: 0, total: 0, complete: false };
+  // Capped at the season's own length: Watch History can still hold an
+  // episode TMDB has since dropped from the season, and "9/8 episodes" reads
+  // as a bug rather than as the leftover it is.
+  const watched = Math.min(watchedEpisodeNumbersInSeason(d && d.id, sNum).size, total);
+  return {
+    label: watched + '/' + total + ' episode' + (total === 1 ? '' : 's'),
+    watched: watched,
+    total: total,
+    complete: watched >= total,
+  };
+}
+window.seasonEpisodeCountState = seasonEpisodeCountState;
 
 function updateSeasonWatchedButton(seasonNum) {
   const d = window._currentItemDetails;
   if (!d) return;
   const sNum = Number(seasonNum);
-  const seasonMeta = (d.seasonsData || []).find(s => Number(s.season_number) === sNum);
-  const epCount = seasonMeta ? seasonMeta.episode_count : 0;
-  const isWatched = isSeasonFullyWatched(d.id, sNum, epCount);
+  const seasonMeta = (d.seasonsData || []).find(s => Number(s.season_number) === sNum) || { season_number: sNum };
+  const state = seasonWatchedButtonState(d, seasonMeta);
   document.querySelectorAll('.btn-mark-season-watched[data-season="' + sNum + '"]').forEach(btn => {
-    if (isWatched) {
-      btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
-      btn.classList.remove('primary');
-      btn.classList.add('secondary');
-    } else {
-      btn.innerHTML = 'Mark Season Watched';
-      btn.classList.remove('secondary');
-      btn.classList.add('primary');
-    }
+    applySeasonWatchedButton(btn, state);
   });
+  updateSeasonEpisodeCounts(sNum);
 }
 window.updateSeasonWatchedButton = updateSeasonWatchedButton;
+
+// Repaints the "3/8 episodes" line on the season header. With a season
+// number for a change to that one season, with nothing for a change that
+// could have touched any of them.
+function updateSeasonEpisodeCounts(seasonNum) {
+  const d = window._currentItemDetails;
+  if (!d || typeof document === 'undefined' || !document.querySelectorAll) return;
+  const only = (seasonNum == null) ? null : Number(seasonNum);
+  document.querySelectorAll('.season-header-episodes[data-season]').forEach((el) => {
+    const sNum = Number(el.dataset ? el.dataset.season : el.getAttribute('data-season'));
+    if (only != null && sNum !== only) return;
+    const seasonMeta = (d.seasonsData || []).find((s) => Number(s.season_number) === sNum);
+    if (!seasonMeta) return;
+    const state = seasonEpisodeCountState(d, seasonMeta);
+    if (!state.label) return;
+    el.textContent = state.label;
+    if (el.classList && el.classList.toggle) el.classList.toggle('is-complete', state.complete);
+  });
+}
+window.updateSeasonEpisodeCounts = updateSeasonEpisodeCounts;
+
+// One description of the item page's Mark Show Watched button, for the same
+// reason seasonWatchedButtonState exists: four places set it, and each one
+// spelling out its own label and classes is how they came to disagree.
+function showWatchedButtonState(watched) {
+  return watched
+    ? { label: '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched', className: 'secondary' }
+    : { label: 'Mark Show Watched', className: 'primary' };
+}
+
+function applyShowWatchedButton(btn, watched) {
+  if (!btn) return;
+  const state = showWatchedButtonState(watched);
+  btn.innerHTML = state.label;
+  if (btn.classList) {
+    btn.classList.remove('primary', 'secondary');
+    btn.classList.add(state.className);
+  }
+}
+window.applyShowWatchedButton = applyShowWatchedButton;
+
+// Re-derives that button from what is on disk. Marking the last aired
+// episode watched from the episode grid used to leave it reading "Mark Show
+// Watched" until the page was reopened, because nothing but markShowWatched
+// itself ever touched it.
+function updateShowWatchedButton(watched) {
+  const btn = (typeof document !== 'undefined' && document.getElementById)
+    ? document.getElementById('btnMarkShowWatched') : null;
+  if (!btn) return;
+  applyShowWatchedButton(btn, typeof watched === 'boolean' ? watched : isShowFullyWatched(window._currentItemDetails));
+}
+window.updateShowWatchedButton = updateShowWatchedButton;
+
+// Everything on the item page that is read off Watch History: every season's
+// button and count, and the show's own button. One call after a change beats
+// call sites that each remembered a different subset of it -- and a single
+// episode toggle can move all three, since the episode may have been the
+// last one the season, or the show, was waiting on.
+function refreshItemWatchState() {
+  const d = window._currentItemDetails;
+  if (d && Array.isArray(d.seasonsData)) {
+    d.seasonsData.forEach((s) => {
+      if (!s || Number(s.season_number) === 0) return;
+      updateSeasonWatchedButton(Number(s.season_number));
+    });
+  }
+  updateShowWatchedButton();
+}
+window.refreshItemWatchState = refreshItemWatchState;
 
 window.markSeasonWatched = async function(seasonNum, btn) {
   const d = window._currentItemDetails;
@@ -30349,6 +34519,13 @@ window.markSeasonWatched = async function(seasonNum, btn) {
       throw new Error(data.error || 'Failed to fetch season episodes');
     }
 
+    // Now that this season's real episode list is in hand, everything that
+    // asks "how many episodes has this season actually aired" can stop
+    // guessing from episode_count -- which counts the unaired ones too, so a
+    // part-aired season could never read as fully watched.
+    if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+    window._seasonEpisodesMap[seasonNum] = data.season.episodes;
+
     const episodes = [];
     data.season.episodes.forEach(ep => {
       if (typeof isEpisodeAired === 'function' && !isEpisodeAired(ep)) return;
@@ -30369,9 +34546,13 @@ window.markSeasonWatched = async function(seasonNum, btn) {
     });
 
     if (!episodes.length) {
+      // Nothing in this season has aired. The button used to be handed back
+      // enabled and labelled "Mark Season Watched", so it looked like a
+      // control that simply did nothing; now it says why, and stays out of
+      // the way until the season starts.
       if (btn) {
         btn.disabled = false;
-        btn.textContent = 'Mark Season Watched';
+        applySeasonWatchedButton(btn, seasonWatchedButtonState(d, (d.seasonsData || []).find(sd => Number(sd.season_number) === Number(seasonNum)) || { season_number: seasonNum }));
       }
       return;
     }
@@ -30379,43 +34560,36 @@ window.markSeasonWatched = async function(seasonNum, btn) {
     const resBatch = toggleBatchWatchStatus(episodes);
     if (btn) {
       btn.disabled = false;
-      if (resBatch.nowWatched) {
-        btn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
-        btn.classList.remove('primary');
-        btn.classList.add('secondary');
-      } else {
-        btn.innerHTML = 'Mark Season Watched';
-        btn.classList.remove('secondary');
-        btn.classList.add('primary');
-      }
+      // From the write that just happened, not re-derived: this season's
+      // aired episodes are exactly what was toggled.
+      applySeasonWatchedButton(btn, watchedSeasonButtonState(resBatch.nowWatched));
     }
 
     // Check if whole show is watched or not
     let allSeasonsWatched = false;
     if (d.seasonsData && Array.isArray(d.seasonsData)) {
-      allSeasonsWatched = d.seasonsData.filter(s => s.season_number !== 0).every(s => {
-        if (s.season_number === seasonNum) return resBatch.nowWatched;
-        return isSeasonFullyWatched(d.id, s.season_number, s.episode_count);
-      });
+      allSeasonsWatched = d.seasonsData
+        .filter(s => s.season_number !== 0)
+        // A season that has not started is not something the person is
+        // behind on -- counting it as unwatched meant a show could never
+        // read as caught up once a future season was announced.
+        .filter(s => seasonHasAiredEpisodes(Number(s.season_number), s))
+        .every(s => {
+          if (s.season_number === seasonNum) return resBatch.nowWatched;
+          return isSeasonFullyWatched(d.id, s.season_number, s.episode_count);
+        });
       if (typeof setShowFullyWatched === 'function') {
         setShowFullyWatched(String(d.id), allSeasonsWatched);
       }
     }
 
     // Update overall show watched button if present
-    const btnShow = document.getElementById('btnMarkShowWatched');
-    if (btnShow) {
-      const showWatched = (d.seasonsData && Array.isArray(d.seasonsData)) ? allSeasonsWatched : isShowFullyWatched(d);
-      if (showWatched) {
-        btnShow.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched';
-        btnShow.classList.remove('primary');
-        btnShow.classList.add('secondary');
-      } else {
-        btnShow.innerHTML = 'Mark Show Watched';
-        btnShow.classList.remove('secondary');
-        btnShow.classList.add('primary');
-      }
-    }
+    updateShowWatchedButton((d.seasonsData && Array.isArray(d.seasonsData)) ? allSeasonsWatched : isShowFullyWatched(d));
+    // This path sets the season's button straight from the write it just
+    // made rather than going through updateSeasonWatchedButton, so the count
+    // beside it has to be repainted here. All of them, since repainting one
+    // costs the same as repainting the lot.
+    updateSeasonEpisodeCounts();
   } catch (err) {
     if (btn) {
       btn.disabled = false;
@@ -30433,7 +34607,15 @@ function isShowFullyWatched(d) {
 
   // If seasonsData is available and has non-specials seasons, verify that every season is fully watched
   if (d.seasonsData && Array.isArray(d.seasonsData)) {
-    const regularSeasons = d.seasonsData.filter(s => s.season_number !== 0);
+    // Announced-but-unaired seasons are excluded, the same way markShowWatched
+    // (21_client-custom-list-builder.js) only ever fetches aired episodes:
+    // "fully watched" here means caught up on everything that exists to
+    // watch. Counting a future season made this answer false for every
+    // caught-up show with a renewal, so reopening the modal contradicted the
+    // button the person had just pressed.
+    const regularSeasons = d.seasonsData
+      .filter(s => s.season_number !== 0)
+      .filter(s => seasonHasAiredEpisodes(Number(s.season_number), s));
     if (regularSeasons.length > 0) {
       return regularSeasons.every(s => isSeasonFullyWatched(d.id, s.season_number, s.episode_count));
     }
@@ -30687,6 +34869,16 @@ async function openItemDetailsModal(id, type, opts) {
     // title/poster/seasonsData without re-fetching -- previously read at
     // window._currentItemDetails elsewhere but never actually set here.
     window._currentItemDetails = d;
+    // Both caches are keyed by season (and by episode number within one), not
+    // by show, so leaving the last show's entries standing meant ITS season 1
+    // answered "how many episodes of season 1 have aired" for this one -- the
+    // question behind every count and every watched check below.
+    window._seasonEpisodesMap = {};
+    window._episodeDataCache = {};
+    // Kept for every shelf that prints this show's air date without ever
+    // holding its details -- Continue Watching, Airing Next (see
+    // rememberShowAirTime).
+    rememberShowAirTime(d);
     
     // Formatting helpers
     let dateStr = d.releaseYear || '';
@@ -30736,7 +34928,8 @@ async function openItemDetailsModal(id, type, opts) {
         // long-running / reality shows) -- fall back to the show's own
         // poster rather than leaving a blank placeholder box.
         const sPoster = season.poster_path ? 'https://image.tmdb.org/t/p/w200' + season.poster_path : (d.poster || '');
-        const isSeasonWatched = isSeasonFullyWatched(d.id, season.season_number, season.episode_count);
+        const seasonBtnState = seasonWatchedButtonState(d, season);
+        const seasonCount = seasonEpisodeCountState(d, season);
         seasonsHtml +=
           '<div class="season-card">' +
             '<div class="season-header" onclick="toggleSeasonEpisodes(this, ' + season.season_number + ', &quot;' + escapeJsAttr(d.id) + '&quot;)">' +
@@ -30744,12 +34937,15 @@ async function openItemDetailsModal(id, type, opts) {
                 (sPoster ? '<img src="' + escapeAttr(sPoster) + '" class="season-header-poster" alt="">' : '<div class="season-header-poster-placeholder"></div>') +
                 '<div class="season-header-info">' +
                   '<h4 class="season-header-title">' + escapeHtml(season.name) + '</h4>' +
-                  '<div class="season-header-episodes">' + season.episode_count + ' episodes</div>' +
+                  '<div class="season-header-episodes' + (seasonCount.complete ? ' is-complete' : '') + '" data-season="' + season.season_number + '">' + escapeHtml(seasonCount.label) + '</div>' +
                 '</div>' +
               '</div>' +
               '<div class="season-header-actions">' +
-                '<button type="button" class="lc-btn ' + (isSeasonWatched ? 'secondary' : 'primary') + ' btn-mark-season-watched" data-season="' + season.season_number + '" onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
-                  (isSeasonWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched' : 'Mark Season Watched') +
+                '<button type="button" class="lc-btn ' + seasonBtnState.className + ' btn-mark-season-watched" data-season="' + season.season_number + '"' +
+                  (seasonBtnState.upcoming ? ' disabled' : '') +
+                  (seasonBtnState.title ? ' title="' + escapeAttr(seasonBtnState.title) + '"' : '') +
+                  ' onclick="event.stopPropagation(); markSeasonWatched(' + season.season_number + ', this)">' +
+                  seasonBtnState.label +
                 '</button>' +
               '</div>' +
             '</div>' +
@@ -30762,6 +34958,11 @@ async function openItemDetailsModal(id, type, opts) {
     }
 
     const storylinesHtml = renderItemStorylinesWatchOrder(d, type);
+    // "Watched" for a show means everything that has AIRED is watched, which
+    // is what isShowFullyWatched answers -- so a show caught up on every
+    // episode out so far opens offering to mark it UNwatched, rather than
+    // offering to mark what the person has already seen.
+    const showBtnState = showWatchedButtonState(isShowFullyWatched(d));
 
     body.innerHTML = 
       '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap;">' +
@@ -30775,8 +34976,8 @@ async function openItemDetailsModal(id, type, opts) {
           '<div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-top:20px;">' +
             '<button type="button" class="lc-btn primary" onclick="openSelectListModalFromItemModal()">+ Add to list</button>' +
             (((d.seasonsData && d.seasonsData.length > 0) || type === 'series') ?
-              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + (isShowFullyWatched(d) ? 'secondary' : 'primary') + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
-                (isShowFullyWatched(d) ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched') +
+              '<button type="button" id="btnMarkShowWatched" class="lc-btn ' + showBtnState.className + '" onclick="markShowWatched(&quot;' + escapeJsAttr(d.id) + '&quot;)">' +
+                showBtnState.label +
               '</button>'
               :
               '<button type="button" id="btnMarkWatched" class="lc-btn ' + (isItemWatched(d.id, d.tmdbId, d.imdbId) ? 'secondary' : 'primary') + '" onclick="toggleMovieWatchStatusFromModal()">' +
@@ -32182,8 +36383,28 @@ let channelDraftPoster = null;
 let channelDraftBackdrop = null;
 let channelSearchType = 'tv';
 
+// The show half of the stream id a channel item will be published with.
+//
+// buildChannelMeta joins this to the episode's season/episode to form the
+// video id Stremio hands to every stream add-on, and that id is the only
+// thing the add-on receives -- so a show with no IMDb id has to fall back to
+// the "tmdb:" form this add-on's manifest declares, never to a BARE TMDB
+// number (which matches no idPrefix anywhere, so nothing is asked for it)
+// and never to an empty string (which used to produce ":5:13"). The Worker
+// re-checks this in channelItemShowId and drops whatever still cannot form
+// a real id; this is what keeps it from having to.
+function channelStreamShowId(imdbId, tmdbId) {
+  const imdb = String(imdbId == null ? '' : imdbId).trim();
+  if (/^tt[0-9]+$/.test(imdb)) return imdb;
+  const tmdb = String(tmdbId == null ? '' : tmdbId).trim().replace(/^tmdb:/, '');
+  if (/^[0-9]+$/.test(tmdb)) return 'tmdb:' + tmdb;
+  if (/^tmdb:[0-9]+$/.test(imdb)) return imdb;
+  if (/^[0-9]+$/.test(imdb)) return 'tmdb:' + imdb;
+  return '';
+}
+
 function setChannelSearchType(type, btn) {
-  channelSearchType = type === 'movie' ? 'movie' : 'tv';
+  channelSearchType = (type === 'movie' || type === 'person') ? type : 'tv';
   const bar = document.getElementById('channelSearchTypeChips');
   if (bar) {
     bar.querySelectorAll('.subnav-pill').forEach((p) => {
@@ -32198,11 +36419,18 @@ function setChannelSearchType(type, btn) {
   }
   const input = document.getElementById('channelSearchInput');
   if (input) {
-    input.placeholder = channelSearchType === 'movie' ? 'Search a movie by name...' : 'Search a show by name...';
+    input.placeholder = channelSearchType === 'movie'
+      ? 'Search a movie by name...'
+      : (channelSearchType === 'person'
+        ? 'Search an actor, director or creator...'
+        : 'Search a show by name...');
   }
   const box = document.getElementById('channelSearchResult');
   const epBox = document.getElementById('channelEpisodePicker');
   if (epBox) epBox.innerHTML = '';
+  // The picker below is about to be reused for a different kind of thing,
+  // so the filmography it may be holding stops being what is on screen.
+  channelPersonCredits = null;
   const q = input ? input.value.trim() : '';
   if (q) {
     runChannelTitleSearch();
@@ -32217,6 +36445,13 @@ async function runChannelTitleSearch() {
   document.getElementById('channelEpisodePicker').innerHTML = '';
   if (!q) {
     box.innerHTML = '';
+    return;
+  }
+  // A person is not a title, and the two searches answer different
+  // questions -- so Actors & Directors goes to its own endpoint and its own
+  // result card (see runChannelPersonSearch).
+  if (channelSearchType === 'person') {
+    await runChannelPersonSearch(q);
     return;
   }
   box.innerHTML = '<p><small>Searching\u2026</small></p>';
@@ -32262,6 +36497,14 @@ function renderChannelTitleResults(results, searchType = 'tv') {
 }
 
 document.getElementById('channelSearchResult').addEventListener('click', (e) => {
+  // A person card behaves like a show card: tapping the photo (or the
+  // button) opens what they have been in, below, rather than committing to
+  // a whole channel in one click.
+  const personTarget = e.target.closest('.channelPersonCard, .channelPersonBtn');
+  if (personTarget) {
+    browseChannelPerson(personTarget.dataset.personid, personTarget.dataset.personname);
+    return;
+  }
   const showTarget = e.target.closest('.channelTitleCard, .channelTitleBtn');
   if (showTarget) {
     browseChannelShow(showTarget.dataset.tmdbid, showTarget.dataset.title, showTarget.dataset.poster, showTarget.dataset.backdrop);
@@ -32280,13 +36523,18 @@ document.getElementById('channelSearchResult').addEventListener('click', (e) => 
   }
 });
 
-async function addMovieToChannelDraft(tmdbId, title, year, poster, backdrop, btn) {
+async function addMovieToChannelDraft(tmdbId, title, year, poster, backdrop, btn, duplicateChecked) {
   if (channelDraftItems.length >= CHANNEL_MAX_TOTAL_ITEMS) {
     if (typeof showAppAlert === 'function') {
       showAppAlert('Channel Limit', 'This channel has reached the maximum of ' + CHANNEL_MAX_TOTAL_ITEMS + ' items.');
     }
     return;
   }
+  if (!duplicateChecked && guardChannelDraftDuplicate(
+    title || 'That movie',
+    channelDraftItems.filter((it) => it && it.kind === 'movie' && String(it.tmdbId || '') === String(tmdbId || '')).length,
+    () => addMovieToChannelDraft(tmdbId, title, year, poster, backdrop, btn, true)
+  )) return;
   const originalText = btn ? btn.textContent : '+ Add Movie';
   if (btn) {
     btn.disabled = true;
@@ -32314,6 +36562,7 @@ async function addMovieToChannelDraft(tmdbId, title, year, poster, backdrop, btn
       showName: title,
       epName: 'Movie',
       released: year ? (year + '-01-01') : '',
+      runtime: data.runtime || 0,
       thumbnail: backdrop || poster || '',
       poster: poster || '',
       showPoster: poster || '',
@@ -32383,6 +36632,33 @@ async function browseChannelShow(tmdbId, showName, showPoster, showBackdrop) {
 }
 
 document.getElementById('channelEpisodePicker').addEventListener('click', (e) => {
+  const personMovie = e.target.closest('.channelPersonMovieCard, .channelPersonMovieBtn');
+  if (personMovie) {
+    addMovieToChannelDraft(
+      personMovie.dataset.tmdbid, personMovie.dataset.title, personMovie.dataset.year,
+      personMovie.dataset.poster, personMovie.dataset.backdrop,
+      personMovie.querySelector('.channelPersonMovieBtn') || personMovie
+    );
+    return;
+  }
+  // The button is the precise action -- only the episodes this person is
+  // in -- and the poster beside it is the escape hatch to the full season
+  // picker, for when the whole show is what you actually want.
+  const personShowBtn = e.target.closest('.channelPersonShowBtn');
+  if (personShowBtn) {
+    addPersonShowEpisodes(personShowBtn.dataset.tmdbid, personShowBtn.dataset.title, personShowBtn.dataset.poster, personShowBtn);
+    return;
+  }
+  const personShow = e.target.closest('.channelPersonShowCard');
+  if (personShow) {
+    browseChannelShow(personShow.dataset.tmdbid, personShow.dataset.title, personShow.dataset.poster, personShow.dataset.backdrop);
+    return;
+  }
+  const personAddAll = e.target.closest('.channelPersonAddAllBtn');
+  if (personAddAll) {
+    addWholeSpotlightToDraft(personAddAll);
+    return;
+  }
   const seasonBtn = e.target.closest('.channelSeasonBtn');
   if (seasonBtn) {
     loadChannelSeasonEpisodes(
@@ -32401,12 +36677,12 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
   }
   const addAllBtn = e.target.closest('.channelAddAllEpisodesBtn');
   if (addAllBtn) {
-    addAllEpisodesToChannel(addAllBtn.dataset.imdbid, addAllBtn.dataset.showname, addAllBtn.dataset.poster, addAllBtn.dataset.backdrop);
+    addAllEpisodesToChannel(addAllBtn.dataset.imdbid, addAllBtn.dataset.showname, addAllBtn.dataset.poster, addAllBtn.dataset.backdrop, addAllBtn.dataset.tmdbid);
     return;
   }
   const addBtn = e.target.closest('.channelAddEpisodesBtn');
   if (addBtn) {
-    addCheckedEpisodesToChannel(addBtn.dataset.imdbid, addBtn.dataset.showname, addBtn.dataset.poster, addBtn.dataset.backdrop);
+    addCheckedEpisodesToChannel(addBtn.dataset.imdbid, addBtn.dataset.showname, addBtn.dataset.poster, addBtn.dataset.backdrop, addBtn.dataset.tmdbid);
   }
 });
 
@@ -32414,9 +36690,15 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
 // see /api/show-episodes) and adds all of them in original broadcast order,
 // for "just give me the whole show" instead of clicking through season by
 // season.
-async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, showBackdrop, seasonsCsv, btn) {
+async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, showBackdrop, seasonsCsv, btn, duplicateChecked) {
   const seasons = String(seasonsCsv || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!seasons.length) return;
+  const showStreamId = channelStreamShowId(imdbId, tmdbId);
+  if (!duplicateChecked && guardChannelDraftDuplicate(
+    showName || 'That show',
+    channelDraftCountForShow(showStreamId, showName),
+    () => addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, showBackdrop, seasonsCsv, btn, true)
+  )) return;
   if (btn) {
     btn.disabled = true;
     btn.textContent = 'Adding every season\u2026';
@@ -32435,13 +36717,14 @@ async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, show
         episodes.forEach((ep) => {
           showEpisodes.push({
             kind: 'episode',
-            imdbId: imdbId,
+            imdbId: showStreamId,
             season: season,
             episode: ep.episode,
             showName: showName || '',
             epName: ep.name || ('Episode ' + ep.episode),
             title: (showName ? showName + ' S' + season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.name || ('Episode ' + ep.episode)),
             released: ep.released,
+            runtime: ep.runtime || 0,
             thumbnail: ep.thumbnail || showBackdrop || showPoster,
             poster: showPoster || ep.thumbnail || showBackdrop || '',
             showPoster: showPoster || '',
@@ -32492,7 +36775,7 @@ async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, s
     }
     const rows = data.episodes.map((ep) => {
       const epJson = escapeAttr(JSON.stringify({
-        season: parseInt(season, 10), episode: ep.episode, title: ep.name, released: ep.released, thumbnail: ep.thumbnail,
+        season: parseInt(season, 10), episode: ep.episode, title: ep.name, released: ep.released, thumbnail: ep.thumbnail, runtime: ep.runtime || 0,
       }));
       return '<label class="row quick-row" style="cursor:pointer;">' +
         '<span><input type="checkbox" class="channelEpisodeCheck" data-ep="' + epJson + '"> ' +
@@ -32502,10 +36785,12 @@ async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, s
     listBox.innerHTML = rows +
       '<div class="actions" style="margin-top:8px;">' +
       '<button type="button" class="secondary channelAddEpisodesBtn"' +
-      ' data-imdbid="' + escapeAttr(imdbId) + '" data-showname="' + escapeAttr(showName) + '"' +
+      ' data-imdbid="' + escapeAttr(imdbId) + '" data-tmdbid="' + escapeAttr(tmdbId) + '"' +
+      ' data-showname="' + escapeAttr(showName) + '"' +
       ' data-poster="' + escapeAttr(showPoster) + '" data-backdrop="' + escapeAttr(showBackdrop || '') + '">Add checked episodes</button>' +
       '<button type="button" class="secondary channelAddAllEpisodesBtn"' +
-      ' data-imdbid="' + escapeAttr(imdbId) + '" data-showname="' + escapeAttr(showName) + '"' +
+      ' data-imdbid="' + escapeAttr(imdbId) + '" data-tmdbid="' + escapeAttr(tmdbId) + '"' +
+      ' data-showname="' + escapeAttr(showName) + '"' +
       ' data-poster="' + escapeAttr(showPoster) + '" data-backdrop="' + escapeAttr(showBackdrop || '') + '">Add all episodes</button>' +
       '</div>';
     listBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -32514,7 +36799,7 @@ async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, s
   }
 }
 
-function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop) {
+function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop, tmdbId) {
   const checks = document.querySelectorAll('#channelEpisodeList .channelEpisodeCheck:checked');
   if (!checks.length) {
     if (typeof showAppAlert === 'function') {
@@ -32524,6 +36809,7 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop)
     }
     return;
   }
+  const showStreamId = channelStreamShowId(imdbId, tmdbId);
   checks.forEach((cb) => {
     let ep;
     try {
@@ -32533,13 +36819,14 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop)
     }
     channelDraftItems.push({
       kind: 'episode',
-      imdbId: imdbId,
+      imdbId: showStreamId,
       season: ep.season,
       episode: ep.episode,
       showName: showName || '',
       epName: ep.title || ('Episode ' + ep.episode),
       title: (showName ? showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.title || ('Episode ' + ep.episode)),
       released: ep.released,
+      runtime: ep.runtime || 0,
       thumbnail: ep.thumbnail || showBackdrop || showPoster,
       poster: showPoster || ep.thumbnail || showBackdrop || '',
       showPoster: showPoster || '',
@@ -32554,11 +36841,11 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop)
 
 // Checks every episode box for the currently-loaded season, then reuses
 // addCheckedEpisodesToChannel above rather than duplicating its logic.
-function addAllEpisodesToChannel(imdbId, showName, showPoster, showBackdrop) {
+function addAllEpisodesToChannel(imdbId, showName, showPoster, showBackdrop, tmdbId) {
   document.querySelectorAll('#channelEpisodeList .channelEpisodeCheck').forEach((cb) => {
     cb.checked = true;
   });
-  addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop);
+  addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop, tmdbId);
 }
 
 const LOCAL_CHANNELS_KEY = 'myListAddon:localChannels';
@@ -32624,6 +36911,11 @@ function compactChannelItemForStorage(it) {
   if (it.released) {
     out.released = it.released.length > 10 ? it.released.slice(0, 10) : it.released;
   }
+  // Minutes, when TMDB had them. Only written when there is a real number to
+  // write -- a zero runtime on every one of 5,000 picks is 15KB of
+  // localStorage spent saying nothing.
+  const runtime = Number(it.runtime);
+  if (Number.isInteger(runtime) && runtime > 0) out.runtime = runtime;
   const poster = it.poster || it.showPoster || it.thumbnail || '';
   const thumbnail = it.thumbnail || '';
   const showPoster = it.showPoster || '';
@@ -32658,7 +36950,11 @@ function saveLocalChannelsMap(map) {
       backdrop: ch.backdrop || null,
       items: compressChannelItemsForStorage(ch.items, 5000),
       shuffle: !!ch.shuffle,
-      dailyRotate: !!ch.dailyRotate,
+      autoSort: ch.autoSort || '',
+      sortByAired: !!ch.sortByAired,
+      ...channelBroadcastFields(ch),
+      ...channelShareFields(ch),
+      order: Number(ch.order) || 0,
       createdAt: ch.createdAt || Date.now(),
       updatedAt: ch.updatedAt || Date.now(),
     };
@@ -32750,7 +37046,11 @@ function ensureAllChannelsSyncedFromRows(map) {
                   backdrop: payload.backdrop || null,
                   items: compressChannelItemsForStorage(payload.items),
                   shuffle: !!payload.shuffle,
-                  dailyRotate: !!payload.dailyRotate,
+                  autoSort: payload.autoSort || '',
+                  sortByAired: !!payload.sortByAired,
+                  ...channelBroadcastFields(payload),
+                  ...channelShareFields(payload),
+                  order: Number(payload.order) || 0,
                   createdAt: Date.now(),
                   updatedAt: Date.now(),
                 };
@@ -32781,7 +37081,13 @@ function saveLocalChannel(payload) {
     backdrop: payload.backdrop || null,
     items: compressChannelItemsForStorage(payload.items),
     shuffle: !!payload.shuffle,
-    dailyRotate: !!payload.dailyRotate,
+    autoSort: payload.autoSort || '',
+    sortByAired: !!payload.sortByAired,
+    ...channelBroadcastFields(payload),
+    ...channelShareFields(payload),
+    // Kept from the existing record when a save does not carry one, so
+    // editing a channel never knocks it out of the order someone arranged.
+    order: Number(payload.order) || (existing ? Number(existing.order) : 0) || 0,
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now,
   };
@@ -32826,6 +37132,264 @@ function pruneChannelFromAllMerges(channelId) {
   return changed;
 }
 
+// --- My Channels: ordering, searching, and taking a delete back ----------
+//
+// Past a dozen or so channels the list is a long scroll with no way to find
+// anything in it, and deleting one was the only destructive action in the
+// app with no undo behind it.
+let myChannelsSort = 'recent';
+let myChannelsSearch = '';
+let _pendingChannelUndo = null;
+let _pendingChannelUndoTimer = null;
+
+function setMyChannelsSort(value) {
+  myChannelsSort = value || 'recent';
+  try { localStorage.setItem('myListAddon:myChannelsSort', myChannelsSort); } catch (e) {}
+  renderMyCreatedChannelsList();
+}
+
+function setMyChannelsSearch(value) {
+  myChannelsSearch = String(value || '');
+  renderMyCreatedChannelsList();
+}
+
+function sortMyChannels(channels, mode) {
+  const how = mode || myChannelsSort;
+  const list = channels.slice();
+  if (how === 'name') {
+    list.sort((a, b) => String(a.name || '').toLowerCase().localeCompare(String(b.name || '').toLowerCase()));
+  } else if (how === 'size') {
+    list.sort((a, b) => ((b.items || []).length - (a.items || []).length));
+  } else if (how === 'created') {
+    list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  } else if (how === 'manual') {
+    // A channel with no order yet sorts after every channel that has one,
+    // by how recently it was touched -- so a newly added channel lands at
+    // the end of an arrangement rather than somewhere in the middle of it.
+    list.sort((a, b) => {
+      const oa = Number(a.order) || 0;
+      const ob = Number(b.order) || 0;
+      if (oa && ob) return oa - ob;
+      if (oa) return -1;
+      if (ob) return 1;
+      return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
+    });
+  } else {
+    list.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  }
+  return list;
+}
+
+function filterMyChannels(channels) {
+  const q = myChannelsSearch.trim().toLowerCase();
+  if (!q) return channels;
+  return channels.filter((ch) => {
+    if (!ch) return false;
+    if (String(ch.name || '').toLowerCase().indexOf(q) !== -1) return true;
+    if (String(ch.description || '').toLowerCase().indexOf(q) !== -1) return true;
+    // A channel is also findable by what is IN it, which is usually how
+    // people remember one -- "the one with Rugrats in".
+    return (ch.items || []).some((it) => it && String(it.showName || '').toLowerCase().indexOf(q) !== -1);
+  });
+}
+
+// The undo bar, and the timer that retires it.
+//
+// Held for a minute, and cleared when it is used or when the page moves on
+// -- an Undo still sitting there ten minutes later is a promise about state
+// that has since changed underneath it.
+function offerChannelDeleteUndo(snapshot, wasInCatalogs) {
+  _pendingChannelUndo = { channel: snapshot, inCatalogs: wasInCatalogs };
+  if (_pendingChannelUndoTimer) clearTimeout(_pendingChannelUndoTimer);
+  _pendingChannelUndoTimer = setTimeout(() => {
+    _pendingChannelUndo = null;
+    renderChannelUndoBar();
+  }, 60000);
+  renderChannelUndoBar();
+}
+
+function renderChannelUndoBar() {
+  const bar = document.getElementById('myChannelsUndoBar');
+  if (!bar) return;
+  if (!_pendingChannelUndo) {
+    bar.style.display = 'none';
+    bar.innerHTML = '';
+    return;
+  }
+  const name = _pendingChannelUndo.channel.name || 'Channel';
+  bar.style.display = 'block';
+  bar.innerHTML = '<div class="row" style="gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--surface);">' +
+    '<span style="flex:1; font-size:0.85rem;">Deleted &ldquo;' + escapeHtml(name) + '&rdquo;.</span>' +
+    '<button type="button" class="secondary lc-btn" onclick="undoChannelDelete()">Undo</button>' +
+    '</div>';
+}
+
+function undoChannelDelete() {
+  if (!_pendingChannelUndo) return;
+  const { channel, inCatalogs } = _pendingChannelUndo;
+  _pendingChannelUndo = null;
+  if (_pendingChannelUndoTimer) clearTimeout(_pendingChannelUndoTimer);
+  saveLocalChannel(channel);
+  if (inCatalogs) {
+    const payload = Object.assign({}, channel);
+    addRow(channel.name || 'Channel', 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channel.channelId);
+    saveState();
+  }
+  renderChannelUndoBar();
+  renderMyCreatedChannelsList();
+  renderChannelMergeList();
+  showAddedToast('Restored channel "' + (channel.name || 'Channel') + '".');
+}
+
+
+// --- arranging My Channels by hand ---------------------------------------
+//
+// The same three ways My Lists lets a catalog row be moved -- a drag handle,
+// up/down buttons, and a position you can type -- because past a dozen
+// channels "recently updated" is not an order anyone chose.
+//
+// All three work on the list AS SHOWN. A filter or another ordering means
+// the cards on screen are a subset in a different sequence, so a move
+// permutes the visible channels among the slots they already occupy in the
+// stored arrangement and leaves every hidden channel exactly where it is --
+// the same rule the channel draft's own filtered drag follows, and for the
+// same reason: rebuilding an order from a partial view loses whatever the
+// view was hiding.
+function visibleMyChannelIds() {
+  const box = document.getElementById('myCreatedChannelsList');
+  if (!box) return [];
+  return [...box.querySelectorAll('.list-card[data-channel-id]')]
+    .map((card) => card.getAttribute('data-channel-id'))
+    .filter(Boolean);
+}
+
+// Rearranging while another ordering is on screen adopts THAT as the
+// starting arrangement, so the card lands where it was dropped rather than
+// somewhere in a stored order nobody was looking at.
+function seedMyChannelsManualOrder() {
+  const map = loadLocalChannels();
+  const displayed = sortMyChannels(Object.values(map));
+  let changed = false;
+  displayed.forEach((ch, i) => {
+    if (!ch || !map[ch.channelId]) return;
+    if (Number(map[ch.channelId].order) !== i + 1) {
+      map[ch.channelId].order = i + 1;
+      changed = true;
+    }
+  });
+  if (changed) saveLocalChannelsMap(map);
+}
+
+function applyMyChannelOrder(visibleIdsInNewOrder) {
+  const map = loadLocalChannels();
+  const all = sortMyChannels(Object.values(map), 'manual');
+  const wanted = {};
+  visibleIdsInNewOrder.forEach((id) => { wanted[id] = true; });
+  // The positions the visible channels hold in the full arrangement. The
+  // hidden ones keep theirs untouched.
+  const slots = [];
+  all.forEach((ch, i) => { if (ch && wanted[ch.channelId]) slots.push(i); });
+  const next = all.slice();
+  visibleIdsInNewOrder.forEach((id, n) => {
+    if (n < slots.length && map[id]) next[slots[n]] = map[id];
+  });
+  next.forEach((ch, i) => {
+    if (ch && map[ch.channelId]) map[ch.channelId].order = i + 1;
+  });
+  saveLocalChannelsMap(map);
+  // Arranging by hand IS choosing the hand-made order, so the dropdown
+  // follows rather than leaving the list to re-sort out from under it.
+  myChannelsSort = 'manual';
+  try { localStorage.setItem('myListAddon:myChannelsSort', 'manual'); } catch (e) {}
+  renderMyCreatedChannelsList();
+}
+
+function beginMyChannelReorder() {
+  if (myChannelsSort !== 'manual') seedMyChannelsManualOrder();
+}
+
+// Drag-to-reorder. Mouse goes through HTML5 drag-and-drop and touch/pen
+// through Pointer Events, which is the same split My Lists uses and for the
+// same reason: native drag-and-drop generally does not fire on touch at all.
+let myChannelDragCard = null;
+let myChannelTouchCard = null;
+let myChannelsDragBound = false;
+
+function myChannelDragAfterElement(container, y) {
+  const cards = [...container.querySelectorAll('.list-card[data-channel-id]:not(.dragging)')];
+  return cards.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
+    return closest;
+  }, { offset: -Infinity, element: null }).element;
+}
+
+function moveMyChannelDragCard(container, card, clientY) {
+  const afterEl = myChannelDragAfterElement(container, clientY);
+  if (afterEl == null) container.appendChild(card);
+  else if (afterEl !== card) container.insertBefore(card, afterEl);
+}
+
+// Bound once on the container rather than per card, because the card list is
+// re-rendered wholesale on every change and per-card listeners would be
+// re-attached (and leak) each time.
+function initMyChannelsDrag() {
+  const container = document.getElementById('myCreatedChannelsList');
+  if (!container || myChannelsDragBound) return;
+  myChannelsDragBound = true;
+
+  container.addEventListener('dragstart', (e) => {
+    const handle = e.target.closest('.channel-drag-handle');
+    if (!handle) { e.preventDefault(); return; }
+    myChannelDragCard = handle.closest('.list-card[data-channel-id]');
+    if (!myChannelDragCard) return;
+    myChannelDragCard.classList.add('dragging');
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+  });
+
+  container.addEventListener('dragover', (e) => {
+    if (!myChannelDragCard) return;
+    e.preventDefault();
+    moveMyChannelDragCard(container, myChannelDragCard, e.clientY);
+  });
+
+  container.addEventListener('dragend', () => {
+    if (!myChannelDragCard) return;
+    myChannelDragCard.classList.remove('dragging');
+    myChannelDragCard = null;
+    beginMyChannelReorder();
+    applyMyChannelOrder(visibleMyChannelIds());
+  });
+
+  const onTouchMove = (e) => {
+    if (!myChannelTouchCard) return;
+    moveMyChannelDragCard(container, myChannelTouchCard, e.clientY);
+  };
+  const onTouchEnd = () => {
+    document.removeEventListener('pointermove', onTouchMove);
+    if (!myChannelTouchCard) return;
+    myChannelTouchCard.classList.remove('dragging');
+    myChannelTouchCard = null;
+    beginMyChannelReorder();
+    applyMyChannelOrder(visibleMyChannelIds());
+  };
+
+  container.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
+    const handle = e.target.closest('.channel-drag-handle');
+    if (!handle) return;
+    e.preventDefault();
+    myChannelTouchCard = handle.closest('.list-card[data-channel-id]');
+    if (!myChannelTouchCard) return;
+    myChannelTouchCard.classList.add('dragging');
+    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+    document.addEventListener('pointermove', onTouchMove);
+    document.addEventListener('pointerup', onTouchEnd, { once: true });
+    document.addEventListener('pointercancel', onTouchEnd, { once: true });
+  });
+}
+
 function deleteLocalChannel(channelId, fallbackName) {
   const map = loadLocalChannels();
   const channel = map[channelId];
@@ -32842,6 +37406,25 @@ function deleteLocalChannel(channelId, fallbackName) {
   if (!name || name === 'Channel') name = (channel && channel.name) || 'Channel';
 
   const performDelete = () => {
+    // A published channel is withdrawn from the directory as it goes.
+    //
+    // Deleting only removed this browser's copy, so a listing stayed up
+    // advertising a channel its owner had deleted -- and with the local
+    // record gone the code went too, leaving nothing to unpublish WITH.
+    // Fired before the record is dropped, for the code; the publish panel
+    // lists any that slip through anyway (see renderChannelPublishList), so
+    // this is a best effort rather than the only chance.
+    if (channel && channel.shareCode && channel.sharePublished) {
+      unpublishChannelByCode(channel.shareCode).catch(() => {});
+    }
+    // Kept whole before it goes, so Undo can put back the channel AND its
+    // place in Catalogs. A catalog row has had removeEntryWithUndo since
+    // long before this; deleting a channel -- which can be eight hundred
+    // hand-picked episodes -- was immediate and final.
+    const snapshot = channel ? JSON.parse(JSON.stringify(channel)) : null;
+    const wasInCatalogs = [...document.querySelectorAll('#lists .entry .url')]
+      .some((u) => String(u.value || '').indexOf(channelId) !== -1);
+
     delete map[channelId];
     saveLocalChannelsMap(map);
     pruneChannelFromAllMerges(channelId);
@@ -32856,6 +37439,7 @@ function deleteLocalChannel(channelId, fallbackName) {
       });
     });
     saveState();
+    if (snapshot) offerChannelDeleteUndo(snapshot, wasInCatalogs);
     renderMyCreatedChannelsList();
     renderChannelMergeList();
     showAddedToast('Deleted channel "' + name + '".');
@@ -32907,6 +37491,11 @@ function toggleChannelInCatalog(channelId) {
 }
 
 function renderChannelDraftList() {
+  // Re-applies a remembered sort before drawing, so picks added since the
+  // last render land in order. Every manual reorder disarms the sort first
+  // (see clearChannelDraftAutoSort), which is what lets a hand-moved pick
+  // survive the render it triggers.
+  applyChannelDraftAutoSort();
   const box = document.getElementById('channelDraftList');
   const badge = document.getElementById('channelDraftCountBadge');
   if (badge) badge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ')' : '';
@@ -32914,9 +37503,17 @@ function renderChannelDraftList() {
     box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p>';
     renderChannelPosterPicker();
     renderChannelCrossoverSuggestions();
+    updateChannelBroadcastControls();
+    renderChannelDraftStats();
+    renderChannelDraftGroupOptions();
     return;
   }
-  const cardsHtml = channelDraftItems.map((it, i) => {
+  // The filter decides what is drawn; every index below stays the index into
+  // channelDraftItems, never a position in the filtered view, so a drag or a
+  // typed position means the same thing filtered or not.
+  const visible = channelDraftVisibleIndices();
+  const cardsHtml = visible.map((i) => {
+    const it = channelDraftItems[i];
     let showName = it.showName || '';
     let epName = it.epName || '';
     let seasonEp = '';
@@ -32958,23 +37555,48 @@ function renderChannelDraftList() {
       ? '<img class="live-preview-poster" src="' + escapeAttr(posterSrc) + '" alt="" loading="lazy">'
       : '<div class="live-preview-poster live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
 
-    return '<div class="live-preview-poster-card channel-pick" data-idx="' + i + '" style="position:relative; cursor:grab; user-select:none; touch-action:manipulation;">' +
+    // Dragging is off while selecting: a drag and a tap-to-select on the
+    // same card are the same gesture on a touch screen, and one of the two
+    // has to give.
+    const selecting = channelDraftSelectMode;
+    const selectBox = selecting
+      ? '<div style="position:absolute; top:4px; left:4px; z-index:5;">' +
+          '<input type="checkbox" class="channelPickCheck" data-idx="' + i + '"' + (isChannelDraftSelected(i) ? ' checked' : '') +
+          ' aria-label="Select this pick" style="width:20px; height:20px; accent-color:var(--accent); cursor:pointer;">' +
+        '</div>'
+      : '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
+          '<input type="number" class="pos channelPosInput" min="1" max="' + channelDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
+        '</div>';
+    return '<div class="live-preview-poster-card channel-pick' + (selecting && isChannelDraftSelected(i) ? ' channel-pick-selected' : '') + '" data-idx="' + i + '" style="position:relative; cursor:' + (selecting ? 'pointer' : 'grab') + '; user-select:none; touch-action:manipulation;">' +
       '<div style="position:relative; width:100%;">' +
         posterEl +
-        '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
-          '<input type="number" class="pos channelPosInput" min="1" max="' + channelDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
-        '</div>' +
-        '<button type="button" class="cw-remove-btn channelRemovePickBtn" title="Remove pick" style="z-index:4;">&times;</button>' +
+        selectBox +
+        (selecting ? '' : '<button type="button" class="cw-remove-btn channelRemovePickBtn" title="Remove pick" style="z-index:4;">&times;</button>') +
       '</div>' +
       '<div class="live-preview-poster-name" title="' + escapeAttr(firstLine) + '">' + escapeHtml(firstLine) + '</div>' +
       '<div class="live-preview-poster-year" title="' + escapeAttr(secondLine) + '">' + escapeHtml(secondLine) + '</div>' +
     '</div>';
   }).join('');
   
-  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
+  box.innerHTML = visible.length
+    ? '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>'
+    : '<p style="color:var(--muted); font-size:0.85rem;"><small>No pick in this channel matches that filter.</small></p>';
+  const bulkBar = document.getElementById('channelDraftBulkBar');
+  if (bulkBar) bulkBar.style.display = channelDraftSelectMode ? 'flex' : 'none';
+  const modeBtn = document.getElementById('channelDraftSelectModeBtn');
+  if (modeBtn) modeBtn.textContent = channelDraftSelectMode ? 'Done' : 'Select';
+  renderChannelDraftGroupOptions();
+  updateChannelDraftSelectionCount();
+  renderChannelDraftStats();
+  // Bound unconditionally: the binding happens once and the handler itself
+  // stands down while selecting, so skipping the call here would only mean
+  // never binding at all if the first render happened to be in Select mode.
   initChannelHoldDrag();
   renderChannelPosterPicker();
   renderChannelCrossoverSuggestions();
+  // The schedule hint counts the draft's shows and Story Lock lists them,
+  // so both have to be redrawn whenever the picks change.
+  updateChannelBroadcastControls();
 }
 
 function renderChannelPosterPicker() {
@@ -39639,9 +44261,17 @@ async function spliceCrossoverEvent(eventId, btn) {
 
 function removeAllChannelDraftPicks() {
   if (!channelDraftItems.length) return;
-  if (!confirm('Remove all ' + channelDraftItems.length + ' picks? This cannot be undone.')) return;
-  channelDraftItems = [];
-  renderChannelDraftList();
+  const wipe = () => {
+    channelDraftItems = [];
+    channelDraftSelection = [];
+    channelDraftFilter = '';
+    const filterInput = document.getElementById('channelDraftFilterInput');
+    if (filterInput) filterInput.value = '';
+    renderChannelDraftList();
+  };
+  const message = 'Remove all ' + channelDraftItems.length + ' picks? This cannot be undone.';
+  if (typeof showAppConfirm === 'function') showAppConfirm('Remove all picks', message, 'Remove all', wipe, true);
+  else if (confirm(message)) wipe();
 }
 
 document.getElementById('channelDraftList').addEventListener('click', (e) => {
@@ -39653,6 +44283,24 @@ document.getElementById('channelDraftList').addEventListener('click', (e) => {
     renderChannelDraftList();
     return;
   }
+  // While selecting, the whole card is the checkbox -- a 20px box is not a
+  // target anyone wants to hit forty times in a row on a phone. The
+  // checkbox's own click is left alone so it is not toggled twice.
+  if (channelDraftSelectMode && !e.target.closest('.channelPickCheck')) {
+    const card = e.target.closest('.channel-pick');
+    if (card) {
+      const idx = parseInt(card.dataset.idx, 10);
+      toggleChannelDraftPick(idx, !isChannelDraftSelected(idx));
+      renderChannelDraftList();
+    }
+  }
+});
+
+document.getElementById('channelDraftList').addEventListener('change', (e) => {
+  const check = e.target.closest('.channelPickCheck');
+  if (!check) return;
+  toggleChannelDraftPick(parseInt(check.dataset.idx, 10), check.checked);
+  renderChannelDraftList();
 });
 
 document.getElementById('channelDraftList').addEventListener('change', (e) => {
@@ -39670,6 +44318,7 @@ document.getElementById('channelDraftList').addEventListener('change', (e) => {
     renderChannelDraftList();
     return;
   }
+  clearChannelDraftAutoSort();
   const [item] = channelDraftItems.splice(from, 1);
   channelDraftItems.splice(to, 0, item);
   renderChannelDraftList();
@@ -39749,6 +44398,10 @@ function initChannelHoldDrag() {
 
   // Pointer events for desktop & unified pointer handling
   container.addEventListener('pointerdown', (e) => {
+    // Bound once and never removed, so Select mode has to be checked here:
+    // a hold-drag and a tap-to-select are the same gesture on a touch
+    // screen, and while selecting, selecting wins.
+    if (channelDraftSelectMode) return;
     if (e.target.closest('.channelRemovePickBtn, .channelPosInput')) return;
     const card = e.target.closest('.channel-pick');
     if (!card) return;
@@ -39843,17 +44496,234 @@ function getChannelDragAfterElement(container, x, y) {
   return closest;
 }
 
+// Rebuilds the draft order from the cards on screen after a drag.
+//
+// Only the cards ON SCREEN, which is the whole difficulty: with a filter
+// active those are a SUBSET, and rebuilding the list from them would drop
+// every pick the filter is hiding -- silently, irreversibly, on one
+// accidental drag of a channel someone spent an evening assembling.
+//
+// So the drag permutes the picks among the SLOTS they already occupied in
+// the full list, and everything else stays exactly where it is. With no
+// filter the slots are 0..N-1 and this is the plain reorder it always was.
 function reorderChannelDraftFromDom() {
   const container = document.getElementById('channelDraftList');
   const rows = [...container.querySelectorAll('.channel-pick')];
   if (rows.length) {
-    channelDraftItems = rows.map((row) => channelDraftItems[parseInt(row.dataset.idx, 10)]).filter(Boolean);
+    const order = rows
+      .map((row) => parseInt(row.dataset.idx, 10))
+      .filter((n) => Number.isInteger(n) && n >= 0 && n < channelDraftItems.length);
+    if (order.length) {
+      clearChannelDraftAutoSort();
+      const slots = order.slice().sort((a, b) => a - b);
+      const next = channelDraftItems.slice();
+      order.forEach((fromIdx, n) => { next[slots[n]] = channelDraftItems[fromIdx]; });
+      channelDraftItems = next;
+    }
   }
   renderChannelDraftList();
 }
 
+// --- play order ---------------------------------------------------------
+//
+// One dropdown, and almost every entry in it is an ACTION rather than a
+// mode: picking "Air date -- oldest first" reorders the picks then and
+// there, and what is saved is that order. So the list on screen is always
+// the list that plays, and moving a pick by hand afterwards simply stays
+// moved -- which is what the old "Sort by air date" checkbox could not do,
+// because it re-sorted at serve time and silently overrode every manual
+// move.
+//
+// Two entries are not one-shot sorts:
+//  - "Shuffle daily" is the one real MODE left (the payload's shuffle
+//    flag): the Worker reshuffles from a date-based seed on every request,
+//    so no stored order could express it and the list order is ignored
+//    while it is on.
+//  - "Shuffle now" is a one-shot like the sorts, and leaves the dropdown on
+//    "As listed" -- there is no arrangement to keep re-applying.
+//
+// A static sort is also REMEMBERED, as the payload's autoSort field, and
+// re-applied whenever picks are added later (see applyChannelDraftAutoSort)
+// so an air-date channel stays in air-date order as it grows. Moving a pick
+// by hand disarms that and puts the dropdown back to "As listed": from then
+// on the order is the person's, not the sort's.
+const CHANNEL_STATIC_SORTS = ['aired-asc', 'aired-desc', 'show-season-episode', 'interleave', 'title-az'];
+
+const CHANNEL_PLAY_ORDER_HINTS = {
+  'as-listed': 'Picks play in the order listed above \u2014 drag one, or type a new position, to change it.',
+  'shuffle-daily': 'The channel reshuffles itself once every 24 hours, so the order listed above is ignored while this is selected.',
+  'sorted': 'Sorted now, and sorted again whenever you add more picks. Move a pick by hand and this switches back to "As listed", keeping your order.',
+  'interleave': 'One episode from each show in turn, then round again \u2014 a prime-time block rather than fifty episodes of one show before the next one starts. Re-applied whenever you add more picks.',
+};
+
+const CHANNEL_SORT_LABELS = {
+  'aired-asc': 'air date order',
+  'aired-desc': 'newest aired first',
+  'show-season-episode': 'by show, season & episode',
+  'interleave': 'interleaved across shows',
+  'title-az': 'A\u2013Z by title',
+};
+
+// How a saved channel plays, in a few words, or '' when it is simply the
+// order its picks are listed in. sortByAired is the pre-dropdown flag the
+// Worker still honours for a channel nobody has edited since.
+function channelPlayOrderLabel(ch) {
+  if (!ch) return '';
+  if (ch.shuffle) return 'shuffled daily';
+  if (ch.autoSort && CHANNEL_SORT_LABELS[ch.autoSort]) return CHANNEL_SORT_LABELS[ch.autoSort];
+  if (ch.sortByAired) return CHANNEL_SORT_LABELS['aired-asc'];
+  return '';
+}
+
+function getChannelPlayOrder() {
+  const sel = document.getElementById('channelPlayOrderSelect');
+  const v = sel && sel.value ? sel.value : 'as-listed';
+  return v === 'shuffle-now' ? 'as-listed' : v;
+}
+
+function updateChannelPlayOrderHint() {
+  const hint = document.getElementById('channelPlayOrderHint');
+  if (!hint) return;
+  const v = getChannelPlayOrder();
+  const key = v === 'shuffle-daily' ? 'shuffle-daily'
+    : (v === 'interleave' ? 'interleave'
+      : (CHANNEL_STATIC_SORTS.indexOf(v) !== -1 ? 'sorted' : 'as-listed'));
+  hint.textContent = CHANNEL_PLAY_ORDER_HINTS[key];
+}
+
+function setChannelPlayOrder(value) {
+  const sel = document.getElementById('channelPlayOrderSelect');
+  const v = value || 'as-listed';
+  if (sel) sel.value = v;
+  updateChannelPlayOrderHint();
+  updateChannelPlayOrderDependants();
+}
+
+// The static sort to re-apply when picks are added, or '' when there is
+// none -- "As listed" and "Shuffle daily" both leave the order alone.
+function channelDraftAutoSortKey() {
+  const v = getChannelPlayOrder();
+  return CHANNEL_STATIC_SORTS.indexOf(v) !== -1 ? v : '';
+}
+
+// Every manual reorder path calls this BEFORE it re-renders: the re-render
+// is what re-applies a remembered sort (see applyChannelDraftAutoSort), so
+// disarming first is what lets a hand-moved pick stay where it was put.
+function clearChannelDraftAutoSort() {
+  if (channelDraftAutoSortKey()) setChannelPlayOrder('as-listed');
+}
+
+function channelSortComparator(key) {
+  if (key === 'aired-asc' || key === 'aired-desc') {
+    const dir = key === 'aired-desc' ? -1 : 1;
+    return (a, b) => {
+      const da = channelItemAiredDateClient(a.it);
+      const db = channelItemAiredDateClient(b.it);
+      if (da === db) return a.i - b.i;
+      // Undated last in BOTH directions: "newest first" is still no reason
+      // to open a channel with the picks we could not place at all.
+      if (!da) return 1;
+      if (!db) return -1;
+      return (da < db ? -1 : 1) * dir;
+    };
+  }
+  if (key === 'interleave') {
+    // Round-robin: every show's first pick, then every show's second, and
+    // so on. Expressed as a comparator because that is what the rest of
+    // this machinery speaks -- runIndex is a pick's position within its
+    // OWN show's run, so ordering by it groups the lineup into rounds, and
+    // showRank keeps each round in the order the shows first appear.
+    // Neither rank reorders a show against itself, so a show's episodes
+    // stay in the order they were added.
+    return (a, b) => {
+      if (a.runIndex !== b.runIndex) return a.runIndex - b.runIndex;
+      if (a.showRank !== b.showRank) return a.showRank - b.showRank;
+      return a.i - b.i;
+    };
+  }
+  if (key === 'show-season-episode') {
+    // Shows keep the order they first appear in, so this groups a channel
+    // back into runs of each show without also reshuffling which show opens
+    // it. Within a show it is plain broadcast order.
+    return (a, b) => {
+      if (a.showRank !== b.showRank) return a.showRank - b.showRank;
+      const sa = Number(a.it.season); const sb = Number(b.it.season);
+      if (sa !== sb) return (isNaN(sa) ? 0 : sa) - (isNaN(sb) ? 0 : sb);
+      const ea = Number(a.it.episode); const eb = Number(b.it.episode);
+      if (ea !== eb) return (isNaN(ea) ? 0 : ea) - (isNaN(eb) ? 0 : eb);
+      return a.i - b.i;
+    };
+  }
+  return (a, b) => {
+    const na = String(a.it.showName || a.it.title || '').toLowerCase();
+    const nb = String(b.it.showName || b.it.title || '').toLowerCase();
+    if (na !== nb) return na < nb ? -1 : 1;
+    const sa = Number(a.it.season); const sb = Number(b.it.season);
+    if (sa !== sb) return (isNaN(sa) ? 0 : sa) - (isNaN(sb) ? 0 : sb);
+    const ea = Number(a.it.episode); const eb = Number(b.it.episode);
+    if (ea !== eb) return (isNaN(ea) ? 0 : ea) - (isNaN(eb) ? 0 : eb);
+    return a.i - b.i;
+  };
+}
+
+// Sorts channelDraftItems in place-ish. Every comparator falls back to the
+// item's current index, so a tie -- two episodes aired the same night, a
+// whole season dropped on one day, anything undated -- keeps the order it
+// is already in rather than jumping around on each re-sort.
+function sortChannelDraftItems(key) {
+  if (!key || channelDraftItems.length < 2) return;
+  const showRanks = new Map();
+  const runLengths = new Map();
+  const wrapped = channelDraftItems.map((it, i) => {
+    const showKey = String((it && (it.showName || it.imdbId)) || '');
+    if (!showRanks.has(showKey)) showRanks.set(showKey, showRanks.size);
+    const runIndex = runLengths.get(showKey) || 0;
+    runLengths.set(showKey, runIndex + 1);
+    return { it: it, i: i, showRank: showRanks.get(showKey), runIndex: runIndex };
+  });
+  wrapped.sort(channelSortComparator(key));
+  channelDraftItems = wrapped.map((w) => w.it);
+}
+
+// Called by renderChannelDraftList, which is the one thing every path that
+// adds picks ends with -- the episode picker, "Add every season", a movie,
+// a crossover, an imported channel. Hooking it here is what keeps a sorted
+// channel sorted as it grows without every one of those paths having to
+// remember to re-sort.
+function applyChannelDraftAutoSort() {
+  sortChannelDraftItems(channelDraftAutoSortKey());
+}
+
+// The dropdown's onchange. A static sort reorders the picks and stays
+// selected (so it re-applies as the channel grows); "Shuffle now" reorders
+// them once and falls back to "As listed"; the other two only set state.
+function applyChannelPlayOrder(value) {
+  const v = value || 'as-listed';
+  if (v === 'shuffle-now') {
+    setChannelPlayOrder('as-listed');
+    shuffleChannelDraft();
+    return;
+  }
+  setChannelPlayOrder(v);
+  const key = channelDraftAutoSortKey();
+  if (key) sortChannelDraftItems(key);
+  renderChannelDraftList();
+}
+
+// A channel whose play order is the listed one has nothing for Story Lock to
+// protect against, and renderChannelStoryLock says so -- so the dropdown has
+// to redraw it. setChannelPlayOrder is where every path through the dropdown
+// meets, including the one-shot "Shuffle now" that bounces back to
+// "As listed".
+function updateChannelPlayOrderDependants() {
+  if (typeof renderChannelStoryLock === 'function') renderChannelStoryLock();
+}
+
 function shuffleChannelDraft() {
   if (channelDraftItems.length < 2) return;
+  // A one-shot, so it cannot leave a sort armed to undo it on the next
+  // render.
+  clearChannelDraftAutoSort();
   for (let i = channelDraftItems.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     const tmp = channelDraftItems[i];
@@ -39861,6 +44731,682 @@ function shuffleChannelDraft() {
     channelDraftItems[j] = tmp;
   }
   renderChannelDraftList();
+}
+
+// --- broadcast schedule & smart rules -----------------------------------
+//
+// Five fields that shape HOW a channel plays rather than WHAT is in it, so
+// none of them ever rewrites the picks someone saved. The Worker reads all
+// five (see buildChannelMeta, 05_catalog-core.js); this is the half that
+// collects them and puts them back on screen when a channel is reopened.
+//
+//   dailyRotate + rotateShows/rotateEpisodes/rotateTurnover
+//                a pool bigger than one day, cut into a fresh lineup daily
+//   hideWatched  drop picks already in Watch History
+//   storyLocked  shows that must advance in sequence through a shuffle
+//   liveSync + sourceUrl
+//                rebuild the pool from the list this was imported from
+//   dynamic      no stored picks at all; derived per request (Next Up)
+//
+// The defaults are the numbers Quick Add's network channels have always
+// rotated on, so turning the schedule on without touching a dial gives a
+// custom channel exactly the cadence those already had.
+const CHANNEL_DEFAULT_ROTATE_SHOWS = 24;
+const CHANNEL_DEFAULT_ROTATE_EPISODES = 3;
+// The Worker's CHANNEL_PART_GROUP_MAX, which is what actually enforces this;
+// saying so here means the builder refuses a seventh episode rather than
+// silently storing a pairing that plays as six.
+const CHANNEL_DRAFT_PAIR_MAX = 6;
+
+// The draft's own copy of the three fields that have no input of their own:
+// Story Lock is a rendered list, and the last two are stamped on by whatever
+// created the channel (Import from link, the Next Up button) rather than
+// typed.
+let channelDraftStoryLocked = [];
+let channelDraftSourceUrl = '';
+let channelDraftDynamic = '';
+// Pairs made by hand in the draft: arrays of stream ids, the same keys the
+// Worker glues by. Stored as ids rather than positions because every sort,
+// filter and drag in this builder moves positions around.
+let channelDraftPairedGroups = [];
+
+// The client twin of the Worker's channelItemShowKey (05_catalog-core.js).
+// Both sides have to agree on this exactly: it is the key a Story Lock is
+// stored under here and looked up by there.
+function channelDraftShowKey(it) {
+  if (!it) return '';
+  return it.imdbId || ((it.kind || 'episode') + ':' + (it.title || ''));
+}
+
+// Every field on a saved channel that this section owns, normalized. One
+// function because three separate places persist a channel (saveLocalChannel,
+// saveLocalChannelsMap and ensureAllChannelsSyncedFromRows) and each of them
+// rebuilds the record field by field -- a flag added to only two of the three
+// is a flag that silently disappears on the next save.
+function channelBroadcastFields(src) {
+  const o = src || {};
+  return {
+    description: String(o.description || '').slice(0, 400),
+    dailyRotate: !!o.dailyRotate,
+    rotateShows: Number(o.rotateShows) || 0,
+    rotateEpisodes: Number(o.rotateEpisodes) || 0,
+    rotateTurnover: Number(o.rotateTurnover) || 0,
+    rotateTurnoverTime: o.rotateTurnoverTime || '',
+    rotateTurnoverZone: o.rotateTurnoverZone === 'local' ? 'local' : 'utc',
+    hideWatched: !!o.hideWatched,
+    storyLocked: Array.isArray(o.storyLocked) ? o.storyLocked.slice() : [],
+    pairParts: !!o.pairParts,
+    pairedGroups: Array.isArray(o.pairedGroups)
+      ? o.pairedGroups.filter((g) => Array.isArray(g) && g.length > 1).map((g) => g.slice())
+      : [],
+    autoNewEpisodes: !!o.autoNewEpisodes,
+    newEpisodesAtTop: !!o.newEpisodesAtTop,
+    liveSync: !!o.liveSync,
+    sourceUrl: o.sourceUrl || '',
+    dynamic: o.dynamic || '',
+  };
+}
+
+// "HH:MM" in the chosen zone -> minutes past midnight UTC, which is the only
+// form the Worker stores.
+//
+// getTimezoneOffset() is minutes to ADD to local time to get UTC (300 in
+// UTC-5), so local midnight is 05:00 UTC there. It is read at save time and
+// baked in, so a channel set to local midnight drifts by an hour across a
+// DST boundary until it is saved again -- worth it to keep the Worker free
+// of timezone databases, and an hour's drift on when tomorrow's lineup
+// appears is not something a viewer can act on anyway.
+function channelTurnoverToUtcMinutes(timeStr, zone) {
+  const m = String(timeStr || '').match(/^([0-9]{1,2}):([0-9]{2})$/);
+  const local = m ? (Math.min(23, parseInt(m[1], 10)) * 60 + Math.min(59, parseInt(m[2], 10))) : 0;
+  const shift = zone === 'local' ? new Date().getTimezoneOffset() : 0;
+  return (((local + shift) % 1440) + 1440) % 1440;
+}
+
+function channelMinutesToTimeString(minutes) {
+  const total = (((Number(minutes) || 0) % 1440) + 1440) % 1440;
+  const h = Math.floor(total / 60);
+  const mm = total % 60;
+  return (h < 10 ? '0' : '') + h + ':' + (mm < 10 ? '0' : '') + mm;
+}
+
+// The distinct shows in the draft, each with the picks that belong to it --
+// what Story Lock offers, and what the "N shows" line in the schedule hint
+// counts.
+function channelDraftShowGroups() {
+  const groups = [];
+  const index = new Map();
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftShowKey(it);
+    if (!key) return;
+    if (!index.has(key)) {
+      index.set(key, groups.length);
+      groups.push({ key: key, name: it.showName || it.title || 'Untitled', count: 0, isMovie: it.kind === 'movie' });
+    }
+    groups[index.get(key)].count++;
+  });
+  return groups;
+}
+
+function isChannelShowStoryLocked(key) {
+  return channelDraftStoryLocked.indexOf(key) !== -1;
+}
+
+function toggleChannelStoryLock(key, on) {
+  const at = channelDraftStoryLocked.indexOf(key);
+  if (on && at === -1) channelDraftStoryLocked.push(key);
+  else if (!on && at !== -1) channelDraftStoryLocked.splice(at, 1);
+}
+
+// Story Lock only makes sense per SHOW, and only for a channel that shuffles
+// or rotates -- with picks playing in the order they are listed there is
+// nothing for a lock to protect against, so the section says so instead of
+// offering switches that would do nothing.
+function renderChannelStoryLock() {
+  const box = document.getElementById('channelStoryLockSection');
+  if (!box) return;
+  const groups = channelDraftShowGroups().filter((g) => !g.isMovie && g.count > 1);
+  // A lock on a show that has since been removed is dropped here rather than
+  // saved forward -- it can only confuse the next person to open this.
+  const liveKeys = groups.map((g) => g.key);
+  channelDraftStoryLocked = channelDraftStoryLocked.filter((k) => liveKeys.indexOf(k) !== -1);
+  if (!groups.length) {
+    box.innerHTML = '';
+    return;
+  }
+  const rotating = !!(document.getElementById('channelDailyRotateCheck') || {}).checked;
+  const shuffling = getChannelPlayOrder() === 'shuffle-daily';
+  const active = rotating || shuffling;
+  const rows = groups.map((g) => {
+    const id = 'channelStoryLock_' + encodeURIComponent(g.key).replace(/[^A-Za-z0-9]/g, '_');
+    return '<label class="channel-rule-row" for="' + escapeAttr(id) + '">' +
+      '<input type="checkbox" id="' + escapeAttr(id) + '"' + (isChannelShowStoryLocked(g.key) ? ' checked' : '') +
+        ' onchange="toggleChannelStoryLock(&quot;' + escapeJsAttr(g.key) + '&quot;, this.checked)">' +
+      '<span>' + escapeHtml(g.name) + ' <small style="color:var(--muted);">(' + g.count + ')</small></span>' +
+    '</label>';
+  }).join('');
+  box.innerHTML =
+    '<p style="margin:0 0 4px; font-weight:600; font-size:0.85rem;">Story Lock</p>' +
+    '<p style="margin:0 0 4px; color:var(--muted); font-size:0.78rem;">' +
+      'Shuffling suits a procedural &mdash; Seinfeld, The Office, Law &amp; Order. It ruins a serialized one. ' +
+      'Tick a show here and it always advances to its next episode in order, while everything else keeps shuffling around it.' +
+    '</p>' +
+    (active ? '' : '<p style="margin:0 0 4px; color:var(--muted); font-size:0.78rem;"><em>This channel plays in the order listed above, so nothing is being shuffled for a lock to protect against yet.</em></p>') +
+    '<div class="channel-storylock-grid">' + rows + '</div>';
+}
+
+// Keeps the schedule dials, their hint line and the Story Lock list in step
+// with each other. Called by every control in the section, and once more
+// whenever the draft is re-rendered.
+function updateChannelBroadcastControls() {
+  const check = document.getElementById('channelDailyRotateCheck');
+  const dials = document.getElementById('channelDailyRotateDials');
+  const hint = document.getElementById('channelDailyRotateHint');
+  const on = !!(check && check.checked);
+  if (dials) dials.style.display = on ? 'flex' : 'none';
+  if (hint) {
+    if (!on) {
+      hint.textContent = 'Off — every pick in this channel plays, in the order above.';
+    } else {
+      const shows = Math.max(1, Math.min(48, parseInt((document.getElementById('channelRotateShowsInput') || {}).value, 10) || CHANNEL_DEFAULT_ROTATE_SHOWS));
+      const eps = Math.max(1, Math.min(12, parseInt((document.getElementById('channelRotateEpisodesInput') || {}).value, 10) || CHANNEL_DEFAULT_ROTATE_EPISODES));
+      const available = channelDraftShowGroups().length;
+      const running = Math.min(shows, available || shows);
+      const zoneSel = document.getElementById('channelRotateTurnoverZone');
+      const zone = zoneSel && zoneSel.value === 'local' ? 'your local time' : 'UTC';
+      const timeInput = document.getElementById('channelRotateTurnoverTime');
+      const timeStr = (timeInput && timeInput.value) || '00:00';
+      hint.textContent = running + ' show' + (running === 1 ? '' : 's') + ' a day, ' + eps +
+        ' back-to-back episode' + (eps === 1 ? '' : 's') + ' each (' + (running * eps) + ' episodes), ' +
+        'refreshing at ' + timeStr + ' ' + zone + '.' +
+        (available && shows > available ? ' This channel only has ' + available + ' shows in it so far.' : '');
+    }
+  }
+  updateChannelNewEpisodeControls();
+  updateChannelPairControls();
+  renderChannelStoryLock();
+}
+
+// The sub-rule only exists while the rule above it is on: "put new episodes
+// at the top" of a channel that is not collecting any is a switch with
+// nothing behind it.
+function updateChannelNewEpisodeControls() {
+  const check = document.getElementById('channelAutoNewEpisodesCheck');
+  const row = document.getElementById('channelNewEpisodesRow');
+  const hint = document.getElementById('channelAutoNewEpisodesHint');
+  const on = !!(check && check.checked);
+  if (row) row.style.display = on ? 'block' : 'none';
+  if (!hint) return;
+  if (!on) {
+    hint.textContent = 'Off — this channel plays the picks below and nothing else.';
+    return;
+  }
+  const shows = channelDraftShowGroups().filter((g) => !g.isMovie).length;
+  const topCheck = document.getElementById('channelNewEpisodesTopCheck');
+  const where = topCheck && topCheck.checked ? 'at the top' : 'at the end';
+  hint.textContent = 'Episodes that air from now on are added ' + where + ' on their own, for ' +
+    (shows ? (shows + ' show' + (shows === 1 ? '' : 's')) : 'the shows') +
+    ' in this channel. Checked in the background a couple of times a day; already-aired episodes only.';
+}
+
+// Everything the hand-made pairs need on screen: the count, a way to drop
+// them all, and the pruning that keeps them honest when picks are removed.
+function updateChannelPairControls() {
+  const keys = {};
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftPairKey(it);
+    if (key) keys[key] = true;
+  });
+  // A pair whose other half has been removed is not a pair. Dropped here
+  // rather than saved forward, the same way a Story Lock on a removed show
+  // is.
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys[k]))
+    .filter((g) => g.length > 1);
+  const hint = document.getElementById('channelPairPartsHint');
+  if (!hint) return;
+  const base = 'Finds “Part 1” / “Pt. II” / “(2)” in episode titles. Whenever one part is on today, the rest play straight after it instead of turning up tomorrow.';
+  const made = channelDraftPairedGroups.length;
+  hint.textContent = made
+    ? (base + ' ' + made + ' pair' + (made === 1 ? '' : 's') + ' made by hand below — those play together whether this is ticked or not.')
+    : (base + ' Select picks below and hit Pair to link any two by hand.');
+}
+
+// The client twin of the Worker's channelItemStreamId: the key a pairing is
+// stored under on both sides.
+function channelDraftPairKey(it) {
+  if (!it) return '';
+  const showId = String(it.imdbId || '').trim();
+  if (!showId) return '';
+  if (it.kind === 'movie') return showId;
+  if (it.season == null || it.episode == null) return '';
+  return showId + ':' + it.season + ':' + it.episode;
+}
+
+// "Pair" over the selection: these picks play back to back, in the order
+// they are listed in the channel, wherever the first of them is drawn.
+//
+// A pick can only belong to one pair, so selecting a pick that is already in
+// one replaces that pair rather than leaving it in two places with two
+// different answers about what plays next.
+function pairChannelDraftSelection() {
+  const keys = [];
+  channelDraftSelection.slice().sort((a, b) => a - b).forEach((i) => {
+    const key = channelDraftPairKey(channelDraftItems[i]);
+    if (key && keys.indexOf(key) === -1) keys.push(key);
+  });
+  if (keys.length < 2) {
+    showAddedToast('Pick at least two episodes to pair.');
+    return;
+  }
+  if (keys.length > CHANNEL_DRAFT_PAIR_MAX) {
+    showAddedToast('A pairing can hold at most ' + CHANNEL_DRAFT_PAIR_MAX + ' episodes.');
+    return;
+  }
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys.indexOf(k) === -1))
+    .filter((g) => g.length > 1);
+  channelDraftPairedGroups.push(keys);
+  renderChannelDraftList();
+  showAddedToast(keys.length + ' episodes will play back to back.');
+}
+
+function unpairChannelDraftSelection() {
+  const keys = [];
+  channelDraftSelection.forEach((i) => {
+    const key = channelDraftPairKey(channelDraftItems[i]);
+    if (key) keys.push(key);
+  });
+  if (!keys.length) return;
+  const before = channelDraftPairedGroups.length;
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys.indexOf(k) === -1))
+    .filter((g) => g.length > 1);
+  renderChannelDraftList();
+  showAddedToast(before === channelDraftPairedGroups.length ? 'None of those were paired.' : 'Pairing removed.');
+}
+
+// Reads the whole section back as the payload fields the Worker understands.
+function readChannelBroadcastSettings() {
+  const check = document.getElementById('channelDailyRotateCheck');
+  const dailyRotate = !!(check && check.checked);
+  const zoneSel = document.getElementById('channelRotateTurnoverZone');
+  const zone = zoneSel && zoneSel.value === 'local' ? 'local' : 'utc';
+  const timeInput = document.getElementById('channelRotateTurnoverTime');
+  const timeStr = (timeInput && timeInput.value) || '00:00';
+  const liveCheck = document.getElementById('channelLiveSyncCheck');
+  const hideCheck = document.getElementById('channelHideWatchedCheck');
+  const pairCheck = document.getElementById('channelPairPartsCheck');
+  const newEpCheck = document.getElementById('channelAutoNewEpisodesCheck');
+  const newEpTopCheck = document.getElementById('channelNewEpisodesTopCheck');
+  const descInput = document.getElementById('channelDescriptionInput');
+  return {
+    description: descInput ? String(descInput.value || '').trim().slice(0, 400) : '',
+    dailyRotate: dailyRotate,
+    rotateShows: dailyRotate ? Math.max(1, Math.min(48, parseInt((document.getElementById('channelRotateShowsInput') || {}).value, 10) || CHANNEL_DEFAULT_ROTATE_SHOWS)) : 0,
+    rotateEpisodes: dailyRotate ? Math.max(1, Math.min(12, parseInt((document.getElementById('channelRotateEpisodesInput') || {}).value, 10) || CHANNEL_DEFAULT_ROTATE_EPISODES)) : 0,
+    rotateTurnover: dailyRotate ? channelTurnoverToUtcMinutes(timeStr, zone) : 0,
+    rotateTurnoverTime: dailyRotate ? timeStr : '',
+    rotateTurnoverZone: zone,
+    hideWatched: !!(hideCheck && hideCheck.checked),
+    storyLocked: channelDraftStoryLocked.slice(),
+    pairParts: !!(pairCheck && pairCheck.checked),
+    pairedGroups: channelDraftPairedGroups.map((g) => g.slice()),
+    autoNewEpisodes: !!(newEpCheck && newEpCheck.checked),
+    // Only meaningful with the line above on, and stored as 0 when it is
+    // off for the same reason the rotation dials are: a flag with nothing
+    // behind it reads as a rule the channel does not actually have.
+    newEpisodesAtTop: !!(newEpCheck && newEpCheck.checked && newEpTopCheck && newEpTopCheck.checked),
+    // Live Cloud Sync has nothing to sync FROM unless this channel was
+    // imported from a list, so it can only ever be on for one that was.
+    liveSync: !!(channelDraftSourceUrl && liveCheck && liveCheck.checked),
+    sourceUrl: channelDraftSourceUrl || '',
+    dynamic: channelDraftDynamic || '',
+  };
+}
+
+// Puts a saved channel's settings back on screen. The counterpart of
+// readChannelBroadcastSettings, called by every path that opens the builder.
+function applyChannelBroadcastSettings(channel) {
+  const f = channelBroadcastFields(channel);
+  const descInput = document.getElementById('channelDescriptionInput');
+  if (descInput) descInput.value = f.description;
+  channelDraftStoryLocked = f.storyLocked;
+  channelDraftPairedGroups = f.pairedGroups;
+  channelDraftSourceUrl = f.sourceUrl;
+  channelDraftDynamic = f.dynamic;
+  const check = document.getElementById('channelDailyRotateCheck');
+  if (check) check.checked = f.dailyRotate;
+  const showsInput = document.getElementById('channelRotateShowsInput');
+  if (showsInput) showsInput.value = f.rotateShows || CHANNEL_DEFAULT_ROTATE_SHOWS;
+  const epsInput = document.getElementById('channelRotateEpisodesInput');
+  if (epsInput) epsInput.value = f.rotateEpisodes || CHANNEL_DEFAULT_ROTATE_EPISODES;
+  const zoneSel = document.getElementById('channelRotateTurnoverZone');
+  if (zoneSel) zoneSel.value = f.rotateTurnoverZone;
+  const timeInput = document.getElementById('channelRotateTurnoverTime');
+  if (timeInput) {
+    // rotateTurnoverTime is what was typed; rotateTurnover is the same
+    // instant in UTC. A channel saved before the time box existed (every
+    // Quick Add network channel) only has the second one, and it is always
+    // midnight UTC, so deriving from it is exact rather than a guess.
+    timeInput.value = f.rotateTurnoverTime || channelMinutesToTimeString(f.rotateTurnover);
+  }
+  const hideCheck = document.getElementById('channelHideWatchedCheck');
+  if (hideCheck) hideCheck.checked = f.hideWatched;
+  const pairCheck = document.getElementById('channelPairPartsCheck');
+  if (pairCheck) pairCheck.checked = f.pairParts;
+  const newEpCheck = document.getElementById('channelAutoNewEpisodesCheck');
+  if (newEpCheck) newEpCheck.checked = f.autoNewEpisodes;
+  const newEpTopCheck = document.getElementById('channelNewEpisodesTopCheck');
+  if (newEpTopCheck) newEpTopCheck.checked = f.newEpisodesAtTop;
+  const liveRow = document.getElementById('channelLiveSyncRow');
+  const liveCheck = document.getElementById('channelLiveSyncCheck');
+  if (liveCheck) liveCheck.checked = f.liveSync;
+  if (liveRow) liveRow.style.display = f.sourceUrl ? 'block' : 'none';
+  const liveHint = document.getElementById('channelLiveSyncHint');
+  if (liveHint) {
+    liveHint.textContent = f.sourceUrl
+      ? ('Rebuilds this channel’s pool from ' + f.sourceUrl + ' in the background, so titles the list gains turn up here without re-importing.')
+      : '';
+  }
+  updateChannelBroadcastControls();
+}
+
+
+// --- working on a big draft ----------------------------------------------
+//
+// A channel with 800 picks was drag-one-at-a-time, type-a-position, or
+// Remove all. These three together are what make one editable: a filter to
+// find the picks you mean, selection to gather them, and bulk moves to place
+// them.
+//
+// Selection is by INDEX into channelDraftItems, and every operation that
+// reorders or removes rebuilds it, because an index that survives a reorder
+// is an index pointing at the wrong pick.
+let channelDraftFilter = '';
+let channelDraftSelectMode = false;
+let channelDraftSelection = [];
+
+// Everything about one pick that a filter should match: the show, the
+// episode, and the S/E people actually type ("s5e12").
+function channelDraftItemHaystack(it) {
+  if (!it) return '';
+  const se = (it.season != null && it.episode != null) ? ('s' + it.season + 'e' + it.episode) : '';
+  return [it.showName, it.epName, it.title, se].filter(Boolean).join(' ').toLowerCase();
+}
+
+// The indices currently on screen -- which is what "shown" means in every
+// bulk action, so a filtered list cannot act on picks nobody can see.
+function channelDraftVisibleIndices() {
+  const q = channelDraftFilter.trim().toLowerCase();
+  const out = [];
+  channelDraftItems.forEach((it, i) => {
+    if (!q || channelDraftItemHaystack(it).indexOf(q) !== -1) out.push(i);
+  });
+  return out;
+}
+
+// The filter and the selection are about the EDITING SESSION, not the
+// channel, so every path that opens the builder on something else clears
+// them -- otherwise a filter typed for one channel silently hides most of
+// the next one.
+function resetChannelDraftWorkspace() {
+  channelDraftFilter = '';
+  channelDraftSelectMode = false;
+  channelDraftSelection = [];
+  const filterInput = document.getElementById('channelDraftFilterInput');
+  if (filterInput) filterInput.value = '';
+}
+
+function setChannelDraftFilter(value) {
+  channelDraftFilter = String(value || '');
+  renderChannelDraftList();
+}
+
+function toggleChannelDraftSelectMode() {
+  channelDraftSelectMode = !channelDraftSelectMode;
+  if (!channelDraftSelectMode) channelDraftSelection = [];
+  renderChannelDraftList();
+}
+
+function isChannelDraftSelected(index) {
+  return channelDraftSelection.indexOf(index) !== -1;
+}
+
+function toggleChannelDraftPick(index, on) {
+  const at = channelDraftSelection.indexOf(index);
+  if (on && at === -1) channelDraftSelection.push(index);
+  else if (!on && at !== -1) channelDraftSelection.splice(at, 1);
+  updateChannelDraftSelectionCount();
+}
+
+function selectAllChannelDraftShown(on) {
+  if (!on) {
+    channelDraftSelection = [];
+  } else {
+    channelDraftVisibleIndices().forEach((i) => {
+      if (channelDraftSelection.indexOf(i) === -1) channelDraftSelection.push(i);
+    });
+  }
+  renderChannelDraftList();
+}
+
+// "Select a whole show or season" -- the two groupings anyone actually wants
+// to act on at once. The option value is JSON rather than a delimited
+// string: a show key is either an IMDb id or "kind:title", and a title with
+// a colon in it would split any separator worth typing.
+function selectChannelDraftByGroup(value) {
+  if (!value) return;
+  let showKey = '';
+  let season = null;
+  try {
+    const parsed = JSON.parse(value);
+    showKey = parsed[0];
+    season = parsed.length > 1 && parsed[1] !== null ? Number(parsed[1]) : null;
+  } catch (e) {
+    return;
+  }
+  channelDraftItems.forEach((it, i) => {
+    if (channelDraftShowKey(it) !== showKey) return;
+    if (season !== null && Number(it.season) !== season) return;
+    if (channelDraftSelection.indexOf(i) === -1) channelDraftSelection.push(i);
+  });
+  renderChannelDraftList();
+}
+
+function updateChannelDraftSelectionCount() {
+  const el = document.getElementById('channelDraftSelectionCount');
+  if (el) el.textContent = channelDraftSelection.length + ' selected';
+}
+
+function removeChannelDraftSelection() {
+  if (!channelDraftSelection.length) return;
+  const drop = {};
+  channelDraftSelection.forEach((i) => { drop[i] = true; });
+  channelDraftItems = channelDraftItems.filter((_, i) => !drop[i]);
+  channelDraftSelection = [];
+  // A hand-made change to the order, so a remembered sort must not undo it
+  // on the re-render -- the rule every other manual move follows.
+  clearChannelDraftAutoSort();
+  renderChannelDraftList();
+}
+
+function moveChannelDraftSelection(where) {
+  if (!channelDraftSelection.length) return;
+  const picked = {};
+  channelDraftSelection.forEach((i) => { picked[i] = true; });
+  const moved = channelDraftItems.filter((_, i) => picked[i]);
+  const rest = channelDraftItems.filter((_, i) => !picked[i]);
+  channelDraftItems = where === 'bottom' ? rest.concat(moved) : moved.concat(rest);
+  // The moved picks are now a contiguous run at one end, so the selection is
+  // rebuilt to point at where they actually ended up.
+  channelDraftSelection = moved.map((_, n) => (where === 'bottom' ? rest.length + n : n));
+  clearChannelDraftAutoSort();
+  renderChannelDraftList();
+}
+
+// The show/season menu, rebuilt from the draft on each render so it cannot
+// offer a show that is no longer in the channel.
+function renderChannelDraftGroupOptions() {
+  const sel = document.getElementById('channelDraftSelectShowSelect');
+  if (!sel) return;
+  const groups = [];
+  const index = new Map();
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftShowKey(it);
+    if (!key) return;
+    if (!index.has(key)) {
+      index.set(key, groups.length);
+      groups.push({ key: key, name: it.showName || it.title || 'Untitled', count: 0, seasons: new Map() });
+    }
+    const g = groups[index.get(key)];
+    g.count++;
+    const season = Number(it.season);
+    if (Number.isInteger(season)) g.seasons.set(season, (g.seasons.get(season) || 0) + 1);
+  });
+  const options = ['<option value="">Select a whole show or season…</option>'];
+  groups.forEach((g) => {
+    options.push('<option value="' + escapeAttr(JSON.stringify([g.key])) + '">' +
+      escapeHtml(g.name) + ' — all ' + g.count + '</option>');
+    if (g.seasons.size > 1) {
+      [...g.seasons.keys()].sort((a, b) => a - b).forEach((season) => {
+        options.push('<option value="' + escapeAttr(JSON.stringify([g.key, season])) + '">' +
+          escapeHtml(g.name) + ' — season ' + season + ' (' + g.seasons.get(season) + ')</option>');
+      });
+    }
+  });
+  sel.innerHTML = options.join('');
+}
+
+// --- what this channel adds up to ----------------------------------------
+//
+// Shows, episodes, hours, the years it spans, and which rules are in force.
+// Cheap to compute, and it turns a channel from a blob of eight hundred rows
+// into something you can tell apart from the last one you built.
+//
+// Runtime is only known for picks added since it started being stored, so
+// the hours are an estimate and SAY SO rather than being quietly wrong: a
+// pick with no runtime is counted at this channel's own average, or at half
+// an hour when nothing at all is known.
+function channelDraftSummary(items, settings) {
+  const list = Array.isArray(items) ? items : [];
+  const shows = new Set();
+  let episodes = 0;
+  let movies = 0;
+  let knownMinutes = 0;
+  let knownCount = 0;
+  let earliest = '';
+  let latest = '';
+  list.forEach((it) => {
+    if (!it) return;
+    const key = channelDraftShowKey(it);
+    if (key) shows.add(key);
+    if (it.kind === 'movie') movies++;
+    else episodes++;
+    const runtime = Number(it.runtime);
+    if (Number.isInteger(runtime) && runtime > 0) {
+      knownMinutes += runtime;
+      knownCount++;
+    }
+    const date = channelItemAiredDateClient(it);
+    if (date) {
+      if (!earliest || date < earliest) earliest = date;
+      if (!latest || date > latest) latest = date;
+    }
+  });
+  const average = knownCount ? (knownMinutes / knownCount) : 30;
+  const totalMinutes = knownMinutes + ((list.length - knownCount) * average);
+  const s = settings || {};
+  const rules = [];
+  if (s.dailyRotate) {
+    rules.push((s.rotateShows || CHANNEL_DEFAULT_ROTATE_SHOWS) + ' shows × ' +
+      (s.rotateEpisodes || CHANNEL_DEFAULT_ROTATE_EPISODES) + ' a day');
+  }
+  if ((s.storyLocked || []).length) rules.push((s.storyLocked || []).length + ' story-locked');
+  if (s.hideWatched) rules.push('hides watched');
+  if (s.pairParts) rules.push('parts stay together');
+  else if ((s.pairedGroups || []).length) rules.push((s.pairedGroups || []).length + ' paired');
+  if (s.autoNewEpisodes) rules.push('auto-adds new episodes' + (s.newEpisodesAtTop ? ' at the top' : ''));
+  if (s.liveSync) rules.push('live cloud sync');
+  return {
+    shows: shows.size,
+    episodes: episodes,
+    movies: movies,
+    total: list.length,
+    hours: Math.round(totalMinutes / 60),
+    estimated: knownCount < list.length,
+    firstYear: earliest ? earliest.slice(0, 4) : '',
+    lastYear: latest ? latest.slice(0, 4) : '',
+    rules: rules,
+  };
+}
+
+// The summary as one line. Used under the draft and on a saved channel's
+// card, so both say the same thing the same way.
+function channelSummaryLine(summary) {
+  if (!summary || !summary.total) return '';
+  const bits = [];
+  if (summary.shows) bits.push(summary.shows + (summary.shows === 1 ? ' show' : ' shows'));
+  if (summary.episodes) bits.push(summary.episodes + (summary.episodes === 1 ? ' episode' : ' episodes'));
+  if (summary.movies) bits.push(summary.movies + (summary.movies === 1 ? ' movie' : ' movies'));
+  if (summary.hours) bits.push((summary.estimated ? '~' : '') + summary.hours + (summary.hours === 1 ? ' hour' : ' hours'));
+  if (summary.firstYear) {
+    bits.push(summary.firstYear === summary.lastYear ? summary.firstYear : (summary.firstYear + '–' + summary.lastYear));
+  }
+  return bits.concat(summary.rules).join(' · ');
+}
+
+function renderChannelDraftStats() {
+  const box = document.getElementById('channelDraftStats');
+  if (!box) return;
+  if (!channelDraftItems.length) {
+    box.textContent = '';
+    return;
+  }
+  const line = channelSummaryLine(channelDraftSummary(channelDraftItems, readChannelBroadcastSettings()));
+  box.textContent = line;
+  box.title = line;
+}
+
+// --- adding something that is already here -------------------------------
+//
+// Adding a show twice from two different places, or splicing the same
+// crossover in again, used to just work -- and you found out later, by which
+// point the duplicate is somewhere in eight hundred rows.
+function channelDraftCountForShow(imdbId, showName) {
+  const id = String(imdbId || '').trim();
+  const name = String(showName || '').trim().toLowerCase();
+  if (!id && !name) return 0;
+  return channelDraftItems.filter((it) => {
+    if (!it) return false;
+    if (id && String(it.imdbId || '').trim() === id) return true;
+    return !!name && String(it.showName || '').trim().toLowerCase() === name;
+  }).length;
+}
+
+// True when the caller should STOP: the dialog is up, and confirming it calls
+// the retry callback, which is the caller again with the check already done.
+//
+// Deliberately not a promise. showAppConfirm has no cancel callback -- the X,
+// the Cancel button, the backdrop and Escape all just close it -- so a
+// promise here could only resolve on "yes" and would hang forever on every
+// "no". A dangling promise per declined add is a leak in the browser and a
+// hung test everywhere else.
+//
+// With no dialog available it lets the add through rather than refusing: a
+// missing confirmation must not become a missing feature.
+function guardChannelDraftDuplicate(label, existingCount, retry) {
+  if (!existingCount) return false;
+  if (typeof showAppConfirm !== 'function') return false;
+  showAppConfirm(
+    'Already in this channel',
+    label + ' is already in this channel (' + existingCount + ' pick' + (existingCount === 1 ? '' : 's') +
+      '). Add it again anyway?',
+    'Add anyway',
+    retry,
+    false
+  );
+  return true;
 }
 
 let editingChannelId = null;
@@ -39891,21 +45437,37 @@ function saveChannel() {
     const matchedItem = channelDraftItems.find((it) => it && (it.showPoster === verticalPoster || it.poster === verticalPoster));
     horizontalBackdrop = (matchedItem && (matchedItem.backdrop || matchedItem.showBackdrop || matchedItem.thumbnail)) || channelDraftBackdrop || verticalPoster;
   }
-  const shuffle = document.getElementById('channelRandomizeCheck').checked;
+  // The dropdown is the whole play-order state: "Shuffle daily" is the only
+  // entry the Worker acts on, and a static sort has already been applied to
+  // channelDraftItems, so the saved item order IS the play order. autoSort
+  // only says which sort to re-apply when picks are added later.
+  const playOrder = getChannelPlayOrder();
+  const shuffle = playOrder === 'shuffle-daily';
+  const autoSort = channelDraftAutoSortKey();
 
   const map = loadLocalChannels();
   const channelId = editingChannelId || generateChannelId();
-  const existing = map[channelId] || {};
   
-  const payload = {
+  const payload = Object.assign({
     channelId: channelId,
     name: name,
     poster: verticalPoster,
     backdrop: horizontalBackdrop,
     items: channelDraftItems,
     shuffle: shuffle,
-    dailyRotate: existing.dailyRotate || false
-  };
+    autoSort: autoSort,
+    // Cleared, never written: a channel that carried it was sorted by the
+    // Worker on every request, and its picks have just been sorted for real
+    // (see editChannelById) -- so the stored order is now the answer.
+    sortByAired: false,
+  // The broadcast schedule, Story Lock, Hide watched and Live Cloud Sync,
+  // read straight off the panel below the play-order dropdown. The saved
+  // channel is no longer consulted for dailyRotate: the panel was populated
+  // FROM it when the builder opened (applyChannelBroadcastSettings), so what
+  // is on screen is the full picture including anything Quick Add set, and
+  // reading it back is what lets someone turn a network channel's rotation
+  // off.
+  }, readChannelBroadcastSettings());
 
   saveLocalChannel(payload);
 
@@ -39937,7 +45499,7 @@ function saveChannel() {
   channelDraftPoster = null;
   channelDraftBackdrop = null;
   nameInput.value = '';
-  document.getElementById('channelRandomizeCheck').checked = false;
+  setChannelPlayOrder('as-listed');
   const searchInput = document.getElementById('channelSearchInput');
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('channelSearchResult');
@@ -40333,7 +45895,7 @@ async function fetchStorylineOrderedItems(eventId) {
 
             fullOrderedItems.push({
               kind: 'episode',
-              imdbId: showImdbId || String(ep.tmdbId),
+              imdbId: channelStreamShowId(showImdbId, ep.tmdbId),
               season: sNum,
               episode: epItem.episode,
               showName: ep.showName,
@@ -40383,7 +45945,7 @@ async function fetchStorylineOrderedItems(eventId) {
 
       fullOrderedItems.push({
         kind: 'episode',
-        imdbId: showImdbId || (epData && epData.imdbId) || String(ep.tmdbId),
+        imdbId: channelStreamShowId(showImdbId || (epData && epData.imdbId), ep.tmdbId),
         season: ep.season,
         episode: ep.episode,
         showName: ep.showName,
@@ -40539,8 +46101,7 @@ async function loadStorylineToDraft(eventId, btn) {
 
     const nameInput = document.getElementById('channelNameInput');
     if (nameInput) nameInput.value = event.name;
-    const randCheck = document.getElementById('channelRandomizeCheck');
-    if (randCheck) randCheck.checked = false;
+    setChannelPlayOrder('as-listed');
 
     renderChannelDraftList();
     updateChannelSaveButtonLabel();
@@ -40581,6 +46142,7 @@ function switchChannelsSubmenu(name, btn) {
     'my-channels': document.getElementById('channelsSubMyChannels'),
     'storylines': document.getElementById('channelsSubStorylines'),
     'quickadd': document.getElementById('channelsSubQuickAdd'),
+    'explore': document.getElementById('channelsSubExplore'),
     'import': document.getElementById('channelsSubImport'),
     'build': document.getElementById('channelsSubBuild')
   };
@@ -40600,6 +46162,10 @@ function switchChannelsSubmenu(name, btn) {
     renderChannelMergeList();
   } else if (name === 'storylines') {
     renderStorylinesUniverseList();
+  } else if (name === 'explore') {
+    loadChannelDirectory(false);
+    renderChannelPublishList();
+    loadOrphanedPublishedChannels();
   } else if (name === 'import') {
     renderChannelMergeList();
   }
@@ -40611,10 +46177,13 @@ function openBuildCustomChannel() {
   channelDraftItems = [];
   channelDraftPoster = null;
   channelDraftBackdrop = null;
+  resetChannelDraftWorkspace();
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  if (randCheck) randCheck.checked = false;
+  const descInput = document.getElementById('channelDescriptionInput');
+  if (descInput) descInput.value = '';
+  setChannelPlayOrder('as-listed');
+  applyChannelBroadcastSettings(null);
   const searchInput = document.getElementById('channelSearchInput');
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('channelSearchResult');
@@ -40645,14 +46214,20 @@ function editChannelById(channelId) {
   }
   editingChannelId = channelId;
   editingChannelUrlInput = null;
+  resetChannelDraftWorkspace();
   channelDraftItems = (channel.items || []).slice();
   channelDraftPoster = channel.poster || null;
   channelDraftBackdrop = channel.backdrop || null;
   
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = channel.name || '';
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  if (randCheck) randCheck.checked = !!channel.shuffle;
+  // A channel saved with the old "Sort by air date" flag is migrated here:
+  // it becomes the equivalent dropdown selection, the render below sorts its
+  // picks for real, and saveChannel then writes the sorted order with the
+  // flag cleared. Until it is edited the Worker keeps sorting it, so nothing
+  // changes for a channel nobody opens.
+  setChannelPlayOrder(channel.shuffle ? 'shuffle-daily' : (channel.sortByAired ? 'aired-asc' : (channel.autoSort || 'as-listed')));
+  applyChannelBroadcastSettings(channel);
   
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
@@ -40700,9 +46275,49 @@ function editChannel(btnOrRow) {
   }
 }
 
-function openChannelDetailsPage(channelIdOrDivId) {
+// An item's air date, as a sortable "YYYY-MM-DD" string or '' -- the field
+// the builder's air-date sorts order by, and the client twin of the Worker's
+// channelItemAiredDate (05_catalog-core.js). Zero-padded ISO dates compare
+// as plain strings, and an item with no date it can be placed by sorts as ''
+// so callers can push it to the end.
+//
+// channelItemsInPlayOrder below is now only for a channel still carrying the
+// pre-dropdown sortByAired flag, which the Worker sorts on every request:
+// "See All" reads the saved items directly, so without this it would list
+// such a channel in an order it does not play in. A channel saved since has
+// its picks stored in the order they play, and falls straight through.
+function channelItemAiredDateClient(it) {
+  if (!it) return '';
+  const raw = String(it.released == null ? '' : it.released).trim();
+  const m = raw.match(/^([0-9]{4})(?:-([0-9]{2})(?:-([0-9]{2}))?)?/);
+  if (m) return m[1] + '-' + (m[2] || '01') + '-' + (m[3] || '01');
+  const year = parseInt(it.year, 10);
+  if (Number.isInteger(year) && year > 0) return String(year).padStart(4, '0') + '-01-01';
+  return '';
+}
+
+function channelItemsInPlayOrder(items, channel) {
+  const list = Array.isArray(items) ? items : [];
+  if (!channel || !channel.sortByAired || list.length < 2) return list;
+  return list
+    .map((it, i) => ({ it: it, i: i, aired: channelItemAiredDateClient(it) }))
+    .sort((a, b) => {
+      if (a.aired === b.aired) return a.i - b.i;
+      if (!a.aired) return 1;
+      if (!b.aired) return -1;
+      return a.aired < b.aired ? -1 : 1;
+    })
+    .map((w) => w.it);
+}
+
+// channelOverride is a channel this browser does not own -- one fetched from
+// Explore Channels, so it can be looked through before it is added. Every
+// lookup below is about finding a channel that IS saved here, and none of
+// them can find one that is not, so a caller holding the channel already
+// hands it straight over.
+function openChannelDetailsPage(channelIdOrDivId, channelOverride) {
   const map = loadLocalChannels();
-  let channel = map[channelIdOrDivId];
+  let channel = channelOverride || map[channelIdOrDivId];
   if (!channel) {
     for (const ch of Object.values(map)) {
       if (ch && (ch.channelId === channelIdOrDivId || ch.name === channelIdOrDivId)) {
@@ -40775,7 +46390,12 @@ function openChannelDetailsPage(channelIdOrDivId) {
   }
   if (!channel) return;
 
-  if (channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
+  // A channel reconstructed from a row is worth keeping in the in-memory
+  // map, because it IS one of this browser's channels and the map is just
+  // behind. A previewed one is not: it belongs to someone else and has not
+  // been added, so writing it here would put it in My Channels for simply
+  // having been looked at.
+  if (!channelOverride && channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
     map[channel.channelId] = channel;
     _memoryChannelsMap = map;
   }
@@ -40799,7 +46419,7 @@ function openChannelDetailsPage(channelIdOrDivId) {
     });
   }
   
-  const sample = (resolvedItems || []).map((it, idx) => {
+  const sample = channelItemsInPlayOrder(resolvedItems, channel).map((it, idx) => {
     let showName = it.showName || '';
     let epName = it.epName || '';
     let seasonEp = '';
@@ -40911,13 +46531,44 @@ function renderMyCreatedChannelsList() {
     return;
   }
   
-  channels.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  renderChannelUndoBar();
+  const sortSel = document.getElementById('myChannelsSortSelect');
+  if (sortSel && sortSel.value !== myChannelsSort) sortSel.value = myChannelsSort;
+  const shown = sortMyChannels(filterMyChannels(channels));
+  if (!shown.length) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No channel matches that search.</small></p>';
+    return;
+  }
 
-  box.innerHTML = channels.map((ch) => {
+  box.innerHTML = shown.map((ch) => {
     const isAdded = [...document.querySelectorAll('#lists .entry .url')].some((u) => u.value.includes(ch.channelId));
     const allItems = ch.items || [];
     const totalEpisodes = allItems.length;
-    const metaText = '24/7 TV Channel &middot; ' + totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's');
+    // Every rule a channel carries, spelled out on its card -- a channel
+    // that hides watched episodes or locks a show behaves visibly
+    // differently from one that does not, and the card is the only place
+    // that is visible without opening the editor.
+    const orderLabel = channelPlayOrderLabel(ch);
+    const metaBits = ['24/7 TV Channel'];
+    if (ch.dynamic === 'next-up') metaBits.push('fills itself in from Continue Watching');
+    else metaBits.push(totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's'));
+    if (ch.dailyRotate) {
+      metaBits.push((ch.rotateShows || CHANNEL_DEFAULT_ROTATE_SHOWS) + ' shows \u00d7 ' +
+        (ch.rotateEpisodes || CHANNEL_DEFAULT_ROTATE_EPISODES) + ' daily');
+    }
+    if (orderLabel) metaBits.push(orderLabel);
+    if (ch.hideWatched) metaBits.push('hides watched');
+    if ((ch.storyLocked || []).length) metaBits.push((ch.storyLocked || []).length + ' story-locked');
+    if (ch.pairParts) metaBits.push('parts stay together');
+    else if ((ch.pairedGroups || []).length) metaBits.push((ch.pairedGroups || []).length + ' paired');
+    if (ch.autoNewEpisodes) metaBits.push('auto-adds new episodes' + (ch.newEpisodesAtTop ? ' at the top' : ''));
+    if (ch.liveSync) metaBits.push('live cloud sync');
+    if (ch.sharePublished) metaBits.push('published');
+    const metaText = metaBits.map(escapeHtml).join(' &middot; ');
+    // The second line: what this channel actually holds. Same function the
+    // builder's own stats line uses, so a channel reads the same before and
+    // after it is saved.
+    const summaryLine = ch.dynamic === 'next-up' ? '' : channelSummaryLine(channelDraftSummary(allItems, ch));
     
     const allPosters = allItems.slice(0, 9);
     const posterThumbs = allPosters.map((it, i) => {
@@ -41014,13 +46665,25 @@ function renderMyCreatedChannelsList() {
     return '<div class="list-card" style="margin-bottom:12px;" data-channel-id="' + escapeAttr(ch.channelId) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' + escapeHtml(ch.name) + '</div>' +
+          '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' +
+            '<span class="drag-handle-list channel-drag-handle" draggable="true" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
+            escapeHtml(ch.name) +
+          '</div>' +
+          (ch.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(ch.description) + '</div>' : '') +
           '<div class="list-card-meta">' +
             '<span>' + metaText + '</span>' +
           '</div>' +
+          (summaryLine ? '<div class="list-card-meta"><span>' + escapeHtml(summaryLine) + '</span></div>' : '') +
         '</div>' +
         '<div class="list-card-actions">' +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">Edit</button>' +
+          (ch.shareCode
+            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Copy this channel\u2019s share link">Copy link</button>' +
+              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Push your latest edits to the link people already have">Update link</button>'
+            : '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Create a link that rebuilds this channel anywhere">Share</button>') +
+          (ch.dynamic === 'next-up'
+            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshNextUpChannelSeed(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Pull in whatever you have started watching since">Refresh</button>'
+            : '') +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalChannel(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, &quot;' + escapeJsAttr(ch.name) + '&quot;)">Delete</button>' +
           addBtnHtml +
         '</div>' +
@@ -41028,6 +46691,7 @@ function renderMyCreatedChannelsList() {
       (posterThumbs ? '<div class="list-card-posters poster-preview-static">' + posterThumbs + '</div>' : '') +
     '</div>';
   }).join('');
+  initMyChannelsDrag();
 }
 
 function cancelEditChannel() {
@@ -41036,10 +46700,13 @@ function cancelEditChannel() {
   channelDraftItems = [];
   channelDraftPoster = null;
   channelDraftBackdrop = null;
+  resetChannelDraftWorkspace();
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
-  const randCheck = document.getElementById('channelRandomizeCheck');
-  if (randCheck) randCheck.checked = false;
+  const descInput = document.getElementById('channelDescriptionInput');
+  if (descInput) descInput.value = '';
+  setChannelPlayOrder('as-listed');
+  applyChannelBroadcastSettings(null);
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
   switchChannelsSubmenu('my-channels', document.querySelector('#channelsSubnavBar button:nth-child(1)'));
@@ -41121,7 +46788,82 @@ const CHANNEL_POOL_MAX_ITEMS = 5000;
 const CHANNEL_ROTATION_SHOWS_PER_DAY = 24;
 const CHANNEL_ROTATION_EPISODES_PER_SHOW = 3;
 
-async function quickAddChannel(name, listUrl, networkId, btn) {
+// --- turning a list of shows into channel picks -------------------------
+//
+// Three features now start from "here are some shows, make a channel out of
+// them": Quick Add's network buttons, the Quick Channel Wizard, and an
+// actor's TV credits in a Spotlight channel. All three need the same two
+// rounds of fetching -- each show's seasons, then each season's episodes --
+// and the same two caps, so it lives here once rather than three times.
+//
+// Never throws: a show whose seasons or episodes cannot be read is skipped
+// and the rest of the channel is still built. One unreachable show is not a
+// reason to hand back nothing.
+async function buildChannelItemsFromShows(shows, opts) {
+  const o = opts || {};
+  const maxItems = o.maxItems || CHANNEL_POOL_MAX_ITEMS;
+  const maxPerShow = o.maxEpisodesPerShow || CHANNEL_MAX_EPISODES_PER_SHOW;
+  const onProgress = typeof o.onProgress === 'function' ? o.onProgress : null;
+  const items = [];
+  let poster = o.poster || null;
+  let backdrop = o.backdrop || null;
+  for (let i = 0; i < shows.length; i++) {
+    if (items.length >= maxItems) break;
+    const show = shows[i];
+    if (onProgress) onProgress(i, shows.length, show);
+    if (!poster && show.poster) poster = show.poster;
+    if (!backdrop && (show.backdrop || show.thumbnail)) backdrop = show.backdrop || show.thumbnail;
+    try {
+      const seasonsRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(show.tmdbId), { cache: 'no-store' });
+      const seasonsData = await seasonsRes.json();
+      if (!seasonsData.ok) continue;
+      const seasonResults = await Promise.all(seasonsData.seasons.map((s) =>
+        fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(show.tmdbId) + '&season=' + encodeURIComponent(s.season), { cache: 'no-store' })
+          .then((r) => r.json())
+          .then((d) => ({ season: s.season, episodes: d.ok ? d.episodes : [] }))
+          .catch(() => ({ season: s.season, episodes: [] }))
+      ));
+      const showEpisodes = [];
+      seasonResults
+        .sort((a, b) => a.season - b.season)
+        .forEach(({ season, episodes }) => {
+          episodes.forEach((ep) => {
+            const stillUrl = ep.thumbnail || show.backdrop || show.poster || '';
+            const showPosterUrl = show.poster || '';
+            showEpisodes.push({
+              kind: 'episode',
+              imdbId: channelStreamShowId(show.imdbId, show.tmdbId),
+              season: season,
+              episode: ep.episode,
+              showName: show.name || '',
+              epName: ep.name || ('Episode ' + ep.episode),
+              title: (show.name ? show.name + ' S' + season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.name || ('Episode ' + ep.episode)),
+              released: ep.released || '',
+              runtime: ep.runtime || 0,
+              thumbnail: stillUrl || showPosterUrl,
+              poster: showPosterUrl || stillUrl,
+              showPoster: showPosterUrl,
+            });
+          });
+        });
+      // The LAST maxPerShow episodes, not the first: a long-running show's
+      // most recent seasons are the ones most likely to be watchable.
+      let finalShowEpisodes = showEpisodes.length > maxPerShow
+        ? showEpisodes.slice(-maxPerShow)
+        : showEpisodes;
+      const remainingBudget = maxItems - items.length;
+      if (finalShowEpisodes.length > remainingBudget) {
+        finalShowEpisodes = finalShowEpisodes.slice(0, remainingBudget);
+      }
+      items.push(...finalShowEpisodes);
+    } catch (e) {
+      continue;
+    }
+  }
+  return { items: items, poster: poster, backdrop: backdrop };
+}
+
+async function quickAddChannel(name, listUrl, networkId, btn, options) {
   const statusBox = document.getElementById('channelQuickAddStatus');
   const originalLabel = btn ? btn.textContent : '';
   if (btn) {
@@ -41136,7 +46878,7 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
         const data = await res.json();
         if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_POOL_MAX_ITEMS) {
           const channelId = generateChannelId();
-          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name });
+          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '' });
           saveLocalChannel(payload);
           addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
           renderMyCreatedChannelsList();
@@ -41177,71 +46919,18 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
       shows[i] = shows[j];
       shows[j] = tmp;
     }
-    const items = [];
-    let poster = data.networkLogo || null;
-    let backdrop = null;
-    let showsIncluded = 0;
-    let showsTrimmed = 0;
-    let stoppedEarly = false;
-    for (let i = 0; i < shows.length; i++) {
-      if (items.length >= CHANNEL_POOL_MAX_ITEMS) {
-        stoppedEarly = true;
-        break;
-      }
-      const show = shows[i];
-      if (statusBox) {
-        statusBox.innerHTML = '<p><small>Building ' + escapeHtml(name) + '\u2026 show ' + (i + 1) + ' of ' + shows.length +
-          ' (' + escapeHtml(show.name) + ')</small></p>';
-      }
-      if (!poster && show.poster) poster = show.poster;
-      if (!backdrop && (show.backdrop || show.thumbnail)) backdrop = show.backdrop || show.thumbnail;
-      try {
-        const seasonsRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(show.tmdbId), { cache: 'no-store' });
-        const seasonsData = await seasonsRes.json();
-        if (!seasonsData.ok) continue;
-        const seasonResults = await Promise.all(seasonsData.seasons.map((s) =>
-          fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(show.tmdbId) + '&season=' + encodeURIComponent(s.season), { cache: 'no-store' })
-            .then((r) => r.json())
-            .then((d) => ({ season: s.season, episodes: d.ok ? d.episodes : [] }))
-            .catch(() => ({ season: s.season, episodes: [] }))
-        ));
-        const showEpisodes = [];
-        seasonResults
-          .sort((a, b) => a.season - b.season)
-          .forEach(({ season, episodes }) => {
-            episodes.forEach((ep) => {
-              const stillUrl = ep.thumbnail || show.backdrop || show.poster || '';
-              const showPosterUrl = show.poster || '';
-              showEpisodes.push({
-                kind: 'episode',
-                imdbId: show.imdbId,
-                season: season,
-                episode: ep.episode,
-                showName: show.name || '',
-                epName: ep.name || ('Episode ' + ep.episode),
-                title: (show.name ? show.name + ' S' + season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.name || ('Episode ' + ep.episode)),
-                released: ep.released || '',
-                thumbnail: stillUrl || showPosterUrl,
-                poster: showPosterUrl || stillUrl,
-                showPoster: showPosterUrl,
-              });
-            });
-          });
-        let finalShowEpisodes = showEpisodes.length > CHANNEL_MAX_EPISODES_PER_SHOW
-          ? showEpisodes.slice(-CHANNEL_MAX_EPISODES_PER_SHOW)
-          : showEpisodes;
-        if (finalShowEpisodes.length < showEpisodes.length) showsTrimmed++;
-        const remainingBudget = CHANNEL_POOL_MAX_ITEMS - items.length;
-        if (finalShowEpisodes.length > remainingBudget) {
-          finalShowEpisodes = finalShowEpisodes.slice(0, remainingBudget);
-          stoppedEarly = true;
+    const built = await buildChannelItemsFromShows(shows, {
+      poster: data.networkLogo || null,
+      onProgress: function (i, total, show) {
+        if (statusBox) {
+          statusBox.innerHTML = '<p><small>Building ' + escapeHtml(name) + '\u2026 show ' + (i + 1) + ' of ' + total +
+            ' (' + escapeHtml(show.name) + ')</small></p>';
         }
-        if (finalShowEpisodes.length) showsIncluded++;
-        items.push(...finalShowEpisodes);
-      } catch (e) {
-        continue;
-      }
-    }
+      },
+    });
+    const items = built.items;
+    const poster = built.poster;
+    const backdrop = built.backdrop;
     if (!items.length) {
       if (typeof showAppAlert === 'function') {
         showAppAlert('Could Not Build Channel', 'Could not build ' + name + ' -- no episodes were found.');
@@ -41251,7 +46940,21 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
       return;
     }
     const channelId = generateChannelId();
-    const payload = { channelId: channelId, name: name, poster: poster, backdrop: backdrop || poster, items: items, shuffle: false, dailyRotate: true };
+    const payload = {
+      channelId: channelId,
+      name: name,
+      poster: poster,
+      backdrop: backdrop || poster,
+      items: items,
+      shuffle: false,
+      dailyRotate: true,
+      // Live Cloud Sync, when this came from a pasted list link and the
+      // Import tab's toggle was left on: the channel keeps the URL, and the
+      // Worker rebuilds its pool from that list in the background instead of
+      // this staying the one-time snapshot it used to be.
+      liveSync: !!(options && options.liveSync && listUrl),
+      sourceUrl: (options && options.liveSync && listUrl) ? listUrl : '',
+    };
     saveLocalChannel(payload);
     addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
     renderMyCreatedChannelsList();
@@ -41303,11 +47006,1485 @@ async function importChannelFromLink(btn) {
     }
     return;
   }
-  await quickAddChannel(name, listUrl, null, btn);
+  const liveCheck = document.getElementById('channelImportLiveSyncCheck');
+  await quickAddChannel(name, listUrl, null, btn, { liveSync: !liveCheck || liveCheck.checked });
   urlInput.value = '';
   nameInput.value = '';
 }
 
+
+// --- the Next Up channel ------------------------------------------------
+//
+// One channel that always plays the next unwatched episode of everything on
+// the go. Unlike every other channel it stores no picks at all: the payload
+// carries dynamic:'next-up' and the Worker derives the lineup from the
+// account's own Continue Watching on each request (see channelNextUpItems,
+// 05_catalog-core.js), so it follows what is actually being watched rather
+// than freezing the day it was made.
+//
+// That also means it only works signed in with Auto-track playback on --
+// there is no other way for this Worker to know what has been watched -- so
+// this says so up front rather than saving a channel that would come back
+// empty.
+const NEXT_UP_CHANNEL_NAME = 'Next Up';
+
+// The picks a Next Up channel is SEEDED with, out of this browser's own
+// Continue Watching list.
+//
+// The Worker re-derives the lineup per request and that stays the channel's
+// real answer -- but it can only do so for an install config that proved
+// which account it speaks for (see trackOwner in resolveConfig), and a
+// config with no personal shelf in it does not. A channel that stored
+// nothing therefore came back EMPTY for exactly the people most likely to
+// try it first. Seeding fixes that: the channel works the moment it is
+// saved, and the Worker's live answer replaces the seed whenever it has one.
+function channelNextUpSeedItems() {
+  let cw = [];
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    const list = map && map['continue-watching'];
+    cw = (list && Array.isArray(list.items)) ? list.items : [];
+  } catch (e) {
+    cw = [];
+  }
+  const out = [];
+  const seen = {};
+  cw.forEach((it) => {
+    if (!it) return;
+    const showId = String(it.showId || it.imdbId || '').trim();
+    const season = Number(it.seasonNum);
+    const episode = Number(it.episodeNum);
+    if (!showId || !Number.isInteger(season) || !Number.isInteger(episode)) return;
+    const key = showId + ':' + season + ':' + episode;
+    if (seen[key]) return;
+    seen[key] = true;
+    const showName = String(it.showTitle || '').trim();
+    const epName = String(it.name || '').trim() || ('Episode ' + episode);
+    const poster = it.showPoster || it.poster || '';
+    out.push({
+      kind: 'episode',
+      imdbId: showId,
+      season: season,
+      episode: episode,
+      showName: showName,
+      epName: epName,
+      title: showName ? (showName + ' S' + season + 'E' + episode + ' — ' + epName) : epName,
+      released: it.released || '',
+      thumbnail: poster,
+      poster: poster,
+      showPoster: poster,
+    });
+  });
+  return out;
+}
+
+// Re-seeds a saved Next Up channel from Continue Watching as it stands now,
+// and rewrites the catalog row that carries it. What the card's Refresh
+// button does.
+function refreshNextUpChannelSeed(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch || ch.dynamic !== 'next-up') return 0;
+  const items = channelNextUpSeedItems();
+  ch.items = items;
+  saveLocalChannelsMap(map);
+  const payload = Object.assign({}, ch, { items: items });
+  const rows = [...document.querySelectorAll('#lists .entry')];
+  rows.forEach((row) => {
+    [...row.querySelectorAll('.url')].forEach((u) => {
+      if (String(u.value || '').indexOf(channelId) !== -1) u.value = 'channel:v1:' + JSON.stringify(payload);
+    });
+  });
+  if (typeof saveState === 'function') saveState();
+  renderMyCreatedChannelsList();
+  if (btn) {
+    btn.textContent = items.length + ' up next ✓';
+    setTimeout(() => { if (btn) btn.textContent = 'Refresh'; }, 1800);
+  }
+  return items.length;
+}
+
+function createNextUpChannel(btn) {
+  const status = document.getElementById('channelNextUpStatus');
+  const say = (html) => { if (status) status.innerHTML = html; };
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (!signedIn) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ A Next Up channel reads your watch history, so it needs a Creator Profile with Auto-track playback switched on.</p>');
+    return;
+  }
+  const map = loadLocalChannels();
+  const already = Object.values(map).find((ch) => ch && ch.dynamic === 'next-up');
+  if (already) {
+    say('<p class="testresult ok" style="margin:4px 0 0;">You already have one — "' + escapeHtml(already.name) + '".</p>');
+    openChannelDetailsPage(already.channelId);
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    const channelId = generateChannelId();
+    const payload = {
+      channelId: channelId,
+      name: NEXT_UP_CHANNEL_NAME,
+      poster: null,
+      backdrop: null,
+      // A seed, not the answer. The Worker re-derives the lineup on every
+      // request and that replaces this -- but only for a config that can
+      // prove whose it is, so this is what the channel plays until then and
+      // what it falls back to if that proof is ever missing.
+      items: channelNextUpSeedItems(),
+      shuffle: false,
+      autoSort: '',
+      sortByAired: false,
+      dailyRotate: false,
+      dynamic: 'next-up',
+    };
+    saveLocalChannel(payload);
+    addRow(NEXT_UP_CHANNEL_NAME, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+    renderMyCreatedChannelsList();
+    renderChannelMergeList();
+    showAddedToast('"' + NEXT_UP_CHANNEL_NAME + '" added to your Catalogs.');
+    const seeded = payload.items.length;
+    say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + NEXT_UP_CHANNEL_NAME + '" added with ' + seeded +
+      ' show' + (seeded === 1 ? '' : 's') + ' up next, and it refreshes itself from Continue Watching as you watch.' +
+      (seeded ? '' : ' Nothing is in progress yet — it fills in once you have started something.') + '</p>');
+    setTimeout(() => { if (status) status.innerHTML = ''; }, 8000);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// --- the Quick Channel Wizard -------------------------------------------
+//
+// Network x era x genre -> a finished 24/7 channel. The server answers with
+// a list of shows (see /api/wizard-channel-shows) and the rest is the same
+// path Quick Add's network buttons take, so a wizard channel behaves
+// exactly like one of those: a rotating daily lineup out of a large pool.
+function channelWizardName() {
+  const typed = (document.getElementById('channelWizardNameInput') || {}).value;
+  if (typed && typed.trim()) return typed.trim();
+  const pick = (id) => {
+    const sel = document.getElementById(id);
+    if (!sel || !sel.value) return '';
+    return sel.options[sel.selectedIndex].textContent.trim();
+  };
+  const network = pick('channelWizardNetwork');
+  const era = pick('channelWizardEra');
+  const genre = pick('channelWizardGenre');
+  const parts = [era, network, genre].filter(Boolean);
+  return parts.length ? parts.join(' ') : 'My Channel';
+}
+
+async function runChannelWizard(btn) {
+  const statusBox = document.getElementById('channelWizardStatus');
+  const say = (html) => { if (statusBox) statusBox.innerHTML = html; };
+  const networkId = (document.getElementById('channelWizardNetwork') || {}).value || '';
+  const era = (document.getElementById('channelWizardEra') || {}).value || '';
+  const genres = (document.getElementById('channelWizardGenre') || {}).value || '';
+  const limit = parseInt((document.getElementById('channelWizardSize') || {}).value, 10) || 8;
+  if (!networkId && !era && !genres) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ Choose at least one of network, era or genre first.</p>');
+    return;
+  }
+  const name = channelWizardName();
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Building…';
+  }
+  try {
+    say('<p><small>Finding the top shows for ' + escapeHtml(name) + '…</small></p>');
+    let params = 'limit=' + encodeURIComponent(limit);
+    if (networkId) params += '&networkId=' + encodeURIComponent(networkId);
+    if (era) params += '&era=' + encodeURIComponent(era);
+    if (genres) params += '&genres=' + encodeURIComponent(genres);
+    const res = await fetch(ORIGIN + '/api/wizard-channel-shows?' + params, { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok || !Array.isArray(data.shows) || !data.shows.length) {
+      say('<p class="testresult err" style="margin:4px 0 0;">✗ ' + escapeHtml(data.error || 'Nothing matched that combination.') + '</p>');
+      return;
+    }
+    const built = await buildChannelItemsFromShows(data.shows, {
+      poster: data.networkLogo || null,
+      onProgress: function (i, total, show) {
+        say('<p><small>Building ' + escapeHtml(name) + '… show ' + (i + 1) + ' of ' + total +
+          ' (' + escapeHtml(show.name || '') + ')</small></p>');
+      },
+    });
+    if (!built.items.length) {
+      say('<p class="testresult err" style="margin:4px 0 0;">✗ Found those shows but could not read any episodes for them.</p>');
+      return;
+    }
+    const channelId = generateChannelId();
+    const payload = {
+      channelId: channelId,
+      name: name,
+      poster: built.poster,
+      backdrop: built.backdrop || built.poster,
+      items: built.items,
+      shuffle: false,
+      // A wizard channel is a pool, not a playlist, so it rotates like a
+      // network channel -- and interleaves, which is what makes a lineup of
+      // eight shows read as a block rather than eight blocks in a row.
+      autoSort: 'interleave',
+      dailyRotate: true,
+    };
+    saveLocalChannel(payload);
+    addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+    renderMyCreatedChannelsList();
+    renderChannelMergeList();
+    showAddedToast('Channel "' + name + '" added to your Catalogs.');
+    say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + escapeHtml(name) + '" built from ' + data.shows.length +
+      ' shows (' + built.items.length + ' episodes), rotating a fresh lineup daily.</p>');
+    const nameInput = document.getElementById('channelWizardNameInput');
+    if (nameInput) nameInput.value = '';
+  } catch (e) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ Network error while building that channel.</p>');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// --- the Quick List Wizard (Catalogs Quick Add) --------------------------
+//
+// Network/studio x era x genre -> separate lists for movies and shows
+// (not combined). The server answers with resolved titles from TMDB,
+// and the client adds them directly to the user's Catalogs as customlist:v1:
+// rows, saving them into local custom lists so they can also be edited.
+function catalogWizardName(customSuffix) {
+  const typed = (document.getElementById('catalogWizardNameInput') || {}).value;
+  if (typed && typed.trim()) {
+    const t = typed.trim();
+    return customSuffix ? (t.toLowerCase().endsWith(customSuffix.toLowerCase()) ? t : t + ' ' + customSuffix) : t;
+  }
+  const pick = (id) => {
+    const sel = document.getElementById(id);
+    if (!sel || !sel.value) return '';
+    return sel.options[sel.selectedIndex].textContent.trim();
+  };
+  const network = pick('catalogWizardNetwork');
+  const era = pick('catalogWizardEra');
+  const genre = pick('catalogWizardGenre');
+  const parts = [era, network, genre].filter(Boolean);
+  const base = parts.length ? parts.join(' ') : 'My List';
+  return customSuffix ? base + ' ' + customSuffix : base;
+}
+
+async function fetchWizardTitles(type, networkId, era, genres, limit) {
+  let params = 'type=' + encodeURIComponent(type) + '&limit=' + encodeURIComponent(limit);
+  if (networkId) params += '&networkId=' + encodeURIComponent(networkId);
+  if (era) params += '&era=' + encodeURIComponent(era);
+  if (genres) params += '&genres=' + encodeURIComponent(genres);
+  const res = await fetch(ORIGIN + '/api/wizard-channel-shows?' + params, { cache: 'no-store' });
+  const data = await res.json();
+  if (!data.ok || !Array.isArray(data.items || data.shows) || !(data.items || data.shows).length) {
+    throw new Error(data.error || 'Nothing matched that combination.');
+  }
+  return data.items || data.shows;
+}
+
+function addCatalogWizardList(name, items, type) {
+  const channelId = generateChannelId();
+  const baseSlug = (typeof slugify === 'function' ? slugify(name) : name.toLowerCase().replace(/[^a-z0-9]+/g, '-')) || 'list';
+  let slug = baseSlug;
+  const localMap = typeof loadLocalCustomLists === 'function' ? loadLocalCustomLists() : {};
+  let n = 2;
+  while (localMap[slug]) {
+    slug = baseSlug + '-' + n;
+    n++;
+  }
+  const cleanItems = items.map((it) => ({
+    imdbId: it.imdbId,
+    title: it.name || it.title || 'Untitled',
+    year: it.year || undefined,
+    poster: it.poster || undefined,
+    type: type,
+  }));
+  const payload = {
+    listId: channelId,
+    localSlug: slug,
+    listSlug: slug,
+    name: name,
+    type: type,
+    items: cleanItems,
+    shuffle: false,
+  };
+  if (typeof saveLocalCustomListsMap === 'function') {
+    localMap[slug] = {
+      slug: slug,
+      name: name,
+      type: type,
+      items: cleanItems,
+      visibility: 'unlisted',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    saveLocalCustomListsMap(localMap);
+    if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  }
+  addRow(name, 'customlist:v1:' + JSON.stringify(payload), type, true, 'Custom Lists');
+  saveState();
+}
+
+async function runCatalogListWizard(targetType, btn) {
+  const statusBox = document.getElementById('catalogWizardStatus');
+  const say = (html) => { if (statusBox) statusBox.innerHTML = html; };
+  const networkId = (document.getElementById('catalogWizardNetwork') || {}).value || '';
+  const era = (document.getElementById('catalogWizardEra') || {}).value || '';
+  const genres = (document.getElementById('catalogWizardGenre') || {}).value || '';
+  const limit = parseInt((document.getElementById('catalogWizardSize') || {}).value, 10) || 20;
+
+  if (!networkId && !era && !genres) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ Choose at least one of network/studio, era or genre first.</p>');
+    return;
+  }
+
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Building…';
+  }
+
+  try {
+    if (targetType === 'both') {
+      say('<p><small>Finding top movies and shows for your lists…</small></p>');
+      const movieName = catalogWizardName('(Movies)');
+      const showName = catalogWizardName('(Shows)');
+
+      let movieItems = [];
+      let showItems = [];
+      let movieErr = null;
+      let showErr = null;
+
+      try {
+        movieItems = await fetchWizardTitles('movie', networkId, era, genres, limit);
+      } catch (err) {
+        movieErr = err.message;
+      }
+
+      try {
+        showItems = await fetchWizardTitles('series', networkId, era, genres, limit);
+      } catch (err) {
+        showErr = err.message;
+      }
+
+      if (!movieItems.length && !showItems.length) {
+        say('<p class="testresult err" style="margin:4px 0 0;">✗ ' + escapeHtml(movieErr || showErr || 'Nothing matched that combination.') + '</p>');
+        return;
+      }
+
+      const addedDesc = [];
+      if (movieItems.length) {
+        addCatalogWizardList(movieName, movieItems, 'movie');
+        addedDesc.push(movieItems.length + ' movies ("' + escapeHtml(movieName) + '")');
+      }
+      if (showItems.length) {
+        addCatalogWizardList(showName, showItems, 'series');
+        addedDesc.push(showItems.length + ' shows ("' + escapeHtml(showName) + '")');
+      }
+
+      if (typeof renderLivePreview === 'function') renderLivePreview();
+      showAddedToast('Added separate lists: ' + addedDesc.join(' and ') + ' to Catalogs.');
+      say('<p class="testresult ok" style="margin:4px 0 0;">✓ Built ' + addedDesc.join(' and ') + ' as separate catalog rows (not combined).</p>');
+    } else {
+      const isMovie = targetType === 'movie';
+      const suffix = isMovie ? '(Movies)' : '(Shows)';
+      const listName = catalogWizardName(suffix);
+      say('<p><small>Finding top ' + (isMovie ? 'movies' : 'shows') + ' for ' + escapeHtml(listName) + '…</small></p>');
+
+      const items = await fetchWizardTitles(targetType, networkId, era, genres, limit);
+      addCatalogWizardList(listName, items, targetType);
+      if (typeof renderLivePreview === 'function') renderLivePreview();
+      showAddedToast('List "' + listName + '" added to your Catalogs.');
+      say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + escapeHtml(listName) + '" built from ' + items.length + ' ' + (isMovie ? 'movies' : 'shows') + ' and added to your Catalogs.</p>');
+    }
+    const nameInput = document.getElementById('catalogWizardNameInput');
+    if (nameInput) nameInput.value = '';
+  } catch (e) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ ' + escapeHtml(e.message || 'Network error while building lists.') + '</p>');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// --- Spotlight channels (an actor, a director, a creator) ---------------
+//
+// Searching a PERSON answers a different question from searching a title,
+// so it gets its own result card and its own builder: pick someone and the
+// whole channel -- their best films plus the shows they were in -- is put
+// together in one go, rather than searching and adding fifteen titles by
+// hand.
+let channelSpotlightSort = 'chronological';
+
+function setChannelSpotlightSort(value) {
+  channelSpotlightSort = value === 'rating' ? 'rating' : 'chronological';
+}
+
+async function runChannelPersonSearch(q) {
+  const box = document.getElementById('channelSearchResult');
+  box.innerHTML = '<p><small>Searching…</small></p>';
+  try {
+    const res = await fetch(ORIGIN + '/api/person-search?q=' + encodeURIComponent(q), { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Search failed.') + '</p>';
+      return;
+    }
+    renderChannelPersonResults(data.results || []);
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">✗ Network error while searching.</p>';
+  }
+}
+
+function renderChannelPersonResults(results) {
+  const box = document.getElementById('channelSearchResult');
+  if (!results.length) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No one by that name.</small></p>';
+    return;
+  }
+  const cards = results.map((p) => {
+    const img = p.poster
+      ? '<img class="preview-thumb" src="' + escapeAttr(p.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No photo</div>';
+    const data = ' data-personid="' + escapeAttr(String(p.personId)) + '" data-personname="' + escapeAttr(p.name) + '"';
+    return '<div class="custom-list-search-item channelPersonCard" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
+      img +
+      '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(p.name) + '">' + escapeHtml(p.name) + '</div>' +
+      '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; width:100%;" title="' + escapeAttr(p.knownFor || p.department || '') + '">' +
+        escapeHtml(p.knownFor || p.department || '') +
+      '</div>' +
+      '<button type="button" class="lc-btn secondary channelPersonBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' + data + '>+ Browse</button>' +
+      '</div>';
+  }).join('');
+  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cards + '</div>';
+}
+
+// --- browsing one person's filmography ----------------------------------
+//
+// The same shape as browsing a show: tap the card and everything they have
+// been in opens BELOW, where each title can be added on its own -- rather
+// than the whole channel being committed in one click, which gave no way to
+// drop the one film you have seen too often.
+//
+// A film is added directly. A TV credit hands off to browseChannelShow, so
+// picking seasons and episodes of a show someone was in is the same journey
+// as picking them from the Shows tab, with the same controls.
+let channelPersonCredits = null;
+
+async function browseChannelPerson(personId, personName) {
+  const box = document.getElementById('channelEpisodePicker');
+  if (!box) return;
+  box.innerHTML = '<p><small>Loading ' + escapeHtml(personName || 'their') + '\u2019s filmography\u2026</small></p>';
+  box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  try {
+    const res = await fetch(ORIGIN + '/api/person-credits?personId=' + encodeURIComponent(personId) +
+      '&sort=' + encodeURIComponent(channelSpotlightSort) + '&movies=120&shows=60', { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not read that filmography.') + '</p>';
+      return;
+    }
+    channelPersonCredits = {
+      personId: String(personId),
+      name: data.name || personName || '',
+      poster: data.poster || null,
+      backdrop: data.backdrop || null,
+      movies: data.movies || [],
+      shows: data.shows || [],
+    };
+    renderChannelPersonCredits();
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">\u2717 Network error loading that filmography.</p>';
+  }
+}
+
+// The sort is a property of the whole filmography, so changing it re-asks
+// the server rather than re-ordering here: which credits make the cut is
+// decided by popularity and only their ORDER is the sort, so sorting a
+// fetched page locally would be sorting the wrong forty titles.
+function setChannelSpotlightSortAndReload(value) {
+  setChannelSpotlightSort(value);
+  if (channelPersonCredits) browseChannelPerson(channelPersonCredits.personId, channelPersonCredits.name);
+}
+
+function channelPersonCreditCardHtml(credit, isShow) {
+  const poster = credit.poster || '';
+  const img = poster
+    ? '<img class="preview-thumb" src="' + escapeAttr(poster) + '" alt="" loading="lazy">'
+    : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
+  const data =
+    ' data-tmdbid="' + escapeAttr(String(credit.tmdbId)) + '"' +
+    ' data-title="' + escapeAttr(credit.title) + '"' +
+    ' data-year="' + escapeAttr(credit.year || '') + '"' +
+    ' data-poster="' + escapeAttr(poster) + '"' +
+    ' data-backdrop="' + escapeAttr(credit.backdrop || '') + '"';
+  const cardClass = isShow ? 'channelPersonShowCard' : 'channelPersonMovieCard';
+  const btnClass = isShow ? 'channelPersonShowBtn' : 'channelPersonMovieBtn';
+  const btnLabel = isShow ? '+ Their episodes' : '+ Add';
+  const sub = [credit.year, credit.role].filter(Boolean).join(' \u00b7 ');
+  return '<div class="custom-list-search-item ' + cardClass + '" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
+    img +
+    '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(credit.title) + '">' +
+      escapeHtml(credit.title) +
+    '</div>' +
+    '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; width:100%;" title="' + escapeAttr(sub) + '">' + escapeHtml(sub) + '</div>' +
+    '<button type="button" class="lc-btn secondary ' + btnClass + '" style="width:100%; padding:4px 6px; font-size:0.75rem;"' + data + '>' + btnLabel + '</button>' +
+    '</div>';
+}
+
+function renderChannelPersonCredits() {
+  const box = document.getElementById('channelEpisodePicker');
+  if (!box || !channelPersonCredits) return;
+  const c = channelPersonCredits;
+  if (!c.movies.length && !c.shows.length) {
+    box.innerHTML = '<p class="testresult err">\u2717 TMDB has no credits we can build a channel from for ' + escapeHtml(c.name) + '.</p>';
+    return;
+  }
+  const header =
+    '<div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px;">' +
+      '<p style="margin:0; font-weight:600; font-size:0.9rem; flex:1; min-width:160px;">' +
+        escapeHtml(c.name) + ' \u2014 ' + c.movies.length + ' film' + (c.movies.length === 1 ? '' : 's') +
+        (c.shows.length ? ' and ' + c.shows.length + ' show' + (c.shows.length === 1 ? '' : 's') : '') +
+      '</p>' +
+      '<label for="channelSpotlightSortSelect" style="font-size:0.8rem; font-weight:600;">Order:</label>' +
+      '<select id="channelSpotlightSortSelect" onchange="setChannelSpotlightSortAndReload(this.value)" style="font-size:0.82rem; padding:5px 8px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">' +
+        '<option value="chronological"' + (channelSpotlightSort === 'chronological' ? ' selected' : '') + '>Career order</option>' +
+        '<option value="rating"' + (channelSpotlightSort === 'rating' ? ' selected' : '') + '>Best first</option>' +
+      '</select>' +
+    '</div>' +
+    '<div class="actions" style="flex-wrap:wrap; margin-bottom:10px;">' +
+      '<button type="button" class="secondary channelPersonAddAllBtn">Add everything as a Spotlight channel</button>' +
+    '</div>';
+  const movies = c.movies.length
+    ? '<p style="margin:10px 0 4px; font-weight:600; font-size:0.85rem;">Films</p>' +
+      '<div class="poster-grid-3">' + c.movies.map((m) => channelPersonCreditCardHtml(m, false)).join('') + '</div>'
+    : '';
+  const shows = c.shows.length
+    ? '<p style="margin:14px 0 4px; font-weight:600; font-size:0.85rem;">Television</p>' +
+      '<p style="margin:0 0 6px; color:var(--muted); font-size:0.78rem;">The button adds only the episodes they are actually in. Tap the poster instead to pick seasons and episodes yourself, the same way you would from the Shows tab.</p>' +
+      '<div class="poster-grid-3">' + c.shows.map((sh) => channelPersonCreditCardHtml(sh, true)).join('') + '</div>' +
+      '<div id="channelEpisodeList"></div>'
+    : '<div id="channelEpisodeList"></div>';
+  box.innerHTML = header + movies + shows;
+}
+
+// "Add everything as a Spotlight channel".
+//
+// Everything means everything: every film listed above, and every episode of
+// every show listed above that this person is ACTUALLY in -- not a slice of
+// each, and not a show's opening episodes because they happened to appear in
+// one of them (see /api/person-show-episodes, which is what settles which
+// episodes those are).
+//
+// The whole lot is then ordered TOGETHER by the chosen sort. Films first and
+// television after was the old shape, and it read as broken: a 1994 guest
+// appearance played after a 2021 film in what was supposed to be career
+// order. Sorting the items rather than the credits is what puts each episode
+// where it actually belongs among the films.
+function spotlightItemSortDate(it) {
+  return channelItemAiredDateClient(it) || '';
+}
+
+function sortSpotlightItems(items, mode) {
+  const wrapped = items.map((it, i) => ({ it: it, i: i }));
+  if (mode === 'rating') {
+    // An episode has no rating of its own worth ranking by, so it inherits
+    // its show's -- which keeps a show's run together, in broadcast order,
+    // sitting where that show ranks among the films.
+    wrapped.sort((a, b) => {
+      const ra = Number(a.it.spotlightRating) || 0;
+      const rb = Number(b.it.spotlightRating) || 0;
+      if (ra !== rb) return rb - ra;
+      return a.i - b.i;
+    });
+  } else {
+    wrapped.sort((a, b) => {
+      const da = spotlightItemSortDate(a.it);
+      const db = spotlightItemSortDate(b.it);
+      if (da === db) return a.i - b.i;
+      // Undated last, never first: being unable to place something is no
+      // reason to open a tribute with it. Same call sortChannelItemsByAired
+      // makes server-side.
+      if (!da) return 1;
+      if (!db) return -1;
+      return da < db ? -1 : 1;
+    });
+  }
+  return wrapped.map((w) => {
+    const out = Object.assign({}, w.it);
+    delete out.spotlightRating;
+    return out;
+  });
+}
+
+// Adds one show's worth of a person's own episodes -- the per-show version
+// of what "Add everything" does, for when only that credit is wanted.
+async function addPersonShowEpisodes(tmdbId, showTitle, showPoster, btn, duplicateChecked) {
+  if (!channelPersonCredits) return;
+  const c = channelPersonCredits;
+  if (!duplicateChecked && guardChannelDraftDuplicate(
+    showTitle || 'That show',
+    channelDraftCountForShow('', showTitle),
+    () => addPersonShowEpisodes(tmdbId, showTitle, showPoster, btn, true)
+  )) return;
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Finding\u2026';
+  }
+  try {
+    const r = await fetch(ORIGIN + '/api/person-show-episodes?personId=' + encodeURIComponent(c.personId) +
+      '&tmdbId=' + encodeURIComponent(tmdbId), { cache: 'no-store' });
+    const d = await r.json();
+    if (!d.ok || !Array.isArray(d.episodes) || !d.episodes.length) {
+      if (btn) btn.textContent = 'None found';
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+      return;
+    }
+    const poster = d.poster || showPoster || '';
+    const showName = d.showName || showTitle || '';
+    const items = d.episodes.map((ep) => ({
+      kind: 'episode',
+      imdbId: channelStreamShowId(d.imdbId, tmdbId),
+      season: ep.season,
+      episode: ep.episode,
+      showName: showName,
+      epName: ep.name,
+      title: showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + ep.name,
+      released: ep.released || '',
+      runtime: ep.runtime || 0,
+      thumbnail: ep.thumbnail || poster,
+      poster: poster || ep.thumbnail || '',
+      showPoster: poster,
+    }));
+    channelDraftItems = channelDraftItems.concat(items);
+    renderChannelDraftList();
+    updateChannelSaveButtonLabel();
+    if (btn) {
+      btn.textContent = '+' + items.length + ' \u2713';
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+    }
+  } catch (e) {
+    if (btn) btn.textContent = 'Failed';
+    setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function addWholeSpotlightToDraft(btn) {
+  if (!channelPersonCredits) return;
+  const c = channelPersonCredits;
+  const box = document.getElementById('channelEpisodePicker');
+  const say = (html) => { if (box) box.innerHTML = html; };
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Building\u2026';
+  }
+  try {
+    // A film needs its IMDB id resolved one by one: a channel item's id IS
+    // the stream request (see channelItemStreamId server-side), so a movie
+    // with no id would play as nothing.
+    const movieItems = [];
+    for (let i = 0; i < c.movies.length; i++) {
+      const m = c.movies[i];
+      say('<p><small>Resolving films\u2026 ' + (i + 1) + ' of ' + c.movies.length + ' (' + escapeHtml(m.title) + ')</small></p>');
+      try {
+        const r = await fetch(ORIGIN + '/api/resolve-movie?tmdbId=' + encodeURIComponent(m.tmdbId), { cache: 'no-store' });
+        const d = await r.json();
+        if (!d.ok || !d.imdbId) continue;
+        movieItems.push({
+          kind: 'movie',
+          imdbId: d.imdbId,
+          tmdbId: m.tmdbId,
+          title: m.title,
+          year: m.year || '',
+          showName: m.title,
+          epName: 'Movie',
+          released: m.released || (m.year ? m.year + '-01-01' : ''),
+          runtime: d.runtime || 0,
+          thumbnail: m.backdrop || m.poster || '',
+          poster: m.poster || '',
+          showPoster: m.poster || '',
+          backdrop: m.backdrop || '',
+          spotlightRating: m.rating || 0,
+        });
+      } catch (e) {
+        continue;
+      }
+    }
+
+    const episodeItems = [];
+    let guestShows = 0;
+    for (let i = 0; i < c.shows.length; i++) {
+      const sh = c.shows[i];
+      say('<p><small>Finding ' + escapeHtml(c.name) + '\u2019s episodes\u2026 show ' + (i + 1) + ' of ' + c.shows.length +
+        ' (' + escapeHtml(sh.title) + ')</small></p>');
+      try {
+        const r = await fetch(ORIGIN + '/api/person-show-episodes?personId=' + encodeURIComponent(c.personId) +
+          '&tmdbId=' + encodeURIComponent(sh.tmdbId), { cache: 'no-store' });
+        const d = await r.json();
+        if (!d.ok || !Array.isArray(d.episodes) || !d.episodes.length) continue;
+        if (!d.regular) guestShows++;
+        const showPoster = d.poster || sh.poster || '';
+        const showName = d.showName || sh.title || '';
+        d.episodes.forEach((ep) => {
+          episodeItems.push({
+            kind: 'episode',
+            imdbId: channelStreamShowId(d.imdbId, sh.tmdbId),
+            season: ep.season,
+            episode: ep.episode,
+            showName: showName,
+            epName: ep.name,
+            title: showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + ep.name,
+            released: ep.released || '',
+            runtime: ep.runtime || 0,
+            thumbnail: ep.thumbnail || showPoster,
+            poster: showPoster || ep.thumbnail || '',
+            showPoster: showPoster,
+            spotlightRating: sh.rating || 0,
+          });
+        });
+      } catch (e) {
+        continue;
+      }
+    }
+
+    const items = sortSpotlightItems(movieItems.concat(episodeItems), channelSpotlightSort);
+    if (!items.length) {
+      say('<p class="testresult err">\u2717 Could not resolve any of ' + escapeHtml(c.name) + '\u2019s credits to something playable.</p>');
+      return;
+    }
+    channelDraftItems = channelDraftItems.concat(items);
+    if (!channelDraftPoster) channelDraftPoster = c.poster || (c.movies[0] && c.movies[0].poster) || null;
+    if (!channelDraftBackdrop) channelDraftBackdrop = c.backdrop || null;
+    const nameInput = document.getElementById('channelNameInput');
+    if (nameInput && !nameInput.value.trim()) nameInput.value = c.name + ' Spotlight';
+    // The items have just been put in the order that was asked for, so the
+    // draft stays "As listed" -- arming an auto-sort here would re-sort them
+    // on the next render and throw that ordering away.
+    setChannelPlayOrder('as-listed');
+    renderChannelDraftList();
+    updateChannelSaveButtonLabel();
+    say('<p class="testresult ok" style="margin:4px 0 0;">\u2713 Added ' + movieItems.length + ' film' + (movieItems.length === 1 ? '' : 's') +
+      (episodeItems.length ? ' and ' + episodeItems.length + ' episode' + (episodeItems.length === 1 ? '' : 's') : '') +
+      ', ' + (channelSpotlightSort === 'rating' ? 'best first' : 'in career order') + '.' +
+      (guestShows ? ' Guest appearances are only the episodes ' + escapeHtml(c.name) + ' is in.' : '') +
+      ' Tune the picks below, then Save.</p>');
+  } catch (e) {
+    say('<p class="testresult err">\u2717 Network error while building that spotlight.</p>');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// --- sharing a channel, and the Explore Channels directory --------------
+//
+// A channel is thousands of episodes, so a share link cannot carry it: what
+// travels is a short code, and the channel itself is stored server-side
+// under channelshare:{code} (see /api/channel/share). Pasting the link -- or
+// opening it -- rebuilds the channel here, picks, play order, broadcast
+// schedule and all.
+//
+// Sharing is unlisted and needs no account. PUBLISHING to the directory
+// does need a Creator Profile, so every listing has an owner who can take it
+// back down.
+
+// Every field a share carries. Kept out of channelBroadcastFields because
+// these say where a channel has BEEN rather than how it plays -- but carried
+// through the same three persistence points for the same reason: a field
+// only two of the three know about is a field that disappears on the next
+// save.
+function channelShareFields(src) {
+  const o = src || {};
+  return {
+    shareCode: String(o.shareCode || ''),
+    sharePublished: !!o.sharePublished,
+  };
+}
+
+function channelShareUrl(code) {
+  return ORIGIN.replace(/\\/+$/, '') + '/channel/' + encodeURIComponent(code);
+}
+
+// The code inside whatever got pasted: a full share URL, a "channel:share:"
+// prefix, the fragment a share link redirects to, or the bare code.
+function parseChannelShareCode(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  const fromUrl = text.match(/\\/channel\\/([A-Za-z0-9_-]{1,64})/);
+  if (fromUrl) return fromUrl[1];
+  const fromHash = text.match(/[#&?]channel=([A-Za-z0-9_-]{1,64})/);
+  if (fromHash) return fromHash[1];
+  const fromScheme = text.match(/^channel:share:([A-Za-z0-9_-]{1,64})$/);
+  if (fromScheme) return fromScheme[1];
+  return /^[A-Za-z0-9_-]{1,64}$/.test(text) ? text : '';
+}
+
+// The payload a share sends. Deliberately NOT the stored record: a saved
+// channel carries local bookkeeping (createdAt, the share code itself) that
+// has no meaning on anyone else's device.
+function channelSharePayload(ch) {
+  return Object.assign({
+    name: ch.name,
+    poster: ch.poster,
+    backdrop: ch.backdrop,
+    items: ch.items || [],
+    shuffle: !!ch.shuffle,
+    autoSort: ch.autoSort || '',
+    sortByAired: !!ch.sortByAired,
+  }, channelBroadcastFields(ch));
+}
+
+async function postChannelShare(ch, opts) {
+  const o = opts || {};
+  const body = {
+    channel: channelSharePayload(ch),
+    code: ch.shareCode || '',
+    description: o.description || '',
+    publish: !!o.publish,
+  };
+  // Credentials go with a re-share too, not only with a publish.
+  //
+  // Re-sharing writes over an existing record, and a record created by
+  // PUBLISHING has an owner -- so an unlisted re-share that proved nothing
+  // was refused as "that share link belongs to someone else", by its own
+  // owner. Sent whenever they are available: an unlisted share of a channel
+  // nobody has published still needs nothing, and the server only uses them
+  // to decide who is writing.
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (signedIn && (o.publish || ch.shareCode)) {
+    body.creatorName = activeCreator.creatorName;
+    body.creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  }
+  const res = await fetch(ORIGIN + '/api/channel/share', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+// Remembers the code on the local channel, so sharing the same channel again
+// after an edit updates the link people already have rather than minting a
+// second one beside it.
+function rememberChannelShare(channelId, code, published) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch) return;
+  ch.shareCode = code;
+  ch.sharePublished = !!published;
+  saveLocalChannelsMap(map);
+}
+
+// Copies the link a channel already has, without re-uploading it.
+//
+// The modal that appears after sharing or publishing is not a place to keep
+// something: it closes, and the link goes with it. A channel that has a code
+// carries this button from then on, so the link is always one tap away.
+async function copyChannelShareLink(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch || !ch.shareCode) return;
+  const link = channelShareUrl(ch.shareCode);
+  let copied = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(link);
+      copied = true;
+    }
+  } catch (e) {
+    copied = false;
+  }
+  if (copied) {
+    if (btn) {
+      const label = btn.textContent;
+      btn.textContent = 'Copied \u2713';
+      setTimeout(() => { if (btn) btn.textContent = label; }, 1600);
+    }
+    showAddedToast('Link to "' + ch.name + '" copied.');
+    return;
+  }
+  // No clipboard (an insecure origin, or a browser that refuses): the link
+  // still has to be gettable, so it goes on screen to be selected by hand.
+  showAppAlert('Link to "' + ch.name + '"', link, true);
+}
+
+async function shareChannelById(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch) return;
+  const originalLabel = btn ? btn.textContent : 'Share';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Sharing…';
+  }
+  try {
+    const data = await postChannelShare(ch, { publish: false });
+    if (!data.ok) {
+      showAppAlert('Share Channel', data.error || 'Could not create a share link for that channel.');
+      return;
+    }
+    rememberChannelShare(channelId, data.code, data.published);
+    const link = data.url || channelShareUrl(data.code);
+    let copied = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(link);
+        copied = true;
+      }
+    } catch (e) {
+      copied = false;
+    }
+    showAppAlert(
+      'Share "' + ch.name + '"',
+      (copied ? 'Link copied to your clipboard:\\n\\n' : 'Copy this link:\\n\\n') + link +
+        '\\n\\nAnyone who opens it gets this exact channel — every pick, its play order and its broadcast schedule.',
+      true
+    );
+    renderMyCreatedChannelsList();
+  } catch (e) {
+    showAppAlert('Share Channel', 'Network error while creating that share link.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// Saves a shared channel locally and adds it to Catalogs. Shared by the
+// Import tab, the Explore Channels cards and the share-link deep link, so
+// all three land a channel the same way.
+function acceptSharedChannel(channel, code) {
+  const channelId = generateChannelId();
+  const payload = Object.assign({}, channel, {
+    channelId: channelId,
+    // The code travels with the copy so its owner's later edits can be
+    // pulled in again, but sharePublished stays false: this copy is not the
+    // one listed in the directory, and marking it so would offer an
+    // "Unpublish" that belongs to someone else.
+    shareCode: code || '',
+    sharePublished: false,
+  });
+  saveLocalChannel(payload);
+  addRow(payload.name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+  renderMyCreatedChannelsList();
+  renderChannelMergeList();
+  showAddedToast('Channel "' + payload.name + '" added to your Catalogs.');
+  return channelId;
+}
+
+async function fetchSharedChannel(code) {
+  const res = await fetch(ORIGIN + '/api/channel/share?code=' + encodeURIComponent(code), { cache: 'no-store' });
+  return res.json();
+}
+
+async function importSharedChannel(btn) {
+  const input = document.getElementById('channelShareCodeInput');
+  const statusBox = document.getElementById('channelShareImportStatus');
+  const say = (html) => { if (statusBox) statusBox.innerHTML = html; };
+  const code = parseChannelShareCode(input ? input.value : '');
+  if (!code) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ That does not look like a channel share link or code.</p>');
+    return;
+  }
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Adding…';
+  }
+  try {
+    say('<p><small>Fetching that channel…</small></p>');
+    const data = await fetchSharedChannel(code);
+    if (!data.ok || !data.channel) {
+      say('<p class="testresult err" style="margin:4px 0 0;">✗ ' + escapeHtml(data.error || 'That channel link could not be read.') + '</p>');
+      return;
+    }
+    acceptSharedChannel(data.channel, code);
+    say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + escapeHtml(data.channel.name || 'Channel') + '" added (' +
+      (data.channel.items || []).length + ' picks).</p>');
+    if (input) input.value = '';
+  } catch (e) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ Network error while fetching that channel.</p>');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// A share link opened directly lands on /configure#channel=<code> (see the
+// /channel/<code> redirect in 25_api-catalog-routes.js). Picking it up here
+// rather than at the server keeps the code out of the request URL, and
+// therefore out of any log: for an unlisted channel the code is the only
+// thing standing between it and everyone.
+async function handleChannelShareDeepLink() {
+  let code = '';
+  try {
+    code = parseChannelShareCode(window.location.hash || '');
+  } catch (e) {
+    code = '';
+  }
+  if (!code) return false;
+  try {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+  } catch (e) {}
+  switchTab('channels');
+  switchChannelsSubmenu('import', document.querySelector('#channelsSubnavBar [data-sub="import"]'));
+  const input = document.getElementById('channelShareCodeInput');
+  if (input) input.value = code;
+  await importSharedChannel(null);
+  return true;
+}
+
+// --- the directory ------------------------------------------------------
+let _channelDirectoryEntries = null;
+let _channelDirectoryLoading = false;
+let _channelDirectorySort = 'newest';
+// Which listings this browser has voted for. The server is authoritative --
+// its ledger is what decides -- but the heart has to fill in before a round
+// trip or it flickers on every render.
+let _channelDirectoryLiked = {};
+
+function setChannelDirectorySort(value) {
+  const next = value || 'newest';
+  if (next === _channelDirectorySort) return;
+  _channelDirectorySort = next;
+  // The ORDER is the server's to decide -- it sees likes and adds from every
+  // visitor, this page sees one page of them -- so a change re-asks rather
+  // than re-sorting what is already here.
+  loadChannelDirectory(true);
+}
+
+async function loadChannelDirectory(force) {
+  const feed = document.getElementById('channelDirectoryFeed');
+  if (_channelDirectoryLoading) return;
+  if (_channelDirectoryEntries && !force) {
+    renderChannelDirectory();
+    return;
+  }
+  _channelDirectoryLoading = true;
+  if (feed) feed.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Loading published channels…</small></p>';
+  try {
+    const res = await fetch(ORIGIN + '/api/channel/directory?limit=60&sort=' + encodeURIComponent(_channelDirectorySort),
+      { cache: force ? 'no-store' : 'default' });
+    const data = await res.json();
+    _channelDirectoryEntries = (data && data.ok && Array.isArray(data.channels)) ? data.channels : [];
+  } catch (e) {
+    _channelDirectoryEntries = null;
+    if (feed) feed.innerHTML = '<p class="testresult err">✗ Could not reach the channel directory just now.</p>';
+    _channelDirectoryLoading = false;
+    return;
+  }
+  _channelDirectoryLoading = false;
+  renderChannelDirectory();
+}
+
+function channelDirectoryMetaLine(entry) {
+  const bits = [];
+  if (entry.dynamic === 'next-up') bits.push('follows its owner’s watch history');
+  else bits.push(entry.itemCount + ' episode' + (entry.itemCount === 1 ? '' : 's'));
+  if (entry.showCount > 1) bits.push(entry.showCount + ' shows');
+  if (entry.dailyRotate) bits.push('daily lineup');
+  else if (entry.shuffle) bits.push('shuffled daily');
+  if (entry.autoSort === 'interleave') bits.push('interleaved');
+  if (entry.owner) bits.push('by ' + entry.owner);
+  if (entry.adds) bits.push(entry.adds + ' added');
+  return bits.join(' · ');
+}
+
+function renderChannelDirectory() {
+  const feed = document.getElementById('channelDirectoryFeed');
+  if (!feed) return;
+  const entries = _channelDirectoryEntries || [];
+  if (!entries.length) {
+    feed.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Nothing published yet. Build a channel and be the first — publish it from the panel below.</small></p>';
+    return;
+  }
+  const filterInput = document.getElementById('channelDirectorySearchInput');
+  const q = (filterInput ? filterInput.value : '').trim().toLowerCase();
+  const shown = q
+    ? entries.filter((e) => (
+        String(e.name || '').toLowerCase().indexOf(q) !== -1 ||
+        String(e.description || '').toLowerCase().indexOf(q) !== -1 ||
+        String(e.owner || '').toLowerCase().indexOf(q) !== -1
+      ))
+    : entries;
+  if (!shown.length) {
+    feed.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No published channel matches that.</small></p>';
+    return;
+  }
+  feed.innerHTML = shown.map((e) => channelListingCardHtml(
+    e,
+    '<button type="button" class="lc-btn searchLikeExternalBtn' + (_channelDirectoryLiked[e.code] ? ' liked' : '') + '"' +
+      ' aria-label="Like this channel" title="Like this channel"' +
+      ' onclick="toggleChannelDirectoryLike(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">' +
+      (_channelDirectoryLiked[e.code] ? '\u2665' : '\u2661') + (e.likes ? ' ' + e.likes : '') +
+    '</button>' +
+    '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">See all</button>' +
+    '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="addDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">+ Add</button>',
+    ''
+  )).join('');
+}
+
+// Look through a published channel before taking it.
+//
+// A directory row is a one-line summary by design -- the index has to stay
+// cheap to read -- so seeing what is actually IN a channel means fetching
+// it. Which is the same fetch adding it makes, so a preview costs a person
+// nothing they were not about to spend anyway, and answers the question the
+// summary cannot: is this the lineup I want?
+async function previewDirectoryChannel(code, btn) {
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn && btn.tagName === 'BUTTON') {
+    btn.disabled = true;
+    btn.textContent = 'Opening\u2026';
+  }
+  try {
+    const data = await fetchSharedChannel(code);
+    if (!data.ok || !data.channel) {
+      showAppAlert('Explore Channels', data.error || 'That channel could not be read.');
+      return;
+    }
+    // A synthetic id: this channel is not saved here, and giving it one that
+    // could collide with a saved channel's would make "+ Add" on the details
+    // page act on the wrong one.
+    const preview = Object.assign({}, data.channel, { channelId: 'directory:' + code });
+    openChannelDetailsPage(preview.channelId, preview);
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while opening that channel.');
+  } finally {
+    if (btn && btn.tagName === 'BUTTON') {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+async function toggleChannelDirectoryLike(code, btn) {
+  const wasLiked = !!_channelDirectoryLiked[code];
+  // Filled in before the round trip so the heart answers the tap, and put
+  // back if the server disagrees -- it holds the ledger, this does not.
+  _channelDirectoryLiked[code] = !wasLiked;
+  renderChannelDirectory();
+  try {
+    const body = { code: code, action: wasLiked ? 'unlike' : 'like' };
+    const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+    if (signedIn) {
+      body.creatorName = activeCreator.creatorName;
+      body.creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+    }
+    const res = await fetch(ORIGIN + '/api/channel/like', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      _channelDirectoryLiked[code] = wasLiked;
+      renderChannelDirectory();
+      return;
+    }
+    _channelDirectoryLiked[code] = !!data.liked;
+    const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
+    if (entry) entry.likes = data.likes;
+    renderChannelDirectory();
+  } catch (e) {
+    _channelDirectoryLiked[code] = wasLiked;
+    renderChannelDirectory();
+  }
+}
+
+async function addDirectoryChannel(code, btn) {
+  const originalLabel = btn ? btn.textContent : '+ Add';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Adding…';
+  }
+  try {
+    const data = await fetchSharedChannel(code);
+    if (!data.ok || !data.channel) {
+      showAppAlert('Explore Channels', data.error || 'That channel could not be read.');
+      return;
+    }
+    acceptSharedChannel(data.channel, code);
+    // Taking a channel is the signal "most added" ranks on. Best effort by
+    // design: it must never be the reason an add fails.
+    fetch(ORIGIN + '/api/channel/added', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: code }),
+    }).catch(() => {});
+    const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
+    if (entry) entry.adds = (Number(entry.adds) || 0) + 1;
+    if (btn) btn.textContent = 'Added ✓';
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while adding that channel.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1500);
+    }
+  }
+}
+
+// The "publish one of your own" half of the Explore tab: every saved channel
+// with a control to list it, or take it back down.
+// One card, drawn the way Explore Channels draws one.
+//
+// The publish panel and the directory show the same thing -- a channel, as
+// other people will see it -- so they are built by the same function and
+// differ only in the buttons on the right. Two card shapes for one object is
+// how a description ends up shown in one place and not the other.
+function channelListingCardHtml(entry, actionsHtml, extraHtml) {
+  const art = entry.backdrop || entry.poster || '';
+  const thumb = art
+    ? '<img src="' + escapeAttr(art) + '" alt="" loading="lazy" style="width:88px; height:56px; object-fit:cover; border-radius:6px; border:1px solid var(--border); flex:0 0 auto;">'
+    : '';
+  const openAttr = entry.code
+    ? ' style="cursor:pointer;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(entry.code) + '&quot;, this)" title="See everything in this channel"'
+    : '';
+  return '<div class="list-card" style="margin-bottom:10px;">' +
+    '<div class="list-card-header" style="gap:10px; align-items:center;">' +
+      (thumb ? '<div' + openAttr + '>' + thumb + '</div>' : '') +
+      '<div class="list-card-body">' +
+        '<div class="list-card-title"' + openAttr + '>' + escapeHtml(entry.name || 'Channel') + '</div>' +
+        (entry.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(entry.description) + '</div>' : '') +
+        '<div class="list-card-meta"><span>' + escapeHtml(channelDirectoryMetaLine(entry)) + '</span></div>' +
+      '</div>' +
+      '<div class="list-card-actions">' + actionsHtml + '</div>' +
+    '</div>' +
+    (extraHtml || '') +
+  '</div>';
+}
+
+// A saved channel, described the way a directory row describes one -- so the
+// panel can preview what publishing it would actually look like.
+function channelAsListingEntry(ch) {
+  const items = ch.items || [];
+  const showKeys = {};
+  items.forEach((it) => { const k = channelDraftShowKey(it); if (k) showKeys[k] = true; });
+  return {
+    code: ch.sharePublished ? ch.shareCode : '',
+    name: ch.name,
+    description: ch.description || '',
+    poster: ch.poster || null,
+    backdrop: ch.backdrop || null,
+    itemCount: items.length,
+    showCount: Object.keys(showKeys).length,
+    dailyRotate: !!ch.dailyRotate,
+    shuffle: !!ch.shuffle,
+    autoSort: ch.autoSort || '',
+    dynamic: ch.dynamic || '',
+    owner: ch.sharePublished && typeof activeCreator !== 'undefined' && activeCreator ? activeCreator.creatorName : '',
+    likes: 0,
+    adds: 0,
+  };
+}
+
+let _orphanedPublishedChannels = [];
+
+// Listings this account still has up whose channel is gone from this
+// browser. Fetched rather than inferred: the local store is exactly what
+// cannot answer this, because the record that knew the code is the one that
+// was deleted.
+async function loadOrphanedPublishedChannels() {
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (!signedIn) {
+    _orphanedPublishedChannels = [];
+    return;
+  }
+  try {
+    const res = await fetch(ORIGIN + '/api/channel/mine', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: localStorage.getItem('myListAddon:creatorKey') || '',
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) return;
+    const mine = loadLocalChannels();
+    const known = {};
+    Object.values(mine).forEach((ch) => { if (ch && ch.shareCode) known[ch.shareCode] = true; });
+    _orphanedPublishedChannels = (data.channels || []).filter((e) => e && !known[e.code]);
+  } catch (e) {
+    // Leave whatever was last known rather than clearing the list on a
+    // hiccup -- an orphan that vanishes from the panel is an orphan nobody
+    // can take down.
+  }
+  renderChannelPublishList();
+}
+
+function renderChannelPublishList() {
+  const box = document.getElementById('channelPublishList');
+  if (!box) return;
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (!signedIn) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Sign in to a Creator Profile under <strong>Settings</strong> to publish a channel here. You can still share any channel privately with <strong>Share</strong> under My Channels.</small></p>';
+    return;
+  }
+  const channels = Object.values(ensureAllChannelsSyncedFromRows(loadLocalChannels()));
+  channels.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  const mine = channels.map((ch) => {
+    const action = ch.sharePublished
+      ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="unpublishChannelFromDirectory(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Unpublish</button>'
+      : '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="publishChannelToDirectory(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Publish</button>';
+    const extra =
+      (ch.sharePublished ? '' :
+        '<input type="text" id="channelPublishDesc_' + escapeAttr(ch.channelId) + '" placeholder="One line about this channel (optional)" style="margin-top:8px; font-size:0.82rem;" value="' + escapeAttr(ch.description || '') + '">') +
+      // A published channel's link lives here, on screen, rather than only
+      // in the modal that announced it -- that modal closes and takes the
+      // link with it.
+      (ch.shareCode
+        ? '<div class="row" style="margin-top:8px; gap:8px;">' +
+            '<input type="text" readonly value="' + escapeAttr(channelShareUrl(ch.shareCode)) + '" onclick="this.select()" style="font-size:0.8rem;">' +
+            '<button type="button" class="secondary lc-btn" style="flex:none; width:auto; white-space:nowrap;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Copy</button>' +
+          '</div>'
+        : '');
+    return channelListingCardHtml(channelAsListingEntry(ch), action, extra);
+  }).join('');
+
+  // Listings with no channel left behind them. Shown apart from the rest
+  // because there is nothing to edit, publish or copy -- only to withdraw.
+  const orphans = _orphanedPublishedChannels.map((entry) => channelListingCardHtml(
+    entry,
+    '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="unpublishOrphanedChannel(&quot;' + escapeJsAttr(entry.code) + '&quot;, this)">Unpublish</button>',
+    ''
+  )).join('');
+
+  box.innerHTML =
+    (channels.length ? mine : '<p style="color:var(--muted); font-size:0.85rem;"><small>No channels yet \u2014 build one first.</small></p>') +
+    (orphans
+      ? '<p style="margin:16px 0 6px; font-weight:600; font-size:0.85rem;">Still listed, but no longer on this device</p>' +
+        '<p style="margin:0 0 8px; color:var(--muted); font-size:0.78rem;">You published these and the channel has since been deleted here. They are still in Explore Channels until you take them down.</p>' +
+        orphans
+      : '');
+}
+
+async function publishChannelToDirectory(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch) return;
+  const descInput = document.getElementById('channelPublishDesc_' + channelId);
+  const originalLabel = btn ? btn.textContent : 'Publish';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Publishing…';
+  }
+  try {
+    const data = await postChannelShare(ch, {
+      publish: true,
+      description: descInput ? descInput.value.trim() : '',
+    });
+    if (!data.ok) {
+      showAppAlert('Publish Channel', data.error || 'Could not publish that channel.');
+      return;
+    }
+    rememberChannelShare(channelId, data.code, true);
+    showAppAlert(
+      'Published',
+      '"' + ch.name + '" is now listed in Explore Channels.\\n\\nIts direct link is ' + (data.url || channelShareUrl(data.code)),
+      true
+    );
+    renderChannelPublishList();
+    loadChannelDirectory(true);
+  } catch (e) {
+    showAppAlert('Publish Channel', 'Network error while publishing that channel.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// Withdraws one listing by its code. The one place that call lives, so
+// deleting a channel, unpublishing from the panel, and clearing an orphaned
+// listing all do exactly the same thing.
+async function unpublishChannelByCode(code) {
+  if (!code) return { ok: false, error: 'No code.' };
+  const res = await fetch(ORIGIN + '/api/channel/unpublish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      code: code,
+      creatorName: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : '',
+      creatorKey: localStorage.getItem('myListAddon:creatorKey') || '',
+    }),
+  });
+  return res.json();
+}
+
+async function unpublishChannelFromDirectory(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch || !ch.shareCode) return;
+  const originalLabel = btn ? btn.textContent : 'Unpublish';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Removing…';
+  }
+  try {
+    const data = await unpublishChannelByCode(ch.shareCode);
+    if (!data.ok) {
+      showAppAlert('Explore Channels', data.error || 'Could not remove that listing.');
+      return;
+    }
+    // Only the LISTING goes. The share link keeps working, because "stop
+    // advertising this" and "break everyone's link" are different asks.
+    rememberChannelShare(channelId, ch.shareCode, false);
+    renderChannelPublishList();
+    loadChannelDirectory(true);
+    loadOrphanedPublishedChannels();
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while removing that listing.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// A listing whose channel is no longer in this browser. Nothing local is
+// left to update, so this only withdraws it and redraws the panel.
+async function unpublishOrphanedChannel(code, btn) {
+  const originalLabel = btn ? btn.textContent : 'Unpublish';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Removing…';
+  }
+  try {
+    const data = await unpublishChannelByCode(code);
+    if (!data.ok) {
+      showAppAlert('Explore Channels', data.error || 'Could not remove that listing.');
+      return;
+    }
+    renderChannelPublishList();
+    loadChannelDirectory(true);
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while removing that listing.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
 
 //
 const LOCAL_MERGED_CHANNELS_KEY = 'myListAddon:localMergedChannels';
@@ -42679,6 +49856,16 @@ window._inProgressShowIds = new Set();
 // initWatchHistory below for a local-only browser; a signed-in account
 // gets it from the server instead (see loadCreatorSync).
 window._dismissedContinueWatching = {};
+// Shows explicitly removed from Airing Next, keyed by showId, each mapped to
+// the watched snapshot (season/episode) the removal was made at -- the same
+// shape, and for the same reason, as _dismissedContinueWatching above: the
+// point of removing a show from Airing Next is "stop telling me about this
+// one", not "forget that I watch it", so nothing about Watch History changes
+// and watching a genuinely newer episode later supersedes the removal on its
+// own. See removeAiringNextShow. Restored from localStorage in
+// initWatchHistory below for a local-only browser; a signed-in account gets
+// it from the server instead (see loadCreatorSync).
+window._removedAiringNext = {};
 
 // Finds the position:relative box a watched-checkmark badge should be
 // inserted into for a given .clickable-poster/.clickable-episode element.
@@ -42785,6 +49972,15 @@ function initWatchHistory() {
     }
   } catch (e) {
     // non-critical -- a dismissed show might just reappear once
+  }
+  try {
+    const removedAiringRaw = localStorage.getItem(REMOVED_AIRING_NEXT_KEY);
+    if (removedAiringRaw) {
+      const parsed = JSON.parse(removedAiringRaw);
+      if (parsed && typeof parsed === 'object') window._removedAiringNext = parsed;
+    }
+  } catch (e) {
+    // non-critical -- a removed show might just reappear once
   }
 
   // Badges new posters as they appear.
@@ -43225,7 +50421,29 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   const list = getOrCreateWatchHistoryList();
   
   let existingIdx = list.items.findIndex(it => it.id === id);
-  
+
+  // An episode that has not aired yet cannot have been watched, and letting
+  // one in poisons everything downstream: it counts towards "fully watched",
+  // evicts the show from Continue Watching, and is pushed to the account as
+  // a real viewing. The modal no longer offers the button (see
+  // openEpisodeDetails, 19_client-search-and-likes.js) -- this is the guard
+  // behind it, because this function is the single door every episode toggle
+  // goes through.
+  //
+  // Only ADDING is refused. Removing one that is already recorded is exactly
+  // how a person undoes a mistake made before this existed, so that path is
+  // left alone -- as is anything this browser has no air date for, which is
+  // unknown rather than future.
+  if (existingIdx < 0 && type === 'episode' && typeof isEpisodeAired === 'function') {
+    const cached = Object.values(window._episodeDataCache || {}).find(ep => String(ep && ep.id) === String(id));
+    if (cached && (cached.air_date || cached.airDate) && !isEpisodeAired(cached)) {
+      if (typeof showAddedToast === 'function') {
+        showAddedToast('That episode has not aired yet, so it was not marked watched.');
+      }
+      return;
+    }
+  }
+
   if (existingIdx < 0 && type === 'episode') {
     const d = window._currentItemDetails;
     if (d) {
@@ -43318,7 +50536,13 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   if (type === 'episode') {
     const d = window._currentItemDetails;
     if (d && d.id) updateContinueWatching(d.id).catch(() => {});
-    if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
+    // Everything on the item page that reads Watch History, not just the
+    // season last expanded: the episode toggled may have been the last one
+    // its season -- or the whole show -- was waiting on, and its own season
+    // is not always the one _currentSeasonNum points at.
+    if (typeof refreshItemWatchState === 'function') {
+      refreshItemWatchState();
+    } else if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
       updateSeasonWatchedButton(window._currentSeasonNum);
     }
   } else if (type === 'movie' && existingIdx < 0) {
@@ -43575,6 +50799,11 @@ window.markShowWatched = async function(imdbId) {
             '&seasonNum=' + season.season_number + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
           const data = await res.json();
           if (data.ok && data.season && Array.isArray(data.season.episodes)) {
+            // Shared with the season buttons: once the real episode list is
+            // known, "has this season aired anything" and "is it fully
+            // watched" stop having to guess from episode_count.
+            if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+            window._seasonEpisodesMap[season.season_number] = data.season.episodes;
             data.season.episodes.forEach((ep) => {
               if (typeof isEpisodeAired === 'function' && !isEpisodeAired(ep)) return;
               const epStill = ep.still_path
@@ -43613,6 +50842,11 @@ window.markShowWatched = async function(imdbId) {
       btn.innerHTML = "Couldn't load episodes -- try again";
     } else {
       btn.innerHTML = wasFullyWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched';
+      // Every season is still to come, so there is genuinely nothing to
+      // mark. Silence here read as a broken button.
+      if (typeof showAddedToast === 'function') {
+        showAddedToast('Nothing has aired yet, so there is nothing to mark watched.');
+      }
     }
     return;
   }
@@ -43664,18 +50898,39 @@ window.markShowWatched = async function(imdbId) {
       };
 
       if (nowWatched) {
-        // Evict any entry for this completed show from Continue Watching
+        // "Watched everything that has aired" is not the same as "finished".
+        //
+        // The reconciliation awaited above (updateContinueWatching) has
+        // already worked out what comes next for this show, and for a show
+        // that is merely caught up that is an episode with a future air date
+        // -- the entry Continue Watching renders with an "Airs ..." badge,
+        // exactly as it does when the last episode is marked watched one at a
+        // time. Evicting it here made Mark Show Watched the one path that
+        // dropped the show off the shelf entirely, which is the difference
+        // the report describes.
+        //
+        // A show with nothing left to air keeps the old behaviour: evicted,
+        // and its storyline conclusion (Breaking Bad -> El Camino) queued in
+        // its place. A companion only makes sense once a show is actually
+        // over, so it is not queued while an episode is still coming.
+        const isUpcomingEntry = (it) => !!(it && (it.isUnaired ||
+          (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate))));
+        const upcoming = (cwList.items || []).find((it) => isShowItem(it) && isUpcomingEntry(it));
         cwList.items = (cwList.items || []).filter((it) => !isShowItem(it));
-        // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
-        let companion = null;
-        for (const alias of allShowAliases) {
-          if (typeof findCompanionShowConclusion === 'function') {
-            companion = findCompanionShowConclusion(alias);
+        if (upcoming) {
+          cwList.items.unshift(upcoming);
+        } else {
+          // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
+          let companion = null;
+          for (const alias of allShowAliases) {
+            if (typeof findCompanionShowConclusion === 'function') {
+              companion = findCompanionShowConclusion(alias);
+            }
+            if (companion) break;
           }
-          if (companion) break;
-        }
-        if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
-          cwList.items.unshift(companion);
+          if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
+            cwList.items.unshift(companion);
+          }
         }
       } else {
         // If unwatching the whole show, remove any companion queued for this show
@@ -43703,7 +50958,23 @@ window.markShowWatched = async function(imdbId) {
     btn.classList.remove('secondary');
     btn.classList.add('primary');
   }
+  // Only the seasons this actually wrote to. allEpisodes holds the AIRED
+  // episodes that were toggled, so a season absent from it had nothing to
+  // mark -- and relabelling it "Mark Season Unwatched" anyway is what made a
+  // not-yet-aired season read as watched over an empty Watch History. Those
+  // seasons are handed back to the shared state instead, which says when they
+  // air (seasonWatchedButtonState, 19_client-search-and-likes.js).
+  const touchedSeasons = new Set(allEpisodes.map((ep) => String(ep.seasonNum)));
   document.querySelectorAll('.btn-mark-season-watched').forEach((seasonBtn) => {
+    const sNum = seasonBtn.dataset ? seasonBtn.dataset.season : null;
+    if (sNum != null && !touchedSeasons.has(String(sNum))) {
+      if (typeof updateSeasonWatchedButton === 'function') updateSeasonWatchedButton(Number(sNum));
+      return;
+    }
+    if (typeof applySeasonWatchedButton === 'function' && typeof watchedSeasonButtonState === 'function') {
+      applySeasonWatchedButton(seasonBtn, watchedSeasonButtonState(nowWatched));
+      return;
+    }
     if (nowWatched) {
       seasonBtn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
       seasonBtn.classList.remove('primary');
@@ -43714,6 +50985,9 @@ window.markShowWatched = async function(imdbId) {
       seasonBtn.classList.add('primary');
     }
   });
+  // The "x/8 episodes" line beside each of those buttons is read off Watch
+  // History, which this just rewrote for every aired episode of the show.
+  if (typeof updateSeasonEpisodeCounts === 'function') updateSeasonEpisodeCounts();
 };
 
 // One-way add to Watch History as watched -- unlike toggleBatchWatchStatus
@@ -44452,16 +51726,8 @@ function dismissContinueWatchingShow(showId, btn) {
   }
   if (!window._dismissedContinueWatching) window._dismissedContinueWatching = {};
 
-  const history = loadLocalCustomLists()['watch-history'];
-  const watchedEps = (history ? history.items : []).filter(it =>
-    it.type === 'episode' && it.showId === showId && it.seasonNum != null && it.episodeNum != null
-  );
-  if (watchedEps.length) {
-    const latest = watchedEps.reduce((best, ep) => {
-      if (ep.seasonNum > best.seasonNum) return ep;
-      if (ep.seasonNum === best.seasonNum && ep.episodeNum > best.episodeNum) return ep;
-      return best;
-    }, watchedEps[0]);
+  const latest = latestWatchedEpisodeForShowIds(showId);
+  if (latest) {
     window._dismissedContinueWatching[showId] = { seasonNum: latest.seasonNum, episodeNum: latest.episodeNum };
   } else {
     window._dismissedContinueWatching[showId] = { dismissedAt: Date.now() };
@@ -44538,7 +51804,11 @@ function getOrCreateAiringNextList() {
 // this list shows all of them with a known upcoming episode, no Fully
 // Watched/In Progress split (that distinction was removed; see this
 // function's git history for the old bucketing logic if it's ever needed
-// again).
+// again) -- minus the ones explicitly removed from this shelf, which is the
+// one and only place that removal is applied (see isAiringNextRemoved).
+// Filtering here rather than at each render covers every path at once: the
+// dashboard card, the full-page view, the refresh that rebuilds the list
+// against TMDB, and the push that hands it to the Stremio catalog.
 function collectAiringNextCandidateShowIds() {
   const ids = new Set();
   const map = loadLocalCustomLists();
@@ -44551,7 +51821,236 @@ function collectAiringNextCandidateShowIds() {
   if (window._fullyWatchedShowIds) {
     window._fullyWatchedShowIds.forEach((id) => ids.add(id));
   }
+  [...ids].forEach((id) => {
+    if (isAiringNextRemoved(id)) ids.delete(id);
+  });
   return ids;
+}
+
+// --- Removing one show from Airing Next -------------------------------------
+//
+// "Stop showing me this show's upcoming episodes" -- without touching a
+// single thing in Watch History. Everything the person has marked watched
+// stays exactly as it was, the show keeps its watched badges, and Continue
+// Watching is not involved at all; only this one shelf stops listing it.
+//
+// Stored as a snapshot of the watched episode the removal was made at rather
+// than a permanent flag, exactly like dismissContinueWatchingShow above, and
+// for the same reason: watching another episode of the show is a clear
+// statement that the person is following it again, so the removal is
+// superseded and the show returns to the shelf on its own. That is the whole
+// mechanism -- there is no separate "re-add" path to keep in step with it,
+// and nothing to go stale, because eligibility is re-derived from Watch
+// History every time collectAiringNextCandidateShowIds runs.
+const REMOVED_AIRING_NEXT_KEY = 'myListAddon:removedAiringNext';
+
+function getRemovedAiringNext() {
+  if (window._removedAiringNext && typeof window._removedAiringNext === 'object') return window._removedAiringNext;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(REMOVED_AIRING_NEXT_KEY) || '{}');
+    window._removedAiringNext = (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch (e) {
+    window._removedAiringNext = {};
+  }
+  return window._removedAiringNext;
+}
+
+function persistRemovedAiringNext() {
+  try {
+    localStorage.setItem(REMOVED_AIRING_NEXT_KEY, JSON.stringify(getRemovedAiringNext()));
+  } catch (e) {
+    // non-critical -- the removal still applies for this session either way
+  }
+}
+
+// The furthest-along watched episode across any of the ids one show can be
+// recorded under (Watch History can hold both an imdb and a tmdb-prefixed
+// form for the same series -- see refreshAiringNext's own dedupe). Returns
+// { seasonNum, episodeNum } or null when nothing has been watched.
+//
+// Shared by the Continue Watching dismissal and the Airing Next removal so
+// the two agree on what "the episode this was done at" means; getting that
+// wrong in one of them and not the other is how a show comes back in one
+// shelf and not the other.
+function latestWatchedEpisodeForShowIds(showIds) {
+  const ids = new Set((Array.isArray(showIds) ? showIds : [showIds]).filter(Boolean).map(String));
+  if (!ids.size) return null;
+  const history = loadLocalCustomLists()['watch-history'];
+  const watchedEps = ((history && history.items) || []).filter((it) =>
+    it && it.type === 'episode' && it.showId && ids.has(String(it.showId)) &&
+    it.seasonNum != null && it.episodeNum != null
+  );
+  if (!watchedEps.length) return null;
+  const latest = watchedEps.reduce((best, ep) => {
+    if (ep.seasonNum > best.seasonNum) return ep;
+    if (ep.seasonNum === best.seasonNum && ep.episodeNum > best.episodeNum) return ep;
+    return best;
+  }, watchedEps[0]);
+  return { seasonNum: latest.seasonNum, episodeNum: latest.episodeNum };
+}
+
+// Whether the removal recorded for this show still stands. A removal with no
+// snapshot at all (recorded when nothing was watched, or round-tripped
+// through a server that stores the two numbers and not much else) reads as
+// S0E0, so any real episode watched afterwards supersedes it -- which is the
+// behaviour that matters, stated the same way in both cases.
+//
+// Deliberately a pure read: it is called from render paths and from the
+// candidate sweep, and a function that quietly rewrote storage from there
+// would be writing on every dashboard paint. Clearing superseded entries is
+// pruneSupersededAiringRemovals's job, below.
+function isAiringNextRemoved(showId) {
+  if (!showId) return false;
+  const mark = getRemovedAiringNext()[String(showId)];
+  if (!mark) return false;
+  const latest = latestWatchedEpisodeForShowIds(showId);
+  if (!latest) return true;
+  const atSeason = Number(mark.seasonNum) || 0;
+  const atEpisode = Number(mark.episodeNum) || 0;
+  if (latest.seasonNum > atSeason) return false;
+  if (latest.seasonNum === atSeason && latest.episodeNum > atEpisode) return false;
+  return true;
+}
+
+// Drops the removals that a newer watched episode has already superseded, so
+// the stored set stays the size of what is actually removed rather than
+// growing once per show forever. Purely housekeeping: isAiringNextRemoved
+// already ignores a superseded entry, so this changes what is STORED, never
+// what is shown. Returns whether anything changed.
+function pruneSupersededAiringRemovals() {
+  const marks = getRemovedAiringNext();
+  const superseded = Object.keys(marks).filter((id) => !isAiringNextRemoved(id));
+  if (!superseded.length) return false;
+  superseded.forEach((id) => { delete marks[id]; });
+  persistRemovedAiringNext();
+  return true;
+}
+
+// The "x" on an Airing Next poster. Records the removal, takes the show off
+// the shelf immediately, and pushes the shortened list to the account.
+//
+// intentionalRemoval is what makes the push actually shorten the account's
+// copy: save-tracking refuses to let an EMPTY derived list replace a stored
+// non-empty one (a browser that has not computed Airing Next yet must not
+// wipe one another browser has), and removing the last show on the shelf
+// sends exactly that empty array. Without the flag, the Stremio row would go
+// on serving the show this removed.
+function removeAiringNextShow(showId, btn) {
+  if (!showId) return;
+  const id = String(showId);
+  if (btn) {
+    const tile = btn.closest('.list-card-mini-poster-tile, .live-preview-poster-card');
+    if (tile) {
+      tile.style.opacity = '0';
+      tile.style.transform = 'scale(0.85)';
+      tile.style.transition = 'all 0.2s ease';
+      setTimeout(() => {
+        if (tile && tile.parentNode) tile.parentNode.removeChild(tile);
+      }, 200);
+    }
+  }
+
+  const map = loadLocalCustomLists();
+  const list = map['airing-next'];
+  const items = (list && Array.isArray(list.items)) ? list.items : [];
+  const entry = items.find((it) => it && String(it.showId || it.id) === id);
+  // A show can sit in Watch History under both an imdb and a tmdb-prefixed
+  // id (refreshAiringNext dedupes exactly that), and the shelf is rebuilt
+  // from whichever of them Watch History happens to hold. Marking only the
+  // id this tile was rendered under would let the other one put the show
+  // straight back on the next refresh.
+  const aliases = [id];
+  if (entry && entry.canonicalTmdbId && !id.startsWith('tmdb:')) aliases.push('tmdb:' + entry.canonicalTmdbId);
+  const at = latestWatchedEpisodeForShowIds(aliases) || { seasonNum: 0, episodeNum: 0 };
+
+  const marks = getRemovedAiringNext();
+  aliases.forEach((alias) => {
+    marks[alias] = { seasonNum: at.seasonNum, episodeNum: at.episodeNum };
+  });
+  persistRemovedAiringNext();
+
+  if (list && items.length) {
+    list.items = items.filter((it) => {
+      const itemId = String((it && (it.showId || it.id)) || '');
+      return itemId && aliases.indexOf(itemId) === -1;
+    });
+    list.updatedAt = Date.now();
+    map['airing-next'] = list;
+    saveLocalCustomListsMap(map);
+  }
+
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+  if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+  if (typeof showAddedToast === 'function') {
+    const title = (entry && (entry.showTitle || entry.name)) || 'This show';
+    showAddedToast('Removed ' + title + ' from Airing Next. Watch another episode to bring it back.');
+  }
+}
+window.removeAiringNextShow = removeAiringNextShow;
+
+// Undoes a removal by hand, from the Settings panel that lists them. Takes
+// every id the show is recorded under -- one Settings row can stand for two
+// marks (see removeAiringNextShow's aliases and getRemovedAiringNextShows's
+// grouping), and clearing one of them would leave the other still hiding the
+// show. Accepts an array or a comma-separated string, because the id list
+// travels through a data- attribute on the button.
+//
+// The forced refresh is what actually puts the show back: syncAiringNextWatchState
+// only ever narrows the cached list (see its own comment), so a show that is
+// eligible again still needs its next air date fetched before it can appear.
+function restoreAiringNextShow(showIds) {
+  if (!showIds) return;
+  const ids = (Array.isArray(showIds) ? showIds : String(showIds).split(','))
+    .map((id) => String(id).trim())
+    .filter(Boolean);
+  const marks = getRemovedAiringNext();
+  const cleared = ids.filter((id) => Object.prototype.hasOwnProperty.call(marks, id));
+  if (!cleared.length) return;
+  cleared.forEach((id) => { delete marks[id]; });
+  persistRemovedAiringNext();
+  if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
+  if (typeof refreshAiringNext === 'function') refreshAiringNext(true).catch(() => {});
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+}
+window.restoreAiringNextShow = restoreAiringNextShow;
+
+// The removed shows, with whatever title Watch History still knows them by,
+// for the Settings panel. Reads titles out of Watch History rather than
+// keeping a copy in the removal record: the record is synced to the account
+// and round-trips through two numbers per show, and a title cached there
+// would be the one thing in it that could go stale.
+//
+// Grouped by title, because one show can carry two marks -- the id its tile
+// was rendered under and its tmdb alias (see removeAiringNextShow). Two rows
+// for one show would be confusing, and putting back only one of them would
+// not work. An id Watch History cannot name is its own row, under the id
+// itself: unlovely, but it is the only way to reach it.
+function getRemovedAiringNextShows() {
+  const marks = getRemovedAiringNext();
+  const ids = Object.keys(marks).filter((id) => isAiringNextRemoved(id));
+  if (!ids.length) return [];
+  const titleById = new Map();
+  const posterById = new Map();
+  ((loadLocalCustomLists()['watch-history'] || {}).items || []).forEach((it) => {
+    if (!it || !it.showId) return;
+    const key = String(it.showId);
+    if (it.showTitle && !titleById.has(key)) titleById.set(key, it.showTitle);
+    if (it.showPoster && !posterById.has(key)) posterById.set(key, it.showPoster);
+  });
+  const byTitle = new Map();
+  ids.forEach((id) => {
+    const title = titleById.get(id) || id;
+    const key = title.toLowerCase();
+    const row = byTitle.get(key);
+    if (row) {
+      row.showIds.push(id);
+      if (!row.poster) row.poster = posterById.get(id) || '';
+      return;
+    }
+    byTitle.set(key, { showIds: [id], title: title, poster: posterById.get(id) || '' });
+  });
+  return [...byTitle.values()].sort((a, b) => a.title.localeCompare(b.title));
 }
 
 // Re-derives the already-computed Airing Next list's eligibility against
@@ -44570,6 +52069,11 @@ function syncAiringNextWatchState() {
   const map = loadLocalCustomLists();
   const list = map['airing-next'];
 
+  // Watch state has just moved, so this is the moment a removal can have
+  // been superseded by a newer watched episode -- drop the record before
+  // deciding who is a candidate, so the show is a candidate again in the
+  // very same pass rather than one watch event later.
+  const prunedRemovals = pruneSupersededAiringRemovals();
   const candidates = collectAiringNextCandidateShowIds();
 
   // If there are candidate shows that aren't in the cached list at all, those
@@ -44582,7 +52086,12 @@ function syncAiringNextWatchState() {
     return;
   }
 
-  if (!list || !Array.isArray(list.items) || !list.items.length) return;
+  if (!list || !Array.isArray(list.items) || !list.items.length) {
+    // Nothing to filter, but a pruned record is still a change the account
+    // has not been told about.
+    if (prunedRemovals && typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+    return;
+  }
 
   let changed = false;
   const filtered = list.items.filter((it) => {
@@ -44590,7 +52099,10 @@ function syncAiringNextWatchState() {
     if (!stillCandidate) changed = true;
     return stillCandidate;
   });
-  if (!changed) return;
+  if (!changed) {
+    if (prunedRemovals && typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+    return;
+  }
 
   list.items = filtered;
   map['airing-next'] = list;
@@ -44599,7 +52111,7 @@ function syncAiringNextWatchState() {
   // Keeps a signed-in account's live "autotrack:airing-next:..." Stremio
   // catalog in sync too, not just this browser's own dashboard preview --
   // no-ops if not signed in, same guard as scheduleTrackingSync's own.
-  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: prunedRemovals });
 }
 
 // Recomputes the Airing Next list against TMDB, throttled to
@@ -44662,6 +52174,10 @@ async function refreshAiringNext(force) {
   function airingEntryFrom(showId, d) {
     if (!d || !d.nextEpisodeAirDate) return null;
     if (typeof isEpisodeAired === 'function' && isEpisodeAired(d.nextEpisodeAirDate)) return null;
+    // This shelf is the one place every upcoming show's details pass through,
+    // so it is where the per-show air times are filled in for the shelves that
+    // never see a details payload of their own (Continue Watching).
+    if (typeof rememberShowAirTime === 'function') rememberShowAirTime(d);
     const known = knownByShow.get(showId);
     const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
     const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
@@ -44686,6 +52202,10 @@ async function refreshAiringNext(force) {
       isSeasonFinale: isFinale,
       seasonFinaleAirDate: d.seasonFinaleAirDate || null,
       seasonFinaleEpisodeNumber: d.seasonFinaleEpisodeNumber || null,
+      // Stored on the entry as well as in the per-show store, so a tile
+      // restored from local storage on a cold start still knows the hour
+      // without waiting for the shelf to refresh.
+      airTime: d.nextEpisodeAirTimeLabel || (d.airTime && d.airTime.label) || null,
       isUnaired: true,
     };
   }
@@ -45021,10 +52541,7 @@ function buildAiringNextCardHtml() {
     const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
     let dateBadge = '';
     if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-      if (badgeText) {
-        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
-      }
+      dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
     }
     const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
     const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -45047,11 +52564,15 @@ function buildAiringNextCardHtml() {
           title: (it.showTitle || '') + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
           subtitle: it.name || it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
         };
+    const removeBtn = it.showId
+      ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeAiringNextShow(&quot;' + escapeJsAttr(it.showId) + '&quot;, this)" title="Remove from Airing Next">&times;</button>'
+      : '';
     return '<div class="list-card-mini-poster-tile">' +
       '<div class="list-card-mini-poster-img-wrap">' +
         '<img src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.showPoster || '') : (it.showPoster || '')) + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
         dateBadge +
         bottomBadge +
+        removeBtn +
         overlays +
       '</div>' +
       '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
@@ -45101,10 +52622,19 @@ function openAiringNextDetailsPage() {
       type: 'series',
       name: label.title,
       subtitle: label.subtitle,
+      // What puts an "x" on this tile in the full-page view -- read by
+      // livePreviewPosterHtml (23_client-list-management.js). Deliberately
+      // its own field rather than removeShowId, which that function reads as
+      // "this is a Continue Watching tile" and would remove the wrong thing.
+      removeAiringShowId: it.showId,
       poster: typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.showPoster) : it.showPoster,
       isAdult: typeof isAdultOrNsfw === 'function' ? isAdultOrNsfw(it) : !!it.adult,
       isAdultPosterFiltered: typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled() && (it.isAdult || (typeof isAdultOrNsfw === 'function' && isAdultOrNsfw(it))),
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,
       isSeasonFinale: it.isSeasonFinale,
@@ -45297,6 +52827,12 @@ function compactCustomListItem(it) {
   if (it.watchedAt) clean.watchedAt = it.watchedAt;
   if (it.imdbId) clean.imdbId = it.imdbId;
   if (it.tmdbId) clean.tmdbId = it.tmdbId;
+  // The resolved TMDB id an Airing Next entry is deduped and matched by
+  // (refreshAiringNext, and the Continue Watching badge matching in
+  // buildLocalListCardHtml). It was dropped here, so every consumer of it
+  // was reading a field that existed only in the seconds between the shelf
+  // being computed and the map being saved -- which is to say, never.
+  if (it.canonicalTmdbId) clean.canonicalTmdbId = it.canonicalTmdbId;
   if (it.airDate) clean.airDate = it.airDate;
   if (it.isUnaired) clean.isUnaired = true;
   if (it.seasonFinaleAirDate) clean.seasonFinaleAirDate = it.seasonFinaleAirDate;
@@ -45726,6 +53262,16 @@ async function openResetAccountModal() {
 
       // Stop anything in flight from re-uploading what we are about to clear.
       window._suppressCreatorSync = true;
+      // Up BEFORE the local clear, not after the request: clearing this
+      // browser empties every list on screen instantly, and from there until
+      // the server answers -- a second or two -- the page looked like an
+      // account that had lost its data with nothing to say why. This is the
+      // only thing on screen that says the reset is running, so it goes up
+      // before the first thing that changes. Replaced below by the success
+      // or failure dialog, whichever the round trip produces.
+      if (typeof showAppBusy === 'function') {
+        showAppBusy('Resetting Account', 'Clearing your lists, channels, presets and watch history\u2026 this takes a moment.');
+      }
       try {
         if (typeof clearLocalAccountData === 'function') clearLocalAccountData();
 
@@ -45738,7 +53284,9 @@ async function openResetAccountModal() {
         if (!data || !data.ok) {
           const msg = (data && data.error) || 'The reset could not be completed.';
           if (typeof showAppAlert === 'function') showAppAlert('Reset Failed', msg + ' Your local data has been cleared; sign in again to restore it from your account.', false);
-          else alert(msg);
+          // Nothing replaces the busy dialog on this branch, so take it down
+          // rather than leave a spinner turning over a finished request.
+          else { if (typeof closeModal === 'function') closeModal(); alert(msg); }
           return;
         }
 
@@ -45763,6 +53311,7 @@ async function openResetAccountModal() {
         }
       } catch (e) {
         if (typeof showAppAlert === 'function') showAppAlert('Reset Failed', 'Could not reach the server. Your local data has been cleared; sign in again to restore it from your account.', false);
+        else if (typeof closeModal === 'function') closeModal();
       } finally {
         window._suppressCreatorSync = false;
       }
@@ -46052,6 +53601,52 @@ function onHiddenSectionToggle(cb) {
   if (!section) return;
   // Same checked = hidden convention as onHiddenListToggle above.
   if (typeof setMyListsSectionHidden === 'function') setMyListsSectionHidden(section, cb.checked);
+}
+
+// "Removed from Airing Next" panel on Settings -- the way back from the "x"
+// on an Airing Next poster (removeAiringNextShow, 21_client-custom-list-
+// builder.js).
+//
+// A removal undoes itself the moment another episode of the show is watched,
+// so this panel is not the only route back. It is the route for the person
+// who removed the wrong show, or changed their mind about one they are not
+// currently watching -- without it, a show removed by mistake could only be
+// recovered by watching an episode of it.
+//
+// Deliberately hidden entirely when nothing is removed: an empty panel
+// explaining a feature nobody has used is noise on a Settings tab that
+// already has a lot to read.
+function renderRemovedAiringNextSettingsSection() {
+  const box = document.getElementById('removedAiringNextSettingsSection');
+  if (!box) return;
+  const panel = box.closest('.panel');
+  const shows = (typeof getRemovedAiringNextShows === 'function') ? getRemovedAiringNextShows() : [];
+  if (!shows.length) {
+    box.innerHTML = '';
+    if (panel) panel.style.display = 'none';
+    return;
+  }
+  if (panel) panel.style.display = '';
+  box.innerHTML = shows.map((sh) =>
+    '<div style="display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid var(--border);">' +
+      // onerror takes the element out rather than hiding it: a backslash in
+      // this file never reaches the browser (the whole bundle is served from
+      // inside a template literal), so an inline handler here cannot contain
+      // an escaped quote -- the admin page lost a whole day to exactly that,
+      // see CHANGELOG.md. this.remove() needs no nested string at all.
+      (sh.poster
+        ? '<img src="' + escapeAttr(sh.poster) + '" alt="" loading="lazy" style="width:34px; height:51px; object-fit:cover; border-radius:4px; flex-shrink:0;" onerror="this.remove()">'
+        : '') +
+      '<span style="font-weight:600; min-width:0; overflow-wrap:anywhere; flex:1;">' + escapeHtml(sh.title) + '</span>' +
+      '<button type="button" class="lc-btn secondary" data-show-id="' + escapeAttr(sh.showIds.join(',')) + '" onclick="onRestoreAiringNextShow(this)" style="flex-shrink:0;">Put Back</button>' +
+    '</div>'
+  ).join('');
+}
+
+function onRestoreAiringNextShow(btn) {
+  const showId = btn && btn.dataset ? btn.dataset.showId : '';
+  if (!showId) return;
+  if (typeof restoreAiringNextShow === 'function') restoreAiringNextShow(showId);
 }
 
 // that persists anywhere outside a single browser for that link to
@@ -46432,6 +54027,9 @@ function clearLocalAccountData() {
   // Read everywhere else as a plain object (Object.keys(...), map lookups by
   // show id), so resetting it to a Set left a value nothing could use.
   window._dismissedContinueWatching = {};
+  // Same shape and the same reason as the line above: read everywhere else
+  // as a plain object keyed by show id.
+  window._removedAiringNext = {};
   window._fullyWatchedShowIds = new Set();
   window._inProgressShowIds = new Set();
 
@@ -46442,6 +54040,9 @@ function clearLocalAccountData() {
   window._watchedIndexLength = 0;
   window._currentItemDetails = null;
   window._episodeDataCache = {};
+  // Same reason, and it is what the season counts and every "has this aired"
+  // check read: left in place it answers for whatever show was open last.
+  window._seasonEpisodesMap = {};
   window._currentListDetailsAllItems = [];
 
   // Caches held by other modules that key off the same data.
@@ -46543,6 +54144,7 @@ function clearLocalAccountData() {
   if (typeof renderAccountKeySection === 'function') renderAccountKeySection();
   if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
   if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+  if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
   if (typeof renderTrackPlaybackSection === 'function') renderTrackPlaybackSection();
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard();
   if (typeof renderTraktConnectStatus === 'function') renderTraktConnectStatus();
@@ -47355,6 +54957,7 @@ function trackingSyncSignature(localMap) {
     Number(wl.updatedAt) || 0,
     (window._fullyWatchedShowIds ? window._fullyWatchedShowIds.size || [...window._fullyWatchedShowIds].length : 0),
     Object.keys(window._dismissedContinueWatching || {}).length,
+    Object.keys(window._removedAiringNext || {}).length,
     localStorage.getItem('myListAddon:trackPlayback') === '1' ? 1 : 0,
     localStorage.getItem('myListAddon:removeWatchedFromWatchlist') !== '0' ? 1 : 0,
     localStorage.getItem('myListAddon:scrobbleFilterUsers') === '1' ? 1 : 0,
@@ -47436,6 +55039,13 @@ async function pushTrackingSync(opts) {
         scrobbleBlockAnonymous: localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1',
         fullyWatchedShowIds: [...(window._fullyWatchedShowIds || [])],
         dismissedContinueWatching: window._dismissedContinueWatching || {},
+        // Which shows have been taken off Airing Next, and at which watched
+        // episode -- see removeAiringNextShow (21_client-custom-list-
+        // builder.js). Carried on the account rather than left in this
+        // browser because the shelf is REBUILT from Watch History on every
+        // device: another browser that had never heard of the removal would
+        // recompute the show straight back onto it and push that up.
+        removedAiringNext: window._removedAiringNext || {},
         // Set only by flows that are deliberately shrinking Watch History
         // (Clear Watch History, removing a single item) -- tells the
         // server to trust this array exactly as sent instead of rescuing
@@ -48183,6 +55793,35 @@ async function loadCreatorSync(opts) {
         try {
           localStorage.setItem('myListAddon:dismissedContinueWatching', JSON.stringify(synced.dismissedContinueWatching));
         } catch (e) {}
+      }
+      // Guarded by isRecentRemoval for the same reason the dismissals above
+      // are: a removal made on this device moments ago must not be undone by
+      // an account copy that predates it.
+      if (!isRecentRemoval && synced.removedAiringNext && typeof synced.removedAiringNext === 'object') {
+        window._removedAiringNext = synced.removedAiringNext;
+        try {
+          localStorage.setItem(REMOVED_AIRING_NEXT_KEY, JSON.stringify(synced.removedAiringNext));
+        } catch (e) {}
+        // The shelf this browser is holding can predate the removals just
+        // applied -- it may have computed one before this account's state
+        // arrived, or before another device removed a show. Filtered here
+        // rather than by calling syncAiringNextWatchState, which would see
+        // shows it has no air dates for and start a full TMDB rebuild on
+        // every sign-in load.
+        try {
+          const anMap = loadLocalCustomLists();
+          const anList = anMap['airing-next'];
+          if (anList && Array.isArray(anList.items) && anList.items.length) {
+            const kept = anList.items.filter((it) => !isAiringNextRemoved(it && (it.showId || it.id)));
+            if (kept.length !== anList.items.length) {
+              anList.items = kept;
+              anList.updatedAt = Date.now();
+              anMap['airing-next'] = anList;
+              saveLocalCustomListsMap(anMap);
+            }
+          }
+        } catch (e) {}
+        touchedTracking = true;
       }
       if (Array.isArray(synced.dashboardListOrder) && synced.dashboardListOrder.length) {
         try {
@@ -49426,6 +57065,7 @@ async function renderCreatorDashboard(options) {
     if (prevScrollTop) box.scrollTop = prevScrollTop;
     document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
     if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+    if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
 
     // Auto-sync check for lists linked to external URLs if >24 hours stale
     try {
@@ -49537,6 +57177,13 @@ function buildLocalListCardHtml(l) {
     const cwRemoveId = it.showId || it.imdbId || it.id;
     if (l.slug === 'continue-watching' && cwRemoveId) {
       removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+    } else if (l.slug === 'airing-next' && cwRemoveId) {
+      // The dashboard renders Airing Next through buildAiringNextCardHtml
+      // (21_client-custom-list-builder.js), which has its own copy of this
+      // button. This branch is for anything that reaches the generic card
+      // with the airing-next slug, so the shelf never renders an "x" that
+      // removes the wrong thing -- or, worse, none at all.
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeAiringNextShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Airing Next">&times;</button>';
     } else if (isWatchlist) {
       removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
     } else if (l.slug === 'watch-history') {
@@ -49811,6 +57458,7 @@ function renderLocalCustomListsDashboard(box, silent) {
   if (prevScrollTop) box.scrollTop = prevScrollTop;
   document.querySelectorAll('#creatorListRows .drag-handle-list').forEach((h) => initCreatorListTouchDrag(h));
   if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+  if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
 }
 
 
@@ -51641,6 +59289,8 @@ async function testSourceRow(btn) {
     if (keys.simklKey) body.simklKey = keys.simklKey;
     if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
     if (keys.creatorName) body.creatorName = keys.creatorName;
+    const previewKey = previewCreatorKey(url);
+    if (previewKey) body.creatorKey = previewKey;
     if (keys.adultContentFilter || (typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled())) body.adultContentFilter = true;
     const res = await fetch(ORIGIN + '/api/preview', {
       method: 'POST',
@@ -51726,6 +59376,42 @@ function repairAutotrackUrl(url) {
   const m = /^autotrack:([a-z0-9-]+):(movie|series|mixed):(.*)$/.exec(url);
   if (!m || m[3] === activeCreator.creatorName) return url;
   return 'autotrack:' + m[1] + ':' + m[2] + ':' + activeCreator.creatorName;
+}
+
+// The Creator Key that lets /api/preview prove who is asking.
+//
+// Watch History, Continue Watching, Watchlist and Airing Next are
+// 'autotrack:<slug>:<type>:<username>' rows, and reading one server-side
+// means reading that account's private tracking record. /api/preview is an
+// unauthenticated endpoint, so the username inside that string is a claim and
+// nothing more until the caller proves it -- and mayReadTrackedShelf
+// (02_http-and-creator-utils.js) answers an unproven reader with an EMPTY
+// shelf rather than an error, because a catalog row has no way to show a
+// message. That is exactly what "No items found." in Live Preview & Editor
+// was: not a missing shelf, an unauthenticated read of one. Airing Next has
+// no share flag at all (only watchlist, watch-history and continue-watching
+// have one), so proving ownership is the ONLY way to read it -- which is why
+// adding it to the config could never preview even for its own owner.
+//
+// Sent only for a url that actually names one of those shelves, for the same
+// reason collectKeys only puts trackCreatorKey into a config that carries
+// one: the key is a bearer credential, and a preview of a public
+// mdblist/trakt/tmdb list has no business carrying it.
+function previewCreatorKey(url) {
+  if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return '';
+  if (!urlHasAutotrackSource(url)) return '';
+  try {
+    return localStorage.getItem('myListAddon:creatorKey') || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// A merged row stacks several sources into one newline-separated url (see
+// collectEntries), so a personal shelf can sit on any line of it, not only
+// the first.
+function urlHasAutotrackSource(url) {
+  return String(url || '').split('\\n').some((line) => line.trim().startsWith('autotrack:'));
 }
 
 function collectEntries() {
@@ -52091,6 +59777,8 @@ async function renderLivePreview() {
         if (keys.simklKey) body.simklKey = keys.simklKey;
         if (keys.simklAccessToken) body.simklAccessToken = keys.simklAccessToken;
         if (keys.creatorName) body.creatorName = keys.creatorName;
+        const previewKey = previewCreatorKey(s.url);
+        if (previewKey) body.creatorKey = previewKey;
         if (keys.hideNonDigitalReleases) body.hideNonDigitalReleases = true;
         if (keys.adultContentFilter) body.adultContentFilter = true;
         const res = await fetch(ORIGIN + '/api/preview', {
@@ -52464,6 +60152,8 @@ function livePreviewPosterHtml(m) {
   const cwRemoveTarget = m.removeShowId || (isCwItem ? (m.showId || m.id || m.imdbId) : null);
   if (cwRemoveTarget) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="cw" data-remove-id="' + escapeAttr(cwRemoveTarget) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Continue Watching">&times;</button>';
+  } else if (m.removeAiringShowId) {
+    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="airing" data-remove-id="' + escapeAttr(m.removeAiringShowId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Airing Next">&times;</button>';
   } else if (m.removeWatchlistId) {
     removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="watchlist" data-remove-id="' + escapeAttr(m.removeWatchlistId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watchlist">&times;</button>';
   } else if (m.removeHistoryId) {
@@ -52515,10 +60205,19 @@ function livePreviewPosterHtml(m) {
     const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
 
     if (showAirDate && !m.hideDateBadge && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
-      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
-      if (badgeText) {
-        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(effectiveAirDate) + '">' + escapeHtml(badgeText) + '</div>';
-      }
+      // Built rather than passed straight through: this renderer resolves the
+      // date, season and episode itself from the tile plus its Airing Next
+      // match, and those resolved values are what the air time has to be
+      // looked up against.
+      dateBadge = typeof watchItemAirDateBadgeHtml === 'function'
+        ? watchItemAirDateBadgeHtml({
+            airDate: effectiveAirDate,
+            airTime: m.airTime || (airingMatch && airingMatch.airTime) || '',
+            showId: m.showId || m.id,
+            seasonNum: mSeason,
+            episodeNum: currentEpNum,
+          })
+        : '';
     }
 
     const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (m.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
@@ -52587,13 +60286,15 @@ function removeListItemFromDetails(btn) {
     Object.keys(window._listPreloadedCache).forEach((k) => {
       const cache = window._listPreloadedCache[k];
       if (cache && Array.isArray(cache.sample)) {
-        cache.sample = cache.sample.filter((it) => it && String(it.id || it.removeShowId || it.removeWatchlistId || it.removeHistoryId) !== targetId);
+        cache.sample = cache.sample.filter((it) => it && String(it.id || it.removeShowId || it.removeAiringShowId || it.removeWatchlistId || it.removeHistoryId) !== targetId);
       }
     });
   }
 
   if (type === 'cw') {
     if (typeof dismissContinueWatchingShow === 'function') dismissContinueWatchingShow(targetId, btn);
+  } else if (type === 'airing') {
+    if (typeof removeAiringNextShow === 'function') removeAiringNextShow(targetId, btn);
   } else if (type === 'watchlist') {
     if (typeof removeWatchlistItemDirect === 'function') removeWatchlistItemDirect(targetId, btn);
   } else if (type === 'history') {
@@ -52930,6 +60631,93 @@ function renderWatchHistoryGrid() {
 }
 window.renderWatchHistoryGrid = renderWatchHistoryGrid;
 
+
+// --- "On Today": what this channel is actually running --------------------
+//
+// A rotating channel stores a pool much bigger than a day, and until now the
+// only way to see which shows and episodes today's lineup had drawn from it
+// was to open the channel in Stremio. So you could set 24 shows x 3 episodes
+// and have no idea what that produced.
+//
+// The Worker answers it (see /api/channel-lineup), which matters: the
+// rotation is a seeded shuffle, and a second copy of that PRNG living on
+// this page is the kind of thing that drifts by one episode after some later
+// edit and is never noticed. This asks the same function the meta route uses.
+async function renderChannelLineupTab(params) {
+  const gridEl = document.getElementById('detailGrid');
+  const statusEl = document.getElementById('detailStatus');
+  const subEl = document.getElementById('detailSubtitle');
+  if (!gridEl) return;
+  const listUrl = (params && params.listUrl) || '';
+  const channelId = listUrl.startsWith('channel:id:') ? listUrl.slice('channel:id:'.length) : '';
+  const channel = channelId && typeof loadLocalChannels === 'function' ? loadLocalChannels()[channelId] : null;
+  if (!channel) {
+    if (statusEl) statusEl.innerHTML = '<small>This channel is not saved in this browser, so there is nothing to look up.</small>';
+    return;
+  }
+  gridEl.innerHTML = '';
+  // The lineup rewrites the page subtitle with today's numbers, so hold on to
+  // the list's own subtitle -- All has to put it back.
+  if (subEl && typeof window._listDetailsSubtitleBeforeLineup !== 'string') {
+    window._listDetailsSubtitleBeforeLineup = subEl.textContent || '';
+  }
+  if (statusEl) statusEl.innerHTML = '<small>Working out what is on&hellip;</small>';
+  try {
+    const res = await fetch(ORIGIN + '/api/channel-lineup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'channel:v1:' + JSON.stringify(channel) }),
+      cache: 'no-store',
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      if (statusEl) statusEl.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Could not work out this channel’s lineup.') + '</p>';
+      return;
+    }
+    const items = data.items || [];
+    if (!items.length) {
+      if (statusEl) statusEl.innerHTML = '<small>Nothing is scheduled for this channel right now.</small>';
+      return;
+    }
+    const tiles = items.map((it, idx) => {
+      const seasonEp = (it.season != null && it.episode != null && it.kind !== 'movie')
+        ? ('S' + it.season + 'E' + it.episode) : '';
+      const showName = it.showName || it.title || 'Untitled';
+      return {
+        id: (typeof channelItemId === 'function' ? channelItemId(it, idx) : (it.imdbId || String(idx))),
+        type: it.kind === 'movie' ? 'movie' : 'series',
+        // The running order IS the answer here, so each tile is numbered:
+        // "12." is the twelfth thing this channel plays today.
+        name: (idx + 1) + '. ' + showName + (seasonEp ? ' ' + seasonEp : ''),
+        subtitle: it.epName || '',
+        title: it.title || showName,
+        poster: it.thumbnail || it.poster || it.showPoster || channel.poster || '',
+        thumbnail: it.thumbnail || it.poster || '',
+        year: it.released ? String(it.released).slice(0, 4) : '',
+        listUrl: listUrl,
+        listName: channel.name || '',
+      };
+    });
+    if (typeof renderPosterGridChunked === 'function') renderPosterGridChunked(gridEl, tiles);
+    const bits = [items.length + ' playing today'];
+    if (data.rotating && data.plan) {
+      bits.push('out of ' + data.poolSize + ', ' + data.plan.shows + ' shows × ' + data.plan.episodes + ' episodes');
+    }
+    // An honest label rather than a lineup that differs from what will play:
+    // this endpoint is unauthenticated and cannot read anyone's history, so
+    // a channel whose rules depend on one is previewed without them.
+    if ((data.unappliedRules || []).length) {
+      bits.push('shown without ' + (data.unappliedRules.indexOf('dynamic') !== -1
+        ? 'your Continue Watching'
+        : 'the watched-episode filter') + ', which only applies once installed');
+    }
+    if (subEl) subEl.textContent = bits.join(' · ');
+    if (statusEl) statusEl.innerHTML = '';
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = '<p class="testresult err">✗ Network error working out this channel’s lineup.</p>';
+  }
+}
+
 window.switchListDetailsType = function(newType) {
   if (!window._currentListDetailsParams) return;
   const p = window._currentListDetailsParams;
@@ -52939,9 +60727,33 @@ window.switchListDetailsType = function(newType) {
   const aBtn = document.getElementById('detailTypeAllBtn');
   const mBtn = document.getElementById('detailTypeMovieBtn');
   const sBtn = document.getElementById('detailTypeSeriesBtn');
+  const lBtn = document.getElementById('detailTypeLineupBtn');
   if (aBtn) aBtn.classList.toggle('active', newType === 'all');
   if (mBtn) mBtn.classList.toggle('active', newType === 'movie');
   if (sBtn) sBtn.classList.toggle('active', newType === 'series');
+  if (lBtn) lBtn.classList.toggle('active', newType === 'lineup');
+
+  // "On Today" is not a filter over what is loaded -- it is a different
+  // question, answered by the Worker: out of this channel's whole pool,
+  // which picks is it actually running right now? See renderChannelLineupTab.
+  if (newType === 'lineup') {
+    if (typeof renderChannelLineupTab === 'function') renderChannelLineupTab(p);
+    return;
+  }
+
+  // Coming back off On Today: restore the subtitle it borrowed, so All reads
+  // as the list again rather than keeping today's running-order line.
+  if (typeof window._listDetailsSubtitleBeforeLineup === 'string') {
+    if (typeof window._listDetailsSubtitleRefresh === 'function') {
+      window._listDetailsSubtitleRefresh();
+    } else {
+      const subEl = document.getElementById('detailSubtitle');
+      if (subEl) subEl.textContent = window._listDetailsSubtitleBeforeLineup;
+    }
+    const statusEl = document.getElementById('detailStatus');
+    if (statusEl) statusEl.innerHTML = '';
+    window._listDetailsSubtitleBeforeLineup = null;
+  }
 
   // If this is a dual-type chart (separate endpoint for movies vs series)
   let isDualTypeChart = false;
@@ -53579,6 +61391,10 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   window._currentListDetailsParams = { name, type, listUrl };
   window._currentListDetailsFilter = (isDualTypeChart && !isContinueWatching) ? type : 'all';
   window._currentListDetailsAllItems = [];
+  // A fresh list page: whatever subtitle On Today had stashed belongs to the
+  // list we just left.
+  window._listDetailsSubtitleBeforeLineup = null;
+  window._listDetailsSubtitleRefresh = null;
   const filterBar = document.getElementById('detailFilterBar');
   const isExternalHistory = !!(
     (listUrl && (listUrl === 'trakt:history' || listUrl.startsWith('trakt:history') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/history')))) ||
@@ -53592,6 +61408,18 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     listUrl === 'watch-history'
   );
   const isMixedList = type === 'mixed' || isDualTypeChart || isExternalHistory || (preloaded && preloaded.sample && preloaded.sample.some((it) => it.type === 'series' || it.showId) && preloaded.sample.some((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'))) || (listUrl && (listUrl.includes('watchlist') || listUrl.includes('continue-watching') || listUrl.startsWith('autotrack:')));
+
+  // A channel saved in this browser -- the only thing that HAS a "today" to
+  // show, and the only one whose payload is here to ask about. A directory
+  // preview is somebody else's channel and is not in the local store.
+  const lineupChannelId = (listUrl && listUrl.startsWith('channel:id:')) ? listUrl.slice('channel:id:'.length) : '';
+  const canShowLineup = !!(lineupChannelId && typeof loadLocalChannels === 'function' && loadLocalChannels()[lineupChannelId]);
+  // Whether the Movies/Shows pills have anything to divide. A channel of
+  // only episodes has nothing to filter, but it still has a lineup -- which
+  // is why the bar can no longer be gated on being mixed.
+  const channelHasBothTypes = !!(preloaded && preloaded.sample &&
+    preloaded.sample.some((it) => it && it.type === 'movie') &&
+    preloaded.sample.some((it) => it && it.type !== 'movie'));
 
   const whControls = document.getElementById('whFilterControls');
   const whSortControls = document.getElementById('whSortControls');
@@ -53618,7 +61446,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       filterBar.querySelectorAll('.wh-filter-pill').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.whFilter === curFilter);
       });
-    } else if (isDualTypeChart || isMixedList) {
+    } else if (isDualTypeChart || isMixedList || canShowLineup) {
       filterBar.style.display = 'flex';
       if (whControls) whControls.style.display = 'none';
       if (whSortControls) whSortControls.style.display = 'none';
@@ -53630,8 +61458,24 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         const aBtn = document.getElementById('detailTypeAllBtn');
         const mBtn = document.getElementById('detailTypeMovieBtn');
         const sBtn = document.getElementById('detailTypeSeriesBtn');
+        const lBtn = document.getElementById('detailTypeLineupBtn');
+        if (lBtn) {
+          lBtn.style.display = canShowLineup ? '' : 'none';
+          lBtn.classList.remove('active');
+        }
         const isExternalProvider = isExternalHistory || (listUrl && (listUrl.includes('trakt:watchlist') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/watchlist')) || listUrl.includes('mdblist:watchlist')));
-        if (isDualTypeChart && !isExternalProvider) {
+        if (canShowLineup && !channelHasBothTypes) {
+          // One kind of thing in this channel, so Movies and Shows would be
+          // two pills showing the same list. All stays: it is the whole
+          // channel, and the way back from On Today.
+          const curFilter = window._currentListDetailsFilter || 'all';
+          if (aBtn) {
+            aBtn.style.display = '';
+            aBtn.classList.toggle('active', curFilter !== 'lineup');
+          }
+          if (mBtn) mBtn.style.display = 'none';
+          if (sBtn) sBtn.style.display = 'none';
+        } else if (isDualTypeChart && !isExternalProvider) {
           // On dual-type charts (Catalogs Quick Add & Discover), hide 'All' and show only 'Movies' & 'Shows'
           if (aBtn) aBtn.style.display = 'none';
           if (mBtn) {
@@ -53943,32 +61787,45 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     // why: this is the path a large Custom List, Watchlist, or paginated
     // chart takes as the user scrolls, and it used to tear down and
     // rebuild every already-rendered poster on every page that arrived.
-    appendPosterGridItems(gridEl, newlyMatching);
+    // On Today owns the grid, the status line and the subtitle while it is
+    // the open tab, so a page that lands behind it is only accumulated --
+    // All re-renders from the accumulated items the moment it is clicked.
+    if (window._currentListDetailsFilter !== 'lineup') appendPosterGridItems(gridEl, newlyMatching);
     loadedCount = window._currentListDetailsAllItems.length;
     return newCount;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
+    const onLineup = window._currentListDetailsFilter === 'lineup';
     if (!maybeMore || itemsThisPage === 0 || pagesLoaded >= MAX_PAGES) {
       done = true;
-      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
-    } else {
+      if (!onLineup) statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
+    } else if (!onLineup) {
       statusEl.innerHTML = '<small>Scroll for more\u2026</small>';
     }
     // Set before the subtitle is written, not after: the subtitle says "100+"
     // rather than "100" precisely when this is true.
     moreToLoad = !done;
-    subEl.textContent = formatSubtitle(loadedCount);
+    if (!onLineup) subEl.textContent = formatSubtitle(loadedCount);
   }
+  // How All puts the list's own subtitle back after On Today borrowed it --
+  // recomputed rather than restored from a string, so a count that grew while
+  // On Today was open is still right.
+  window._listDetailsSubtitleRefresh = function() {
+    subEl.textContent = formatSubtitle(loadedCount);
+  };
 
   async function loadNextPage() {
     if (loading || done) return;
+    // Same reason as in appendItems: while On Today is the open tab the status
+    // line is its, so a page loading behind it says nothing.
+    const quiet = window._currentListDetailsFilter === 'lineup';
     if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
       done = true;
-      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
+      if (!quiet) statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
       return;
     }
     loading = true;
-    statusEl.innerHTML = '<small>Loading\u2026</small>';
+    if (!quiet) statusEl.innerHTML = '<small>Loading\u2026</small>';
     try {
       const body = { url: listUrl, type: type, skip: skip, sample: 100 };
       if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
@@ -56534,6 +64391,7 @@ renderCreatorProfileBar();
 renderAccountKeySection();
 if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
 if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
 renderTrackPlaybackSection();
 renderCreatorDashboard();
 if (typeof pickUpMdblistTokenFromUrl === 'function') pickUpMdblistTokenFromUrl();
@@ -56560,6 +64418,14 @@ tryAutoRestoreCreatorProfile();
 // link, or a plain page refresh lands back on that exact page instead of
 // always falling back to whatever tab was last active.
 (function handleInitialDeepLink() {
+  // A channel share link (/channel/<code>) redirects here carrying the code
+  // in the fragment. Checked first and returned on, because it is the one
+  // deep link that does something to this browser's own data rather than
+  // opening a page -- see handleChannelShareDeepLink.
+  if (typeof handleChannelShareDeepLink === 'function' && /[#&?]channel=/.test(location.hash || '')) {
+    handleChannelShareDeepLink();
+    return;
+  }
   if (SERVER_DEEP_LINK_LIST) {
     openListDetailsPage(SERVER_DEEP_LINK_LIST.name, SERVER_DEEP_LINK_LIST.type, SERVER_DEEP_LINK_LIST.url, SERVER_DEEP_LINK_LIST, { skipPushState: true });
     return;
@@ -57587,7 +65453,10 @@ function renderGuidePage(origin) {
       <li>Click <strong>+ New Channel</strong>.</li>
       <li>Use the <strong>Shows / Movies</strong> toggle to set what you're searching for.</li>
       <li>Search a title and add picks &mdash; for shows, an episode picker lets you choose specific seasons/episodes.</li>
-      <li>Reorder or remove picks in <strong>Picks in this channel</strong>. <strong>Shuffle picks now</strong> randomizes the order once; the <strong>Randomize play order</strong> checkbox re-shuffles automatically every 24 hours.</li>
+      <li>Drag a pick, or type a new position, to reorder <strong>Picks in this channel</strong>. Where a pick sits in this list is the order it plays in.</li>
+      <li>Use the <strong>Play order</strong> dropdown to arrange them all at once &mdash; <strong>Air date</strong> (oldest or newest first, from each episode's TMDB air date and each movie's release date, with anything undated last), <strong>Show, then season &amp; episode</strong>, <strong>Title A&ndash;Z</strong>, or <strong>Shuffle now</strong>. Each one reorders the list right there, so what you see is what plays.</li>
+      <li>A sort stays selected and is re-applied whenever you add more picks, so a channel keeps its order as it grows. Move a pick by hand and the dropdown goes back to <strong>As listed</strong> &mdash; your order is kept from then on.</li>
+      <li><strong>Shuffle daily</strong> is the one option that is not a one-off: the channel reshuffles itself every 24 hours, and the order in the list is ignored while it is selected.</li>
       <li>Choose a <strong>Channel Poster</strong> from an added show's artwork, or use the default channel poster.</li>
       <li>Name the channel and click <strong>Save</strong>.</li>
     </ol>
@@ -58228,6 +66097,28 @@ async function handleFetch(request, env, ctx) {
         // writing somebody's keys to disk.
         { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } }
       );
+    }
+
+    // /channel/<code> -- what a channel share link actually points at.
+    //
+    // A redirect rather than its own page: everything needed to accept a
+    // shared channel (the local channel store, the Catalogs rows, the
+    // Channels tab) already lives on the builder page, so this hands the
+    // code to it in the fragment and handleInitialDeepLink takes it from
+    // there. The fragment, not the query string, because a fragment is
+    // never sent to the server or written into its logs -- an unlisted
+    // channel's code is the only thing protecting it.
+    m = path.match(/^\/channel\/([A-Za-z0-9_-]{1,64})$/);
+    if (m) {
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: `${url.origin}/configure#channel=${encodeURIComponent(m[1])}`,
+          "Cache-Control": "no-store",
+          ...corsHeaders(),
+        },
+      });
     }
 
     // bare /configure (no config yet) -> same builder, empty/default state
@@ -58931,7 +66822,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
         if (metaType !== "series") return jsonPublic({ meta: null });
         const wantedChannelId = id.slice("channel_".length);
         try {
-          const { entries } = await resolveConfig(config, env);
+          // watchHistory/continueWatching feed the channel flags that read
+          // the account rather than the payload -- "Hide watched" and the
+          // dynamic Next Up channel. resolveConfig only fills them in for a
+          // config that PROVED whose it is (see trackOwner there), so an
+          // unverified config simply gets a channel with neither applied.
+          const { entries, watchHistory, continueWatching, tmdbKey, mdblistKey, traktKey, traktAccessToken } = await resolveConfig(config, env);
           let matchedEntry = null;
           for (const e of entries) {
             if (e.enabled === false) continue;
@@ -58947,7 +66843,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
             if (matchedEntry) break;
           }
           if (!matchedEntry) return jsonPublic({ meta: null });
-          const meta = buildChannelMeta(matchedEntry, url.origin);
+          const meta = await buildChannelMeta(matchedEntry, url.origin, {
+            env, ctx, origin: url.origin,
+            watchHistory, continueWatching,
+            tmdbKey, mdblistKey, traktKey, traktAccessToken,
+          });
           return jsonPublic({ meta: meta || null });
         } catch (err) {
           return jsonPublic({ meta: null, error: safeErrorMessage(err) });
@@ -59060,7 +66960,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
   <image x="100" y="300" width="400" height="240" preserveAspectRatio="xMidYMid meet" href="${dataUri}"/>
   <g transform="translate(300, 780)">
     <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGradP)"/>
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
   </g>
 </svg>`;
 
@@ -59636,6 +67536,7 @@ function generateSearchVariations(query) {
             name: e.name,
             released: e.air_date || null,
             thumbnail: e.still_path || null,
+            runtime: Number.isInteger(e.runtime) ? e.runtime : null,
           }));
           return json({ ok: true, episodes });
         }
@@ -59657,6 +67558,7 @@ function generateSearchVariations(query) {
               name: e.name,
               released: e.air_date || null,
               thumbnail: e.still_path || null,
+              runtime: Number.isInteger(e.runtime) ? e.runtime : null,
             }));
             return json({ ok: true, episodes });
           }
@@ -59668,6 +67570,12 @@ function generateSearchVariations(query) {
           name: e.name,
           released: e.air_date || null,
           thumbnail: e.still_path ? `https://image.tmdb.org/t/p/w780${e.still_path}` : null,
+          // Minutes, when TMDB has them. Carried onto the channel pick so a
+          // channel can say how many hours of television it holds -- and so
+          // a schedule can one day be built from real block lengths rather
+          // than an assumed half hour. Often null, which is why nothing
+          // downstream may require it.
+          runtime: Number.isInteger(e.runtime) ? e.runtime : null,
         }));
         return json({ ok: true, episodes });
       } catch (err) {
@@ -59824,6 +67732,460 @@ function generateSearchVariations(query) {
       }
     }
 
+    // /api/channel-lineup  (POST)  { url, watchHistory?, continueWatching? }
+    //   -> { ok, items, rotating, plan, generatedAt }
+    //
+    // What this channel is running RIGHT NOW -- the same lineup the meta
+    // route would serve, produced by the same function (resolveChannelLineup)
+    // rather than by a second copy of the seeded shuffle living on the page.
+    //
+    // POST, like /api/preview and for the same reason: a channel's url is its
+    // whole payload and routinely exceeds what a query string can carry.
+    //
+    // Unauthenticated, and it reads nothing it is not given: "Hide watched"
+    // and a dynamic channel both depend on an account's tracking, and this
+    // route has no way to prove whose it is -- so a preview of one of those
+    // shows the channel WITHOUT those rules applied and says so, rather than
+    // quietly reading somebody's history on an unproven claim.
+    if (path === "/api/channel-lineup" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const payload = parseChannelPayload(body.url || "");
+      if (!payload) return json({ ok: false, error: "That is not a channel." }, 400);
+      try {
+        const lineup = await resolveChannelLineup(payload, {
+          env, ctx, origin: url.origin,
+          now: typeof body.now === "number" ? body.now : undefined,
+        });
+        if (!lineup) return json({ ok: true, items: [], rotating: !!payload.dailyRotate, plan: null });
+        const needsAccount = !!(payload.hideWatched || payload.dynamic);
+        return json({
+          ok: true,
+          rotating: !!payload.dailyRotate,
+          // Named so the page can say "24 shows x 3 episodes" from the same
+          // numbers the Worker clamped, not from what the inputs say.
+          plan: lineup.plan,
+          poolSize: lineup.sourceItems.length,
+          // The two rules this route cannot honour, so the page can label
+          // the preview honestly instead of showing a lineup that differs
+          // from what will actually play.
+          unappliedRules: needsAccount
+            ? [payload.hideWatched ? "hideWatched" : null, payload.dynamic ? "dynamic" : null].filter(Boolean)
+            : [],
+          generatedAt: Date.now(),
+          items: lineup.items,
+        }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) }, 500, { "Cache-Control": "no-store" });
+      }
+    }
+
+    // /api/person-search?q=<name>
+    //   -> { ok, results: [{ personId, name, department, knownFor, poster }] }
+    //
+    // The third search type in the Channel builder, alongside Shows and
+    // Movies. Searching a PERSON is a different question from searching a
+    // title -- "everything Robin Williams was in" rather than one film -- so
+    // it gets its own endpoint rather than another branch of title-search,
+    // whose whole response shape is built around a title.
+    if (path === "/api/person-search") {
+      const q = (url.searchParams.get("q") || "").trim();
+      if (!q) return json({ ok: true, results: [] });
+      try {
+        ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
+        const res = await fetch(
+          `https://api.themoviedb.org/3/search/person?api_key=${encodeURIComponent(TMDB_API_KEY)}&query=${encodeURIComponent(q)}&include_adult=false&page=1`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 3600, cacheEverything: true } }
+        );
+        if (!res.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${res.status}).` });
+        const data = await res.json();
+        const results = (data.results || [])
+          .filter((p) => p && p.id && !p.adult)
+          .slice(0, 20)
+          .map((p) => ({
+            personId: p.id,
+            name: p.name || "",
+            department: p.known_for_department || "",
+            // The two or three titles TMDB thinks this person is known for,
+            // shown under the name because "Chris Evans" alone is not enough
+            // to pick the right one out of a search result.
+            knownFor: (p.known_for || [])
+              .map((k) => k && (k.title || k.name))
+              .filter(Boolean)
+              .slice(0, 3)
+              .join(", "),
+            poster: p.profile_path ? `https://image.tmdb.org/t/p/w200${p.profile_path}` : null,
+          }));
+        return json({ ok: true, results }, 200, { "Cache-Control": "public, max-age=3600" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/person-credits?personId=<id>&sort=chronological|rating&movies=N&shows=N
+    //   -> { ok, name, poster, backdrop, movies: [...], shows: [...] }
+    //
+    // What a Spotlight channel is built from. Acting credits and directing/
+    // creating credits both count -- a Nolan or a Miyazaki spotlight is the
+    // films they MADE, and TMDB files those under crew rather than cast.
+    //
+    // Both lists come back already cut and ordered, because the ordering is
+    // the whole feature: "chronological" walks a career forward, "rating"
+    // opens with the best of it.
+    if (path === "/api/person-credits") {
+      const personId = (url.searchParams.get("personId") || "").trim();
+      if (!/^[0-9]+$/.test(personId)) return json({ ok: false, error: "Missing personId." }, 400);
+      const sort = url.searchParams.get("sort") === "rating" ? "rating" : "chronological";
+      // A filmography is the whole point here, so the ceilings are a career
+      // rather than a shelf. Popularity still decides the ORDER these are
+      // cut in (see byWeight below), so asking for fewer gives the best of
+      // them rather than an arbitrary slice.
+      const movieLimit = Math.min(Math.max(parseInt(url.searchParams.get("movies") || "12", 10) || 12, 0), 120);
+      const showLimit = Math.min(Math.max(parseInt(url.searchParams.get("shows") || "4", 10) || 4, 0), 60);
+      try {
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
+        const [personRes, creditsRes] = await Promise.all([
+          fetch(
+            `https://api.themoviedb.org/3/person/${encodeURIComponent(personId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+          ),
+          fetch(
+            `https://api.themoviedb.org/3/person/${encodeURIComponent(personId)}/combined_credits?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+          ),
+        ]);
+        if (!creditsRes.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${creditsRes.status}).` });
+        const person = personRes.ok ? await personRes.json() : {};
+        const credits = await creditsRes.json();
+        const DIRECTING_JOBS = /^(director|writer|creator|screenplay|executive producer)$/i;
+        const seen = new Set();
+        const collect = (list, isCrew) => {
+          const out = [];
+          for (const c of (list || [])) {
+            if (!c || !c.id || c.adult) continue;
+            if (isCrew && !DIRECTING_JOBS.test(String(c.job || ""))) continue;
+            const mediaType = c.media_type === "tv" ? "tv" : "movie";
+            const key = `${mediaType}:${c.id}`;
+            if (seen.has(key)) continue;
+            // A talk-show or awards-ceremony appearance is a credit but not
+            // a title anyone wants in a tribute channel, and TMDB marks
+            // those 10767/10763 (talk / news). Same for a person's own
+            // documentary interviews showing up with no votes at all.
+            const genres = Array.isArray(c.genre_ids) ? c.genre_ids : [];
+            if (genres.includes(10767) || genres.includes(10763)) continue;
+            const votes = Number(c.vote_count) || 0;
+            if (votes < 20) continue;
+            seen.add(key);
+            const date = c.release_date || c.first_air_date || "";
+            out.push({
+              tmdbId: c.id,
+              type: mediaType,
+              title: c.title || c.name || "",
+              year: String(date).slice(0, 4),
+              released: date || "",
+              rating: typeof c.vote_average === "number" ? Math.round(c.vote_average * 10) / 10 : 0,
+              votes: votes,
+              poster: c.poster_path ? `https://image.tmdb.org/t/p/w500${c.poster_path}` : null,
+              backdrop: c.backdrop_path ? `https://image.tmdb.org/t/p/w780${c.backdrop_path}` : null,
+              role: isCrew ? (c.job || "Crew") : (c.character || "Cast"),
+            });
+          }
+          return out;
+        };
+        const all = [...collect(credits.cast, false), ...collect(credits.crew, true)];
+        const order = (a, b) => {
+          if (sort === "rating") {
+            if (b.rating !== a.rating) return b.rating - a.rating;
+            return b.votes - a.votes;
+          }
+          // Chronological, and an undated credit goes last rather than
+          // opening the channel -- the same call sortChannelItemsByAired
+          // makes for the same reason.
+          if (!a.year) return 1;
+          if (!b.year) return -1;
+          if (a.year !== b.year) return a.year < b.year ? -1 : 1;
+          return b.votes - a.votes;
+        };
+        // Popularity picks WHICH credits make the cut; the chosen sort then
+        // decides what order they play in. Ranking by the sort itself would
+        // make "chronological" mean "their earliest 12 credits", which for
+        // most careers is the student films.
+        const byWeight = (a, b) => (b.rating * 10 + Math.log10(b.votes + 1)) - (a.rating * 10 + Math.log10(a.votes + 1));
+        const movies = all.filter((c) => c.type === "movie").sort(byWeight).slice(0, movieLimit).sort(order);
+        const shows = all.filter((c) => c.type === "tv").sort(byWeight).slice(0, showLimit).sort(order);
+        return json({
+          ok: true,
+          name: person.name || "",
+          poster: person.profile_path ? `https://image.tmdb.org/t/p/w500${person.profile_path}` : null,
+          backdrop: (movies[0] && movies[0].backdrop) || (shows[0] && shows[0].backdrop) || null,
+          movies,
+          shows,
+        }, 200, { "Cache-Control": "public, max-age=86400" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/person-show-episodes?personId=<id>&tmdbId=<show id>
+    //   -> { ok, imdbId, showName, poster, backdrop, regular, episodes: [...] }
+    //
+    // The episodes of one show that a given person is ACTUALLY in.
+    //
+    // A Spotlight channel used to take a show's first N episodes whenever a
+    // person had any TV credit on it, so Tobey Maguire's single guest
+    // appearance in Roseanne put ten Roseanne episodes into the channel --
+    // nine of which he is not in. TMDB does not answer "which episodes" in
+    // one call, but it does carry the two facts that settle it:
+    //
+    //   * a season's own `credits.cast` is that season's REGULARS, who are
+    //     in every episode of it without being listed on each one;
+    //   * each episode's `guest_stars` and `crew` name everyone else --
+    //     which is where a one-episode guest, and a director, turn up.
+    //
+    // So: a regular contributes the whole season, and anyone else
+    // contributes exactly the episodes that name them.
+    if (path === "/api/person-show-episodes") {
+      const personId = (url.searchParams.get("personId") || "").trim();
+      const tmdbId = (url.searchParams.get("tmdbId") || "").trim();
+      if (!/^[0-9]+$/.test(personId) || !/^[0-9]+$/.test(tmdbId)) {
+        return json({ ok: false, error: "Missing personId or tmdbId." }, 400);
+      }
+      const wantedPerson = parseInt(personId, 10);
+      try {
+        const showRes = await fetch(
+          `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+        );
+        if (!showRes.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${showRes.status}).` });
+        const show = await showRes.json();
+        const imdbId = (show.external_ids && show.external_ids.imdb_id) || `tmdb:${tmdbId}`;
+        const showPoster = show.poster_path ? `https://image.tmdb.org/t/p/w500${show.poster_path}` : "";
+        const showBackdrop = show.backdrop_path ? `https://image.tmdb.org/t/p/w780${show.backdrop_path}` : "";
+        // Specials (season 0) are left out: they are recaps, gag reels and
+        // clip shows as often as they are episodes, and a channel built out
+        // of them plays badly.
+        const seasons = (show.seasons || [])
+          .filter((s) => s && s.season_number > 0)
+          .map((s) => s.season_number)
+          .slice(0, PERSON_SHOW_MAX_SEASONS);
+        let anyRegular = false;
+        const perSeason = await mapWithConcurrency(seasons, 4, async (seasonNumber) => {
+          try {
+            const sRes = await fetch(
+              `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/season/${seasonNumber}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=credits`,
+              { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+            );
+            if (!sRes.ok) return [];
+            const sData = await sRes.json();
+            const seasonCast = (sData.credits && Array.isArray(sData.credits.cast)) ? sData.credits.cast : [];
+            const seasonCrew = (sData.credits && Array.isArray(sData.credits.crew)) ? sData.credits.crew : [];
+            const isRegular =
+              seasonCast.some((c) => c && c.id === wantedPerson) ||
+              seasonCrew.some((c) => c && c.id === wantedPerson && /^(creator|executive producer)$/i.test(String(c.job || "")));
+            if (isRegular) anyRegular = true;
+            const out = [];
+            for (const ep of (sData.episodes || [])) {
+              if (!ep || !Number.isInteger(ep.episode_number)) continue;
+              if (!isRegular) {
+                const named =
+                  (ep.guest_stars || []).some((g) => g && g.id === wantedPerson) ||
+                  (ep.crew || []).some((c) => c && c.id === wantedPerson);
+                if (!named) continue;
+              }
+              const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+              out.push({
+                season: seasonNumber,
+                episode: ep.episode_number,
+                name: ep.name || `Episode ${ep.episode_number}`,
+                released: ep.air_date || "",
+                thumbnail: stillUrl,
+                runtime: Number.isInteger(ep.runtime) ? ep.runtime : null,
+              });
+            }
+            return out;
+          } catch {
+            return [];
+          }
+        });
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 1 + seasons.length));
+        const episodes = [];
+        for (const run of perSeason) episodes.push(...run);
+        episodes.sort((a, b) => (a.season - b.season) || (a.episode - b.episode));
+        return json({
+          ok: true,
+          imdbId,
+          showName: show.name || "",
+          poster: showPoster,
+          backdrop: showBackdrop,
+          // True when the person is a season regular somewhere in this show,
+          // which is what "every episode of that season" above is standing
+          // on -- surfaced so the client can say which of the two answers
+          // it got rather than presenting a guess as a fact.
+          regular: anyRegular,
+          episodes: episodes.slice(0, PERSON_SHOW_MAX_EPISODES),
+        }, 200, { "Cache-Control": "public, max-age=86400" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/wizard-channel-shows?networkId=&era=&genres=&limit=&type=
+    //   -> { ok, name, shows: [...], items: [...], networkLogo }
+    //
+    // The Quick Wizard's server call for building TV channels and catalog
+    // lists. Supports type=series (default) and type=movie. Discovers top
+    // matching titles from TMDB by crossing network/studio, era and genre.
+    if (path === "/api/wizard-channel-shows") {
+      const networkId = (url.searchParams.get("networkId") || "").trim();
+      const era = (url.searchParams.get("era") || "").trim();
+      const genres = (url.searchParams.get("genres") || "").trim();
+      const type = (url.searchParams.get("type") || "series").trim().toLowerCase();
+      const isMovie = type === "movie";
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "8", 10) || 8, 1), 50);
+      if (networkId && !/^[0-9a-zA-Z_-]+$/.test(networkId)) return json({ ok: false, error: "Bad networkId." }, 400);
+      if (genres && !/^[0-9]+(,[0-9]+)*$/.test(genres)) return json({ ok: false, error: "Bad genres." }, 400);
+      const eraMatch = era.match(/^([0-9]{4})-([0-9]{4})$/);
+      try {
+        const studioMap = {
+          "49": { name: "HBO", tvNetwork: "49", movieCompany: "3268|9993", movieProvider: "1899" },
+          "88": { name: "FX", tvNetwork: "88", movieCompany: "88" },
+          "80": { name: "Adult Swim", tvNetwork: "80", movieCompany: "80|56" },
+          "13": { name: "Nickelodeon", tvNetwork: "13", movieCompany: "2348" },
+          "56": { name: "Cartoon Network", tvNetwork: "56", movieCompany: "56" },
+          "54": { name: "Disney Channel", tvNetwork: "54", movieCompany: "2" },
+          "4": { name: "BBC One", tvNetwork: "4", movieCompany: "3341" },
+          "67": { name: "Showtime", tvNetwork: "67", movieCompany: "67" },
+          "174": { name: "AMC", tvNetwork: "174", movieCompany: "127928|174" },
+          "47": { name: "Comedy Central", tvNetwork: "47", movieCompany: "47" },
+          "213": { name: "Netflix", tvNetwork: "213", movieCompany: "178464", movieProvider: "8" },
+          "1024": { name: "Prime Video", tvNetwork: "1024", movieCompany: "20580", movieProvider: "9" },
+          "2552": { name: "Apple TV+", tvNetwork: "2552", movieCompany: "194232", movieProvider: "350" },
+          "2739": { name: "Disney+", tvNetwork: "2739", movieCompany: "2", movieProvider: "337" },
+          "19": { name: "FOX", tvNetwork: "19", movieCompany: "25" },
+          "6": { name: "NBC", tvNetwork: "6", movieCompany: "33" },
+          "16": { name: "CBS", tvNetwork: "16", movieCompany: "4" },
+          "2": { name: "ABC", tvNetwork: "2", movieCompany: "2" },
+          "71": { name: "The CW", tvNetwork: "71", movieCompany: "174" },
+          "149": { name: "Syfy", tvNetwork: "149", movieCompany: "149|33" },
+          "wb": { name: "Warner Bros. Pictures", movieCompany: "174", tvCompany: "1957" },
+          "universal": { name: "Universal Pictures", movieCompany: "33", tvCompany: "2672" },
+          "paramount": { name: "Paramount Pictures", movieCompany: "4", tvNetwork: "436" },
+          "sony": { name: "Sony Pictures", movieCompany: "5", tvCompany: "11073" },
+          "a24": { name: "A24", movieCompany: "41077", tvCompany: "41077" },
+          "lionsgate": { name: "Lionsgate", movieCompany: "35", tvCompany: "35" },
+          "mgm": { name: "MGM", movieCompany: "21", tvCompany: "21" }
+        };
+
+        let params = `api_key=${encodeURIComponent(TMDB_API_KEY)}&sort_by=popularity.desc&include_adult=false`;
+        if (isMovie) {
+          if (networkId) {
+            const studio = studioMap[networkId];
+            if (studio && studio.movieCompany) {
+              params += `&with_companies=${encodeURIComponent(studio.movieCompany)}`;
+            } else if (studio && studio.movieProvider) {
+              params += `&with_watch_providers=${encodeURIComponent(studio.movieProvider)}&watch_region=US&with_watch_monetization_types=flatrate`;
+            } else if (/^[0-9]+$/.test(networkId)) {
+              params += `&with_companies=${encodeURIComponent(networkId)}`;
+            }
+          }
+          if (genres) {
+            const movieGenres = genres.split(",").map((g) => {
+              const tr = g.trim();
+              if (tr === "10765") return "878,14";
+              if (tr === "10759") return "28,12";
+              if (tr === "10762") return "10751,16";
+              if (tr === "9648") return "9648,53";
+              return tr;
+            }).filter(Boolean).join(",");
+            if (movieGenres) params += `&with_genres=${encodeURIComponent(movieGenres)}`;
+          }
+          if (eraMatch) {
+            params += `&primary_release_date.gte=${eraMatch[1]}-01-01&primary_release_date.lte=${eraMatch[2]}-12-31`;
+          }
+          params += "&vote_count.gte=30";
+        } else {
+          params += "&include_null_first_air_dates=false";
+          if (networkId) {
+            const studio = studioMap[networkId];
+            if (studio && studio.tvNetwork) {
+              params += `&with_networks=${encodeURIComponent(studio.tvNetwork)}`;
+            } else if (studio && studio.tvCompany) {
+              params += `&with_companies=${encodeURIComponent(studio.tvCompany)}`;
+            } else if (/^[0-9]+$/.test(networkId)) {
+              params += `&with_networks=${encodeURIComponent(networkId)}`;
+            }
+          }
+          if (genres) params += `&with_genres=${encodeURIComponent(genres)}`;
+          if (eraMatch) {
+            params += `&first_air_date.gte=${eraMatch[1]}-01-01&first_air_date.lte=${eraMatch[2]}-12-31`;
+          }
+          params += "&vote_count.gte=30";
+        }
+
+        const discoverEndpoint = isMovie ? "discover/movie" : "discover/tv";
+        const discovered = [];
+        let pagesFetched = 0;
+        for (let page = 1; page <= 4 && discovered.length < limit * 3; page++) {
+          pagesFetched++;
+          const res = await fetch(
+            `https://api.themoviedb.org/3/${discoverEndpoint}?${params}&page=${page}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 3600, cacheEverything: true } }
+          );
+          if (!res.ok) break;
+          const data = await res.json();
+          discovered.push(...(data.results || []));
+          if (page >= (data.total_pages || 1)) break;
+        }
+        if (!discovered.length) {
+          return json({ ok: false, error: "Nothing matched that combination. Try widening the era or the genre." });
+        }
+        let networkLogo = null;
+        if (networkId && /^[0-9]+$/.test(networkId) && !isMovie) {
+          try {
+            const networkRes = await fetch(
+              `https://api.themoviedb.org/3/network/${encodeURIComponent(networkId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+              { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+            );
+            if (networkRes.ok) {
+              const networkData = await networkRes.json();
+              if (networkData.logo_path) networkLogo = `${url.origin}/api/channel-logo?path=${encodeURIComponent(networkData.logo_path)}`;
+            }
+          } catch {
+            // best-effort; fallback to poster
+          }
+        }
+        const candidates = discovered.slice(0, Math.min(limit * 2, 60));
+        const resolved = await mapWithConcurrency(candidates, 8, async (item) => {
+          const details = await fetchTmdbDetails(item.id, isMovie ? "movie" : "tv", TMDB_API_KEY);
+          if (!details.imdbId) return null;
+          const itemTitle = isMovie ? (item.title || item.name) : item.name;
+          const releaseDate = isMovie ? item.release_date : item.first_air_date;
+          const year = (releaseDate || "").slice(0, 4);
+          return {
+            imdbId: details.imdbId,
+            tmdbId: item.id,
+            name: itemTitle,
+            title: itemTitle,
+            year: year || undefined,
+            type: isMovie ? "movie" : "series",
+            kind: isMovie ? "movie" : "series",
+            poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
+            backdrop: item.backdrop_path ? `https://image.tmdb.org/t/p/w780${item.backdrop_path}` : null,
+          };
+        });
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", pagesFetched + (networkId ? 1 : 0) + candidates.length));
+        const finalTitles = resolved.filter(Boolean).slice(0, limit);
+        if (!finalTitles.length) return json({ ok: false, error: "Couldn't resolve any of those titles to IMDB." });
+        return json({ ok: true, items: finalTitles, shows: finalTitles, networkLogo });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
     //
     // Three sources feed this: any mdblist.com/trakt.tv/themoviedb.org list
     // link (someone else's hand-picked lineup, or "Import from link"'s own
@@ -59966,7 +68328,7 @@ function generateSearchVariations(query) {
         ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const details = await fetchTmdbDetails(tmdbId, "movie", TMDB_API_KEY);
         if (!details.imdbId) return json({ ok: false, error: "Couldn't resolve an IMDB id for this movie." });
-        return json({ ok: true, imdbId: details.imdbId });
+        return json({ ok: true, imdbId: details.imdbId, runtime: Number.isInteger(details.runtime) ? details.runtime : null });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }
@@ -66684,6 +75046,319 @@ function generateSearchVariations(query) {
       });
     }
 
+    // --- Sharing a channel, and the Explore Channels directory -----------
+    //
+    // A channel is thousands of episodes; a link is a few hundred characters.
+    // So a share link carries a short code and the channel itself lives here
+    // under channelshare:{code}, which is also what the directory indexes.
+    //
+    // Two levels, deliberately distinct:
+    //   * a SHARE is unlisted and needs no account -- anyone with the code
+    //     can rebuild the channel, nobody can find it who was not given it.
+    //   * PUBLISHING adds it to the Explore Channels directory, and that
+    //     does need a Creator Profile: a listing everyone can see needs an
+    //     owner who can take it down again.
+
+    // /api/channel/share  (POST)
+    //   { channel, description?, publish?, creatorName?, creatorKey? }
+    //     -> { ok, code, url, published }
+    if (path === "/api/channel/share" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const channel = sanitizeSharedChannel(body.channel);
+      if (!channel) {
+        return json({ ok: false, error: "That channel has nothing playable in it to share." }, 400);
+      }
+      const publish = !!body.publish;
+      // Who is writing, when they say so.
+      //
+      // Publishing REQUIRES it -- a listing everyone can see needs an owner
+      // who can take it down. An unlisted share does not, but it may still
+      // carry credentials, and it has to: re-sharing writes over an existing
+      // record, and one created by publishing has an owner, so a re-share
+      // that proved nothing was refused as someone else's link by the very
+      // person who owned it.
+      let owner = "";
+      if (publish) {
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (!auth.ok) return authFailureResponse(auth);
+        owner = auth.username;
+      } else if (body.creatorName && body.creatorKey) {
+        // Best-effort: bad credentials on an unlisted share are simply not
+        // proof, and fall through to the unowned path below. They cannot
+        // buy access to someone else's record either way -- the ownership
+        // check is against `owner`, which stays "" unless this succeeded.
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (auth.ok) owner = auth.username;
+      }
+      const description = (String(body.description || "").trim() || channel.description || "").slice(0, SHARED_CHANNEL_DESCRIPTION_MAX);
+      // Reusing the code someone already has is what makes "Share" on an
+      // edited channel update the link they handed out rather than mint a
+      // second one beside it. Only the owner of a PUBLISHED code may do
+      // that; an unlisted code is its own proof, the same way the link is.
+      let code = String(body.code || "").trim().slice(0, 64);
+      if (code && !/^[A-Za-z0-9_-]+$/.test(code)) code = "";
+      let existing = null;
+      if (code) {
+        try {
+          const raw = await env.CONFIGS.get(`channelshare:${code}`);
+          existing = raw ? JSON.parse(raw) : null;
+        } catch {
+          existing = null;
+        }
+        if (existing && existing.owner && existing.owner !== owner) {
+          return json({ ok: false, error: "That share link belongs to someone else." }, 403);
+        }
+        if (!existing) code = "";
+      }
+      if (!code) code = generateShortId();
+      const record = {
+        code: code,
+        channel: channel,
+        description: description,
+        owner: owner || (existing && existing.owner) || "",
+        published: publish || !!(existing && existing.published),
+        publishedAt: (existing && existing.publishedAt) || Date.now(),
+        updatedAt: Date.now(),
+      };
+      const serialized = JSON.stringify(record);
+      if (serialized.length > SHARED_CHANNEL_BYTES_MAX) {
+        return json({
+          ok: false,
+          error: "That channel is too large to share. Trim it down and try again.",
+        }, 413);
+      }
+      try {
+        await env.CONFIGS.put(`channelshare:${code}`, serialized);
+      } catch {
+        return json({ ok: false, error: "Couldn't save that share link. Please try again." }, 500);
+      }
+      if (record.published) {
+        await upsertPublicChannelIndex(env, code, record).catch(() => {});
+      }
+      ctx.waitUntil(bumpStat(env, publish ? "channels:published" : "channels:shared"));
+      return json({
+        ok: true,
+        code: code,
+        url: `${url.origin}/channel/${code}`,
+        published: record.published,
+      });
+    }
+
+    // /api/channel/share?code=...  (GET) -> { ok, channel, description, owner }
+    //
+    // The import half. Unauthenticated by design: the code IS the
+    // credential for an unlisted channel, and a published one is public.
+    if (path === "/api/channel/share" && request.method === "GET") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      const code = String(url.searchParams.get("code") || "").trim();
+      if (!code || !/^[A-Za-z0-9_-]{1,64}$/.test(code)) {
+        return json({ ok: false, error: "That doesn't look like a channel share link." }, 400);
+      }
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      if (!record || !record.channel) {
+        return json({ ok: false, error: "That channel link has expired or was removed." }, 404);
+      }
+      // Sanitized again on the way out, not only on the way in: a record
+      // written by an older build of this Worker has only been through
+      // whatever that build checked.
+      const channel = sanitizeSharedChannel(record.channel);
+      if (!channel) return json({ ok: false, error: "That channel link is no longer readable." }, 404);
+      return json({
+        ok: true,
+        code: code,
+        channel: channel,
+        description: record.description || "",
+        owner: record.owner || "",
+        published: !!record.published,
+      }, 200, { "Cache-Control": "public, max-age=60" });
+    }
+
+    // /api/channel/directory  (GET)  ?limit=
+    //   -> { ok, channels: [summary, ...] }
+    //
+    // Explore Channels. One index key rather than a KV scan: the directory
+    // is read on every visit to the tab and a prefix scan plus one GET per
+    // entry would be dozens of round trips for a page of cards.
+    if (path === "/api/channel/directory" && request.method === "GET") {
+      if (!env || !env.CONFIGS) return json({ ok: true, channels: [] });
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "60", 10) || 60, 1), PUBLIC_CHANNEL_INDEX_MAX);
+      const sort = String(url.searchParams.get("sort") || "newest");
+      const index = sortPublicChannelIndex(await readPublicChannelIndex(env), sort);
+      return json({
+        ok: true,
+        total: index.length,
+        sort,
+        channels: index.slice(0, limit),
+      }, 200, { "Cache-Control": "public, max-age=120" });
+    }
+
+    // /api/channel/like  (POST)  { code, action: "like"|"unlike", creatorName?, creatorKey? }
+    //   -> { ok, likes, liked }
+    //
+    // The same one-identity-one-vote machinery lists use (applyLikeVote /
+    // likeVoterId): a signed-in visitor votes as themselves, everyone else
+    // as a per-channel hash of their IP, and the count is always DERIVED
+    // from the ledger rather than incremented -- so it cannot drift upward
+    // on its own.
+    //
+    // Only a PUBLISHED channel is likeable. An unlisted share is reachable
+    // by anyone holding its code, and letting those be voted on would mint
+    // a permanent ledger key for every link ever handed out.
+    if (path === "/api/channel/like" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Channel not found." }, 404);
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      // The same answer for "no such channel" and "not published",
+      // deliberately: a distinguishable response is an oracle for which
+      // unlisted codes exist.
+      if (!record || !record.published) return json({ ok: false, error: "Channel not found." }, 404);
+
+      let voterName = "";
+      if (body.creatorName && body.creatorKey) {
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (auth.ok) voterName = auth.username;
+      }
+      const voterId = await likeVoterId(request, env, voterName, `channel:${code}`);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
+      const liked = body.action !== "unlike";
+      const { count, capped } = await applyLikeVote(env, `channellikevoters:${code}`, voterId, liked);
+
+      // The count is denormalised onto both the record and the directory
+      // row, because the directory reads one key and must not open a ledger
+      // per listing. Re-read before writing, and write only this one field:
+      // the record may have been re-published while the ledger was being
+      // updated, and putting a stale snapshot back would take the channel
+      // with it.
+      try {
+        const freshRaw = await env.CONFIGS.get(`channelshare:${code}`);
+        if (freshRaw) {
+          const fresh = JSON.parse(freshRaw);
+          if ((fresh.likes || 0) !== count) {
+            fresh.likes = count;
+            await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(fresh));
+          }
+        }
+      } catch {
+        // The ledger already holds the vote; the denormalised copy catches
+        // up on the next one rather than this failing the request.
+      }
+      await updatePublicChannelIndexEntry(env, code, { likes: count }).catch(() => {});
+      return json({ ok: true, likes: count, liked, capped: capped || undefined }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/added  (POST)  { code }
+    //
+    // "Someone took this channel." Counted so the directory can rank by what
+    // people actually use rather than only by what they upvote -- taking a
+    // channel costs something, so it is the better signal of the two.
+    //
+    // Deliberately not a vote: it is a counter, it only goes up, and it is
+    // best-effort. Nothing is shown to the caller and nothing fails if it
+    // does not land.
+    if (path === "/api/channel/added" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: true });
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: true });
+      const entries = await readPublicChannelIndex(env);
+      const row = entries.find((e) => e && e.code === code);
+      if (!row) return json({ ok: true });
+      await updatePublicChannelIndexEntry(env, code, { adds: (Number(row.adds) || 0) + 1 }).catch(() => {});
+      return json({ ok: true }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/mine  (POST)  { creatorName, creatorKey } -> { ok, channels }
+    //
+    // Everything this creator currently has listed in the directory.
+    //
+    // Exists because a listing can outlive the local channel it came from:
+    // deleting a channel in the builder removes this browser's copy, and if
+    // the withdrawal did not also land -- offline, signed out, a failed
+    // request -- the listing stayed up with nothing left on the device that
+    // knew its code. That is an advertised channel its own owner could no
+    // longer take down. This is how they find it again.
+    if (path === "/api/channel/mine" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true, channels: [] });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+      const entries = await readPublicChannelIndex(env);
+      const mine = entries.filter((e) => e && e.owner === auth.username);
+      return json({ ok: true, channels: mine }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/unpublish  (POST)  { code, creatorName, creatorKey }
+    //
+    // Takes a channel out of the directory. The stored channel itself stays,
+    // so a link already handed out keeps working -- "stop advertising this"
+    // and "break everyone's link" are different asks.
+    if (path === "/api/channel/unpublish" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+      const code = String(body.code || "").trim();
+      if (!code || !/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Missing code." }, 400);
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      if (!record) return json({ ok: false, error: "No such channel." }, 404);
+      if (record.owner && record.owner !== auth.username) {
+        return json({ ok: false, error: "That channel belongs to someone else." }, 403);
+      }
+      record.published = false;
+      record.updatedAt = Date.now();
+      try {
+        await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(record));
+      } catch {}
+      await removePublicChannelIndex(env, code).catch(() => {});
+      return json({ ok: true });
+    }
+
     // /api/creator/lists/delete  (POST)  { creatorName, creatorKey, slug }
     if (path === "/api/creator/lists/delete" && request.method === "POST") {
       let body;
@@ -67357,6 +76032,23 @@ function generateSearchVariations(query) {
           : null,
         fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
         dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
+        // Shows taken off Airing Next, each mapped to the watched episode the
+        // removal was made at -- the account's copy of what removeAiringNextShow
+        // recorded (21_client-custom-list-builder.js). Unlike airingNext itself
+        // this is not derived: no browser can recompute it, so losing it means
+        // every device puts the removed shows straight back.
+        //
+        // A push that does not carry the field at all (an older browser) has
+        // no opinion about removals rather than saying there are none, so the
+        // stored set is carried forward. Defaulting it to {} here would erase
+        // the account's removals on the first autosave from such a browser --
+        // and would erase them in D1 too, since what this route hands
+        // saveCreatorTrackingD1 is this blob, not the raw body.
+        removedAiringNext: (body.removedAiringNext && typeof body.removedAiringNext === "object")
+          ? body.removedAiringNext
+          : ((existingBlob && existingBlob.removedAiringNext && typeof existingBlob.removedAiringNext === "object")
+              ? existingBlob.removedAiringNext
+              : {}),
         trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
         removeWatchedFromWatchlist: typeof body.removeWatchedFromWatchlist === "boolean" ? body.removeWatchedFromWatchlist : true,
         scrobbleFilterUsers: typeof body.scrobbleFilterUsers === "boolean" ? body.scrobbleFilterUsers : false,
@@ -67864,6 +76556,7 @@ function generateSearchVariations(query) {
           : undefined;
         data.fullyWatchedShowIds = Array.isArray(d1Tracking.fullyWatchedShowIds) ? d1Tracking.fullyWatchedShowIds : [];
         data.dismissedContinueWatching = d1Tracking.dismissedContinueWatching && typeof d1Tracking.dismissedContinueWatching === "object" ? d1Tracking.dismissedContinueWatching : {};
+        data.removedAiringNext = d1Tracking.removedAiringNext && typeof d1Tracking.removedAiringNext === "object" ? d1Tracking.removedAiringNext : {};
         data.trackPlayback = typeof d1Tracking.trackPlayback === "boolean" ? d1Tracking.trackPlayback : false;
         data.removeWatchedFromWatchlist = typeof d1Tracking.removeWatchedFromWatchlist === "boolean" ? d1Tracking.removeWatchedFromWatchlist : true;
         data.scrobbleFilterUsers = typeof d1Tracking.scrobbleFilterUsers === "boolean" ? d1Tracking.scrobbleFilterUsers : false;
@@ -67934,6 +76627,7 @@ function generateSearchVariations(query) {
             : undefined;
           data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
           data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
+          data.removedAiringNext = trackingBlob.removedAiringNext && typeof trackingBlob.removedAiringNext === "object" ? trackingBlob.removedAiringNext : {};
           data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;
           data.removeWatchedFromWatchlist = typeof trackingBlob.removeWatchedFromWatchlist === "boolean" ? trackingBlob.removeWatchedFromWatchlist : true;
           data.scrobbleFilterUsers = typeof trackingBlob.scrobbleFilterUsers === "boolean" ? trackingBlob.scrobbleFilterUsers : false;
@@ -69823,6 +78517,164 @@ function generateSearchVariations(query) {
       }, 200, { "Cache-Control": "no-store" });
     }
 
+    // /admin/api/published-channels  (GET)  ?limit=&cursor=
+    //   -> { ok, count, channels: [...], cursor, done }
+    //
+    // The operator's view of the Explore Channels directory.
+    //
+    // Publishing a channel was owner-only with no operator path at all: if
+    // someone published something abusive, the only person who could take it
+    // down was the person who put it there. Published LISTS have had
+    // /admin/api/published-lists for exactly this reason; this is the same
+    // door for channels.
+    //
+    // Two sources, deliberately. The directory index is what the public
+    // actually sees and is one cheap read. The channelshare: keyspace is
+    // everything ever stored, listed or not -- which is where a channel that
+    // was published, reported, and then quietly unpublished still lives, and
+    // where an index write that lost a race leaves an orphan. An operator
+    // needs to be able to see both.
+    if (path === "/admin/api/published-channels" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-storage" });
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 200);
+      const scope = url.searchParams.get("scope") === "all" ? "all" : "listed";
+
+      if (scope === "listed") {
+        const index = await readPublicChannelIndex(env);
+        return json({
+          ok: true,
+          scope,
+          count: index.length,
+          channels: index.slice(0, limit).map((e) => Object.assign({}, e, {
+            url: `${url.origin}/channel/${e.code}`,
+            listed: true,
+          })),
+          done: index.length <= limit,
+          cursor: null,
+        }, 200, { "Cache-Control": "no-store" });
+      }
+
+      const cursor = url.searchParams.get("cursor") || "";
+      let listed;
+      try {
+        listed = await env.CONFIGS.list({ prefix: "channelshare:", limit, ...(cursor ? { cursor } : {}) });
+      } catch {
+        return json({ ok: false, error: "Could not read the stored channels right now." }, 500, { "Cache-Control": "no-store" });
+      }
+      const channels = await Promise.all((listed.keys || []).map(async (k) => {
+        const code = k.name.slice("channelshare:".length);
+        let record = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          record = raw ? JSON.parse(raw) : null;
+        } catch {
+          record = null;
+        }
+        if (!record) {
+          return { code, name: "(unreadable record)", listed: false, url: `${url.origin}/channel/${code}` };
+        }
+        const channel = record.channel || {};
+        return {
+          code,
+          name: channel.name || "(untitled)",
+          description: record.description || channel.description || "",
+          owner: record.owner || "",
+          listed: !!record.published,
+          itemCount: Array.isArray(channel.items) ? channel.items.length : 0,
+          likes: Number(record.likes) || 0,
+          publishedAt: record.publishedAt || null,
+          updatedAt: record.updatedAt || null,
+          url: `${url.origin}/channel/${code}`,
+        };
+      }));
+      return json({
+        ok: true,
+        scope,
+        count: channels.length,
+        channels,
+        cursor: listed.list_complete ? null : (listed.cursor || null),
+        done: !!listed.list_complete,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/channel-moderate  (POST)  { code, action: "unlist"|"delete" }
+    //
+    // Two different acts, kept apart on purpose.
+    //
+    // "unlist" takes the channel out of the directory and leaves the stored
+    // record alone, so a link already handed out keeps working -- the same
+    // thing the owner's own Unpublish does, which is the right response to
+    // "this does not belong in a public directory".
+    //
+    // "delete" removes the record itself, so every link to it stops working.
+    // That is the response to content that should not exist at all, and it
+    // takes the like ledger with it rather than leaving one behind for
+    // whoever mints the same code next.
+    if (path === "/admin/api/channel-moderate" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-storage" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Missing code." }, 400);
+      const action = body.action === "delete" ? "delete" : "unlist";
+
+      // The directory row goes either way, and its removal is checked
+      // rather than assumed: reporting success on a takedown that left the
+      // channel advertised is the failure mode worth designing against.
+      let removedFromIndex = true;
+      try {
+        await removePublicChannelIndex(env, code);
+      } catch {
+        removedFromIndex = false;
+      }
+
+      if (action === "delete") {
+        try {
+          await env.CONFIGS.delete(`channelshare:${code}`);
+          await env.CONFIGS.delete(`channellikevoters:${code}`);
+        } catch {
+          return json({
+            ok: false,
+            error: "Couldn't finish removing that channel. It may still be reachable -- please try again.",
+          }, 500, { "Cache-Control": "no-store" });
+        }
+        if (!removedFromIndex) {
+          return json({
+            ok: false,
+            error: "The channel was deleted but its directory listing could not be removed. Please try again.",
+          }, 500, { "Cache-Control": "no-store" });
+        }
+        return json({ ok: true, action, code }, 200, { "Cache-Control": "no-store" });
+      }
+
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        if (raw) {
+          const record = JSON.parse(raw);
+          record.published = false;
+          record.updatedAt = Date.now();
+          await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(record));
+        }
+      } catch {
+        return json({
+          ok: false,
+          error: "Couldn't mark that channel unlisted. Please try again.",
+        }, 500, { "Cache-Control": "no-store" });
+      }
+      if (!removedFromIndex) {
+        return json({ ok: false, error: "That channel is still listed. Please try again." }, 500, { "Cache-Control": "no-store" });
+      }
+      return json({ ok: true, action, code }, 200, { "Cache-Control": "no-store" });
+    }
+
     // /admin/api/published-lists  (GET)  ?limit=&cursor=
     //   -> { ok, lists: [{ slug, name, type, itemCount, likes, visibility,
     //                      publishedAt, url }], cursor, done }
@@ -70501,6 +79353,99 @@ function generateSearchVariations(query) {
       }
     }
 
+    // --- New on Streaming (admin-only while the shelf ships dark) -----------
+    //
+    // tmdb:new-on-streaming is a real catalog the moment this deploys -- it
+    // resolves, installs into Stremio and pages like any other row -- but it
+    // has no Quick Add card and no Discover entry until
+    // NEW_ON_STREAMING_IN_QUICK_ADD is flipped (00_constants.js). These three
+    // routes are how it gets judged before that: what the sweep has actually
+    // collected, a way to push the walk along without waiting out the cron,
+    // and a preview that reads through the SAME fetchNewOnStreaming the
+    // add-on serves, so what the dashboard shows is what Stremio would get
+    // rather than a second implementation that can drift from it.
+
+    // /admin/api/new-on-streaming -> the sweep's own state: cursor position,
+    // walk generation, rows per service, and how much of it is seeded (dated
+    // by the title's release because the first walk had nothing to compare
+    // against) versus observed (a genuine arrival this add-on watched happen).
+    // The seeded/observed split is the one number that says whether the list
+    // is working yet: observed only starts growing after walk 0 completes.
+    if (path === "/admin/api/new-on-streaming" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      try {
+        const status = await newOnStreamingStatus(env);
+        return json({ ok: true, status }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/new-on-streaming/sweep -> runs sweep units right now, and
+    // optionally the episode re-bump with them.
+    //
+    // Bounded at 40 units because this runs inside a REQUEST, not the cron
+    // tick, so it spends the request's own subrequest allowance: 40 units is
+    // up to 840 outbound fetches against the paid plan's 10,000, and on a
+    // first walk (when every title needs an IMDb resolution) that ceiling is
+    // real rather than theoretical.
+    if (path === "/admin/api/new-on-streaming/sweep" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (e) {
+        body = {};
+      }
+      const requested = parseInt(body && body.units, 10);
+      const units = Number.isFinite(requested) ? Math.max(1, Math.min(40, requested)) : NEW_ON_STREAMING_PAGES_PER_TICK;
+      const withBump = body && body.bump === true;
+      try {
+        const sweep = await sweepNewOnStreaming(env, ctx, units * NEW_ON_STREAMING_SWEEP_FETCHES, units);
+        let bump = null;
+        if (withBump) bump = await bumpNewOnStreamingEpisodes(env, ctx, NEW_ON_STREAMING_SWEEP_FETCHES * 4);
+        // Counted the same way every other shared-key TMDB path is, so a
+        // dashboard sweep shows up in the API Usage tab rather than looking
+        // like the key spent itself.
+        const spent = (sweep && sweep.units ? sweep.units : 0) + (sweep && sweep.resolved ? sweep.resolved : 0);
+        if (spent > 0) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", spent));
+        return json({ ok: true, sweep, bump }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/new-on-streaming/preview?type=movie&services=netflix+hulu&skip=0
+    // -> exactly what a Stremio catalog request for this row returns, through
+    // fetchNewOnStreaming itself. `source` comes back so the url under test
+    // can be copied straight into a catalog row.
+    if (path === "/admin/api/new-on-streaming/preview" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      const type = url.searchParams.get("type") === "series" ? "series" : "movie";
+      const servicesParam = (url.searchParams.get("services") || "").trim();
+      const skipParam = parseInt(url.searchParams.get("skip"), 10);
+      const skip = Number.isFinite(skipParam) && skipParam > 0 ? skipParam : 0;
+      const region = (url.searchParams.get("region") || "US").trim().toUpperCase().slice(0, 2) || "US";
+      const source = servicesParam ? `tmdb:new-on-streaming:${servicesParam}` : "tmdb:new-on-streaming";
+      try {
+        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming" }, skip, { env, ctx, region });
+        return json({
+          ok: true,
+          source,
+          type,
+          region,
+          skip,
+          totalItems: items && items.totalItems != null ? items.totalItems : null,
+          items: (items || []).slice(0, 60),
+        }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
     if (path === "/admin/login" && request.method === "POST") {
       if (!env || !env.ADMIN_KEY) {
         return new Response(
@@ -70844,10 +79789,34 @@ export default {
     // they always were: neither issues outbound fetches, and holding the index
     // rebuild behind a TMDB sweep would delay it for no reason.
     const episodeSweep = guard("checkForNewEpisodes", checkForNewEpisodes(env, episodeBudget));
+    // New on Streaming is paid for out of the episode sweep's own unreachable
+    // reserve, NOT out of the pre-warm's share.
+    //
+    // episodeBudget is half the tick by CRON_EPISODE_CHECK_SHARE, but
+    // checkForNewEpisodes stops at CRON_EPISODE_CHECK_MAX shows at
+    // CRON_EPISODE_CHECK_FETCHES each -- 300 fetches against a 5,000 reserve
+    // on the default budget. Spending a quarter of the 4,700 nobody can reach
+    // leaves `cronBudget - episodeBudget` intact for the pre-warm, which is
+    // what keeps its own guarantee true: the whole chart list still fits in
+    // one tick, so no chart is deferred to the next one.
+    //
+    // Chained behind the episode sweep for the same reason the pre-warm is --
+    // the thing a person is actually waiting on has to be written first --
+    // and ahead of the pre-warm because it is far cheaper: a dozen pages
+    // against ~105 fetches for a single chart, so putting it last would mean
+    // it never ran on a tick that got cut short.
+    const episodeCeiling = Math.min(episodeBudget, CRON_EPISODE_CHECK_MAX * CRON_EPISODE_CHECK_FETCHES);
+    const newOnStreamingBudget = Math.floor((episodeBudget - episodeCeiling) * CRON_NEW_ON_STREAMING_SHARE);
+    const streamingSweep = guard(
+      "sweepNewOnStreaming",
+      episodeSweep.then(() => sweepNewOnStreaming(env, ctx, newOnStreamingBudget))
+    );
     ctx.waitUntil(
       Promise.all([
         episodeSweep,
-        guard("prewarmSharedCatalogs", episodeSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
+        streamingSweep,
+        guard("bumpNewOnStreamingEpisodes", streamingSweep.then(() => bumpNewOnStreamingEpisodes(env, ctx, newOnStreamingBudget))),
+        guard("prewarmSharedCatalogs", streamingSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
         // Cheap (one sqlite_master read per tick) and the only thing that puts
         // "you have not run migration N" somewhere an operator will see it
         // without going looking. The admin panel shows the same thing on

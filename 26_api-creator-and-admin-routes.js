@@ -2286,6 +2286,319 @@
       });
     }
 
+    // --- Sharing a channel, and the Explore Channels directory -----------
+    //
+    // A channel is thousands of episodes; a link is a few hundred characters.
+    // So a share link carries a short code and the channel itself lives here
+    // under channelshare:{code}, which is also what the directory indexes.
+    //
+    // Two levels, deliberately distinct:
+    //   * a SHARE is unlisted and needs no account -- anyone with the code
+    //     can rebuild the channel, nobody can find it who was not given it.
+    //   * PUBLISHING adds it to the Explore Channels directory, and that
+    //     does need a Creator Profile: a listing everyone can see needs an
+    //     owner who can take it down again.
+
+    // /api/channel/share  (POST)
+    //   { channel, description?, publish?, creatorName?, creatorKey? }
+    //     -> { ok, code, url, published }
+    if (path === "/api/channel/share" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const channel = sanitizeSharedChannel(body.channel);
+      if (!channel) {
+        return json({ ok: false, error: "That channel has nothing playable in it to share." }, 400);
+      }
+      const publish = !!body.publish;
+      // Who is writing, when they say so.
+      //
+      // Publishing REQUIRES it -- a listing everyone can see needs an owner
+      // who can take it down. An unlisted share does not, but it may still
+      // carry credentials, and it has to: re-sharing writes over an existing
+      // record, and one created by publishing has an owner, so a re-share
+      // that proved nothing was refused as someone else's link by the very
+      // person who owned it.
+      let owner = "";
+      if (publish) {
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (!auth.ok) return authFailureResponse(auth);
+        owner = auth.username;
+      } else if (body.creatorName && body.creatorKey) {
+        // Best-effort: bad credentials on an unlisted share are simply not
+        // proof, and fall through to the unowned path below. They cannot
+        // buy access to someone else's record either way -- the ownership
+        // check is against `owner`, which stays "" unless this succeeded.
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (auth.ok) owner = auth.username;
+      }
+      const description = (String(body.description || "").trim() || channel.description || "").slice(0, SHARED_CHANNEL_DESCRIPTION_MAX);
+      // Reusing the code someone already has is what makes "Share" on an
+      // edited channel update the link they handed out rather than mint a
+      // second one beside it. Only the owner of a PUBLISHED code may do
+      // that; an unlisted code is its own proof, the same way the link is.
+      let code = String(body.code || "").trim().slice(0, 64);
+      if (code && !/^[A-Za-z0-9_-]+$/.test(code)) code = "";
+      let existing = null;
+      if (code) {
+        try {
+          const raw = await env.CONFIGS.get(`channelshare:${code}`);
+          existing = raw ? JSON.parse(raw) : null;
+        } catch {
+          existing = null;
+        }
+        if (existing && existing.owner && existing.owner !== owner) {
+          return json({ ok: false, error: "That share link belongs to someone else." }, 403);
+        }
+        if (!existing) code = "";
+      }
+      if (!code) code = generateShortId();
+      const record = {
+        code: code,
+        channel: channel,
+        description: description,
+        owner: owner || (existing && existing.owner) || "",
+        published: publish || !!(existing && existing.published),
+        publishedAt: (existing && existing.publishedAt) || Date.now(),
+        updatedAt: Date.now(),
+      };
+      const serialized = JSON.stringify(record);
+      if (serialized.length > SHARED_CHANNEL_BYTES_MAX) {
+        return json({
+          ok: false,
+          error: "That channel is too large to share. Trim it down and try again.",
+        }, 413);
+      }
+      try {
+        await env.CONFIGS.put(`channelshare:${code}`, serialized);
+      } catch {
+        return json({ ok: false, error: "Couldn't save that share link. Please try again." }, 500);
+      }
+      if (record.published) {
+        await upsertPublicChannelIndex(env, code, record).catch(() => {});
+      }
+      ctx.waitUntil(bumpStat(env, publish ? "channels:published" : "channels:shared"));
+      return json({
+        ok: true,
+        code: code,
+        url: `${url.origin}/channel/${code}`,
+        published: record.published,
+      });
+    }
+
+    // /api/channel/share?code=...  (GET) -> { ok, channel, description, owner }
+    //
+    // The import half. Unauthenticated by design: the code IS the
+    // credential for an unlisted channel, and a published one is public.
+    if (path === "/api/channel/share" && request.method === "GET") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      const code = String(url.searchParams.get("code") || "").trim();
+      if (!code || !/^[A-Za-z0-9_-]{1,64}$/.test(code)) {
+        return json({ ok: false, error: "That doesn't look like a channel share link." }, 400);
+      }
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      if (!record || !record.channel) {
+        return json({ ok: false, error: "That channel link has expired or was removed." }, 404);
+      }
+      // Sanitized again on the way out, not only on the way in: a record
+      // written by an older build of this Worker has only been through
+      // whatever that build checked.
+      const channel = sanitizeSharedChannel(record.channel);
+      if (!channel) return json({ ok: false, error: "That channel link is no longer readable." }, 404);
+      return json({
+        ok: true,
+        code: code,
+        channel: channel,
+        description: record.description || "",
+        owner: record.owner || "",
+        published: !!record.published,
+      }, 200, { "Cache-Control": "public, max-age=60" });
+    }
+
+    // /api/channel/directory  (GET)  ?limit=
+    //   -> { ok, channels: [summary, ...] }
+    //
+    // Explore Channels. One index key rather than a KV scan: the directory
+    // is read on every visit to the tab and a prefix scan plus one GET per
+    // entry would be dozens of round trips for a page of cards.
+    if (path === "/api/channel/directory" && request.method === "GET") {
+      if (!env || !env.CONFIGS) return json({ ok: true, channels: [] });
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "60", 10) || 60, 1), PUBLIC_CHANNEL_INDEX_MAX);
+      const sort = String(url.searchParams.get("sort") || "newest");
+      const index = sortPublicChannelIndex(await readPublicChannelIndex(env), sort);
+      return json({
+        ok: true,
+        total: index.length,
+        sort,
+        channels: index.slice(0, limit),
+      }, 200, { "Cache-Control": "public, max-age=120" });
+    }
+
+    // /api/channel/like  (POST)  { code, action: "like"|"unlike", creatorName?, creatorKey? }
+    //   -> { ok, likes, liked }
+    //
+    // The same one-identity-one-vote machinery lists use (applyLikeVote /
+    // likeVoterId): a signed-in visitor votes as themselves, everyone else
+    // as a per-channel hash of their IP, and the count is always DERIVED
+    // from the ledger rather than incremented -- so it cannot drift upward
+    // on its own.
+    //
+    // Only a PUBLISHED channel is likeable. An unlisted share is reachable
+    // by anyone holding its code, and letting those be voted on would mint
+    // a permanent ledger key for every link ever handed out.
+    if (path === "/api/channel/like" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Channel not found." }, 404);
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      // The same answer for "no such channel" and "not published",
+      // deliberately: a distinguishable response is an oracle for which
+      // unlisted codes exist.
+      if (!record || !record.published) return json({ ok: false, error: "Channel not found." }, 404);
+
+      let voterName = "";
+      if (body.creatorName && body.creatorKey) {
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (auth.ok) voterName = auth.username;
+      }
+      const voterId = await likeVoterId(request, env, voterName, `channel:${code}`);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
+      const liked = body.action !== "unlike";
+      const { count, capped } = await applyLikeVote(env, `channellikevoters:${code}`, voterId, liked);
+
+      // The count is denormalised onto both the record and the directory
+      // row, because the directory reads one key and must not open a ledger
+      // per listing. Re-read before writing, and write only this one field:
+      // the record may have been re-published while the ledger was being
+      // updated, and putting a stale snapshot back would take the channel
+      // with it.
+      try {
+        const freshRaw = await env.CONFIGS.get(`channelshare:${code}`);
+        if (freshRaw) {
+          const fresh = JSON.parse(freshRaw);
+          if ((fresh.likes || 0) !== count) {
+            fresh.likes = count;
+            await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(fresh));
+          }
+        }
+      } catch {
+        // The ledger already holds the vote; the denormalised copy catches
+        // up on the next one rather than this failing the request.
+      }
+      await updatePublicChannelIndexEntry(env, code, { likes: count }).catch(() => {});
+      return json({ ok: true, likes: count, liked, capped: capped || undefined }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/added  (POST)  { code }
+    //
+    // "Someone took this channel." Counted so the directory can rank by what
+    // people actually use rather than only by what they upvote -- taking a
+    // channel costs something, so it is the better signal of the two.
+    //
+    // Deliberately not a vote: it is a counter, it only goes up, and it is
+    // best-effort. Nothing is shown to the caller and nothing fails if it
+    // does not land.
+    if (path === "/api/channel/added" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: true });
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: true });
+      const entries = await readPublicChannelIndex(env);
+      const row = entries.find((e) => e && e.code === code);
+      if (!row) return json({ ok: true });
+      await updatePublicChannelIndexEntry(env, code, { adds: (Number(row.adds) || 0) + 1 }).catch(() => {});
+      return json({ ok: true }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/mine  (POST)  { creatorName, creatorKey } -> { ok, channels }
+    //
+    // Everything this creator currently has listed in the directory.
+    //
+    // Exists because a listing can outlive the local channel it came from:
+    // deleting a channel in the builder removes this browser's copy, and if
+    // the withdrawal did not also land -- offline, signed out, a failed
+    // request -- the listing stayed up with nothing left on the device that
+    // knew its code. That is an advertised channel its own owner could no
+    // longer take down. This is how they find it again.
+    if (path === "/api/channel/mine" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true, channels: [] });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+      const entries = await readPublicChannelIndex(env);
+      const mine = entries.filter((e) => e && e.owner === auth.username);
+      return json({ ok: true, channels: mine }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/unpublish  (POST)  { code, creatorName, creatorKey }
+    //
+    // Takes a channel out of the directory. The stored channel itself stays,
+    // so a link already handed out keeps working -- "stop advertising this"
+    // and "break everyone's link" are different asks.
+    if (path === "/api/channel/unpublish" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+      const code = String(body.code || "").trim();
+      if (!code || !/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Missing code." }, 400);
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      if (!record) return json({ ok: false, error: "No such channel." }, 404);
+      if (record.owner && record.owner !== auth.username) {
+        return json({ ok: false, error: "That channel belongs to someone else." }, 403);
+      }
+      record.published = false;
+      record.updatedAt = Date.now();
+      try {
+        await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(record));
+      } catch {}
+      await removePublicChannelIndex(env, code).catch(() => {});
+      return json({ ok: true });
+    }
+
     // /api/creator/lists/delete  (POST)  { creatorName, creatorKey, slug }
     if (path === "/api/creator/lists/delete" && request.method === "POST") {
       let body;
@@ -2959,6 +3272,23 @@
           : null,
         fullyWatchedShowIds: Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : [],
         dismissedContinueWatching: body.dismissedContinueWatching && typeof body.dismissedContinueWatching === "object" ? body.dismissedContinueWatching : {},
+        // Shows taken off Airing Next, each mapped to the watched episode the
+        // removal was made at -- the account's copy of what removeAiringNextShow
+        // recorded (21_client-custom-list-builder.js). Unlike airingNext itself
+        // this is not derived: no browser can recompute it, so losing it means
+        // every device puts the removed shows straight back.
+        //
+        // A push that does not carry the field at all (an older browser) has
+        // no opinion about removals rather than saying there are none, so the
+        // stored set is carried forward. Defaulting it to {} here would erase
+        // the account's removals on the first autosave from such a browser --
+        // and would erase them in D1 too, since what this route hands
+        // saveCreatorTrackingD1 is this blob, not the raw body.
+        removedAiringNext: (body.removedAiringNext && typeof body.removedAiringNext === "object")
+          ? body.removedAiringNext
+          : ((existingBlob && existingBlob.removedAiringNext && typeof existingBlob.removedAiringNext === "object")
+              ? existingBlob.removedAiringNext
+              : {}),
         trackPlayback: typeof body.trackPlayback === "boolean" ? body.trackPlayback : false,
         removeWatchedFromWatchlist: typeof body.removeWatchedFromWatchlist === "boolean" ? body.removeWatchedFromWatchlist : true,
         scrobbleFilterUsers: typeof body.scrobbleFilterUsers === "boolean" ? body.scrobbleFilterUsers : false,
@@ -3466,6 +3796,7 @@
           : undefined;
         data.fullyWatchedShowIds = Array.isArray(d1Tracking.fullyWatchedShowIds) ? d1Tracking.fullyWatchedShowIds : [];
         data.dismissedContinueWatching = d1Tracking.dismissedContinueWatching && typeof d1Tracking.dismissedContinueWatching === "object" ? d1Tracking.dismissedContinueWatching : {};
+        data.removedAiringNext = d1Tracking.removedAiringNext && typeof d1Tracking.removedAiringNext === "object" ? d1Tracking.removedAiringNext : {};
         data.trackPlayback = typeof d1Tracking.trackPlayback === "boolean" ? d1Tracking.trackPlayback : false;
         data.removeWatchedFromWatchlist = typeof d1Tracking.removeWatchedFromWatchlist === "boolean" ? d1Tracking.removeWatchedFromWatchlist : true;
         data.scrobbleFilterUsers = typeof d1Tracking.scrobbleFilterUsers === "boolean" ? d1Tracking.scrobbleFilterUsers : false;
@@ -3536,6 +3867,7 @@
             : undefined;
           data.fullyWatchedShowIds = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds : [];
           data.dismissedContinueWatching = trackingBlob.dismissedContinueWatching && typeof trackingBlob.dismissedContinueWatching === "object" ? trackingBlob.dismissedContinueWatching : {};
+          data.removedAiringNext = trackingBlob.removedAiringNext && typeof trackingBlob.removedAiringNext === "object" ? trackingBlob.removedAiringNext : {};
           data.trackPlayback = typeof trackingBlob.trackPlayback === "boolean" ? trackingBlob.trackPlayback : false;
           data.removeWatchedFromWatchlist = typeof trackingBlob.removeWatchedFromWatchlist === "boolean" ? trackingBlob.removeWatchedFromWatchlist : true;
           data.scrobbleFilterUsers = typeof trackingBlob.scrobbleFilterUsers === "boolean" ? trackingBlob.scrobbleFilterUsers : false;
@@ -5425,6 +5757,164 @@
       }, 200, { "Cache-Control": "no-store" });
     }
 
+    // /admin/api/published-channels  (GET)  ?limit=&cursor=
+    //   -> { ok, count, channels: [...], cursor, done }
+    //
+    // The operator's view of the Explore Channels directory.
+    //
+    // Publishing a channel was owner-only with no operator path at all: if
+    // someone published something abusive, the only person who could take it
+    // down was the person who put it there. Published LISTS have had
+    // /admin/api/published-lists for exactly this reason; this is the same
+    // door for channels.
+    //
+    // Two sources, deliberately. The directory index is what the public
+    // actually sees and is one cheap read. The channelshare: keyspace is
+    // everything ever stored, listed or not -- which is where a channel that
+    // was published, reported, and then quietly unpublished still lives, and
+    // where an index write that lost a race leaves an orphan. An operator
+    // needs to be able to see both.
+    if (path === "/admin/api/published-channels" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-storage" });
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 200);
+      const scope = url.searchParams.get("scope") === "all" ? "all" : "listed";
+
+      if (scope === "listed") {
+        const index = await readPublicChannelIndex(env);
+        return json({
+          ok: true,
+          scope,
+          count: index.length,
+          channels: index.slice(0, limit).map((e) => Object.assign({}, e, {
+            url: `${url.origin}/channel/${e.code}`,
+            listed: true,
+          })),
+          done: index.length <= limit,
+          cursor: null,
+        }, 200, { "Cache-Control": "no-store" });
+      }
+
+      const cursor = url.searchParams.get("cursor") || "";
+      let listed;
+      try {
+        listed = await env.CONFIGS.list({ prefix: "channelshare:", limit, ...(cursor ? { cursor } : {}) });
+      } catch {
+        return json({ ok: false, error: "Could not read the stored channels right now." }, 500, { "Cache-Control": "no-store" });
+      }
+      const channels = await Promise.all((listed.keys || []).map(async (k) => {
+        const code = k.name.slice("channelshare:".length);
+        let record = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          record = raw ? JSON.parse(raw) : null;
+        } catch {
+          record = null;
+        }
+        if (!record) {
+          return { code, name: "(unreadable record)", listed: false, url: `${url.origin}/channel/${code}` };
+        }
+        const channel = record.channel || {};
+        return {
+          code,
+          name: channel.name || "(untitled)",
+          description: record.description || channel.description || "",
+          owner: record.owner || "",
+          listed: !!record.published,
+          itemCount: Array.isArray(channel.items) ? channel.items.length : 0,
+          likes: Number(record.likes) || 0,
+          publishedAt: record.publishedAt || null,
+          updatedAt: record.updatedAt || null,
+          url: `${url.origin}/channel/${code}`,
+        };
+      }));
+      return json({
+        ok: true,
+        scope,
+        count: channels.length,
+        channels,
+        cursor: listed.list_complete ? null : (listed.cursor || null),
+        done: !!listed.list_complete,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/channel-moderate  (POST)  { code, action: "unlist"|"delete" }
+    //
+    // Two different acts, kept apart on purpose.
+    //
+    // "unlist" takes the channel out of the directory and leaves the stored
+    // record alone, so a link already handed out keeps working -- the same
+    // thing the owner's own Unpublish does, which is the right response to
+    // "this does not belong in a public directory".
+    //
+    // "delete" removes the record itself, so every link to it stops working.
+    // That is the response to content that should not exist at all, and it
+    // takes the like ledger with it rather than leaving one behind for
+    // whoever mints the same code next.
+    if (path === "/admin/api/channel-moderate" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-storage" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Missing code." }, 400);
+      const action = body.action === "delete" ? "delete" : "unlist";
+
+      // The directory row goes either way, and its removal is checked
+      // rather than assumed: reporting success on a takedown that left the
+      // channel advertised is the failure mode worth designing against.
+      let removedFromIndex = true;
+      try {
+        await removePublicChannelIndex(env, code);
+      } catch {
+        removedFromIndex = false;
+      }
+
+      if (action === "delete") {
+        try {
+          await env.CONFIGS.delete(`channelshare:${code}`);
+          await env.CONFIGS.delete(`channellikevoters:${code}`);
+        } catch {
+          return json({
+            ok: false,
+            error: "Couldn't finish removing that channel. It may still be reachable -- please try again.",
+          }, 500, { "Cache-Control": "no-store" });
+        }
+        if (!removedFromIndex) {
+          return json({
+            ok: false,
+            error: "The channel was deleted but its directory listing could not be removed. Please try again.",
+          }, 500, { "Cache-Control": "no-store" });
+        }
+        return json({ ok: true, action, code }, 200, { "Cache-Control": "no-store" });
+      }
+
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        if (raw) {
+          const record = JSON.parse(raw);
+          record.published = false;
+          record.updatedAt = Date.now();
+          await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(record));
+        }
+      } catch {
+        return json({
+          ok: false,
+          error: "Couldn't mark that channel unlisted. Please try again.",
+        }, 500, { "Cache-Control": "no-store" });
+      }
+      if (!removedFromIndex) {
+        return json({ ok: false, error: "That channel is still listed. Please try again." }, 500, { "Cache-Control": "no-store" });
+      }
+      return json({ ok: true, action, code }, 200, { "Cache-Control": "no-store" });
+    }
+
     // /admin/api/published-lists  (GET)  ?limit=&cursor=
     //   -> { ok, lists: [{ slug, name, type, itemCount, likes, visibility,
     //                      publishedAt, url }], cursor, done }
@@ -6103,6 +6593,99 @@
       }
     }
 
+    // --- New on Streaming (admin-only while the shelf ships dark) -----------
+    //
+    // tmdb:new-on-streaming is a real catalog the moment this deploys -- it
+    // resolves, installs into Stremio and pages like any other row -- but it
+    // has no Quick Add card and no Discover entry until
+    // NEW_ON_STREAMING_IN_QUICK_ADD is flipped (00_constants.js). These three
+    // routes are how it gets judged before that: what the sweep has actually
+    // collected, a way to push the walk along without waiting out the cron,
+    // and a preview that reads through the SAME fetchNewOnStreaming the
+    // add-on serves, so what the dashboard shows is what Stremio would get
+    // rather than a second implementation that can drift from it.
+
+    // /admin/api/new-on-streaming -> the sweep's own state: cursor position,
+    // walk generation, rows per service, and how much of it is seeded (dated
+    // by the title's release because the first walk had nothing to compare
+    // against) versus observed (a genuine arrival this add-on watched happen).
+    // The seeded/observed split is the one number that says whether the list
+    // is working yet: observed only starts growing after walk 0 completes.
+    if (path === "/admin/api/new-on-streaming" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      try {
+        const status = await newOnStreamingStatus(env);
+        return json({ ok: true, status }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/new-on-streaming/sweep -> runs sweep units right now, and
+    // optionally the episode re-bump with them.
+    //
+    // Bounded at 40 units because this runs inside a REQUEST, not the cron
+    // tick, so it spends the request's own subrequest allowance: 40 units is
+    // up to 840 outbound fetches against the paid plan's 10,000, and on a
+    // first walk (when every title needs an IMDb resolution) that ceiling is
+    // real rather than theoretical.
+    if (path === "/admin/api/new-on-streaming/sweep" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (e) {
+        body = {};
+      }
+      const requested = parseInt(body && body.units, 10);
+      const units = Number.isFinite(requested) ? Math.max(1, Math.min(40, requested)) : NEW_ON_STREAMING_PAGES_PER_TICK;
+      const withBump = body && body.bump === true;
+      try {
+        const sweep = await sweepNewOnStreaming(env, ctx, units * NEW_ON_STREAMING_SWEEP_FETCHES, units);
+        let bump = null;
+        if (withBump) bump = await bumpNewOnStreamingEpisodes(env, ctx, NEW_ON_STREAMING_SWEEP_FETCHES * 4);
+        // Counted the same way every other shared-key TMDB path is, so a
+        // dashboard sweep shows up in the API Usage tab rather than looking
+        // like the key spent itself.
+        const spent = (sweep && sweep.units ? sweep.units : 0) + (sweep && sweep.resolved ? sweep.resolved : 0);
+        if (spent > 0) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", spent));
+        return json({ ok: true, sweep, bump }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/new-on-streaming/preview?type=movie&services=netflix+hulu&skip=0
+    // -> exactly what a Stremio catalog request for this row returns, through
+    // fetchNewOnStreaming itself. `source` comes back so the url under test
+    // can be copied straight into a catalog row.
+    if (path === "/admin/api/new-on-streaming/preview" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      const type = url.searchParams.get("type") === "series" ? "series" : "movie";
+      const servicesParam = (url.searchParams.get("services") || "").trim();
+      const skipParam = parseInt(url.searchParams.get("skip"), 10);
+      const skip = Number.isFinite(skipParam) && skipParam > 0 ? skipParam : 0;
+      const region = (url.searchParams.get("region") || "US").trim().toUpperCase().slice(0, 2) || "US";
+      const source = servicesParam ? `tmdb:new-on-streaming:${servicesParam}` : "tmdb:new-on-streaming";
+      try {
+        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming" }, skip, { env, ctx, region });
+        return json({
+          ok: true,
+          source,
+          type,
+          region,
+          skip,
+          totalItems: items && items.totalItems != null ? items.totalItems : null,
+          items: (items || []).slice(0, 60),
+        }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
     if (path === "/admin/login" && request.method === "POST") {
       if (!env || !env.ADMIN_KEY) {
         return new Response(
@@ -6446,10 +7029,34 @@ export default {
     // they always were: neither issues outbound fetches, and holding the index
     // rebuild behind a TMDB sweep would delay it for no reason.
     const episodeSweep = guard("checkForNewEpisodes", checkForNewEpisodes(env, episodeBudget));
+    // New on Streaming is paid for out of the episode sweep's own unreachable
+    // reserve, NOT out of the pre-warm's share.
+    //
+    // episodeBudget is half the tick by CRON_EPISODE_CHECK_SHARE, but
+    // checkForNewEpisodes stops at CRON_EPISODE_CHECK_MAX shows at
+    // CRON_EPISODE_CHECK_FETCHES each -- 300 fetches against a 5,000 reserve
+    // on the default budget. Spending a quarter of the 4,700 nobody can reach
+    // leaves `cronBudget - episodeBudget` intact for the pre-warm, which is
+    // what keeps its own guarantee true: the whole chart list still fits in
+    // one tick, so no chart is deferred to the next one.
+    //
+    // Chained behind the episode sweep for the same reason the pre-warm is --
+    // the thing a person is actually waiting on has to be written first --
+    // and ahead of the pre-warm because it is far cheaper: a dozen pages
+    // against ~105 fetches for a single chart, so putting it last would mean
+    // it never ran on a tick that got cut short.
+    const episodeCeiling = Math.min(episodeBudget, CRON_EPISODE_CHECK_MAX * CRON_EPISODE_CHECK_FETCHES);
+    const newOnStreamingBudget = Math.floor((episodeBudget - episodeCeiling) * CRON_NEW_ON_STREAMING_SHARE);
+    const streamingSweep = guard(
+      "sweepNewOnStreaming",
+      episodeSweep.then(() => sweepNewOnStreaming(env, ctx, newOnStreamingBudget))
+    );
     ctx.waitUntil(
       Promise.all([
         episodeSweep,
-        guard("prewarmSharedCatalogs", episodeSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
+        streamingSweep,
+        guard("bumpNewOnStreamingEpisodes", streamingSweep.then(() => bumpNewOnStreamingEpisodes(env, ctx, newOnStreamingBudget))),
+        guard("prewarmSharedCatalogs", streamingSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
         // Cheap (one sqlite_master read per tick) and the only thing that puts
         // "you have not run migration N" somewhere an operator will see it
         // without going looking. The admin panel shows the same thing on

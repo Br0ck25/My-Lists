@@ -136,6 +136,10 @@ function openMdblistAiringNextDetailsPage() {
       subtitle: label.subtitle,
       poster: it.poster,
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId || it.id,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: isPremiere,
       isSeasonFinale: isFinale,
@@ -272,8 +276,7 @@ function renderMyMdblistLists(lists) {
             const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
             let dateBadge = '';
             if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-              const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-              if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+              dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
             }
             const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
             const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -943,6 +946,10 @@ function openTraktAiringNextDetailsPage() {
       subtitle: label.subtitle,
       poster: it.poster,
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId || it.id,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: isPremiere,
       isSeasonFinale: isFinale,
@@ -1084,8 +1091,7 @@ function renderMyPrivateTraktLists(lists) {
             const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
             let dateBadge = '';
             if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-              const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-              if (badgeText) dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
+              dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
             }
             const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
             const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -1750,6 +1756,10 @@ function openSimklAiringNextDetailsPage() {
       subtitle: label.subtitle,
       poster: it.poster,
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId || it.id,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: isPremiere,
       isSeasonFinale: isFinale,
@@ -1882,10 +1892,7 @@ function renderMySimklLists(lists) {
           const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
           let dateBadge = '';
           if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-            const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-            if (badgeText) {
-              dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
-            }
+            dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
           }
           const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
           const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;

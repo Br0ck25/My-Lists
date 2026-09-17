@@ -4,6 +4,7 @@
     <button type="button" class="subnav-pill active" data-sub="my-channels" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
     <button type="button" class="subnav-pill" data-sub="storylines" onclick="switchChannelsSubmenu('storylines', this)">Storylines &amp; Universes</button>
     <button type="button" class="subnav-pill" data-sub="quickadd" onclick="switchChannelsSubmenu('quickadd', this)">Quick Add</button>
+    <button type="button" class="subnav-pill" data-sub="explore" onclick="switchChannelsSubmenu('explore', this)">Explore Channels</button>
     <button type="button" class="subnav-pill" data-sub="import" onclick="switchChannelsSubmenu('import', this)">Import</button>
   </div>
 
@@ -36,9 +37,24 @@
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="shelf-title">My Channels</h2>
-        <button type="button" class="primary lc-btn" onclick="openBuildCustomChannel()">+ New Channel</button>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button type="button" class="secondary lc-btn" onclick="createNextUpChannel(this)" title="A channel that always plays the next episode of everything you have on the go">+ Next Up Channel</button>
+          <button type="button" class="primary lc-btn" onclick="openBuildCustomChannel()">+ New Channel</button>
+        </div>
       </div>
-      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
+      <div id="channelNextUpStatus" style="margin-bottom:8px;"></div>
+      <div class="row" id="myChannelsToolbar" style="margin-bottom:10px; gap:8px;">
+        <input type="text" id="myChannelsSearchInput" aria-label="Search your channels" placeholder="Search your channels..." oninput="setMyChannelsSearch(this.value)">
+        <select id="myChannelsSortSelect" aria-label="Order your channels" onchange="setMyChannelsSort(this.value)" style="flex:none; width:auto;">
+          <option value="recent">Recently updated</option>
+          <option value="created">Recently created</option>
+          <option value="name">Name (A&ndash;Z)</option>
+          <option value="size">Most episodes</option>
+          <option value="manual">My order (drag to arrange)</option>
+        </select>
+      </div>
+      <div id="myChannelsUndoBar" style="display:none; margin-bottom:10px;"></div>
       <div id="myCreatedChannelsList"><p style="color:var(--muted); font-size:0.85rem;"><small>No channels created yet. Tap <strong>+ New Channel</strong> above or add a popular network in <strong>Quick Add</strong>.</small></p></div>
     </div>
 
@@ -74,6 +90,77 @@
 
   <!-- Submenu 2: Quick Add Popular Networks -->
   <div class="channels-subpanel" id="channelsSubQuickAdd" style="display:none;">
+    <div class="panel" style="margin-bottom:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Quick Channel Wizard</h2>
+      </div>
+      <p class="qa-shelf-sub">Pick a network, an era and a mood, and we will build the channel from the top shows that match &mdash; no blank canvas to fill in.</p>
+      <div class="channel-wizard-grid">
+        <label>Network or studio
+          <select id="channelWizardNetwork">
+            <option value="">Any network</option>
+            <option value="49">HBO</option>
+            <option value="88">FX</option>
+            <option value="80">Adult Swim</option>
+            <option value="13">Nickelodeon</option>
+            <option value="56">Cartoon Network</option>
+            <option value="54">Disney Channel</option>
+            <option value="4">BBC One</option>
+            <option value="67">Showtime</option>
+            <option value="174">AMC</option>
+            <option value="47">Comedy Central</option>
+            <option value="213">Netflix</option>
+            <option value="1024">Prime Video</option>
+            <option value="2552">Apple TV+</option>
+            <option value="2739">Disney+</option>
+            <option value="19">FOX</option>
+            <option value="6">NBC</option>
+            <option value="16">CBS</option>
+            <option value="2">ABC</option>
+            <option value="71">The CW</option>
+            <option value="149">Syfy</option>
+          </select>
+        </label>
+        <label>Era
+          <select id="channelWizardEra">
+            <option value="">Any era</option>
+            <option value="1970-1979">70s</option>
+            <option value="1980-1989">80s</option>
+            <option value="1990-1999">90s classics</option>
+            <option value="2000-2009">2000s</option>
+            <option value="2010-2014">Early 2010s</option>
+            <option value="2015-2099">Modern (2015+)</option>
+          </select>
+        </label>
+        <label>Genre or mood
+          <select id="channelWizardGenre">
+            <option value="">Any genre</option>
+            <option value="80,9648">Crime &amp; thrillers</option>
+            <option value="16">Saturday morning cartoons</option>
+            <option value="35">Chill comedy</option>
+            <option value="18">Drama</option>
+            <option value="10765">Sci-fi &amp; fantasy</option>
+            <option value="10759">Action &amp; adventure</option>
+            <option value="10751">Family</option>
+            <option value="99">Documentary</option>
+            <option value="10762">Kids</option>
+            <option value="9648">Mystery</option>
+          </select>
+        </label>
+        <label>Shows in the channel
+          <select id="channelWizardSize">
+            <option value="8">Top 8 shows</option>
+            <option value="12">Top 12 shows</option>
+            <option value="16">Top 16 shows</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <input type="text" id="channelWizardNameInput" placeholder="Channel name (left blank, we will name it for you)" style="flex:1;">
+        <button type="button" class="primary" onclick="runChannelWizard(this)">Build channel</button>
+      </div>
+      <div id="channelWizardStatus" style="margin-top:8px;"></div>
+    </div>
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:8px;">
         <h2 class="shelf-title">Quick Add Popular Networks</h2>
@@ -113,6 +200,37 @@
     </div>
   </div>
 
+  <!-- Submenu: Explore Channels (the community directory) -->
+  <div class="channels-subpanel" id="channelsSubExplore" style="display:none;">
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Explore Channels</h2>
+        <button type="button" class="secondary lc-btn" onclick="loadChannelDirectory(true)">Refresh</button>
+      </div>
+      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">
+        24/7 channels built and published by other people &mdash; &ldquo;Saturday Morning 90s&rdquo;, &ldquo;80s VHS Sci-Fi Vault&rdquo;, whatever anyone has put together. Add one to your own setup in a single click, then edit it however you like.
+      </p>
+      <div class="row" style="margin-bottom:10px; gap:8px;">
+        <input type="text" id="channelDirectorySearchInput" aria-label="Filter published channels" placeholder="Filter by name, description or creator..." oninput="renderChannelDirectory()">
+        <select id="channelDirectorySortSelect" aria-label="Order published channels" onchange="setChannelDirectorySort(this.value)" style="flex:none; width:auto;">
+          <option value="newest">Newest</option>
+          <option value="added">Most added</option>
+          <option value="liked">Most liked</option>
+          <option value="name">Name (A&ndash;Z)</option>
+        </select>
+      </div>
+      <div id="channelDirectoryFeed"><p style="color:var(--muted); font-size:0.85rem;"><small>Loading published channels&hellip;</small></p></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Publish one of your own</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Publishing needs a Creator Profile, so a listing has an owner who can take it down again. Sharing a private link does not &mdash; use <strong>Share</strong> on any channel under My Channels for that.</p>
+      <div id="channelPublishList"></div>
+    </div>
+  </div>
+
   <!-- Submenu 3: Import & Merge Tools -->
   <div class="channels-subpanel" id="channelsSubImport" style="display:none;">
     <div class="panel">
@@ -127,6 +245,23 @@
         <input type="text" id="channelImportNameInput" placeholder="Channel name (e.g. Sitcom Central)">
         <button type="button" class="secondary" onclick="importChannelFromLink(this)">Import channel</button>
       </div>
+      <label class="channel-rule-row" style="margin-top:10px;">
+        <input type="checkbox" id="channelImportLiveSyncCheck" checked>
+        <span>Live Cloud Sync &mdash; keep this channel following the list instead of taking a one-time snapshot</span>
+      </label>
+      <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">The channel remembers the list URL and rebuilds its pool in the background, so titles the list gains turn up here on their own.</p>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Add a shared channel</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Paste a channel share link (or just its code) to rebuild that exact channel here &mdash; every pick, its play order and its broadcast schedule.</p>
+      <div class="row">
+        <input type="text" id="channelShareCodeInput" placeholder="https://... /channel/AbC123 &mdash; or the code on its own" onkeydown="if(event.key==='Enter'){event.preventDefault();importSharedChannel(this);}">
+        <button type="button" class="secondary" onclick="importSharedChannel(this)">Add channel</button>
+      </div>
+      <div id="channelShareImportStatus" style="margin-top:8px;"></div>
     </div>
   </div>
 
@@ -140,6 +275,7 @@
       <div class="subnav-pills-bar" id="channelSearchTypeChips" style="margin-bottom:10px;">
         <button type="button" class="subnav-pill active" id="channelSearchTypeShowsBtn" onclick="setChannelSearchType('tv', this)"><span class="check-icon">&#x2713;</span> Shows</button>
         <button type="button" class="subnav-pill" id="channelSearchTypeMoviesBtn" onclick="setChannelSearchType('movie', this)">Movies</button>
+        <button type="button" class="subnav-pill" id="channelSearchTypePeopleBtn" onclick="setChannelSearchType('person', this)">Actors &amp; Directors</button>
       </div>
       <div class="row">
         <input type="text" id="channelSearchInput" placeholder="Search a show by name..." onkeydown="if(event.key==='Enter'){event.preventDefault();runChannelTitleSearch();}">
@@ -150,16 +286,105 @@
 
       <div id="channelCrossoverSuggestions" style="display:none; margin-top:14px;"></div>
 
-      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel:</p>
+      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel: <span id="channelDraftCountBadge" style="color:var(--muted); font-weight:500;"></span></p>
+      <div id="channelDraftStats" style="margin:0 0 8px; color:var(--muted); font-size:0.78rem;"></div>
+      <div class="row" style="margin-bottom:8px; gap:8px;">
+        <input type="text" id="channelDraftFilterInput" aria-label="Filter these picks" placeholder="Filter these picks by show or episode name..." oninput="setChannelDraftFilter(this.value)">
+        <button type="button" class="secondary lc-btn" id="channelDraftSelectModeBtn" style="flex:none; width:auto; white-space:nowrap;" onclick="toggleChannelDraftSelectMode()">Select</button>
+      </div>
+      <div id="channelDraftBulkBar" style="display:none; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:8px; padding:8px; border:1px solid var(--border); border-radius:8px; background:var(--surface);">
+        <span id="channelDraftSelectionCount" style="font-size:0.8rem; font-weight:600;">0 selected</span>
+        <button type="button" class="secondary lc-btn" onclick="selectAllChannelDraftShown(true)">Select shown</button>
+        <button type="button" class="secondary lc-btn" onclick="selectAllChannelDraftShown(false)">Clear</button>
+        <select id="channelDraftSelectShowSelect" onchange="selectChannelDraftByGroup(this.value); this.selectedIndex = 0;" style="font-size:0.82rem; padding:5px 8px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="">Select a whole show or season&hellip;</option>
+        </select>
+        <span style="flex:1;"></span>
+        <button type="button" class="secondary lc-btn" onclick="pairChannelDraftSelection()" title="Play these picks back to back, in this order">Pair</button>
+        <button type="button" class="secondary lc-btn" onclick="unpairChannelDraftSelection()" title="Drop any hand-made pairing on these picks">Unpair</button>
+        <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('top')">To top</button>
+        <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('bottom')">To bottom</button>
+        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeChannelDraftSelection()">Remove selected</button>
+      </div>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
-        <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft()">Shuffle picks now</button>
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove all</button>
       </div>
-      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
-        <input type="checkbox" id="channelRandomizeCheck">
-        <span style="font-size:0.85rem;">Randomize play order (reshuffles once a day)</span>
-      </label>
+      <div style="display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap;">
+        <label for="channelPlayOrderSelect" style="font-size:0.85rem; font-weight:600; white-space:nowrap;">Play order:</label>
+        <select id="channelPlayOrderSelect" onchange="applyChannelPlayOrder(this.value)" style="flex:1; min-width:210px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="as-listed">As listed (custom)</option>
+          <option value="aired-asc">Air date &mdash; oldest first</option>
+          <option value="aired-desc">Air date &mdash; newest first</option>
+          <option value="show-season-episode">Show, then season &amp; episode</option>
+          <option value="interleave">Interleaved &mdash; one episode per show, in turn</option>
+          <option value="title-az">Title A&ndash;Z</option>
+          <option value="shuffle-now">Shuffle now</option>
+          <option value="shuffle-daily">Shuffle daily (reshuffles every 24h)</option>
+        </select>
+      </div>
+      <p id="channelPlayOrderHint" style="margin:6px 0 0; color:var(--muted); font-size:0.78rem;">Picks play in the order listed above &mdash; drag one, or type a new position, to change it.</p>
+
+      <!-- Broadcast schedule & smart rules -->
+      <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+        <p style="margin:0 0 8px; font-weight:600; font-size:0.85rem;">Broadcast schedule</p>
+        <label class="channel-rule-row">
+          <input type="checkbox" id="channelDailyRotateCheck" onchange="updateChannelBroadcastControls()">
+          <span>Daily Broadcast Schedule &mdash; run a fresh lineup out of these picks every day</span>
+        </label>
+        <div id="channelDailyRotateDials" style="display:none; margin:8px 0 0 24px; flex-wrap:wrap; gap:10px;">
+          <label class="channel-dial">Shows per day
+            <input type="number" id="channelRotateShowsInput" min="1" max="48" step="1" value="24" onchange="updateChannelBroadcastControls()">
+          </label>
+          <label class="channel-dial">Episodes per block
+            <input type="number" id="channelRotateEpisodesInput" min="1" max="12" step="1" value="3" onchange="updateChannelBroadcastControls()">
+          </label>
+          <label class="channel-dial">Turns over at
+            <input type="time" id="channelRotateTurnoverTime" value="00:00" onchange="updateChannelBroadcastControls()">
+          </label>
+          <label class="channel-dial">In
+            <select id="channelRotateTurnoverZone" onchange="updateChannelBroadcastControls()">
+              <option value="utc">UTC</option>
+              <option value="local">my local time</option>
+            </select>
+          </label>
+        </div>
+        <p id="channelDailyRotateHint" style="margin:6px 0 0 24px; color:var(--muted); font-size:0.78rem;">Off &mdash; every pick in this channel plays, in the order above.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelHideWatchedCheck">
+          <span>Hide watched &mdash; skip episodes already in my Watch History</span>
+        </label>
+        <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Needs Auto-track playback signed in. Once every pick has been seen, the whole channel comes back rather than going dark. Leave it off to keep watched episodes in the rotation.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelPairPartsCheck" onchange="updateChannelBroadcastControls()">
+          <span>Keep multi-part episodes together</span>
+        </label>
+        <p id="channelPairPartsHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Finds &ldquo;Part 1&rdquo; / &ldquo;Pt. II&rdquo; / &ldquo;(2)&rdquo; in episode titles. Whenever one part is on today, the rest play straight after it instead of turning up tomorrow.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelAutoNewEpisodesCheck" onchange="updateChannelBroadcastControls()">
+          <span>Automatically add new episodes</span>
+        </label>
+        <div id="channelNewEpisodesRow" style="display:none; margin:6px 0 0 24px;">
+          <label class="channel-rule-row">
+            <input type="checkbox" id="channelNewEpisodesTopCheck">
+            <span>Put new episodes at the top</span>
+          </label>
+        </div>
+        <p id="channelAutoNewEpisodesHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Off &mdash; this channel plays the picks below and nothing else.</p>
+
+        <div id="channelLiveSyncRow" style="display:none; margin-top:10px;">
+          <label class="channel-rule-row">
+            <input type="checkbox" id="channelLiveSyncCheck">
+            <span>Live Cloud Sync &mdash; refresh this channel from its source list</span>
+          </label>
+          <p id="channelLiveSyncHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;"></p>
+        </div>
+
+        <div id="channelStoryLockSection" style="margin-top:12px;"></div>
+      </div>
 
       <!-- Channel Poster Selection Section -->
       <div id="channelPosterPickerSection" style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; display:none;">
@@ -180,6 +405,9 @@
       </div>
 
       <div class="row" style="margin-top:12px;">
+        <input type="text" id="channelDescriptionInput" placeholder="One line about this channel (optional) &mdash; shown wherever you share it" style="flex:1; font-size:0.85rem;" maxlength="400">
+      </div>
+      <div class="row" style="margin-top:8px;">
         <input type="text" id="channelNameInput" placeholder="Channel name (e.g. Comedy Night)" style="flex:1;">
         <button type="button" class="primary" id="channelSaveBtn" onclick="saveChannel()">Save</button>
         <button type="button" id="channelCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditChannel()">Cancel</button>

@@ -31,6 +31,7 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 ### Discover & Quick Add Shelves
 - One-click catalog shortcuts for major streaming platforms (Netflix, Disney+, Prime Video, Apple TV+, Max, Hulu, Paramount+, Peacock, Anime, etc.).
 - Curated collections, award winners, box office hits, and trending lists built right into the configuration UI.
+- **New on Streaming** (admin-only for now): a catalog row of what actually *arrived* on each service, newest first, with a show pushed back to the top the day a new episode airs. Sorted by arrival, never by release date. See [New on Streaming](#new-on-streaming) below.
 
 ### Custom List Builder & Letterboxd Import
 - **Build from scratch**: Search movies and shows across TMDB to create custom catalogs.
@@ -40,11 +41,49 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 ### Virtual TV Channel Builder
 - Create synthetic linear TV channels and scheduled playlists combining hand-picked episodes from different TV shows and whole movies into a single row.
 - Built-in channel logo generator, custom poster rendering (`/api/channel-poster`), and quick-add channel presets.
+- **Known limit — a movie in a channel may have no streams.** A channel is a *series* to Stremio, and it
+  does not work out a type per video, so tapping a movie in one asks stream add-ons for it under
+  `series` rather than `movie`. Lenient add-ons (Torrentio-style) and Nuvio cope; strict ones (PenguPlay)
+  return nothing. Nothing inside the add-on can change what Stremio asks for, so the movie is best opened
+  from its own page.
+- A **Play order** dropdown arranges a channel's picks: by air date (oldest or newest first, from each episode's TMDB air date and each movie's release date), by show then season and episode, **interleaved**, A-Z by title, or shuffled once. Each sorts the list in place, so the order you see is the order it plays -- and a sort is re-applied as you add more picks. Drag a pick by hand and it stays put. **Shuffle daily** is the one live mode: the channel reshuffles itself every 24 hours.
+- **Interleaved (round-robin) play order.** One episode from each show in turn, then round again -- `Simpsons S1E1 -> King of the Hill S1E1 -> Malcolm S1E1 -> Simpsons S1E2`. A 90s prime-time block rather than fifty episodes of one show before the next one starts.
+- **Daily Broadcast Schedule for any channel.** The rotating lineup that Quick Add's network channels have always had, with dials: how many shows run in a day, how many back-to-back episodes make up each show's block, and what time of day (UTC or your own) the lineup turns over. Load a 1,000-episode pool of sitcoms and it reads like a cable channel with fresh programming every morning.
+- **Story Lock.** Shuffling suits a procedural and ruins a serialized drama. Tick a show as story-locked and it always advances to its next episode in order -- picking up the next day where the last block left off -- while everything else keeps shuffling around it.
+- **Hide watched.** With Auto-track playback on, a channel can skip episodes already in your Watch History. Once the whole pool has been seen it comes back rather than going dark.
+- **Next Up channel.** One button, and no picks to make: the channel is seeded from your Continue Watching and re-derived on the server on every request, so pressing play always serves the next unwatched episode across everything you have on the go. **Refresh** on its card pulls in whatever you have started since.
+- **Quick Channel Wizard.** Network or studio, era, genre or mood -- and a finished 24/7 channel built from the top shows that match, no blank canvas to fill in.
+- **Spotlight channels.** Search an actor, director or creator next to Shows and Movies in the builder. Tapping a result opens their whole filmography below, the way tapping a show opens its seasons: add films one at a time, add just the episodes of a show they are actually in, open a show's poster to pick episodes yourself, or take the lot in one click as a Spotlight channel. Films and episodes are ordered together -- in career order or best-first -- so a guest appearance plays where it belongs among the films rather than after them.
+- **Keep multi-part episodes together.** One toggle, and a two-parter stops being split across two days: whenever one part is drawn into a lineup, the rest play straight after it, in part order. Titles are read for "Part 1" / "Pt. II" / "(2)", and anything the titles cannot show -- a crossover that runs across two different shows -- can be paired by hand from **Select** mode.
+- **Automatically add new episodes.** A channel is a snapshot of a show, and a show keeps going. Tick this and the Worker re-checks each show the channel carries in the background and folds in whatever has aired since, at the top of the channel or at the end, as you prefer. Already-aired episodes only -- next month's announcement is not a slot that plays nothing.
+- **Live Cloud Sync.** A channel imported from a Trakt, MDBList, Simkl or TMDB list can keep following that list instead of taking a one-time snapshot: the Worker rebuilds its pool in the background, so titles the list gains turn up in the channel on their own.
+- **Built for big channels.** A filter over the picks, a **Select** mode with select-a-whole-show / select-a-season and bulk remove-or-move, and a warning before you add something the channel already has.
+- **A stats line on every channel** -- shows, episodes, hours, the years it spans, and the rules it runs under -- plus an **On Today** tab on a channel's See All page showing the lineup the server would serve right now.
+- **My Channels sorts, searches and rearranges** -- drag a channel by its handle, the same way a list is reordered -- and deleting a channel can be undone for a minute afterwards.
+- **Share links and the Explore Channels directory.** **Share** on any channel copies a link that rebuilds it anywhere -- every pick, its play order and its broadcast schedule -- and **Copy link** keeps that link one tap away afterwards. Publishing (with a Creator Profile) lists it in **Explore Channels**, where tapping a channel shows everything in it before you add it, and the directory can be ordered by newest, most added, most liked or name.
 
 ### Continue Watching & Background Watch Sync
 - Automatically tracks watch progress and next unwatched episode per show.
 - Mark titles as watched/unwatched directly from the UI or scrobble integrations.
-- **Scheduled Cron Worker**: Automatically queries TMDB every 6 minutes via Cloudflare Cron Triggers (`*/6 * * * *`, cursor-paginated so it does not re-sweep every account on every tick) to find newly-aired episodes for caught-up shows and push them to Continue Watching, and to keep the shared provider charts pre-warmed in KV.
+- **A show's page counts each season's progress** -- `3/8 episodes`, `0/8` for one you have not started,
+  `8/8` (in the accent colour) once it is done -- and updates as you mark episodes, a season, or the whole
+  show watched.
+- **"Watched" means everything that has aired.** A show you are caught up on mid-season reads as watched
+  and offers **Mark Show Unwatched**, instead of offering to mark episodes you have already seen because
+  the rest of the season is still to come.
+- **Air times, not just air dates.** An episode airing today or later shows the hour it is on -- `9 PM ET`,
+  `9:30 PM ET` -- under the date on its page and under the day on its Continue Watching / Airing Next
+  badge. TMDB has no episode air time at all, so it comes from [TVmaze](https://www.tvmaze.com/api), which
+  needs **no API key and no configuration**: the show's regular slot, plus the next episode's own where
+  TVmaze dates it apart (a premiere running long, a finale moved an hour). It is only looked up for a show
+  with an episode still to come, and cached for twelve hours. A streaming show with no broadcast slot, or
+  one TVmaze has never heard of, simply shows the date on its own.
+- **Airing Next** lists the next upcoming episode of every show you have watched, soonest first. The **x** on
+  a poster takes one show off that shelf without changing a thing about what you have watched -- and watching
+  another episode of it puts it back by itself. Settings -> Account & Sync lists what you have removed if you
+  want one back sooner. Needs `migrations/0012_add_airing_next_removals.sql` to remember removals across
+  devices; without it everything else still syncs and a removal holds only in the browser that made it.
+- **Scheduled Cron Worker**: Automatically queries TMDB every 6 minutes via Cloudflare Cron Triggers (`*/6 * * * *`, cursor-paginated so it does not re-sweep every account on every tick) to find newly-aired episodes for caught-up shows and push them to Continue Watching, to record what has arrived on each streaming service for [New on Streaming](#new-on-streaming), and to keep the shared provider charts pre-warmed in KV.
 
 ### Creator Profiles & Cloud Sync
 - Free, passwordless account system secured by salted PBKDF2-SHA256 Creator Keys (`MYL-XXXX-XXXX-XXXX`).
@@ -55,6 +94,7 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 - Real-time telemetry: page views, installs, and live API usage counters for TMDB, Trakt, MDBList, and Simkl.
 - Catalog leaderboards and community feedback/issue tracking inbox (open/in-progress/closed).
 - Streaming provider lookup and Netflix catalog preview inspector.
+- **New on Streaming** panel: sweep state (cursor, walk generation, rows per service, seeded vs observed), a run-a-sweep-now button, and a preview that reads through the same code that serves the catalog to Stremio -- the test surface for the feature while it is still hidden from everyone else.
 - Moderation tools: rebuild the public list index, delete a creator's lists, and browse/delete lists published anonymously (those have no owner to ask, so the dashboard is the only way to remove one).
 - Database schema check: reports which files under `migrations/` the bound D1 database has not had run, and what each one silently breaks until it is applied.
 
@@ -101,6 +141,10 @@ Measured against those, on the free plan:
   two KV counters; with D1 bound the same page view costs **zero** KV writes, because the counters move into
   D1 entirely. After the 1,000-write budget is gone, *every* KV write in the app fails for the rest of the
   day: rate limiters, list saves, sync, feedback.
+- **New on Streaming does not run.** Its budget comes out of the episode sweep's unreachable reserve
+  (see [New on Streaming](#new-on-streaming)), and on a free Worker that reserve is small enough to be fully
+  used -- so the share is zero, and the sweep skips itself with one log line. It also needs D1, which a free
+  deployment often has not bound. Nothing else is affected.
 - **Chart pre-warming does not run, and the cron needs one variable set.** One chart warm is ~105 subrequests
   on its own — five paged TMDB reads and a detail call per item — so no free-plan budget can fit even one.
   Set `CRON_SUBREQUEST_BUDGET` to `48` (see [below](#the-three-subrequest-budgets)) and the tick skips the
@@ -216,7 +260,7 @@ Every step below is doable entirely from the Cloudflare Dashboard -- nothing her
 **4. Backfill any existing KV data into it**
 If you already had Creator Profiles or Custom Lists in KV *before* adding D1 (i.e. you're enabling this on a site that's already been running), D1 starts out empty and needs a one-time copy. Log into `/admin`, open **Management & Tools &rarr; Maintenance**, and click **Migrate KV &rarr; D1**. (A brand-new site with no accounts yet can skip this -- there's nothing to copy.) This is safe to click more than once; KV stays the authoritative copy either way.
 
-**Applying a migration:** files under [`migrations/`](https://github.com/Br0ck25/My-Lists/tree/main/migrations) are small, additive changes to an already-live database (unlike `schema.sql`, they're safe to run with real data present). Open the file on GitHub, copy its `ALTER TABLE`/`CREATE INDEX`/etc. statements (skip the `--` comment lines), paste them into the same D1 Console used in step 2 above, and click **Run**. Apply them in filename order (`0001_...`, `0002_...`, and so on) -- each one assumes the ones before it already ran.
+**Applying a migration:** files under [`migrations/`](https://github.com/Br0ck25/My-Lists/tree/main/migrations) are small, additive changes to an already-live database (unlike `schema.sql`, they're safe to run with real data present). Open the file on GitHub, copy its `ALTER TABLE`/`CREATE INDEX`/etc. statements (skip the `--` comment lines), paste them into the same D1 Console used in step 2 above, and click **Run**. Run one statement at a time, and do skip the comment lines rather than pasting the whole file: a `--` comment runs to the end of its **line**, so if the paste arrives with its line breaks collapsed, the first comment swallows everything after it. A half-eaten `CREATE TABLE` reports `incomplete input: SQLITE_ERROR`, and a whole file that has become one comment reports nothing at all and creates nothing -- both look like the migration is broken when it is only the paste. Apply them in filename order (`0001_...`, `0002_...`, and so on) -- each one assumes the ones before it already ran.
 
 **Which migrations does my deployment still need?** The Admin Dashboard's **Database schema** panel answers this: it reports every file under `migrations/` that has not been run against the bound database, and what each omission silently costs. Nothing records that a migration was applied, and this Worker degrades quietly rather than refusing to start when one is missing -- so after any deploy that shipped a new migration, check that panel. Worth being concrete about why: deploy without `0004_add_creator_tombstones.sql` and account deletion still reports success and still refuses the deleted account on a normal request, while a colo whose KV cache predates the deletion will happily authenticate it. **Apply migrations first, then deploy the Worker.**
 
@@ -290,6 +334,45 @@ To automatically pre-warm shared **Trakt**, **TMDB**, **Simkl**, and **MDBList**
 5. Click **Save** / **Deploy**.
 
 This same cron run also seeds the public list directory/search index (`/lists/public.json`, in-app search) the first time it finds one missing -- a fresh deployment, or the index having been lost some other way -- so a self-hoster with the cron trigger enabled never has to think about it. Without a cron trigger configured, the index instead seeds itself lazily on whichever visitor's request happens to find it missing first, which briefly serves a truncated (capped, oldest-first) directory/search result until that finishes. To seed it immediately and synchronously -- e.g. right after a fresh deploy, without waiting on either of those -- log into `/admin` and POST `/admin/api/rebuild-public-index`.
+
+---
+
+## New on Streaming
+
+A catalog row of what actually **arrived** on a streaming service, newest first -- and a show goes back to the top the day a new episode airs.
+
+**Why it needs a database and a cron trigger, when no other row does.** Nothing upstream publishes the date a title landed on a service. TMDB's `with_watch_providers` answers "is this on Netflix right now" and says nothing about yesterday; Trakt and Simkl do not model provider catalogs at all. The closest thing this add-on had before -- the `Stream Releases` genre row -- sorts by *release* date, which is why it shows theatrical-era titles and completely misses a 1998 film being added to Hulu this morning.
+
+So the add-on observes it. Every cron tick walks a slice of each provider's catalog; a title that is not in the `streaming_events` table already is an arrival, and the moment it was first seen is the date the shelf sorts on. That has three consequences worth knowing before you judge the list:
+
+- **It needs D1** (`migrations/0011_add_streaming_events.sql`). Unlike everything else in this add-on there is no KV fallback -- these dates are observed over time and cannot be refetched later, so a tick that runs without the table is history not collected, not a cache miss.
+- **It needs the cron trigger** from Step 7 above, and enough subrequest budget to run (see [Which Cloudflare plan do I need?](#which-cloudflare-plan-do-i-need)). On a free Worker the sweep skips itself with one log line, the same way chart pre-warming does.
+- **It reads each catalog to its end, and the depth is measured, not configured.** Every TMDB discover response carries `total_pages`, so the sweep learns how deep each service goes and walks exactly that far. This is what lets a 2010 film added to a service today be picked up at all: sorted by release date it is nowhere near page one, so a fixed page horizon would never fetch it.
+- **A completed pass is also what detects removals.** A pass has read every page of every catalog, so a title it did not see is gone. Three guards stand between that inference and the shelf: a title must be missed by two consecutive passes; a pass that failed to read more than a handful of pages concludes nothing; and if a single catalog appears to have lost more than a quarter of its titles at once, that catalog is left alone and the reason is logged. Rows are marked, never deleted -- so if the title comes back, it returns dated as the new arrival it is.
+- **The first pass is seeded.** Every title is "new" the first time you look at a catalog, so the first full walk dates each title by its own release date instead of pretending it just arrived. Arrivals found after that are real. The admin dashboard shows the split as **seeded** versus **observed** -- while observed is zero, the ordering is still release dates.
+
+A full pass is roughly 1,000-1,500 pages across the eight services and both types -- the sweep measures the real number and the admin panel reports it -- which at 40 pages a tick is about three hours on the recommended `*/6` schedule. That is the detection latency for a back-catalog addition and for a removal. It is not how long the shelf takes to look right: the walk is page-major, so the first tick covers page one of every provider and both types, and the hours after that only add depth. A new release is found on the next tick either way, because the walk is sorted newest-first and a new release lands on page one.
+
+**Serving it costs nothing.** The title, poster and year are denormalised into the row, so rendering the shelf is one indexed D1 read and zero outbound requests -- it is the only catalog here that a provider outage cannot slow down or empty.
+
+### Trying it before it goes live
+
+It ships dark: `NEW_ON_STREAMING_IN_QUICK_ADD` in `00_constants.js` is `false`, so there is no Quick Add card and no Discover entry. The catalog itself is live from the moment you deploy, which is the point -- it can be judged against real data first.
+
+1. Apply `migrations/0011_add_streaming_events.sql`, deploy, and confirm the cron trigger is set.
+2. Open `/admin` &rarr; **Management & Tools** &rarr; **New on Streaming**. Use **Run a sweep now** to pull the first walk in by hand rather than waiting on the cron; it advances the same cursor, so it brings the walk forward instead of duplicating it.
+3. **Preview the catalog** reads through the same code that serves Stremio, so what you see there is what a client gets.
+4. To try it in Stremio or Nuvio for real while it is still hidden, add a catalog on the main site (**Catalogs** &rarr; **+ New Catalog**) with one of these as the URL:
+
+   | URL | Row |
+   |---|---|
+   | `tmdb:new-on-streaming` | Everything, across every service |
+   | `tmdb:new-on-streaming:netflix` | One service |
+   | `tmdb:new-on-streaming:netflix+hulu` | Any combination, `+`-separated |
+
+   Pick Movies or Shows with the type selector, exactly like any other row.
+
+**To turn it on for everyone**, set `NEW_ON_STREAMING_IN_QUICK_ADD = true` and rebuild. That one constant adds the Quick Add card, the Discover shelf, and the `/lists/New-on-Streaming` pages; nothing else about the feature changes.
 
 ---
 

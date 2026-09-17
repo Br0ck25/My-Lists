@@ -227,12 +227,16 @@ CREATE INDEX idx_creator_user_lists_lookup ON creator_user_lists(username, list_
 
 DROP TABLE IF EXISTS creator_show_states;
 CREATE TABLE creator_show_states (
-    username           TEXT NOT NULL,
-    show_id            TEXT NOT NULL,
-    is_fully_watched   INTEGER DEFAULT 0,
-    dismissed_season   INTEGER,
-    dismissed_episode  INTEGER,
-    updated_at         INTEGER NOT NULL,
+    username               TEXT NOT NULL,
+    show_id                TEXT NOT NULL,
+    is_fully_watched       INTEGER DEFAULT 0,
+    dismissed_season       INTEGER,
+    dismissed_episode      INTEGER,
+    -- The watched episode an Airing Next removal was made at; NULL means the
+    -- show has not been removed from that shelf. See migrations/0012.
+    airing_removed_season  INTEGER,
+    airing_removed_episode INTEGER,
+    updated_at             INTEGER NOT NULL,
     PRIMARY KEY (username, show_id)
 );
 CREATE INDEX idx_creator_show_states_fw ON creator_show_states(username, is_fully_watched);
@@ -250,3 +254,31 @@ CREATE TABLE creator_tracking_meta (
     updated_at                 INTEGER NOT NULL
 );
 
+
+-- Observed provider-catalog arrivals, behind the "New on Streaming" catalog
+-- (tmdb:new-on-streaming[:service]). Written only by the cron sweep; see
+-- migrations/0011_add_streaming_events.sql for why the add-on has to observe
+-- these dates rather than read them from an upstream API.
+DROP TABLE IF EXISTS streaming_events;
+CREATE TABLE streaming_events (
+    region         TEXT NOT NULL,
+    service        TEXT NOT NULL,
+    imdb_id        TEXT NOT NULL,
+    tmdb_id        INTEGER,
+    kind           TEXT NOT NULL,
+    added_at       INTEGER NOT NULL,
+    last_event_at  INTEGER NOT NULL,
+    event_kind     TEXT NOT NULL,
+    season         INTEGER,
+    episode        INTEGER,
+    seeded         INTEGER NOT NULL DEFAULT 0,
+    last_seen_walk INTEGER NOT NULL DEFAULT 0,
+    removed_at     INTEGER,
+    name           TEXT,
+    poster         TEXT,
+    background     TEXT,
+    year           TEXT,
+    PRIMARY KEY (region, service, imdb_id)
+);
+CREATE INDEX idx_streaming_events_feed ON streaming_events(region, kind, last_event_at DESC);
+CREATE INDEX idx_streaming_events_tmdb ON streaming_events(region, kind, tmdb_id);

@@ -2469,6 +2469,7 @@ renderCreatorProfileBar();
 renderAccountKeySection();
 if (typeof renderWatchlistPreferencesSection === 'function') renderWatchlistPreferencesSection();
 if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
+if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
 renderTrackPlaybackSection();
 renderCreatorDashboard();
 if (typeof pickUpMdblistTokenFromUrl === 'function') pickUpMdblistTokenFromUrl();
@@ -2495,6 +2496,14 @@ tryAutoRestoreCreatorProfile();
 // link, or a plain page refresh lands back on that exact page instead of
 // always falling back to whatever tab was last active.
 (function handleInitialDeepLink() {
+  // A channel share link (/channel/<code>) redirects here carrying the code
+  // in the fragment. Checked first and returned on, because it is the one
+  // deep link that does something to this browser's own data rather than
+  // opening a page -- see handleChannelShareDeepLink.
+  if (typeof handleChannelShareDeepLink === 'function' && /[#&?]channel=/.test(location.hash || '')) {
+    handleChannelShareDeepLink();
+    return;
+  }
   if (SERVER_DEEP_LINK_LIST) {
     openListDetailsPage(SERVER_DEEP_LINK_LIST.name, SERVER_DEEP_LINK_LIST.type, SERVER_DEEP_LINK_LIST.url, SERVER_DEEP_LINK_LIST, { skipPushState: true });
     return;
@@ -3522,7 +3531,10 @@ function renderGuidePage(origin) {
       <li>Click <strong>+ New Channel</strong>.</li>
       <li>Use the <strong>Shows / Movies</strong> toggle to set what you're searching for.</li>
       <li>Search a title and add picks &mdash; for shows, an episode picker lets you choose specific seasons/episodes.</li>
-      <li>Reorder or remove picks in <strong>Picks in this channel</strong>. <strong>Shuffle picks now</strong> randomizes the order once; the <strong>Randomize play order</strong> checkbox re-shuffles automatically every 24 hours.</li>
+      <li>Drag a pick, or type a new position, to reorder <strong>Picks in this channel</strong>. Where a pick sits in this list is the order it plays in.</li>
+      <li>Use the <strong>Play order</strong> dropdown to arrange them all at once &mdash; <strong>Air date</strong> (oldest or newest first, from each episode's TMDB air date and each movie's release date, with anything undated last), <strong>Show, then season &amp; episode</strong>, <strong>Title A&ndash;Z</strong>, or <strong>Shuffle now</strong>. Each one reorders the list right there, so what you see is what plays.</li>
+      <li>A sort stays selected and is re-applied whenever you add more picks, so a channel keeps its order as it grows. Move a pick by hand and the dropdown goes back to <strong>As listed</strong> &mdash; your order is kept from then on.</li>
+      <li><strong>Shuffle daily</strong> is the one option that is not a one-off: the channel reshuffles itself every 24 hours, and the order in the list is ignored while it is selected.</li>
       <li>Choose a <strong>Channel Poster</strong> from an added show's artwork, or use the default channel poster.</li>
       <li>Name the channel and click <strong>Save</strong>.</li>
     </ol>

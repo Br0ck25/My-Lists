@@ -5915,6 +5915,128 @@ describe("Tracking writes: a save that did not land must not report success", ()
     assert.equal(env.DB.q("SELECT name FROM continue_watching")[0].name, "first");
   });
 
+  // Airing Next is rebuilt from Watch History by every browser that loads the
+  // page, so "I took this show off the shelf" cannot live only in the browser
+  // that said it: the next device to recompute the shelf would put the show
+  // straight back and push that up. The removal therefore has to survive the
+  // account round trip, which means reaching creator_show_states and coming
+  // back out of /api/creator/sync/load.
+  it("an Airing Next removal survives the account round trip", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "airingremoval");
+
+    const saved = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      intentionalRemoval: true,
+      watchHistory: [
+        { id: "ttA:1:1", showId: "ttA", type: "episode", seasonNum: 1, episodeNum: 1, watchedAt: 10 },
+        { id: "ttB:4:7", showId: "ttB", type: "episode", seasonNum: 4, episodeNum: 7, watchedAt: 20 },
+      ],
+      // The shelf as the browser now shows it: ttB removed, ttA still on it.
+      airingNext: [{ id: "ttA:1:2", showId: "ttA", name: "next", airDate: "2099-01-01" }],
+      removedAiringNext: { ttB: { seasonNum: 4, episodeNum: 7 } },
+    }});
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.ok, true);
+
+    const state = env.DB.q("SELECT show_id, airing_removed_season, airing_removed_episode FROM creator_show_states");
+    assert.equal(state.length, 1);
+    assert.equal(state[0].show_id, "ttB");
+    // Stored as the episode it was made at, so a later one can supersede it.
+    assert.equal(state[0].airing_removed_season, 4);
+    assert.equal(state[0].airing_removed_episode, 7);
+
+    // Watch History is untouched: removing a show from one shelf is not a
+    // statement about what has been watched, which is the whole point.
+    assert.equal(env.DB.q("SELECT item_id FROM watch_history").length, 2);
+
+    const loaded = await call(env, "/api/creator/sync/load", { method: "POST", json: cred });
+    assert.equal(loaded.status, 200);
+    assert.deepEqual(loaded.body.data.removedAiringNext, { ttB: { seasonNum: 4, episodeNum: 7 } },
+      "another device has to be told, or it recomputes the show back onto the shelf");
+    assert.equal(loaded.body.data.airingNext.length, 1);
+  });
+
+  // A payload that never mentions removals is not the same as one saying
+  // there are none -- an older browser, or one of the scrobble paths writing a
+  // blob it assembled itself, sends no such field. Reading that as "none"
+  // would clear the removals of every show that write happens to touch.
+  it("a tracking write that omits removals leaves the stored ones alone", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "airingomit");
+
+    await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      intentionalRemoval: true,
+      watchHistory: [{ id: "ttB:4:7", showId: "ttB", type: "episode", seasonNum: 4, episodeNum: 7, watchedAt: 20 }],
+      fullyWatchedShowIds: ["ttB"],
+      removedAiringNext: { ttB: { seasonNum: 4, episodeNum: 7 } },
+    }});
+
+    // Same account, same show, a push with no opinion about Airing Next.
+    const r = await call(env, "/api/creator/sync/save-tracking", { method: "POST", json: {
+      ...cred,
+      watchHistory: [{ id: "ttB:4:7", showId: "ttB", type: "episode", seasonNum: 4, episodeNum: 7, watchedAt: 20 }],
+      fullyWatchedShowIds: ["ttB"],
+    }});
+    assert.equal(r.status, 200);
+
+    const state = env.DB.q("SELECT airing_removed_season, airing_removed_episode FROM creator_show_states WHERE show_id = 'ttB'");
+    assert.equal(state.length, 1, "an ordinary autosave must not undo a removal it says nothing about");
+    assert.equal(state[0].airing_removed_season, 4);
+    assert.equal(state[0].airing_removed_episode, 7);
+  });
+
+  // The columns arrived in migration 0012, and an operator can deploy the
+  // Worker without having run it. That must cost the removals and nothing
+  // else -- not Watch History, not Continue Watching, not Airing Next itself.
+  it("a database without migration 0012 still stores everything else", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const cred = await seed(env, "premigration");
+    env.DB._db.exec("DROP TABLE creator_show_states");
+    env.DB._db.exec(`CREATE TABLE creator_show_states (
+      username TEXT NOT NULL, show_id TEXT NOT NULL, is_fully_watched INTEGER DEFAULT 0,
+      dismissed_season INTEGER, dismissed_episode INTEGER, updated_at INTEGER NOT NULL,
+      PRIMARY KEY (username, show_id));`);
+
+    // A cold isolate, because the Worker remembers a database that HAS the
+    // columns and this one deliberately does not. Nothing takes a column away
+    // in production, so that memory is safe there; here it would answer for
+    // the wrong database. Same reasoning as every other freshIsolate() in
+    // this file.
+    const cold = await freshIsolate();
+    const post = async (path, body) => {
+      const res = await cold.fetch(
+        new Request("https://example.test" + path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "CF-Connecting-IP": nextIp() },
+          body: JSON.stringify(body),
+        }),
+        env,
+        { waitUntil() {} }
+      );
+      return { status: res.status, body: JSON.parse(await res.text()) };
+    };
+
+    const r = await post("/api/creator/sync/save-tracking", {
+      ...cred,
+      intentionalRemoval: true,
+      watchHistory: [{ id: "ttA:1:1", showId: "ttA", type: "episode", seasonNum: 1, episodeNum: 1, watchedAt: 10 }],
+      airingNext: [{ id: "ttA:1:2", showId: "ttA", name: "next", airDate: "2099-01-01" }],
+      fullyWatchedShowIds: ["ttA"],
+      removedAiringNext: { ttB: { seasonNum: 4, episodeNum: 7 } },
+    });
+    assert.equal(r.status, 200, JSON.stringify(r.body).slice(0, 200));
+    assert.equal(r.body.ok, true);
+    assert.equal(env.DB.q("SELECT item_id FROM watch_history").length, 1);
+    assert.equal(env.DB.q("SELECT show_id FROM airing_next").length, 1);
+    assert.equal(env.DB.q("SELECT show_id FROM creator_show_states")[0].show_id, "ttA");
+
+    const loaded = await post("/api/creator/sync/load", cred);
+    assert.deepEqual(loaded.body.data.removedAiringNext, {},
+      "nowhere to store them in D1, so the account reports none rather than failing");
+  });
+
   // BE-001. saveCreatorTrackingD1 returns false on failure and the route dropped
   // that value, so a D1 outage answered ok:true -- and because D1 is what
   // /api/creator/sync/load reads first, the browser was then told its push had
@@ -7380,7 +7502,7 @@ describe("the Worker can tell an operator it is ahead of its own database", () =
     // endpoint's report IS the manifest -- and it comes through the same code
     // path an operator would use.
     const db = makeD1();
-    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones", "list_likes", "feedback", "scrobble_tokens", "event_meta", "watch_history", "continue_watching", "airing_next", "creator_user_lists", "creator_show_states", "creator_tracking_meta"]) {
+    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones", "list_likes", "feedback", "scrobble_tokens", "event_meta", "watch_history", "continue_watching", "airing_next", "creator_user_lists", "creator_show_states", "creator_tracking_meta", "streaming_events"]) {
       db._db.exec(`DROP TABLE IF EXISTS ${t};`);
     }
     const env = makeEnv({ CONFIGS: makeKv(), DB: db });
@@ -10675,3 +10797,1751 @@ describe("Title Search resilience (word variations and fuzzy fallback)", () => {
 
 
 
+// A Channel's video ids ARE its stream requests.
+//
+// Stremio asks every installed stream add-on for
+// /stream/<type>/<video.id>.json and sends nothing else -- the season/episode
+// fields on the video object are this channel's own running order, for
+// display, and never reach an add-on at all. So an id that is merely
+// well-formed but wrong does not fail visibly: the episode plays, it is just
+// the wrong episode. That is what `parseInt(it.season, 10) || 1` used to
+// produce for any item that had no season or episode stored (and for a
+// season stored as the string "0"): `<show>:1:1`, i.e. that show's series
+// premiere, under the title of the episode we meant.
+describe("worker: channel video ids are real stream requests", () => {
+  const channelFns = loadSourceFunctions("05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+
+  function channelMeta(items, extra = {}, opts = {}) {
+    const payload = { channelId: "ch1", name: "Test Channel", items, ...extra };
+    const entry = { id: "ch1", type: "series", name: "Test Channel", url: "channel:v1:" + JSON.stringify(payload) };
+    return channelFns.buildChannelMeta(entry, "https://example.com", opts);
+  }
+
+  const ep = (over = {}) => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13", ...over });
+
+  it("carries the REAL season/episode in the id while the displayed numbering is the running order", async () => {
+    const meta = await channelMeta([ep({ season: 1, episode: 1 }), ep({ season: 10, episode: 17 }), ep()]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:1:1", "tt0108778:10:17", "tt0108778:5:13"]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.season), [1, 1, 1]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.episode), [1, 2, 3], "display numbering is the channel's running order");
+  });
+
+  it("drops an item with no season or no episode instead of pointing it at S01E01", async () => {
+    const meta = await channelMeta([
+      ep({ season: undefined }),
+      ep({ episode: null }),
+      ep({ season: "", episode: "" }),
+      ep({ season: 4, episode: 8 }),
+    ]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:4:8"]);
+    assert.ok(!meta.videos.some((v) => v.id === "tt0108778:1:1"), "an unnumbered item must never resolve to the show's premiere");
+  });
+
+  it("keeps season 0 and episode 0 as 0 -- the old `|| 1` could not tell them from missing", async () => {
+    const meta = await channelMeta([ep({ season: 0, episode: 2 }), ep({ season: "0", episode: "1" })]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:0:2", "tt0108778:0:1"]);
+  });
+
+  it("gives a show with no IMDb id the tmdb: prefix the manifest declares, not a bare number", async () => {
+    const meta = await channelMeta([ep({ imdbId: "1668" }), ep({ imdbId: "tmdb:1668", season: 2, episode: 3 })]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tmdb:1668:5:13", "tmdb:1668:2:3"]);
+    assert.ok(
+      meta.videos.every((v) => v.id.startsWith("tt") || v.id.startsWith("tmdb:")),
+      "every id must match one of buildManifest's declared idPrefixes, or no add-on is asked for it"
+    );
+  });
+
+  it("drops an item whose show id is missing or unusable rather than emitting ':5:13'", async () => {
+    const meta = await channelMeta([ep({ imdbId: "" }), ep({ imdbId: undefined }), ep({ imdbId: "kitsu:44" }), ep({ imdbId: "tt42", season: 2, episode: 2 })]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt42:2:2"]);
+  });
+
+  it("closes the gap left by a dropped item so the running order stays 1..N", async () => {
+    const meta = await channelMeta([ep({ season: 1, episode: 1 }), ep({ season: undefined }), ep({ season: 3, episode: 3 }), ep({ imdbId: "" }), ep({ season: 4, episode: 4 })]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.episode), [1, 2, 3], "no holes in the queue numbering");
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:1:1", "tt0108778:3:3", "tt0108778:4:4"]);
+  });
+
+  it("leaves a movie's id alone -- no season/episode appended", async () => {
+    const meta = await channelMeta([{ kind: "movie", imdbId: "tt0133093", title: "The Matrix", year: 1999 }]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0133093"]);
+  });
+
+  // "Sort by air date" is the other half of the builder's one-or-the-other
+  // play-order choice. Nothing is looked up for it: every pick already
+  // carries the air date TMDB gave when it was added (`released`), so the
+  // order is decided from the payload alone.
+  it("plays an air-date-sorted channel oldest first, across every show", async () => {
+    const meta = await channelMeta([
+      ep({ imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13", released: "1999-02-11" }),
+      ep({ imdbId: "tt0386676", season: 2, episode: 7, title: "The Office S2E7", released: "2005-11-22" }),
+      ep({ imdbId: "tt0108778", season: 1, episode: 1, title: "Friends S1E1", released: "1994-09-22" }),
+      { kind: "movie", imdbId: "tt0133093", title: "The Matrix", released: "1999-03-31" },
+    ], { sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title),
+      ["Friends S1E1", "Friends S5E13", "The Matrix", "The Office S2E7"]);
+    assert.deepEqual(Array.from(meta.videos, (v) => v.episode), [1, 2, 3, 4], "running order is still 1..N");
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id),
+      ["tt0108778:1:1", "tt0108778:5:13", "tt0133093", "tt0386676:2:7"], "sorting never renumbers an id");
+  });
+
+  it("dates a movie by its year when that is all the builder stored", async () => {
+    const meta = await channelMeta([
+      { kind: "movie", imdbId: "tt0499549", title: "Avatar", year: 2009 },
+      { kind: "movie", imdbId: "tt0133093", title: "The Matrix", year: "1999" },
+      { kind: "movie", imdbId: "tt0111161", title: "Shawshank", released: "1994-09-23T00:00:00.000Z" },
+    ], { sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["Shawshank", "The Matrix", "Avatar"]);
+  });
+
+  it("sends an item with no date it can be placed by to the END, in its saved order", async () => {
+    const meta = await channelMeta([
+      ep({ season: 2, episode: 2, title: "undated A" }),
+      ep({ season: 3, episode: 3, title: "dated", released: "2001-01-05" }),
+      ep({ season: 4, episode: 4, title: "undated B", released: "" }),
+    ], { sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["dated", "undated A", "undated B"],
+      "an undated item must not open the channel, and undated items keep their saved order");
+  });
+
+  it("keeps two episodes aired the same night in the order they were saved", async () => {
+    const meta = await channelMeta([
+      ep({ season: 1, episode: 1, title: "part one", released: "1997-09-24" }),
+      ep({ season: 1, episode: 2, title: "part two", released: "1997-09-24" }),
+    ], { sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["part one", "part two"]);
+  });
+
+  // The builder never writes both flags (the checkboxes clear each other,
+  // and saveChannel drops shuffle when the sort is on), but a payload saved
+  // before air-date order existed can only carry shuffle -- so the tie has
+  // to resolve somewhere rather than falling to whichever branch is tested
+  // first.
+  it("lets the explicit sort win over shuffle if a payload somehow carries both", async () => {
+    const items = [];
+    for (let e = 1; e <= 12; e++) items.push(ep({ season: 1, episode: e, title: `E${e}`, released: `2001-01-${String(e).padStart(2, "0")}` }));
+    const meta = await channelMeta(items, { shuffle: true, sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), items.map((it) => it.title));
+  });
+
+  it("orders a rotating Quick Add channel's day by air date too, without changing what it picked", async () => {
+    const items = [];
+    for (let show = 1; show <= 3; show++) {
+      for (let e = 1; e <= 4; e++) {
+        items.push(ep({
+          imdbId: `tt000000${show}`, season: 1, episode: e,
+          title: `show${show} E${e}`,
+          released: `200${show}-0${e}-01`,
+        }));
+      }
+    }
+    const rotated = await channelMeta(items, { dailyRotate: true });
+    const sorted = await channelMeta(items, { dailyRotate: true, sortByAired: true });
+    assert.deepEqual(
+      Array.from(sorted.videos, (v) => v.id).sort(),
+      Array.from(rotated.videos, (v) => v.id).sort(),
+      "the same day's lineup -- the sort decides the order, not the picks"
+    );
+    const dates = Array.from(sorted.videos, (v) => v.released);
+    assert.deepEqual(dates, [...dates].sort(), "today's lineup plays oldest first");
+  });
+
+  // autoSort is a BUILDER field: it says which sort to re-apply when picks
+  // are added on the page, and the picks are stored already in that order.
+  // If the Worker acted on it too, a pick the person then dragged somewhere
+  // else would snap back on every request -- the exact bug the dropdown
+  // replaced the sortByAired checkbox to fix.
+  it("never re-sorts on the builder's autoSort -- the stored order is the play order", async () => {
+    const items = [
+      ep({ season: 9, episode: 9, title: "moved to the front by hand", released: "2009-01-01" }),
+      ep({ season: 1, episode: 1, title: "oldest", released: "1999-01-01" }),
+    ];
+    const meta = await channelMeta(items, { autoSort: "aired-asc" });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["moved to the front by hand", "oldest"]);
+  });
+
+  it("leaves a channel with neither flag exactly as its picks were listed", async () => {
+    const items = [
+      ep({ season: 9, episode: 9, title: "last aired", released: "2009-01-01" }),
+      ep({ season: 1, episode: 1, title: "first aired", released: "1999-01-01" }),
+    ];
+    const meta = await channelMeta(items, {});
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["last aired", "first aired"]);
+  });
+
+  // --- Interleaved play order ------------------------------------------
+  //
+  // The builder applies it to the stored order too, so the Worker's copy is
+  // mostly there for a rotating channel -- where the day's picks are chosen
+  // per request and there is no stored order to have interleaved.
+  it("interleaves a rotating lineup one episode per show, in turn", async () => {
+    const items = [];
+    for (const show of ["tt1", "tt2", "tt3"]) {
+      for (let e = 1; e <= 3; e++) {
+        items.push(ep({ imdbId: show, season: 1, episode: e, title: `${show} E${e}`, showName: show }));
+      }
+    }
+    const meta = await channelMeta(items, { autoSort: "interleave" });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), [
+      "tt1 E1", "tt2 E1", "tt3 E1",
+      "tt1 E2", "tt2 E2", "tt3 E2",
+      "tt1 E3", "tt2 E3", "tt3 E3",
+    ]);
+  });
+
+  it("interleaving a lineup that is already interleaved changes nothing", async () => {
+    const items = [];
+    for (let e = 1; e <= 3; e++) {
+      for (const show of ["tt1", "tt2"]) items.push(ep({ imdbId: show, season: 1, episode: e, title: `${show} E${e}` }));
+    }
+    const once = await channelMeta(items, { autoSort: "interleave" });
+    assert.deepEqual(Array.from(once.videos, (v) => v.title), items.map((it) => it.title));
+  });
+
+  it("leaves a one-show channel alone rather than 'interleaving' it with itself", async () => {
+    const items = [1, 2, 3].map((e) => ep({ season: 1, episode: e, title: `E${e}` }));
+    const meta = await channelMeta(items, { autoSort: "interleave" });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["E1", "E2", "E3"]);
+  });
+
+  it("lets air-date order win over interleaving if a payload carries both", async () => {
+    const items = [
+      ep({ imdbId: "tt1", season: 1, episode: 1, title: "newer", released: "2009-01-01" }),
+      ep({ imdbId: "tt2", season: 1, episode: 1, title: "older", released: "1999-01-01" }),
+    ];
+    const meta = await channelMeta(items, { autoSort: "interleave", sortByAired: true });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["older", "newer"]);
+  });
+
+  // --- the custom daily broadcast schedule ------------------------------
+  const poolOf = (shows, episodes) => {
+    const items = [];
+    for (let s = 1; s <= shows; s++) {
+      for (let e = 1; e <= episodes; e++) {
+        items.push(ep({ imdbId: `tt${s}`, season: 1, episode: e, title: `show${s} E${e}` }));
+      }
+    }
+    return items;
+  };
+
+  it("runs exactly as many shows a day, and as many episodes each, as the dials say", async () => {
+    const meta = await channelMeta(poolOf(10, 8), { dailyRotate: true, rotateShows: 4, rotateEpisodes: 2 });
+    assert.equal(meta.videos.length, 8, "4 shows x 2 episodes");
+    const shows = new Set(Array.from(meta.videos, (v) => v.id.split(":")[0]));
+    assert.equal(shows.size, 4);
+  });
+
+  it("falls back to the network-channel numbers when a rotating payload sets no dials", async () => {
+    const meta = await channelMeta(poolOf(30, 5), { dailyRotate: true });
+    const shows = new Set(Array.from(meta.videos, (v) => v.id.split(":")[0]));
+    assert.equal(shows.size, 24, "CHANNEL_ROTATION_SHOWS_PER_DAY");
+    assert.equal(meta.videos.length, 24 * 3, "x CHANNEL_ROTATION_EPISODES_PER_SHOW");
+  });
+
+  it("reads a stored 0 as unset rather than as one show, one episode", async () => {
+    // The builder writes 0 for both counts whenever the schedule panel is
+    // closed, so a Quick Add network channel arrives as dailyRotate with
+    // zeroed dials. That used to clamp up to the floor of 1 and put a single
+    // episode on the air.
+    const meta = await channelMeta(poolOf(30, 5), { dailyRotate: true, rotateShows: 0, rotateEpisodes: 0 });
+    const shows = new Set(Array.from(meta.videos, (v) => v.id.split(":")[0]));
+    assert.equal(shows.size, 24);
+    assert.equal(meta.videos.length, 24 * 3);
+  });
+
+  it("clamps dials a hand-edited payload pushes past what a day can hold", async () => {
+    const meta = await channelMeta(poolOf(80, 40), { dailyRotate: true, rotateShows: 9999, rotateEpisodes: 9999 });
+    const shows = new Set(Array.from(meta.videos, (v) => v.id.split(":")[0]));
+    assert.equal(shows.size, 48, "CHANNEL_ROTATION_MAX_SHOWS_PER_DAY");
+    assert.equal(meta.videos.length, 48 * 12, "x CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW");
+  });
+
+  it("holds one lineup for a whole day and changes it the next", async () => {
+    const pool = poolOf(30, 6);
+    const opts = { dailyRotate: true, rotateShows: 3, rotateEpisodes: 2 };
+    const morning = await channelMeta(pool, opts, { now: new Date("2026-03-04T06:00:00Z") });
+    const evening = await channelMeta(pool, opts, { now: new Date("2026-03-04T21:00:00Z") });
+    const tomorrow = await channelMeta(pool, opts, { now: new Date("2026-03-05T06:00:00Z") });
+    assert.deepEqual(Array.from(morning.videos, (v) => v.id), Array.from(evening.videos, (v) => v.id));
+    assert.notDeepEqual(Array.from(morning.videos, (v) => v.id), Array.from(tomorrow.videos, (v) => v.id));
+  });
+
+  it("turns the lineup over at the time the channel asks for, not at midnight UTC", async () => {
+    const pool = poolOf(30, 6);
+    // 300 minutes past midnight UTC == midnight in UTC-5.
+    const opts = { dailyRotate: true, rotateShows: 3, rotateEpisodes: 2, rotateTurnover: 300 };
+    const beforeTurnover = await channelMeta(pool, opts, { now: new Date("2026-03-05T04:30:00Z") });
+    const afterTurnover = await channelMeta(pool, opts, { now: new Date("2026-03-05T05:30:00Z") });
+    assert.notDeepEqual(
+      Array.from(beforeTurnover.videos, (v) => v.id),
+      Array.from(afterTurnover.videos, (v) => v.id),
+      "05:00 UTC is the new day for this channel"
+    );
+    const utcChannel = { dailyRotate: true, rotateShows: 3, rotateEpisodes: 2 };
+    assert.deepEqual(
+      Array.from((await channelMeta(pool, utcChannel, { now: new Date("2026-03-05T04:30:00Z") })).videos, (v) => v.id),
+      Array.from((await channelMeta(pool, utcChannel, { now: new Date("2026-03-05T05:30:00Z") })).videos, (v) => v.id),
+      "a channel with no turnover set still runs on midnight UTC"
+    );
+  });
+
+  // --- Story Lock -------------------------------------------------------
+  it("advances a story-locked show in order through a shuffle while the rest moves", async () => {
+    const items = [];
+    for (let e = 1; e <= 8; e++) items.push(ep({ imdbId: "tt9001", season: 1, episode: e, title: `serial E${e}` }));
+    for (let e = 1; e <= 8; e++) items.push(ep({ imdbId: "tt9002", season: 1, episode: e, title: `proc E${e}` }));
+    const meta = await channelMeta(items, { shuffle: true, storyLocked: ["tt9001"] });
+    const serial = Array.from(meta.videos, (v) => v.id).filter((id) => id.startsWith("tt9001"));
+    assert.deepEqual(serial, [1, 2, 3, 4, 5, 6, 7, 8].map((e) => `tt9001:1:${e}`), "the locked show never jumps");
+    const proc = Array.from(meta.videos, (v) => v.id).filter((id) => id.startsWith("tt9002"));
+    assert.notDeepEqual(proc, [1, 2, 3, 4, 5, 6, 7, 8].map((e) => `tt9002:1:${e}`), "the procedural still shuffles");
+  });
+
+  it("walks a story-locked show's blocks forward day by day in a rotation", async () => {
+    const items = [];
+    for (let e = 1; e <= 9; e++) items.push(ep({ imdbId: "tt9001", season: 1, episode: e, title: `E${e}` }));
+    const opts = { dailyRotate: true, rotateShows: 1, rotateEpisodes: 3, storyLocked: ["tt9001"] };
+    const day1 = await channelMeta(items, opts, { now: new Date("2026-03-04T12:00:00Z") });
+    const day2 = await channelMeta(items, opts, { now: new Date("2026-03-05T12:00:00Z") });
+    const eps = (m) => Array.from(m.videos, (v) => Number(v.id.split(":")[2]));
+    assert.deepEqual(eps(day1).length, 3);
+    // Consecutive within a day, and the next day's block starts where this
+    // one stopped (wrapping at the end of the run).
+    assert.deepEqual(eps(day1), [eps(day1)[0], eps(day1)[0] + 1, eps(day1)[0] + 2]);
+    const expectedNextStart = ((eps(day1)[0] - 1) / 3 + 1) % 3 * 3 + 1;
+    assert.equal(eps(day2)[0], expectedNextStart, "tomorrow picks up where today left off");
+  });
+
+  it("keeps a locked show sequential even when its picks were saved out of order", async () => {
+    const items = [5, 1, 3, 2, 4].map((e) => ep({ imdbId: "tt9001", season: 1, episode: e, title: `E${e}` }));
+    items.push(...[1, 2, 3, 4, 5].map((e) => ep({ imdbId: "tt9002", season: 1, episode: e, title: `proc E${e}` })));
+    const meta = await channelMeta(items, { shuffle: true, storyLocked: ["tt9001"] });
+    const serial = Array.from(meta.videos, (v) => v.id).filter((id) => id.startsWith("tt9001"));
+    assert.deepEqual(serial, [1, 2, 3, 4, 5].map((e) => `tt9001:1:${e}`));
+  });
+
+  // --- Hide watched -----------------------------------------------------
+  const watched = (showId, season, episode) => ({ type: "episode", showId, seasonNum: season, episodeNum: episode });
+
+  it("drops episodes already in watch history when the channel asks it to", async () => {
+    const items = [1, 2, 3, 4].map((e) => ep({ season: 1, episode: e, title: `E${e}` }));
+    const meta = await channelMeta(items, { hideWatched: true }, {
+      watchHistory: [watched("tt0108778", 1, 2), watched("tt0108778", 1, 4)],
+    });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["E1", "E3"]);
+  });
+
+  it("ignores watch history entirely when the channel does not ask", async () => {
+    const items = [1, 2].map((e) => ep({ season: 1, episode: e, title: `E${e}` }));
+    const meta = await channelMeta(items, {}, { watchHistory: [watched("tt0108778", 1, 1)] });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["E1", "E2"]);
+  });
+
+  it("brings the whole channel back rather than going dark once everything has been seen", async () => {
+    const items = [1, 2].map((e) => ep({ season: 1, episode: e, title: `E${e}` }));
+    const meta = await channelMeta(items, { hideWatched: true }, {
+      watchHistory: [watched("tt0108778", 1, 1), watched("tt0108778", 1, 2)],
+    });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["E1", "E2"]);
+  });
+
+  it("matches a watched movie on its title id, not on a season and episode it has not got", async () => {
+    const items = [
+      { kind: "movie", imdbId: "tt0133093", title: "The Matrix", year: 1999 },
+      { kind: "movie", imdbId: "tt0234215", title: "Reloaded", year: 2003 },
+    ];
+    const meta = await channelMeta(items, { hideWatched: true }, {
+      watchHistory: [{ type: "movie", id: "tt0133093" }],
+    });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["Reloaded"]);
+  });
+
+  it("hides watched episodes BEFORE the rotation, so a seen one costs no slot", async () => {
+    const items = [];
+    for (let e = 1; e <= 6; e++) items.push(ep({ imdbId: "tt1", season: 1, episode: e, title: `E${e}` }));
+    const history = [1, 2, 3].map((e) => watched("tt1", 1, e));
+    const meta = await channelMeta(items, { dailyRotate: true, rotateShows: 1, rotateEpisodes: 3, hideWatched: true }, { watchHistory: history });
+    assert.equal(meta.videos.length, 3, "a full block, not a block with holes in it");
+    assert.ok(
+      Array.from(meta.videos, (v) => Number(v.id.split(":")[2])).every((e) => e > 3),
+      "and every one of them unwatched"
+    );
+  });
+
+  // --- the dynamic Next Up channel --------------------------------------
+  it("builds a dynamic channel out of Continue Watching rather than stored picks", async () => {
+    const meta = await channelMeta([], { dynamic: "next-up" }, {
+      continueWatching: [
+        { showId: "tt0903747", showTitle: "Breaking Bad", seasonNum: 2, episodeNum: 5, name: "Breakage", showPoster: "https://img/p.jpg" },
+        { showId: "tt0108778", showTitle: "Friends", seasonNum: 5, episodeNum: 13, name: "The One With Joey's Bag" },
+      ],
+    });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0903747:2:5", "tt0108778:5:13"]);
+    assert.equal(meta.videos[0].title, "Breaking Bad S2E5 — Breakage");
+  });
+
+  it("answers null for a dynamic channel with no live lineup and no seed either", async () => {
+    assert.equal(await channelMeta([], { dynamic: "next-up" }, { continueWatching: [] }), null);
+    assert.equal(await channelMeta([], { dynamic: "next-up" }, {}), null);
+  });
+
+  it("prefers the live derivation over the seed the builder stored", async () => {
+    const seed = [ep({ season: 1, episode: 1, title: "seeded when it was saved" })];
+    const meta = await channelMeta(seed, { dynamic: "next-up" }, {
+      continueWatching: [{ showId: "tt0903747", showTitle: "Breaking Bad", seasonNum: 1, episodeNum: 2, name: "Cat's in the Bag" }],
+    });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0903747:1:2"]);
+  });
+
+  // The case that made this channel come back blank: resolveConfig only
+  // hands over continueWatching for a config that PROVED whose it is, so
+  // for a config with no personal shelf the live derivation is empty every
+  // time and the seed is the only lineup the channel will ever have.
+  it("falls back to the seed when the config cannot prove whose tracking to read", async () => {
+    const seed = [ep({ season: 1, episode: 1, title: "seeded when it was saved" })];
+    const meta = await channelMeta(seed, { dynamic: "next-up" }, {});
+    assert.deepEqual(Array.from(meta.videos, (v) => v.title), ["seeded when it was saved"]);
+  });
+
+  it("drops a Continue Watching row it cannot turn into a stream request", async () => {
+    const meta = await channelMeta([], { dynamic: "next-up" }, {
+      continueWatching: [
+        { showId: "", seasonNum: 1, episodeNum: 1, name: "no show id" },
+        { showId: "tt1", seasonNum: null, episodeNum: 1, name: "no season" },
+        { showId: "tt1", seasonNum: 3, episodeNum: 4, name: "fine", showTitle: "Fine" },
+        { showId: "tt1", seasonNum: 3, episodeNum: 4, name: "duplicate", showTitle: "Fine" },
+      ],
+    });
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt1:3:4"]);
+  });
+
+  it("a shuffled channel reorders the queue without ever renumbering an id", async () => {
+    const items = [];
+    for (let s = 1; s <= 4; s++) {
+      for (let e = 1; e <= 6; e++) items.push(ep({ season: s, episode: e, title: `S${s}E${e}` }));
+    }
+    const meta = await channelMeta(items, { shuffle: true });
+    const ids = Array.from(meta.videos, (v) => v.id);
+    assert.equal(new Set(ids).size, items.length, "every real episode appears exactly once");
+    assert.deepEqual([...ids].sort(), items.map((it) => `tt0108778:${it.season}:${it.episode}`).sort());
+    assert.deepEqual(Array.from(meta.videos, (v) => v.episode), items.map((_, i) => i + 1));
+  });
+
+  // --- pairing glue: two halves of one story play together --------------
+  //
+  // Every ordering step above can split a two-parter: the rotation deals a
+  // block that ends between them, the shuffle scatters them, the interleaver
+  // drops four other shows in the gap.
+  const twoParter = (over = {}) => [
+    ep({ imdbId: "tt9100", season: 3, episode: 26, epName: "The Best of Both Worlds, Part I", title: "p1", ...over }),
+    ep({ imdbId: "tt9100", season: 3, episode: 27, epName: "The Best of Both Worlds, Part II", title: "p2", ...over }),
+  ];
+
+  const titlesOf = (meta) => Array.from(meta.videos, (v) => v.title);
+
+  it("plays the second half straight after the first, wherever the shuffle put them", async () => {
+    const filler = [];
+    for (let e = 1; e <= 12; e++) filler.push(ep({ imdbId: "tt9200", season: 1, episode: e, epName: `Filler ${e}`, title: `f${e}` }));
+    const meta = await channelMeta([...twoParter(), ...filler], { shuffle: true, pairParts: true });
+    const titles = titlesOf(meta);
+    assert.equal(titles.indexOf("p2"), titles.indexOf("p1") + 1, "part II plays immediately after part I");
+    assert.equal(titles.filter((t) => t === "p2").length, 1, "and only once");
+  });
+
+  it("plays a story from its first part even when the second was the one drawn", async () => {
+    // The pool holds both, the rotation only asked for one episode of that
+    // show, and the one it landed on is part II. The back half of a story on
+    // its own is worse than a minute of extra runtime.
+    const meta = await channelMeta(twoParter(), { pairParts: true, shuffle: false });
+    assert.deepEqual(titlesOf(meta), ["p1", "p2"]);
+    const reversed = await channelMeta(twoParter().reverse(), { pairParts: true });
+    assert.deepEqual(titlesOf(reversed), ["p1", "p2"], "part order, not the order they were listed in");
+  });
+
+  it("leaves a channel that has not asked for it exactly as it was", async () => {
+    const meta = await channelMeta(twoParter().reverse(), {});
+    assert.deepEqual(titlesOf(meta), ["p2", "p1"]);
+  });
+
+  it("reads Pt. II, (2) and part 3 as the same kind of thing", async () => {
+    const roman = await channelMeta([
+      ep({ imdbId: "tt9300", season: 1, episode: 2, epName: "Time's Arrow, Pt. II", title: "b" }),
+      ep({ imdbId: "tt9300", season: 1, episode: 1, epName: "Time's Arrow Pt. I", title: "a" }),
+    ], { pairParts: true });
+    assert.deepEqual(titlesOf(roman), ["a", "b"]);
+    const bracketed = await channelMeta([
+      ep({ imdbId: "tt9301", season: 2, episode: 9, epName: "The Rural Juror (2)", title: "b" }),
+      ep({ imdbId: "tt9301", season: 2, episode: 8, epName: "The Rural Juror (1)", title: "a" }),
+    ], { pairParts: true });
+    assert.deepEqual(titlesOf(bracketed), ["a", "b"]);
+  });
+
+  it("does not glue two shows, two seasons or two different stories together", async () => {
+    const meta = await channelMeta([
+      ep({ imdbId: "tt9400", season: 1, episode: 1, epName: "Kidnapped, Part 1", title: "showA-s1" }),
+      // Same story name, different season: a remake ten years later is not
+      // the other half of anything.
+      ep({ imdbId: "tt9400", season: 9, episode: 1, epName: "Kidnapped, Part 2", title: "showA-s9" }),
+      // Same season, same part numbering, different story.
+      ep({ imdbId: "tt9400", season: 1, episode: 5, epName: "Something Else, Part 2", title: "showA-other" }),
+      // Same story name, different show.
+      ep({ imdbId: "tt9401", season: 1, episode: 2, epName: "Kidnapped, Part 2", title: "showB" }),
+    ], { pairParts: true });
+    assert.deepEqual(titlesOf(meta), ["showA-s1", "showA-s9", "showA-other", "showB"], "nothing moved");
+  });
+
+  it("honours a pairing made by hand whether or not the toggle is on", async () => {
+    // Two halves of a crossover, one on each show -- which no title-based
+    // detection can see, and which is why the builder can pair by hand.
+    const crossover = [
+      ep({ imdbId: "tt9500", season: 4, episode: 8, epName: "Invasion!", title: "flash" }),
+      ep({ imdbId: "tt9600", season: 2, episode: 7, epName: "Medusa", title: "supergirl" }),
+      ep({ imdbId: "tt9700", season: 1, episode: 1, epName: "Elsewhere", title: "other" }),
+    ];
+    const meta = await channelMeta([crossover[2], crossover[1], crossover[0]], {
+      pairedGroups: [["tt9500:4:8", "tt9600:2:7"]],
+    });
+    const titles = titlesOf(meta);
+    assert.equal(titles.indexOf("supergirl"), titles.indexOf("flash") + 1);
+    assert.deepEqual(titles, ["other", "flash", "supergirl"], "the pair plays where its first-drawn member was");
+  });
+
+  it("caps one story at six episodes rather than gluing a whole season into one block", async () => {
+    const chapters = [];
+    for (let e = 1; e <= 9; e++) {
+      chapters.push(ep({ imdbId: "tt9800", season: 1, episode: e, epName: `The Long Story, Part ${e}`, title: `c${e}` }));
+    }
+    const meta = await channelMeta(chapters, { pairParts: true });
+    const titles = titlesOf(meta);
+    assert.deepEqual(titles.slice(0, 6), ["c1", "c2", "c3", "c4", "c5", "c6"]);
+    assert.equal(titles.length, 9, "the rest still play, they are just not glued on");
+  });
+
+  it("keeps a pair together through a rotation that would have split it", async () => {
+    // One episode per show per day, so a two-parter could only ever land
+    // half of itself -- exactly the case the rule exists for.
+    const pool = [...twoParter()];
+    for (let s = 2; s <= 6; s++) {
+      for (let e = 1; e <= 4; e++) pool.push(ep({ imdbId: `tt91${s}`, season: 1, episode: e, epName: `E${e}`, title: `s${s}e${e}` }));
+    }
+    for (let day = 0; day < 6; day++) {
+      const meta = await channelMeta(pool, { dailyRotate: true, rotateShows: 6, rotateEpisodes: 1, pairParts: true }, {
+        now: day * 86400000,
+      });
+      const titles = titlesOf(meta);
+      const at1 = titles.indexOf("p1");
+      const at2 = titles.indexOf("p2");
+      if (at1 === -1 && at2 === -1) continue;
+      assert.notEqual(at1, -1, "part I is never left out when part II is on");
+      assert.equal(at2, at1 + 1, `day ${day}: the parts stay adjacent`);
+    }
+  });
+
+  it("still plays the rest of a story when one part is not in the channel at all", async () => {
+    const meta = await channelMeta([
+      ep({ imdbId: "tt9900", season: 1, episode: 1, epName: "A Story, Part 1", title: "a" }),
+      // no part 2
+      ep({ imdbId: "tt9900", season: 1, episode: 3, epName: "A Story, Part 3", title: "c" }),
+    ], { pairParts: true, shuffle: true });
+    const titles = titlesOf(meta);
+    assert.equal(titles.indexOf("c"), titles.indexOf("a") + 1);
+    assert.equal(titles.length, 2);
+  });
+});
+
+// TMDB has no episode air time at all, so the hour behind every "Airs Tuesday"
+// comes from TVmaze (fetchShowAirTime, 07_source-fetchers-tmdb-simkl.js).
+// These pin down what is asked of it, what is made of the answer, and that a
+// show it has never heard of -- or a streaming service with no slot -- degrades
+// to the date alone rather than to a guess.
+// A payload that gains a field is a payload whose stored copies are now the
+// wrong shape. The details cache is keyed by id/type/region only, so without a
+// shape segment a deploy keeps serving pre-change copies for up to two hours --
+// which is exactly why air times shipped and then did not appear.
+describe("worker: the details cache key tracks the payload shape", () => {
+  it("carries a shape version that a field change can move", async () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "07_source-fetchers-tmdb-simkl.js"), "utf8");
+    const declared = /const ITEM_DETAILS_SHAPE = "(v\d+)"/.exec(src);
+    assert.ok(declared, "ITEM_DETAILS_SHAPE must be declared");
+    assert.match(src, /tmdb:itemdetails:\$\{ITEM_DETAILS_SHAPE\}:/,
+      "the key has to actually use it, or bumping it retires nothing");
+  });
+
+  it("puts a show opened before a shape change on a different key than after it", async () => {
+    const keyFor = (shape) => `tmdb:itemdetails:${shape}:tt17371078:series:US`;
+    assert.notEqual(keyFor("v1"), keyFor("v2"),
+      "an entry written by the old code must be unreachable to the new code");
+  });
+});
+
+describe("worker: episode air times", () => {
+  function loadAirTimeSource(fetchStub) {
+    const sandbox = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "07_source-fetchers-tmdb-simkl.js");
+    sandbox.fetch = fetchStub;
+    return sandbox;
+  }
+
+  const jsonRes = (body, ok = true) => ({ ok, json: async () => body });
+
+  const BROADCAST_SHOW = {
+    id: 82,
+    name: "Air Show",
+    schedule: { time: "21:00", days: ["Sunday"] },
+    network: { name: "HBO", country: { name: "United States", code: "US", timezone: "America/New_York" } },
+    webChannel: null,
+    _links: { self: { href: "https://api.tvmaze.com/shows/82" } },
+  };
+
+  it("turns a show's slot into the string a listing prints", async () => {
+    const calls = [];
+    const sb = loadAirTimeSource(async (url) => {
+      calls.push(String(url));
+      return jsonRes(BROADCAST_SHOW);
+    });
+    const out = await sb.fetchShowAirTimeUncached("tt0944947");
+    assert.equal(out.label, "9 PM ET");
+    assert.equal(out.time, "21:00");
+    assert.equal(out.timezone, "America/New_York");
+    assert.equal(out.next, null, "a show with no next episode link is one fetch");
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /^https:\/\/api\.tvmaze\.com\/lookup\/shows\?imdb=tt0944947$/);
+  });
+
+  it("takes the next episode's own slot when TVmaze dates it apart from the regular one", async () => {
+    const sb = loadAirTimeSource(async (url) => {
+      if (String(url).includes("/lookup/shows")) {
+        return jsonRes({
+          ...BROADCAST_SHOW,
+          _links: { ...BROADCAST_SHOW._links, nextepisode: { href: "https://api.tvmaze.com/episodes/999" } },
+        });
+      }
+      return jsonRes({ season: 3, number: 6, airdate: "2026-10-04", airtime: "21:30" });
+    });
+    const out = await sb.fetchShowAirTimeUncached("tt0944947");
+    assert.equal(out.label, "9 PM ET", "the regular slot is still what other episodes get");
+    assert.deepEqual(
+      { season: out.next.season, number: out.next.number, label: out.next.label },
+      { season: 3, number: 6, label: "9:30 PM ET" },
+      "a premiere that runs long gets its own time"
+    );
+
+    // Which of the two an episode gets is one rule, so the Worker's Stremio
+    // description and the page cannot print different times for it.
+    assert.equal(sb.airTimeLabelForNextEpisode(out, { nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 6 }), "9:30 PM ET");
+    assert.equal(sb.airTimeLabelForNextEpisode(out, { nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 7 }), "9 PM ET",
+      "a different episode falls back to the regular slot");
+    assert.equal(sb.airTimeLabelForNextEpisode(null, { nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 6 }), null);
+  });
+
+  it("says nothing for a streaming show with no broadcast slot", async () => {
+    const sb = loadAirTimeSource(async () => jsonRes({
+      id: 41220, name: "Streamer", schedule: { time: "", days: ["Friday"] },
+      network: null, webChannel: { name: "Apple TV", country: null }, _links: {},
+    }));
+    const out = await sb.fetchShowAirTimeUncached("tt11280740");
+    assert.equal(out.label, "", "no invented hour for something that just appears");
+    assert.equal(out.time, null);
+  });
+
+  it("degrades to nothing when TVmaze has never heard of the show, or is down", async () => {
+    const missing = loadAirTimeSource(async () => ({ ok: false, json: async () => null }));
+    const out = await missing.fetchShowAirTimeUncached("tt0000001");
+    // Field by field rather than deep-compared: the object comes out of the
+    // vm's own realm and is never reference-equal to a plain one out here.
+    assert.equal(out.label, "");
+    assert.equal(out.time, null);
+    assert.equal(out.timezone, null);
+    assert.equal(out.next, null);
+    assert.equal(out.days.length, 0);
+
+    const broken = loadAirTimeSource(async () => { throw new Error("network down"); });
+    assert.equal((await broken.fetchShowAirTimeUncached("tt0944947")).label, "",
+      "an air time is never worth failing a details lookup over");
+
+    // A tmdb: id has no IMDb id to look up, and must not cost a request.
+    let called = 0;
+    const noImdb = loadAirTimeSource(async () => { called++; return jsonRes(BROADCAST_SHOW); });
+    assert.equal((await noImdb.fetchShowAirTimeUncached("tmdb:1396")).label, "");
+    assert.equal(called, 0);
+  });
+
+  it("follows the next-episode link only while it points at TVmaze", async () => {
+    const seen = [];
+    const sb = loadAirTimeSource(async (url) => {
+      seen.push(String(url));
+      if (String(url).includes("/lookup/shows")) {
+        return jsonRes({ ...BROADCAST_SHOW, _links: { nextepisode: { href: "https://example.invalid/episodes/999" } } });
+      }
+      return jsonRes({ season: 1, number: 1, airtime: "06:00" });
+    });
+    const out = await sb.fetchShowAirTimeUncached("tt0944947");
+    assert.equal(seen.length, 1, "a link off TVmaze is not a link this follows");
+    assert.equal(out.next, null);
+  });
+
+  it("counts its fetches for the batch budget", async () => {
+    const sb = loadAirTimeSource(async (url) => String(url).includes("/lookup/shows")
+      ? jsonRes({ ...BROADCAST_SHOW, _links: { nextepisode: { href: "https://api.tvmaze.com/episodes/999" } } })
+      : jsonRes({ season: 1, number: 1, airtime: "21:00" }));
+    const meter = { spent: 0 };
+    await sb.fetchShowAirTimeUncached("tt0944947", meter);
+    assert.equal(meter.spent, 2, "/api/details/batch has to see these to stay inside a free Worker's budget");
+  });
+});
+
+// A movie inside a channel is a known limit, not something this repo can fix.
+// A channel's meta is a series and Stremio does not re-derive a type per
+// video, so tapping a movie asks every stream add-on for
+// /stream/series/<the movie's own imdb id>.json, which strict add-ons answer
+// with nothing. These pin down what the add-on does, and deliberately does
+// NOT do, about it.
+describe("worker: a movie inside a channel", () => {
+  const channelFns = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+
+  const MOVIE = { kind: "movie", imdbId: "tt0133093", title: "The Matrix", year: 1999 };
+  const EPISODE = { kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" };
+  const channelEntry = (items, over = {}) => ({
+    id: "ch1", type: "series", name: "My Channel", enabled: true,
+    url: "channel:v1:" + JSON.stringify({ channelId: "ch1", name: "My Channel", items }),
+    ...over,
+  });
+
+  it("emits the movie's plain id and claims no stream resource for it", async () => {
+    // The id stays as it is: that is what Nuvio resolves to play the movie
+    // today. And no stream resource is declared -- answering that request here
+    // with a deep link to the movie's own page was tried and removed, because
+    // Stremio Web treats an externalUrl as leaving the app, so it was a dead
+    // end that looked like a working option.
+    const meta = await channelFns.buildChannelMeta(channelEntry([EPISODE, MOVIE]), "https://example.com");
+    assert.deepEqual(Array.from(meta.videos, (v) => v.id), ["tt0108778:5:13", "tt0133093"]);
+
+    const manifest = channelFns.buildManifest([channelEntry([EPISODE, MOVIE])], "https://example.com");
+    assert.equal((manifest.resources || []).some((r) => r && r.name === "stream"), false,
+      "this add-on has no streams of its own and must not be asked for any");
+
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const saved = await call(env, "/api/save", { method: "POST", json: { entries: [channelEntry([EPISODE, MOVIE])] } });
+    const res = await call(env, `/${saved.body.id}/stream/series/tt0133093.json`);
+    assert.notEqual(res.status, 200, "and must not serve a stream route either");
+  });
+
+  it("dates a pick so it reads the same on every clock", async () => {
+    // Midnight UTC is the previous evening anywhere west of Greenwich, which
+    // is how a 1996 movie in a channel came out as "Dec 31, 1995" in the US.
+    const meta = await channelFns.buildChannelMeta(channelEntry([MOVIE, { ...EPISODE, released: "2009-02-19" }]), "https://example.com");
+    const dates = Array.from(meta.videos, (v) => v.released);
+    assert.deepEqual(dates, ["1999-01-01T11:00:00.000Z", "2009-02-19T11:00:00.000Z"]);
+    // World offsets span 26 hours, so no instant is right in all of them; this
+    // one holds from UTC-11 (American Samoa) to UTC+12:45 (Chatham).
+    dates.forEach((iso) => {
+      for (const offsetHours of [-11, -8, -5, -3, 0, 1, 5.5, 8, 10, 12, 12.75]) {
+        const shifted = new Date(new Date(iso).getTime() + offsetHours * 3600000);
+        assert.equal(shifted.toISOString().slice(0, 10), iso.slice(0, 10),
+          `${iso} slips a day at UTC${offsetHours >= 0 ? "+" : ""}${offsetHours}`);
+      }
+    });
+  });
+});
+
+// --- sharing a channel, and the Explore Channels directory ---------------
+//
+// The whole point of a share code is that the link stays short while the
+// channel behind it does not, so these cover the two things that go wrong
+// with that arrangement: what the store is willing to accept from a stranger,
+// and who is allowed to change or withdraw an entry once it is there.
+describe("worker: channel share links", () => {
+  const ep = (over = {}) => ({
+    kind: "episode", imdbId: "tt0108778", season: 5, episode: 13,
+    showName: "Friends", epName: "The One", title: "Friends S5E13", ...over,
+  });
+  const channelOf = (over = {}) => ({ name: "Block Party", items: [ep()], ...over });
+
+  const share = (env, body) => call(env, "/api/channel/share", { method: "POST", json: body });
+  const read = (env, code) => call(env, `/api/channel/share?code=${encodeURIComponent(code)}`);
+
+  it("stores a channel under a short code and hands it back whole", async () => {
+    const env = makeEnv();
+    const created = await share(env, {
+      channel: channelOf({ dailyRotate: true, rotateShows: 6, rotateEpisodes: 2, hideWatched: true, storyLocked: ["tt0108778"] }),
+    });
+    assert.equal(created.body.ok, true);
+    assert.match(created.body.url, /\/channel\/[A-Za-z0-9_-]+$/);
+
+    const fetched = await read(env, created.body.code);
+    assert.equal(fetched.body.ok, true);
+    assert.equal(fetched.body.channel.name, "Block Party");
+    assert.equal(fetched.body.channel.dailyRotate, true);
+    assert.equal(fetched.body.channel.rotateShows, 6);
+    assert.equal(fetched.body.channel.rotateEpisodes, 2);
+    assert.equal(fetched.body.channel.hideWatched, true);
+    assert.deepEqual(fetched.body.channel.storyLocked, ["tt0108778"]);
+    assert.equal(fetched.body.published, false, "sharing is unlisted");
+  });
+
+  it("refuses a channel with nothing playable in it", async () => {
+    const env = makeEnv();
+    const empty = await share(env, { channel: channelOf({ items: [] }) });
+    assert.equal(empty.body.ok, false);
+    assert.equal(empty.status, 400);
+    const unusable = await share(env, { channel: channelOf({ items: [ep({ imdbId: "kitsu:44" })] }) });
+    assert.equal(unusable.body.ok, false);
+  });
+
+  it("drops art that is not an http(s) url rather than storing a javascript: poster", async () => {
+    const env = makeEnv();
+    const created = await share(env, {
+      channel: channelOf({
+        poster: "javascript:alert(1)",
+        backdrop: "data:text/html,<script>1</script>",
+        items: [ep({ poster: "javascript:alert(1)", thumbnail: "https://img/ok.jpg" })],
+      }),
+    });
+    const fetched = await read(env, created.body.code);
+    assert.equal(fetched.body.channel.poster, null);
+    assert.equal(fetched.body.channel.backdrop, null);
+    assert.equal(fetched.body.channel.items[0].poster, undefined);
+    assert.equal(fetched.body.channel.items[0].thumbnail, "https://img/ok.jpg");
+  });
+
+  it("drops a Story Lock for a show the shared picks do not contain", async () => {
+    const env = makeEnv();
+    const created = await share(env, { channel: channelOf({ storyLocked: ["tt0108778", "tt_not_here"] }) });
+    const fetched = await read(env, created.body.code);
+    assert.deepEqual(fetched.body.channel.storyLocked, ["tt0108778"]);
+  });
+
+  it("carries the rules that make a channel keep itself up to date", async () => {
+    const env = makeEnv();
+    const created = await share(env, {
+      channel: channelOf({ pairParts: true, autoNewEpisodes: true, newEpisodesAtTop: true }),
+    });
+    const fetched = await read(env, created.body.code);
+    assert.equal(fetched.body.channel.pairParts, true);
+    assert.equal(fetched.body.channel.autoNewEpisodes, true, "a copy keeps up with its shows too");
+    assert.equal(fetched.body.channel.newEpisodesAtTop, true);
+  });
+
+  it("drops a hand-made pairing whose other half did not come through", async () => {
+    const env = makeEnv();
+    const created = await share(env, {
+      channel: channelOf({
+        items: [ep(), ep({ season: 5, episode: 14 })],
+        pairedGroups: [
+          ["tt0108778:5:13", "tt0108778:5:14"],
+          ["tt0108778:5:13", "tt0108778:9:99"],
+          ["tt0108778:5:13"],
+          "not even an array",
+        ],
+      }),
+    });
+    const fetched = await read(env, created.body.code);
+    assert.equal(fetched.body.channel.pairedGroups.length, 1, "a rule about one episode is not a pairing");
+    assert.deepEqual(fetched.body.channel.pairedGroups[0], ["tt0108778:5:13", "tt0108778:5:14"]);
+  });
+
+  it("keeps Live Cloud Sync only when a real list url comes with it", async () => {
+    const env = makeEnv();
+    const good = await share(env, { channel: channelOf({ liveSync: true, sourceUrl: "https://trakt.tv/users/x/lists/y" }) });
+    assert.equal((await read(env, good.body.code)).body.channel.liveSync, true);
+    const bad = await share(env, { channel: channelOf({ liveSync: true, sourceUrl: "not-a-url" }) });
+    assert.equal((await read(env, bad.body.code)).body.channel.liveSync, undefined);
+  });
+
+  it("lets a dynamic channel through with no picks, since it has none by design", async () => {
+    const env = makeEnv();
+    const created = await share(env, { channel: channelOf({ items: [], dynamic: "next-up" }) });
+    assert.equal(created.body.ok, true);
+    assert.equal((await read(env, created.body.code)).body.channel.dynamic, "next-up");
+  });
+
+  it("re-shares into the same code instead of leaving the old link behind", async () => {
+    const env = makeEnv();
+    const first = await share(env, { channel: channelOf({ name: "Block Party" }) });
+    const again = await share(env, { channel: channelOf({ name: "Block Party II" }), code: first.body.code });
+    assert.equal(again.body.code, first.body.code);
+    assert.equal((await read(env, first.body.code)).body.channel.name, "Block Party II");
+  });
+
+  it("mints a fresh code rather than 404ing when the one cited is gone", async () => {
+    const env = makeEnv();
+    const created = await share(env, { channel: channelOf(), code: "NOSUCHCODE" });
+    assert.equal(created.body.ok, true);
+    assert.notEqual(created.body.code, "NOSUCHCODE");
+  });
+
+  it("answers 404 for a code that was never stored, and 400 for one that is not a code", async () => {
+    const env = makeEnv();
+    assert.equal((await read(env, "ZZZZZZZZZZ")).status, 404);
+    assert.equal((await call(env, "/api/channel/share?code=" + encodeURIComponent("../secret"))).status, 400);
+    assert.equal((await call(env, "/api/channel/share")).status, 400);
+  });
+
+  it("points a /channel/<code> link at the builder with the code in the fragment", async () => {
+    const env = makeEnv();
+    const res = await call(env, "/channel/AbC-123");
+    assert.equal(res.status, 302);
+    const location = res.headers.get("Location");
+    assert.match(location, /\/configure#channel=AbC-123$/);
+    assert.equal(location.includes("?"), false, "the code must not reach a server log as a query param");
+  });
+});
+
+describe("worker: the Explore Channels directory", () => {
+  const ep = () => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" });
+  const channelOf = (over = {}) => ({ name: "Saturday Morning 90s", items: [ep()], ...over });
+
+  it("lists nothing until something is published", async () => {
+    const env = makeEnv();
+    const listing = await call(env, "/api/channel/directory");
+    assert.equal(listing.body.ok, true);
+    assert.deepEqual(listing.body.channels, []);
+  });
+
+  it("does not list a channel that was only shared", async () => {
+    const env = makeEnv();
+    await call(env, "/api/channel/share", { method: "POST", json: { channel: channelOf() } });
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, []);
+  });
+
+  it("refuses to publish without a Creator Profile", async () => {
+    const env = makeEnv();
+    const res = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "nobody", creatorKey: "WRONG" },
+    });
+    assert.equal(res.body.ok, false);
+    assert.equal(res.status, 401);
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, []);
+  });
+
+  it("lists a published channel with a summary, not with its episodes", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: {
+        channel: channelOf({ dailyRotate: true }),
+        publish: true, description: "Cartoons, all morning.",
+        creatorName: "alice", creatorKey: alice.creatorKey,
+      },
+    });
+    assert.equal(published.body.ok, true);
+    assert.equal(published.body.published, true);
+
+    const listing = await call(env, "/api/channel/directory");
+    assert.equal(listing.body.channels.length, 1);
+    const entry = listing.body.channels[0];
+    assert.equal(entry.name, "Saturday Morning 90s");
+    assert.equal(entry.description, "Cartoons, all morning.");
+    assert.equal(entry.owner, "alice");
+    assert.equal(entry.itemCount, 1);
+    assert.equal(entry.showCount, 1);
+    assert.equal(entry.dailyRotate, true);
+    assert.equal("items" in entry, false, "a directory row is a summary, not a channel");
+  });
+
+  it("moves a re-published channel back to the front rather than listing it twice", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const auth = { creatorName: "alice", creatorKey: alice.creatorKey, publish: true };
+    const first = await call(env, "/api/channel/share", { method: "POST", json: { ...auth, channel: channelOf({ name: "One" }) } });
+    await call(env, "/api/channel/share", { method: "POST", json: { ...auth, channel: channelOf({ name: "Two" }) } });
+    await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { ...auth, channel: channelOf({ name: "One, reworked" }), code: first.body.code },
+    });
+    const channels = (await call(env, "/api/channel/directory")).body.channels;
+    assert.equal(channels.length, 2);
+    assert.equal(channels[0].name, "One, reworked");
+    assert.equal(channels[0].code, first.body.code);
+  });
+
+  it("will not let one creator overwrite another's published channel", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const bob = await createUser(env, "bob");
+    const mine = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const hijack = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf({ name: "Hijacked" }), publish: true, code: mine.body.code, creatorName: "bob", creatorKey: bob.creatorKey },
+    });
+    assert.equal(hijack.status, 403);
+    assert.equal((await call(env, `/api/channel/share?code=${mine.body.code}`)).body.channel.name, "Saturday Morning 90s");
+  });
+
+  it("unpublishes the listing but leaves the link working", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const removed = await call(env, "/api/channel/unpublish", {
+      method: "POST",
+      json: { code: published.body.code, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    assert.equal(removed.body.ok, true);
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, []);
+    const still = await call(env, `/api/channel/share?code=${published.body.code}`);
+    assert.equal(still.body.ok, true, "a link already handed out keeps working");
+  });
+
+  it("will not let someone else unpublish a channel that is not theirs", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const bob = await createUser(env, "bob");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const attempt = await call(env, "/api/channel/unpublish", {
+      method: "POST",
+      json: { code: published.body.code, creatorName: "bob", creatorKey: bob.creatorKey },
+    });
+    assert.equal(attempt.status, 403);
+    assert.equal((await call(env, "/api/channel/directory")).body.channels.length, 1);
+  });
+});
+
+// --- the episodes a person is actually in --------------------------------
+//
+// A Spotlight channel used to take a show's first N episodes whenever a
+// person had any credit on it, so a single guest appearance in Roseanne put
+// ten Roseanne episodes into the channel. These pin down the two facts that
+// settle which episodes are really theirs.
+describe("worker: a person's own episodes in a show", () => {
+  const SHOW = {
+    id: 99, name: "Roseanne", poster_path: "/p.jpg", backdrop_path: "/b.jpg",
+    external_ids: { imdb_id: "tt0094540" },
+    seasons: [
+      { season_number: 0, name: "Specials" },
+      { season_number: 1, name: "Season 1" },
+      { season_number: 2, name: "Season 2" },
+    ],
+  };
+  const episode = (n, over = {}) => ({
+    episode_number: n, name: "Episode " + n, air_date: "1993-0" + n + "-01",
+    still_path: null, guest_stars: [], crew: [], ...over,
+  });
+
+  function seasonRoutes(fetchImpl) {
+    return fetchImpl;
+  }
+
+  // The harness's Worker talks to the real TMDB host, so these tests stub
+  // global fetch for the duration and assert on what the route made of the
+  // answers rather than on the network.
+  function withTmdb(handler, run) {
+    const real = globalThis.fetch;
+    globalThis.fetch = async (input) => {
+      const u = String(input && input.url ? input.url : input);
+      const body = handler(u);
+      if (body === undefined) return new Response("{}", { status: 404 });
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    return run().finally(() => { globalThis.fetch = real; });
+  }
+
+  it("takes one episode for a one-episode guest, not the season", async () => {
+    const env = makeEnv();
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      if (u.includes("/season/1?")) {
+        return {
+          credits: { cast: [{ id: 1 }], crew: [] },
+          episodes: [episode(1), episode(2, { guest_stars: [{ id: 2157 }] }), episode(3)],
+        };
+      }
+      if (u.includes("/season/2?")) return { credits: { cast: [{ id: 1 }], crew: [] }, episodes: [episode(1)] };
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=2157&tmdbId=99");
+      assert.equal(res.body.ok, true);
+      assert.equal(res.body.regular, false);
+      assert.deepEqual(res.body.episodes.map((e) => e.season + "x" + e.episode), ["1x2"]);
+      assert.equal(res.body.imdbId, "tt0094540");
+    });
+  });
+
+  it("takes the whole season for a season regular, who is on no episode's own credits", async () => {
+    const env = makeEnv();
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      if (u.includes("/season/1?")) {
+        return { credits: { cast: [{ id: 2157 }], crew: [] }, episodes: [episode(1), episode(2), episode(3)] };
+      }
+      if (u.includes("/season/2?")) return { credits: { cast: [{ id: 5 }], crew: [] }, episodes: [episode(1)] };
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=2157&tmdbId=99");
+      assert.equal(res.body.regular, true);
+      assert.deepEqual(res.body.episodes.map((e) => e.season + "x" + e.episode), ["1x1", "1x2", "1x3"]);
+    });
+  });
+
+  it("counts a directing credit on an episode, not only an acting one", async () => {
+    const env = makeEnv();
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      if (u.includes("/season/1?")) {
+        return {
+          credits: { cast: [], crew: [] },
+          episodes: [episode(1), episode(2, { crew: [{ id: 525, job: "Director" }] })],
+        };
+      }
+      if (u.includes("/season/2?")) return { credits: { cast: [], crew: [] }, episodes: [episode(1)] };
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=525&tmdbId=99");
+      assert.deepEqual(res.body.episodes.map((e) => e.season + "x" + e.episode), ["1x2"]);
+    });
+  });
+
+  it("leaves specials out and keeps the rest in broadcast order", async () => {
+    const env = makeEnv();
+    let askedSeasons = [];
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      const m = u.match(/\/season\/(\d+)\?/);
+      if (m) {
+        askedSeasons.push(Number(m[1]));
+        return { credits: { cast: [{ id: 2157 }], crew: [] }, episodes: [episode(2), episode(1)] };
+      }
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=2157&tmdbId=99");
+      assert.deepEqual(askedSeasons.sort(), [1, 2], "season 0 is never asked for");
+      assert.deepEqual(res.body.episodes.map((e) => e.season + "x" + e.episode), ["1x1", "1x2", "2x1", "2x2"]);
+    });
+  });
+
+  it("answers an empty list rather than everything when the person is in none of it", async () => {
+    const env = makeEnv();
+    await withTmdb((u) => {
+      if (u.includes("/tv/99?")) return SHOW;
+      if (u.includes("/season/")) return { credits: { cast: [{ id: 1 }], crew: [] }, episodes: [episode(1), episode(2)] };
+      return undefined;
+    }, async () => {
+      const res = await call(env, "/api/person-show-episodes?personId=2157&tmdbId=99");
+      assert.equal(res.body.ok, true);
+      assert.deepEqual(res.body.episodes, []);
+    });
+  });
+
+  it("rejects a personId or tmdbId that is not a number", async () => {
+    const env = makeEnv();
+    assert.equal((await call(env, "/api/person-show-episodes?personId=abc&tmdbId=99")).status, 400);
+    assert.equal((await call(env, "/api/person-show-episodes?personId=1")).status, 400);
+  });
+});
+
+describe("worker: re-sharing a channel you published", () => {
+  const ep = () => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" });
+  const channelOf = (over = {}) => ({ name: "Block Party", items: [ep()], ...over });
+
+  // The bug: an unlisted re-share proved nothing, so the owner check on the
+  // record it was overwriting refused its own owner.
+  it("lets the owner re-share a channel they published, unlisted", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const again = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: {
+        channel: channelOf({ name: "Block Party II" }),
+        code: published.body.code,
+        creatorName: "alice", creatorKey: alice.creatorKey,
+      },
+    });
+    assert.equal(again.body.ok, true);
+    assert.equal(again.body.code, published.body.code);
+    assert.equal((await call(env, `/api/channel/share?code=${published.body.code}`)).body.channel.name, "Block Party II");
+  });
+
+  it("still refuses a stranger, credentials or not", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const bob = await createUser(env, "bob");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const asBob = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf({ name: "Hijacked" }), code: published.body.code, creatorName: "bob", creatorKey: bob.creatorKey },
+    });
+    assert.equal(asBob.status, 403);
+    const anonymous = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf({ name: "Hijacked" }), code: published.body.code },
+    });
+    assert.equal(anonymous.status, 403);
+    assert.equal((await call(env, `/api/channel/share?code=${published.body.code}`)).body.channel.name, "Block Party");
+  });
+
+  // Bad credentials on an unlisted share are not proof, but they must not be
+  // a refusal either -- the share still has to work, just without an owner.
+  it("treats a wrong key on an unlisted share as no proof rather than an error", async () => {
+    const env = makeEnv();
+    await createUser(env, "alice");
+    const shared = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), creatorName: "alice", creatorKey: "WRONG-KEY" },
+    });
+    assert.equal(shared.body.ok, true);
+    const fetched = await call(env, `/api/channel/share?code=${shared.body.code}`);
+    assert.equal(fetched.body.owner, "", "it did not get to claim alice");
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, [], "and it is not listed");
+  });
+});
+
+describe("worker: the generated channel poster", () => {
+  const posterFns = loadSourceFunctions("05_catalog-core.js");
+
+  // Every non-text element rendered in Nuvio and every <text> did not, while
+  // Stremio drew the lot -- the signature of a rasterizer that resolves no
+  // font at all rather than falling back. These keep the SVG to what the
+  // least capable renderer in the wild can draw.
+  it("names only fonts a bare rasterizer can resolve", () => {
+    const svg = posterFns.generateChannelPosterSvg("Tobey Maguire Spotlight");
+    const families = svg.match(/font-family="[^"]*"/g) || [];
+    assert.ok(families.length, "the poster does have text on it");
+    families.forEach((f) => {
+      assert.equal(/-apple-system|BlinkMacSystemFont|'/.test(f), false, `vendor or quoted family name: ${f}`);
+      assert.match(f, /sans-serif/, "and a generic family to fall back to");
+    });
+  });
+
+  it("uses a weight keyword rather than a numeric weight", () => {
+    const svg = posterFns.generateChannelPosterSvg("Tobey Maguire Spotlight");
+    assert.equal(/font-weight="\d/.test(svg), false);
+  });
+
+  it("draws the name's shadow without a filter, so a dropped filter cannot take the name with it", () => {
+    const svg = posterFns.generateChannelPosterSvg("Tobey Maguire Spotlight");
+    assert.equal(/<text[^>]*filter=/.test(svg), false);
+    assert.equal(/<g filter="url\(#shadow\)"/.test(svg), false);
+    assert.ok(svg.includes("TOBEY"), "and the name is in there twice -- shadow and face");
+    assert.equal((svg.match(/TOBEY/g) || []).length, 2);
+  });
+
+  it("gives every text element an explicit x and y", () => {
+    const svg = posterFns.generateChannelPosterSvg("Test");
+    (svg.match(/<text[^>]*>/g) || []).forEach((t) => {
+      assert.match(t, /\bx="/, t);
+      assert.match(t, /\by="/, t);
+    });
+  });
+});
+
+// --- today's lineup, as an endpoint --------------------------------------
+//
+// The builder page asks the Worker what a channel is running rather than
+// keeping a second copy of the seeded shuffle. These pin down that the
+// answer is the same one the meta route would give, and that the endpoint
+// is honest about the two rules it cannot apply.
+// A channel is a snapshot of a show, and a show keeps going. "Automatically
+// add new episodes" is what stops a channel of The Last of Us from being
+// stuck on season 1 forever -- the Worker re-checks each show the channel
+// carries, in the background, and folds in whatever has aired since.
+describe("worker: channels that keep up with their shows", () => {
+  const newEpFns = loadSourceFunctions("00_constants.js", "02_http-and-creator-utils.js", "05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+
+  const ep = (over = {}) => ({ kind: "episode", imdbId: "tt700", season: 1, episode: 1, ...over });
+
+  it("reads the high-water mark per show, which is what makes the check cheap", () => {
+    const marks = newEpFns.channelShowWatermarks([
+      ep({ imdbId: "tt700", season: 1, episode: 1, showName: "Show A", showPoster: "p.jpg" }),
+      ep({ imdbId: "tt700", season: 3, episode: 7 }),
+      ep({ imdbId: "tt701", season: 2, episode: 4 }),
+      { kind: "movie", imdbId: "tt702", season: 1, episode: 1 },
+      ep({ imdbId: "", season: 1, episode: 1 }),
+    ]);
+    assert.equal([...marks.keys()].join(","), "tt700,tt701", "movies and unusable ids are not shows to check");
+    assert.equal(marks.get("tt700").maxSeason, 3);
+    assert.equal(marks.get("tt700").showName, "Show A");
+    assert.equal(marks.get("tt700").showPoster, "p.jpg");
+    assert.ok(marks.get("tt700").have.has("3:7"));
+  });
+
+  it("changes its signature when the channel is edited, so a cached answer is not reused", () => {
+    const base = [ep({ season: 1, episode: 1 })];
+    const sig = (items) => newEpFns.channelNewEpisodeSignature(newEpFns.channelShowWatermarks(items));
+    assert.equal(sig(base), sig([ep({ season: 1, episode: 1 })]), "same channel, same signature");
+    assert.notEqual(sig(base), sig([...base, ep({ season: 1, episode: 2 })]), "an episode added by hand");
+    assert.notEqual(sig(base), sig([...base, ep({ imdbId: "tt701", season: 1, episode: 1 })]), "a show added");
+  });
+
+  it("puts new episodes where the channel says, and never twice", () => {
+    const stored = [ep({ season: 1, episode: 1, title: "old" })];
+    const fresh = [
+      ep({ season: 1, episode: 2, title: "new" }),
+      ep({ season: 1, episode: 1, title: "already have this" }),
+    ];
+    const atEnd = newEpFns.mergeChannelNewEpisodes(stored, fresh, false);
+    assert.equal(atEnd.map((it) => it.title).join(","), "old,new");
+    const atTop = newEpFns.mergeChannelNewEpisodes(stored, fresh, true);
+    assert.equal(atTop.map((it) => it.title).join(","), "new,old");
+    assert.equal(newEpFns.mergeChannelNewEpisodes(stored, [], true).map((it) => it.title).join(","), "old");
+  });
+
+  it("orders what it found newest first, so 'at the top' means the newest one", () => {
+    const sorted = newEpFns.sortChannelNewEpisodes([
+      ep({ season: 1, episode: 1, released: "2024-01-01", title: "oldest" }),
+      ep({ season: 2, episode: 5, released: "2026-05-05", title: "newest" }),
+      ep({ season: 2, episode: 1, released: "2025-02-02", title: "middle" }),
+    ]);
+    assert.equal(sorted.map((it) => it.title).join(","), "newest,middle,oldest");
+  });
+
+  // The TMDB side, with the network stubbed: what it asks for matters as
+  // much as what it returns, since this runs for every show in a channel.
+  const stubTmdb = (seasons, episodesBySeason) => {
+    const calls = [];
+    newEpFns.fetch = async (url) => {
+      calls.push(String(url));
+      const u = String(url);
+      if (u.includes("/find/")) return { ok: true, json: async () => ({ tv_results: [{ id: 42, poster_path: "/p.jpg" }] }) };
+      const season = u.match(/\/season\/([0-9]+)\?/);
+      if (season) {
+        return { ok: true, json: async () => ({ episodes: episodesBySeason[season[1]] || [] }) };
+      }
+      return {
+        ok: true,
+        json: async () => ({ name: "The Show", poster_path: "/p.jpg", seasons: seasons.map((n) => ({ season_number: n })) }),
+      };
+    };
+    return calls;
+  };
+
+  it("asks only about seasons at or past the one the channel already carries", async () => {
+    const calls = stubTmdb([1, 2, 3, 4, 5], {});
+    const marks = newEpFns.channelShowWatermarks([ep({ season: 4, episode: 1 })]);
+    await newEpFns.fetchShowEpisodesAfter(marks.get("tt700"), "key", "2026-09-17");
+    const seasonCalls = calls.filter((u) => u.includes("/season/")).map((u) => u.match(/\/season\/([0-9]+)\?/)[1]);
+    assert.equal(seasonCalls.join(","), "4,5", "seasons 1-3 cannot hold anything new");
+  });
+
+  it("returns what aired and not what is merely announced", async () => {
+    stubTmdb([1], {
+      1: [
+        { episode_number: 1, name: "Have this", air_date: "2025-01-01" },
+        { episode_number: 2, name: "Aired since", air_date: "2026-01-01", still_path: "/s.jpg" },
+        { episode_number: 3, name: "Next month", air_date: "2026-12-01" },
+        { episode_number: 4, name: "No date at all", air_date: "" },
+      ],
+    });
+    const marks = newEpFns.channelShowWatermarks([ep({ season: 1, episode: 1 })]);
+    const found = await newEpFns.fetchShowEpisodesAfter(marks.get("tt700"), "key", "2026-09-17");
+    assert.equal(found.map((it) => it.epName).join(","), "Aired since");
+    const only = found[0];
+    assert.equal(only.imdbId, "tt700");
+    assert.equal(only.season, 1);
+    assert.equal(only.episode, 2);
+    assert.equal(only.title, "The Show S1E2 — Aired since");
+    assert.equal(newEpFns.channelItemStreamId(only), "tt700:1:2", "it has to be playable");
+  });
+
+  it("caches the answer, empty or not, rather than re-checking on every request", async () => {
+    stubTmdb([1], { 1: [{ episode_number: 1, name: "Have this", air_date: "2025-01-01" }] });
+    const env = { CONFIGS: makeKv() };
+    const payload = { channelId: "ch-new", items: [ep({ season: 1, episode: 1 })] };
+    const written = await newEpFns.refreshChannelNewEpisodes(payload, { env, tmdbKey: "key" });
+    assert.equal(written.length, 0, "nothing new, which is an answer");
+    const raw = JSON.parse(await env.CONFIGS.get("channelnew:ch-new"));
+    assert.equal(raw.items.length, 0);
+    assert.ok(raw.updatedAt > 0);
+    const cached = await newEpFns.readChannelNewEpisodes(payload, { env });
+    assert.equal(cached.length, 0, "served from KV, no second round of TMDB calls");
+  });
+
+  it("throws away a cached answer that was computed against a different channel", async () => {
+    const env = { CONFIGS: makeKv() };
+    const payload = { channelId: "ch-edit", items: [ep({ season: 1, episode: 1 })] };
+    stubTmdb([1], { 1: [{ episode_number: 1, name: "Have this", air_date: "2025-01-01" }] });
+    await newEpFns.refreshChannelNewEpisodes(payload, { env, tmdbKey: "key" });
+    const edited = { channelId: "ch-edit", items: [...payload.items, ep({ season: 1, episode: 2 })] };
+    const scheduled = [];
+    const stale = await newEpFns.readChannelNewEpisodes(edited, {
+      env,
+      ctx: { waitUntil: (p) => scheduled.push(p) },
+    });
+    assert.equal(stale, null, "an answer about the old picks would re-add an episode the channel now has");
+    assert.equal(scheduled.length, 1, "and a rebuild is scheduled off the request's critical path");
+    await Promise.all(scheduled);
+  });
+
+  it("plays the new episodes it found, at the end or at the top as the channel says", async () => {
+    const env = { CONFIGS: makeKv() };
+    const stored = [
+      ep({ season: 1, episode: 1, title: "S1E1" }),
+      ep({ season: 1, episode: 2, title: "S1E2" }),
+    ];
+    stubTmdb([1], {
+      1: [
+        { episode_number: 1, name: "one", air_date: "2025-01-01" },
+        { episode_number: 2, name: "two", air_date: "2025-01-08" },
+        { episode_number: 3, name: "three", air_date: "2025-01-15" },
+      ],
+    });
+    const payload = { channelId: "ch-play", name: "Keeps up", items: stored, autoNewEpisodes: true };
+    await newEpFns.refreshChannelNewEpisodes(payload, { env, tmdbKey: "key" });
+    const atEnd = await newEpFns.channelSourceItems(payload, { env });
+    assert.equal(atEnd.map((it) => it.epName || it.title).join(","), "S1E1,S1E2,three");
+    const atTop = await newEpFns.channelSourceItems({ ...payload, newEpisodesAtTop: true }, { env });
+    assert.equal(atTop.map((it) => it.epName || it.title).join(","), "three,S1E1,S1E2");
+    const off = await newEpFns.channelSourceItems({ ...payload, autoNewEpisodes: false }, { env });
+    assert.equal(off.map((it) => it.title).join(","), "S1E1,S1E2", "a channel that did not ask gets nothing");
+  });
+});
+
+describe("worker: the channel lineup endpoint", () => {
+  const ep = (over = {}) => ({
+    kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13", ...over,
+  });
+  const channelUrl = (over = {}) =>
+    "channel:v1:" + JSON.stringify({ channelId: "ch1", name: "Block Party", items: [ep()], ...over });
+  const lineup = (env, over = {}, body = {}) =>
+    call(env, "/api/channel-lineup", { method: "POST", json: { url: channelUrl(over), ...body } });
+
+  it("answers with the picks in the order they will play", async () => {
+    const env = makeEnv();
+    const items = [1, 2, 3].map((e) => ep({ season: 1, episode: e, title: "E" + e }));
+    const res = await lineup(env, { items });
+    assert.equal(res.body.ok, true);
+    assert.deepEqual(res.body.items.map((i) => i.title), ["E1", "E2", "E3"]);
+    assert.equal(res.body.rotating, false);
+  });
+
+  it("gives the same lineup the meta route would serve, from the same seed", async () => {
+    const env = makeEnv();
+    const items = [];
+    for (let show = 1; show <= 8; show++) {
+      for (let e = 1; e <= 5; e++) items.push(ep({ imdbId: "tt" + show, season: 1, episode: e, title: `s${show}e${e}` }));
+    }
+    const over = { items, dailyRotate: true, rotateShows: 3, rotateEpisodes: 2 };
+    const fromEndpoint = await lineup(env, over);
+    const entry = { id: "ch1", type: "series", name: "Block Party", url: channelUrl(over) };
+    const channelFns = loadSourceFunctions("05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+    const meta = await channelFns.buildChannelMeta(entry, "https://example.com");
+    // Joined, not deep-compared: meta.videos comes from the vm realm
+    // loadSourceFunctions evaluates in, and a strict deepEqual against an
+    // array built here fails on the prototype alone however equal they are.
+    assert.equal(
+      fromEndpoint.body.items.map((i) => `${i.imdbId}:${i.season}:${i.episode}`).join(","),
+      meta.videos.map((v) => v.id).join(","),
+      "one lineup, one function -- not two copies of a PRNG"
+    );
+  });
+
+  it("reports the dials it actually used, not the ones that were asked for", async () => {
+    const env = makeEnv();
+    const items = [];
+    for (let show = 1; show <= 60; show++) items.push(ep({ imdbId: "tt" + show, season: 1, episode: 1 }));
+    const res = await lineup(env, { items, dailyRotate: true, rotateShows: 9999, rotateEpisodes: 9999 });
+    assert.equal(res.body.rotating, true);
+    assert.equal(res.body.plan.shows, 48, "clamped, and the page is told the clamped number");
+    assert.equal(res.body.plan.episodes, 12);
+    assert.equal(res.body.poolSize, 60);
+  });
+
+  it("tells the page the network numbers when the stored dials are zeroed", async () => {
+    const env = makeEnv();
+    const items = [];
+    for (let show = 1; show <= 60; show++) items.push(ep({ imdbId: "tt" + show, season: 1, episode: 1 }));
+    const res = await lineup(env, { items, dailyRotate: true, rotateShows: 0, rotateEpisodes: 0 });
+    assert.equal(res.body.plan.shows, 24);
+    assert.equal(res.body.plan.episodes, 3);
+    assert.equal(res.body.items.length, 24, "one episode each -- the pool has no more");
+  });
+
+  it("says which rules it could not apply rather than showing a lineup that differs", async () => {
+    const env = makeEnv();
+    const hidden = await lineup(env, { hideWatched: true });
+    assert.deepEqual(hidden.body.unappliedRules, ["hideWatched"]);
+    const dynamic = await lineup(env, { items: [ep()], dynamic: "next-up" });
+    assert.deepEqual(dynamic.body.unappliedRules, ["dynamic"]);
+    const plain = await lineup(env, {});
+    assert.deepEqual(plain.body.unappliedRules, []);
+  });
+
+  it("refuses anything that is not a channel", async () => {
+    const env = makeEnv();
+    const res = await call(env, "/api/channel-lineup", { method: "POST", json: { url: "https://mdblist.com/lists/a/b" } });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.ok, false);
+  });
+});
+
+describe("worker: liking and ranking published channels", () => {
+  const ep = () => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" });
+  const channelOf = (over = {}) => ({ name: "Saturday Morning 90s", items: [ep()], ...over });
+
+  async function publish(env, creator, over = {}, description = "") {
+    const res = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(over), publish: true, description, creatorName: creator.name, creatorKey: creator.key },
+    });
+    return res.body.code;
+  }
+
+  it("counts one like per identity, however many times it is sent", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey });
+    const ip = nextIp();
+    const first = await call(env, "/api/channel/like", { method: "POST", ip, json: { code, action: "like" } });
+    assert.equal(first.body.likes, 1);
+    const again = await call(env, "/api/channel/like", { method: "POST", ip, json: { code, action: "like" } });
+    assert.equal(again.body.likes, 1, "the same voter does not count twice");
+    const other = await call(env, "/api/channel/like", { method: "POST", ip: nextIp(), json: { code, action: "like" } });
+    assert.equal(other.body.likes, 2);
+  });
+
+  it("takes a like back", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey });
+    const ip = nextIp();
+    await call(env, "/api/channel/like", { method: "POST", ip, json: { code, action: "like" } });
+    const undone = await call(env, "/api/channel/like", { method: "POST", ip, json: { code, action: "unlike" } });
+    assert.equal(undone.body.likes, 0);
+    assert.equal(undone.body.liked, false);
+  });
+
+  it("will not let an unlisted channel be voted on, or say whether it exists", async () => {
+    const env = makeEnv();
+    const shared = await call(env, "/api/channel/share", { method: "POST", json: { channel: channelOf() } });
+    const onShared = await call(env, "/api/channel/like", { method: "POST", json: { code: shared.body.code, action: "like" } });
+    const onNothing = await call(env, "/api/channel/like", { method: "POST", json: { code: "NOSUCHCODE", action: "like" } });
+    assert.equal(onShared.status, 404);
+    assert.equal(onNothing.status, 404);
+    assert.equal(onShared.body.error, onNothing.body.error, "the same answer either way -- anything else is an oracle");
+  });
+
+  it("shows the count on the directory row", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey });
+    await call(env, "/api/channel/like", { method: "POST", json: { code, action: "like" } });
+    const listing = await call(env, "/api/channel/directory");
+    assert.equal(listing.body.channels[0].likes, 1);
+  });
+
+  it("keeps likes and adds when the channel is re-published", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey });
+    await call(env, "/api/channel/like", { method: "POST", json: { code, action: "like" } });
+    await call(env, "/api/channel/added", { method: "POST", json: { code } });
+    await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf({ name: "Reworked" }), code, publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const row = (await call(env, "/api/channel/directory")).body.channels[0];
+    assert.equal(row.name, "Reworked");
+    assert.equal(row.likes, 1, "editing a channel is not a reason to lose its votes");
+    assert.equal(row.adds, 1);
+  });
+
+  it("orders by newest, most liked, most added or name on request", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const first = await publish(env, { name: "alice", key: alice.creatorKey }, { name: "Alpha" });
+    const second = await publish(env, { name: "alice", key: alice.creatorKey }, { name: "Zulu" });
+    await call(env, "/api/channel/like", { method: "POST", json: { code: first, action: "like" } });
+    await call(env, "/api/channel/added", { method: "POST", json: { code: second } });
+    await call(env, "/api/channel/added", { method: "POST", json: { code: second } });
+
+    const names = async (sort) =>
+      (await call(env, `/api/channel/directory?sort=${sort}`)).body.channels.map((c) => c.name);
+    assert.deepEqual(await names("newest"), ["Zulu", "Alpha"]);
+    assert.deepEqual(await names("liked"), ["Alpha", "Zulu"]);
+    assert.deepEqual(await names("added"), ["Zulu", "Alpha"]);
+    assert.deepEqual(await names("name"), ["Alpha", "Zulu"]);
+  });
+
+  it("counts an add only for a channel that is listed", async () => {
+    const env = makeEnv();
+    const shared = await call(env, "/api/channel/share", { method: "POST", json: { channel: channelOf() } });
+    const res = await call(env, "/api/channel/added", { method: "POST", json: { code: shared.body.code } });
+    assert.equal(res.body.ok, true, "best effort -- it never fails an add");
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, []);
+  });
+
+  it("publishes the channel's own description when none is typed", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const code = await publish(env, { name: "alice", key: alice.creatorKey }, { description: "Cartoons, all morning." });
+    const row = (await call(env, "/api/channel/directory")).body.channels[0];
+    assert.equal(row.description, "Cartoons, all morning.");
+    // And it survives being taken out of the directory, which is the whole
+    // point of it living on the channel rather than on the listing.
+    const fetched = await call(env, `/api/channel/share?code=${code}`);
+    assert.equal(fetched.body.channel.description, "Cartoons, all morning.");
+  });
+});
+
+describe("worker: an operator can moderate the channel directory", () => {
+  const ep = () => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" });
+  const channelOf = (over = {}) => ({ name: "Saturday Morning 90s", items: [ep()], ...over });
+  const ADMIN = { Cookie: "" };
+
+  async function adminCookie(env) {
+    const res = await call(env, "/admin/login", { method: "POST", form: { key: "test-admin-secret" } });
+    const setCookie = res.headers.get("Set-Cookie") || "";
+    return setCookie.split(";")[0];
+  }
+
+  it("refuses everything without an admin session", async () => {
+    const env = makeEnv();
+    assert.equal((await call(env, "/admin/api/published-channels")).status, 401);
+    assert.equal((await call(env, "/admin/api/channel-moderate", { method: "POST", json: { code: "X" } })).status, 401);
+  });
+
+  it("lists what the directory is showing", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const cookie = await adminCookie(env);
+    const res = await call(env, "/admin/api/published-channels", { cookie });
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.channels.length, 1);
+    assert.equal(res.body.channels[0].name, "Saturday Morning 90s");
+    assert.equal(res.body.channels[0].listed, true);
+  });
+
+  it("also lists a channel that was quietly unlisted, which the directory cannot show", async () => {
+    const env = makeEnv();
+    await call(env, "/api/channel/share", { method: "POST", json: { channel: channelOf({ name: "Unlisted one" }) } });
+    const cookie = await adminCookie(env);
+    const listed = await call(env, "/admin/api/published-channels?scope=listed", { cookie });
+    assert.deepEqual(listed.body.channels, []);
+    const all = await call(env, "/admin/api/published-channels?scope=all", { cookie });
+    assert.equal(all.body.channels.length, 1);
+    assert.equal(all.body.channels[0].listed, false);
+  });
+
+  it("unlists a channel and leaves the links working", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const cookie = await adminCookie(env);
+    const res = await call(env, "/admin/api/channel-moderate", {
+      method: "POST", cookie, json: { code: published.body.code, action: "unlist" },
+    });
+    assert.equal(res.body.ok, true);
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, []);
+    assert.equal((await call(env, `/api/channel/share?code=${published.body.code}`)).body.ok, true);
+  });
+
+  it("deletes a channel outright, so every link to it stops working", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const code = published.body.code;
+    await call(env, "/api/channel/like", { method: "POST", json: { code, action: "like" } });
+    const cookie = await adminCookie(env);
+    const res = await call(env, "/admin/api/channel-moderate", { method: "POST", cookie, json: { code, action: "delete" } });
+    assert.equal(res.body.ok, true);
+    assert.deepEqual((await call(env, "/api/channel/directory")).body.channels, []);
+    assert.equal((await call(env, `/api/channel/share?code=${code}`)).status, 404);
+    // The like ledger goes with it, rather than being inherited by whoever
+    // mints the same code next.
+    assert.equal(env.CONFIGS._store.has(`channellikevoters:${code}`), false);
+  });
+
+  it("defaults to unlisting rather than deleting when the action is not recognised", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const cookie = await adminCookie(env);
+    await call(env, "/admin/api/channel-moderate", {
+      method: "POST", cookie, json: { code: published.body.code, action: "something-else" },
+    });
+    assert.equal((await call(env, `/api/channel/share?code=${published.body.code}`)).body.ok, true,
+      "the safer of the two actions is the one an unknown verb gets");
+  });
+});
+
+describe("worker: finding your own listings again", () => {
+  const ep = () => ({ kind: "episode", imdbId: "tt0108778", season: 5, episode: 13, title: "Friends S5E13" });
+  const channelOf = (over = {}) => ({ name: "Saturday Morning 90s", items: [ep()], ...over });
+
+  // The recovery path for a listing whose local channel was deleted: the
+  // record that knew the code is exactly the one that is gone, so the
+  // browser cannot answer this and the server has to.
+  it("lists what this creator currently has published", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const mine = await call(env, "/api/channel/mine", {
+      method: "POST", json: { creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    assert.equal(mine.body.ok, true);
+    assert.equal(mine.body.channels.length, 1);
+    assert.equal(mine.body.channels[0].code, published.body.code);
+    assert.equal(mine.body.channels[0].name, "Saturday Morning 90s");
+  });
+
+  it("shows one creator nothing of another's", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const bob = await createUser(env, "bob");
+    await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const mine = await call(env, "/api/channel/mine", {
+      method: "POST", json: { creatorName: "bob", creatorKey: bob.creatorKey },
+    });
+    assert.deepEqual(mine.body.channels, []);
+  });
+
+  it("refuses without credentials", async () => {
+    const env = makeEnv();
+    await createUser(env, "alice");
+    const res = await call(env, "/api/channel/mine", {
+      method: "POST", json: { creatorName: "alice", creatorKey: "WRONG" },
+    });
+    assert.equal(res.status, 401);
+  });
+
+  it("stops listing one that has been withdrawn", async () => {
+    const env = makeEnv();
+    const alice = await createUser(env, "alice");
+    const published = await call(env, "/api/channel/share", {
+      method: "POST",
+      json: { channel: channelOf(), publish: true, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    await call(env, "/api/channel/unpublish", {
+      method: "POST",
+      json: { code: published.body.code, creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    const mine = await call(env, "/api/channel/mine", {
+      method: "POST", json: { creatorName: "alice", creatorKey: alice.creatorKey },
+    });
+    assert.deepEqual(mine.body.channels, []);
+  });
+});

@@ -1663,6 +1663,9 @@ function ledgerKeyToListId(ledgerKey) {
   if (ledgerKey.startsWith("extlikevoters:")) {
     return "ext:" + ledgerKey.slice("extlikevoters:".length);
   }
+  if (ledgerKey.startsWith("channellikevoters:")) {
+    return "ch:" + ledgerKey.slice("channellikevoters:".length);
+  }
   return ledgerKey;
 }
 
@@ -1676,6 +1679,9 @@ function listIdToLedgerKey(listId) {
   }
   if (listId.startsWith("ext:")) {
     return "extlikevoters:" + listId.slice(4);
+  }
+  if (listId.startsWith("ch:")) {
+    return "channellikevoters:" + listId.slice(3);
   }
   return "listlikevoters:" + listId;
 }
@@ -3749,6 +3755,81 @@ function isEpisodeAired(airDateStr) {
   return d.getTime() < today.getTime();
 }
 
+// --- Air times --------------------------------------------------------------
+//
+// The hour behind an air date. TMDB has no episode air TIME at all -- it dates
+// an episode and stops -- so every "Airs Tuesday" in this add-on was a day
+// with no hour behind it. TVmaze has both (see fetchShowAirTime,
+// 07_source-fetchers-tmdb-simkl.js); these turn what it returns into the
+// string a listing would print.
+//
+// Shared by the Worker and the page, which is why they live here beside
+// formatAirDateBadge rather than in a client file: /api/details ships the
+// finished label so the browser never has to know a timezone database.
+
+// "21:00" -> "9 PM", "21:30" -> "9:30 PM". The minutes are dropped on the hour
+// exactly the way a TV listing writes it.
+function formatAirClockTime(time) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(time == null ? "" : time).trim());
+  if (!m) return "";
+  const h24 = Number(m[1]);
+  const mins = Number(m[2]);
+  if (!(h24 >= 0 && h24 <= 23) || !(mins >= 0 && mins <= 59)) return "";
+  const suffix = h24 < 12 ? "AM" : "PM";
+  const h12 = (h24 % 12 === 0) ? 12 : (h24 % 12);
+  return mins === 0 ? (h12 + " " + suffix) : (h12 + ":" + String(mins).padStart(2, "0") + " " + suffix);
+}
+
+// The short name a schedule is spoken in. North America is spelled out because
+// "9 PM ET" is the convention there and it does not move with daylight saving
+// the way "EDT"/"EST" do -- a slot is "9 ET" all year, and a listing that
+// flips label twice a year reads like a different time. Everywhere else asks
+// Intl for the zone's own short name on the day, which is right wherever the
+// abbreviation genuinely changes.
+const AIR_TIME_ZONE_LABELS = {
+  "America/New_York": "ET",
+  "America/Detroit": "ET",
+  "America/Toronto": "ET",
+  "America/Nassau": "ET",
+  "America/Chicago": "CT",
+  "America/Winnipeg": "CT",
+  "America/Mexico_City": "CT",
+  "America/Denver": "MT",
+  "America/Edmonton": "MT",
+  "America/Phoenix": "MST",
+  "America/Los_Angeles": "PT",
+  "America/Vancouver": "PT",
+  "America/Anchorage": "AKT",
+  "Pacific/Honolulu": "HST",
+  "America/Halifax": "AT",
+  "America/St_Johns": "NT",
+};
+
+function airTimeZoneLabel(timezone) {
+  const tz = String(timezone == null ? "" : timezone).trim();
+  if (!tz) return "";
+  if (AIR_TIME_ZONE_LABELS[tz]) return AIR_TIME_ZONE_LABELS[tz];
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, timeZoneName: "short" }).formatToParts(new Date());
+    const name = (parts.find((part) => part.type === "timeZoneName") || {}).value || "";
+    // A real abbreviation ("JST", "CET") or the offset form Intl falls back to
+    // ("GMT+9"). Either tells a reader this is not their own clock, which is
+    // the whole job of the label; anything else is dropped.
+    return (/^[A-Z]{2,5}$/.test(name) || /^GMT[+-]\d{1,2}(:\d{2})?$/.test(name)) ? name : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+// "21:00" + "America/New_York" -> "9 PM ET". An empty string means there is no
+// air time to show, which every caller treats as "print the date alone".
+function formatAirTimeLabel(time, timezone) {
+  const clock = formatAirClockTime(time);
+  if (!clock) return "";
+  const zone = airTimeZoneLabel(timezone);
+  return zone ? (clock + " " + zone) : clock;
+}
+
 function formatAirDateBadge(airDateStr) {
   if (!airDateStr) return '';
   const parts = String(airDateStr).split(/[-T\s]/);
@@ -3876,6 +3957,39 @@ async function d1ReplaceRowsById(env, table, username, keyColumn, keepIds) {
   );
 }
 
+// Whether this database has migration 0012's airing-removal columns on
+// creator_show_states.
+//
+// Every other column this file writes has been there since the table was
+// created, so a write could assume the whole shape. These two arrived later,
+// and an operator who deploys the Worker without running the migration would
+// otherwise have EVERY tracking write fail on "no such column" -- not just
+// the new feature, but Watch History, Continue Watching and Airing Next with
+// it. So the write asks first and falls back to the older statement, which is
+// exactly what a database without the migration used to receive.
+//
+// Only a positive answer is cached. A negative one is re-checked on the next
+// write, so applying the migration takes effect without waiting for isolates
+// to recycle; the cost while it is missing is one extra tiny read per save,
+// on a deployment that is already being told to migrate by /admin.
+let _d1AiringRemovalColumns = false;
+async function d1HasAiringRemovalColumns(env) {
+  if (_d1AiringRemovalColumns) return true;
+  try {
+    const row = await env.DB.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='creator_show_states'"
+    ).first();
+    // Same word-boundary match checkD1Schema uses, and for the same reason:
+    // sqlite_master's stored DDL is what ALTER TABLE ADD COLUMN updates.
+    _d1AiringRemovalColumns = /(^|[(,\s])airing_removed_season\s/i.test(String((row && row.sql) || ""));
+  } catch (e) {
+    // Unreadable right now -- treat it as absent and write the older shape,
+    // which is always accepted. Never cached, so the next write asks again.
+    _d1AiringRemovalColumns = false;
+  }
+  return _d1AiringRemovalColumns;
+}
+
 async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   if (!env || !env.DB || !username || !trackingData) return false;
   try {
@@ -3922,16 +4036,30 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       )
     );
 
-    // 2. Show states (fullyWatchedShowIds & dismissedContinueWatching)
+    // 2. Show states (fullyWatchedShowIds, dismissedContinueWatching &
+    //    removedAiringNext)
     const fullyWatched = Array.isArray(trackingData.fullyWatchedShowIds) ? trackingData.fullyWatchedShowIds.map(String) : [];
     const dismissed = trackingData.dismissedContinueWatching && typeof trackingData.dismissedContinueWatching === "object"
       ? trackingData.dismissedContinueWatching
       : {};
+    // A payload that does not mention Airing Next removals at all (an older
+    // browser, or one of the scrobble paths writing a blob it built itself)
+    // has no opinion about them, which is not the same as "there are none".
+    // In that case the columns are left out of the statement entirely, so an
+    // ON CONFLICT update keeps whatever is stored instead of nulling it.
+    const removedAiring = trackingData.removedAiringNext && typeof trackingData.removedAiringNext === "object"
+      ? trackingData.removedAiringNext
+      : null;
+    const writeAiringRemoval = !!removedAiring && await d1HasAiringRemovalColumns(env);
 
     // Deferred to the end and narrowed to the rows that are actually gone --
     // see d1ReplaceRowsById.
     const prunes = [];
-    const allShows = new Set([...fullyWatched, ...Object.keys(dismissed)]);
+    const allShows = new Set([
+      ...fullyWatched,
+      ...Object.keys(dismissed),
+      ...(writeAiringRemoval ? Object.keys(removedAiring) : []),
+    ]);
     if (isIntentionalRemoval) {
       prunes.push(...await d1ReplaceRowsById(env, "creator_show_states", username, "show_id", allShows));
     }
@@ -3940,6 +4068,29 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       const dis = dismissed[sid];
       const disSeason = dis && Number.isFinite(Number(dis.seasonNum)) ? Number(dis.seasonNum) : null;
       const disEpisode = dis && Number.isFinite(Number(dis.episodeNum)) ? Number(dis.episodeNum) : null;
+      if (writeAiringRemoval) {
+        const rem = removedAiring[sid];
+        // Stored as the two numbers rather than a flag, because the numbers
+        // ARE the record: they say which watched episode the removal was
+        // made at, and a later one supersedes it. A removal recorded with
+        // nothing watched is 0/0, which any real episode passes.
+        const remSeason = rem ? (Number.isFinite(Number(rem.seasonNum)) ? Number(rem.seasonNum) : 0) : null;
+        const remEpisode = rem ? (Number.isFinite(Number(rem.episodeNum)) ? Number(rem.episodeNum) : 0) : null;
+        stmts.push(
+          env.DB.prepare(
+            `INSERT INTO creator_show_states (username, show_id, is_fully_watched, dismissed_season, dismissed_episode, airing_removed_season, airing_removed_episode, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(username, show_id) DO UPDATE SET
+               is_fully_watched = excluded.is_fully_watched,
+               dismissed_season = excluded.dismissed_season,
+               dismissed_episode = excluded.dismissed_episode,
+               airing_removed_season = excluded.airing_removed_season,
+               airing_removed_episode = excluded.airing_removed_episode,
+               updated_at = excluded.updated_at`
+          ).bind(username, sid, isFw, disSeason, disEpisode, remSeason, remEpisode, meta.updatedAt)
+        );
+        continue;
+      }
       stmts.push(
         env.DB.prepare(
           `INSERT INTO creator_show_states (username, show_id, is_fully_watched, dismissed_season, dismissed_episode, updated_at)
@@ -4276,12 +4427,23 @@ async function readCreatorTrackingD1(env, username) {
 
     const fullyWatchedShowIds = [];
     const dismissedContinueWatching = {};
+    const removedAiringNext = {};
     for (const s of stateRows) {
       if (s.is_fully_watched) fullyWatchedShowIds.push(s.show_id);
       if (s.dismissed_season != null || s.dismissed_episode != null) {
         dismissedContinueWatching[s.show_id] = {
           seasonNum: s.dismissed_season != null ? s.dismissed_season : 0,
           episodeNum: s.dismissed_episode != null ? s.dismissed_episode : 0,
+        };
+      }
+      // Undefined rather than null on a database that has not had migration
+      // 0012 applied -- SELECT * simply does not return a column that is not
+      // there -- so this reads as "no removals" instead of throwing, which is
+      // the same degraded-but-working answer the write side falls back to.
+      if (s.airing_removed_season != null || s.airing_removed_episode != null) {
+        removedAiringNext[s.show_id] = {
+          seasonNum: s.airing_removed_season != null ? s.airing_removed_season : 0,
+          episodeNum: s.airing_removed_episode != null ? s.airing_removed_episode : 0,
         };
       }
     }
@@ -4297,6 +4459,7 @@ async function readCreatorTrackingD1(env, username) {
       airingNext,
       fullyWatchedShowIds,
       dismissedContinueWatching,
+      removedAiringNext,
       curatedRecommendations: curatedRecs,
       trackPlayback: Boolean(metaRow.track_playback),
       removeWatchedFromWatchlist: Boolean(metaRow.remove_watched_watchlist),
@@ -4380,4 +4543,104 @@ async function readCreatorUserListsD1(env, username) {
     console.error("D1 read error (readCreatorUserListsD1):", err);
     return null;
   }
+}
+
+// --- the Explore Channels directory index -------------------------------
+//
+// One KV key holding the whole directory, newest listing first. A prefix
+// scan over channelshare: would also work, but the tab reads this on every
+// visit and a scan plus one GET per entry is dozens of round trips to draw
+// one page of cards -- so each listing's one-line summary is denormalized
+// into this index and the full channel stays one code lookup away.
+//
+// Read-modify-write on a single key, with no compare-and-swap available in
+// KV: two people publishing in the same instant can cost one of the two
+// listings. That is the same trade index:publiclists makes, and it is
+// tolerable for the same reason -- the channel itself is stored under its
+// own key and is never at risk, only its row in this directory, and
+// re-publishing puts the row back.
+const PUBLIC_CHANNEL_INDEX_KEY = "index:publicchannels";
+
+async function readPublicChannelIndex(env) {
+  if (!env || !env.CONFIGS) return [];
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_CHANNEL_INDEX_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.entries) ? parsed.entries : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writePublicChannelIndex(env, entries) {
+  if (!env || !env.CONFIGS) return;
+  await env.CONFIGS.put(
+    PUBLIC_CHANNEL_INDEX_KEY,
+    JSON.stringify({ entries: entries.slice(0, PUBLIC_CHANNEL_INDEX_MAX), updatedAt: Date.now() })
+  );
+}
+
+async function upsertPublicChannelIndex(env, code, record) {
+  const entries = await readPublicChannelIndex(env);
+  const previous = entries.find((e) => e && e.code === code);
+  const summary = sharedChannelSummary(code, record);
+  // Likes and adds are counted against the listing, not the channel, and
+  // re-publishing an edited channel must not reset them -- so they are
+  // carried across rather than rebuilt from the record.
+  if (previous) {
+    summary.likes = Number(previous.likes) || summary.likes || 0;
+    summary.adds = Number(previous.adds) || summary.adds || 0;
+    summary.publishedAt = previous.publishedAt || summary.publishedAt;
+  }
+  const without = entries.filter((e) => e && e.code !== code);
+  // Newest first, and an update moves a listing back to the front -- a
+  // channel someone has just reworked is the one worth showing.
+  await writePublicChannelIndex(env, [summary, ...without]);
+}
+
+// Writes one field onto one listing, leaving the rest of the index alone.
+//
+// Read-modify-write on a single key with no compare-and-swap, same as every
+// other write here -- so this touches as little as it can and never rebuilds
+// a row from the channel record, which a concurrent publish may have moved on
+// from. A listing that has since been withdrawn is simply not updated.
+async function updatePublicChannelIndexEntry(env, code, patch) {
+  const entries = await readPublicChannelIndex(env);
+  let found = false;
+  const next = entries.map((e) => {
+    if (!e || e.code !== code) return e;
+    found = true;
+    return Object.assign({}, e, patch);
+  });
+  if (!found) return false;
+  await writePublicChannelIndex(env, next);
+  return true;
+}
+
+async function removePublicChannelIndex(env, code) {
+  const entries = await readPublicChannelIndex(env);
+  const without = entries.filter((e) => e && e.code !== code);
+  if (without.length === entries.length) return;
+  await writePublicChannelIndex(env, without);
+}
+
+
+// How the Explore Channels directory is ordered.
+//
+// The index is stored newest-first and is small enough to sort on read, so
+// the ordering is a read-time choice rather than several stored orders that
+// could disagree. "added" ranks by how many people actually took a channel,
+// which is a better signal than a like: taking one costs something.
+function sortPublicChannelIndex(entries, sort) {
+  const list = entries.slice();
+  if (sort === "liked") {
+    list.sort((a, b) => (Number(b.likes) || 0) - (Number(a.likes) || 0) || (Number(b.adds) || 0) - (Number(a.adds) || 0));
+  } else if (sort === "added") {
+    list.sort((a, b) => (Number(b.adds) || 0) - (Number(a.adds) || 0) || (Number(b.likes) || 0) - (Number(a.likes) || 0));
+  } else if (sort === "name") {
+    list.sort((a, b) => String(a.name || "").toLowerCase().localeCompare(String(b.name || "").toLowerCase()));
+  }
+  // "newest" is the order the index is already kept in, so it sorts nothing.
+  return list;
 }

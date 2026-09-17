@@ -1,5 +1,639 @@
 # Changes Log
 
+## 2026-09-16 - Air times that did not appear, and a date that read a day early
+
+### Files Changed
+`05_catalog-core.js`, `07_source-fetchers-tmdb-simkl.js`, `worker_entry_combined.js`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`
+
+### Air times shipped and then did not show
+
+Reported with a screenshot: The Ark S3E8, "Airs Tomorrow", date shown, no time. TVmaze has that show --
+`schedule.time` 22:00, `America/New_York`, i.e. 10 PM ET -- so the data was there and the page was not
+printing it.
+
+The cause is the details cache, not the air-time code. `fetchTmdbItemDetails` keys on
+`tmdb:itemdetails:<id>:<type>:<region>` and nothing else: entries live two hours fresh in isolate memory
+and a week in KV. A show opened shortly BEFORE the air-time deploy had a copy stored without an `airTime`
+field, and after the deploy that copy was still fresh and still served -- correct-looking, just missing the
+new field, for up to two hours.
+
+The key now carries `ITEM_DETAILS_SHAPE`, bumped to `v2` for this payload change. Every entry written by
+the old code is on a key the new code never asks for, so the fix lands on deploy rather than two hours
+later. The convention is written down where the constant is declared: a field added to or removed from the
+details payload bumps it.
+
+### A 1996 movie that read "Dec 31, 1995"
+
+Visible in the same report's channel screenshot. `buildChannelMeta` emits each pick's date as
+`<date>T00:00:00.000Z`, and a client renders that in the VIEWER's timezone -- so midnight UTC is the
+previous evening across the whole of the Americas.
+
+It is now 11:00 UTC. An instant at hour H shows as the intended date wherever the offset is in [-H, 24-H);
+world offsets span UTC-12 to UTC+14, 26 hours, so no instant covers all of them and two hours' worth are
+always wrong. H=11 covers UTC-11 to UTC+12:59 -- every inhabited zone except UTC+13/+14 -- and is one
+better than midday, which also slips in New Zealand. The first attempt here WAS midday; the test written
+alongside it caught the New Zealand case.
+
+### Tests
+
+`tests/worker.test.mjs` (3) -- the shape segment declared and actually used in the key, an old shape
+landing on a different key than the new one, and a pick's date holding across eleven offsets from UTC-11
+to UTC+12:45.
+
+## 2026-09-16 - A movie in a Channel: tried, reverted, documented as a limit
+
+### Files Changed
+`05_catalog-core.js`, `25_api-catalog-routes.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`
+
+### What prompted it
+
+Reported: a movie added to a Channel cannot be played in Stremio, and PenguPlay finds no stream for it,
+while Nuvio plays it.
+
+### The cause, which was already written down
+
+`05_catalog-core.js` carried a NOTE calling this "a known soft spot": a Channel's meta is a SERIES, and
+Stremio does not re-derive a type per video, so tapping a movie in one requests
+`/stream/series/<the movie's plain imdb id>.json`. Most stream add-ons branch their whole handler on that
+type param before they look at the id at all. The note guessed that lenient, Torrentio-style add-ons would
+cope and others might not -- which is exactly the split the report describes. Nuvio resolves the id itself
+(it renders from this add-on's full metadata, see the /meta route's own comment) and so was never affected.
+
+### What can and cannot be fixed
+
+Nothing here can make a third-party stream add-on answer a series-typed request for a movie. The id cannot
+be reshaped into something they would answer either: `tt123:1:1` points at a season 1 episode 1 that does
+not exist, and a bare number or a private prefix matches no `idPrefixes` anywhere, so no add-on is asked at
+all.
+
+What can be fixed is that the request is a DEAD END. This add-on answers that one id itself, with a single
+stream whose `externalUrl` is `stremio:///detail/movie/<id>/<id>` -- handled by Stremio itself, so it moves
+within the app to the movie's own page, where every stream add-on is asked for it as a movie and finds it.
+One tap instead of nothing.
+
+The video's id is left exactly as it was (`channelItemStreamId` still returns the movie's plain id), because
+that is what Nuvio resolves today. This is an extra answer, not a different question.
+
+### Keeping it off everyone else's playback
+
+A `stream` resource is declared for every id matching its `idPrefixes`, so declaring it unconditionally
+would have Stremio call this Worker on every episode anyone plays anywhere, for an answer that is always
+empty. `channelMovieStreamIndex` builds the set of movie ids reachable from a config's enabled Channels, and
+`buildManifest` declares the resource only when that set is non-empty.
+
+The route matches the id against that same set rather than parsing it. An id with no season and episode is
+not proof of a movie -- a show's own bare id is a real request Stremio makes -- and offering the link there
+would be a dead link of a different kind.
+
+### Reverted, on the report that it did not work
+
+The deep link was tested in Stremio Web and does not work there. An `externalUrl` is treated as *leaving*
+Stremio: it routes through a `stremio.com/warning` interstitial ("It seems you are leaving Stremio") and
+then hands the `stremio://` scheme to the operating system. It may work in the desktop app, but where it
+was tested it was a dead end -- and a dead end that looks like a working option is worse than an empty
+stream list, which at least reads as "nothing here".
+
+So the stream resource, the route, and `channelMovieStreamIndex` are all removed, and the code comment now
+records the limit and what was tried, so the next person does not try the same thing.
+
+Asked which of the three real options to take -- proxy the person's own stream add-on (reliable, but this
+add-on would hold their debrid key), split a channel's movies into their own movie-typed row (reliable, but
+out of the channel's play order), or remove the dead link and document -- the answer was to remove and
+document.
+
+### Tests
+
+`tests/worker.test.mjs` (2) -- the channel meta still emitting the movie's plain id (what Nuvio resolves)
+with no stream resource declared and no stream route served, and a pick's date holding across offsets.
+
+## 2026-09-16 - Episode air times, from the one source that actually has them
+
+### Files Changed
+`02_http-and-creator-utils.js`, `07_source-fetchers-tmdb-simkl.js`, `09_page-shell.js`,
+`17_client-my-lists-and-trakt-oauth.js`, `19_client-search-and-likes.js`,
+`21_client-custom-list-builder.js`, `23_client-list-management.js`, `worker_entry_combined.js`,
+`README.md`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/helpers-unit.test.mjs`,
+`tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### What prompted it
+
+Asked for: the air time beside or under the air date -- `9 PM ET`, `9:30 PM ET` -- for episodes airing
+today or later.
+
+### Why it needed a new source
+
+TMDB has no episode air time anywhere in its TV payloads. It dates an episode and stops. Every "Airs
+Tuesday" in this add-on has been a day with no hour behind it for that reason, and no amount of squeezing
+TMDB was going to produce one.
+
+Three candidates were checked against real payloads before picking:
+
+| Source | Has the time? | Cost |
+|---|---|---|
+| TMDB | no | already paid |
+| Cinemeta (already used here) | no -- `released` is the date at 05:00Z, i.e. midnight ET, not the broadcast hour | already paid |
+| Trakt | yes (`airs.time` + `airs.timezone`) | needs `TRAKT_CLIENT_ID`, which is an optional secret |
+| TVmaze | yes (`schedule.time` + the network country's IANA zone, and per-episode `airtime`) | **no API key at all** |
+
+Cinemeta was checked directly: Game of Thrones' episodes come back as `2019-05-20T05:00:00.000Z` -- a date
+shifted to midnight ET, not the 9 PM it actually aired. Trakt has the right data but behind a key a
+self-hoster may not have set, which would have made this feature silently absent for them. TVmaze needs
+nothing configured, so that is what this uses.
+
+### What is fetched, and when
+
+`fetchShowAirTime` is only ever called for a show with an episode still to come -- gated on TMDB's
+`next_episode_to_air` as well as the strictly-future `isUnairedFuture`, because that flag does not fire for
+an episode airing TODAY and today is exactly when someone wants to know the hour. A finished show costs
+nothing: nothing displays a time against an episode that has already aired.
+
+One call (`/lookup/shows?imdb=`) gives the show's regular slot and its network country's timezone. A second,
+tiny one follows `_links.nextepisode` when there is one, because the next episode is what every "Airs
+Tomorrow" badge is about and the one most likely to sit outside the regular slot. Measured against the live
+API: an ended show costs 1 fetch, a running one 2, and both are cached for twelve hours in memory and a week
+in KV, behind the same circuit breaker every other provider here sits behind.
+
+`airTimeLabelForNextEpisode` is the single rule for choosing between the two labels, so the Worker's own
+Stremio description and the page cannot print different times for the same episode.
+
+### The label
+
+`formatAirTimeLabel` (02, beside `formatAirDateBadge`) turns `"21:00"` + `"America/New_York"` into
+`9 PM ET`. Minutes are dropped on the hour the way a listing writes it. North American zones are spelled
+`ET`/`CT`/`MT`/`PT` from a small table rather than `EDT`/`EST`: a slot is 9 ET all year, and a label that
+flips twice a year reads as though the time moved. Everywhere else asks `Intl` for the zone's own short
+name on the day, and anything it cannot name recognisably (`GMT+5:30`) is dropped rather than printed.
+
+The Worker ships the finished string, so the page never carries a timezone database.
+
+### Getting it to the page
+
+The air time is a fact about a SHOW, but it has to print beside episodes that reach the page from three
+directions: the show's own page (has the details payload), an Airing Next tile (built from details, then
+stored), and a Continue Watching entry (built from `/api/season`, which has never seen one). Threading a new
+field through all of those -- and through everything already in every browser's local storage -- would have
+been a migration.
+
+So it is remembered per show instead. `rememberShowAirTime` is called from the two places a details payload
+passes through (opening a show's page, and the Airing Next refresh, which sees every upcoming show), writing
+a small entry under every id that show is known by. `showAirTimeLabel` reads it back by whichever id the
+caller happens to hold, and expires an entry after a week -- a show can be moved to a new night. Airing Next
+tiles also store the label directly, so a cold start knows the hour before the shelf refreshes.
+
+### One badge, five shelves
+
+The "Airs Tomorrow" pill was hand-written markup in five places (three in 17, one each in 21 and 23), which
+would have meant teaching five renderers about air times. They now share `airDateBadgeHtml` /
+`watchItemAirDateBadgeHtml`, and the hour goes on a second line inside the same pill rather than making it
+wider -- these sit on posters barely 100px across.
+
+### Tests
+
+`tests/helpers-unit.test.mjs` (6) -- the label: on the hour and off it, midnight and noon, the North
+American table, a zone outside it, and the empty answers (no time, unusable zone, junk input).
+
+`tests/worker.test.mjs` (6) -- what is asked of TVmaze and what is made of it: a broadcast slot, a next
+episode dated apart from it, a streaming show with no slot, a 404 and a thrown fetch both degrading to the
+date alone, a `tmdb:` id costing no request, a next-episode link off TVmaze not being followed, and the
+fetch meter the batch budget reads.
+
+`tests/client.test.mjs` (8) -- the hour under the date for tonight's episode and later ones, the next
+episode's own slot, nothing against an episode already out, nothing at all when TVmaze had none, the per-show
+store found by every id and expiring after a week, and the badge with and without a time.
+
+## 2026-09-16 - Season watch counts on a show's page, and "watched" measured against what has aired
+
+### Files Changed
+`09_page-shell.js`, `19_client-search-and-likes.js`, `21_client-custom-list-builder.js`,
+`22_client-creator-profile.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`, `Changes.md`,
+`FUNCTION-MAP.md`, `tests/client.test.mjs`
+
+### What prompted it
+
+Two asks about a show's item page. First: the season header says how many episodes a season has, so say how
+many of them have been watched too -- `3/8`, `8/8`, `0/8`. Second: when every episode that has aired is
+watched and the next one is still to come, Mark Show Watched should read Mark Show **Un**watched, because
+there is nothing left to mark.
+
+The second one is the same bug the first one would have made visible. "Fully watched" was counted against
+TMDB's `episode_count`, which counts the episodes still to come as well. Five episodes watched out of a
+ten-episode season with episode 6 a month away came out as 5/10 -- not caught up -- so the button offered to
+mark watched what had already been watched, and pressing it would have flipped the season to unwatched.
+
+`isSeasonFullyWatched` already knew better when `window._seasonEpisodesMap` held the season's real episode
+list, but that only arrives after a season is expanded or Mark Show Watched fetches every season. On the
+render that matters -- opening the page -- there was nothing but `episode_count`.
+
+### Where the aired count comes from
+
+`/api/details` already returns the show's next unaired episode: `nextEpisodeSeasonNumber`,
+`nextEpisodeNumber`, `nextEpisodeAirDate` (TMDB's `next_episode_to_air`, plus the server's own fallbacks).
+That single pointer places every season around it with no further request:
+
+| Season vs. the pointer | Aired |
+|---|---|
+| after it | nothing |
+| the one it falls in | everything before that episode (`nextEpisodeNumber - 1`) |
+| before it | the whole season (`episode_count`) |
+
+`seasonAiredEpisodeCount` reads three sources, most specific first: the loaded episode list, then that
+pointer, then the season's own air date with `episode_count` standing in for "all of it is out". It is now
+the denominator `isSeasonFullyWatched` compares against, and `seasonHasAiredEpisodes` -- which decides
+whether a season button says "Airs Mar 4" -- consults the same pointer.
+
+The pointer is counted in TMDB's season numbers, so it is not applied to a show whose seasons were
+renumbered: an anime unpacked out of an episode group, or a series rebuilt from Cinemeta
+(`resolveUnpackedShowData`, 07_source-fetchers-tmdb-simkl.js). Those payloads are the only ones carrying the
+`episodeCount` alias, which is what `showSeasonsAreTmdbNumbered` keys off.
+
+### The count itself
+
+`watchedEpisodeNumbersInSeason` is the episode tally split out of `isSeasonFullyWatched`, so the "3/8" on a
+season header and the button beside it cannot disagree about what has been watched.
+`seasonEpisodeCountState` turns it into the label and a `complete` flag (the accent colour at 8/8), capped at
+the season's own length so an episode TMDB has since dropped cannot render "9/8".
+
+`updateSeasonEpisodeCounts` repaints the labels -- one season, or all of them -- and hangs off
+`updateSeasonWatchedButton`, so every path that already refreshed a season button refreshes its count too.
+
+### The show button
+
+`showWatchedButtonState` / `applyShowWatchedButton` / `updateShowWatchedButton` give that button one
+description, the way `seasonWatchedButtonState` already did for the season buttons. Three places set it and
+each spelled out its own label and classes.
+
+`refreshItemWatchState` (every season button, every count, the show button) is what an episode toggle now
+calls, in place of repainting only `_currentSeasonNum`'s season button: the episode toggled may have been the
+last one the show was waiting on, and its season is not always the one that global points at.
+
+### One show's episode lists answering for another's
+
+`_seasonEpisodesMap` and `_episodeDataCache` are keyed by season number and episode number, not by show, and
+nothing cleared them between shows. Open a show, expand season 1, open a different show: that first show's
+season 1 was still what "how many episodes of season 1 have aired" read. Both are cleared when a show's page
+opens, and `_seasonEpisodesMap` joins `_episodeDataCache` in the sign-out reset.
+
+### Tests
+
+`tests/client.test.mjs` (15) -- the aired count from the pointer, in the airing season and either side of it;
+a season and a show reading as caught up at 5 of 5 aired and not at 4; a loaded episode list overriding the
+pointer; a renumbered show ignoring it; the button repainted from disk; the labels at 0/8, 3/8 and 8/8,
+deduplicated, capped, and blank when a season has no episode count; and the page itself rendered, which is
+both asks end to end -- `8/8`, `8/8`, `5/10` across the season headers with Mark Show **Un**watched above
+them, and Mark Show Watched again one aired episode short.
+
+## 2026-09-15 - A Channel's Play order is a menu of arrangements, not a rule applied over the top
+
+### Files Changed
+`13_tab-channels.js`, `16_client-row-core.js`, `20_client-channel-builder.js`,
+`24_client-backup-restore-presets.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### What prompted it
+
+Asked, of the "Sort by air date" checkbox shipped earlier the same day: what happens if a user selects sort
+by air date and then manually moves an item? Nothing good. The flag was a SERVE-TIME rule -- the Worker
+re-sorted on every request -- so the move was saved, shown in the builder, and then ignored on playback
+except where two picks shared a date. The list on screen was not the list that played.
+
+The fix is to change what a sort IS: an action that rearranges the stored picks once, rather than a rule
+layered over them forever. Then the stored order is the only order, and a hand-moved pick needs no special
+case to survive.
+
+### The control
+
+One **Play order** dropdown replaces both checkboxes and the "Shuffle picks now" button:
+
+| Entry | Kind |
+|---|---|
+| As listed (custom) | state -- the stored order plays |
+| Air date -- oldest first / newest first | one-shot sort, stays selected |
+| Show, then season & episode | one-shot sort, stays selected |
+| Title A-Z | one-shot sort, stays selected |
+| Shuffle now | one-shot, falls back to "As listed" |
+| Shuffle daily | the one persistent MODE (payload `shuffle`) |
+
+A static sort is remembered as the payload's `autoSort` purely so it can be re-applied when picks are added
+later; the Worker never reads it. `applyChannelDraftAutoSort` hooks `renderChannelDraftList` -- the one call
+every add path in the builder already ends with (episode picker, "Add every season", movies, crossovers,
+imports) -- so a sorted channel stays sorted as it grows without each of those paths knowing about sorting.
+
+Both manual reorder paths (the position input and the hold-drag `reorderChannelDraftFromDom`) call
+`clearChannelDraftAutoSort` BEFORE they re-render, which is the whole trick: the re-render is what would
+re-apply the sort, so disarming first is what lets the moved pick stay put.
+
+### Sorting rules
+
+Every comparator falls back to the item's current index, so ties keep the order they are already in: two
+episodes aired the same night, a whole season dropped on one day, anything undated. Undated picks sort last
+in both air-date directions. "Show, then season & episode" ranks shows by first appearance, so it groups a
+channel into runs of each show without also reshuffling which show opens it.
+
+### Migration
+
+`sortByAired` shipped a few hours earlier, so a channel could already carry it. The Worker keeps honouring
+it -- a channel nobody edits plays exactly as it does now -- and `editChannelById` turns it into the
+equivalent dropdown selection, which sorts the picks for real on the render that follows; `saveChannel`
+then writes the sorted order with the flag cleared. `channelItemsInPlayOrder` stays in "See All" for the
+same un-migrated case and falls straight through for everything else.
+
+### Tests
+
+`tests/client.test.mjs` (8) -- each sort rearranging the picks; a pick added later landing mid-list rather
+than at the bottom; a hand-moved pick staying put, the dropdown falling back to "As listed", nothing armed
+to re-sort, and a further add appending; "Shuffle now" arming nothing; a sort saving as the item order with
+`sortByAired: false` while "Shuffle daily" saves the flag and leaves the picks alone; the dropdown restored
+on edit; the legacy flag migrating; and "See All" still ordering an un-migrated channel.
+
+`tests/worker.test.mjs` -- one added: the Worker never acts on `autoSort`, so the stored order is the play
+order. The existing air-date tests stay, covering the retained `sortByAired` path.
+
+## 2026-09-15 - A Channel can play in air date order
+
+### Files Changed
+`05_catalog-core.js`, `13_tab-channels.js`, `16_client-row-core.js`, `20_client-channel-builder.js`,
+`24_client-backup-restore-presets.js`, `worker_entry_combined.js`, `README.md`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`, `tests/client.test.mjs`
+
+### What was asked for
+
+A way to sort a channel by aired date when creating or editing it -- working like the existing *Randomize
+play order (reshuffles once a day)* checkbox, with only one of the two selectable at a time.
+
+### Where the air date comes from
+
+Nowhere new. Every channel pick has carried its air date since it was added:
+
+- **Episodes**: `/api/show-episodes` maps TMDB's `air_date` for that exact episode to `released`, and every
+  path that builds a draft item (the episode picker, *Add every season*, Quick Add Channel, the
+  crossover/storyline builders) copies it onto the item.
+- **Movies**: the movie's release date, falling back to `<year>-01-01` when the year was all TMDB gave.
+- `compactChannelItemForStorage` already keeps `released` on the saved item (it drops `year`), and the
+  payload the Worker reads is that same item list.
+
+So the ordering is decided from the saved payload alone -- no TMDB request is made for it, on the page or
+in the Worker, and a channel built before this change sorts correctly without being rebuilt.
+
+### The change
+
+**Worker (`05_catalog-core.js`)**. `channelItemAiredDate` reads an item's date as a sortable `YYYY-MM-DD`
+string (accepting a full ISO timestamp, a bare year, or the `year` field), and `sortChannelItemsByAired`
+orders a list by it: oldest first, undated items last in their saved order, ties keeping their saved order
+-- which is what puts two episodes aired the same night back in broadcast order. `buildChannelMeta` applies
+it after the rotation/shuffle branch, so it also orders a `dailyRotate` channel's lineup for the day
+(the rotation still chooses *which* shows and episodes play; the sort chooses the order). The running
+order is still renumbered 1..N afterwards and no stream id changes.
+
+**One choice, not two.** The builder's two checkboxes clear each other (`setChannelPlayOrderMode`), and
+`saveChannel` drops `shuffle` whenever `sortByAired` is set, so no payload this app writes carries both.
+A payload old enough to carry both -- `shuffle` was the only flag that existed -- resolves the same way in
+the Worker: the branch is `payload.shuffle && !payload.sortByAired`, and the sort is applied last.
+Leaving both off keeps the picks in the order they are listed, which is why these are two checkboxes
+rather than a radio group: "neither" is the default answer and a radio group would need a third option to
+say it.
+
+**Persistence.** `sortByAired` is carried through `saveLocalChannel`, `saveLocalChannelsMap` (all three
+quota tiers) and `ensureAllChannelsSyncedFromRows`, so it survives a reload and rides the existing
+`/api/creator/sync/save-channels` push to other devices like `shuffle` always has.
+
+**"See All".** `openChannelDetailsPage` reads the saved items directly rather than going through the
+Worker, so it was listing an air-date channel in whatever order its picks happened to be stored in --
+contradicting the builder that had just been told otherwise. `channelItemsInPlayOrder` applies the same
+ordering client-side (its regex uses `[0-9]` character classes, not `\d`, because these files are string
+content inside `renderBuilder`'s template literal and a lone backslash never reaches the browser).
+
+**Where it shows.** The channel card in *My Channels* and the source-row summary under a catalog row both
+say which order a channel plays in ("air date order" / "shuffled daily").
+
+### Tests
+
+`tests/worker.test.mjs` -- oldest-first across shows without renumbering an id, the `year`-only fallback,
+undated items last in saved order, same-night ties in saved order, the sort winning over a payload that
+carries both flags, a rotating channel's day ordered without changing what it picked, and a channel with
+neither flag left exactly as listed.
+
+`tests/client.test.mjs` -- the checkboxes clearing each other (and unticking one not ticking the other),
+`saveChannel` never saving both flags, `editChannelById` putting the saved order back on the right box,
+and "See All" listing an air-date channel oldest first with undated picks last.
+
+## 2026-09-15 - A Channel episode asks a stream add-on for the episode it actually is
+
+### Files Changed
+`05_catalog-core.js`, `20_client-channel-builder.js`, `worker_entry_combined.js`, `CHANGELOG.md`,
+`Changes.md`, `FUNCTION-MAP.md`, `tests/worker.test.mjs`
+
+### Root Cause
+
+Reported: "Non-debrid addons (like Pengu) dont pickup the fake episodes order. I.e: FRIENDS randomized
+channel has the S01E01 at the start of the queue when in fact it's, let's say, S05E13. With Debrid addons it
+plays correctly the S05E13, but non debrid scrapes the original S01E01."
+
+The first thing to establish is what a stream add-on can actually see, because the report assumes it sees
+the channel's running order. It cannot. Stremio asks every installed stream add-on for
+`/stream/<type>/<video.id>.json` and sends nothing else -- the addon SDK's own `defineStreamHandler`
+documentation says the id it receives IS the video id, and stremio-core builds that request from
+`video.id` alone. `buildChannelMeta` has always put the REAL episode there (`tt0108778:5:13`) and used
+`season: 1, episode: i + 1` only for display, which is what makes the shuffled order hold in the UI. Those
+two fields never leave this Worker. Confirmed against the live deployment: a four-item shuffled Friends
+channel publishes ids `tt0108778:1:1`, `tt0108778:10:17`, `tt0108778:5:13`, `tt0108778:3:5` under running
+numbers 1-4.
+
+So for a Friends channel built from TMDB -- every item carrying a real `tt` id and a real season and
+episode -- the request Pengu receives is byte-identical to the one it receives when someone opens Friends
+from Cinemeta and clicks S05E13, and an S01E01 result is Pengu resolving it wrongly on its own side. That
+half is not ours to fix.
+
+What IS ours is every case where the id we publish is not the episode we display, and there were three:
+
+1. `parseInt(it.season, 10) || 1` could not distinguish "no season stored" from season 0. An item missing
+   either number -- or carrying `"0"` as a string -- was published as `<show>:1:1`. That is not a broken
+   link that gets reported; it is that show's series premiere playing under the title of the episode we
+   meant, which is exactly the symptom described.
+2. A show TMDB has no IMDb id for was stored as a bare TMDB number (`String(ep.tmdbId)`) in the
+   crossover/storyline builders, or as an empty string from the episode picker (whose buttons carried only
+   `data-imdbid`, which `/api/show-seasons` leaves empty in that case). Those publish as `12345:5:13` and
+   `:5:13`. Neither matches an `idPrefixes` entry anywhere, so no add-on is asked for either.
+3. `/api/channel-preset` already used the correct `tmdb:<id>` fallback, so the same channel built two
+   different ways published two different id shapes.
+
+### What changed
+
+**`05_catalog-core.js`** -- `channelItemShowId`, `channelItemNumber` and `channelItemStreamId`, directly
+above `buildChannelMeta`. The show half is normalised to `tt...` or `tmdb:<id>` (a bare number is given the
+prefix; anything else is unusable), and a season or episode has to be a real integer >= 0 -- 0 included,
+which is what the old `|| 1` could not express. `buildChannelMeta` filters items through
+`channelItemStreamId` BEFORE the daily rotation or the shuffle picks a lineup, so a dropped item costs the
+channel one slot instead of leaving a hole in the middle of it, and the running order stays 1..N. Trading a
+wrong episode for a missing one is the point: a missing episode can be reported, a wrong one looks like it
+worked.
+
+**`20_client-channel-builder.js`** -- `channelStreamShowId`, the same normalisation where draft items are
+built, so the Worker's check has nothing left to catch: picked episodes, "Add every season", Quick Add
+Channel and both crossover/storyline paths. The episode picker's two add buttons now carry `data-tmdbid`
+beside `data-imdbid`, and `addCheckedEpisodesToChannel`/`addAllEpisodesToChannel` take it, which is what
+gives a show with no IMDb id a real `tmdb:` fallback rather than an empty string. `tmdb:<id>:<s>:<e>` is
+already a first-class shape elsewhere in the app (`23_client-list-management.js` splits it explicitly), so
+nothing downstream had to change.
+
+**`tests/worker.test.mjs`** -- eight cases against the real `buildChannelMeta`: the real season/episode
+reaching the id while the display numbering stays the running order, an unnumbered item being dropped
+rather than resolving to `:1:1`, season/episode 0 surviving as 0, a bare TMDB number gaining its prefix, an
+unusable show id being dropped rather than publishing `:5:13`, the queue closing its gaps, a movie keeping
+its plain id, and a shuffled channel reordering the queue without ever renumbering an id.
+
+### Still open (not this change)
+
+A stream add-on that resolves `tt0108778:5:13` to S01E01 is doing so from an identical request to the one
+the normal Cinemeta detail page produces. The way to prove that to its author is to play the same episode
+from outside a channel; if it is also wrong there, nothing in this repository is involved.
+
+## 2026-09-15 - No "mark as watched" control can claim a future episode
+
+### Files Changed
+`09_page-shell.js`, `19_client-search-and-likes.js`, `21_client-custom-list-builder.js`,
+`worker_entry_combined.js`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/client.test.mjs`
+
+### Root Cause
+
+Reported: "if i use the Mark Show Watched the future season is marked as watched but the episode isnt marked
+as watched and the show isnt added to continue watching, any mark as watched buttons should not mark a
+future episode as watched."
+
+Two of those three are one bug and the third is a second one.
+
+`markShowWatched` never marked a future episode watched -- it filters on `isEpisodeAired` when it fetches
+each season, which is why the episode was correctly absent from Watch History. What it did do was finish
+with `document.querySelectorAll('.btn-mark-season-watched').forEach(...)` and relabel **every** season
+button on the page to "Mark Season Unwatched", including a season with nothing aired and nothing watched.
+The state was right; the only thing wrong was the button, and the button is what the person reads.
+
+Behind that sat a smaller mess: four places set that same button (the item modal's first render,
+`updateSeasonWatchedButton`, `markSeasonWatched`'s own post-write update, and the bulk relabel above) and
+none of them had a case for "this season has not aired". `markSeasonWatched` on such a season fetched, found
+zero aired episodes, and handed the button back enabled and labelled "Mark Season Watched" -- a control that
+silently does nothing. And the episode modal offered "Mark as Watched" for any episode at all, with
+`toggleWatchStatus` -- the single function every episode toggle goes through -- doing no air-date check, so
+a future episode could be recorded as watched from there and then counted towards fully-watched, evicted the
+show from Continue Watching, and been pushed to the account.
+
+The third symptom is separate. `updateContinueWatching` deliberately keeps a caught-up show on the shelf
+with its next, unaired episode (`isUnaired`, rendered with an "Airs ..." badge) -- that is what marking the
+last aired episode one at a time does. `markShowWatched` then ran its own Continue Watching commit *after*
+that reconciliation and unconditionally evicted the show, so the whole-show button was the one path that
+dropped a caught-up show off the shelf.
+
+### What changed
+
+**One button state (`19`)** -- `seasonHasAiredEpisodes`, `seasonFirstAirDate`, `seasonWatchedButtonState`,
+`watchedSeasonButtonState` and `applySeasonWatchedButton`. Airedness comes from the season's loaded episode
+list when there is one and from its TMDB `air_date` otherwise; a season with no air date at all is unknown,
+and unknown behaves exactly as before rather than being disabled on a guess. An upcoming season gets a
+disabled button saying when it airs. All four call sites now go through it, `markShowWatched`'s included --
+and that one only relabels the seasons whose episodes it actually wrote, from `allEpisodes`.
+
+**Caught up is fully watched (`19`)** -- `isShowFullyWatched` and `markSeasonWatched`'s `allSeasonsWatched`
+both skip seasons with nothing aired. One announced season used to make a show unfinishable.
+
+**The episode door (`19`, `21`)** -- `episodeWatchButtonHtml` renders "Airs ..." disabled for an unaired
+episode, and `toggleWatchStatus` refuses to ADD one. Removal is untouched: an entry made before this, or by
+a scrobble, still has to be undoable. `markShowWatched` and `markSeasonWatched` now say so with a toast when
+there is nothing aired to mark, instead of appearing to fail.
+
+**Continue Watching (`21`)** -- `markShowWatched` keeps the upcoming entry the reconciliation just computed
+for the show, and only evicts (and queues a storyline conclusion) when nothing is left to air.
+
+**Supporting (`19`, `21`, `09`)** -- both mark paths now stash their fetched episode lists in
+`_seasonEpisodesMap`, so `isSeasonFullyWatched` stops falling back to `episode_count` (which counts unaired
+episodes) for those seasons; and `.lc-btn:disabled` finally looks disabled.
+
+### Tests
+
+Client: marking a whole show watched writes only the aired episode and leaves the future season's button
+saying it has not aired; the show reads as caught up rather than unfinished; it stays on Continue Watching
+with the unaired next episode; `toggleWatchStatus` refuses to add a future episode but still removes one
+already recorded; the episode modal offers no wired-up button for an unaired episode and keeps one for an
+episode already marked watched; marking a not-yet-aired season leaves a disabled button that says when it
+airs; and a season with no air date is treated as ordinary.
+
+## 2026-09-14 - Airing Next gets a remove, and Reset Account Data stops looking stuck
+
+### Files Changed
+`00_constants.js`, `02_http-and-creator-utils.js`, `09_page-shell.js`, `15_tab-settings-html.js`,
+`16_client-row-core.js`, `21_client-custom-list-builder.js`, `22_client-creator-profile.js`,
+`23_client-list-management.js`, `24_client-backup-restore-presets.js`,
+`26_api-creator-and-admin-routes.js`, `schema.sql`,
+`migrations/0012_add_airing_next_removals.sql`, `worker_entry_combined.js`, `CHANGELOG.md`, `Changes.md`,
+`FUNCTION-MAP.md`, `README.md`, `tests/client.test.mjs`, `tests/worker.test.mjs`
+
+### Root Cause
+
+Two reports. "Reset Account Data takes a sec or two to complete and the user has no idea what is happening
+during this time," and "airing next, add a remove feature to allow a user to stop seeing airing next for a
+show but keep the episodes they currently have marked as watched and if they watch another episode it gets
+added back to airing next."
+
+**Reset.** `openResetAccountModal` clears this browser *before* it calls the server, and the comment above it
+explains why: the reverse order leaves a window in which an autosave or a scrobble can push the old lists
+straight back into the account that was just emptied. What it costs is a gap -- the confirm dialog has closed,
+`clearLocalAccountData` has emptied every shelf on screen, and the fetch has not answered yet. Nothing at all
+was rendered during that gap, so a successful reset and a failed one looked identical for a second or two.
+
+**Airing Next.** The shelf is derived, not stored: `collectAiringNextCandidateShowIds` takes every show with a
+watched episode and `refreshAiringNext` asks TMDB for each one's next air date. Nothing in that pipeline had a
+notion of "not this show", so the only ways off the shelf were to delete the show's Watch History rows or mark
+the whole show unwatched -- both of which destroy the record the person wanted to keep. The shape for the fix
+was already in the file: `dismissContinueWatchingShow` records a *watched snapshot* rather than a flag, so
+watching a newer episode supersedes the dismissal on its own.
+
+### What changed -- Airing Next removals
+
+**Client (`21`)** -- `removeAiringNextShow` records `{seasonNum, episodeNum}` for the show (its furthest-along
+watched episode, via the new shared `latestWatchedEpisodeForShowIds`, which `dismissContinueWatchingShow` now
+uses too), drops it from the cached shelf and pushes the shortened list with `intentionalRemoval` -- which is
+what lets an empty shelf replace a stored one, since save-tracking otherwise refuses that.
+`isAiringNextRemoved` is the only place the rule lives and is a pure read; `collectAiringNextCandidateShowIds`
+applies it, which covers the 6-hourly refresh, the watch-state sync, the dashboard card's eligibility check
+and the Stremio catalog push in one. `pruneSupersededAiringRemovals` (called from `syncAiringNextWatchState`,
+where watch state has just moved) drops a record the person has already passed.
+
+**UI (`21`, `22`, `23`)** -- an "x" on every Airing Next poster: the dashboard card, the generic list card,
+and the full-page view (a `removeAiringShowId` field on the sample, deliberately not `removeShowId`, which
+`livePreviewPosterHtml` reads as "this is a Continue Watching tile"). A "Removed from Airing Next" panel in
+Settings -> Account & Sync (`15`, `22`) lists what is removed and puts one back; hidden when empty.
+
+**Found on the way (`22`)** -- `compactCustomListItem` runs over every item on every local list save and
+did not carry `canonicalTmdbId` through, so the resolved TMDB id that `refreshAiringNext`'s dedupe and
+`buildLocalListCardHtml`'s badge matching both key on survived only until the next save. Kept now; it is also
+what lets a removal cover both ids one show can be recorded under.
+
+**Sync (`22`, `26`, `02`, `schema.sql`, `migrations/0012`)** -- the shelf is rebuilt from Watch History by
+every device, so a removal held only where it was made is undone by the next device to rebuild and push. It
+travels with the tracking record as `removedAiringNext` and lands in two new `creator_show_states` columns.
+The write probes for those columns first (`d1HasAiringRemovalColumns`) and falls back to the pre-0012
+statement when they are absent, so an unmigrated deployment keeps syncing everything else. A payload with no
+`removedAiringNext` at all is treated as "no opinion", not "none" -- both in the D1 write and in the blob the
+route stores -- so an older browser's ordinary autosave cannot clear the account's removals.
+
+### What changed -- Reset Account Data
+
+**Client (`16`, `22`, `09`)** -- a new `showAppBusy` beside `showAppAlert`/`showAppConfirm`: a dialog with a
+spinner and no buttons, raised *before* the local clear and replaced by the outcome dialog when the request
+finishes. And the spinner actually turns now -- `animation: spin` was referenced in two places and
+`@keyframes spin` was declared in none.
+
+### Tests
+
+Client: a removal leaves Watch History whole, keeps the show out of the candidate set a rebuild starts from,
+comes back when a later episode is watched and does not when an older one is rewatched, is forgotten once
+superseded, can be undone from Settings, reaches the account with `intentionalRemoval`, and is applied (and
+filtered out of an already-computed shelf) when another device made it. The reset shows the working dialog
+before anything disappears and always lands on an outcome dialog, and no animation may be used by name
+without being declared. Worker: the removal survives the save/load round trip and reaches
+`creator_show_states`; a write that omits it leaves the stored ones alone; a database without migration 0012
+still stores Watch History, Continue Watching and Airing Next, and reports no removals rather than failing.
+
 ## 2026-09-09 - Discover: a header and Refresh on every sub-nav tab, and poster previews that retry
 
 ### Files Changed

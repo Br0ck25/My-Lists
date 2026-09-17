@@ -35,6 +35,9 @@
     <!-- Streaming Catalogs Shelf -->
     ${streamingHtml}
 
+    <!-- New on Streaming Shelf -->
+    ${newOnStreamingHtml}
+
     <!-- Hidden Gems Shelf -->
     ${hiddenGemsHtml}
 

@@ -33,6 +33,30 @@ const CURATED_RECOMMENDATION_LIMIT = 40;
 // trade one bug for a worse, invisible one.
 const PUBLISHED_LIST_ITEMS_MAX = 10000;
 const PUBLISHED_LIST_NAME_MAX = 200;
+
+// --- shared channels ----------------------------------------------------
+//
+// A shared channel is stored whole under one KV key, so it needs a ceiling
+// that KV itself does not give it in any useful form: 25MB is the hard
+// limit, but a 25MB record is also a 25MB read on every import and every
+// directory card built from it. 4MB is roughly a 5,000-episode channel with
+// full artwork -- the largest thing this add-on can actually build -- and
+// is rejected rather than truncated, for the reason PUBLISHED_LIST_ITEMS_MAX
+// already spells out: quietly storing a shortened channel is a worse bug
+// than refusing an oversized one.
+const SHARED_CHANNEL_BYTES_MAX = 4000000;
+// How many channels the Explore Channels directory holds. One KV key, read
+// on every visit to the tab, so this is a page-weight budget as much as a
+// storage one; the oldest listing falls off when a new one arrives.
+const PUBLIC_CHANNEL_INDEX_MAX = 500;
+
+// A Spotlight channel reads one show a season at a time to find the episodes
+// its subject is actually in (see /api/person-show-episodes). These bound
+// what one show can cost and contribute: a soap with 40 seasons would
+// otherwise be 40 TMDB calls, and a series regular on a 300-episode run
+// would drown every other credit in the channel.
+const PERSON_SHOW_MAX_SEASONS = 20;
+const PERSON_SHOW_MAX_EPISODES = 400;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 10 * 1024 * 1024;        // 10 MB of serialized JSON
 
@@ -255,6 +279,167 @@ const CRON_EPISODE_CHECK_MAX = 150;
 // leaving 9,700 for the charts, which covers all 47 of them; at a free
 // Worker's 48 it is 24 fetches -> 12 shows a tick, which is 2,880 checks a day.
 const CRON_EPISODE_CHECK_SHARE = 0.5;
+
+// --- New on Streaming -------------------------------------------------------
+//
+// The catalog behind tmdb:new-on-streaming[:service]: what actually arrived on
+// a streaming service, newest first, with a show pushed back to the top when
+// a new episode airs.
+//
+// It cannot be a discover query, and that is the whole reason any of this
+// exists. TMDB's with_watch_providers answers "is this on Netflix right now";
+// nothing in TMDB, Trakt or Simkl answers "when did it get there". The closest
+// existing row in this add-on, tmdb:genre:stream-releases, sorts by
+// primary_release_date instead -- which is why it shows theatrical-era titles
+// and completely misses a 1998 film being added to Hulu this morning.
+//
+// So the add-on observes it. Each cron tick walks a slice of a provider's
+// catalog; a title that was not in streaming_events already is an arrival, and
+// the moment it is first seen is the date the shelf sorts on. That date is
+// only ever as good as the observation, which is why the sweep is written to
+// be cheap enough to run constantly rather than accurate in one pass.
+//
+// Provider ids are the ones already verified for TMDB_CHART_PATHS (see
+// tmdbProviderChartPaths, 07_source-fetchers-tmdb-simkl.js): TMDB carries more
+// than one entry for some services, a wrong id fails silently by showing the
+// wrong catalog under the right label, and these were confirmed through the
+// admin dashboard's Provider Preview tab. Do NOT hand-edit them from memory --
+// re-verify through that tab, the same rule that block already carries.
+const NEW_ON_STREAMING_PROVIDERS = [
+  { key: "netflix", name: "Netflix", tmdbId: 8 },
+  { key: "primevideo", name: "Prime Video", tmdbId: 9 },
+  { key: "disney", name: "Disney+", tmdbId: 337 },
+  { key: "hbomax", name: "HBO Max", tmdbId: 1899 },
+  { key: "hulu", name: "Hulu", tmdbId: 15 },
+  { key: "appletv", name: "Apple TV+", tmdbId: 350 },
+  { key: "paramount", name: "Paramount+", tmdbId: 2303 },
+  { key: "peacock", name: "Peacock", tmdbId: 387 },
+];
+
+// Which watch_region the sweep observes. One region is not a simplification
+// that can be lifted by adding entries here: each extra region multiplies the
+// walk by the number of providers again, and a region nobody has selected is
+// a full catalog walk spent on nobody. A reader whose own region is not swept
+// is served the first entry's rows instead of an empty shelf -- stated plainly
+// in the catalog's own error path rather than silently.
+const NEW_ON_STREAMING_REGIONS = ["US"];
+
+// The walk reads each provider catalog to its END, and the depth is LEARNED
+// rather than configured: every discover response carries total_pages, so the
+// sweep records how deep each provider+kind actually goes and walks exactly
+// that far.
+//
+// It shipped with a fixed 40-page horizon instead, and that quietly broke the
+// feature's whole premise. Sorted by release date descending, 40 pages is the
+// ~800 most recently RELEASED titles -- one to three years. A 2010 film added
+// to Netflix today sits far outside that window, so the sweep never fetched
+// the page it was on and the title never entered the table at all: not as an
+// arrival, not even as a seeded row. The list could only ever report new
+// releases arriving, which is the case that needed it least, and is exactly
+// the failure this feature was built to fix.
+//
+// This is the only hard bound left, and it is TMDB's, not a choice: discover
+// stops paginating at page 500 (10,000 titles). No single service's flatrate
+// catalogue in one region comes near it.
+const NEW_ON_STREAMING_MAX_PAGES_PER_CATALOG = 500;
+
+// Sweep units (one provider + kind + page) per tick.
+//
+// Raised from 12 now that a pass covers whole catalogues rather than their
+// first 40 pages. A pass is roughly 1,000-1,500 pages in total across the
+// eight services and both types -- the sweep measures the real number and the
+// admin panel reports it -- so 40 a tick brings a full pass in around three
+// hours on the recommended */6 schedule. That is the detection latency for a
+// back-catalogue arrival and, now, for a removal.
+//
+// It is not how long the shelf takes to look right: the walk is page-major
+// (see newOnStreamingCombos), so the first 16 units are page 1 of every
+// provider and kind and the newest titles everywhere are in within one tick.
+// The hours after that only add depth.
+//
+// The budget check uses NEW_ON_STREAMING_SWEEP_FETCHES (21) as a per-page
+// ceiling, so 40 pages reserves 840 against the ~1,175 the sweep is given.
+// That ceiling is only ever paid on a first walk; once IMDb ids are cached a
+// page costs one fetch.
+const NEW_ON_STREAMING_PAGES_PER_TICK = 40;
+
+// Budget ceiling for one sweep unit: the discover page itself, plus an IMDb
+// resolution for each of its 20 items. Like CRON_CHART_WARM_FETCHES this is a
+// ceiling and not an average -- the sweep asks D1 which of the page's TMDB ids
+// it already has and resolves only the rest, so a page of titles already in
+// the table costs the single discover fetch. A first walk pays the full 21.
+const NEW_ON_STREAMING_SWEEP_FETCHES = 21;
+
+// Share of the budget the sweep may claim -- and specifically, a share of the
+// reserve the EPISODE sweep is handed but cannot reach.
+//
+// The episode half is given CRON_EPISODE_CHECK_SHARE of the tick (5,000 at the
+// default) while CRON_EPISODE_CHECK_MAX caps what it can actually spend at 300,
+// so 4,700 fetches are reserved every tick by something that will never ask for
+// them. Taking this from there rather than from the pre-warm's share is what
+// keeps the guarantee the pre-warm already had: on the default budget the
+// entire chart list still warms in ONE tick, so no chart is ever left for the
+// next one. Take it from the pre-warm instead and 35 of the 40 charts fit,
+// which is a working feature quietly degraded to pay for a new one.
+//
+// At the default that is 1,175 fetches -- comfortably more than the 252 a
+// 12-unit tick can spend at its own ceiling. On a free Worker the episode
+// reserve is 24 and fully reachable, so this comes out at 0 and the sweep
+// skips itself with one log line, exactly as chart pre-warming does.
+const CRON_NEW_ON_STREAMING_SHARE = 0.25;
+
+// How far back an episode counts as "just aired" for the re-bump pass, how
+// many discover pages of candidates it collects per provider, and how many
+// shows it may resolve exactly per tick.
+//
+// The window is wider than a week so a show is not missed when a tick is
+// dropped; re-bumping a show to a date it already holds is a no-op, so overlap
+// is free.
+//
+// Three pages rather than one because the candidate scan is popularity-ordered
+// and a busy service can have well over twenty shows airing inside the window
+// -- at one page, a mid-list show's new episode would simply never be seen.
+// Widening the candidate list is nearly free: candidates are then narrowed to
+// the shows this add-on already carries, and the per-show answer is KV-cached
+// for six hours, so the pages cost 3 fetches each and most of the resolutions
+// cost none.
+const NEW_ON_STREAMING_EPISODE_WINDOW_DAYS = 10;
+const NEW_ON_STREAMING_EPISODE_SCAN_PAGES = 3;
+const NEW_ON_STREAMING_EPISODE_SHOWS_PER_TICK = 40;
+
+// --- Marking a title as gone ------------------------------------------------
+//
+// A completed pass has visited every page of every catalogue, so a row it did
+// not see is a title that is no longer there. That is the only evidence
+// available, and it is worth being careful with: the cost of a false removal
+// is a title vanishing from the shelf, and then -- when the next pass finds it
+// again -- reappearing at the top as an arrival that never happened.
+//
+// Three guards, in increasing order of how badly things have to be going:
+//
+//   GRACE_WALKS   a row must be missed by this many CONSECUTIVE completed
+//                 passes before it is marked gone. Two passes is several hours
+//                 of TMDB consistently not listing it, which no ordinary
+//                 hiccup survives.
+//   MAX_PASS_ERRORS  a pass that could not read this many pages did not
+//                 establish that anything is absent; it marks nothing.
+//   MAX_REMOVAL_SHARE  and if a pass somehow still concludes that more than
+//                 this fraction of everything on record has vanished at once,
+//                 the conclusion is wrong. It marks nothing and says so
+//                 loudly, because that is a provider or an API having a bad
+//                 day, not a quarter of the catalogue leaving overnight.
+const NEW_ON_STREAMING_REMOVAL_GRACE_WALKS = 2;
+const NEW_ON_STREAMING_MAX_PASS_ERRORS = 20;
+const NEW_ON_STREAMING_MAX_REMOVAL_SHARE = 0.25;
+
+// Ships dark. The sweep, the catalog and the /lists route are live as soon as
+// this deploys -- tmdb:new-on-streaming resolves, installs into Stremio and
+// pages like any other row -- but the Quick Add shelf and the Discover
+// entries stay hidden until this is true, so the list can be tested from the
+// admin dashboard against real data before anyone else can add it. Flipping
+// this to true is the entire "move it to the live site" step; nothing else
+// about the feature changes.
+const NEW_ON_STREAMING_IN_QUICK_ADD = false;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
@@ -734,6 +919,26 @@ const D1_SCHEMA_MANIFEST = [
   {
     migration: "0010", kind: "table", name: "creator_tracking_meta",
     consequence: "Tracking metadata and conflict versioning fall back to creatorsynctracking:* KV blob.",
+  },
+  {
+    migration: "0011", kind: "table", name: "streaming_events",
+    consequence: "New on Streaming has nowhere to record provider arrivals, so the sweep writes nothing and the catalog stays empty. Unlike the rest of this manifest there is no KV fallback: the dates in this table are observed over time and cannot be refetched, so every tick that runs without it is history not collected.",
+  },
+  {
+    migration: "0011", kind: "index", name: "idx_streaming_events_feed",
+    consequence: "Every page of the New on Streaming shelf sorts the whole table instead of walking an index. Slower, not broken.",
+  },
+  {
+    migration: "0011", kind: "index", name: "idx_streaming_events_tmdb",
+    consequence: "The sweep's \"which of these titles do I already have\" lookup scans the table once per page walked, and so does the episode re-bump. Slower, not broken.",
+  },
+  {
+    migration: "0012", kind: "column", table: "creator_show_states", name: "airing_removed_season",
+    consequence: "Removing a show from Airing Next stops sticking: the removal cannot be stored on the account, so it holds only in the browser that made it and any other device puts the show back. Everything else about tracking keeps working -- the Worker checks for this column and writes the older statement without it.",
+  },
+  {
+    migration: "0012", kind: "column", table: "creator_show_states", name: "airing_removed_episode",
+    consequence: "The other half of the pair above; without it a stored removal has no episode to be superseded by, so watching another episode could not bring the show back.",
   },
 ];
 

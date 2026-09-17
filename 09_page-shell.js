@@ -27,6 +27,11 @@ function renderBuilder(
   const kidsHtml = buildKidsHtml();
   const holidaysHtml = buildHolidaysHtml();
   const genresHtml = buildGenresHtml();
+  // Both empty strings until NEW_ON_STREAMING_IN_QUICK_ADD is flipped -- the
+  // catalog itself is live either way, it just has no entry in the two places
+  // a visitor would find it. See buildNewOnStreamingHtml (08).
+  const newOnStreamingHtml = buildNewOnStreamingHtml();
+  const newOnStreamingQuickAddCard = buildNewOnStreamingQuickAddCard();
   // Precomputed here (same pattern as the *Html fragments above) rather
   // than built inline inside the giant HTML template literal below --
   // this file's template literal has bitten past changes before with
@@ -252,8 +257,10 @@ ${seoHeadHtml}
     border-radius: 4px;
   }
 
-  /* The page has three @keyframes animations and 33 transitions and said
-     nothing about people who have asked their system not to animate. */
+  /* The page has four @keyframes animations and 33 transitions and said
+     nothing about people who have asked their system not to animate.
+     The busy spinner (.app-spinner) is covered by this too -- it stops
+     turning, and the wording beside it is what says the work is running. */
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
       animation-duration: 0.01ms !important;
@@ -1251,6 +1258,81 @@ ${seoHeadHtml}
     gap: 8px;
     margin-top: 8px;
   }
+  /* --- Channel broadcast schedule, Story Lock & the Quick Channel wizard -- */
+  .channel-rule-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    user-select: none;
+    line-height: 1.35;
+  }
+  .channel-rule-row input[type="checkbox"] {
+    margin: 2px 0 0;
+    flex: 0 0 auto;
+  }
+  .channel-dial {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .channel-dial input,
+  .channel-dial select {
+    width: auto;
+    min-width: 76px;
+    font-size: 0.82rem;
+    padding: 5px 8px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  /* Rearranging My Channels. The handle itself is .drag-handle-list, the
+     same one a list card uses; this is only what marks the card in flight. */
+  .list-card.dragging {
+    opacity: 0.55;
+    outline: 2px dashed var(--accent);
+    outline-offset: 2px;
+  }
+  .channel-pick-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 8px;
+  }
+  .channel-pick-selected img {
+    opacity: 0.72;
+  }
+  .channel-storylock-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 6px 12px;
+    margin-top: 6px;
+  }
+  .channel-wizard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .channel-wizard-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .channel-wizard-grid select {
+    font-size: 0.85rem;
+    padding: 6px 10px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
   @media (min-width: 641px) {
     .channel-season-grid {
       grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
@@ -1334,6 +1416,12 @@ ${seoHeadHtml}
   }
   .lc-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .lc-btn.primary:hover:not(:disabled) { opacity: 0.85; }
+  /* Disabled meant "ignores clicks" and looked identical to a working
+     button, which is how a season that has not aired yet -- whose button
+     now says when it does -- would otherwise read as one that is simply
+     broken. Covers every disabled .lc-btn, including the ones already
+     disabled mid-fetch. */
+  .lc-btn:disabled { opacity: 0.55; cursor: default; }
   /* The same surface 'button.secondary' gives every Connect / Disconnect /
      Copy button, spelled with two classes so it also reaches the <a>s that
      are styled as buttons. Those needed it: 'button, .actions a' (further
@@ -1817,6 +1905,18 @@ ${seoHeadHtml}
     pointer-events: none;
     white-space: nowrap;
     text-transform: uppercase;
+  }
+  /* The hour under the day, inside the same pill -- a second line rather than
+     a longer one, because these sit on a poster barely 100px wide. */
+  .cw-date-badge-timed {
+    text-align: center;
+    max-width: calc(100% - 8px);
+  }
+  .cw-date-badge-time {
+    display: block;
+    font-weight: 700;
+    font-size: 0.95em;
+    opacity: 0.92;
   }
   .cw-date-badge-premiere {
     background: #2fa84f;
@@ -2988,6 +3088,9 @@ ${seoHeadHtml}
     color: var(--muted);
     font-size: 0.9rem;
   }
+  .season-header-episodes.is-complete {
+    color: var(--brand);
+  }
   .season-header-actions {
     flex-shrink: 0;
     margin-left: 12px;
@@ -3039,6 +3142,19 @@ ${seoHeadHtml}
   .modal-card.modal-card-wide {
     max-width: 1100px;
     width: 95vw;
+  }
+  /* The one animation in here that is not decoration: it is the only signal
+     a modal gives that a slow action (Reset Account Data, generating an
+     install link) is still running rather than stuck. The spin animation was
+     referenced by name in two places and declared in none, so both spinners
+     sat perfectly still. */
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .app-spinner {
+    display: inline-block; width: 20px; height: 20px; flex: none;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
   }
   .modal-close-x {
     float: right; background: var(--bg); border: 1px solid var(--border-strong);
@@ -3516,6 +3632,7 @@ ${seoHeadHtml}
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeMovieBtn" onclick="switchListDetailsType('movie')">Movies</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeSeriesBtn" onclick="switchListDetailsType('series')">Shows</button>
+        <button type="button" class="subnav-pill generic-type-pill" id="detailTypeLineupBtn" onclick="switchListDetailsType('lineup')" style="display:none;">On Today</button>
         <button type="button" class="subnav-pill" id="cwClearHistoryBtn" onclick="clearContinueWatchingAll()" style="display:none; color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear All</button>
       </div>
       <div id="whSortControls" style="display:flex; align-items:center; gap:8px;">
@@ -3683,6 +3800,7 @@ window._CHARTS_STREAMING_ALL = ${jsonForScript(STREAMING_ALL)};
 window._CHARTS_KIDS = ${jsonForScript(KIDS_LISTS)};
 window._CHARTS_HOLIDAYS = ${jsonForScript(HOLIDAY_LISTS)};
 window._CHARTS_GENRES = ${jsonForScript(GENRE_LISTS)};
+window._CHARTS_NEW_ON_STREAMING = ${jsonForScript(NEW_ON_STREAMING_IN_QUICK_ADD ? NEW_ON_STREAMING_LISTS : [])};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }

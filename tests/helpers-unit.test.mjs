@@ -15,6 +15,9 @@ function loadHelpers() {
     "expandIpv6Hextets",
     "normalizeExternalListUrl",
     "utf8ByteLength",
+    "formatAirClockTime",
+    "airTimeZoneLabel",
+    "formatAirTimeLabel",
   ];
   const chunks = [];
   for (const name of names) {
@@ -32,7 +35,7 @@ function loadHelpers() {
     chunks.push(src02.slice(start, i));
   }
   const consts = [];
-  for (const name of ["CREATOR_DISPLAY_NAME_MAX", "EXTERNAL_LIKE_HOSTS", "LIKEABLE_SENTINEL_PREFIXES", "LIKEABLE_SENTINEL_EXACT"]) {
+  for (const name of ["CREATOR_DISPLAY_NAME_MAX", "EXTERNAL_LIKE_HOSTS", "LIKEABLE_SENTINEL_PREFIXES", "LIKEABLE_SENTINEL_EXACT", "AIR_TIME_ZONE_LABELS"]) {
     const re = new RegExp(`const ${name}[\\s\\S]*?;`);
     const m = src02.match(re);
     if (m) consts.push(m[0]);
@@ -122,5 +125,49 @@ describe("utf8ByteLength", () => {
     assert.equal(H.utf8ByteLength(null), 0);
     assert.equal(H.utf8ByteLength(undefined), 0);
     assert.equal(H.utf8ByteLength(""), 0);
+  });
+});
+
+describe("air time labels", () => {
+  it("writes a slot the way a listing does", () => {
+    assert.equal(H.formatAirClockTime("21:00"), "9 PM", "the minutes go on the hour");
+    assert.equal(H.formatAirClockTime("21:30"), "9:30 PM");
+    assert.equal(H.formatAirClockTime("09:05"), "9:05 AM");
+    assert.equal(H.formatAirClockTime("00:00"), "12 AM", "midnight is 12 AM, not 0 AM");
+    assert.equal(H.formatAirClockTime("12:00"), "12 PM", "and noon is 12 PM");
+  });
+
+  it("has nothing to say about something that is not a time", () => {
+    ["", null, undefined, "tonight", "25:00", "21:60", "9pm", "21:0"].forEach((bad) => {
+      assert.equal(H.formatAirClockTime(bad), "", JSON.stringify(bad) + " is not a slot");
+    });
+  });
+
+  it("names North American zones the way a schedule is spoken", () => {
+    // Not "EDT"/"EST": a slot is 9 ET all year, and a label that flips twice a
+    // year reads like the time moved.
+    assert.equal(H.formatAirTimeLabel("21:00", "America/New_York"), "9 PM ET");
+    assert.equal(H.formatAirTimeLabel("21:30", "America/Toronto"), "9:30 PM ET");
+    assert.equal(H.formatAirTimeLabel("20:00", "America/Los_Angeles"), "8 PM PT");
+    assert.equal(H.formatAirTimeLabel("20:00", "America/Chicago"), "8 PM CT");
+    assert.equal(H.formatAirTimeLabel("19:00", "America/Phoenix"), "7 PM MST");
+  });
+
+  it("still says where a slot is outside North America", () => {
+    const uk = H.formatAirTimeLabel("21:00", "Europe/London");
+    assert.match(uk, /^9 PM (GMT|BST|GMT[+-]\d)/, "a reader has to see this is not their own clock: " + uk);
+    const jp = H.formatAirTimeLabel("23:00", "Asia/Tokyo");
+    assert.match(jp, /^11 PM [A-Z]{2,5}|^11 PM GMT[+-]\d/, jp);
+  });
+
+  it("prints the hour alone rather than a zone nobody would recognise", () => {
+    assert.equal(H.formatAirTimeLabel("21:00", ""), "9 PM");
+    assert.equal(H.formatAirTimeLabel("21:00", "Not/AZone"), "9 PM", "an unusable zone is dropped, not printed");
+    assert.equal(H.airTimeZoneLabel(""), "");
+  });
+
+  it("says nothing at all without a time, whatever the zone", () => {
+    assert.equal(H.formatAirTimeLabel("", "America/New_York"), "");
+    assert.equal(H.formatAirTimeLabel(null, "America/New_York"), "");
   });
 });

@@ -2299,6 +2299,197 @@ describe("client: local storage quota and creator profile watch history preserva
   });
 });
 
+// A channel plays in exactly one order: the order its picks are listed,
+// reshuffled once a day, or oldest-aired first. The builder offers the last
+// two as two checkboxes (because "neither" is the default answer and a radio
+// group would need a third option to say it), which only works if they keep
+// each other clear -- on the page AND in what gets saved, since the Worker
+// reads the saved payload and nothing else.
+// A channel's picks play in the order they are listed, full stop. The Play
+// order dropdown is a menu of one-shot ARRANGEMENTS of that list -- picking
+// one reorders the picks then and there -- rather than a rule applied over
+// the top of them at serve time, which is what the old "Sort by air date"
+// checkbox was and why a hand-moved pick used to snap back.
+//
+// The one exception is "Shuffle daily": the Worker reshuffles from a
+// date-based seed on every request, so no stored order can express it.
+describe("client: a channel's Play order arranges the list itself", () => {
+  const ep = (over = {}) => ({
+    kind: "episode", imdbId: "tt1", season: 1, episode: 1,
+    showName: "Show", epName: "Ep", title: "Show S1E1", ...over,
+  });
+  // Deliberately out of every order this tests: not by date, not by show.
+  const PICKS = [
+    ep({ imdbId: "tt_office", showName: "The Office", season: 2, episode: 7, title: "The Office S2E7", released: "2005-11-22" }),
+    ep({ imdbId: "tt_friends", showName: "Friends", season: 5, episode: 13, title: "Friends S5E13", released: "1999-02-11" }),
+    ep({ imdbId: "tt_office", showName: "The Office", season: 1, episode: 1, title: "The Office S1E1", released: "2005-03-24" }),
+    ep({ imdbId: "tt_friends", showName: "Friends", season: 1, episode: 1, title: "Friends S1E1", released: "1994-09-22" }),
+  ];
+  const titles = (client) => client.get("channelDraftItems").map((it) => it.title);
+
+  function withPicks(client, picks = PICKS) {
+    client.set("channelDraftItems", picks.map((it) => ({ ...it })));
+    return client;
+  }
+
+  it("reorders the picks themselves when a sort is chosen", () => {
+    const client = withPicks(loadClient());
+    client.call("applyChannelPlayOrder", "aired-asc");
+    assert.deepEqual(titles(client),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"]);
+
+    client.call("applyChannelPlayOrder", "aired-desc");
+    assert.deepEqual(titles(client),
+      ["The Office S2E7", "The Office S1E1", "Friends S5E13", "Friends S1E1"]);
+
+    // Shows keep the order they first appear in; within a show, broadcast order.
+    withPicks(client);
+    client.call("applyChannelPlayOrder", "show-season-episode");
+    assert.deepEqual(titles(client),
+      ["The Office S1E1", "The Office S2E7", "Friends S1E1", "Friends S5E13"]);
+
+    withPicks(client);
+    client.call("applyChannelPlayOrder", "title-az");
+    assert.deepEqual(titles(client),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"]);
+  });
+
+  it("keeps a sorted channel sorted as picks are added", () => {
+    const client = withPicks(loadClient());
+    client.call("applyChannelPlayOrder", "aired-asc");
+
+    // Every add path in the builder ends with renderChannelDraftList, which
+    // is where a remembered sort is re-applied.
+    client.get("channelDraftItems").push(ep({
+      imdbId: "tt_frasier", showName: "Frasier", season: 8, episode: 14,
+      title: "Frasier S8E14", released: "2001-02-20",
+    }));
+    client.call("renderChannelDraftList");
+
+    assert.deepEqual(titles(client),
+      ["Friends S1E1", "Friends S5E13", "Frasier S8E14", "The Office S1E1", "The Office S2E7"],
+      "a pick added later must land in its place, not at the bottom");
+  });
+
+  // The whole point of the change: what you drag stays dragged.
+  it("stops re-sorting once a pick is moved by hand, and keeps the new order", () => {
+    const client = withPicks(loadClient());
+    client.call("applyChannelPlayOrder", "aired-asc");
+
+    // Move the last pick to the front, the way the position input does.
+    const items = client.get("channelDraftItems");
+    client.call("clearChannelDraftAutoSort");
+    items.unshift(items.pop());
+    client.call("renderChannelDraftList");
+
+    assert.deepEqual(titles(client),
+      ["The Office S2E7", "Friends S1E1", "Friends S5E13", "The Office S1E1"],
+      "the hand-moved pick must stay where it was put");
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed",
+      "the dropdown must fall back to As listed");
+    assert.equal(client.call("channelDraftAutoSortKey"), "",
+      "and nothing must be armed to re-sort on the next render");
+
+    // A further add must not resurrect the sort either.
+    client.get("channelDraftItems").push(ep({ imdbId: "tt_new", title: "Added Later", released: "1990-01-01" }));
+    client.call("renderChannelDraftList");
+    assert.equal(titles(client)[0], "The Office S2E7", "still the person's order");
+    assert.equal(titles(client)[4], "Added Later", "a new pick appends once the sort is off");
+  });
+
+  it("shuffles once without arming anything, and leaves the dropdown alone", () => {
+    const client = withPicks(loadClient());
+    client.call("applyChannelPlayOrder", "aired-asc");
+    client.call("applyChannelPlayOrder", "shuffle-now");
+
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed");
+    assert.equal(client.call("channelDraftAutoSortKey"), "", "Shuffle now is a one-off, not a mode");
+    assert.deepEqual([...titles(client)].sort(), [...PICKS.map((it) => it.title)].sort(),
+      "every pick is still there, once");
+  });
+
+  it("saves a sort as the item order, and Shuffle daily as the only flag", () => {
+    const client = withPicks(loadClient());
+    client.get("document").getElementById("channelNameInput").value = "Sorted Channel";
+    client.call("applyChannelPlayOrder", "aired-asc");
+    client.call("saveChannel");
+
+    const saved = Object.values(client.call("loadLocalChannels"))[0];
+    assert.deepEqual(saved.items.map((it) => it.title),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"],
+      "the saved order IS the play order -- the Worker does not sort it");
+    assert.equal(saved.autoSort, "aired-asc", "remembered so later picks land in order");
+    assert.equal(saved.shuffle, false);
+    assert.equal(saved.sortByAired, false, "the serve-time flag is never written again");
+
+    const client2 = withPicks(loadClient());
+    client2.get("document").getElementById("channelNameInput").value = "Daily Channel";
+    client2.call("applyChannelPlayOrder", "shuffle-daily");
+    client2.call("saveChannel");
+    const daily = Object.values(client2.call("loadLocalChannels"))[0];
+    assert.equal(daily.shuffle, true, "Shuffle daily is the one entry the Worker acts on");
+    assert.equal(daily.autoSort, "", "and it arranges nothing itself");
+    assert.deepEqual(daily.items.map((it) => it.title), PICKS.map((it) => it.title),
+      "the picks keep their order -- the daily reshuffle happens at serve time");
+  });
+
+  it("puts the saved play order back on the dropdown when a channel is edited", () => {
+    const client = loadClient();
+    client.call("saveLocalChannel", { channelId: "ch-sorted", name: "Sorted", autoSort: "title-az", items: [PICKS[0]] });
+    client.call("saveLocalChannel", { channelId: "ch-daily", name: "Daily", shuffle: true, items: [PICKS[0]] });
+    client.call("saveLocalChannel", { channelId: "ch-plain", name: "Plain", items: [PICKS[0]] });
+
+    client.call("editChannelById", "ch-sorted");
+    assert.equal(client.call("getChannelPlayOrder"), "title-az");
+    client.call("editChannelById", "ch-daily");
+    assert.equal(client.call("getChannelPlayOrder"), "shuffle-daily");
+    client.call("editChannelById", "ch-plain");
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed");
+  });
+
+  // The previous release's checkbox wrote a flag the Worker sorted on every
+  // request. Editing such a channel has to turn that into a real order, or
+  // it would open in the builder looking unsorted and save that way.
+  it("migrates a channel saved with the old serve-time sortByAired flag", () => {
+    const client = loadClient();
+    client.call("saveLocalChannel", {
+      channelId: "ch-legacy", name: "Legacy", sortByAired: true, items: PICKS.map((it) => ({ ...it })),
+    });
+
+    client.call("editChannelById", "ch-legacy");
+    assert.equal(client.call("getChannelPlayOrder"), "aired-asc");
+    assert.deepEqual(titles(client),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"],
+      "opening it sorts the picks for real");
+
+    client.get("document").getElementById("channelNameInput").value = "Legacy";
+    client.call("saveChannel");
+    const saved = client.call("loadLocalChannels")["ch-legacy"];
+    assert.equal(saved.sortByAired, false, "the serve-time flag is dropped on save");
+    assert.equal(saved.autoSort, "aired-asc");
+    assert.deepEqual(saved.items.map((it) => it.title),
+      ["Friends S1E1", "Friends S5E13", "The Office S1E1", "The Office S2E7"]);
+  });
+
+  it("still lists a not-yet-migrated sortByAired channel in play order in See All", () => {
+    const client = loadClient();
+    client.call("saveLocalChannel", {
+      channelId: "ch-order", name: "Order", sortByAired: true,
+      items: [
+        ep({ imdbId: "tt_office", showName: "The Office", season: 2, episode: 7, released: "2005-11-22" }),
+        ep({ imdbId: "tt_bb", showName: "Breaking Bad", released: "" }),
+        ep({ imdbId: "tt_friends", showName: "Friends", released: "1994-09-22" }),
+      ],
+    });
+    let opened = null;
+    client.set("openListDetailsPage", (title, type, url, preloaded) => { opened = preloaded; });
+    client.call("openChannelDetailsPage", "ch-order");
+    assert.deepEqual([...opened.sample].map((it) => it.name),
+      ["Friends S1E1", "The Office S2E7", "Breaking Bad S1E1"],
+      "undated last, the rest oldest first");
+  });
+});
+
 describe("client: season watched detection (isSeasonFullyWatched)", () => {
   it("never returns true for an unwatched season even if the show is in _fullyWatchedShowIds", () => {
     const client = loadClient();
@@ -2359,6 +2550,281 @@ describe("client: season watched detection (isSeasonFullyWatched)", () => {
     // 0 watched
     client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: [] } });
     assert.equal(client.call("isSeasonFullyWatched", "tt0364845", 6, 25), false, "expanded season with 0 watched episodes returns false");
+  });
+});
+
+// A show part-way through a season could not be read as caught up until its
+// finale: every "is this watched" check counted against TMDB's episode_count,
+// which includes the episodes still to come. /api/details already says where
+// the next unaired episode is, so the answer needs no extra fetch -- these
+// pin down that the pointer is read, and that it is NOT read for a show whose
+// seasons were renumbered out of a TMDB episode group.
+describe("client: a season is measured by what has aired", () => {
+  const dayOffset = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+  const FUTURE = dayOffset(30);
+
+  // Season 3 lists 10 episodes; 5 are out and episode 6 airs in a month.
+  const AIRING = {
+    id: "tt_airing",
+    tmdbId: "999",
+    title: "Airing Show",
+    seasonsData: [
+      { season_number: 1, name: "Season 1", episode_count: 8, air_date: "2021-01-01" },
+      { season_number: 2, name: "Season 2", episode_count: 8, air_date: "2022-01-01" },
+      { season_number: 3, name: "Season 3", episode_count: 10, air_date: dayOffset(-60) },
+    ],
+    nextEpisodeAirDate: FUTURE,
+    nextEpisodeSeasonNumber: 3,
+    nextEpisodeNumber: 6,
+  };
+  const S3 = AIRING.seasonsData[2];
+
+  const watched = (seasonNum, upTo) => Array.from({ length: upTo }, (_, i) => ({
+    id: "tt_airing:" + seasonNum + ":" + (i + 1),
+    type: "episode",
+    showId: "tt_airing",
+    showTitle: "Airing Show",
+    seasonNum,
+    episodeNum: i + 1,
+  }));
+
+  function seeded(items, details) {
+    const client = loadClient();
+    client.set("_fullyWatchedShowIds", new Set());
+    client.set("_seasonEpisodesMap", {});
+    client.set("_currentItemDetails", details || AIRING);
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: items } });
+    return client;
+  }
+
+  it("counts the episodes before the next unaired one, not the whole season", () => {
+    const client = seeded([]);
+    assert.equal(client.call("seasonAiredEpisodeCount", 3, S3, AIRING), 5,
+      "5 of season 3's 10 episodes are out");
+    assert.equal(client.call("seasonAiredEpisodeCount", 1, AIRING.seasonsData[0], AIRING), 8,
+      "an earlier season is out in full");
+  });
+
+  it("reads a season as fully watched once every aired episode of it is", () => {
+    assert.equal(seeded(watched(3, 5)).call("isSeasonFullyWatched", "tt_airing", 3, 10), true,
+      "5 of the 5 aired episodes is caught up");
+    assert.equal(seeded(watched(3, 4)).call("isSeasonFullyWatched", "tt_airing", 3, 10), false,
+      "an aired episode still unwatched is not");
+  });
+
+  it("reads the show as fully watched when the only episodes left have not aired", () => {
+    const caughtUp = seeded([...watched(1, 8), ...watched(2, 8), ...watched(3, 5)]);
+    assert.equal(caughtUp.call("isShowFullyWatched", AIRING), true,
+      "every episode that exists to watch has been watched");
+
+    const behind = seeded([...watched(1, 8), ...watched(2, 8), ...watched(3, 4)]);
+    assert.equal(behind.call("isShowFullyWatched", AIRING), false,
+      "one aired episode short is not caught up");
+  });
+
+  it("treats a season that starts after the next episode as not aired at all", () => {
+    const client = seeded([]);
+    const s4 = { season_number: 4, name: "Season 4", episode_count: 8, air_date: FUTURE };
+    assert.equal(client.call("seasonAiredEpisodeCount", 4, s4, AIRING), 0);
+    assert.equal(client.call("seasonHasAiredEpisodes", 4, s4), false);
+  });
+
+  it("ignores the pointer once the season's real episode list is loaded", () => {
+    const client = seeded(watched(3, 5));
+    // TMDB re-dated episode 6 to yesterday; the loaded list is the truth.
+    client.set("_seasonEpisodesMap", {
+      3: Array.from({ length: 10 }, (_, i) => ({
+        id: 3000 + i, episode_number: i + 1, name: "E" + (i + 1),
+        air_date: i < 6 ? dayOffset(-10) : FUTURE,
+      })),
+    });
+    assert.equal(client.call("seasonAiredEpisodeCount", 3, S3, AIRING), 6);
+    assert.equal(client.call("isSeasonFullyWatched", "tt_airing", 3, 10), false,
+      "6 have aired now, and only 5 are watched");
+  });
+
+  it("ignores the pointer for a show whose seasons were renumbered", () => {
+    // An anime unpacked out of a TMDB episode group numbers its own seasons,
+    // so a pointer counted in TMDB's numbers cannot be lined up against them.
+    const unpacked = {
+      id: "tt_unpacked",
+      title: "Unpacked Show",
+      seasonsData: [
+        { season_number: 1, season: 1, name: "Part 1", episode_count: 12, episodeCount: 12 },
+        { season_number: 2, season: 2, name: "Part 2", episode_count: 12, episodeCount: 12 },
+      ],
+      nextEpisodeAirDate: FUTURE,
+      nextEpisodeSeasonNumber: 1,
+      nextEpisodeNumber: 20,
+    };
+    const client = seeded([], unpacked);
+    assert.equal(client.call("seasonAiredCountFromNextEpisode", 2, unpacked.seasonsData[1], unpacked), null,
+      "the pointer says nothing about a renumbered season");
+    assert.equal(client.call("seasonAiredEpisodeCount", 2, unpacked.seasonsData[1], unpacked), 12,
+      "which leaves the season's own episode count");
+  });
+
+  it("repaints Mark Show Watched from what is on disk", () => {
+    const client = seeded([...watched(1, 8), ...watched(2, 8), ...watched(3, 5)]);
+    client.call("updateShowWatchedButton");
+    const btn = client.__byId.get("btnMarkShowWatched");
+    assert.match(btn.innerHTML, /Mark Show Unwatched/,
+      "caught up on everything aired reads as watched");
+    assert.equal(btn.className, "secondary");
+  });
+});
+
+describe("client: the season header counts what has been watched", () => {
+  const SHOW = {
+    id: "tt_counts",
+    title: "Counted Show",
+    seasonsData: [{ season_number: 1, name: "Season 1", episode_count: 8, air_date: "2021-01-01" }],
+  };
+  const S1 = SHOW.seasonsData[0];
+
+  function seeded(upTo) {
+    const client = loadClient();
+    client.set("_fullyWatchedShowIds", new Set());
+    client.set("_seasonEpisodesMap", {});
+    client.set("_currentItemDetails", SHOW);
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history",
+        items: Array.from({ length: upTo }, (_, i) => ({
+          id: "tt_counts:1:" + (i + 1),
+          type: "episode",
+          showId: "tt_counts",
+          showTitle: "Counted Show",
+          seasonNum: 1,
+          episodeNum: i + 1,
+        })),
+      },
+    });
+    return client;
+  }
+
+  it("reads 0/8 with nothing watched, 3/8 part-way, and 8/8 at the end", () => {
+    assert.equal(seeded(0).call("seasonEpisodeCountState", SHOW, S1).label, "0/8 episodes");
+    assert.equal(seeded(3).call("seasonEpisodeCountState", SHOW, S1).label, "3/8 episodes");
+    assert.equal(seeded(8).call("seasonEpisodeCountState", SHOW, S1).label, "8/8 episodes");
+  });
+
+  it("flags only a finished season as complete", () => {
+    assert.equal(seeded(7).call("seasonEpisodeCountState", SHOW, S1).complete, false);
+    assert.equal(seeded(8).call("seasonEpisodeCountState", SHOW, S1).complete, true);
+  });
+
+  it("counts an episode once however many times it was logged", () => {
+    const client = seeded(0);
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history",
+        items: [1, 1, 2].map((n, i) => ({
+          id: "tt_counts:1:" + n + ":" + i,
+          type: "episode",
+          showId: "tt_counts",
+          showTitle: "Counted Show",
+          seasonNum: 1,
+          episodeNum: n,
+        })),
+      },
+    });
+    assert.equal(client.call("seasonEpisodeCountState", SHOW, S1).label, "2/8 episodes");
+  });
+
+  it("never reads past the season's own length", () => {
+    // Watch History can hold an episode TMDB has since dropped from a season.
+    const client = seeded(0);
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history",
+        items: Array.from({ length: 9 }, (_, i) => ({
+          id: "tt_counts:1:" + (i + 1),
+          type: "episode",
+          showId: "tt_counts",
+          showTitle: "Counted Show",
+          seasonNum: 1,
+          episodeNum: i + 1,
+        })),
+      },
+    });
+    assert.equal(client.call("seasonEpisodeCountState", SHOW, S1).label, "8/8 episodes");
+  });
+
+  it("says nothing when the season has no episode count to count against", () => {
+    const client = seeded(3);
+    assert.equal(client.call("seasonEpisodeCountState", SHOW, { season_number: 1 }).label, "");
+  });
+});
+
+// The two asks, end to end: open a show's page and read what it renders.
+describe("client: a show's page, rendered", () => {
+  const dayOffset = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+
+  // Season 3 lists 10 episodes, 5 are out, episode 6 airs in three weeks.
+  const DETAILS = {
+    id: "tt_rendered", tmdbId: "555", title: "Rendered Show", overview: "x", poster: "", seasons: 3,
+    seasonsData: [
+      { season_number: 1, name: "Season 1", episode_count: 8, air_date: "2021-01-01" },
+      { season_number: 2, name: "Season 2", episode_count: 8, air_date: "2022-01-01" },
+      { season_number: 3, name: "Season 3", episode_count: 10, air_date: dayOffset(-60) },
+    ],
+    nextEpisodeAirDate: dayOffset(20),
+    nextEpisodeSeasonNumber: 3,
+    nextEpisodeNumber: 6,
+  };
+
+  async function render(watchedInS3) {
+    const client = loadClient({ routes: { "/api/details": () => ({ json: { ok: true, details: DETAILS } }) } });
+    const items = [];
+    const add = (season, upTo) => {
+      for (let i = 1; i <= upTo; i++) {
+        items.push({
+          id: "tt_rendered:" + season + ":" + i, type: "episode",
+          showId: "tt_rendered", showTitle: "Rendered Show", seasonNum: season, episodeNum: i,
+        });
+      }
+    };
+    add(1, 8);
+    add(2, 8);
+    add(3, watchedInS3);
+    client.set("_fullyWatchedShowIds", new Set());
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: items } });
+    await client.call("openItemDetailsModal", "tt_rendered", "series");
+    return client.get("document").getElementById("itemDetailsBody").innerHTML;
+  }
+
+  it("puts the watched count on every season header", async () => {
+    const html = await render(5);
+    const counts = [...html.matchAll(/season-header-episodes[^"]*" data-season="(\d+)">([^<]*)</g)]
+      .map((m) => m[1] + ":" + m[2]);
+    assert.deepEqual(counts, ["1:8/8 episodes", "2:8/8 episodes", "3:5/10 episodes"]);
+    assert.match(html, /season-header-episodes is-complete" data-season="1"/,
+      "a finished season is flagged for the accent colour");
+    assert.equal(/season-header-episodes is-complete" data-season="3"/.test(html), false,
+      "a season with episodes still to come is not");
+  });
+
+  it("offers Mark Show Unwatched once every aired episode has been watched", async () => {
+    const caughtUp = await render(5);
+    assert.match(caughtUp, /Mark Show Unwatched/,
+      "5 of the 5 episodes out so far -- there is nothing left to mark");
+    assert.equal(/>Mark Show Watched</.test(caughtUp), false);
+
+    const behind = await render(4);
+    assert.match(behind, />Mark Show Watched</, "one aired episode short is still unwatched");
+    assert.equal(/Mark Show Unwatched/.test(behind), false);
+  });
+
+  it("starts at 0/8 for a show nothing has been watched of", async () => {
+    const client = loadClient({ routes: { "/api/details": () => ({ json: { ok: true, details: DETAILS } }) } });
+    client.set("_fullyWatchedShowIds", new Set());
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: [] } });
+    await client.call("openItemDetailsModal", "tt_rendered", "series");
+    const html = client.get("document").getElementById("itemDetailsBody").innerHTML;
+    assert.match(html, /data-season="1">0\/8 episodes</);
+    assert.match(html, /data-season="3">0\/10 episodes</);
+    assert.match(html, />Mark Show Watched</);
   });
 });
 
@@ -3417,3 +3883,2278 @@ describe("client: markShowWatched is not raced by its own background reconciliat
     assert.equal(btn.disabled, false, "and it must come back afterwards");
   });
 });
+
+// Live Preview & Editor renders a personal shelf by asking /api/preview for it,
+// and that endpoint is unauthenticated: the username inside an
+// 'autotrack:<slug>:<type>:<username>' url is an unproven claim until the call
+// also carries a Creator Key it can verify. mayReadTrackedShelf answers an
+// unproven reader with an EMPTY shelf rather than an error (a catalog row has
+// no way to show a message), so the request that omitted the key did not fail
+// -- it came back ok:true with nothing in it, and Watch History, Continue
+// Watching and Airing Next each rendered "No items found." the moment they
+// were added to the config, for their own owner.
+describe("client: Live Preview proves who is asking before reading a personal shelf", () => {
+  // renderLivePreview walks real rows, and the harness's document stub answers
+  // every querySelectorAll with []. These are the few nodes it actually reads.
+  function fakeInput(value) {
+    return { value, dataset: {} };
+  }
+
+  function fakeEntry(name, url, type) {
+    const posters = { innerHTML: "", classList: { add() {}, remove() {}, toggle() {} } };
+    const status = { innerHTML: "" };
+    const entry = {
+      dataset: {},
+      posters,
+      status,
+      querySelector(sel) {
+        if (sel === ".name") return fakeInput(name);
+        if (sel === ".type") return fakeInput(type);
+        if (sel === ".url") return fakeInput(url);
+        if (sel === ".live-preview-posters") return posters;
+        if (sel === ".live-preview-shelf-status") return status;
+        return null;
+      },
+      querySelectorAll(sel) {
+        if (sel === ".url") return [fakeInput(url)];
+        return [];
+      },
+    };
+    return entry;
+  }
+
+  // One row per shelf, wired up the way the builder page would have them.
+  function withRows(client, rows) {
+    const entries = rows.map((r) => fakeEntry(r.name, r.url, r.type));
+    const doc = client.get("document");
+    const lists = doc.getElementById("lists");
+    lists.querySelectorAll = (sel) => (sel === ".entry" ? entries : []);
+    doc.querySelectorAll = (sel) => {
+      if (sel === "#lists .entry") return entries;
+      if (sel === "#lists .entry .url") return rows.map((r) => fakeInput(r.url));
+      return [];
+    };
+    return entries;
+  }
+
+  const previewOk = (req) => ({
+    json: {
+      ok: true,
+      count: 1,
+      totalItems: 1,
+      maybeMore: false,
+      sample: [{ id: "tt0903747", type: "series", name: "Breaking Bad", poster: "" }],
+    },
+  });
+
+  it("sends the Creator Key for an autotrack row so the shelf is readable", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { "/api/preview": previewOk },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    withRows(client, [
+      { name: "Continue Watching", url: "autotrack:continue-watching:series:alice", type: "series" },
+      { name: "Watch History", url: "autotrack:watch-history:movie:alice", type: "movie" },
+      { name: "Airing Next", url: "autotrack:airing-next:series:alice", type: "series" },
+    ]);
+
+    await client.call("renderLivePreview");
+    await settle();
+
+    const sent = requestsTo(client, "/api/preview");
+    assert.equal(sent.length, 3, "one preview call per enabled shelf");
+    for (const req of sent) {
+      // Without this the server cannot place the caller, mayReadTrackedShelf
+      // falls back to the owner's share flags -- and airing-next has none at
+      // all -- so the answer is an empty shelf and the row reads
+      // "No items found."
+      assert.equal(req.body.creatorKey, "KEY-123",
+        `a personal shelf preview must prove ownership: ${req.body.url}`);
+      assert.equal(req.body.creatorName, "alice", "and name the account it is proving");
+    }
+  });
+
+  it("finds a personal shelf on any line of a merged row's url", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { "/api/preview": previewOk },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    withRows(client, [
+      { name: "Mixed", url: "mdblist:trending\nautotrack:watch-history:movie:alice", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+    await settle();
+
+    const sent = requestsTo(client, "/api/preview");
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].body.creatorKey, "KEY-123",
+      "a merged row stacks sources one per line; the personal one need not be first");
+  });
+
+  it("keeps the key out of a preview that does not need it", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { "/api/preview": previewOk },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    withRows(client, [
+      { name: "Trending", url: "https://mdblist.com/lists/someone/trending", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+    await settle();
+
+    const sent = requestsTo(client, "/api/preview");
+    assert.equal(sent.length, 1);
+    // The Creator Key is a bearer credential. A public list preview has no use
+    // for it, the same reason collectKeys only puts trackCreatorKey into a
+    // config that actually carries a personal shelf.
+    assert.equal(sent[0].body.creatorKey, undefined,
+      "a public list preview must not carry the account key");
+  });
+
+  it("sends nothing to prove when nobody is signed in", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-123" },
+      routes: { "/api/preview": previewOk },
+    });
+    client.set("activeCreator", null);
+    withRows(client, [
+      { name: "Watch History", url: "autotrack:watch-history:movie:alice", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+    await settle();
+
+    const sent = requestsTo(client, "/api/preview");
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].body.creatorKey, undefined,
+      "a signed-out browser has no ownership to claim over someone else's shelf");
+  });
+});
+
+describe("client: taking one show off Airing Next", () => {
+  const LOAD = "/api/creator/sync/load";
+  const SAVE_TRACKING = "/api/creator/sync/save-tracking";
+  const BATCH = "/api/details/batch";
+
+  // A show with three watched episodes and an upcoming one on the shelf,
+  // alongside a second show that must be left entirely alone.
+  const seedShelf = (client) => {
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history", name: "Watch History", type: "series",
+        items: [
+          { id: "ttB:4:7", showId: "ttB", showTitle: "Removed Show", type: "episode", seasonNum: 4, episodeNum: 7, watchedAt: 30 },
+          { id: "ttB:4:6", showId: "ttB", showTitle: "Removed Show", type: "episode", seasonNum: 4, episodeNum: 6, watchedAt: 20 },
+          { id: "ttA:1:1", showId: "ttA", showTitle: "Kept Show", type: "episode", seasonNum: 1, episodeNum: 1, watchedAt: 10 },
+        ],
+        updatedAt: 1000,
+      },
+      "airing-next": {
+        slug: "airing-next", name: "Airing Next", type: "series",
+        items: [
+          { id: "ttA", showId: "ttA", showTitle: "Kept Show", airDate: "2099-01-01", seasonNum: 1, episodeNum: 2 },
+          { id: "ttB", showId: "ttB", showTitle: "Removed Show", airDate: "2099-02-02", seasonNum: 4, episodeNum: 8 },
+        ],
+        updatedAt: 1000,
+      },
+    });
+  };
+
+  const shelfIds = (client) =>
+    ((client.call("loadLocalCustomLists")["airing-next"] || {}).items || []).map((it) => it.showId);
+  const historyIds = (client) =>
+    ((client.call("loadLocalCustomLists")["watch-history"] || {}).items || []).map((it) => it.id);
+
+  it("takes the show off the shelf without touching what is watched", () => {
+    const client = loadClient();
+    seedShelf(client);
+
+    client.call("removeAiringNextShow", "ttB", null);
+
+    assert.deepEqual(shelfIds(client), ["ttA"], "only the removed show leaves the shelf");
+    // The whole point of the feature: a removal says nothing about what has
+    // been watched, so every episode stays exactly where it was.
+    assert.deepEqual(historyIds(client).sort(), ["ttA:1:1", "ttB:4:6", "ttB:4:7"]);
+    // Recorded at the furthest-along watched episode, which is what a later
+    // one supersedes. (Field by field: the object was built inside the
+    // bundle's own realm, so it is not deep-equal to a plain one out here.)
+    const mark = client.window._removedAiringNext.ttB;
+    assert.equal(mark.seasonNum, 4);
+    assert.equal(mark.episodeNum, 7);
+  });
+
+  it("keeps it off when the shelf is rebuilt", () => {
+    const client = loadClient();
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+
+    // collectAiringNextCandidateShowIds is what every rebuild starts from --
+    // the 6-hourly refresh, the watch-state sync, and the dashboard card's own
+    // eligibility check. A removal that did not reach here would last until
+    // the next refresh and no longer.
+    const candidates = [...client.call("collectAiringNextCandidateShowIds")];
+    assert.deepEqual(candidates, ["ttA"]);
+  });
+
+  it("puts it back as soon as another episode is watched", () => {
+    const client = loadClient();
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), true);
+
+    // The next episode of the removed show, watched.
+    const map = client.call("loadLocalCustomLists");
+    map["watch-history"].items.unshift({
+      id: "ttB:4:8", showId: "ttB", showTitle: "Removed Show", type: "episode",
+      seasonNum: 4, episodeNum: 8, watchedAt: 40,
+    });
+    client.call("saveLocalCustomListsMap", map);
+
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), false,
+      "watching on is how the show comes back -- there is no second switch to flip");
+    assert.ok([...client.call("collectAiringNextCandidateShowIds")].includes("ttB"));
+  });
+
+  it("stays removed when an older episode is rewatched", () => {
+    const client = loadClient();
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+
+    const map = client.call("loadLocalCustomLists");
+    map["watch-history"].items.unshift({
+      id: "ttB:1:1", showId: "ttB", showTitle: "Removed Show", type: "episode",
+      seasonNum: 1, episodeNum: 1, watchedAt: 50,
+    });
+    client.call("saveLocalCustomListsMap", map);
+
+    // Rewatching season 1 is not "I am following this again" -- the shelf is
+    // about what airs next, and nothing about what airs next has changed.
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), true);
+  });
+
+  it("forgets a removal once it has been superseded", () => {
+    const client = loadClient();
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+
+    const map = client.call("loadLocalCustomLists");
+    map["watch-history"].items.unshift({
+      id: "ttB:5:1", showId: "ttB", showTitle: "Removed Show", type: "episode",
+      seasonNum: 5, episodeNum: 1, watchedAt: 60,
+    });
+    client.call("saveLocalCustomListsMap", map);
+
+    assert.equal(client.call("pruneSupersededAiringRemovals"), true);
+    assert.deepEqual(Object.keys(client.window._removedAiringNext), [],
+      "otherwise the stored set grows by one entry per show, forever");
+  });
+
+  it("can be undone by hand from Settings", async () => {
+    const client = loadClient({ routes: { [BATCH]: () => ({ json: { ok: true, results: {} } }) } });
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+    const removedRows = client.call("getRemovedAiringNextShows");
+    assert.equal(removedRows.length, 1);
+    assert.equal(removedRows[0].title, "Removed Show");
+
+    client.call("restoreAiringNextShow", "ttB");
+    await settle();
+
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), false);
+    assert.ok([...client.call("collectAiringNextCandidateShowIds")].includes("ttB"));
+    assert.equal(client.call("getRemovedAiringNextShows").length, 0);
+  });
+
+  it("puts the x on the full-page view, wired to the right shelf", () => {
+    const client = loadClient();
+    const html = client.call("livePreviewPosterHtml", {
+      id: "ttB", type: "series", name: "Removed Show", showTitle: "Removed Show",
+      removeAiringShowId: "ttB", listUrl: "custom:airing-next",
+    });
+    assert.match(html, /data-remove-type="airing"/);
+    assert.match(html, /data-remove-id="ttB"/);
+    // livePreviewPosterHtml reads removeShowId as "this is a Continue
+    // Watching tile", so an Airing Next tile must not carry it -- the x would
+    // dismiss the show from the wrong shelf and mark it fully watched.
+    assert.doesNotMatch(html, /data-remove-type="cw"/);
+
+    // And the dispatch behind that button reaches the removal, not one of
+    // its four neighbours in the same switch.
+    seedShelf(client);
+    const btn = client.window.document.createElement("button");
+    btn.dataset.removeType = "airing";
+    btn.dataset.removeId = "ttB";
+    client.call("removeListItemFromDetails", btn);
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), true);
+    assert.deepEqual(historyIds(client).sort(), ["ttA:1:1", "ttB:4:6", "ttB:4:7"]);
+  });
+
+  it("covers the second id the same show is recorded under", async () => {
+    // Watch History can hold both an imdb and a tmdb-prefixed id for one
+    // series -- refreshAiringNext dedupes exactly that when it builds the
+    // shelf. Marking only the id the tile was rendered under leaves the other
+    // one a candidate, and the next rebuild puts the show straight back.
+    const client = loadClient({ routes: { [BATCH]: () => ({ json: { ok: true, results: {} } }) } });
+    client.call("saveLocalCustomListsMap", {
+      "watch-history": {
+        slug: "watch-history", name: "Watch History", type: "series",
+        items: [
+          { id: "tt9:1:1", showId: "tt9", showTitle: "Twin Show", type: "episode", seasonNum: 1, episodeNum: 1, watchedAt: 10 },
+          { id: "tmdb:55:1:2", showId: "tmdb:55", showTitle: "Twin Show", type: "episode", seasonNum: 1, episodeNum: 2, watchedAt: 20 },
+        ],
+        updatedAt: 1000,
+      },
+      "airing-next": {
+        slug: "airing-next", name: "Airing Next", type: "series",
+        items: [{ id: "tt9", showId: "tt9", canonicalTmdbId: "55", showTitle: "Twin Show", airDate: "2099-03-03" }],
+        updatedAt: 1000,
+      },
+    });
+
+    client.call("removeAiringNextShow", "tt9", null);
+    assert.deepEqual([...client.call("collectAiringNextCandidateShowIds")], [],
+      "both ids for the removed show have to go, or the shelf rebuilds it under the other one");
+
+    // One show, one row -- and putting it back clears both marks, or the
+    // leftover would go on hiding it.
+    const rows = client.call("getRemovedAiringNextShows");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].title, "Twin Show");
+    client.call("restoreAiringNextShow", rows[0].showIds.join(","));
+    await settle();
+    assert.deepEqual([...client.call("collectAiringNextCandidateShowIds")].sort(), ["tmdb:55", "tt9"]);
+  });
+
+  it("tells the account, so another device does not rebuild the show back on", async () => {
+    const pushes = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice" },
+      routes: {
+        [LOAD]: () => ({ json: { ok: true, data: { watchHistory: [], trackingUpdatedAt: 6000, trackingClientVersion: 3 } } }),
+        [SAVE_TRACKING]: (req) => { pushes.push(req.body); return { json: { ok: true, clientVersion: 4 } }; },
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("markCreatorSyncLoaded");
+    seedShelf(client);
+    client.call("removeAiringNextShow", "ttB", null);
+
+    await client.call("pushTrackingSync", { intentionalRemoval: true });
+    await settle();
+
+    assert.equal(pushes.length, 1);
+    assert.deepEqual(pushes[0].removedAiringNext, { ttB: { seasonNum: 4, episodeNum: 7 } });
+    assert.deepEqual(pushes[0].airingNext.map((it) => it.showId), ["ttA"]);
+    // Removing the last show on the shelf sends an empty array, and
+    // save-tracking refuses to let an empty derived list replace a stored one
+    // unless this flag is set -- without it the Stremio row keeps serving the
+    // show that was just removed.
+    assert.equal(pushes[0].intentionalRemoval, true);
+  });
+
+  it("applies a removal made on another device", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice" },
+      routes: {
+        [LOAD]: () => ({ json: { ok: true, data: {
+          trackingUpdatedAt: 6000,
+          trackingClientVersion: 3,
+          removedAiringNext: { ttB: { seasonNum: 4, episodeNum: 7 } },
+        } } }),
+        [SAVE_TRACKING]: () => ({ json: { ok: true, clientVersion: 4 } }),
+        [LISTS]: () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    seedShelf(client);
+
+    await client.call("loadCreatorSync");
+    await settle();
+
+    assert.equal(client.call("isAiringNextRemoved", "ttB"), true);
+    // This browser had already computed a shelf with the show on it, so
+    // applying the account's removals has to reach that copy too.
+    assert.deepEqual(shelfIds(client), ["ttA"]);
+  });
+});
+
+describe("client: Reset Account Data says it is working", () => {
+  const RESET = "/api/creator/account/reset";
+
+  // Resetting clears this browser first and only then waits on the server --
+  // deliberately, so nothing can re-upload the old lists into the account
+  // being emptied. The cost is a second or two in which every list on screen
+  // has already vanished and the confirm dialog has already closed. Before
+  // this, nothing at all was on screen during that gap, and pressing Reset
+  // again was the obvious thing to try.
+  const arrange = (client, events, resetResponse) => {
+    client.set("activeCreator", { creatorName: "alice", displayName: "Alice" });
+    client.set("showAppConfirm", (title, msg, btn, onConfirm) => { client.window.__pending = onConfirm(); });
+    client.set("showAppBusy", () => { events.push("busy"); });
+    client.set("showAppAlert", (title) => { events.push("alert:" + title); });
+    client.set("clearLocalAccountData", () => { events.push("cleared"); });
+    return resetResponse;
+  };
+
+  it("puts a working dialog up before anything disappears, and replaces it with the result", async () => {
+    const events = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice" },
+      routes: { [RESET]: () => { events.push("request"); return { json: { ok: true, resetAt: 5 } }; } },
+    });
+    arrange(client, events);
+
+    client.call("openResetAccountModal");
+    await client.window.__pending;
+    await settle();
+
+    assert.deepEqual(events, ["busy", "cleared", "request", "alert:Account Reset"],
+      "the working dialog goes up before the local clear, and the outcome dialog replaces it");
+  });
+
+  it("still lands on a dialog when the reset fails", async () => {
+    const events = [];
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1", "myListAddon:creatorName": "alice" },
+      routes: { [RESET]: () => { events.push("request"); return { status: 500, json: { ok: false, error: "Nope." } }; } },
+    });
+    arrange(client, events);
+
+    client.call("openResetAccountModal");
+    await client.window.__pending;
+    await settle();
+
+    // A spinner left turning over a finished request is worse than no
+    // spinner at all.
+    assert.equal(events[events.length - 1], "alert:Reset Failed");
+  });
+
+  it("ships the animation the spinner is named after", () => {
+    // Two places asked for `animation: spin` and the page declared no such
+    // keyframes, so both spinners sat perfectly still -- a progress indicator
+    // that does not move says "stuck", which is the exact impression this is
+    // here to remove. Cheap to lose again in a CSS edit, so it is asserted.
+    const html = renderPage();
+    assert.match(html, /@keyframes spin\b/, "the page must declare the animation it uses by name");
+    for (const m of html.matchAll(/animation:\s*([A-Za-z_-][\w-]*)/g)) {
+      // `animation: none` is the CSS keyword for "no animation", not a name.
+      if (m[1] === "none") continue;
+      assert.match(html, new RegExp("@keyframes\\s+" + m[1] + "\\b"),
+        `animation "${m[1]}" is used but never declared`);
+    }
+  });
+});
+
+describe("client: a not-yet-aired episode is not something anyone watched", () => {
+  const SEASON = "/api/season";
+
+  // Far enough out that no clock skew makes it "aired" mid-test.
+  const FUTURE = "2099-06-01";
+
+  const showWith = (seasons) => ({
+    id: "tt5555555", tmdbId: 9999, title: "Renewed Show", poster: "", seasonsData: seasons,
+  });
+
+  const seasonRoutes = (bySeason) => ({
+    [SEASON]: (req) => {
+      const s = new URL(req.url, "https://example.com").searchParams.get("seasonNum");
+      const eps = bySeason[s];
+      if (!eps) return { json: { ok: false, error: "Not found" } };
+      return { json: { ok: true, season: { episodes: eps } } };
+    },
+  });
+
+  const fakeBtn = () => ({ disabled: false, textContent: "", innerHTML: "", title: "", classList: { remove() {}, add() {} } });
+
+  it("marking the whole show watched leaves the future season alone", async () => {
+    const client = loadClient({
+      routes: seasonRoutes({
+        "1": [{ id: 101, name: "Pilot", episode_number: 1, air_date: "2020-01-01" }],
+        "2": [{ id: 201, name: "Return", episode_number: 1, air_date: FUTURE }],
+      }),
+    });
+    const d = showWith([
+      { season_number: 1, episode_count: 1, air_date: "2020-01-01" },
+      { season_number: 2, episode_count: 1, air_date: FUTURE },
+    ]);
+    client.set("_currentItemDetails", d);
+    const btnShow = client.get("document").getElementById("btnMarkShowWatched");
+    btnShow.classList.add("primary");
+    btnShow.innerHTML = "Mark Show Watched";
+
+    await client.call("markShowWatched", "tt5555555");
+
+    const hist = (client.call("loadLocalCustomLists")["watch-history"] || {}).items || [];
+    // Joined rather than deep-compared: the array comes out of the bundle's
+    // own realm and is not deep-equal to a plain one out here.
+    assert.equal(hist.map((it) => String(it.id)).join(","), "101",
+      "only the aired episode is watched -- a season that has not started cannot have been");
+
+    // The season button is the part the report was about: it used to be
+    // relabelled "Mark Season Unwatched" for every season on screen,
+    // including one with nothing in Watch History behind it.
+    const s2 = client.call("seasonWatchedButtonState", d, d.seasonsData[1]);
+    assert.equal(s2.upcoming, true);
+    assert.equal(s2.label.includes("Unwatched"), false, "a season that has not aired must never read as watched");
+    const s1 = client.call("seasonWatchedButtonState", d, d.seasonsData[0]);
+    assert.equal(s1.upcoming, false);
+    assert.equal(s1.label.includes("Mark Season Unwatched"), true, "the aired season did get watched");
+  });
+
+  it("counts the show as caught up rather than unfinished", async () => {
+    const client = loadClient({
+      routes: seasonRoutes({
+        "1": [{ id: 101, name: "Pilot", episode_number: 1, air_date: "2020-01-01" }],
+        "2": [{ id: 201, name: "Return", episode_number: 1, air_date: FUTURE }],
+      }),
+    });
+    const d = showWith([
+      { season_number: 1, episode_count: 1, air_date: "2020-01-01" },
+      { season_number: 2, episode_count: 1, air_date: FUTURE },
+    ]);
+    client.set("_currentItemDetails", d);
+    const btnShow = client.get("document").getElementById("btnMarkShowWatched");
+    btnShow.classList.add("primary");
+    btnShow.innerHTML = "Mark Show Watched";
+
+    await client.call("markShowWatched", "tt5555555");
+
+    // Before: an announced season made this false forever, so reopening the
+    // modal contradicted the button the person had just pressed.
+    assert.equal(client.call("isShowFullyWatched", d), true);
+  });
+
+  it("keeps the caught-up show on Continue Watching instead of dropping it", async () => {
+    const client = loadClient({
+      routes: seasonRoutes({
+        "1": [
+          { id: 101, name: "Pilot", episode_number: 1, air_date: "2020-01-01" },
+          { id: 102, name: "Finale", episode_number: 2, air_date: FUTURE },
+        ],
+      }),
+    });
+    const d = showWith([{ season_number: 1, episode_count: 2, air_date: "2020-01-01" }]);
+    client.set("_currentItemDetails", d);
+    const btnShow = client.get("document").getElementById("btnMarkShowWatched");
+    btnShow.classList.add("primary");
+    btnShow.innerHTML = "Mark Show Watched";
+
+    await client.call("markShowWatched", "tt5555555");
+    await settle();
+
+    const cw = (client.call("loadLocalCustomLists")["continue-watching"] || {}).items || [];
+    // Marking the last aired episode one at a time leaves the show here with
+    // an "Airs ..." badge; Mark Show Watched used to be the one path that
+    // evicted it outright, which is the difference the report describes.
+    assert.equal(cw.length, 1, "a show with an episode still to come has not finished");
+    assert.equal(String(cw[0].id), "102");
+    assert.equal(cw[0].isUnaired, true);
+  });
+
+  it("refuses to mark a future episode watched, and still lets one be unmarked", () => {
+    const client = loadClient();
+    client.set("_currentItemDetails", { id: "tt5555555", title: "Renewed Show", poster: "" });
+    client.set("_episodeDataCache", { 1: { id: 201, episode_number: 1, season_number: 2, air_date: FUTURE, name: "Return" } });
+
+    client.call("toggleWatchStatus", "201", "episode", "Return", "");
+    let hist = (client.call("loadLocalCustomLists")["watch-history"] || {}).items || [];
+    assert.equal(hist.length, 0, "the door every episode toggle goes through has to hold this line too");
+
+    // An entry recorded before this guard existed is still removable -- the
+    // guard only refuses to ADD.
+    const map = client.call("loadLocalCustomLists");
+    map["watch-history"] = { slug: "watch-history", name: "Watch History", type: "series", items: [
+      { id: "201", type: "episode", name: "Return", showId: "tt5555555", seasonNum: 2, episodeNum: 1, watchedAt: 10 },
+    ], updatedAt: 1 };
+    client.call("saveLocalCustomListsMap", map);
+    client.call("toggleWatchStatus", "201", "episode", "Return", "");
+    hist = (client.call("loadLocalCustomLists")["watch-history"] || {}).items || [];
+    assert.equal(hist.length, 0, "a mistake made before the guard existed must still be undoable");
+  });
+
+  it("offers no watch button on an unaired episode, and keeps one on a watched episode", () => {
+    const client = loadClient();
+    const upcoming = client.call("episodeWatchButtonHtml", { id: 201, air_date: FUTURE, name: "Return" }, false);
+    assert.match(upcoming, /disabled/);
+    assert.equal(upcoming.includes("toggleEpisodeWatchStatusFromModal"), false,
+      "a button that cannot legitimately be pressed should not be wired up");
+
+    const aired = client.call("episodeWatchButtonHtml", { id: 101, air_date: "2020-01-01", name: "Pilot" }, false);
+    assert.match(aired, /Mark as Watched/);
+    assert.equal(aired.includes("disabled"), false);
+
+    // Already in Watch History: the way back has to stay open whatever the date.
+    const watchedButUnaired = client.call("episodeWatchButtonHtml", { id: 201, air_date: FUTURE, name: "Return" }, true);
+    assert.match(watchedButUnaired, /Mark as unwatched/);
+    assert.equal(watchedButUnaired.includes("disabled"), false);
+  });
+
+  it("says when a season airs instead of doing nothing", async () => {
+    const client = loadClient({
+      routes: seasonRoutes({ "2": [{ id: 201, name: "Return", episode_number: 1, air_date: FUTURE }] }),
+    });
+    const d = showWith([{ season_number: 2, episode_count: 1, air_date: FUTURE }]);
+    client.set("_currentItemDetails", d);
+
+    const btn = fakeBtn();
+    await client.call("markSeasonWatched", 2, btn);
+
+    const hist = (client.call("loadLocalCustomLists")["watch-history"] || {}).items || [];
+    assert.equal(hist.length, 0);
+    // It did nothing before either -- silently, handing back a button that
+    // read "Mark Season Watched" and looked broken.
+    assert.equal(btn.disabled, true);
+    assert.equal(btn.innerHTML.includes("Unwatched"), false);
+    assert.match(btn.innerHTML, /Airs|Not aired yet/);
+  });
+
+  it("treats a season with no air date at all as ordinary", () => {
+    const client = loadClient();
+    // TMDB does not always carry a season air date. Unknown is not future:
+    // disabling the button on a guess would take the feature away from every
+    // show with thin metadata.
+    assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, episode_count: 8 }), true);
+    assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, air_date: FUTURE }), false);
+    assert.equal(client.call("seasonHasAiredEpisodes", 3, { season_number: 3, air_date: "2020-01-01" }), true);
+  });
+});
+
+// The hour behind the date. /api/details carries it as a finished string, and
+// the page has to print it against episodes that reach it from three different
+// directions -- the show's own page, a Continue Watching entry built from
+// /api/season, an Airing Next tile restored from local storage.
+describe("client: air times", () => {
+  const dayOffset = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+
+  const DETAILS = {
+    id: "tt_air", tmdbId: "777", title: "Air Show", overview: "x", poster: "", seasons: 3,
+    seasonsData: [{ season_number: 3, name: "Season 3", episode_count: 10, air_date: dayOffset(-60) }],
+    nextEpisodeAirDate: dayOffset(3), nextEpisodeSeasonNumber: 3, nextEpisodeNumber: 6,
+    airTime: {
+      time: "21:00", timezone: "America/New_York", label: "9 PM ET", days: ["Sunday"],
+      next: { season: 3, number: 6, airdate: dayOffset(3), time: "21:30", label: "9:30 PM ET" },
+    },
+    nextEpisodeAirTimeLabel: "9:30 PM ET",
+  };
+
+  const EPISODES = [
+    { id: 1, episode_number: 5, season_number: 3, name: "Already Out", air_date: dayOffset(-4), overview: "" },
+    { id: 2, episode_number: 6, season_number: 3, name: "Next One", air_date: dayOffset(3), overview: "" },
+    { id: 3, episode_number: 7, season_number: 3, name: "Later One", air_date: dayOffset(10), overview: "" },
+    { id: 4, episode_number: 8, season_number: 3, name: "Tonight", air_date: dayOffset(0), overview: "" },
+  ];
+
+  async function openShow(details) {
+    const client = loadClient({
+      routes: {
+        "/api/details": () => ({ json: { ok: true, details: details || DETAILS } }),
+        "/api/season": () => ({ json: { ok: true, season: { episodes: EPISODES } } }),
+      },
+    });
+    client.set("_fullyWatchedShowIds", new Set());
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: [] } });
+    await client.call("openItemDetailsModal", "tt_air", "series");
+    client.set("_episodeDataCache", Object.fromEntries(EPISODES.map((e) => [e.episode_number, e])));
+    client.set("_currentSeasonNum", 3);
+    return client;
+  }
+
+  function episodeModalTimes(client, epNum) {
+    let html = "";
+    client.set("showModal", (inner) => { html = inner; });
+    client.call("openEpisodeDetails", epNum);
+    return [...html.matchAll(/color:var\(--brand\);">([^<]*)</g)].map((m) => m[1]);
+  }
+
+  it("puts the hour under the date, for tonight's episode and every later one", async () => {
+    const client = await openShow();
+    assert.deepEqual(episodeModalTimes(client, 8), ["9 PM ET"], "an episode airing today is exactly when this matters");
+    assert.deepEqual(episodeModalTimes(client, 7), ["9 PM ET"], "a later episode gets the show's regular slot");
+  });
+
+  it("gives the next episode its own slot where it was dated apart", async () => {
+    const client = await openShow();
+    assert.deepEqual(episodeModalTimes(client, 6), ["9:30 PM ET"]);
+  });
+
+  it("says nothing against an episode that has already gone out", async () => {
+    const client = await openShow();
+    assert.deepEqual(episodeModalTimes(client, 5), [], "a time is a thing you are still waiting for");
+  });
+
+  it("prints the date alone when TVmaze had no slot for the show", async () => {
+    const noTime = { ...DETAILS, airTime: { time: null, timezone: null, label: "", days: [], next: null }, nextEpisodeAirTimeLabel: null };
+    const client = await openShow(noTime);
+    assert.deepEqual(episodeModalTimes(client, 6), [], "a streaming drop has no hour to invent");
+  });
+
+  it("remembers the show's slot for shelves that never see its details", async () => {
+    const client = await openShow();
+    // Continue Watching entries are built from /api/season and carry no air
+    // time of their own; the store is what answers for them.
+    assert.equal(client.call("showAirTimeLabel", "tt_air", 3, 7), "9 PM ET");
+    assert.equal(client.call("showAirTimeLabel", "tt_air", 3, 6), "9:30 PM ET", "the next episode keeps its own");
+    assert.equal(client.call("showAirTimeLabel", "777", 3, 7), "9 PM ET", "found by TMDB id too");
+    assert.equal(client.call("showAirTimeLabel", "tmdb:777", 3, 7), "9 PM ET");
+    assert.equal(client.call("showAirTimeLabel", "tt_air:3:7", 3, 7), "9 PM ET", "an episode id is still that show");
+    assert.equal(client.call("showAirTimeLabel", "tt_unknown", 3, 7), "", "a show nobody has details for says nothing");
+  });
+
+  it("stops trusting a remembered slot once it is a week old", async () => {
+    const client = await openShow();
+    const store = client.call("loadAirTimeStore");
+    Object.keys(store).forEach((k) => { store[k].at = Date.now() - (8 * 24 * 60 * 60 * 1000); });
+    assert.equal(client.call("showAirTimeLabel", "tt_air", 3, 7), "", "a show can be moved to a new night");
+  });
+
+  it("puts the hour under the day on a poster badge, and never on an aired one", async () => {
+    const client = await openShow();
+    const next = client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(3), showId: "tt_air", seasonNum: 3, episodeNum: 6 });
+    assert.match(next, /class="cw-date-badge cw-date-badge-timed"/);
+    assert.match(next, /<span class="cw-date-badge-time">9:30 PM ET<\/span>/);
+    assert.match(next, /title="Airs on [\d-]+ at 9:30 PM ET"/);
+
+    const unknown = client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(2), showId: "tt_nobody" });
+    assert.match(unknown, /class="cw-date-badge"/, "no time is still a date badge");
+    assert.equal(/cw-date-badge-time/.test(unknown), false);
+
+    assert.equal(client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(-2), showId: "tt_air" }), "",
+      "an episode that has aired gets no badge at all");
+    assert.equal(client.call("watchItemAirDateBadgeHtml", { showId: "tt_air" }), "");
+  });
+
+  it("prefers the time stored on an entry over the one remembered for its show", async () => {
+    const client = await openShow();
+    const badge = client.call("watchItemAirDateBadgeHtml", { airDate: dayOffset(3), airTime: "8 PM CT", showId: "tt_air", seasonNum: 3, episodeNum: 6 });
+    assert.match(badge, /8 PM CT/, "a tile restored from local storage knows its own hour");
+  });
+});
+
+// The DOM stub creates an element the first time it is asked for by id, so a
+// test that wants to fill a box in has to ask through document rather than
+// reach into the id map.
+function el(client, id) {
+  return client.document.getElementById(id);
+}
+
+// The bundle builds its objects inside the vm, so they carry that realm's
+// Object/Array prototypes and a strict deepEqual against a literal written
+// here fails on the prototype alone, however equal the contents. Comparing
+// the JSON of both sides is what the assertion actually means.
+function plain(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+// --- the Channel builder's broadcast panel -------------------------------
+//
+// Five flags that shape how a channel plays rather than what is in it. The
+// risk they all share is not the logic but the PLUMBING: a channel is
+// rebuilt field by field in three separate places (saveLocalChannel,
+// saveLocalChannelsMap, ensureAllChannelsSyncedFromRows), so a flag that
+// only two of them know about is a flag that silently disappears on the
+// next save. These tests are mostly about that round trip.
+describe("client: a channel's broadcast schedule and smart rules", () => {
+  function builder(draft = []) {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", draft);
+    client.set("channelDraftStoryLocked", []);
+    client.set("channelDraftPairedGroups", []);
+    client.set("channelDraftSelection", []);
+    client.set("channelDraftSourceUrl", "");
+    client.set("channelDraftDynamic", "");
+    return client;
+  }
+
+  const epOf = (imdbId, season, episode, showName) => ({
+    kind: "episode", imdbId, season, episode, showName,
+    epName: `E${episode}`, title: `${showName} S${season}E${episode}`,
+  });
+
+  it("turns a time of day plus a zone into minutes past midnight UTC", () => {
+    const client = builder();
+    assert.equal(client.call("channelTurnoverToUtcMinutes", "00:00", "utc"), 0);
+    assert.equal(client.call("channelTurnoverToUtcMinutes", "06:30", "utc"), 390);
+    assert.equal(client.call("channelTurnoverToUtcMinutes", "", "utc"), 0, "a blank box is midnight, not NaN");
+    assert.equal(client.call("channelTurnoverToUtcMinutes", "99:99", "utc"), 23 * 60 + 59, "a hand-typed impossible time is clamped");
+    // Local depends on the runner's own zone, so this asserts the relation
+    // rather than a fixed number.
+    const shift = new Date().getTimezoneOffset();
+    assert.equal(
+      client.call("channelTurnoverToUtcMinutes", "00:00", "local"),
+      ((shift % 1440) + 1440) % 1440
+    );
+  });
+
+  it("renders minutes back to the time box they came from", () => {
+    const client = builder();
+    assert.equal(client.call("channelMinutesToTimeString", 0), "00:00");
+    assert.equal(client.call("channelMinutesToTimeString", 390), "06:30");
+    assert.equal(client.call("channelMinutesToTimeString", 1439), "23:59");
+  });
+
+  it("groups a draft by show the same way the Worker does", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      epOf("tt1", 1, 2, "Simpsons"),
+      epOf("tt2", 1, 1, "King of the Hill"),
+    ]);
+    const groups = client.call("channelDraftShowGroups");
+    assert.deepEqual(plain(groups.map((g) => [g.key, g.count])), [["tt1", 2], ["tt2", 1]]);
+  });
+
+  it("carries every flag through a save and back out again", () => {
+    const client = builder();
+    const payload = {
+      channelId: "ch1", name: "Block Party", items: [epOf("tt1", 1, 1, "Simpsons")],
+      dailyRotate: true, rotateShows: 6, rotateEpisodes: 2,
+      rotateTurnover: 300, rotateTurnoverTime: "00:00", rotateTurnoverZone: "local",
+      hideWatched: true, storyLocked: ["tt1"],
+      pairParts: true, pairedGroups: [["tt1:1:1", "tt1:1:2"]],
+      autoNewEpisodes: true, newEpisodesAtTop: true,
+      liveSync: true, sourceUrl: "https://trakt.tv/users/x/lists/y",
+      dynamic: "", shareCode: "AbC123", sharePublished: true,
+    };
+    client.call("saveLocalChannel", payload);
+    const saved = client.call("loadLocalChannels").ch1;
+    for (const key of [
+      "dailyRotate", "rotateShows", "rotateEpisodes", "rotateTurnover",
+      "rotateTurnoverTime", "rotateTurnoverZone", "hideWatched",
+      "pairParts", "autoNewEpisodes", "newEpisodesAtTop",
+      "liveSync", "sourceUrl", "shareCode", "sharePublished",
+    ]) {
+      assert.deepEqual(plain(saved[key]), payload[key], `${key} survived the save`);
+    }
+    assert.deepEqual(plain(saved.storyLocked), ["tt1"]);
+    assert.deepEqual(plain(saved.pairedGroups), [["tt1:1:1", "tt1:1:2"]]);
+  });
+
+  it("keeps the flags through a SECOND save, which is where a dropped field shows up", () => {
+    const client = builder();
+    client.call("saveLocalChannel", {
+      channelId: "ch1", name: "Block Party", items: [epOf("tt1", 1, 1, "Simpsons")],
+      dailyRotate: true, rotateShows: 6, hideWatched: true, storyLocked: ["tt1"],
+      pairParts: true, pairedGroups: [["tt1:1:1", "tt1:1:2"]], autoNewEpisodes: true,
+    });
+    // saveLocalChannelsMap rebuilds every record, so a field it does not know
+    // about is lost here rather than on the first write.
+    client.call("saveLocalChannelsMap", client.call("loadLocalChannels"));
+    const saved = client.call("loadLocalChannels").ch1;
+    assert.equal(saved.dailyRotate, true);
+    assert.equal(saved.rotateShows, 6);
+    assert.equal(saved.hideWatched, true);
+    assert.deepEqual(plain(saved.storyLocked), ["tt1"]);
+    assert.equal(saved.pairParts, true);
+    assert.equal(saved.autoNewEpisodes, true);
+    assert.deepEqual(plain(saved.pairedGroups), [["tt1:1:1", "tt1:1:2"]]);
+  });
+
+  it("normalizes anything missing rather than writing undefined into the payload", () => {
+    const client = builder();
+    const f = plain(client.call("channelBroadcastFields", {}));
+    assert.deepEqual(f, {
+      description: "",
+      dailyRotate: false, rotateShows: 0, rotateEpisodes: 0, rotateTurnover: 0,
+      rotateTurnoverTime: "", rotateTurnoverZone: "utc", hideWatched: false,
+      storyLocked: [], pairParts: false, pairedGroups: [],
+      autoNewEpisodes: false, newEpisodesAtTop: false,
+      liveSync: false, sourceUrl: "", dynamic: "",
+    });
+    assert.deepEqual(plain(client.call("channelBroadcastFields", null).storyLocked), []);
+  });
+
+  it("pairs the selection by stream id, in the order the channel lists them", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      epOf("tt1", 1, 2, "Simpsons"),
+      epOf("tt2", 1, 1, "King of the Hill"),
+    ]);
+    client.set("channelDraftSelection", [2, 0]);
+    client.call("pairChannelDraftSelection");
+    assert.deepEqual(plain(client.get("channelDraftPairedGroups")), [["tt1:1:1", "tt2:1:1"]],
+      "listed order, not the order they were ticked in");
+  });
+
+  it("refuses a pairing of one, and one of more than six", () => {
+    const draft = [];
+    for (let e = 1; e <= 8; e++) draft.push(epOf("tt1", 1, e, "Simpsons"));
+    const client = builder(draft);
+    client.set("channelDraftSelection", [0]);
+    client.call("pairChannelDraftSelection");
+    assert.equal(client.get("channelDraftPairedGroups").length, 0, "one episode is not a pair");
+    client.set("channelDraftSelection", [0, 1, 2, 3, 4, 5, 6]);
+    client.call("pairChannelDraftSelection");
+    assert.equal(client.get("channelDraftPairedGroups").length, 0, "seven is past what the Worker will glue");
+  });
+
+  it("lets a pick belong to one pairing only", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      epOf("tt1", 1, 2, "Simpsons"),
+      epOf("tt1", 1, 3, "Simpsons"),
+    ]);
+    client.set("channelDraftSelection", [0, 1]);
+    client.call("pairChannelDraftSelection");
+    client.set("channelDraftSelection", [1, 2]);
+    client.call("pairChannelDraftSelection");
+    assert.deepEqual(plain(client.get("channelDraftPairedGroups")), [["tt1:1:2", "tt1:1:3"]],
+      "the first pairing is left with one member, so it is not a pairing any more");
+  });
+
+  it("unpairs whatever is selected and leaves the rest alone", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      epOf("tt1", 1, 2, "Simpsons"),
+      epOf("tt2", 1, 1, "King of the Hill"),
+      epOf("tt2", 1, 2, "King of the Hill"),
+    ]);
+    client.set("channelDraftPairedGroups", [["tt1:1:1", "tt1:1:2"], ["tt2:1:1", "tt2:1:2"]]);
+    client.set("channelDraftSelection", [0]);
+    client.call("unpairChannelDraftSelection");
+    assert.deepEqual(plain(client.get("channelDraftPairedGroups")), [["tt2:1:1", "tt2:1:2"]]);
+  });
+
+  it("drops a pairing whose other half has been removed from the channel", () => {
+    const client = builder([epOf("tt1", 1, 1, "Simpsons")]);
+    client.set("channelDraftPairedGroups", [["tt1:1:1", "tt1:1:2"]]);
+    client.call("updateChannelPairControls");
+    assert.deepEqual(plain(client.get("channelDraftPairedGroups")), [],
+      "a rule about one episode is not a pairing");
+  });
+
+  it("drops a Story Lock for a show that is no longer in the channel", () => {
+    const client = builder([epOf("tt1", 1, 1, "Simpsons"), epOf("tt1", 1, 2, "Simpsons")]);
+    client.set("channelDraftStoryLocked", ["tt1", "tt_removed"]);
+    client.call("renderChannelStoryLock");
+    assert.deepEqual(plain(client.get("channelDraftStoryLocked")), ["tt1"]);
+  });
+
+  it("offers no Story Lock for a one-episode show or a movie", () => {
+    const client = builder([
+      epOf("tt1", 1, 1, "Simpsons"),
+      { kind: "movie", imdbId: "tt9", title: "The Matrix", showName: "The Matrix" },
+    ]);
+    client.set("channelDraftStoryLocked", []);
+    client.call("renderChannelStoryLock");
+    assert.equal(el(client, "channelStoryLockSection").innerHTML, "");
+  });
+
+  it("toggles a lock on and off without ever duplicating it", () => {
+    const client = builder();
+    client.call("toggleChannelStoryLock", "tt1", true);
+    client.call("toggleChannelStoryLock", "tt1", true);
+    assert.deepEqual(plain(client.get("channelDraftStoryLocked")), ["tt1"]);
+    client.call("toggleChannelStoryLock", "tt1", false);
+    assert.deepEqual(plain(client.get("channelDraftStoryLocked")), []);
+  });
+});
+
+describe("client: the Channel builder's interleaved play order", () => {
+  function withDraft(items) {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", items);
+    client.set("channelDraftStoryLocked", []);
+    return client;
+  }
+  const epOf = (imdbId, episode, showName) => ({
+    kind: "episode", imdbId, season: 1, episode, showName,
+    epName: `E${episode}`, title: `${showName} E${episode}`,
+  });
+
+  it("deals one episode of each show in turn", () => {
+    const client = withDraft([
+      epOf("tt1", 1, "Simpsons"), epOf("tt1", 2, "Simpsons"), epOf("tt1", 3, "Simpsons"),
+      epOf("tt2", 1, "King of the Hill"), epOf("tt2", 2, "King of the Hill"),
+      epOf("tt3", 1, "Malcolm"),
+    ]);
+    client.call("sortChannelDraftItems", "interleave");
+    assert.deepEqual(plain(client.get("channelDraftItems").map((it) => it.title)), [
+      "Simpsons E1", "King of the Hill E1", "Malcolm E1",
+      "Simpsons E2", "King of the Hill E2",
+      "Simpsons E3",
+    ]);
+  });
+
+  it("is idempotent, so the builder and the Worker cannot fight over it", () => {
+    const client = withDraft([
+      epOf("tt1", 1, "A"), epOf("tt2", 1, "B"), epOf("tt1", 2, "A"), epOf("tt2", 2, "B"),
+    ]);
+    client.call("sortChannelDraftItems", "interleave");
+    const once = plain(client.get("channelDraftItems").map((it) => it.title));
+    client.call("sortChannelDraftItems", "interleave");
+    assert.deepEqual(plain(client.get("channelDraftItems").map((it) => it.title)), once);
+  });
+
+  it("counts as a remembered sort, so picks added later are interleaved too", () => {
+    const client = withDraft([]);
+    el(client, "channelPlayOrderSelect").value = "interleave";
+    assert.equal(client.call("channelDraftAutoSortKey"), "interleave");
+    client.set("channelDraftItems", [
+      epOf("tt1", 1, "A"), epOf("tt1", 2, "A"), epOf("tt2", 1, "B"),
+    ]);
+    client.call("applyChannelDraftAutoSort");
+    assert.deepEqual(plain(client.get("channelDraftItems").map((it) => it.title)), ["A E1", "B E1", "A E2"]);
+  });
+});
+
+describe("client: channel share links", () => {
+  const load = (routes = {}) => loadClient({ routes, storage: { "myListAddon:creatorKey": "KEY-1" } });
+
+  it("reads the code out of a link, a scheme, a fragment or a bare code", () => {
+    const client = load();
+    assert.equal(client.call("parseChannelShareCode", "https://example.com/channel/AbC-123"), "AbC-123");
+    assert.equal(client.call("parseChannelShareCode", "https://example.com/configure#channel=AbC-123"), "AbC-123");
+    assert.equal(client.call("parseChannelShareCode", "channel:share:AbC-123"), "AbC-123");
+    assert.equal(client.call("parseChannelShareCode", "  AbC-123  "), "AbC-123");
+    assert.equal(client.call("parseChannelShareCode", "not a code at all"), "");
+    assert.equal(client.call("parseChannelShareCode", ""), "");
+  });
+
+  it("sends the play rules with the picks, and never the local bookkeeping", () => {
+    const client = load();
+    const payload = client.call("channelSharePayload", {
+      channelId: "ch1", name: "Block Party", items: [], shuffle: true,
+      autoSort: "interleave", dailyRotate: true, rotateShows: 6, hideWatched: true,
+      storyLocked: ["tt1"], createdAt: 1, updatedAt: 2, shareCode: "OLD",
+    });
+    assert.equal(payload.autoSort, "interleave");
+    assert.equal(payload.dailyRotate, true);
+    assert.equal(payload.rotateShows, 6);
+    assert.equal(payload.hideWatched, true);
+    assert.deepEqual(plain(payload.storyLocked), ["tt1"]);
+    assert.equal("channelId" in payload, false, "the receiver mints its own id");
+    assert.equal("createdAt" in payload, false);
+    assert.equal("shareCode" in payload, false);
+  });
+
+  it("re-shares under the code it already has rather than minting a second link", async () => {
+    const posts = [];
+    const client = load({
+      "/api/channel/share": (req) => {
+        posts.push(req.body);
+        return { json: { ok: true, code: req.body.code || "NEW1", url: "https://example.com/channel/NEW1" } };
+      },
+    });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [] });
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal(posts[0].code, "", "nothing to reuse the first time");
+    assert.equal(client.call("loadLocalChannels").ch1.shareCode, "NEW1");
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal(posts[1].code, "NEW1", "the second share updates the same link");
+  });
+
+  it("does not send a Creator Key with an unlisted share", async () => {
+    const posts = [];
+    const client = load({
+      "/api/channel/share": (req) => { posts.push(req.body); return { json: { ok: true, code: "C1" } }; },
+    });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [] });
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal(posts[0].publish, false);
+    assert.equal("creatorKey" in posts[0], false);
+  });
+
+  it("adds a shared channel under a fresh id, and never as someone else's listing", () => {
+    const client = load();
+    const id = client.call("acceptSharedChannel", {
+      name: "Saturday Morning 90s", items: [], dailyRotate: true, rotateShows: 4, sharePublished: true,
+    }, "CODE1");
+    const saved = client.call("loadLocalChannels")[id];
+    assert.equal(saved.name, "Saturday Morning 90s");
+    assert.equal(saved.rotateShows, 4);
+    assert.equal(saved.shareCode, "CODE1");
+    assert.equal(saved.sharePublished, false, "a copy is not the published listing");
+  });
+
+  it("imports the channel behind a pasted link", async () => {
+    const client = load({
+      "/api/channel/share": () => ({ json: { ok: true, channel: { name: "80s VHS Sci-Fi Vault", items: [] } } }),
+    });
+    el(client, "channelShareCodeInput").value = "https://example.com/channel/VHS1";
+    await client.call("importSharedChannel", null);
+    const asked = requestsTo(client, "/api/channel/share");
+    assert.equal(asked.length, 1);
+    assert.match(asked[0].url, /code=VHS1/);
+    assert.ok(
+      Object.values(client.call("loadLocalChannels")).some((ch) => ch.name === "80s VHS Sci-Fi Vault"),
+      "the channel landed locally"
+    );
+  });
+
+  it("says so rather than calling the server when the pasted text is not a code", async () => {
+    const client = load();
+    el(client, "channelShareCodeInput").value = "just some words";
+    await client.call("importSharedChannel", null);
+    assert.equal(requestsTo(client, "/api/channel/share").length, 0);
+    assert.match(el(client, "channelShareImportStatus").innerHTML, /does not look like/);
+  });
+});
+
+describe("client: the Explore Channels directory", () => {
+  it("filters the listing it has already fetched rather than re-asking", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/directory": () => ({
+          json: {
+            ok: true,
+            channels: [
+              { code: "a", name: "Saturday Morning 90s", description: "cartoons", owner: "alice", itemCount: 300, showCount: 12, dailyRotate: true },
+              { code: "b", name: "Comedy Central 2000s", description: "sitcoms", owner: "bob", itemCount: 200, showCount: 8 },
+            ],
+          },
+        }),
+      },
+    });
+    await client.call("loadChannelDirectory", true);
+    assert.equal(requestsTo(client, "/api/channel/directory").length, 1);
+    const feed = el(client, "channelDirectoryFeed");
+    assert.match(feed.innerHTML, /Saturday Morning 90s/);
+    assert.match(feed.innerHTML, /Comedy Central 2000s/);
+
+    el(client, "channelDirectorySearchInput").value = "cartoons";
+    client.call("renderChannelDirectory");
+    assert.match(feed.innerHTML, /Saturday Morning 90s/);
+    assert.equal(/Comedy Central 2000s/.test(feed.innerHTML), false);
+    assert.equal(requestsTo(client, "/api/channel/directory").length, 1, "filtering is local");
+  });
+
+  it("describes a dynamic listing by what it does, not by a pick count it has not got", async () => {
+    const client = loadClient({ routes: {} });
+    const line = client.call("channelDirectoryMetaLine", {
+      code: "c", name: "Next Up", dynamic: "next-up", itemCount: 0, showCount: 0, owner: "alice",
+    });
+    assert.match(line, /watch history/);
+    assert.equal(/0 episodes/.test(line), false);
+  });
+});
+
+describe("client: the dynamic Next Up channel", () => {
+  it("refuses to make one while signed out, since it has no history to read", () => {
+    const client = loadClient({ routes: {} });
+    client.set("activeCreator", null);
+    client.call("createNextUpChannel", null);
+    assert.deepEqual(plain(client.call("loadLocalChannels")), {});
+    assert.match(el(client, "channelNextUpStatus").innerHTML, /Creator Profile/);
+  });
+
+  it("seeds itself from Continue Watching, so it plays before the server can help", () => {
+    const client = loadClient({
+      routes: {},
+      storage: {
+        "myListAddon:localCustomLists": JSON.stringify({
+          "continue-watching": {
+            slug: "continue-watching", name: "Continue Watching", type: "series",
+            items: [
+              { id: "1", type: "episode", name: "Breakage", showId: "tt0903747", showTitle: "Breaking Bad", showPoster: "https://img/bb.jpg", seasonNum: 2, episodeNum: 5 },
+              { id: "2", type: "episode", name: "The One", showId: "tt0108778", showTitle: "Friends", seasonNum: 5, episodeNum: 13 },
+            ],
+          },
+        }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("createNextUpChannel", null);
+    const saved = Object.values(client.call("loadLocalChannels"));
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].dynamic, "next-up");
+    assert.deepEqual(
+      plain(saved[0].items.map((it) => it.imdbId + ":" + it.season + ":" + it.episode)),
+      ["tt0903747:2:5", "tt0108778:5:13"]
+    );
+    assert.equal(saved[0].items[0].title, "Breaking Bad S2E5 \u2014 Breakage");
+  });
+
+  it("saves with no picks when nothing is in progress, rather than refusing", () => {
+    const client = loadClient({ routes: {} });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("createNextUpChannel", null);
+    const saved = Object.values(client.call("loadLocalChannels"));
+    assert.equal(saved.length, 1);
+    assert.deepEqual(plain(saved[0].items), []);
+  });
+
+  it("drops a Continue Watching row it could not turn into a stream request", () => {
+    const client = loadClient({
+      routes: {},
+      storage: {
+        "myListAddon:localCustomLists": JSON.stringify({
+          "continue-watching": {
+            slug: "continue-watching", name: "Continue Watching", type: "series",
+            items: [
+              { id: "1", type: "episode", name: "no show id", showId: "", seasonNum: 1, episodeNum: 1 },
+              { id: "2", type: "episode", name: "no season", showId: "tt1", seasonNum: null, episodeNum: 1 },
+              { id: "3", type: "episode", name: "fine", showId: "tt1", showTitle: "Fine", seasonNum: 3, episodeNum: 4 },
+              { id: "4", type: "episode", name: "same again", showId: "tt1", showTitle: "Fine", seasonNum: 3, episodeNum: 4 },
+            ],
+          },
+        }),
+      },
+    });
+    const seeded = client.call("channelNextUpSeedItems");
+    assert.deepEqual(plain(seeded.map((it) => it.imdbId + ":" + it.season + ":" + it.episode)), ["tt1:3:4"]);
+  });
+
+  it("opens the one that exists instead of adding a second", () => {
+    const client = loadClient({ routes: {} });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("createNextUpChannel", null);
+    client.call("createNextUpChannel", null);
+    assert.equal(Object.keys(client.call("loadLocalChannels")).length, 1);
+  });
+});
+
+// --- browsing a person's filmography -------------------------------------
+//
+// Tapping an actor or director opens what they have been in BELOW the
+// search, the same way tapping a show opens its seasons -- so a tribute can
+// be pruned before it is saved rather than committed whole in one click.
+describe("client: browsing an actor or director's filmography", () => {
+  const CREDITS = {
+    ok: true,
+    name: "Robin Williams",
+    poster: "https://img/rw.jpg",
+    backdrop: "https://img/rw-bd.jpg",
+    movies: [
+      { tmdbId: 1, type: "movie", title: "Good Will Hunting", year: "1997", released: "1997-12-05", rating: 8.2, votes: 9000, poster: "https://img/gwh.jpg", backdrop: "", role: "Sean" },
+      { tmdbId: 2, type: "movie", title: "Aladdin", year: "1992", released: "1992-11-25", rating: 7.7, votes: 8000, poster: "https://img/al.jpg", backdrop: "", role: "Genie" },
+    ],
+    shows: [
+      { tmdbId: 90, type: "tv", title: "Mork & Mindy", year: "1978", released: "1978-09-14", rating: 7.1, votes: 300, poster: "https://img/mm.jpg", backdrop: "", role: "Mork" },
+    ],
+  };
+
+  function personClient(extraRoutes = {}) {
+    return loadClient({
+      routes: {
+        "/api/person-search": () => ({
+          json: { ok: true, results: [{ personId: 2157, name: "Robin Williams", department: "Acting", knownFor: "Aladdin", poster: "https://img/rw.jpg" }] },
+        }),
+        "/api/person-credits": () => ({ json: CREDITS }),
+        ...extraRoutes,
+      },
+    });
+  }
+
+  it("puts a person's search card behind the same browse gesture a show's card uses", async () => {
+    const client = personClient();
+    client.set("channelSearchType", "person");
+    el(client, "channelSearchInput").value = "robin williams";
+    await client.call("runChannelTitleSearch");
+    const html = el(client, "channelSearchResult").innerHTML;
+    assert.match(html, /channelPersonCard/);
+    assert.match(html, /channelPersonBtn/);
+    assert.match(html, /data-personid="2157"/);
+    assert.match(html, /\+ Browse</, "not an immediate 'build me a channel'");
+  });
+
+  it("lists the films and the television separately, each with its own control", async () => {
+    const client = personClient();
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    const html = el(client, "channelEpisodePicker").innerHTML;
+    assert.match(html, /Good Will Hunting/);
+    assert.match(html, /Aladdin/);
+    assert.match(html, /Mork &amp; Mindy/, "a title's ampersand is escaped, not injected");
+    assert.match(html, /channelPersonMovieBtn/);
+    assert.match(html, /channelPersonShowBtn/);
+    assert.match(html, /Add everything as a Spotlight channel/);
+    assert.match(html, /2 films and 1 show/);
+  });
+
+  it("asks the server again when the order changes, rather than re-sorting one page", async () => {
+    const client = personClient();
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    assert.equal(requestsTo(client, "/api/person-credits").length, 1);
+    await client.call("setChannelSpotlightSortAndReload", "rating");
+    const asked = requestsTo(client, "/api/person-credits");
+    assert.equal(asked.length, 2);
+    assert.match(asked[1].url, /sort=rating/);
+  });
+
+  it("asks for a whole filmography, not just a channel's worth", async () => {
+    const client = personClient();
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    const asked = requestsTo(client, "/api/person-credits")[0];
+    assert.match(asked.url, /movies=120/);
+    assert.match(asked.url, /shows=60/);
+  });
+
+  it("adds every film into the draft, resolving each to an IMDb id first", async () => {
+    const client = personClient({
+      "/api/resolve-movie": (req) => {
+        const tmdbId = new URL(req.url).searchParams.get("tmdbId");
+        return { json: { ok: true, imdbId: "tt000" + tmdbId } };
+      },
+      "/api/person-show-episodes": () => ({ json: { ok: true, imdbId: "tt_mm", showName: "Mork & Mindy", regular: false, episodes: [] } }),
+    });
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    await client.call("addWholeSpotlightToDraft", null);
+    const draft = client.get("channelDraftItems");
+    assert.deepEqual(plain(draft.map((it) => it.imdbId).sort()), ["tt0001", "tt0002"]);
+    assert.equal(draft[0].kind, "movie");
+    assert.equal(el(client, "channelNameInput").value, "Robin Williams Spotlight");
+  });
+
+  it("puts the picks in career order and leaves the draft on 'As listed'", async () => {
+    const client = personClient({
+      "/api/resolve-movie": (req) => ({ json: { ok: true, imdbId: "tt00" + new URL(req.url).searchParams.get("tmdbId") } }),
+      "/api/person-show-episodes": () => ({ json: { ok: true, imdbId: "tt_mm", showName: "Mork & Mindy", regular: false, episodes: [] } }),
+    });
+    client.set("channelDraftItems", []);
+    client.call("setChannelSpotlightSort", "chronological");
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    await client.call("addWholeSpotlightToDraft", null);
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed",
+      "the order has just been applied, so nothing may re-sort it on the next render");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Aladdin", "Good Will Hunting"],
+      "1992 before 1997"
+    );
+  });
+
+  it("adds to an existing draft instead of replacing what is already in it", async () => {
+    const client = personClient({
+      "/api/resolve-movie": (req) => ({ json: { ok: true, imdbId: "tt00" + new URL(req.url).searchParams.get("tmdbId") } }),
+      "/api/person-show-episodes": () => ({ json: { ok: true, imdbId: "tt_mm", showName: "Mork & Mindy", regular: false, episodes: [] } }),
+    });
+    client.set("channelDraftItems", [{ kind: "movie", imdbId: "tt_existing", title: "Already here" }]);
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    await client.call("addWholeSpotlightToDraft", null);
+    assert.equal(client.get("channelDraftItems")[0].imdbId, "tt_existing");
+    assert.equal(client.get("channelDraftItems").length, 3);
+  });
+
+  it("forgets the filmography when the search type changes under it", async () => {
+    const client = personClient();
+    await client.call("browseChannelPerson", "2157", "Robin Williams");
+    assert.ok(client.get("channelPersonCredits"));
+    client.call("setChannelSearchType", "tv", null);
+    assert.equal(client.get("channelPersonCredits"), null);
+  });
+});
+
+// --- the spotlight builder ------------------------------------------------
+describe("client: adding a whole spotlight", () => {
+  const CREDITS = {
+    ok: true,
+    name: "Tobey Maguire",
+    poster: "https://img/tm.jpg",
+    backdrop: null,
+    movies: [
+      { tmdbId: 557, type: "movie", title: "Spider-Man", year: "2002", released: "2002-05-03", rating: 7.2, votes: 9000, poster: "", backdrop: "", role: "Peter" },
+      { tmdbId: 5, type: "movie", title: "Babylon", year: "2022", released: "2022-12-23", rating: 7.1, votes: 3000, poster: "", backdrop: "", role: "Self" },
+    ],
+    shows: [
+      { tmdbId: 99, type: "tv", title: "Roseanne", year: "1988", released: "1988-10-18", rating: 6.9, votes: 400, poster: "", backdrop: "", role: "Guest" },
+    ],
+  };
+
+  function spotlightClient(over = {}) {
+    return loadClient({
+      routes: {
+        "/api/person-credits": () => ({ json: CREDITS }),
+        "/api/resolve-movie": (req) => ({ json: { ok: true, imdbId: "tt" + new URL(req.url).searchParams.get("tmdbId") } }),
+        "/api/person-show-episodes": () => ({
+          json: {
+            ok: true, imdbId: "tt0094540", showName: "Roseanne", poster: "", backdrop: "", regular: false,
+            episodes: [{ season: 5, episode: 12, name: "Crime and Punishment", released: "1993-01-12", thumbnail: "" }],
+          },
+        }),
+        ...over,
+      },
+    });
+  }
+
+  it("adds every film and every episode the person is in, with no cap", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    const draft = client.get("channelDraftItems");
+    assert.equal(draft.length, 3, "two films and the one episode he is in");
+    assert.equal(draft.filter((it) => it.kind === "movie").length, 2);
+    assert.equal(draft.filter((it) => it.kind === "episode").length, 1);
+  });
+
+  it("asks which episodes are his rather than taking a show's opening run", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    const asked = requestsTo(client, "/api/person-show-episodes");
+    assert.equal(asked.length, 1);
+    assert.match(asked[0].url, /personId=2157/);
+    assert.match(asked[0].url, /tmdbId=99/);
+    assert.equal(requestsTo(client, "/api/show-seasons").length, 0, "never the whole show");
+    const episode = client.get("channelDraftItems").find((it) => it.kind === "episode");
+    assert.equal(episode.season, 5);
+    assert.equal(episode.episode, 12);
+  });
+
+  it("orders films and episodes together by date, not films then television", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    client.call("setChannelSpotlightSort", "chronological");
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Roseanne S5E12 — Crime and Punishment", "Spider-Man", "Babylon"],
+      "1993 before 2002 before 2022 -- the guest spot is not stranded at the end"
+    );
+  });
+
+  it("ranks by rating when that is the order asked for", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    client.call("setChannelSpotlightSort", "rating");
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Spider-Man", "Babylon", "Roseanne S5E12 — Crime and Punishment"],
+      "an episode inherits its show's rating so a show's run stays together"
+    );
+  });
+
+  it("does not leave its own sorting scaffolding on the saved picks", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addWholeSpotlightToDraft", null);
+    client.get("channelDraftItems").forEach((it) => {
+      assert.equal("spotlightRating" in it, false);
+    });
+  });
+
+  it("adds one show's episodes on its own when only that credit is wanted", async () => {
+    const client = spotlightClient();
+    client.set("channelDraftItems", []);
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    await client.call("addPersonShowEpisodes", "99", "Roseanne", "", null);
+    const draft = client.get("channelDraftItems");
+    assert.equal(draft.length, 1);
+    assert.equal(draft[0].imdbId, "tt0094540");
+    assert.equal(requestsTo(client, "/api/resolve-movie").length, 0, "no films came along with it");
+  });
+
+  it("offers the precise action on the button and the season picker on the poster", async () => {
+    const client = spotlightClient();
+    await client.call("browseChannelPerson", "2157", "Tobey Maguire");
+    const html = el(client, "channelEpisodePicker").innerHTML;
+    assert.match(html, /\+ Their episodes</);
+    assert.match(html, /channelPersonShowCard/);
+  });
+});
+
+describe("client: keeping hold of a share link", () => {
+  function sharedClient(shareCode) {
+    const client = loadClient({
+      routes: { "/api/channel/share": () => ({ json: { ok: true, code: "CODE1" } }) },
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+    });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [], shareCode: shareCode || "" });
+    return client;
+  }
+
+  it("copies the stored link without re-uploading the channel", async () => {
+    const client = sharedClient("CODE1");
+    await client.call("copyChannelShareLink", "ch1", null);
+    assert.equal(requestsTo(client, "/api/channel/share").length, 0, "nothing was sent");
+  });
+
+  it("does nothing for a channel that has never been shared", async () => {
+    const client = sharedClient("");
+    await client.call("copyChannelShareLink", "ch1", null);
+    assert.equal(requestsTo(client, "/api/channel/share").length, 0);
+  });
+
+  it("sends the creator's credentials when re-sharing, so its own owner is not refused", async () => {
+    const posts = [];
+    const client = loadClient({
+      routes: { "/api/channel/share": (req) => { posts.push(req.body); return { json: { ok: true, code: "CODE1" } }; } },
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [], shareCode: "CODE1", sharePublished: true });
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal(posts[0].code, "CODE1");
+    assert.equal(posts[0].creatorName, "alice");
+    assert.equal(posts[0].creatorKey, "KEY-1");
+    assert.equal(posts[0].publish, false, "re-sharing does not publish something that was not");
+  });
+
+  it("sends nothing to prove on a first, unlisted share", async () => {
+    const posts = [];
+    const client = loadClient({
+      routes: { "/api/channel/share": (req) => { posts.push(req.body); return { json: { ok: true, code: "NEW1" } }; } },
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.call("saveLocalChannel", { channelId: "ch1", name: "Block Party", items: [] });
+    await client.call("shareChannelById", "ch1", null);
+    assert.equal("creatorKey" in posts[0], false);
+  });
+});
+
+describe("client: looking through a published channel before taking it", () => {
+  it("opens the channel's own picks rather than the one-line summary", async () => {
+    const opened = [];
+    const client = loadClient({
+      routes: {
+        "/api/channel/share": () => ({
+          json: {
+            ok: true, code: "SM90",
+            channel: {
+              name: "Saturday Morning 90s",
+              items: [
+                { kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats", epName: "Tommy", title: "Rugrats S1E1" },
+                { kind: "movie", imdbId: "tt9", season: 1, episode: 1, title: "The Rugrats Movie", showName: "The Rugrats Movie" },
+              ],
+            },
+          },
+        }),
+      },
+    });
+    client.set("openListDetailsPage", function (name, type, url, preloaded) {
+      opened.push({ name, type, url, count: preloaded.sample.length, names: preloaded.sample.map((s) => s.name) });
+    });
+    await client.call("previewDirectoryChannel", "SM90", null);
+    assert.equal(opened.length, 1);
+    assert.equal(opened[0].name, "Saturday Morning 90s");
+    assert.equal(opened[0].count, 2, "both picks, not a summary");
+    assert.match(opened[0].url, /directory:SM90/, "and under an id no saved channel can collide with");
+  });
+
+  it("does not save the previewed channel into this browser", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/share": () => ({ json: { ok: true, code: "SM90", channel: { name: "Saturday Morning 90s", items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, title: "Rugrats S1E1" }] } } }),
+      },
+    });
+    client.set("openListDetailsPage", function () {});
+    await client.call("previewDirectoryChannel", "SM90", null);
+    assert.deepEqual(plain(client.call("loadLocalChannels")), {}, "looking is not taking");
+  });
+});
+
+// --- working on a big draft ----------------------------------------------
+describe("client: bulk editing a channel draft", () => {
+  const epOf = (imdbId, season, episode, showName) => ({
+    kind: "episode", imdbId, season, episode, showName,
+    epName: "E" + episode, title: showName + " S" + season + "E" + episode,
+  });
+
+  function draft(items) {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", items);
+    client.set("channelDraftSelection", []);
+    client.set("channelDraftFilter", "");
+    client.set("channelDraftSelectMode", false);
+    client.set("channelDraftStoryLocked", []);
+    return client;
+  }
+
+  const SAMPLE = [
+    epOf("tt1", 1, 1, "Rugrats"),
+    epOf("tt1", 1, 2, "Rugrats"),
+    epOf("tt1", 2, 1, "Rugrats"),
+    epOf("tt2", 1, 1, "Doug"),
+    epOf("tt2", 1, 2, "Doug"),
+  ];
+
+  it("narrows to what the filter matches, by show, episode or S/E", () => {
+    const client = draft(SAMPLE);
+    client.call("setChannelDraftFilter", "doug");
+    assert.deepEqual(plain(client.call("channelDraftVisibleIndices")), [3, 4]);
+    client.call("setChannelDraftFilter", "s2e1");
+    assert.deepEqual(plain(client.call("channelDraftVisibleIndices")), [2]);
+    client.call("setChannelDraftFilter", "");
+    assert.deepEqual(plain(client.call("channelDraftVisibleIndices")), [0, 1, 2, 3, 4]);
+  });
+
+  it("selects only what is on screen, so a filter cannot act on hidden picks", () => {
+    const client = draft(SAMPLE);
+    client.call("setChannelDraftFilter", "doug");
+    client.call("selectAllChannelDraftShown", true);
+    assert.deepEqual(plain(client.get("channelDraftSelection")).sort(), [3, 4]);
+  });
+
+  it("selects a whole show, or one season of it", () => {
+    const client = draft(SAMPLE);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt1"]));
+    assert.deepEqual(plain(client.get("channelDraftSelection")).sort(), [0, 1, 2]);
+    client.call("selectAllChannelDraftShown", false);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt1", 1]));
+    assert.deepEqual(plain(client.get("channelDraftSelection")).sort(), [0, 1]);
+  });
+
+  it("removes the selection and forgets it", () => {
+    const client = draft(SAMPLE);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt1"]));
+    client.call("removeChannelDraftSelection");
+    assert.deepEqual(plain(client.get("channelDraftItems").map((it) => it.title)), ["Doug S1E1", "Doug S1E2"]);
+    assert.deepEqual(plain(client.get("channelDraftSelection")), []);
+  });
+
+  it("moves the selection to the top and keeps pointing at it afterwards", () => {
+    const client = draft(SAMPLE);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt2"]));
+    client.call("moveChannelDraftSelection", "top");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Doug S1E1", "Doug S1E2", "Rugrats S1E1", "Rugrats S1E2", "Rugrats S2E1"]
+    );
+    assert.deepEqual(plain(client.get("channelDraftSelection")), [0, 1],
+      "an index that survived the move would be pointing at the wrong pick");
+  });
+
+  it("moves the selection to the bottom", () => {
+    const client = draft(SAMPLE);
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt1", 1]));
+    client.call("moveChannelDraftSelection", "bottom");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Rugrats S2E1", "Doug S1E1", "Doug S1E2", "Rugrats S1E1", "Rugrats S1E2"]
+    );
+    assert.deepEqual(plain(client.get("channelDraftSelection")), [3, 4]);
+  });
+
+  it("disarms a remembered sort, so a bulk move is not undone on the next render", () => {
+    const client = draft(SAMPLE);
+    el(client, "channelPlayOrderSelect").value = "title-az";
+    client.call("selectChannelDraftByGroup", JSON.stringify(["tt2"]));
+    client.call("moveChannelDraftSelection", "top");
+    assert.equal(client.call("getChannelPlayOrder"), "as-listed");
+  });
+
+  it("clears the filter and the selection when the builder moves to another channel", () => {
+    const client = draft(SAMPLE);
+    client.call("setChannelDraftFilter", "doug");
+    client.call("toggleChannelDraftSelectMode");
+    client.call("selectAllChannelDraftShown", true);
+    client.call("resetChannelDraftWorkspace");
+    assert.equal(client.get("channelDraftFilter"), "");
+    assert.equal(client.get("channelDraftSelectMode"), false);
+    assert.deepEqual(plain(client.get("channelDraftSelection")), []);
+  });
+});
+
+describe("client: what a channel adds up to", () => {
+  const epOf = (imdbId, episode, showName, runtime, released) => ({
+    kind: "episode", imdbId, season: 1, episode, showName, epName: "E" + episode,
+    title: showName + " E" + episode, runtime, released,
+  });
+
+  it("counts shows, episodes, hours and the years it spans", () => {
+    const client = loadClient({ routes: {} });
+    const summary = client.call("channelDraftSummary", [
+      epOf("tt1", 1, "Rugrats", 30, "1991-08-11"),
+      epOf("tt1", 2, "Rugrats", 30, "1992-09-13"),
+      epOf("tt2", 1, "Doug", 60, "1994-01-01"),
+    ], {});
+    assert.equal(summary.shows, 2);
+    assert.equal(summary.episodes, 3);
+    assert.equal(summary.hours, 2);
+    assert.equal(summary.estimated, false);
+    assert.equal(summary.firstYear, "1991");
+    assert.equal(summary.lastYear, "1994");
+  });
+
+  it("marks the hours as an estimate when some picks have no runtime", () => {
+    const client = loadClient({ routes: {} });
+    const summary = client.call("channelDraftSummary", [
+      epOf("tt1", 1, "Rugrats", 30, "1991-08-11"),
+      epOf("tt1", 2, "Rugrats", 0, "1992-09-13"),
+    ], {});
+    assert.equal(summary.estimated, true);
+    assert.match(client.call("channelSummaryLine", summary), /~1 hour/);
+  });
+
+  it("falls back to half an hour when nothing at all is known", () => {
+    const client = loadClient({ routes: {} });
+    const summary = client.call("channelDraftSummary", [
+      epOf("tt1", 1, "Rugrats", 0, ""),
+      epOf("tt1", 2, "Rugrats", 0, ""),
+    ], {});
+    assert.equal(summary.hours, 1);
+    assert.equal(summary.firstYear, "");
+  });
+
+  it("names the rules a channel is running under", () => {
+    const client = loadClient({ routes: {} });
+    const line = client.call("channelSummaryLine", client.call("channelDraftSummary", [
+      epOf("tt1", 1, "Rugrats", 30, "1991-08-11"),
+    ], { dailyRotate: true, rotateShows: 6, rotateEpisodes: 2, hideWatched: true, storyLocked: ["tt1"], liveSync: true }));
+    assert.match(line, /6 shows × 2 a day/);
+    assert.match(line, /1 story-locked/);
+    assert.match(line, /hides watched/);
+    assert.match(line, /live cloud sync/);
+  });
+
+  it("says nothing at all for an empty channel", () => {
+    const client = loadClient({ routes: {} });
+    assert.equal(client.call("channelSummaryLine", client.call("channelDraftSummary", [], {})), "");
+  });
+});
+
+describe("client: adding something already in the channel", () => {
+  it("counts what is already there by id or by show name", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", [
+      { kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" },
+      { kind: "episode", imdbId: "tt1", season: 1, episode: 2, showName: "Rugrats" },
+    ]);
+    assert.equal(client.call("channelDraftCountForShow", "tt1", ""), 2);
+    assert.equal(client.call("channelDraftCountForShow", "", "Rugrats"), 2);
+    assert.equal(client.call("channelDraftCountForShow", "tt9", "Doug"), 0);
+    assert.equal(client.call("channelDraftCountForShow", "", ""), 0);
+  });
+
+  it("does not stop the caller when there is no dialog to ask with", () => {
+    const client = loadClient({ routes: {} });
+    client.set("showAppConfirm", undefined);
+    assert.equal(client.call("guardChannelDraftDuplicate", "Rugrats", 2, function () {}), false);
+  });
+
+  it("does not stop the caller when there is no duplicate to warn about", () => {
+    const client = loadClient({ routes: {} });
+    assert.equal(client.call("guardChannelDraftDuplicate", "Rugrats", 0, function () {}), false);
+  });
+
+  it("stops the caller and re-runs it only if the warning is accepted", () => {
+    const client = loadClient({ routes: {} });
+    let accepted = 0;
+    let onConfirm = null;
+    client.set("showAppConfirm", function (title, message, label, cb) { onConfirm = cb; });
+    const stopped = client.call("guardChannelDraftDuplicate", "Rugrats", 2, function () { accepted++; });
+    assert.equal(stopped, true, "the caller stops while the dialog is up");
+    assert.equal(accepted, 0);
+    onConfirm();
+    assert.equal(accepted, 1, "and only confirming runs it again");
+  });
+
+  it("adds nothing while the duplicate warning is unanswered", async () => {
+    const client = loadClient({
+      routes: { "/api/resolve-movie": () => ({ json: { ok: true, imdbId: "tt_new" } }) },
+    });
+    // A dialog nobody answers -- which is the case a promise-based guard
+    // could never represent, because it would simply hang here.
+    client.set("showAppConfirm", function () {});
+    client.set("channelDraftItems", [{ kind: "movie", imdbId: "tt9", tmdbId: "603", title: "The Matrix", showName: "The Matrix" }]);
+    await client.call("addMovieToChannelDraft", "603", "The Matrix", "1999", "", "", null);
+    assert.equal(client.get("channelDraftItems").length, 1, "the duplicate was not added");
+    assert.equal(requestsTo(client, "/api/resolve-movie").length, 0, "and nothing was even asked for");
+  });
+
+  it("adds the duplicate once the warning is accepted", async () => {
+    const client = loadClient({
+      routes: { "/api/resolve-movie": () => ({ json: { ok: true, imdbId: "tt_new" } }) },
+    });
+    client.set("showAppConfirm", function (title, message, label, onConfirm) { onConfirm(); });
+    client.set("channelDraftItems", [{ kind: "movie", imdbId: "tt9", tmdbId: "603", title: "The Matrix", showName: "The Matrix" }]);
+    await client.call("addMovieToChannelDraft", "603", "The Matrix", "1999", "", "", null);
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(client.get("channelDraftItems").length, 2);
+  });
+
+  it("adds a movie the channel does not have without asking", async () => {
+    const client = loadClient({
+      routes: { "/api/resolve-movie": () => ({ json: { ok: true, imdbId: "tt_new", runtime: 136 } }) },
+    });
+    client.set("channelDraftItems", []);
+    await client.call("addMovieToChannelDraft", "603", "The Matrix", "1999", "", "", null);
+    const draft = client.get("channelDraftItems");
+    assert.equal(draft.length, 1);
+    assert.equal(draft[0].runtime, 136, "and its runtime came along, for the hours count");
+  });
+});
+
+describe("client: managing the My Channels list", () => {
+  function withChannels(client, channels) {
+    channels.forEach((ch) => client.call("saveLocalChannel", ch));
+    return client;
+  }
+  const chan = (id, name, over = {}) => ({
+    channelId: id, name, items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" }], ...over,
+  });
+
+  it("sorts by name, size or when it was touched", () => {
+    const client = loadClient({ routes: {} });
+    const all = [
+      chan("a", "Zulu", { items: [] }),
+      chan("b", "Alpha", { items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1 }, { kind: "episode", imdbId: "tt1", season: 1, episode: 2 }] }),
+    ];
+    client.call("setMyChannelsSort", "name");
+    assert.deepEqual(plain(client.call("sortMyChannels", all).map((c) => c.name)), ["Alpha", "Zulu"]);
+    client.call("setMyChannelsSort", "size");
+    assert.deepEqual(plain(client.call("sortMyChannels", all).map((c) => c.name)), ["Alpha", "Zulu"]);
+  });
+
+  it("finds a channel by its name, its description, or a show inside it", () => {
+    const client = loadClient({ routes: {} });
+    const all = [
+      chan("a", "Saturday Morning", { description: "cartoons all day" }),
+      chan("b", "Late Night", { items: [{ kind: "episode", imdbId: "tt2", season: 1, episode: 1, showName: "Seinfeld" }] }),
+    ];
+    client.call("setMyChannelsSearch", "saturday");
+    assert.deepEqual(plain(client.call("filterMyChannels", all).map((c) => c.name)), ["Saturday Morning"]);
+    client.call("setMyChannelsSearch", "cartoons");
+    assert.deepEqual(plain(client.call("filterMyChannels", all).map((c) => c.name)), ["Saturday Morning"]);
+    client.call("setMyChannelsSearch", "seinfeld");
+    assert.deepEqual(plain(client.call("filterMyChannels", all).map((c) => c.name)), ["Late Night"]);
+    client.call("setMyChannelsSearch", "");
+    assert.equal(client.call("filterMyChannels", all).length, 2);
+  });
+
+  it("puts a deleted channel back, picks and all", () => {
+    const client = withChannels(loadClient({ routes: {} }), [chan("ch1", "Saturday Morning")]);
+    const before = JSON.stringify(client.call("loadLocalChannels").ch1);
+    client.set("showAppConfirm", function (title, message, label, onConfirm) { onConfirm(); });
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning");
+    assert.equal(client.call("loadLocalChannels").ch1, undefined);
+    client.call("undoChannelDelete");
+    const after = client.call("loadLocalChannels").ch1;
+    assert.equal(after.name, "Saturday Morning");
+    assert.equal(after.items.length, JSON.parse(before).items.length);
+  });
+
+  it("offers the undo only until it is used", () => {
+    const client = withChannels(loadClient({ routes: {} }), [chan("ch1", "Saturday Morning")]);
+    client.set("showAppConfirm", function (title, message, label, onConfirm) { onConfirm(); });
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning");
+    assert.match(el(client, "myChannelsUndoBar").innerHTML, /Undo/);
+    client.call("undoChannelDelete");
+    assert.equal(el(client, "myChannelsUndoBar").innerHTML, "");
+    // A second Undo has nothing to put back and must not resurrect anything.
+    client.call("undoChannelDelete");
+    assert.equal(Object.keys(client.call("loadLocalChannels")).length, 1);
+  });
+});
+
+describe("client: the Explore Channels directory ordering and likes", () => {
+  const rows = [
+    { code: "a", name: "Alpha", likes: 1, adds: 0, itemCount: 10, showCount: 2 },
+    { code: "b", name: "Zulu", likes: 0, adds: 5, itemCount: 20, showCount: 3 },
+  ];
+
+  it("re-asks the server when the order changes rather than re-sorting one page", async () => {
+    const client = loadClient({
+      routes: { "/api/channel/directory": () => ({ json: { ok: true, channels: rows } }) },
+    });
+    await client.call("loadChannelDirectory", true);
+    assert.equal(requestsTo(client, "/api/channel/directory").length, 1);
+    await client.call("setChannelDirectorySort", "liked");
+    const asked = requestsTo(client, "/api/channel/directory");
+    assert.equal(asked.length, 2);
+    assert.match(asked[1].url, /sort=liked/);
+  });
+
+  it("does nothing when the order picked is the one already showing", async () => {
+    const client = loadClient({
+      routes: { "/api/channel/directory": () => ({ json: { ok: true, channels: rows } }) },
+    });
+    await client.call("loadChannelDirectory", true);
+    await client.call("setChannelDirectorySort", "newest");
+    assert.equal(requestsTo(client, "/api/channel/directory").length, 1);
+  });
+
+  it("fills the heart in before the round trip and keeps the server's answer", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/directory": () => ({ json: { ok: true, channels: rows.map((r) => Object.assign({}, r)) } }),
+        "/api/channel/like": () => ({ json: { ok: true, likes: 2, liked: true } }),
+      },
+    });
+    await client.call("loadChannelDirectory", true);
+    await client.call("toggleChannelDirectoryLike", "a", null);
+    assert.equal(client.get("_channelDirectoryLiked").a, true);
+    assert.match(el(client, "channelDirectoryFeed").innerHTML, /2/);
+  });
+
+  it("puts the heart back when the server refuses", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/directory": () => ({ json: { ok: true, channels: rows.map((r) => Object.assign({}, r)) } }),
+        "/api/channel/like": () => ({ status: 404, json: { ok: false, error: "Channel not found." } }),
+      },
+    });
+    await client.call("loadChannelDirectory", true);
+    await client.call("toggleChannelDirectoryLike", "a", null);
+    assert.equal(!!client.get("_channelDirectoryLiked").a, false);
+  });
+
+  it("tells the server a channel was taken, and never lets that fail the add", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel/directory": () => ({ json: { ok: true, channels: rows.map((r) => Object.assign({}, r)) } }),
+        "/api/channel/share": () => ({ json: { ok: true, code: "a", channel: { name: "Alpha", items: [] } } }),
+        "/api/channel/added": () => ({ status: 500, json: { ok: false } }),
+      },
+    });
+    await client.call("loadChannelDirectory", true);
+    await client.call("addDirectoryChannel", "a", null);
+    assert.equal(requestsTo(client, "/api/channel/added").length, 1);
+    assert.ok(
+      Object.values(client.call("loadLocalChannels")).some((ch) => ch.name === "Alpha"),
+      "the channel landed even though the counter call failed"
+    );
+  });
+});
+
+describe("client: dragging a pick while the draft is filtered", () => {
+  const epOf = (imdbId, episode, showName) => ({
+    kind: "episode", imdbId, season: 1, episode, showName,
+    epName: "E" + episode, title: showName + " E" + episode,
+  });
+  const SAMPLE = [
+    epOf("tt1", 1, "Rugrats"),
+    epOf("tt2", 1, "Doug"),
+    epOf("tt1", 2, "Rugrats"),
+    epOf("tt2", 2, "Doug"),
+  ];
+
+  // The card order the DOM would be in after a drag. reorderChannelDraftFromDom
+  // reads it back out of the rendered cards, so the stub has to hand back the
+  // same data-idx attributes a real render would.
+  function withRenderedOrder(client, indices) {
+    const list = client.document.getElementById("channelDraftList");
+    list.querySelectorAll = (sel) =>
+      sel === ".channel-pick" ? indices.map((i) => ({ dataset: { idx: String(i) } })) : [];
+    list.querySelector = () => null;
+  }
+
+  it("keeps every hidden pick when a visible one is dragged", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", SAMPLE);
+    client.set("channelDraftFilter", "doug");
+    // Doug sits at slots 1 and 3; dragging swaps the two visible cards.
+    withRenderedOrder(client, [3, 1]);
+    client.call("reorderChannelDraftFromDom");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Rugrats E1", "Doug E2", "Rugrats E2", "Doug E1"],
+      "the two Rugrats picks the filter was hiding are still in their own slots"
+    );
+    assert.equal(client.get("channelDraftItems").length, 4, "nothing was dropped");
+  });
+
+  it("is a plain reorder when nothing is filtered out", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", SAMPLE);
+    client.set("channelDraftFilter", "");
+    withRenderedOrder(client, [3, 2, 1, 0]);
+    client.call("reorderChannelDraftFromDom");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Doug E2", "Rugrats E2", "Doug E1", "Rugrats E1"]
+    );
+  });
+
+  it("ignores a stale index rather than writing undefined into the draft", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", SAMPLE);
+    withRenderedOrder(client, [0, 99, 1]);
+    client.call("reorderChannelDraftFromDom");
+    assert.equal(client.get("channelDraftItems").length, 4);
+    assert.ok(client.get("channelDraftItems").every(Boolean));
+  });
+
+  it("leaves the draft alone when there is nothing rendered to read", () => {
+    const client = loadClient({ routes: {} });
+    client.set("channelDraftItems", SAMPLE);
+    withRenderedOrder(client, []);
+    client.call("reorderChannelDraftFromDom");
+    assert.deepEqual(
+      plain(client.get("channelDraftItems").map((it) => it.title)),
+      ["Rugrats E1", "Doug E1", "Rugrats E2", "Doug E2"]
+    );
+  });
+});
+
+// --- arranging My Channels by hand ---------------------------------------
+//
+// The move operations read the cards ON SCREEN, so these stub the container
+// the way a render would leave it: one .list-card per visible channel, in
+// the order they are shown.
+describe("client: rearranging the channels list", () => {
+  const chan = (id, name, over = {}) => ({
+    channelId: id, name,
+    items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" }],
+    ...over,
+  });
+
+  // Reordering reads the cards ON SCREEN, so the container is stubbed the
+  // way a render would leave it: one .list-card per visible channel, in the
+  // order shown.
+  function withChannels(channels, shownIds) {
+    const client = loadClient({ routes: {} });
+    channels.forEach((ch) => client.call("saveLocalChannel", ch));
+    const box = client.document.getElementById("myCreatedChannelsList");
+    const ids = shownIds || channels.map((c) => c.channelId);
+    box.querySelectorAll = (sel) =>
+      sel.startsWith(".list-card") ? ids.map((id) => ({ getAttribute: () => id })) : [];
+    return client;
+  }
+
+  const orderOf = (client) =>
+    client.call("sortMyChannels", Object.values(client.call("loadLocalChannels")), "manual")
+      .map((c) => c.channelId);
+
+  it("stores the order a drag leaves the cards in", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo"), chan("c", "Charlie")]);
+    client.call("applyMyChannelOrder", ["c", "a", "b"]);
+    assert.deepEqual(plain(orderOf(client)), ["c", "a", "b"]);
+  });
+
+  it("switches the ordering to the hand-made one, so the list does not re-sort out from under it", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")]);
+    client.call("setMyChannelsSort", "name");
+    client.call("applyMyChannelOrder", ["b", "a"]);
+    assert.equal(client.get("myChannelsSort"), "manual");
+    assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
+  });
+
+  it("adopts the arrangement that was on screen rather than one nobody was looking at", () => {
+    // Shown by name: Alpha, Bravo, Charlie. The stored order is the reverse.
+    const client = withChannels(
+      [chan("c", "Charlie", { order: 1 }), chan("b", "Bravo", { order: 2 }), chan("a", "Alpha", { order: 3 })],
+      ["a", "b", "c"]
+    );
+    client.call("setMyChannelsSort", "name");
+    client.call("beginMyChannelReorder");
+    assert.deepEqual(plain(orderOf(client)), ["a", "b", "c"],
+      "the visible arrangement became the starting point for the drag");
+  });
+
+  // The filtered case, where rebuilding an order from a partial view would
+  // quietly reshuffle everything the filter was hiding.
+  it("leaves channels the filter hides exactly where they were", () => {
+    const client = withChannels(
+      [chan("a", "Alpha", { order: 1 }), chan("b", "Bravo", { order: 2 }),
+       chan("c", "Charlie", { order: 3 }), chan("d", "Delta", { order: 4 })],
+      ["b", "d"]
+    );
+    client.set("myChannelsSort", "manual");
+    client.call("applyMyChannelOrder", ["d", "b"]);
+    assert.deepEqual(plain(orderOf(client)), ["a", "d", "c", "b"]);
+  });
+
+  it("puts a channel with no arrangement yet at the end, not in the middle", () => {
+    const client = withChannels(
+      [chan("a", "Alpha", { order: 1 }), chan("b", "Bravo", { order: 2 }), chan("fresh", "Fresh")]
+    );
+    assert.deepEqual(plain(orderOf(client)), ["a", "b", "fresh"]);
+  });
+
+  it("keeps a channel's place when it is edited and saved again", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")]);
+    client.call("applyMyChannelOrder", ["b", "a"]);
+    client.call("saveLocalChannel", chan("b", "Bravo renamed"));
+    assert.deepEqual(plain(orderOf(client)), ["b", "a"], "editing is not a reason to lose your arrangement");
+  });
+
+  it("survives the whole map being rewritten, which is where a dropped field shows up", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")]);
+    client.call("applyMyChannelOrder", ["b", "a"]);
+    client.call("saveLocalChannelsMap", client.call("loadLocalChannels"));
+    assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
+  });
+});
+
+describe("client: a published channel that is deleted locally", () => {
+  const chan = (over = {}) => ({
+    channelId: "ch1", name: "Saturday Morning 90s",
+    items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" }],
+    ...over,
+  });
+
+  function signedInClient(routes = {}) {
+    const client = loadClient({
+      routes: { "/api/channel/unpublish": () => ({ json: { ok: true } }), ...routes },
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+    });
+    client.set("activeCreator", { creatorName: "alice" });
+    client.set("showAppConfirm", function (title, message, label, onConfirm) { onConfirm(); });
+    return client;
+  }
+
+  it("withdraws the directory listing as the channel goes", async () => {
+    const client = signedInClient();
+    client.call("saveLocalChannel", chan({ shareCode: "SM90", sharePublished: true }));
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning 90s");
+    await new Promise((r) => setTimeout(r, 0));
+    const asked = requestsTo(client, "/api/channel/unpublish");
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].body.code, "SM90");
+  });
+
+  it("does not call unpublish for a channel that was never published", async () => {
+    const client = signedInClient();
+    client.call("saveLocalChannel", chan({ shareCode: "SM90", sharePublished: false }));
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning 90s");
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(requestsTo(client, "/api/channel/unpublish").length, 0);
+  });
+
+  it("deletes the channel even when the withdrawal fails", async () => {
+    const client = signedInClient({
+      "/api/channel/unpublish": () => ({ status: 500, json: { ok: false, error: "nope" } }),
+    });
+    client.call("saveLocalChannel", chan({ shareCode: "SM90", sharePublished: true }));
+    client.call("deleteLocalChannel", "ch1", "Saturday Morning 90s");
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(client.call("loadLocalChannels").ch1, undefined, "the delete is not held hostage by the listing");
+  });
+
+  it("finds the listings this account still has up with no channel behind them", async () => {
+    const client = signedInClient({
+      "/api/channel/mine": () => ({
+        json: {
+          ok: true,
+          channels: [
+            { code: "GONE", name: "Deleted one", owner: "alice", itemCount: 12, showCount: 3 },
+            { code: "KEPT", name: "Still here", owner: "alice", itemCount: 9, showCount: 2 },
+          ],
+        },
+      }),
+    });
+    client.call("saveLocalChannel", chan({ channelId: "ch1", shareCode: "KEPT", sharePublished: true }));
+    await client.call("loadOrphanedPublishedChannels");
+    assert.deepEqual(plain(client.get("_orphanedPublishedChannels").map((e) => e.code)), ["GONE"],
+      "only the one with nothing left behind it");
+    assert.match(el(client, "channelPublishList").innerHTML, /Deleted one/);
+    assert.match(el(client, "channelPublishList").innerHTML, /no longer on this device/);
+  });
+
+  it("asks for nothing while signed out", async () => {
+    const client = loadClient({ routes: {} });
+    client.set("activeCreator", null);
+    await client.call("loadOrphanedPublishedChannels");
+    assert.deepEqual(plain(client.get("_orphanedPublishedChannels")), []);
+  });
+
+  it("withdraws an orphaned listing by its code alone", async () => {
+    const client = signedInClient({ "/api/channel/mine": () => ({ json: { ok: true, channels: [] } }) });
+    await client.call("unpublishOrphanedChannel", "GONE", null);
+    const asked = requestsTo(client, "/api/channel/unpublish");
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].body.code, "GONE");
+    assert.equal(asked[0].body.creatorName, "alice");
+  });
+
+  it("keeps the last known orphans when the lookup fails, rather than hiding them", async () => {
+    const client = signedInClient({
+      "/api/channel/mine": () => ({ status: 500, json: { ok: false } }),
+    });
+    client.set("_orphanedPublishedChannels", [{ code: "GONE", name: "Deleted one" }]);
+    await client.call("loadOrphanedPublishedChannels");
+    assert.deepEqual(plain(client.get("_orphanedPublishedChannels").map((e) => e.code)), ["GONE"]);
+  });
+});
+
+describe("client: one card shape for a channel listing", () => {
+  it("draws a publishable channel the way the directory draws one", () => {
+    const client = loadClient({ routes: {} });
+    const html = client.call("channelListingCardHtml", {
+      code: "SM90", name: "Saturday Morning 90s", description: "Cartoons, all morning.",
+      backdrop: "https://img/bd.jpg", itemCount: 300, showCount: 12, dailyRotate: true, owner: "alice",
+    }, "<button>Publish</button>", "");
+    assert.match(html, /Saturday Morning 90s/);
+    assert.match(html, /Cartoons, all morning\./);
+    assert.match(html, /300 episodes/);
+    assert.match(html, /12 shows/);
+    assert.match(html, /daily lineup/);
+    assert.match(html, /img\/bd\.jpg/);
+    assert.match(html, /<button>Publish<\/button>/);
+  });
+
+  it("describes a saved channel the same way, from its own fields", () => {
+    const client = loadClient({ routes: {} });
+    const entry = client.call("channelAsListingEntry", {
+      channelId: "ch1", name: "Block Party", description: "Sitcoms.",
+      items: [
+        { kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" },
+        { kind: "episode", imdbId: "tt2", season: 1, episode: 1, showName: "Doug" },
+      ],
+      dailyRotate: true, sharePublished: false, shareCode: "X",
+    });
+    assert.equal(entry.name, "Block Party");
+    assert.equal(entry.description, "Sitcoms.");
+    assert.equal(entry.itemCount, 2);
+    assert.equal(entry.showCount, 2);
+    assert.equal(entry.code, "", "an unpublished channel has no listing to open");
+  });
+
+  it("offers the preview only once a channel is actually listed", () => {
+    const client = loadClient({ routes: {} });
+    const unlisted = client.call("channelListingCardHtml", { name: "Draft", itemCount: 1, showCount: 1 }, "", "");
+    assert.equal(/previewDirectoryChannel/.test(unlisted), false);
+    const listed = client.call("channelListingCardHtml", { code: "C1", name: "Listed", backdrop: "https://i/x.jpg", itemCount: 1, showCount: 1 }, "", "");
+    assert.match(listed, /previewDirectoryChannel/);
+  });
+});
+
+describe("client: Quick List Wizard in Catalogs Quick Add", () => {
+  it("generates default and suffixed list names cleanly", () => {
+    const client = loadClient({ routes: {} });
+    const name = client.call("catalogWizardName", "(Movies)");
+    assert.match(name, /My List \(Movies\)/);
+  });
+
+  it("builds separate movie and show lists (not combined) from the wizard", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/wizard-channel-shows": (req) => {
+          const u = new URL(req.url, "https://example.com");
+          const type = u.searchParams.get("type");
+          if (type === "movie") {
+            return {
+              json: {
+                ok: true,
+                items: [
+                  { imdbId: "tt0111161", tmdbId: 278, title: "The Shawshank Redemption", year: "1994", type: "movie" },
+                  { imdbId: "tt0068646", tmdbId: 238, title: "The Godfather", year: "1972", type: "movie" },
+                ],
+              },
+            };
+          }
+          return {
+            json: {
+              ok: true,
+              items: [
+                { imdbId: "tt0903747", tmdbId: 1396, name: "Breaking Bad", year: "2008", type: "series" },
+                { imdbId: "tt0944947", tmdbId: 1399, name: "Game of Thrones", year: "2011", type: "series" },
+              ],
+            },
+          };
+        },
+      },
+    });
+
+    const netEl = client.document.getElementById("catalogWizardNetwork");
+    netEl.value = "49";
+    netEl.options = [{ textContent: "HBO" }];
+    netEl.selectedIndex = 0;
+
+    await client.call("runCatalogListWizard", "both", null);
+
+    const localMap = client.call("loadLocalCustomLists");
+    const movieLst = localMap["hbo-movies"];
+    const showLst = localMap["hbo-shows"];
+    assert.ok(movieLst, "movie list must exist");
+    assert.ok(showLst, "series list must exist");
+    assert.equal(movieLst.type, "movie", "movie list type is movie");
+    assert.equal(showLst.type, "series", "series list type is series");
+    assert.equal(movieLst.items.length, 2, "movie list has 2 items");
+    assert.equal(showLst.items.length, 2, "show list has 2 items");
+    assert.notEqual(movieLst.type, showLst.type, "movie and show lists are not combined");
+  });
+});
+

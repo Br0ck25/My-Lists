@@ -992,6 +992,16 @@ window._inProgressShowIds = new Set();
 // initWatchHistory below for a local-only browser; a signed-in account
 // gets it from the server instead (see loadCreatorSync).
 window._dismissedContinueWatching = {};
+// Shows explicitly removed from Airing Next, keyed by showId, each mapped to
+// the watched snapshot (season/episode) the removal was made at -- the same
+// shape, and for the same reason, as _dismissedContinueWatching above: the
+// point of removing a show from Airing Next is "stop telling me about this
+// one", not "forget that I watch it", so nothing about Watch History changes
+// and watching a genuinely newer episode later supersedes the removal on its
+// own. See removeAiringNextShow. Restored from localStorage in
+// initWatchHistory below for a local-only browser; a signed-in account gets
+// it from the server instead (see loadCreatorSync).
+window._removedAiringNext = {};
 
 // Finds the position:relative box a watched-checkmark badge should be
 // inserted into for a given .clickable-poster/.clickable-episode element.
@@ -1098,6 +1108,15 @@ function initWatchHistory() {
     }
   } catch (e) {
     // non-critical -- a dismissed show might just reappear once
+  }
+  try {
+    const removedAiringRaw = localStorage.getItem(REMOVED_AIRING_NEXT_KEY);
+    if (removedAiringRaw) {
+      const parsed = JSON.parse(removedAiringRaw);
+      if (parsed && typeof parsed === 'object') window._removedAiringNext = parsed;
+    }
+  } catch (e) {
+    // non-critical -- a removed show might just reappear once
   }
 
   // Badges new posters as they appear.
@@ -1538,7 +1557,29 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   const list = getOrCreateWatchHistoryList();
   
   let existingIdx = list.items.findIndex(it => it.id === id);
-  
+
+  // An episode that has not aired yet cannot have been watched, and letting
+  // one in poisons everything downstream: it counts towards "fully watched",
+  // evicts the show from Continue Watching, and is pushed to the account as
+  // a real viewing. The modal no longer offers the button (see
+  // openEpisodeDetails, 19_client-search-and-likes.js) -- this is the guard
+  // behind it, because this function is the single door every episode toggle
+  // goes through.
+  //
+  // Only ADDING is refused. Removing one that is already recorded is exactly
+  // how a person undoes a mistake made before this existed, so that path is
+  // left alone -- as is anything this browser has no air date for, which is
+  // unknown rather than future.
+  if (existingIdx < 0 && type === 'episode' && typeof isEpisodeAired === 'function') {
+    const cached = Object.values(window._episodeDataCache || {}).find(ep => String(ep && ep.id) === String(id));
+    if (cached && (cached.air_date || cached.airDate) && !isEpisodeAired(cached)) {
+      if (typeof showAddedToast === 'function') {
+        showAddedToast('That episode has not aired yet, so it was not marked watched.');
+      }
+      return;
+    }
+  }
+
   if (existingIdx < 0 && type === 'episode') {
     const d = window._currentItemDetails;
     if (d) {
@@ -1631,7 +1672,13 @@ window.toggleWatchStatus = function(id, type, name, poster) {
   if (type === 'episode') {
     const d = window._currentItemDetails;
     if (d && d.id) updateContinueWatching(d.id).catch(() => {});
-    if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
+    // Everything on the item page that reads Watch History, not just the
+    // season last expanded: the episode toggled may have been the last one
+    // its season -- or the whole show -- was waiting on, and its own season
+    // is not always the one _currentSeasonNum points at.
+    if (typeof refreshItemWatchState === 'function') {
+      refreshItemWatchState();
+    } else if (typeof updateSeasonWatchedButton === 'function' && window._currentSeasonNum != null) {
       updateSeasonWatchedButton(window._currentSeasonNum);
     }
   } else if (type === 'movie' && existingIdx < 0) {
@@ -1888,6 +1935,11 @@ window.markShowWatched = async function(imdbId) {
             '&seasonNum=' + season.season_number + (tmdbKey ? '&tmdbKey=' + encodeURIComponent(tmdbKey) : ''));
           const data = await res.json();
           if (data.ok && data.season && Array.isArray(data.season.episodes)) {
+            // Shared with the season buttons: once the real episode list is
+            // known, "has this season aired anything" and "is it fully
+            // watched" stop having to guess from episode_count.
+            if (!window._seasonEpisodesMap) window._seasonEpisodesMap = {};
+            window._seasonEpisodesMap[season.season_number] = data.season.episodes;
             data.season.episodes.forEach((ep) => {
               if (typeof isEpisodeAired === 'function' && !isEpisodeAired(ep)) return;
               const epStill = ep.still_path
@@ -1926,6 +1978,11 @@ window.markShowWatched = async function(imdbId) {
       btn.innerHTML = "Couldn't load episodes -- try again";
     } else {
       btn.innerHTML = wasFullyWatched ? '<span style="margin-right:4px;">&#x2713;</span> Mark Show Unwatched' : 'Mark Show Watched';
+      // Every season is still to come, so there is genuinely nothing to
+      // mark. Silence here read as a broken button.
+      if (typeof showAddedToast === 'function') {
+        showAddedToast('Nothing has aired yet, so there is nothing to mark watched.');
+      }
     }
     return;
   }
@@ -1977,18 +2034,39 @@ window.markShowWatched = async function(imdbId) {
       };
 
       if (nowWatched) {
-        // Evict any entry for this completed show from Continue Watching
+        // "Watched everything that has aired" is not the same as "finished".
+        //
+        // The reconciliation awaited above (updateContinueWatching) has
+        // already worked out what comes next for this show, and for a show
+        // that is merely caught up that is an episode with a future air date
+        // -- the entry Continue Watching renders with an "Airs ..." badge,
+        // exactly as it does when the last episode is marked watched one at a
+        // time. Evicting it here made Mark Show Watched the one path that
+        // dropped the show off the shelf entirely, which is the difference
+        // the report describes.
+        //
+        // A show with nothing left to air keeps the old behaviour: evicted,
+        // and its storyline conclusion (Breaking Bad -> El Camino) queued in
+        // its place. A companion only makes sense once a show is actually
+        // over, so it is not queued while an episode is still coming.
+        const isUpcomingEntry = (it) => !!(it && (it.isUnaired ||
+          (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate))));
+        const upcoming = (cwList.items || []).find((it) => isShowItem(it) && isUpcomingEntry(it));
         cwList.items = (cwList.items || []).filter((it) => !isShowItem(it));
-        // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
-        let companion = null;
-        for (const alias of allShowAliases) {
-          if (typeof findCompanionShowConclusion === 'function') {
-            companion = findCompanionShowConclusion(alias);
+        if (upcoming) {
+          cwList.items.unshift(upcoming);
+        } else {
+          // Check for companion show conclusion (e.g. Breaking Bad -> El Camino)
+          let companion = null;
+          for (const alias of allShowAliases) {
+            if (typeof findCompanionShowConclusion === 'function') {
+              companion = findCompanionShowConclusion(alias);
+            }
+            if (companion) break;
           }
-          if (companion) break;
-        }
-        if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
-          cwList.items.unshift(companion);
+          if (companion && !cwList.items.some((it) => String(it.id) === String(companion.id))) {
+            cwList.items.unshift(companion);
+          }
         }
       } else {
         // If unwatching the whole show, remove any companion queued for this show
@@ -2016,7 +2094,23 @@ window.markShowWatched = async function(imdbId) {
     btn.classList.remove('secondary');
     btn.classList.add('primary');
   }
+  // Only the seasons this actually wrote to. allEpisodes holds the AIRED
+  // episodes that were toggled, so a season absent from it had nothing to
+  // mark -- and relabelling it "Mark Season Unwatched" anyway is what made a
+  // not-yet-aired season read as watched over an empty Watch History. Those
+  // seasons are handed back to the shared state instead, which says when they
+  // air (seasonWatchedButtonState, 19_client-search-and-likes.js).
+  const touchedSeasons = new Set(allEpisodes.map((ep) => String(ep.seasonNum)));
   document.querySelectorAll('.btn-mark-season-watched').forEach((seasonBtn) => {
+    const sNum = seasonBtn.dataset ? seasonBtn.dataset.season : null;
+    if (sNum != null && !touchedSeasons.has(String(sNum))) {
+      if (typeof updateSeasonWatchedButton === 'function') updateSeasonWatchedButton(Number(sNum));
+      return;
+    }
+    if (typeof applySeasonWatchedButton === 'function' && typeof watchedSeasonButtonState === 'function') {
+      applySeasonWatchedButton(seasonBtn, watchedSeasonButtonState(nowWatched));
+      return;
+    }
     if (nowWatched) {
       seasonBtn.innerHTML = '<span style="margin-right:4px;">&#x2713;</span> Mark Season Unwatched';
       seasonBtn.classList.remove('primary');
@@ -2027,6 +2121,9 @@ window.markShowWatched = async function(imdbId) {
       seasonBtn.classList.add('primary');
     }
   });
+  // The "x/8 episodes" line beside each of those buttons is read off Watch
+  // History, which this just rewrote for every aired episode of the show.
+  if (typeof updateSeasonEpisodeCounts === 'function') updateSeasonEpisodeCounts();
 };
 
 // One-way add to Watch History as watched -- unlike toggleBatchWatchStatus
@@ -2765,16 +2862,8 @@ function dismissContinueWatchingShow(showId, btn) {
   }
   if (!window._dismissedContinueWatching) window._dismissedContinueWatching = {};
 
-  const history = loadLocalCustomLists()['watch-history'];
-  const watchedEps = (history ? history.items : []).filter(it =>
-    it.type === 'episode' && it.showId === showId && it.seasonNum != null && it.episodeNum != null
-  );
-  if (watchedEps.length) {
-    const latest = watchedEps.reduce((best, ep) => {
-      if (ep.seasonNum > best.seasonNum) return ep;
-      if (ep.seasonNum === best.seasonNum && ep.episodeNum > best.episodeNum) return ep;
-      return best;
-    }, watchedEps[0]);
+  const latest = latestWatchedEpisodeForShowIds(showId);
+  if (latest) {
     window._dismissedContinueWatching[showId] = { seasonNum: latest.seasonNum, episodeNum: latest.episodeNum };
   } else {
     window._dismissedContinueWatching[showId] = { dismissedAt: Date.now() };
@@ -2851,7 +2940,11 @@ function getOrCreateAiringNextList() {
 // this list shows all of them with a known upcoming episode, no Fully
 // Watched/In Progress split (that distinction was removed; see this
 // function's git history for the old bucketing logic if it's ever needed
-// again).
+// again) -- minus the ones explicitly removed from this shelf, which is the
+// one and only place that removal is applied (see isAiringNextRemoved).
+// Filtering here rather than at each render covers every path at once: the
+// dashboard card, the full-page view, the refresh that rebuilds the list
+// against TMDB, and the push that hands it to the Stremio catalog.
 function collectAiringNextCandidateShowIds() {
   const ids = new Set();
   const map = loadLocalCustomLists();
@@ -2864,7 +2957,236 @@ function collectAiringNextCandidateShowIds() {
   if (window._fullyWatchedShowIds) {
     window._fullyWatchedShowIds.forEach((id) => ids.add(id));
   }
+  [...ids].forEach((id) => {
+    if (isAiringNextRemoved(id)) ids.delete(id);
+  });
   return ids;
+}
+
+// --- Removing one show from Airing Next -------------------------------------
+//
+// "Stop showing me this show's upcoming episodes" -- without touching a
+// single thing in Watch History. Everything the person has marked watched
+// stays exactly as it was, the show keeps its watched badges, and Continue
+// Watching is not involved at all; only this one shelf stops listing it.
+//
+// Stored as a snapshot of the watched episode the removal was made at rather
+// than a permanent flag, exactly like dismissContinueWatchingShow above, and
+// for the same reason: watching another episode of the show is a clear
+// statement that the person is following it again, so the removal is
+// superseded and the show returns to the shelf on its own. That is the whole
+// mechanism -- there is no separate "re-add" path to keep in step with it,
+// and nothing to go stale, because eligibility is re-derived from Watch
+// History every time collectAiringNextCandidateShowIds runs.
+const REMOVED_AIRING_NEXT_KEY = 'myListAddon:removedAiringNext';
+
+function getRemovedAiringNext() {
+  if (window._removedAiringNext && typeof window._removedAiringNext === 'object') return window._removedAiringNext;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(REMOVED_AIRING_NEXT_KEY) || '{}');
+    window._removedAiringNext = (parsed && typeof parsed === 'object') ? parsed : {};
+  } catch (e) {
+    window._removedAiringNext = {};
+  }
+  return window._removedAiringNext;
+}
+
+function persistRemovedAiringNext() {
+  try {
+    localStorage.setItem(REMOVED_AIRING_NEXT_KEY, JSON.stringify(getRemovedAiringNext()));
+  } catch (e) {
+    // non-critical -- the removal still applies for this session either way
+  }
+}
+
+// The furthest-along watched episode across any of the ids one show can be
+// recorded under (Watch History can hold both an imdb and a tmdb-prefixed
+// form for the same series -- see refreshAiringNext's own dedupe). Returns
+// { seasonNum, episodeNum } or null when nothing has been watched.
+//
+// Shared by the Continue Watching dismissal and the Airing Next removal so
+// the two agree on what "the episode this was done at" means; getting that
+// wrong in one of them and not the other is how a show comes back in one
+// shelf and not the other.
+function latestWatchedEpisodeForShowIds(showIds) {
+  const ids = new Set((Array.isArray(showIds) ? showIds : [showIds]).filter(Boolean).map(String));
+  if (!ids.size) return null;
+  const history = loadLocalCustomLists()['watch-history'];
+  const watchedEps = ((history && history.items) || []).filter((it) =>
+    it && it.type === 'episode' && it.showId && ids.has(String(it.showId)) &&
+    it.seasonNum != null && it.episodeNum != null
+  );
+  if (!watchedEps.length) return null;
+  const latest = watchedEps.reduce((best, ep) => {
+    if (ep.seasonNum > best.seasonNum) return ep;
+    if (ep.seasonNum === best.seasonNum && ep.episodeNum > best.episodeNum) return ep;
+    return best;
+  }, watchedEps[0]);
+  return { seasonNum: latest.seasonNum, episodeNum: latest.episodeNum };
+}
+
+// Whether the removal recorded for this show still stands. A removal with no
+// snapshot at all (recorded when nothing was watched, or round-tripped
+// through a server that stores the two numbers and not much else) reads as
+// S0E0, so any real episode watched afterwards supersedes it -- which is the
+// behaviour that matters, stated the same way in both cases.
+//
+// Deliberately a pure read: it is called from render paths and from the
+// candidate sweep, and a function that quietly rewrote storage from there
+// would be writing on every dashboard paint. Clearing superseded entries is
+// pruneSupersededAiringRemovals's job, below.
+function isAiringNextRemoved(showId) {
+  if (!showId) return false;
+  const mark = getRemovedAiringNext()[String(showId)];
+  if (!mark) return false;
+  const latest = latestWatchedEpisodeForShowIds(showId);
+  if (!latest) return true;
+  const atSeason = Number(mark.seasonNum) || 0;
+  const atEpisode = Number(mark.episodeNum) || 0;
+  if (latest.seasonNum > atSeason) return false;
+  if (latest.seasonNum === atSeason && latest.episodeNum > atEpisode) return false;
+  return true;
+}
+
+// Drops the removals that a newer watched episode has already superseded, so
+// the stored set stays the size of what is actually removed rather than
+// growing once per show forever. Purely housekeeping: isAiringNextRemoved
+// already ignores a superseded entry, so this changes what is STORED, never
+// what is shown. Returns whether anything changed.
+function pruneSupersededAiringRemovals() {
+  const marks = getRemovedAiringNext();
+  const superseded = Object.keys(marks).filter((id) => !isAiringNextRemoved(id));
+  if (!superseded.length) return false;
+  superseded.forEach((id) => { delete marks[id]; });
+  persistRemovedAiringNext();
+  return true;
+}
+
+// The "x" on an Airing Next poster. Records the removal, takes the show off
+// the shelf immediately, and pushes the shortened list to the account.
+//
+// intentionalRemoval is what makes the push actually shorten the account's
+// copy: save-tracking refuses to let an EMPTY derived list replace a stored
+// non-empty one (a browser that has not computed Airing Next yet must not
+// wipe one another browser has), and removing the last show on the shelf
+// sends exactly that empty array. Without the flag, the Stremio row would go
+// on serving the show this removed.
+function removeAiringNextShow(showId, btn) {
+  if (!showId) return;
+  const id = String(showId);
+  if (btn) {
+    const tile = btn.closest('.list-card-mini-poster-tile, .live-preview-poster-card');
+    if (tile) {
+      tile.style.opacity = '0';
+      tile.style.transform = 'scale(0.85)';
+      tile.style.transition = 'all 0.2s ease';
+      setTimeout(() => {
+        if (tile && tile.parentNode) tile.parentNode.removeChild(tile);
+      }, 200);
+    }
+  }
+
+  const map = loadLocalCustomLists();
+  const list = map['airing-next'];
+  const items = (list && Array.isArray(list.items)) ? list.items : [];
+  const entry = items.find((it) => it && String(it.showId || it.id) === id);
+  // A show can sit in Watch History under both an imdb and a tmdb-prefixed
+  // id (refreshAiringNext dedupes exactly that), and the shelf is rebuilt
+  // from whichever of them Watch History happens to hold. Marking only the
+  // id this tile was rendered under would let the other one put the show
+  // straight back on the next refresh.
+  const aliases = [id];
+  if (entry && entry.canonicalTmdbId && !id.startsWith('tmdb:')) aliases.push('tmdb:' + entry.canonicalTmdbId);
+  const at = latestWatchedEpisodeForShowIds(aliases) || { seasonNum: 0, episodeNum: 0 };
+
+  const marks = getRemovedAiringNext();
+  aliases.forEach((alias) => {
+    marks[alias] = { seasonNum: at.seasonNum, episodeNum: at.episodeNum };
+  });
+  persistRemovedAiringNext();
+
+  if (list && items.length) {
+    list.items = items.filter((it) => {
+      const itemId = String((it && (it.showId || it.id)) || '');
+      return itemId && aliases.indexOf(itemId) === -1;
+    });
+    list.updatedAt = Date.now();
+    map['airing-next'] = list;
+    saveLocalCustomListsMap(map);
+  }
+
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+  if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+  if (typeof showAddedToast === 'function') {
+    const title = (entry && (entry.showTitle || entry.name)) || 'This show';
+    showAddedToast('Removed ' + title + ' from Airing Next. Watch another episode to bring it back.');
+  }
+}
+window.removeAiringNextShow = removeAiringNextShow;
+
+// Undoes a removal by hand, from the Settings panel that lists them. Takes
+// every id the show is recorded under -- one Settings row can stand for two
+// marks (see removeAiringNextShow's aliases and getRemovedAiringNextShows's
+// grouping), and clearing one of them would leave the other still hiding the
+// show. Accepts an array or a comma-separated string, because the id list
+// travels through a data- attribute on the button.
+//
+// The forced refresh is what actually puts the show back: syncAiringNextWatchState
+// only ever narrows the cached list (see its own comment), so a show that is
+// eligible again still needs its next air date fetched before it can appear.
+function restoreAiringNextShow(showIds) {
+  if (!showIds) return;
+  const ids = (Array.isArray(showIds) ? showIds : String(showIds).split(','))
+    .map((id) => String(id).trim())
+    .filter(Boolean);
+  const marks = getRemovedAiringNext();
+  const cleared = ids.filter((id) => Object.prototype.hasOwnProperty.call(marks, id));
+  if (!cleared.length) return;
+  cleared.forEach((id) => { delete marks[id]; });
+  persistRemovedAiringNext();
+  if (typeof renderRemovedAiringNextSettingsSection === 'function') renderRemovedAiringNextSettingsSection();
+  if (typeof refreshAiringNext === 'function') refreshAiringNext(true).catch(() => {});
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+}
+window.restoreAiringNextShow = restoreAiringNextShow;
+
+// The removed shows, with whatever title Watch History still knows them by,
+// for the Settings panel. Reads titles out of Watch History rather than
+// keeping a copy in the removal record: the record is synced to the account
+// and round-trips through two numbers per show, and a title cached there
+// would be the one thing in it that could go stale.
+//
+// Grouped by title, because one show can carry two marks -- the id its tile
+// was rendered under and its tmdb alias (see removeAiringNextShow). Two rows
+// for one show would be confusing, and putting back only one of them would
+// not work. An id Watch History cannot name is its own row, under the id
+// itself: unlovely, but it is the only way to reach it.
+function getRemovedAiringNextShows() {
+  const marks = getRemovedAiringNext();
+  const ids = Object.keys(marks).filter((id) => isAiringNextRemoved(id));
+  if (!ids.length) return [];
+  const titleById = new Map();
+  const posterById = new Map();
+  ((loadLocalCustomLists()['watch-history'] || {}).items || []).forEach((it) => {
+    if (!it || !it.showId) return;
+    const key = String(it.showId);
+    if (it.showTitle && !titleById.has(key)) titleById.set(key, it.showTitle);
+    if (it.showPoster && !posterById.has(key)) posterById.set(key, it.showPoster);
+  });
+  const byTitle = new Map();
+  ids.forEach((id) => {
+    const title = titleById.get(id) || id;
+    const key = title.toLowerCase();
+    const row = byTitle.get(key);
+    if (row) {
+      row.showIds.push(id);
+      if (!row.poster) row.poster = posterById.get(id) || '';
+      return;
+    }
+    byTitle.set(key, { showIds: [id], title: title, poster: posterById.get(id) || '' });
+  });
+  return [...byTitle.values()].sort((a, b) => a.title.localeCompare(b.title));
 }
 
 // Re-derives the already-computed Airing Next list's eligibility against
@@ -2883,6 +3205,11 @@ function syncAiringNextWatchState() {
   const map = loadLocalCustomLists();
   const list = map['airing-next'];
 
+  // Watch state has just moved, so this is the moment a removal can have
+  // been superseded by a newer watched episode -- drop the record before
+  // deciding who is a candidate, so the show is a candidate again in the
+  // very same pass rather than one watch event later.
+  const prunedRemovals = pruneSupersededAiringRemovals();
   const candidates = collectAiringNextCandidateShowIds();
 
   // If there are candidate shows that aren't in the cached list at all, those
@@ -2895,7 +3222,12 @@ function syncAiringNextWatchState() {
     return;
   }
 
-  if (!list || !Array.isArray(list.items) || !list.items.length) return;
+  if (!list || !Array.isArray(list.items) || !list.items.length) {
+    // Nothing to filter, but a pruned record is still a change the account
+    // has not been told about.
+    if (prunedRemovals && typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+    return;
+  }
 
   let changed = false;
   const filtered = list.items.filter((it) => {
@@ -2903,7 +3235,10 @@ function syncAiringNextWatchState() {
     if (!stillCandidate) changed = true;
     return stillCandidate;
   });
-  if (!changed) return;
+  if (!changed) {
+    if (prunedRemovals && typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: true });
+    return;
+  }
 
   list.items = filtered;
   map['airing-next'] = list;
@@ -2912,7 +3247,7 @@ function syncAiringNextWatchState() {
   // Keeps a signed-in account's live "autotrack:airing-next:..." Stremio
   // catalog in sync too, not just this browser's own dashboard preview --
   // no-ops if not signed in, same guard as scheduleTrackingSync's own.
-  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync({ intentionalRemoval: prunedRemovals });
 }
 
 // Recomputes the Airing Next list against TMDB, throttled to
@@ -2975,6 +3310,10 @@ async function refreshAiringNext(force) {
   function airingEntryFrom(showId, d) {
     if (!d || !d.nextEpisodeAirDate) return null;
     if (typeof isEpisodeAired === 'function' && isEpisodeAired(d.nextEpisodeAirDate)) return null;
+    // This shelf is the one place every upcoming show's details pass through,
+    // so it is where the per-show air times are filled in for the shelves that
+    // never see a details payload of their own (Continue Watching).
+    if (typeof rememberShowAirTime === 'function') rememberShowAirTime(d);
     const known = knownByShow.get(showId);
     const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
     const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
@@ -2999,6 +3338,10 @@ async function refreshAiringNext(force) {
       isSeasonFinale: isFinale,
       seasonFinaleAirDate: d.seasonFinaleAirDate || null,
       seasonFinaleEpisodeNumber: d.seasonFinaleEpisodeNumber || null,
+      // Stored on the entry as well as in the per-show store, so a tile
+      // restored from local storage on a cold start still knows the hour
+      // without waiting for the shelf to refresh.
+      airTime: d.nextEpisodeAirTimeLabel || (d.airTime && d.airTime.label) || null,
       isUnaired: true,
     };
   }
@@ -3334,10 +3677,7 @@ function buildAiringNextCardHtml() {
     const isUnairedEp = it.airDate ? !hasAired : !!it.isUnaired;
     let dateBadge = '';
     if (showAirDate && it.airDate && !hasAired && typeof isEpisodeAired === 'function') {
-      const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(it.airDate) : '';
-      if (badgeText) {
-        dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(it.airDate) + '">' + escapeHtml(badgeText) + '</div>';
-      }
+      dateBadge = typeof watchItemAirDateBadgeHtml === 'function' ? watchItemAirDateBadgeHtml(it) : '';
     }
     const isSeasonPremiere = (it.episodeNum === 1 || (it.episodeNum == null && it.isSeasonPremiere));
     const isFinaleUnaired = it.seasonFinaleAirDate && typeof isEpisodeAired === 'function' ? !isEpisodeAired(it.seasonFinaleAirDate) : !!it.seasonFinaleAirDate;
@@ -3360,11 +3700,15 @@ function buildAiringNextCardHtml() {
           title: (it.showTitle || '') + (it.seasonNum != null && it.episodeNum != null ? ' S' + String(it.seasonNum).padStart(2, '0') + 'E' + String(it.episodeNum).padStart(2, '0') : ''),
           subtitle: it.name || it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
         };
+    const removeBtn = it.showId
+      ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeAiringNextShow(&quot;' + escapeJsAttr(it.showId) + '&quot;, this)" title="Remove from Airing Next">&times;</button>'
+      : '';
     return '<div class="list-card-mini-poster-tile">' +
       '<div class="list-card-mini-poster-img-wrap">' +
         '<img src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.showPoster || '') : (it.showPoster || '')) + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
         dateBadge +
         bottomBadge +
+        removeBtn +
         overlays +
       '</div>' +
       '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
@@ -3414,10 +3758,19 @@ function openAiringNextDetailsPage() {
       type: 'series',
       name: label.title,
       subtitle: label.subtitle,
+      // What puts an "x" on this tile in the full-page view -- read by
+      // livePreviewPosterHtml (23_client-list-management.js). Deliberately
+      // its own field rather than removeShowId, which that function reads as
+      // "this is a Continue Watching tile" and would remove the wrong thing.
+      removeAiringShowId: it.showId,
       poster: typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.showPoster) : it.showPoster,
       isAdult: typeof isAdultOrNsfw === 'function' ? isAdultOrNsfw(it) : !!it.adult,
       isAdultPosterFiltered: typeof isAdultContentFilterEnabled === 'function' && isAdultContentFilterEnabled() && (it.isAdult || (typeof isAdultOrNsfw === 'function' && isAdultOrNsfw(it))),
       airDate: it.airDate,
+      airTime: it.airTime || '',
+      showId: it.showId,
+      seasonNum: it.seasonNum,
+      episodeNum: it.episodeNum,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,
       isSeasonFinale: it.isSeasonFinale,

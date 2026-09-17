@@ -4,6 +4,627 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ---
 
+## [Unreleased]
+
+### 📺 Channels: pairing glue, and channels that keep themselves up to date
+
+- **"Keep multi-part episodes together."** Every ordering step a channel has had until now could split a
+  two-parter: the daily rotation deals a block that ends between the halves, the shuffle scatters
+  them, the interleaver drops four other shows into the gap. The new toggle reads episode titles for
+  `Part 1` / `Pt. II` / `(2)` and glues each story back into one run -- whenever any part of it is
+  drawn, the whole story plays there, in part order. Drawing Part 2 first plays the story from Part 1
+  rather than handing you the back half of it, and a part the channel does not have is simply not
+  there while the rest still play together. Same show, same season and the same story name are all
+  required, so a remake nine seasons later and another show's episode of the same name are left
+  alone, and one story is capped at six episodes so a show whose every episode is "Chapter One" cannot
+  glue a season into one block.
+- **Pair by hand, for what a title cannot show.** A crossover event runs across two *different* shows
+  under two different names, which no title-based rule can see. Select the picks in the builder and
+  hit **Pair**: they play back to back wherever the first of them is drawn, toggle or not, because
+  you asked for it explicitly. **Unpair** undoes it, a pick can only belong to one pairing, and a
+  pairing whose other half is removed from the channel is dropped rather than saved forward -- the
+  same rule Story Lock follows.
+- **"Automatically add new episodes."** A channel has always been a snapshot: add The Last of Us today
+  and the channel still holds exactly those episodes a year later while the show moves on without it.
+  With this on, the Worker re-checks each show the channel carries and folds in whatever has aired
+  since, **at the top** or at the end as the channel says. It costs a request nothing: the check runs
+  on a background task with nobody waiting on it, the answer is cached for twelve hours (an empty
+  answer too, so a channel of finished shows stops re-checking), and it is thrown away the moment the
+  channel is edited, since an answer about the old picks would re-add an episode the channel now has
+  by hand. Only seasons at or past the highest one a channel already carries are asked about, so a
+  channel of ten-season shows costs one or two TMDB calls each -- and only episodes that have actually
+  aired are added, because a slot playing next month's announcement plays nothing at all.
+- Both flags travel with a share link and into the directory, and both appear in the channel's rule
+  line next to the ones already there.
+
+### 🩹 Channels: On Today, corrected
+
+- **A rotating channel put one show on the air instead of twenty-four.** The builder writes `0` for
+  both broadcast dials whenever the schedule panel is closed, and the engine read that 0 as a real
+  number and clamped it up to its floor of 1 — so a Quick Add network channel ran *1 show × 1
+  episode* a day. 0 now means "unset" and falls back to the network numbers (24 × 3), which is what
+  the channel's own stats line had been claiming all along. The share sanitizer writes the plan it
+  resolved back into the payload, so the same 0 was being *baked in* as a real 1 × 1 on every
+  channel that travelled through a share link or the directory; those now arrive at 24 × 3 too.
+- **There was no way back from On Today.** On a single-type channel the previous fix hid All along
+  with Movies and Shows, which left the lineup as a tab with no exit. The pills now read exactly as
+  you would expect: **All** and **On Today** on a channel of only shows or only movies, and **All**,
+  **Movies**, **Shows** and **On Today** on one with both. Coming back off On Today restores the
+  list's own subtitle, recomputed rather than remembered, and a page of items that arrives while
+  On Today is open is accumulated quietly instead of being drawn over the lineup.
+- **"On today" is now "On Today"**, to match every other pill on the page.
+
+### 🩹 Channels: four fixes
+
+- **My Channels now rearranges the way My Lists does** — a drag handle in the card's title, and
+  nothing else. The number box and up/down arrows are gone; the two lists sit one tab apart and
+  should not offer two different ways to do the same thing.
+- **"Publish one of your own" is drawn the way Explore Channels draws a channel** — artwork, title,
+  description and the same meta line. Both are built by one function now, which is what stops a
+  description appearing in one place and not the other.
+- **Deleting a published channel left it published.** Deleting removed this browser's copy only, so
+  the directory kept advertising a channel its owner had deleted — and because the local record was
+  the only thing that knew the share code, there was no longer anything to unpublish *with*.
+  Deleting now withdraws the listing as it goes, and because that is a network call that can fail,
+  the publish panel also lists **listings you still have up with no channel behind them**, each with
+  its own Unpublish. (A new `/api/channel/mine` answers that: the browser cannot, since the record
+  that knew the code is the one that was deleted.)
+- **"On Today" never appeared on a channel of only shows, or only movies.** The tab lived inside the
+  branch that draws the Movies/Shows filter, and that branch only ran for a list with *both* kinds
+  in it — so a channel qualified by accident. It now appears for any channel saved in this browser,
+  and on a single-type channel only the Movies/Shows pills are hidden, since two pills showing the
+  same list are two pills with nothing to say.
+
+### 🧰 Channels: a fixed toolbar, and a list you can arrange
+
+- **The search boxes under My Channels and Explore Channels had collapsed.** Both inputs and the
+  `<select>` beside them inherit `width: 100%`, so in a flex row the select took the whole width and
+  squeezed the input down to nothing. They now follow the same pattern the Live Preview toolbar has
+  always used — the input grows, the select is pinned to its own content with `flex: none;
+  width: auto` — and the filter box in the Channel builder is pinned the same way rather than
+  relying on a button's default width.
+- **My Channels can be rearranged**, with the three controls a catalog row has had all along: a drag
+  handle (mouse *and* touch), up/down buttons, and a position you can type. A new **My order** entry
+  joins the sort dropdown, and rearranging switches to it automatically so the list does not
+  re-sort out from under the card you just moved. Rearranging while another ordering is on screen
+  adopts *that* as the starting arrangement, so a card lands where it looked like it would.
+- **Rearranging while filtered leaves hidden channels alone.** A move permutes the visible channels
+  among the slots they already occupy and never rebuilds the whole order from a partial view — the
+  same rule the channel draft's own filtered drag follows.
+
+### 🛠️ Channels: nine things that make one easier to build, find and moderate
+
+**Editing a big channel**
+
+- **Bulk select.** A channel with 800 picks was drag-one-at-a-time, type-a-position, or Remove all.
+  **Select** turns the draft into checkboxes: tap anywhere on a card, pick out a whole show or one
+  season from a menu, then **Remove selected**, **To top** or **To bottom**. Selection is by index
+  and every move rebuilds it, because an index that survives a reorder is an index pointing at the
+  wrong pick.
+- **A filter over the draft**, matching show, episode title and the S/E people actually type
+  (`s5e12`). Bulk actions only ever act on what is on screen, so a filter cannot quietly reach a
+  pick you cannot see.
+- **A duplicate warning.** Adding a show from two different places, or splicing the same crossover
+  in twice, used to just work — and you found out later, by which point the duplicate is somewhere
+  in eight hundred rows.
+
+**Knowing what you built**
+
+- **Runtimes are stored** on each pick (from TMDB, where it has them), which is what the hours
+  count below is made of — and the groundwork for anything schedule-shaped later.
+- **A stats line**, under the draft and on each channel's card: `12 shows · 800 episodes ·
+  ~412 hours · 1989–2004 · 24 shows × 3 a day · 3 story-locked · hides watched`. The hours are
+  marked with a `~` whenever some picks predate runtimes being stored, rather than being quietly
+  wrong.
+- **"On Today"**, a new tab beside Movies and Shows on a channel's See All page: the lineup the
+  Worker would serve *right now*, numbered in playing order. You could set 24 shows × 3 episodes
+  and, until now, only find out what that produced by opening the channel in Stremio. The Worker
+  answers it through the same function the meta route uses — a second copy of the seeded shuffle on
+  the page is the kind of thing that drifts by one episode and is never noticed.
+
+**Finding and keeping channels**
+
+- **A description on the channel itself.** It used to live only on the directory listing, so
+  unpublishing a channel deleted the sentence describing it and a channel shared by link had
+  nowhere to carry one. Publishing now uses the channel's own line when none is typed.
+- **My Channels sorts and searches** — by recently updated, created, name or size, and findable by
+  name, description, or a show inside it, which is usually how people remember one. **Deleting a
+  channel can be undone** for a minute afterwards, which every catalog row could already do and the
+  one action that can discard 800 hand-picked episodes could not.
+- **Explore Channels has likes and ordering**: newest, most added, most liked, or by name. "Most
+  added" ranks by how many people actually took a channel, which is a better signal than a vote
+  because taking one costs something. Likes use the same one-identity-one-vote ledger lists use,
+  and the count is always derived from that ledger rather than incremented, so it cannot drift
+  upward on its own. Editing and re-publishing a channel keeps its votes.
+
+**Moderation**
+
+- **An operator can now moderate the channel directory.** Publishing was owner-only with no
+  operator path at all: if someone published something abusive, the only person who could take it
+  down was the person who put it there — worse than the standard published *lists* have held since
+  they existed. The admin dashboard now lists the directory (and, separately, every stored channel,
+  including ones quietly unlisted or orphaned by a lost index write), with two distinct actions:
+  **Unlist** removes the directory listing and leaves existing share links working, and **Delete**
+  removes the stored channel so every link to it stops working, taking its like ledger with it.
+
+### 🔧 Channels: fixes from the first round of use
+
+- **A Spotlight channel took episodes its subject is not in.** Tobey Maguire's single guest
+  appearance in Roseanne put *ten* Roseanne episodes into the channel, because a TV credit meant
+  "take this show's first N episodes". It now asks which episodes are actually his: a season's own
+  `credits.cast` is that season's regulars (who are in every episode of it without being listed on
+  each one), and each episode's `guest_stars` and `crew` name everyone else — so a regular
+  contributes the whole season and a one-episode guest contributes one episode. Directing credits
+  count too, so a director's spotlight is the episodes they *made*.
+- **"Add everything" now means everything** — every film, and every episode of every show, with no
+  per-show slice and no four-show cap.
+- **The whole lot is ordered together.** Films first and television after read as broken: a 1993
+  guest spot played *after* a 2022 film in what was supposed to be career order. Films and episodes
+  are now sorted as one set, so each episode sits where it belongs among the films. Best-first ranks
+  an episode by its show's rating, which keeps a show's run together.
+- **Per-show precision.** In a filmography, a show's button adds only that person's episodes; its
+  poster still opens the full season-and-episode picker.
+- **Re-sharing a channel you published was refused as someone else's.** An unlisted re-share proved
+  nothing about who was sending it, so the ownership check on the record it was overwriting turned
+  down the record's own owner. Credentials now go with a re-share as well as a publish.
+- **The share link was unreachable once the modal closed.** A channel that has been shared now
+  carries **Copy link** on its card, and a published one shows its link in the Explore Channels
+  publish panel. **Share** became **Update link** for a channel that already has one, which is what
+  it does.
+- **Dialogs no longer scroll sideways.** A share URL has no spaces to break at, so it widened the
+  modal past the screen. Long words now wrap.
+- **Explore Channels cards open.** Tapping one — or **See all** — shows every show, film and
+  episode in that channel before you decide to add it. Looking at a channel no longer files it
+  under My Channels.
+- **The generated channel poster showed no text in Nuvio** while Stremio drew it correctly. The SVG
+  named `-apple-system`/`BlinkMacSystemFont` and a quoted `'Segoe UI'`, used numeric font weights,
+  and wrapped the channel name in an `feDropShadow` filter — a rasterizer that resolves none of
+  those fonts, or drops a filtered subtree it cannot render, loses the text while drawing everything
+  else. It is now `Arial, Helvetica, sans-serif`, `font-weight="bold"`, explicit `x`/`y` on every
+  `<text>`, and the name's shadow is a second offset copy rather than a filter.
+
+### 📺 Channels: broadcast scheduling, smart rules, sharing and a directory
+
+Ten additions, all of them in the Channels tab. The three that change how an existing channel
+*could* play are opt-in and off by default, so every channel saved before this plays exactly as
+it did.
+
+**Play order and scheduling**
+
+- **Interleaved (round-robin) play order.** A new entry in the **Play order** dropdown deals one
+  episode from each show in turn, then rounds again —
+  `Simpsons S1E1 ➔ King of the Hill S1E1 ➔ Malcolm S1E1 ➔ Simpsons S1E2`. That is what a 90s
+  prime-time block actually felt like, and the opposite of playing fifty episodes of one show
+  before the next one starts. Like the other sorts it is re-applied as picks are added, and it is
+  idempotent, so the builder and the Worker cannot fight over it.
+- **Daily Broadcast Schedule, for any channel.** Quick Add's network channels have always rotated
+  24 shows × 3 episodes out of a much bigger pool; that is now a panel under the play-order
+  dropdown for any channel you build, with three dials: **shows per day**, **episodes per block**,
+  and the **time of day the lineup turns over** (UTC or your own local time, rather than always
+  midnight UTC — which is the previous evening everywhere west of Greenwich). Load a 1,000-episode
+  pool of sitcoms and it reads like a cable channel with fresh programming every morning.
+- **Story Lock.** Shuffling suits a procedural — Seinfeld, The Office, Law & Order — and ruins a
+  serialized one. Tick a show as story-locked and it always advances to its next episode in order,
+  picking up the next day where the last block left off, while every other show keeps shuffling
+  around it. The positions it occupies still move, so it stays spread through the day rather than
+  stuck in one block.
+- **Hide watched.** With Auto-track playback on, a channel can suppress episodes already in your
+  Watch History. Applied *before* the daily rotation, so an episode you have seen costs the channel
+  nothing rather than a slot in today's lineup — and once the whole pool has been seen the channel
+  comes back rather than going dark.
+
+**Channels that build themselves**
+
+- **Next Up channel.** One button under My Channels. The lineup is re-derived from your Continue
+  Watching on the server on every request, so pressing play always serves the next unwatched
+  episode across everything you have on the go, and the channel follows what you are actually
+  watching instead of freezing the day it was made. It is also **seeded** from this browser's own
+  Continue Watching when you create it: the Worker can only re-derive a lineup for an install
+  config that has proved which account it speaks for, and a config with no personal shelf in it
+  never does — so without a seed the channel came back *empty* for exactly the people most likely
+  to try it first. The seed is what it plays until the live answer arrives, and what it falls back
+  to if that proof is ever missing. **Refresh** on the channel's card pulls in whatever you have
+  started watching since.
+- **Quick Channel Wizard.** Three dropdowns in Quick Add — network or studio, era, genre or mood —
+  and a finished 24/7 channel compiled from the top shows that match. No blank canvas to fill in.
+- **Spotlight channels.** **Actors & Directors** joins Shows and Movies as a search type in the
+  builder. Tapping a result opens their whole filmography *below the search*, exactly the way
+  tapping a show opens its seasons — films and television listed separately, each film addable on
+  its own, and each show opening into the same season-and-episode picker you get from the Shows
+  tab. **Add everything as a Spotlight channel** is still one click for when the whole filmography
+  is the point. Sorted chronologically (a career unfolding) or best-first, and the order comes from
+  the server so changing it re-asks rather than re-sorting one page — which credits make the cut is
+  decided by popularity, and only their order is the sort. Directing and creating credits count,
+  not only acting ones, so a Nolan or a Miyazaki spotlight is the films they *made*.
+- **Live Cloud Sync.** Importing a Trakt/MDBList/Simkl/TMDB list used to take a one-time snapshot,
+  frozen for good. A channel can now keep the source URL instead: the Worker rebuilds its pool from
+  that list in the background, so a public list gaining a title gains it here too. The rebuild never
+  sits on the request's critical path — a request serves the stored pool and schedules the refresh.
+
+**Sharing**
+
+- **One-click share links.** **Share** on any channel copies a link that rebuilds it anywhere —
+  every pick, its play order and its broadcast schedule. A channel is thousands of episodes and a
+  link is a few hundred characters, so the link carries a short code and the channel is stored
+  behind it; opening the link hands the code over in the URL *fragment*, which never reaches a
+  server log. Re-sharing an edited channel updates the link people already have rather than minting
+  a second one beside it.
+- **Explore Channels.** A new tab listing channels other people have published — add one to your own
+  setup in a single click, then edit it however you like. Publishing needs a Creator Profile so
+  every listing has an owner who can take it down again; **Unpublish** removes the listing and
+  leaves links already handed out working. Sharing privately needs no account at all.
+
+Everything arriving from someone else's channel is rebuilt field by field before it is stored or
+rendered: art that is not an `http(s)` URL is dropped, a Story Lock for a show the shared picks do
+not contain is dropped, and Live Cloud Sync travels only with a real list URL behind it.
+
+### 🐛 Fixed: air times did not appear, and a channel pick could show yesterday's date
+
+- **Air times were missing on shows you had recently opened.** The details cache is keyed by id, type and
+  region only — nothing about the shape of what it stores — so after the air-time deploy it kept handing
+  back copies written *before* it, with no air time in them, for up to two hours. The key now carries a
+  payload-shape version that a field change moves, which retires every stale copy at once.
+- **A movie in a Channel could show the previous day's date** — a 1996 film reading `Dec 31, 1995`. The
+  date was pinned to midnight UTC, which is the previous evening everywhere west of Greenwich. It is now
+  11:00 UTC, which holds the intended date from UTC-11 to UTC+12:45. (World offsets span 26 hours, so no
+  single instant is right in all of them; this one is wrong only at UTC+13/+14.)
+
+### 🎬 Known limit, documented: a movie in a Channel may have no streams in strict add-ons
+
+- **What happens**: a movie added to a Channel plays in Nuvio and in lenient add-ons (Torrentio-style), and
+  shows no streams in strict ones (PenguPlay). A Channel's metadata is a *series*, and Stremio does not
+  work out a type per video — so tapping a movie asks every stream add-on for
+  `/stream/series/<the movie's own IMDb id>.json`, and add-ons that branch on that `type` before reading
+  the id answer with nothing.
+- **This cannot be fixed from inside the add-on.** The type comes from the parent metadata, and no id shape
+  gets around it: `tt123:1:1` points at a season 1 episode 1 that does not exist, and a bare number or a
+  private prefix matches no `idPrefixes` anywhere, so no add-on is even asked.
+- **Tried and removed**: answering that request with a link to the movie's own page. Stremio Web treats an
+  external link as *leaving* Stremio — it routes through a `stremio.com/warning` interstitial and then
+  hands the `stremio://` scheme to the operating system — so it was a dead end that looked like a working
+  option. It is gone rather than left in place looking useful.
+- **What works today**: open the movie from its own page, or use a client that resolves the id itself.
+  The two ways to fix this properly each cost something real — proxying your own stream add-on (which means
+  this add-on holding your debrid key) or splitting a Channel's movies into a separate movie row (which
+  takes them out of the Channel's play order) — so neither is done on the add-on's own initiative.
+
+### 🕒 Episode air times: `9 PM ET` under the air date
+
+- **An episode airing today or later now shows the hour it is on**, under the date on its own page and
+  under the day on its Continue Watching / Airing Next badge — `9 PM ET`, `9:30 PM ET`. An episode that
+  has already gone out shows no time: it is a thing you are waiting for.
+- **TMDB has no episode air time at all** — it dates an episode and stops, which is why every "Airs
+  Tuesday" in this add-on has been a day with no hour behind it. The time comes from
+  [TVmaze](https://www.tvmaze.com/api) instead, which needs **no API key**, so a self-hosted Worker gets
+  this with nothing to configure and nothing to pay for.
+- **The show's regular slot, plus the next episode's own** where TVmaze dates it apart from it — a
+  premiere running long, a finale moved an hour. Every other upcoming episode gets the regular slot, which
+  is what a listing prints for them anyway.
+- **Only a show with an episode still to come is ever looked up**, and the answer is cached for twelve
+  hours (a week in KV): a broadcast slot is a fact about a season, not about a day. A finished show costs
+  nothing, because nothing displays a time against an episode that has already aired.
+- **North American slots are named the way a schedule is spoken** — `ET`, `CT`, `MT`, `PT` — rather
+  than `EDT`/`EST`, which flip twice a year and read as though the time moved. Elsewhere the zone's own
+  short name is used.
+- **Nothing is invented.** A streaming show with no broadcast slot, a show TVmaze has never heard of, or
+  TVmaze being down all come out the same way: the date on its own, exactly as before. An air time is
+  never worth failing a details lookup over.
+- **Stremio rows say it too**: an Airing Next row's description now reads
+  `Next Episode: S03E06 · Airs 2026-10-04 at 9:30 PM ET`.
+
+### ✅ A show's page says how much of each season you have watched, and "watched" means what has aired
+
+- **Every season header now reads `3/8 episodes`** instead of `8 episodes` — how many of that season are in
+  your Watch History, beside how many there are. `0/8` for a season you have not started, `8/8` in the accent
+  colour once it is finished.
+- **It moves as you do.** Marking an episode from the grid, a season from its button, or the whole show
+  updates every count on the page, without reopening it.
+- **A show you are caught up on mid-season now reads as watched.** The Mark Show Watched button says **Mark
+  Show Unwatched** once every episode that has *aired* has been watched, rather than waiting for a season
+  finale that has not gone out yet. Same for the season button beside it.
+- **Why it was wrong**: "fully watched" was counted against TMDB's `episode_count`, which includes the
+  episodes still to come. Watching 5 of a 10-episode season with episode 6 a month away came out as 5/10 —
+  unwatched — so the button offered to mark episodes already seen. The exact episode list settles it, but
+  it was only loaded after a season was expanded or the show was marked watched wholesale.
+- **No extra requests**: `/api/details` already carries the show's next unaired episode
+  (`nextEpisodeSeasonNumber` / `nextEpisodeNumber` / `nextEpisodeAirDate`), which places every season around
+  it — a later season has aired nothing, the season it falls in has aired everything before that episode,
+  an earlier one is out in full. An episode list, once loaded, still wins over it.
+- **Marking the last aired episode watched now flips the show's button** where it used to sit on "Mark Show
+  Watched" until the page was reopened, and it repaints every season's button rather than only the one last
+  expanded.
+- **A show rebuilt from an episode group keeps its old behaviour.** An anime unpacked into its own seasons is
+  not numbered the way TMDB numbers it, so the show-level pointer is not applied to it.
+- **Fixed: one show's episode lists answering for another's.** The season and episode caches were keyed by
+  season and episode number, never cleared between shows, so the last show's season 1 decided what had aired
+  in this one's. They are cleared when a show's page opens, and on sign-out.
+
+### 🔀 A Channel's Play order is a menu of arrangements, and a pick you move stays moved
+
+- **Replaces the two checkboxes** added below with one **Play order** dropdown in the Channel builder:
+  *As listed (custom)*, *Air date — oldest first*, *Air date — newest first*, *Show, then season &
+  episode*, *Title A–Z*, *Shuffle now*, *Shuffle daily*. "Shuffle picks now" moves into it as an entry
+  rather than a separate button.
+- **A sort now rearranges the picks themselves**, right there in the list, instead of being a rule the
+  Worker re-applied on every request. So the order on screen is the order that plays — and **moving a pick
+  by hand simply stays**, which the "Sort by air date" checkbox could not do: it silently overrode every
+  manual move except between two picks sharing a date.
+- **A sort stays selected and is re-applied when picks are added**, so an air-date channel lands each new
+  episode in its place instead of at the bottom as the channel grows. It hooks `renderChannelDraftList`,
+  the one call every add path already ends with, so every way of adding picks is covered.
+- **Moving a pick by hand switches the dropdown back to *As listed*** and stops the re-sorting there: from
+  that point the order is the person's. Dragging and typing a position both disarm it before they re-render.
+- **"Shuffle daily" is the only entry that stays a mode**, because it is the only one no stored order can
+  express — the Worker reshuffles it from a date-based seed each day. The list order is ignored while it is
+  selected, and the hint under the dropdown says so.
+- **Air date and release date are one field, not two.** A saved pick keeps a single date: TMDB's `air_date`
+  for an episode, the release date for a movie. Both air-date sorts read it, and anything undated sorts
+  last in either direction — "newest first" is still no reason to open a channel with picks that could not
+  be placed at all.
+- **Channels already set to "Sort by air date" keep playing correctly.** The Worker still honours that flag
+  for a channel nobody has edited; opening one in the builder sorts its picks for real, selects the
+  matching entry, and saving drops the flag.
+- **A Quick Add network channel is no longer re-ordered at serve time by a sort**, which also settles the
+  odd case where air-date order interleaved a rotating channel's day across shows: the rotation decides the
+  day's lineup, and the stored order is whatever the builder arranged.
+
+### 🗓️ A Channel can play in air date order
+
+- **Asked for**: a way to sort a channel by aired date when creating or editing it, working like *Randomize
+  play order* but with only one of the two selectable.
+- **New checkbox in the Channel builder: *Sort by air date*.** The channel plays oldest first across every
+  show in it -- so a channel of Friends, Seinfeld and Frasier runs as the week they actually went out,
+  rather than one show at a time.
+- **Nothing is looked up for it.** Every pick already stores the date TMDB gave when it was added:
+  `/api/show-episodes` returns each episode's own `air_date` (a movie carries its release date, or the year
+  the builder had), the builder saves it as `released` on the item, and the ordering is decided from the
+  saved payload alone -- no extra request, on the page or in the Worker.
+- **It and *Randomize play order* are one choice.** Ticking either clears the other on the page, and
+  `saveChannel` drops the other flag on the way out, so no channel is ever saved as both. A payload old
+  enough to carry both (shuffle was the only flag that existed) resolves the same way in the Worker: the
+  explicit sort wins.
+- **Leaving both off is still a real answer** -- the picks play in the order they are listed, which is why
+  these are two checkboxes and not a radio group.
+- **A dateless pick plays last**, keeping its saved order, rather than opening the channel; two episodes
+  aired the same night keep the order they were added in, which is what puts a two-part premiere back in
+  broadcast order.
+- **A Quick Add network channel can use it too**: the daily rotation still picks *which* shows and episodes
+  play today, and the sort then decides the order they play in.
+- **"See All" agrees with it.** The channel details page reads the saved items directly rather than through
+  the Worker, so it now applies the same ordering -- it was listing air-date channels in whatever order
+  their picks happened to be stored in.
+
+### 📺 A Channel episode asks a stream add-on for the episode it actually is
+
+- **Reported**: "Non-debrid addons (like Pengu) dont pickup the fake episodes order. I.e: FRIENDS randomized
+  channel has the S01E01 at the start of the queue when in fact it's, let's say, S05E13. With Debrid addons
+  it plays correctly the S05E13, but non debrid scrapes the original S01E01."
+- **A Channel video's `id` *is* its stream request.** Stremio asks every installed stream add-on for
+  `/stream/<type>/<video.id>.json` and sends nothing else -- the `season`/`episode` on each video are the
+  channel's own running order, for display, and never reach an add-on at all. So a malformed id is not a
+  dead link anybody notices: something plays, it is just the wrong thing.
+- **`parseInt(it.season, 10) || 1` could not tell "no season" from season 0.** Both became 1, so an item
+  stored without a season or an episode was published as `<show>:1:1` -- that show's series premiere, under
+  the title of the episode we meant. Such an item is now dropped from the channel instead: a missing episode
+  is something a person can report, a wrong one looks like it worked.
+- **A show with no IMDb id was published as a bare TMDB number.** `12345:5:13` matches no `idPrefixes`
+  anywhere, so no add-on is ever asked for it. It is now the `tmdb:12345:5:13` form this add-on's own
+  manifest declares and the rest of the app already reads. An id that is neither `tt...` nor `tmdb:...`
+  (including the empty string, which used to publish as `:5:13`) is dropped.
+- **The Channel builder stores the same shapes.** `channelStreamShowId` is applied where draft items are
+  built -- picked episodes, "Add every season", Quick Add Channel and the crossover/storyline channels --
+  so the Worker's check has nothing left to catch. The episode picker now carries the show's TMDB id
+  alongside its IMDb id, which is what gives an IMDb-less show a real fallback rather than an empty one.
+- **The shuffled running order is untouched**, and a dropped item closes its gap rather than leaving a hole:
+  the queue is still 1..N. For a channel whose items all carry a real `tt` id and a real season and episode
+  -- which a Friends channel built from TMDB does -- the published id was already correct, and a stream
+  add-on that returns S01E01 for `tt0108778:5:13` is resolving it wrongly on its own side.
+
+### ⏭️ Nothing marks a future episode as watched any more
+
+- **Reported**: "if i use the Mark Show Watched the future season is marked as watched but the episode isnt
+  marked as watched and the show isnt added to continue watching."
+- **What was happening**: `markShowWatched` has always fetched only *aired* episodes -- so nothing wrong
+  went into Watch History -- but it finished by relabelling **every** `.btn-mark-season-watched` on screen
+  to "Mark Season Unwatched", including a season that has not started. The button claimed a season was
+  watched over an empty Watch History. It now relabels only the seasons it actually wrote to (the aired
+  episodes it fetched say which), and hands the rest to the shared state below.
+- **One description of that button, instead of four.** The item modal's first render,
+  `updateSeasonWatchedButton`, `markSeasonWatched`'s own result and `markShowWatched`'s bulk relabel each
+  set it their own way and disagreed about the not-yet-aired case. `seasonWatchedButtonState` is now the
+  single answer, and an upcoming season gets a disabled button saying when it airs rather than one that
+  looks pressable and does nothing.
+- **"Fully watched" now means caught up.** `isShowFullyWatched` required *every* regular season to be fully
+  watched, so one announced season made it false forever: reopening the modal contradicted the button the
+  person had just pressed. Seasons with nothing aired are excluded, matching what Mark Show Watched
+  actually marks.
+- **A caught-up show stays in Continue Watching.** Marking the last aired episode one at a time leaves the
+  show on the shelf with an "Airs …" badge for what is coming; Mark Show Watched was the one path that
+  evicted it outright. It now keeps the upcoming entry the reconciliation just computed, and only evicts
+  (and queues a storyline conclusion like Breaking Bad → El Camino) when there is genuinely nothing left
+  to air.
+- **The episode modal no longer offers a watch button on an unaired episode** — it shows when the episode
+  airs instead — and `toggleWatchStatus`, the single door every episode toggle goes through, refuses to
+  *add* one. Removing stays possible, so an entry made before this (or a stray scrobble) can still be
+  undone. Marking a show or season with nothing aired yet now says so instead of appearing to fail.
+- **Two supporting fixes**: the fetched episode list for a season is now stashed in `_seasonEpisodesMap` by
+  `markShowWatched` and `markSeasonWatched` as well as by expanding the grid, so "is this season fully
+  watched" stops guessing from `episode_count` (which counts unaired episodes); and `.lc-btn:disabled` now
+  actually looks disabled, having been visually identical to a working button.
+
+### 📺 Airing Next: take one show off the shelf without unwatching anything
+
+- **What was missing**: Airing Next lists the next upcoming episode of every show with at least one watched
+  episode, and there was no way to say "not this one". The only ways to get a show off it were to remove its
+  Watch History entries or to mark the whole show unwatched -- both of which throw away the very record the
+  person wanted to keep, and both of which change what is watched everywhere else in the app.
+- **The "x" on an Airing Next poster** (dashboard card and the full-page view) now removes just that show
+  from just that shelf. Watch History is untouched, every watched badge stays, and Continue Watching is not
+  involved at all.
+- **Watching another episode brings it back.** The removal is stored as the watched episode it was made at
+  -- the same shape `dismissContinueWatchingShow` has always used for Continue Watching -- not as a
+  permanent flag. Watching a later episode supersedes it and the show returns on its own, which is what
+  makes this a "stop reminding me" rather than a "never show me again". Rewatching an older episode does
+  not: nothing about what airs next has changed. The record is dropped once it is superseded, so the stored
+  set stays the size of what is actually removed.
+- **Applied in one place**: `collectAiringNextCandidateShowIds`, which every rebuild starts from -- the
+  6-hourly TMDB refresh, the immediate watch-state sync, the dashboard card's own eligibility check, and the
+  list pushed to the `autotrack:airing-next:series:<username>` Stremio catalog. A removal that only reached
+  the renderer would have lasted until the next refresh and no longer.
+- **Carried on the account, not just the browser.** The shelf is recomputed from Watch History by every
+  device that loads the page, so a removal that lived only where it was made would be undone by the next
+  device to rebuild and push. It now travels with the tracking record: new columns `airing_removed_season`
+  and `airing_removed_episode` on `creator_show_states` (**migration 0012**, listed in the schema manifest
+  the `/admin` panel reports on). The Worker checks for the columns before writing them and falls back to
+  the pre-0012 statement when they are absent, so a deployment that has not run the migration keeps syncing
+  everything else -- it just cannot remember removals. A push that does not mention removals at all (an
+  older browser) is treated as having no opinion rather than as saying there are none, so an ordinary
+  autosave cannot clear them.
+- **A way back by hand**: a "Removed from Airing Next" panel in Settings -> Account & Sync lists what has
+  been removed and puts one back, for the show that was removed by mistake and is not currently being
+  watched. Hidden entirely when nothing is removed.
+- **Found on the way**: `compactCustomListItem` -- which every local list save runs every item through --
+  dropped `canonicalTmdbId`, the resolved TMDB id an Airing Next entry is deduped and badge-matched by. The
+  field therefore existed only between the shelf being computed and the map being saved, so the dedupe in
+  `refreshAiringNext` and the Continue Watching badge match in `buildLocalListCardHtml` were both reading
+  something that was never there on a reload. It is kept now, which is also what lets a removal cover both
+  ids a show can be recorded under.
+
+### ⏳ "Reset Account Data" looked like nothing was happening
+
+- **What was wrong**: the reset clears this browser first and only then waits on the server -- deliberately,
+  so no autosave or scrobble can push the old lists back into the account being emptied. The cost is a
+  second or two in which the confirm dialog has already closed, every list on screen has already vanished,
+  and nothing says why. That is indistinguishable from a reset that failed, and pressing Reset again is the
+  obvious thing to try.
+- **A working dialog now covers the gap**, put up before the local clear rather than after the request, and
+  replaced by the success or failure dialog when the round trip finishes. New `showAppBusy` next to
+  `showAppAlert`/`showAppConfirm`, so the next slow action has one to use.
+- **The spinner now spins.** Two places asked for `animation: spin` and the page declared no `@keyframes
+  spin` at all, so both -- the new dialog and "Generating install link..." -- sat perfectly still. A test
+  now fails on any animation used by name and never declared.
+
+### 🔁 New on Streaming: read whole catalogues, and notice when a title leaves
+
+Two defects in the sweep shipped in the entry below, both found by running it and asking it questions.
+
+- **A fixed page horizon meant the feature could not do the thing it was built for.** The walk was capped at
+  `NEW_ON_STREAMING_WALK_DEPTH_PAGES = 40` -- and sorted by release date descending, 40 pages is the ~800
+  most recently *released* titles, one to three years. A 2010 film added to Netflix today sits far outside
+  that window, so the sweep never fetched the page it was on and the title never entered `streaming_events`
+  at all: not as an arrival, not even as a seeded row. The list could only report new *releases* arriving,
+  which is the case that needed it least, and is exactly the failure the README cites to justify the feature.
+  Depth is now **learned** from the `total_pages` every discover response already carries, so each catalogue
+  is read to its end; the only bound left is TMDB's own page-500 pagination limit. A pass grew from 640 pages
+  to ~1,000-1,500 (measured, and reported in the admin panel), and `NEW_ON_STREAMING_PAGES_PER_TICK` went
+  12 -> 40 to keep a full pass near three hours.
+- **Nothing ever marked a title as gone.** `removed_at` existed, the catalog query filtered on it, and the
+  upsert cleared it -- but no code path ever *set* it. `last_seen_walk` was written on every sweep and read
+  by nothing. So the shelf only ever accumulated: a film that left Netflix in March was still listed in
+  December. A completed pass now marks what it did not see, which is only sound because the walk above reads
+  whole catalogues.
+- **Three guards on that inference**, because a false removal costs a title vanishing and then returning as
+  an arrival that never happened: a row must be missed by `NEW_ON_STREAMING_REMOVAL_GRACE_WALKS` (2)
+  consecutive passes; a pass that could not read more than `NEW_ON_STREAMING_MAX_PASS_ERRORS` (20) pages
+  concludes nothing; and a catalogue that appears to have lost more than `NEW_ON_STREAMING_MAX_REMOVAL_SHARE`
+  (25%) of its titles at once is left alone and logged. That last guard is **per catalogue, not per table**,
+  and the distinction is the whole point: TMDB answering 200 with an empty result set for one provider is not
+  an error, and one service is an eighth of the table, so a table-wide threshold would wave "every Netflix
+  title left overnight" through as an ordinary 12%.
+- **A title that comes back is dated as a new arrival.** It is on the service today and was not yesterday,
+  which is what this shelf reports. Rows are marked, never deleted, precisely so the row is still there to
+  clear -- and a title that never left keeps every date it had.
+- **Cursor layout 3.** A fixed-depth walk let the cursor be an index into a fixed-length list; a learned-depth
+  one cannot, so the cursor is now a coordinate (`page` + `idx` over a stable provider x kind axis) plus the
+  pass's accumulated error count. A stored position from an older layout restarts the pass, keeping the walk
+  generation -- a database part-way through seeding is still seeding, and promoting it would date every title
+  it has not yet reached as an arrival that never happened.
+- **Admin panel** reports measured pass size, how many catalogues have been measured, pages per catalogue,
+  titles marked gone, this pass's error count, and why a removal was held back.
+- **Tests**: the sweep is now driven end-to-end against a stubbed TMDB, so the parts that only happen over
+  time are exercised rather than reasoned about -- a catalogue deeper than any fixed horizon collected in
+  full, a 2010 title added today picked up and dated as observed, a departure marked only after the grace
+  passes, an unreadable pass marking nothing, one provider going dark neither wiping itself nor blocking a
+  real departure on a healthy service, a returning title re-dated, and a still-present title keeping its
+  original arrival date across passes.
+
+### 🔧 Watch History, Continue Watching and Airing Next read "No items found." in Live Preview & Editor
+
+- **What was wrong**: those three rows are `autotrack:<slug>:<type>:<username>` sources, and reading one
+  server-side means reading that account's private tracking record. `/api/preview` is unauthenticated, so
+  the username inside that string is a claim until the caller proves it with a Creator Key the endpoint can
+  verify — and `mayReadTrackedShelf` answers an unproven reader with an **empty shelf** rather than an error,
+  because a catalog row has no way to show a message. Live Preview & Editor and the per-row **Test** button
+  both sent `creatorName` with no `creatorKey`, so every one of those shelves came back `ok:true` with
+  nothing in it and rendered "No items found." — for its own owner, while the same shelves showed their
+  items everywhere else on the page. Airing Next has no share flag at all (only `watchlist`,
+  `watch-history` and `continue-watching` do), so proving ownership is the **only** way to read it and it
+  could never preview under any setting.
+- **Where it came from**: SEC-001's remediation notes "`/api/preview` call sites send the signed-in
+  account's key". Two of them did not. `previewCreatorKey` (`23_client-list-management.js`) is now the one
+  place that decides, and both call sites use it.
+- **The key still travels only where it is needed**: it is attached for a url that actually names a personal
+  shelf and nothing else — the same rule `collectKeys` already applies to `trackCreatorKey`, because a
+  Creator Key is a bearer credential and a preview of a public mdblist/trakt/tmdb list has no use for one.
+  A merged row stacks its sources one per line, so any line naming a personal shelf arms it, not just the
+  first. Signed out, nothing is claimed.
+- **Tests**: `tests/client.test.mjs` drives `renderLivePreview` against the real bundle — the key is sent for
+  Continue Watching, Watch History and Airing Next rows and for a merged row whose personal source is not
+  first, and is absent from a public list preview and from a signed-out browser.
+
+### ✨ New on Streaming — a catalog of what actually arrived on a streaming service
+
+A new catalog source, `tmdb:new-on-streaming[:service1+service2]`, sorted by arrival: most recently
+added first, with a show pushed back to the top the day a new episode airs. It **ships dark** —
+`NEW_ON_STREAMING_IN_QUICK_ADD` (`00_constants.js`) is `false`, so there is no Quick Add card, no
+Discover entry and no `/lists/<slug>` page — while the catalog itself is live and installable, which is
+the point: it can be judged against real swept data before anyone else can add it.
+
+- **Why it needed building rather than querying**: nothing upstream publishes the date a title landed on
+  a service. TMDB's `with_watch_providers` answers "is this on Netflix right now" and says nothing about
+  yesterday; Trakt and Simkl do not model provider catalogs at all. The existing `tmdb:genre:stream-releases`
+  row sorts by *release* date instead, which is why it shows theatrical-era titles and completely misses an
+  old film being added to a service this morning. So the add-on observes arrivals on the cron tick and owns
+  the dates: `streaming_events` (`migrations/0011_add_streaming_events.sql`) records the first sighting of a
+  title on a service, and that is what the shelf sorts on.
+- **The sweep** (`sweepNewOnStreaming`, `07_source-fetchers-tmdb-simkl.js`) walks a slice of each provider
+  catalog per tick from a rotating cursor — 8 providers x 2 kinds x 40 pages, 12 units a tick, about five
+  hours for a full pass. Sorted by **release date, not popularity**: a popularity-sorted walk reorders itself
+  between the ticks that read its pages, so titles slide across page boundaries and arrivals are both missed
+  and invented. A page only costs its own fetch in steady state — the sweep asks D1 which of its TMDB ids it
+  already holds and resolves IMDb ids for the rest, and a title arriving on a second service costs no TMDB
+  call at all because the first service's row already carries the id.
+- **The episode half** (`bumpNewOnStreamingEpisodes`) scans two providers a tick for shows with an episode in
+  the last 10 days, keeps only the ones already on the shelf, reads `last_episode_to_air` for the exact date,
+  and re-bumps every service's row for that show — a new episode is new wherever you watch it.
+- **The first pass is seeded, and says so.** Every title is "new" the first time you look at a catalog, so
+  walk 0 dates each title by its own release date rather than pretending it just arrived; walk 1 onward
+  records real arrivals. The admin dashboard reports the split as **seeded** versus **observed**, which is
+  the one number that says whether the list is working yet.
+- **Serving it makes no outbound request at all.** Title, poster, backdrop and year are denormalised into the
+  row, so a catalog page is one indexed D1 read — the only shelf here a provider outage cannot slow down or
+  empty. Covered by a test that fails if a single `fetch` is issued while rendering it.
+- **Admin dashboard**: **Management & Tools → New on Streaming** shows sweep state (cursor, walk generation,
+  rows per service, seeded vs observed), runs a sweep on demand, and previews the catalog *through
+  `fetchNewOnStreaming` itself* rather than re-deriving the shelf — a second implementation would be the one
+  thing guaranteed to disagree with what Stremio gets. Routes: `GET /admin/api/new-on-streaming`,
+  `POST /admin/api/new-on-streaming/sweep`, `GET /admin/api/new-on-streaming/preview`.
+- **Budget, and the regression it nearly caused**: the sweep is paid for out of the episode sweep's own
+  unreachable reserve, not the pre-warm's share. `episodeBudget` is half the tick (5,000 at the default)
+  while `CRON_EPISODE_CHECK_MAX` caps actual spend at 300, so 4,700 fetches are reserved by something that
+  will never ask for them. Taking a quarter of *that* leaves `cronBudget - episodeBudget` intact — which
+  matters, because taking it from the pre-warm dropped it from 40 charts a tick to 35 and quietly broke its
+  "the whole list fits in one tick" guarantee. On a free Worker the share comes out at 0 and the sweep skips
+  itself with one log line, exactly as chart pre-warming does.
+- **Requires D1.** Unlike everything else in this add-on there is no KV fallback: these dates are observed
+  over time and cannot be refetched, so a tick that runs without the table is history not collected rather
+  than a cache miss. `D1_SCHEMA_MANIFEST` says so, so the schema check reports it.
+- **Tests**: `tests/new-on-streaming.test.mjs` — the walk query's ordering and filters, date parsing and
+  future-date clamping, selection parsing (including an unknown service degrading to "all" rather than
+  building an empty `IN ()`), unit-list stability under the cursor, and the catalog itself through the real
+  Worker against real SQLite: arrival ordering, episode re-bump ordering, per-service filtering, a title on
+  several services appearing once dated by its latest arrival, removals hidden, and zero outbound requests.
+
 ## [1.5.4] - 2026-09-14
 
 Everything below the "Earlier unreleased entries" heading predates 2026-09-03. What

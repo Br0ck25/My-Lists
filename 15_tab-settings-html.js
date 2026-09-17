@@ -18,6 +18,12 @@
     </div>
 
     <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Removed from Airing Next</h2>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Shows you've taken off the Airing Next shelf. Nothing about them changed anywhere else -- every episode you marked watched is still watched -- and watching another episode of one puts it back on the shelf by itself. Put one back here at any time.</p>
+      <div id="removedAiringNextSettingsSection"></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Region</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Used for streaming-availability catalogs (Netflix, Disney+, etc.), Stream Releases, and content ratings -- so what shows up actually matches what's available where you are.</p>
       <select id="regionSelect" aria-label="Streaming region" onchange="localStorage.setItem('myListAddon:region', this.value); saveState();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
