@@ -6,6 +6,23 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🧰 Channels: a fixed toolbar, and a list you can arrange
+
+- **The search boxes under My Channels and Explore Channels had collapsed.** Both inputs and the
+  `<select>` beside them inherit `width: 100%`, so in a flex row the select took the whole width and
+  squeezed the input down to nothing. They now follow the same pattern the Live Preview toolbar has
+  always used — the input grows, the select is pinned to its own content with `flex: none;
+  width: auto` — and the filter box in the Channel builder is pinned the same way rather than
+  relying on a button's default width.
+- **My Channels can be rearranged**, with the three controls a catalog row has had all along: a drag
+  handle (mouse *and* touch), up/down buttons, and a position you can type. A new **My order** entry
+  joins the sort dropdown, and rearranging switches to it automatically so the list does not
+  re-sort out from under the card you just moved. Rearranging while another ordering is on screen
+  adopts *that* as the starting arrangement, so a card lands where it looked like it would.
+- **Rearranging while filtered leaves hidden channels alone.** A move permutes the visible channels
+  among the slots they already occupy and never rebuilds the whole order from a partial view — the
+  same rule the channel draft's own filtered drag follows.
+
 ### 🛠️ Channels: nine things that make one easier to build, find and moderate
 
 **Editing a big channel**

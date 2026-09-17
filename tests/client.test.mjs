@@ -5806,3 +5806,135 @@ describe("client: dragging a pick while the draft is filtered", () => {
     );
   });
 });
+
+// --- arranging My Channels by hand ---------------------------------------
+//
+// The move operations read the cards ON SCREEN, so these stub the container
+// the way a render would leave it: one .list-card per visible channel, in
+// the order they are shown.
+describe("client: rearranging the channels list", () => {
+  const chan = (id, name, over = {}) => ({
+    channelId: id, name,
+    items: [{ kind: "episode", imdbId: "tt1", season: 1, episode: 1, showName: "Rugrats" }],
+    ...over,
+  });
+
+  function withChannels(channels, shownIds) {
+    const client = loadClient({ routes: {} });
+    channels.forEach((ch) => client.call("saveLocalChannel", ch));
+    const box = client.document.getElementById("myCreatedChannelsList");
+    const ids = shownIds || channels.map((c) => c.channelId);
+    box.querySelectorAll = (sel) =>
+      sel.startsWith(".list-card") ? ids.map((id) => ({ getAttribute: () => id })) : [];
+    return client;
+  }
+
+  const orderOf = (client) => {
+    const map = client.call("loadLocalChannels");
+    return client
+      .call("sortMyChannels", Object.values(map), "manual")
+      .map((c) => c.channelId);
+  };
+
+  it("moves a channel down and writes the new arrangement", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo"), chan("c", "Charlie")], ["a", "b", "c"]);
+    client.call("moveMyChannel", "a", 1);
+    assert.deepEqual(plain(orderOf(client)), ["b", "a", "c"]);
+  });
+
+  it("moves a channel up", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo"), chan("c", "Charlie")], ["a", "b", "c"]);
+    client.call("moveMyChannel", "c", -1);
+    assert.deepEqual(plain(orderOf(client)), ["a", "c", "b"]);
+  });
+
+  it("will not move the first one up or the last one down", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
+    client.call("moveMyChannel", "a", -1);
+    client.call("moveMyChannel", "b", 1);
+    assert.deepEqual(plain(orderOf(client)), ["a", "b"]);
+  });
+
+  it("switches the ordering to the hand-made one, so the list does not re-sort out from under it", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
+    client.call("setMyChannelsSort", "name");
+    client.call("moveMyChannel", "b", -1);
+    assert.equal(client.get("myChannelsSort"), "manual");
+    assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
+  });
+
+  it("adopts the arrangement that was on screen rather than one nobody was looking at", () => {
+    // Shown by name: Alpha, Bravo, Charlie. Stored order is the reverse.
+    const client = withChannels(
+      [chan("c", "Charlie", { order: 1 }), chan("b", "Bravo", { order: 2 }), chan("a", "Alpha", { order: 3 })],
+      ["a", "b", "c"]
+    );
+    client.call("setMyChannelsSort", "name");
+    client.call("moveMyChannel", "a", 1);
+    assert.deepEqual(plain(orderOf(client)), ["b", "a", "c"],
+      "the drop landed where it looked like it would, not into the old stored order");
+  });
+
+  it("takes a typed position", () => {
+    const client = withChannels(
+      [chan("a", "Alpha"), chan("b", "Bravo"), chan("c", "Charlie"), chan("d", "Delta")],
+      ["a", "b", "c", "d"]
+    );
+    const card = { getAttribute: () => "d" };
+    client.call("moveMyChannelTo", { value: "1", closest: () => card });
+    assert.deepEqual(plain(orderOf(client)), ["d", "a", "b", "c"]);
+  });
+
+  it("clamps a typed position instead of losing the channel", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
+    const card = { getAttribute: () => "a" };
+    client.call("moveMyChannelTo", { value: "99", closest: () => card });
+    assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
+    assert.equal(Object.keys(client.call("loadLocalChannels")).length, 2);
+  });
+
+  it("ignores a position that is not a number", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
+    const card = { getAttribute: () => "a" };
+    client.call("moveMyChannelTo", { value: "", closest: () => card });
+    assert.equal(Object.keys(client.call("loadLocalChannels")).length, 2);
+  });
+
+  // The filtered case, which is where rebuilding an order from a partial
+  // view would quietly reshuffle everything the filter was hiding.
+  it("leaves channels the filter hides exactly where they were", () => {
+    const client = withChannels(
+      [chan("a", "Alpha", { order: 1 }), chan("b", "Bravo", { order: 2 }),
+       chan("c", "Charlie", { order: 3 }), chan("d", "Delta", { order: 4 })],
+      ["b", "d"]
+    );
+    client.set("myChannelsSort", "manual");
+    // Only Bravo and Delta are on screen; swapping them must not disturb
+    // Alpha at slot 1 or Charlie at slot 3.
+    client.call("applyMyChannelOrder", ["d", "b"]);
+    assert.deepEqual(plain(orderOf(client)), ["a", "d", "c", "b"]);
+  });
+
+  it("puts a channel with no arrangement yet at the end, not in the middle", () => {
+    const client = withChannels(
+      [chan("a", "Alpha", { order: 1 }), chan("b", "Bravo", { order: 2 }), chan("fresh", "Fresh")],
+      ["a", "b", "fresh"]
+    );
+    assert.deepEqual(plain(orderOf(client)), ["a", "b", "fresh"]);
+  });
+
+  it("keeps a channel's place when it is edited and saved again", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
+    client.call("moveMyChannel", "b", -1);
+    assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
+    client.call("saveLocalChannel", chan("b", "Bravo renamed"));
+    assert.deepEqual(plain(orderOf(client)), ["b", "a"], "editing is not a reason to lose your arrangement");
+  });
+
+  it("survives the whole map being rewritten, which is where a dropped field shows up", () => {
+    const client = withChannels([chan("a", "Alpha"), chan("b", "Bravo")], ["a", "b"]);
+    client.call("moveMyChannel", "b", -1);
+    client.call("saveLocalChannelsMap", client.call("loadLocalChannels"));
+    assert.deepEqual(plain(orderOf(client)), ["b", "a"]);
+  });
+});

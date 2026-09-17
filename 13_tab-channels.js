@@ -44,13 +44,14 @@
       </div>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
       <div id="channelNextUpStatus" style="margin-bottom:8px;"></div>
-      <div class="row" id="myChannelsToolbar" style="gap:8px; margin-bottom:10px;">
-        <input type="text" id="myChannelsSearchInput" placeholder="Search your channels..." oninput="setMyChannelsSearch(this.value)" style="flex:1; font-size:0.85rem;">
-        <select id="myChannelsSortSelect" onchange="setMyChannelsSort(this.value)" style="font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+      <div class="row" id="myChannelsToolbar" style="margin-bottom:10px; gap:8px;">
+        <input type="text" id="myChannelsSearchInput" aria-label="Search your channels" placeholder="Search your channels..." oninput="setMyChannelsSearch(this.value)">
+        <select id="myChannelsSortSelect" aria-label="Order your channels" onchange="setMyChannelsSort(this.value)" style="flex:none; width:auto;">
           <option value="recent">Recently updated</option>
           <option value="created">Recently created</option>
           <option value="name">Name (A&ndash;Z)</option>
           <option value="size">Most episodes</option>
+          <option value="manual">My order (drag to arrange)</option>
         </select>
       </div>
       <div id="myChannelsUndoBar" style="display:none; margin-bottom:10px;"></div>
@@ -210,8 +211,8 @@
         24/7 channels built and published by other people &mdash; &ldquo;Saturday Morning 90s&rdquo;, &ldquo;80s VHS Sci-Fi Vault&rdquo;, whatever anyone has put together. Add one to your own setup in a single click, then edit it however you like.
       </p>
       <div class="row" style="margin-bottom:10px; gap:8px;">
-        <input type="text" id="channelDirectorySearchInput" placeholder="Filter by name, description or creator..." oninput="renderChannelDirectory()" style="flex:1;">
-        <select id="channelDirectorySortSelect" onchange="setChannelDirectorySort(this.value)" style="font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+        <input type="text" id="channelDirectorySearchInput" aria-label="Filter published channels" placeholder="Filter by name, description or creator..." oninput="renderChannelDirectory()">
+        <select id="channelDirectorySortSelect" aria-label="Order published channels" onchange="setChannelDirectorySort(this.value)" style="flex:none; width:auto;">
           <option value="newest">Newest</option>
           <option value="added">Most added</option>
           <option value="liked">Most liked</option>
@@ -287,9 +288,9 @@
 
       <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel: <span id="channelDraftCountBadge" style="color:var(--muted); font-weight:500;"></span></p>
       <div id="channelDraftStats" style="margin:0 0 8px; color:var(--muted); font-size:0.78rem;"></div>
-      <div class="row" style="gap:8px; margin-bottom:8px;">
-        <input type="text" id="channelDraftFilterInput" placeholder="Filter these picks by show or episode name..." oninput="setChannelDraftFilter(this.value)" style="flex:1; font-size:0.85rem;">
-        <button type="button" class="secondary lc-btn" id="channelDraftSelectModeBtn" style="white-space:nowrap;" onclick="toggleChannelDraftSelectMode()">Select</button>
+      <div class="row" style="margin-bottom:8px; gap:8px;">
+        <input type="text" id="channelDraftFilterInput" aria-label="Filter these picks" placeholder="Filter these picks by show or episode name..." oninput="setChannelDraftFilter(this.value)">
+        <button type="button" class="secondary lc-btn" id="channelDraftSelectModeBtn" style="flex:none; width:auto; white-space:nowrap;" onclick="toggleChannelDraftSelectMode()">Select</button>
       </div>
       <div id="channelDraftBulkBar" style="display:none; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:8px; padding:8px; border:1px solid var(--border); border-radius:8px; background:var(--surface);">
         <span id="channelDraftSelectionCount" style="font-size:0.8rem; font-weight:600;">0 selected</span>

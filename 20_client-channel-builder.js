@@ -583,6 +583,7 @@ function saveLocalChannelsMap(map) {
       sortByAired: !!ch.sortByAired,
       ...channelBroadcastFields(ch),
       ...channelShareFields(ch),
+      order: Number(ch.order) || 0,
       createdAt: ch.createdAt || Date.now(),
       updatedAt: ch.updatedAt || Date.now(),
     };
@@ -678,6 +679,7 @@ function ensureAllChannelsSyncedFromRows(map) {
                   sortByAired: !!payload.sortByAired,
                   ...channelBroadcastFields(payload),
                   ...channelShareFields(payload),
+                  order: Number(payload.order) || 0,
                   createdAt: Date.now(),
                   updatedAt: Date.now(),
                 };
@@ -712,6 +714,9 @@ function saveLocalChannel(payload) {
     sortByAired: !!payload.sortByAired,
     ...channelBroadcastFields(payload),
     ...channelShareFields(payload),
+    // Kept from the existing record when a save does not carry one, so
+    // editing a channel never knocks it out of the order someone arranged.
+    order: Number(payload.order) || (existing ? Number(existing.order) : 0) || 0,
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now,
   };
@@ -777,14 +782,27 @@ function setMyChannelsSearch(value) {
   renderMyCreatedChannelsList();
 }
 
-function sortMyChannels(channels) {
+function sortMyChannels(channels, mode) {
+  const how = mode || myChannelsSort;
   const list = channels.slice();
-  if (myChannelsSort === 'name') {
+  if (how === 'name') {
     list.sort((a, b) => String(a.name || '').toLowerCase().localeCompare(String(b.name || '').toLowerCase()));
-  } else if (myChannelsSort === 'size') {
+  } else if (how === 'size') {
     list.sort((a, b) => ((b.items || []).length - (a.items || []).length));
-  } else if (myChannelsSort === 'created') {
+  } else if (how === 'created') {
     list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  } else if (how === 'manual') {
+    // A channel with no order yet sorts after every channel that has one,
+    // by how recently it was touched -- so a newly added channel lands at
+    // the end of an arrangement rather than somewhere in the middle of it.
+    list.sort((a, b) => {
+      const oa = Number(a.order) || 0;
+      const ob = Number(b.order) || 0;
+      if (oa && ob) return oa - ob;
+      if (oa) return -1;
+      if (ob) return 1;
+      return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
+    });
   } else {
     list.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
   }
@@ -850,6 +868,205 @@ function undoChannelDelete() {
   renderMyCreatedChannelsList();
   renderChannelMergeList();
   showAddedToast('Restored channel "' + (channel.name || 'Channel') + '".');
+}
+
+
+// --- arranging My Channels by hand ---------------------------------------
+//
+// The same three ways My Lists lets a catalog row be moved -- a drag handle,
+// up/down buttons, and a position you can type -- because past a dozen
+// channels "recently updated" is not an order anyone chose.
+//
+// All three work on the list AS SHOWN. A filter or another ordering means
+// the cards on screen are a subset in a different sequence, so a move
+// permutes the visible channels among the slots they already occupy in the
+// stored arrangement and leaves every hidden channel exactly where it is --
+// the same rule the channel draft's own filtered drag follows, and for the
+// same reason: rebuilding an order from a partial view loses whatever the
+// view was hiding.
+function visibleMyChannelIds() {
+  const box = document.getElementById('myCreatedChannelsList');
+  if (!box) return [];
+  return [...box.querySelectorAll('.list-card[data-channel-id]')]
+    .map((card) => card.getAttribute('data-channel-id'))
+    .filter(Boolean);
+}
+
+// Rearranging while another ordering is on screen adopts THAT as the
+// starting arrangement, so the card lands where it was dropped rather than
+// somewhere in a stored order nobody was looking at.
+function seedMyChannelsManualOrder() {
+  const map = loadLocalChannels();
+  const displayed = sortMyChannels(Object.values(map));
+  let changed = false;
+  displayed.forEach((ch, i) => {
+    if (!ch || !map[ch.channelId]) return;
+    if (Number(map[ch.channelId].order) !== i + 1) {
+      map[ch.channelId].order = i + 1;
+      changed = true;
+    }
+  });
+  if (changed) saveLocalChannelsMap(map);
+}
+
+function applyMyChannelOrder(visibleIdsInNewOrder) {
+  const map = loadLocalChannels();
+  const all = sortMyChannels(Object.values(map), 'manual');
+  const wanted = {};
+  visibleIdsInNewOrder.forEach((id) => { wanted[id] = true; });
+  // The positions the visible channels hold in the full arrangement. The
+  // hidden ones keep theirs untouched.
+  const slots = [];
+  all.forEach((ch, i) => { if (ch && wanted[ch.channelId]) slots.push(i); });
+  const next = all.slice();
+  visibleIdsInNewOrder.forEach((id, n) => {
+    if (n < slots.length && map[id]) next[slots[n]] = map[id];
+  });
+  next.forEach((ch, i) => {
+    if (ch && map[ch.channelId]) map[ch.channelId].order = i + 1;
+  });
+  saveLocalChannelsMap(map);
+  // Arranging by hand IS choosing the hand-made order, so the dropdown
+  // follows rather than leaving the list to re-sort out from under it.
+  myChannelsSort = 'manual';
+  try { localStorage.setItem('myListAddon:myChannelsSort', 'manual'); } catch (e) {}
+  renderMyCreatedChannelsList();
+}
+
+function beginMyChannelReorder() {
+  if (myChannelsSort !== 'manual') seedMyChannelsManualOrder();
+}
+
+function moveMyChannel(channelId, dir) {
+  beginMyChannelReorder();
+  const visible = visibleMyChannelIds();
+  const from = visible.indexOf(channelId);
+  if (from === -1) return;
+  const to = from + dir;
+  if (to < 0 || to >= visible.length) return;
+  visible.splice(from, 1);
+  visible.splice(to, 0, channelId);
+  applyMyChannelOrder(visible);
+}
+
+function moveMyChannelTo(input) {
+  const card = input.closest('.list-card[data-channel-id]');
+  if (!card) return;
+  const channelId = card.getAttribute('data-channel-id');
+  const visible = visibleMyChannelIds();
+  const from = visible.indexOf(channelId);
+  const typed = parseInt(input.value, 10);
+  if (from === -1 || !Number.isInteger(typed)) {
+    renderMyCreatedChannelsList();
+    return;
+  }
+  const to = Math.min(Math.max(typed, 1), visible.length) - 1;
+  if (to === from) {
+    renderMyCreatedChannelsList();
+    return;
+  }
+  beginMyChannelReorder();
+  visible.splice(from, 1);
+  visible.splice(to, 0, channelId);
+  applyMyChannelOrder(visible);
+}
+
+// Drag-to-reorder. Mouse goes through HTML5 drag-and-drop and touch/pen
+// through Pointer Events, which is the same split My Lists uses and for the
+// same reason: native drag-and-drop generally does not fire on touch at all.
+let myChannelDragCard = null;
+let myChannelTouchCard = null;
+let myChannelsDragBound = false;
+
+function myChannelDragAfterElement(container, y) {
+  const cards = [...container.querySelectorAll('.list-card[data-channel-id]:not(.dragging)')];
+  return cards.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
+    return closest;
+  }, { offset: -Infinity, element: null }).element;
+}
+
+function moveMyChannelDragCard(container, card, clientY) {
+  const afterEl = myChannelDragAfterElement(container, clientY);
+  if (afterEl == null) container.appendChild(card);
+  else if (afterEl !== card) container.insertBefore(card, afterEl);
+}
+
+// Bound once on the container rather than per card, because the card list is
+// re-rendered wholesale on every change and per-card listeners would be
+// re-attached (and leak) each time.
+function initMyChannelsDrag() {
+  const container = document.getElementById('myCreatedChannelsList');
+  if (!container || myChannelsDragBound) return;
+  myChannelsDragBound = true;
+
+  container.addEventListener('dragstart', (e) => {
+    const handle = e.target.closest('.channel-drag-handle');
+    if (!handle) { e.preventDefault(); return; }
+    myChannelDragCard = handle.closest('.list-card[data-channel-id]');
+    if (!myChannelDragCard) return;
+    myChannelDragCard.classList.add('dragging');
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+  });
+
+  container.addEventListener('dragover', (e) => {
+    if (!myChannelDragCard) return;
+    e.preventDefault();
+    moveMyChannelDragCard(container, myChannelDragCard, e.clientY);
+  });
+
+  container.addEventListener('dragend', () => {
+    if (!myChannelDragCard) return;
+    myChannelDragCard.classList.remove('dragging');
+    myChannelDragCard = null;
+    beginMyChannelReorder();
+    applyMyChannelOrder(visibleMyChannelIds());
+  });
+
+  const onTouchMove = (e) => {
+    if (!myChannelTouchCard) return;
+    moveMyChannelDragCard(container, myChannelTouchCard, e.clientY);
+  };
+  const onTouchEnd = () => {
+    document.removeEventListener('pointermove', onTouchMove);
+    if (!myChannelTouchCard) return;
+    myChannelTouchCard.classList.remove('dragging');
+    myChannelTouchCard = null;
+    beginMyChannelReorder();
+    applyMyChannelOrder(visibleMyChannelIds());
+  };
+
+  container.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
+    const handle = e.target.closest('.channel-drag-handle');
+    if (!handle) return;
+    e.preventDefault();
+    myChannelTouchCard = handle.closest('.list-card[data-channel-id]');
+    if (!myChannelTouchCard) return;
+    myChannelTouchCard.classList.add('dragging');
+    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+    document.addEventListener('pointermove', onTouchMove);
+    document.addEventListener('pointerup', onTouchEnd, { once: true });
+    document.addEventListener('pointercancel', onTouchEnd, { once: true });
+  });
+}
+
+// The row of controls at the top of each channel card.
+function myChannelOrderRowHtml(channelId, index, total) {
+  return '<div class="channel-order-row">' +
+    '<input type="number" class="channel-order-pos" min="1" max="' + total + '" value="' + (index + 1) + '"' +
+      ' title="Type a position to move this channel there" aria-label="Position in your channels"' +
+      ' onchange="moveMyChannelTo(this)">' +
+    '<span class="channel-drag-handle" draggable="true" title="Drag to rearrange" aria-hidden="true">&#9776;</span>' +
+    '<button type="button" class="channel-order-btn" title="Move up" aria-label="Move up"' +
+      (index === 0 ? ' disabled' : '') +
+      ' onclick="moveMyChannel(&quot;' + escapeJsAttr(channelId) + '&quot;, -1)">&#8593;</button>' +
+    '<button type="button" class="channel-order-btn" title="Move down" aria-label="Move down"' +
+      (index === total - 1 ? ' disabled' : '') +
+      ' onclick="moveMyChannel(&quot;' + escapeJsAttr(channelId) + '&quot;, 1)">&#8595;</button>' +
+    '</div>';
 }
 
 function deleteLocalChannel(channelId, fallbackName) {
@@ -9855,7 +10072,7 @@ function renderMyCreatedChannelsList() {
     return;
   }
 
-  box.innerHTML = shown.map((ch) => {
+  box.innerHTML = shown.map((ch, orderIndex) => {
     const isAdded = [...document.querySelectorAll('#lists .entry .url')].some((u) => u.value.includes(ch.channelId));
     const allItems = ch.items || [];
     const totalEpisodes = allItems.length;
@@ -9975,6 +10192,7 @@ function renderMyCreatedChannelsList() {
     '</button>';
 
     return '<div class="list-card" style="margin-bottom:12px;" data-channel-id="' + escapeAttr(ch.channelId) + '">' +
+      myChannelOrderRowHtml(ch.channelId, orderIndex, shown.length) +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
           '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' + escapeHtml(ch.name) + '</div>' +
@@ -10000,6 +10218,7 @@ function renderMyCreatedChannelsList() {
       (posterThumbs ? '<div class="list-card-posters poster-preview-static">' + posterThumbs + '</div>' : '') +
     '</div>';
   }).join('');
+  initMyChannelsDrag();
 }
 
 function cancelEditChannel() {
