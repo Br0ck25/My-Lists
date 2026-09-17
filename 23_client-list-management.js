@@ -1650,7 +1650,7 @@ function renderWatchHistoryGrid() {
 window.renderWatchHistoryGrid = renderWatchHistoryGrid;
 
 
-// --- "On today": what this channel is actually running --------------------
+// --- "On Today": what this channel is actually running --------------------
 //
 // A rotating channel stores a pool much bigger than a day, and until now the
 // only way to see which shows and episodes today's lineup had drawn from it
@@ -1674,6 +1674,11 @@ async function renderChannelLineupTab(params) {
     return;
   }
   gridEl.innerHTML = '';
+  // The lineup rewrites the page subtitle with today's numbers, so hold on to
+  // the list's own subtitle -- All has to put it back.
+  if (subEl && typeof window._listDetailsSubtitleBeforeLineup !== 'string') {
+    window._listDetailsSubtitleBeforeLineup = subEl.textContent || '';
+  }
   if (statusEl) statusEl.innerHTML = '<small>Working out what is on&hellip;</small>';
   try {
     const res = await fetch(ORIGIN + '/api/channel-lineup', {
@@ -1746,12 +1751,26 @@ window.switchListDetailsType = function(newType) {
   if (sBtn) sBtn.classList.toggle('active', newType === 'series');
   if (lBtn) lBtn.classList.toggle('active', newType === 'lineup');
 
-  // "On today" is not a filter over what is loaded -- it is a different
+  // "On Today" is not a filter over what is loaded -- it is a different
   // question, answered by the Worker: out of this channel's whole pool,
   // which picks is it actually running right now? See renderChannelLineupTab.
   if (newType === 'lineup') {
     if (typeof renderChannelLineupTab === 'function') renderChannelLineupTab(p);
     return;
+  }
+
+  // Coming back off On Today: restore the subtitle it borrowed, so All reads
+  // as the list again rather than keeping today's running-order line.
+  if (typeof window._listDetailsSubtitleBeforeLineup === 'string') {
+    if (typeof window._listDetailsSubtitleRefresh === 'function') {
+      window._listDetailsSubtitleRefresh();
+    } else {
+      const subEl = document.getElementById('detailSubtitle');
+      if (subEl) subEl.textContent = window._listDetailsSubtitleBeforeLineup;
+    }
+    const statusEl = document.getElementById('detailStatus');
+    if (statusEl) statusEl.innerHTML = '';
+    window._listDetailsSubtitleBeforeLineup = null;
   }
 
   // If this is a dual-type chart (separate endpoint for movies vs series)
@@ -2390,6 +2409,10 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   window._currentListDetailsParams = { name, type, listUrl };
   window._currentListDetailsFilter = (isDualTypeChart && !isContinueWatching) ? type : 'all';
   window._currentListDetailsAllItems = [];
+  // A fresh list page: whatever subtitle On Today had stashed belongs to the
+  // list we just left.
+  window._listDetailsSubtitleBeforeLineup = null;
+  window._listDetailsSubtitleRefresh = null;
   const filterBar = document.getElementById('detailFilterBar');
   const isExternalHistory = !!(
     (listUrl && (listUrl === 'trakt:history' || listUrl.startsWith('trakt:history') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/history')))) ||
@@ -2460,10 +2483,14 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         }
         const isExternalProvider = isExternalHistory || (listUrl && (listUrl.includes('trakt:watchlist') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/watchlist')) || listUrl.includes('mdblist:watchlist')));
         if (canShowLineup && !channelHasBothTypes) {
-          // One kind of thing in this channel, so All/Movies/Shows would be
-          // three pills that all show the same list. "On today" is the only
-          // one with anything to say.
-          if (aBtn) aBtn.style.display = 'none';
+          // One kind of thing in this channel, so Movies and Shows would be
+          // two pills showing the same list. All stays: it is the whole
+          // channel, and the way back from On Today.
+          const curFilter = window._currentListDetailsFilter || 'all';
+          if (aBtn) {
+            aBtn.style.display = '';
+            aBtn.classList.toggle('active', curFilter !== 'lineup');
+          }
           if (mBtn) mBtn.style.display = 'none';
           if (sBtn) sBtn.style.display = 'none';
         } else if (isDualTypeChart && !isExternalProvider) {
@@ -2778,32 +2805,45 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     // why: this is the path a large Custom List, Watchlist, or paginated
     // chart takes as the user scrolls, and it used to tear down and
     // rebuild every already-rendered poster on every page that arrived.
-    appendPosterGridItems(gridEl, newlyMatching);
+    // On Today owns the grid, the status line and the subtitle while it is
+    // the open tab, so a page that lands behind it is only accumulated --
+    // All re-renders from the accumulated items the moment it is clicked.
+    if (window._currentListDetailsFilter !== 'lineup') appendPosterGridItems(gridEl, newlyMatching);
     loadedCount = window._currentListDetailsAllItems.length;
     return newCount;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
+    const onLineup = window._currentListDetailsFilter === 'lineup';
     if (!maybeMore || itemsThisPage === 0 || pagesLoaded >= MAX_PAGES) {
       done = true;
-      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
-    } else {
+      if (!onLineup) statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
+    } else if (!onLineup) {
       statusEl.innerHTML = '<small>Scroll for more\u2026</small>';
     }
     // Set before the subtitle is written, not after: the subtitle says "100+"
     // rather than "100" precisely when this is true.
     moreToLoad = !done;
-    subEl.textContent = formatSubtitle(loadedCount);
+    if (!onLineup) subEl.textContent = formatSubtitle(loadedCount);
   }
+  // How All puts the list's own subtitle back after On Today borrowed it --
+  // recomputed rather than restored from a string, so a count that grew while
+  // On Today was open is still right.
+  window._listDetailsSubtitleRefresh = function() {
+    subEl.textContent = formatSubtitle(loadedCount);
+  };
 
   async function loadNextPage() {
     if (loading || done) return;
+    // Same reason as in appendItems: while On Today is the open tab the status
+    // line is its, so a page loading behind it says nothing.
+    const quiet = window._currentListDetailsFilter === 'lineup';
     if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
       done = true;
-      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
+      if (!quiet) statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
       return;
     }
     loading = true;
-    statusEl.innerHTML = '<small>Loading\u2026</small>';
+    if (!quiet) statusEl.innerHTML = '<small>Loading\u2026</small>';
     try {
       const body = { url: listUrl, type: type, skip: skip, sample: 100 };
       if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;

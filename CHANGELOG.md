@@ -6,6 +6,23 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🩹 Channels: On Today, corrected
+
+- **A rotating channel put one show on the air instead of twenty-four.** The builder writes `0` for
+  both broadcast dials whenever the schedule panel is closed, and the engine read that 0 as a real
+  number and clamped it up to its floor of 1 — so a Quick Add network channel ran *1 show × 1
+  episode* a day. 0 now means "unset" and falls back to the network numbers (24 × 3), which is what
+  the channel's own stats line had been claiming all along. The share sanitizer writes the plan it
+  resolved back into the payload, so the same 0 was being *baked in* as a real 1 × 1 on every
+  channel that travelled through a share link or the directory; those now arrive at 24 × 3 too.
+- **There was no way back from On Today.** On a single-type channel the previous fix hid All along
+  with Movies and Shows, which left the lineup as a tab with no exit. The pills now read exactly as
+  you would expect: **All** and **On Today** on a channel of only shows or only movies, and **All**,
+  **Movies**, **Shows** and **On Today** on one with both. Coming back off On Today restores the
+  list's own subtitle, recomputed rather than remembered, and a page of items that arrives while
+  On Today is open is accumulated quietly instead of being drawn over the lineup.
+- **"On today" is now "On Today"**, to match every other pill on the page.
+
 ### 🩹 Channels: four fixes
 
 - **My Channels now rearranges the way My Lists does** — a drag handle in the card's title, and
@@ -21,11 +38,11 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
   the publish panel also lists **listings you still have up with no channel behind them**, each with
   its own Unpublish. (A new `/api/channel/mine` answers that: the browser cannot, since the record
   that knew the code is the one that was deleted.)
-- **"On today" never appeared on a channel of only shows, or only movies.** The tab lived inside the
+- **"On Today" never appeared on a channel of only shows, or only movies.** The tab lived inside the
   branch that draws the Movies/Shows filter, and that branch only ran for a list with *both* kinds
   in it — so a channel qualified by accident. It now appears for any channel saved in this browser,
-  and on a single-type channel the All/Movies/Shows pills are hidden, since three pills showing the
-  same list are three pills with nothing to say.
+  and on a single-type channel only the Movies/Shows pills are hidden, since two pills showing the
+  same list are two pills with nothing to say.
 
 ### 🧰 Channels: a fixed toolbar, and a list you can arrange
 
@@ -68,7 +85,7 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
   ~412 hours · 1989–2004 · 24 shows × 3 a day · 3 story-locked · hides watched`. The hours are
   marked with a `~` whenever some picks predate runtimes being stored, rather than being quietly
   wrong.
-- **"On today"**, a new tab beside Movies and Shows on a channel's See All page: the lineup the
+- **"On Today"**, a new tab beside Movies and Shows on a channel's See All page: the lineup the
   Worker would serve *right now*, numbered in playing order. You could set 24 shows × 3 episodes
   and, until now, only find out what that produced by opening the channel in Stremio. The Worker
   answers it through the same function the meta route uses — a second copy of the seeded shuffle on

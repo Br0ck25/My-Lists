@@ -11038,6 +11038,17 @@ describe("worker: channel video ids are real stream requests", () => {
     assert.equal(meta.videos.length, 24 * 3, "x CHANNEL_ROTATION_EPISODES_PER_SHOW");
   });
 
+  it("reads a stored 0 as unset rather than as one show, one episode", async () => {
+    // The builder writes 0 for both counts whenever the schedule panel is
+    // closed, so a Quick Add network channel arrives as dailyRotate with
+    // zeroed dials. That used to clamp up to the floor of 1 and put a single
+    // episode on the air.
+    const meta = await channelMeta(poolOf(30, 5), { dailyRotate: true, rotateShows: 0, rotateEpisodes: 0 });
+    const shows = new Set(Array.from(meta.videos, (v) => v.id.split(":")[0]));
+    assert.equal(shows.size, 24);
+    assert.equal(meta.videos.length, 24 * 3);
+  });
+
   it("clamps dials a hand-edited payload pushes past what a day can hold", async () => {
     const meta = await channelMeta(poolOf(80, 40), { dailyRotate: true, rotateShows: 9999, rotateEpisodes: 9999 });
     const shows = new Set(Array.from(meta.videos, (v) => v.id.split(":")[0]));
@@ -11933,6 +11944,16 @@ describe("worker: the channel lineup endpoint", () => {
     assert.equal(res.body.plan.shows, 48, "clamped, and the page is told the clamped number");
     assert.equal(res.body.plan.episodes, 12);
     assert.equal(res.body.poolSize, 60);
+  });
+
+  it("tells the page the network numbers when the stored dials are zeroed", async () => {
+    const env = makeEnv();
+    const items = [];
+    for (let show = 1; show <= 60; show++) items.push(ep({ imdbId: "tt" + show, season: 1, episode: 1 }));
+    const res = await lineup(env, { items, dailyRotate: true, rotateShows: 0, rotateEpisodes: 0 });
+    assert.equal(res.body.plan.shows, 24);
+    assert.equal(res.body.plan.episodes, 3);
+    assert.equal(res.body.items.length, 24, "one episode each -- the pool has no more");
   });
 
   it("says which rules it could not apply rather than showing a lineup that differs", async () => {

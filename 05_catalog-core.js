@@ -2093,9 +2093,19 @@ function channelRotationPlan(payload) {
     if (!Number.isInteger(n)) return fallback;
     return Math.min(hi, Math.max(lo, n));
   };
+  // A saved channel stores 0 for a dial it never set -- the builder writes 0
+  // for both counts whenever the schedule panel is closed, and an older
+  // payload has no dials at all. 0 means "use the network numbers", not "run
+  // one show a day", so it falls through to the fallback instead of being
+  // clamped up to the floor of 1.
+  const count = (raw, hi, fallback) => {
+    const n = typeof raw === "number" ? raw : parseInt(raw, 10);
+    if (!Number.isInteger(n) || n <= 0) return fallback;
+    return Math.min(hi, n);
+  };
   return {
-    shows: dial(payload.rotateShows, 1, CHANNEL_ROTATION_MAX_SHOWS_PER_DAY, CHANNEL_ROTATION_SHOWS_PER_DAY),
-    episodes: dial(payload.rotateEpisodes, 1, CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW, CHANNEL_ROTATION_EPISODES_PER_SHOW),
+    shows: count(payload.rotateShows, CHANNEL_ROTATION_MAX_SHOWS_PER_DAY, CHANNEL_ROTATION_SHOWS_PER_DAY),
+    episodes: count(payload.rotateEpisodes, CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW, CHANNEL_ROTATION_EPISODES_PER_SHOW),
     // Minutes past midnight UTC at which today's lineup becomes tomorrow's.
     // 0 is midnight UTC, which is what every rotating channel did before
     // this existed; a viewer in UTC-5 stores 300 so the channel turns over
