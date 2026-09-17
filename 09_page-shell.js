@@ -1258,6 +1258,81 @@ ${seoHeadHtml}
     gap: 8px;
     margin-top: 8px;
   }
+  /* --- Channel broadcast schedule, Story Lock & the Quick Channel wizard -- */
+  .channel-rule-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    user-select: none;
+    line-height: 1.35;
+  }
+  .channel-rule-row input[type="checkbox"] {
+    margin: 2px 0 0;
+    flex: 0 0 auto;
+  }
+  .channel-dial {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .channel-dial input,
+  .channel-dial select {
+    width: auto;
+    min-width: 76px;
+    font-size: 0.82rem;
+    padding: 5px 8px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  /* Rearranging My Channels. The handle itself is .drag-handle-list, the
+     same one a list card uses; this is only what marks the card in flight. */
+  .list-card.dragging {
+    opacity: 0.55;
+    outline: 2px dashed var(--accent);
+    outline-offset: 2px;
+  }
+  .channel-pick-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 8px;
+  }
+  .channel-pick-selected img {
+    opacity: 0.72;
+  }
+  .channel-storylock-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 6px 12px;
+    margin-top: 6px;
+  }
+  .channel-wizard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .channel-wizard-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .channel-wizard-grid select {
+    font-size: 0.85rem;
+    padding: 6px 10px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
   @media (min-width: 641px) {
     .channel-season-grid {
       grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
@@ -3557,6 +3632,7 @@ ${seoHeadHtml}
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeMovieBtn" onclick="switchListDetailsType('movie')">Movies</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeSeriesBtn" onclick="switchListDetailsType('series')">Shows</button>
+        <button type="button" class="subnav-pill generic-type-pill" id="detailTypeLineupBtn" onclick="switchListDetailsType('lineup')" style="display:none;">On Today</button>
         <button type="button" class="subnav-pill" id="cwClearHistoryBtn" onclick="clearContinueWatchingAll()" style="display:none; color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear All</button>
       </div>
       <div id="whSortControls" style="display:flex; align-items:center; gap:8px;">

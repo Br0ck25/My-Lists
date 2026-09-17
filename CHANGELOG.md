@@ -6,6 +6,258 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 📺 Channels: pairing glue, and channels that keep themselves up to date
+
+- **"Keep multi-part episodes together."** Every ordering step a channel has had until now could split a
+  two-parter: the daily rotation deals a block that ends between the halves, the shuffle scatters
+  them, the interleaver drops four other shows into the gap. The new toggle reads episode titles for
+  `Part 1` / `Pt. II` / `(2)` and glues each story back into one run -- whenever any part of it is
+  drawn, the whole story plays there, in part order. Drawing Part 2 first plays the story from Part 1
+  rather than handing you the back half of it, and a part the channel does not have is simply not
+  there while the rest still play together. Same show, same season and the same story name are all
+  required, so a remake nine seasons later and another show's episode of the same name are left
+  alone, and one story is capped at six episodes so a show whose every episode is "Chapter One" cannot
+  glue a season into one block.
+- **Pair by hand, for what a title cannot show.** A crossover event runs across two *different* shows
+  under two different names, which no title-based rule can see. Select the picks in the builder and
+  hit **Pair**: they play back to back wherever the first of them is drawn, toggle or not, because
+  you asked for it explicitly. **Unpair** undoes it, a pick can only belong to one pairing, and a
+  pairing whose other half is removed from the channel is dropped rather than saved forward -- the
+  same rule Story Lock follows.
+- **"Automatically add new episodes."** A channel has always been a snapshot: add The Last of Us today
+  and the channel still holds exactly those episodes a year later while the show moves on without it.
+  With this on, the Worker re-checks each show the channel carries and folds in whatever has aired
+  since, **at the top** or at the end as the channel says. It costs a request nothing: the check runs
+  on a background task with nobody waiting on it, the answer is cached for twelve hours (an empty
+  answer too, so a channel of finished shows stops re-checking), and it is thrown away the moment the
+  channel is edited, since an answer about the old picks would re-add an episode the channel now has
+  by hand. Only seasons at or past the highest one a channel already carries are asked about, so a
+  channel of ten-season shows costs one or two TMDB calls each -- and only episodes that have actually
+  aired are added, because a slot playing next month's announcement plays nothing at all.
+- Both flags travel with a share link and into the directory, and both appear in the channel's rule
+  line next to the ones already there.
+
+### 🩹 Channels: On Today, corrected
+
+- **A rotating channel put one show on the air instead of twenty-four.** The builder writes `0` for
+  both broadcast dials whenever the schedule panel is closed, and the engine read that 0 as a real
+  number and clamped it up to its floor of 1 — so a Quick Add network channel ran *1 show × 1
+  episode* a day. 0 now means "unset" and falls back to the network numbers (24 × 3), which is what
+  the channel's own stats line had been claiming all along. The share sanitizer writes the plan it
+  resolved back into the payload, so the same 0 was being *baked in* as a real 1 × 1 on every
+  channel that travelled through a share link or the directory; those now arrive at 24 × 3 too.
+- **There was no way back from On Today.** On a single-type channel the previous fix hid All along
+  with Movies and Shows, which left the lineup as a tab with no exit. The pills now read exactly as
+  you would expect: **All** and **On Today** on a channel of only shows or only movies, and **All**,
+  **Movies**, **Shows** and **On Today** on one with both. Coming back off On Today restores the
+  list's own subtitle, recomputed rather than remembered, and a page of items that arrives while
+  On Today is open is accumulated quietly instead of being drawn over the lineup.
+- **"On today" is now "On Today"**, to match every other pill on the page.
+
+### 🩹 Channels: four fixes
+
+- **My Channels now rearranges the way My Lists does** — a drag handle in the card's title, and
+  nothing else. The number box and up/down arrows are gone; the two lists sit one tab apart and
+  should not offer two different ways to do the same thing.
+- **"Publish one of your own" is drawn the way Explore Channels draws a channel** — artwork, title,
+  description and the same meta line. Both are built by one function now, which is what stops a
+  description appearing in one place and not the other.
+- **Deleting a published channel left it published.** Deleting removed this browser's copy only, so
+  the directory kept advertising a channel its owner had deleted — and because the local record was
+  the only thing that knew the share code, there was no longer anything to unpublish *with*.
+  Deleting now withdraws the listing as it goes, and because that is a network call that can fail,
+  the publish panel also lists **listings you still have up with no channel behind them**, each with
+  its own Unpublish. (A new `/api/channel/mine` answers that: the browser cannot, since the record
+  that knew the code is the one that was deleted.)
+- **"On Today" never appeared on a channel of only shows, or only movies.** The tab lived inside the
+  branch that draws the Movies/Shows filter, and that branch only ran for a list with *both* kinds
+  in it — so a channel qualified by accident. It now appears for any channel saved in this browser,
+  and on a single-type channel only the Movies/Shows pills are hidden, since two pills showing the
+  same list are two pills with nothing to say.
+
+### 🧰 Channels: a fixed toolbar, and a list you can arrange
+
+- **The search boxes under My Channels and Explore Channels had collapsed.** Both inputs and the
+  `<select>` beside them inherit `width: 100%`, so in a flex row the select took the whole width and
+  squeezed the input down to nothing. They now follow the same pattern the Live Preview toolbar has
+  always used — the input grows, the select is pinned to its own content with `flex: none;
+  width: auto` — and the filter box in the Channel builder is pinned the same way rather than
+  relying on a button's default width.
+- **My Channels can be rearranged**, with the three controls a catalog row has had all along: a drag
+  handle (mouse *and* touch), up/down buttons, and a position you can type. A new **My order** entry
+  joins the sort dropdown, and rearranging switches to it automatically so the list does not
+  re-sort out from under the card you just moved. Rearranging while another ordering is on screen
+  adopts *that* as the starting arrangement, so a card lands where it looked like it would.
+- **Rearranging while filtered leaves hidden channels alone.** A move permutes the visible channels
+  among the slots they already occupy and never rebuilds the whole order from a partial view — the
+  same rule the channel draft's own filtered drag follows.
+
+### 🛠️ Channels: nine things that make one easier to build, find and moderate
+
+**Editing a big channel**
+
+- **Bulk select.** A channel with 800 picks was drag-one-at-a-time, type-a-position, or Remove all.
+  **Select** turns the draft into checkboxes: tap anywhere on a card, pick out a whole show or one
+  season from a menu, then **Remove selected**, **To top** or **To bottom**. Selection is by index
+  and every move rebuilds it, because an index that survives a reorder is an index pointing at the
+  wrong pick.
+- **A filter over the draft**, matching show, episode title and the S/E people actually type
+  (`s5e12`). Bulk actions only ever act on what is on screen, so a filter cannot quietly reach a
+  pick you cannot see.
+- **A duplicate warning.** Adding a show from two different places, or splicing the same crossover
+  in twice, used to just work — and you found out later, by which point the duplicate is somewhere
+  in eight hundred rows.
+
+**Knowing what you built**
+
+- **Runtimes are stored** on each pick (from TMDB, where it has them), which is what the hours
+  count below is made of — and the groundwork for anything schedule-shaped later.
+- **A stats line**, under the draft and on each channel's card: `12 shows · 800 episodes ·
+  ~412 hours · 1989–2004 · 24 shows × 3 a day · 3 story-locked · hides watched`. The hours are
+  marked with a `~` whenever some picks predate runtimes being stored, rather than being quietly
+  wrong.
+- **"On Today"**, a new tab beside Movies and Shows on a channel's See All page: the lineup the
+  Worker would serve *right now*, numbered in playing order. You could set 24 shows × 3 episodes
+  and, until now, only find out what that produced by opening the channel in Stremio. The Worker
+  answers it through the same function the meta route uses — a second copy of the seeded shuffle on
+  the page is the kind of thing that drifts by one episode and is never noticed.
+
+**Finding and keeping channels**
+
+- **A description on the channel itself.** It used to live only on the directory listing, so
+  unpublishing a channel deleted the sentence describing it and a channel shared by link had
+  nowhere to carry one. Publishing now uses the channel's own line when none is typed.
+- **My Channels sorts and searches** — by recently updated, created, name or size, and findable by
+  name, description, or a show inside it, which is usually how people remember one. **Deleting a
+  channel can be undone** for a minute afterwards, which every catalog row could already do and the
+  one action that can discard 800 hand-picked episodes could not.
+- **Explore Channels has likes and ordering**: newest, most added, most liked, or by name. "Most
+  added" ranks by how many people actually took a channel, which is a better signal than a vote
+  because taking one costs something. Likes use the same one-identity-one-vote ledger lists use,
+  and the count is always derived from that ledger rather than incremented, so it cannot drift
+  upward on its own. Editing and re-publishing a channel keeps its votes.
+
+**Moderation**
+
+- **An operator can now moderate the channel directory.** Publishing was owner-only with no
+  operator path at all: if someone published something abusive, the only person who could take it
+  down was the person who put it there — worse than the standard published *lists* have held since
+  they existed. The admin dashboard now lists the directory (and, separately, every stored channel,
+  including ones quietly unlisted or orphaned by a lost index write), with two distinct actions:
+  **Unlist** removes the directory listing and leaves existing share links working, and **Delete**
+  removes the stored channel so every link to it stops working, taking its like ledger with it.
+
+### 🔧 Channels: fixes from the first round of use
+
+- **A Spotlight channel took episodes its subject is not in.** Tobey Maguire's single guest
+  appearance in Roseanne put *ten* Roseanne episodes into the channel, because a TV credit meant
+  "take this show's first N episodes". It now asks which episodes are actually his: a season's own
+  `credits.cast` is that season's regulars (who are in every episode of it without being listed on
+  each one), and each episode's `guest_stars` and `crew` name everyone else — so a regular
+  contributes the whole season and a one-episode guest contributes one episode. Directing credits
+  count too, so a director's spotlight is the episodes they *made*.
+- **"Add everything" now means everything** — every film, and every episode of every show, with no
+  per-show slice and no four-show cap.
+- **The whole lot is ordered together.** Films first and television after read as broken: a 1993
+  guest spot played *after* a 2022 film in what was supposed to be career order. Films and episodes
+  are now sorted as one set, so each episode sits where it belongs among the films. Best-first ranks
+  an episode by its show's rating, which keeps a show's run together.
+- **Per-show precision.** In a filmography, a show's button adds only that person's episodes; its
+  poster still opens the full season-and-episode picker.
+- **Re-sharing a channel you published was refused as someone else's.** An unlisted re-share proved
+  nothing about who was sending it, so the ownership check on the record it was overwriting turned
+  down the record's own owner. Credentials now go with a re-share as well as a publish.
+- **The share link was unreachable once the modal closed.** A channel that has been shared now
+  carries **Copy link** on its card, and a published one shows its link in the Explore Channels
+  publish panel. **Share** became **Update link** for a channel that already has one, which is what
+  it does.
+- **Dialogs no longer scroll sideways.** A share URL has no spaces to break at, so it widened the
+  modal past the screen. Long words now wrap.
+- **Explore Channels cards open.** Tapping one — or **See all** — shows every show, film and
+  episode in that channel before you decide to add it. Looking at a channel no longer files it
+  under My Channels.
+- **The generated channel poster showed no text in Nuvio** while Stremio drew it correctly. The SVG
+  named `-apple-system`/`BlinkMacSystemFont` and a quoted `'Segoe UI'`, used numeric font weights,
+  and wrapped the channel name in an `feDropShadow` filter — a rasterizer that resolves none of
+  those fonts, or drops a filtered subtree it cannot render, loses the text while drawing everything
+  else. It is now `Arial, Helvetica, sans-serif`, `font-weight="bold"`, explicit `x`/`y` on every
+  `<text>`, and the name's shadow is a second offset copy rather than a filter.
+
+### 📺 Channels: broadcast scheduling, smart rules, sharing and a directory
+
+Ten additions, all of them in the Channels tab. The three that change how an existing channel
+*could* play are opt-in and off by default, so every channel saved before this plays exactly as
+it did.
+
+**Play order and scheduling**
+
+- **Interleaved (round-robin) play order.** A new entry in the **Play order** dropdown deals one
+  episode from each show in turn, then rounds again —
+  `Simpsons S1E1 ➔ King of the Hill S1E1 ➔ Malcolm S1E1 ➔ Simpsons S1E2`. That is what a 90s
+  prime-time block actually felt like, and the opposite of playing fifty episodes of one show
+  before the next one starts. Like the other sorts it is re-applied as picks are added, and it is
+  idempotent, so the builder and the Worker cannot fight over it.
+- **Daily Broadcast Schedule, for any channel.** Quick Add's network channels have always rotated
+  24 shows × 3 episodes out of a much bigger pool; that is now a panel under the play-order
+  dropdown for any channel you build, with three dials: **shows per day**, **episodes per block**,
+  and the **time of day the lineup turns over** (UTC or your own local time, rather than always
+  midnight UTC — which is the previous evening everywhere west of Greenwich). Load a 1,000-episode
+  pool of sitcoms and it reads like a cable channel with fresh programming every morning.
+- **Story Lock.** Shuffling suits a procedural — Seinfeld, The Office, Law & Order — and ruins a
+  serialized one. Tick a show as story-locked and it always advances to its next episode in order,
+  picking up the next day where the last block left off, while every other show keeps shuffling
+  around it. The positions it occupies still move, so it stays spread through the day rather than
+  stuck in one block.
+- **Hide watched.** With Auto-track playback on, a channel can suppress episodes already in your
+  Watch History. Applied *before* the daily rotation, so an episode you have seen costs the channel
+  nothing rather than a slot in today's lineup — and once the whole pool has been seen the channel
+  comes back rather than going dark.
+
+**Channels that build themselves**
+
+- **Next Up channel.** One button under My Channels. The lineup is re-derived from your Continue
+  Watching on the server on every request, so pressing play always serves the next unwatched
+  episode across everything you have on the go, and the channel follows what you are actually
+  watching instead of freezing the day it was made. It is also **seeded** from this browser's own
+  Continue Watching when you create it: the Worker can only re-derive a lineup for an install
+  config that has proved which account it speaks for, and a config with no personal shelf in it
+  never does — so without a seed the channel came back *empty* for exactly the people most likely
+  to try it first. The seed is what it plays until the live answer arrives, and what it falls back
+  to if that proof is ever missing. **Refresh** on the channel's card pulls in whatever you have
+  started watching since.
+- **Quick Channel Wizard.** Three dropdowns in Quick Add — network or studio, era, genre or mood —
+  and a finished 24/7 channel compiled from the top shows that match. No blank canvas to fill in.
+- **Spotlight channels.** **Actors & Directors** joins Shows and Movies as a search type in the
+  builder. Tapping a result opens their whole filmography *below the search*, exactly the way
+  tapping a show opens its seasons — films and television listed separately, each film addable on
+  its own, and each show opening into the same season-and-episode picker you get from the Shows
+  tab. **Add everything as a Spotlight channel** is still one click for when the whole filmography
+  is the point. Sorted chronologically (a career unfolding) or best-first, and the order comes from
+  the server so changing it re-asks rather than re-sorting one page — which credits make the cut is
+  decided by popularity, and only their order is the sort. Directing and creating credits count,
+  not only acting ones, so a Nolan or a Miyazaki spotlight is the films they *made*.
+- **Live Cloud Sync.** Importing a Trakt/MDBList/Simkl/TMDB list used to take a one-time snapshot,
+  frozen for good. A channel can now keep the source URL instead: the Worker rebuilds its pool from
+  that list in the background, so a public list gaining a title gains it here too. The rebuild never
+  sits on the request's critical path — a request serves the stored pool and schedules the refresh.
+
+**Sharing**
+
+- **One-click share links.** **Share** on any channel copies a link that rebuilds it anywhere —
+  every pick, its play order and its broadcast schedule. A channel is thousands of episodes and a
+  link is a few hundred characters, so the link carries a short code and the channel is stored
+  behind it; opening the link hands the code over in the URL *fragment*, which never reaches a
+  server log. Re-sharing an edited channel updates the link people already have rather than minting
+  a second one beside it.
+- **Explore Channels.** A new tab listing channels other people have published — add one to your own
+  setup in a single click, then edit it however you like. Publishing needs a Creator Profile so
+  every listing has an owner who can take it down again; **Unpublish** removes the listing and
+  leaves links already handed out working. Sharing privately needs no account at all.
+
+Everything arriving from someone else's channel is rebuilt field by field before it is stored or
+rendered: art that is not an `http(s)` URL is dropped, a Story Lock for a show the shared picks do
+not contain is dropped, and Live Cloud Sync travels only with a real list URL behind it.
+
 ### 🐛 Fixed: air times did not appear, and a channel pick could show yesterday's date
 
 - **Air times were missing on shows you had recently opened.** The details cache is keyed by id, type and

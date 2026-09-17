@@ -83,6 +83,30 @@ const CURATED_RECOMMENDATION_LIMIT = 40;
 // trade one bug for a worse, invisible one.
 const PUBLISHED_LIST_ITEMS_MAX = 10000;
 const PUBLISHED_LIST_NAME_MAX = 200;
+
+// --- shared channels ----------------------------------------------------
+//
+// A shared channel is stored whole under one KV key, so it needs a ceiling
+// that KV itself does not give it in any useful form: 25MB is the hard
+// limit, but a 25MB record is also a 25MB read on every import and every
+// directory card built from it. 4MB is roughly a 5,000-episode channel with
+// full artwork -- the largest thing this add-on can actually build -- and
+// is rejected rather than truncated, for the reason PUBLISHED_LIST_ITEMS_MAX
+// already spells out: quietly storing a shortened channel is a worse bug
+// than refusing an oversized one.
+const SHARED_CHANNEL_BYTES_MAX = 4000000;
+// How many channels the Explore Channels directory holds. One KV key, read
+// on every visit to the tab, so this is a page-weight budget as much as a
+// storage one; the oldest listing falls off when a new one arrives.
+const PUBLIC_CHANNEL_INDEX_MAX = 500;
+
+// A Spotlight channel reads one show a season at a time to find the episodes
+// its subject is actually in (see /api/person-show-episodes). These bound
+// what one show can cost and contribute: a soap with 40 seasons would
+// otherwise be 40 TMDB calls, and a series regular on a 300-episode run
+// would drown every other credit in the channel.
+const PERSON_SHOW_MAX_SEASONS = 20;
+const PERSON_SHOW_MAX_EPISODES = 400;
 const SAVED_CONFIG_ENTRIES_MAX = 500;
 const SAVED_CONFIG_BYTES_MAX = 10 * 1024 * 1024;        // 10 MB of serialized JSON
 
@@ -4026,6 +4050,9 @@ function ledgerKeyToListId(ledgerKey) {
   if (ledgerKey.startsWith("extlikevoters:")) {
     return "ext:" + ledgerKey.slice("extlikevoters:".length);
   }
+  if (ledgerKey.startsWith("channellikevoters:")) {
+    return "ch:" + ledgerKey.slice("channellikevoters:".length);
+  }
   return ledgerKey;
 }
 
@@ -4039,6 +4066,9 @@ function listIdToLedgerKey(listId) {
   }
   if (listId.startsWith("ext:")) {
     return "extlikevoters:" + listId.slice(4);
+  }
+  if (listId.startsWith("ch:")) {
+    return "channellikevoters:" + listId.slice(3);
   }
   return "listlikevoters:" + listId;
 }
@@ -6901,6 +6931,106 @@ async function readCreatorUserListsD1(env, username) {
     return null;
   }
 }
+
+// --- the Explore Channels directory index -------------------------------
+//
+// One KV key holding the whole directory, newest listing first. A prefix
+// scan over channelshare: would also work, but the tab reads this on every
+// visit and a scan plus one GET per entry is dozens of round trips to draw
+// one page of cards -- so each listing's one-line summary is denormalized
+// into this index and the full channel stays one code lookup away.
+//
+// Read-modify-write on a single key, with no compare-and-swap available in
+// KV: two people publishing in the same instant can cost one of the two
+// listings. That is the same trade index:publiclists makes, and it is
+// tolerable for the same reason -- the channel itself is stored under its
+// own key and is never at risk, only its row in this directory, and
+// re-publishing puts the row back.
+const PUBLIC_CHANNEL_INDEX_KEY = "index:publicchannels";
+
+async function readPublicChannelIndex(env) {
+  if (!env || !env.CONFIGS) return [];
+  try {
+    const raw = await env.CONFIGS.get(PUBLIC_CHANNEL_INDEX_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.entries) ? parsed.entries : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writePublicChannelIndex(env, entries) {
+  if (!env || !env.CONFIGS) return;
+  await env.CONFIGS.put(
+    PUBLIC_CHANNEL_INDEX_KEY,
+    JSON.stringify({ entries: entries.slice(0, PUBLIC_CHANNEL_INDEX_MAX), updatedAt: Date.now() })
+  );
+}
+
+async function upsertPublicChannelIndex(env, code, record) {
+  const entries = await readPublicChannelIndex(env);
+  const previous = entries.find((e) => e && e.code === code);
+  const summary = sharedChannelSummary(code, record);
+  // Likes and adds are counted against the listing, not the channel, and
+  // re-publishing an edited channel must not reset them -- so they are
+  // carried across rather than rebuilt from the record.
+  if (previous) {
+    summary.likes = Number(previous.likes) || summary.likes || 0;
+    summary.adds = Number(previous.adds) || summary.adds || 0;
+    summary.publishedAt = previous.publishedAt || summary.publishedAt;
+  }
+  const without = entries.filter((e) => e && e.code !== code);
+  // Newest first, and an update moves a listing back to the front -- a
+  // channel someone has just reworked is the one worth showing.
+  await writePublicChannelIndex(env, [summary, ...without]);
+}
+
+// Writes one field onto one listing, leaving the rest of the index alone.
+//
+// Read-modify-write on a single key with no compare-and-swap, same as every
+// other write here -- so this touches as little as it can and never rebuilds
+// a row from the channel record, which a concurrent publish may have moved on
+// from. A listing that has since been withdrawn is simply not updated.
+async function updatePublicChannelIndexEntry(env, code, patch) {
+  const entries = await readPublicChannelIndex(env);
+  let found = false;
+  const next = entries.map((e) => {
+    if (!e || e.code !== code) return e;
+    found = true;
+    return Object.assign({}, e, patch);
+  });
+  if (!found) return false;
+  await writePublicChannelIndex(env, next);
+  return true;
+}
+
+async function removePublicChannelIndex(env, code) {
+  const entries = await readPublicChannelIndex(env);
+  const without = entries.filter((e) => e && e.code !== code);
+  if (without.length === entries.length) return;
+  await writePublicChannelIndex(env, without);
+}
+
+
+// How the Explore Channels directory is ordered.
+//
+// The index is stored newest-first and is small enough to sort on read, so
+// the ordering is a read-time choice rather than several stored orders that
+// could disagree. "added" ranks by how many people actually took a channel,
+// which is a better signal than a like: taking one costs something.
+function sortPublicChannelIndex(entries, sort) {
+  const list = entries.slice();
+  if (sort === "liked") {
+    list.sort((a, b) => (Number(b.likes) || 0) - (Number(a.likes) || 0) || (Number(b.adds) || 0) - (Number(a.adds) || 0));
+  } else if (sort === "added") {
+    list.sort((a, b) => (Number(b.adds) || 0) - (Number(a.adds) || 0) || (Number(b.likes) || 0) - (Number(a.likes) || 0));
+  } else if (sort === "name") {
+    list.sort((a, b) => String(a.name || "").toLowerCase().localeCompare(String(b.name || "").toLowerCase()));
+  }
+  // "newest" is the order the index is already kept in, so it sorts nothing.
+  return list;
+}
 // --- Admin stats (page views, install links generated) -----------------
 //
 // Deliberately simple counters -- KV has no atomic increment (each bump is
@@ -9279,6 +9409,23 @@ async function renderAdminDashboard(env) {
       <button type="button" class="admin-select" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.35);" id="deleteAnonBtn" onclick="runDeletePublishedLists()">Delete these lists</button>
       <span id="deleteAnonStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
     </div>
+
+    <div class="admin-card" style="margin-top:12px;">
+      <h3 style="margin:0 0 6px; font-size:0.95rem;">Published channels</h3>
+      <p style="margin:0 0 10px; color:#8E8E93; font-size:0.82rem;">
+        The Explore Channels directory. Publishing a channel is owner-only, so without this panel
+        a channel could only be withdrawn by whoever put it there.
+        <strong>Unlist</strong> removes it from the directory and leaves existing share links working &mdash;
+        the same thing its owner&rsquo;s own Unpublish does. <strong>Delete</strong> removes the stored channel,
+        so every link to it stops working.
+      </p>
+      <div class="row" style="margin-bottom:8px;">
+        <button type="button" class="admin-select" style="cursor:pointer; margin-right:6px;" id="browseChannelsBtn" onclick="loadPublishedChannels('listed')">Browse the directory</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="browseChannelsAllBtn" onclick="loadPublishedChannels('all')">Browse every stored channel</button>
+        <span id="publishedChannelStatus" style="color:#8E8E93; font-size:0.85rem; margin-left:6px;"></span>
+      </div>
+      <div id="publishedChannelResults"></div>
+    </div>
   </div>
 
   <!-- A form, not a link: logging out is a state change, and /admin/logout
@@ -9980,6 +10127,103 @@ async function renderAdminDashboard(env) {
       btn.disabled = false;
       moreBtn.disabled = false;
     }
+
+    // --- published channels ---------------------------------------------
+    //
+    // Two scopes. "listed" is the directory itself -- one cheap read of the
+    // index, and what the public actually sees. "all" walks the
+    // channelshare: keyspace, which also holds channels that were published,
+    // reported and then quietly unlisted, and any row a lost index write
+    // orphaned. An operator needs both.
+    async function loadPublishedChannels(scope) {
+      const status = document.getElementById('publishedChannelStatus');
+      const results = document.getElementById('publishedChannelResults');
+      const btn = document.getElementById(scope === 'all' ? 'browseChannelsAllBtn' : 'browseChannelsBtn');
+      if (btn) btn.disabled = true;
+      status.textContent = 'Loading\u2026';
+      try {
+        const res = await fetch('/admin/api/published-channels?scope=' + encodeURIComponent(scope) + '&limit=100');
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          if (btn) btn.disabled = false;
+          return;
+        }
+        const channels = data.channels || [];
+        if (!channels.length) {
+          results.innerHTML = '<p style="color:#8E8E93; margin:0; font-size:0.82rem;">Nothing to show.</p>';
+          status.textContent = '';
+          if (btn) btn.disabled = false;
+          return;
+        }
+        const rows = channels.map(function (C) {
+          const code = escapeHtmlAdmin(C.code);
+          return '<tr data-channel-row="' + code + '">' +
+            '<td style="padding:4px 8px 4px 0;"><code>' + code + '</code></td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(C.name || '') + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + escapeHtmlAdmin(C.owner || '\u2014') + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(C.itemCount) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0; text-align:right;">' + (Number(C.likes) || 0) + '</td>' +
+            '<td style="padding:4px 8px 4px 0;">' + (C.listed ? 'listed' : 'unlisted') + '</td>' +
+            '<td style="padding:4px 8px 4px 0;"><a href="' + escapeHtmlAdmin(C.url || '') + '" target="_blank" rel="noopener">open</a></td>' +
+            '<td style="padding:4px 0; white-space:nowrap;">' +
+              '<button type="button" class="admin-select" data-channel-action="unlist" data-code="' + code + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem; margin-right:4px;">Unlist</button>' +
+              '<button type="button" class="admin-select" data-channel-action="delete" data-code="' + code + '" style="cursor:pointer; padding:2px 8px; font-size:0.78rem; color:#FF3B30; border-color:rgba(255,59,48,0.35);">Delete</button>' +
+            '</td>' +
+            '</tr>';
+        }).join('');
+        results.innerHTML = '<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+          '<thead><tr style="color:#8E8E93; text-align:left;">' +
+          '<th style="padding-right:8px;">Code</th><th style="padding-right:8px;">Name</th>' +
+          '<th style="padding-right:8px;">Owner</th>' +
+          '<th style="padding-right:8px; text-align:right;">Items</th>' +
+          '<th style="padding-right:8px; text-align:right;">Likes</th>' +
+          '<th style="padding-right:8px;">State</th><th></th><th></th>' +
+          '</tr></thead><tbody>' + rows + '</tbody></table>';
+        status.textContent = channels.length + ' channel' + (channels.length === 1 ? '' : 's') + ' shown' +
+          (data.done ? '. That is all of them.' : ', more available.');
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+      }
+      if (btn) btn.disabled = false;
+    }
+
+    // Both actions confirm by name before they run. Delete says plainly that
+    // it breaks every link, because that is the part an operator reaching
+    // for "take this down" may not have meant.
+    document.getElementById('publishedChannelResults').addEventListener('click', async function (ev) {
+      const btn = ev.target.closest('[data-channel-action]');
+      if (!btn) return;
+      const action = btn.getAttribute('data-channel-action');
+      const code = btn.getAttribute('data-code');
+      const row = btn.closest('tr');
+      const name = row ? (row.children[1].textContent || code) : code;
+      const question = action === 'delete'
+        ? 'Delete the stored channel "' + name + '"? Every share link to it stops working. This cannot be undone.'
+        : 'Remove "' + name + '" from the Explore Channels directory? Links already handed out keep working.';
+      if (!confirm(question)) return;
+      const status = document.getElementById('publishedChannelStatus');
+      btn.disabled = true;
+      status.textContent = 'Working\u2026';
+      try {
+        const res = await fetch('/admin/api/channel-moderate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: code, action: action }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          status.textContent = 'Failed: ' + (data.error || 'unknown error');
+          btn.disabled = false;
+          return;
+        }
+        status.textContent = (action === 'delete' ? 'Deleted ' : 'Unlisted ') + name + '.';
+        if (row) row.remove();
+      } catch (e) {
+        status.textContent = 'Failed: network error.';
+        btn.disabled = false;
+      }
+    });
 
     // "Select" fills the slug box rather than deleting directly: a one-click
     // delete next to a browse list is how the wrong list gets removed.
@@ -11803,11 +12047,12 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
     <path d="M-90,-105 Q-45,-130 0,-105 T90,-105" fill="none" stroke="url(#accentGrad)" stroke-width="4.5" stroke-linecap="round" opacity="0.85" />
 
     <!-- Channel Name Rendered STRICTLY Inside the TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="170" cy="115" r="6" fill="#007AFF" opacity="0.8" />
@@ -11817,7 +12062,7 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
   <!-- Bottom TV Channel Pill Badge -->
   <g transform="translate(300, 780)">
     <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGrad)" />
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
   </g>
 </svg>`;
 }
@@ -11910,11 +12155,12 @@ function generateChannelBackdropSvg(name, backdropUrl = "") {
     <path d="M-34,-24 Q-17,-32 0,-24 T34,-24" fill="none" stroke="url(#accentGradL)" stroke-width="1.5" stroke-linecap="round" opacity="0.8" />
 
     <!-- Channel Name Rendered STRICTLY Inside TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="86" cy="25" r="2.5" fill="#007AFF" opacity="0.8" />
@@ -12017,13 +12263,13 @@ function generateBadgedPosterSvg({ posterUrl, airDateText, bottomText, bottomBg,
   const topBadgeSvg = safeAirDate ? `
     <g transform="translate(24, 24)">
       <rect x="0" y="0" width="${topPillWidth}" height="72" rx="16" ry="16" fill="#007aff" fill-opacity="0.95" stroke="#66b8ff" stroke-width="3.5" filter="drop-shadow(0px 6px 12px rgba(0,0,0,0.8))"/>
-      <text x="${topPillWidth / 2}" y="49" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="36" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
+      <text x="${topPillWidth / 2}" y="49" font-family="Arial, Helvetica, sans-serif" font-size="36" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
     </g>` : '';
 
   const bottomBadgeSvg = safeBottom ? `
     <g transform="translate(250, 715)">
       <rect x="${-bottomPillWidth / 2}" y="-84" width="${bottomPillWidth}" height="84" rx="20" ry="20" fill="${bottomBg || '#ff9f0a'}" fill-opacity="0.95" stroke="${bottomBorder || 'rgba(255,159,10,0.7)'}" stroke-width="4.5" filter="drop-shadow(0px 8px 16px rgba(0,0,0,0.85))"/>
-      <text x="0" y="-30" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="38" font-weight="900" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
+      <text x="0" y="-30" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="bold" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
     </g>` : '';
 
   const topGradient = safeAirDate ? `
@@ -12118,7 +12364,7 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   <!-- Safe Badge Pill at top -->
   <g transform="translate(250, 60)" filter="url(#safeShadow)">
     <rect x="-140" y="0" width="280" height="42" rx="21" ry="21" fill="url(#shieldGrad)"/>
-    <text x="0" y="27" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="800" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
+    <text x="0" y="27" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
   </g>
 
   <!-- Central Shield / Film Icon -->
@@ -12131,21 +12377,21 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   </g>
 
   <!-- Title -->
-  <text x="250" y="${titleStartY}" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="34" font-weight="800" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
+  <text x="250" y="${titleStartY}" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="bold" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
     ${titleTextSpans}
   </text>
 
   <!-- Metadata: Type & Year -->
   <g transform="translate(250, 560)">
     <rect x="-90" y="-18" width="180" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="700" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
       ${safeType}${safeYear ? ' • ' + safeYear : ''}
     </text>
   </g>
 
   <!-- Certification / Footer -->
   <g transform="translate(250, 680)">
-    <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
+    <text x="0" y="0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
       ${safeCert ? safeCert + ' • ' : ''}AGE-APPROPRIATE FILTER ACTIVE
     </text>
   </g>
@@ -12234,7 +12480,12 @@ function fetchChannelCatalog(entry, origin) {
   const isLandscapeShelf = entry.posterShape === "landscape";
   for (const rawUrl of rawUrls) {
     const payload = parseChannelPayload(rawUrl);
-    if (!payload || !payload.items || !payload.items.length) continue;
+    // A dynamic channel (Next Up) deliberately stores no picks of its own --
+    // its lineup is derived per request in buildChannelMeta -- so "no items"
+    // is not the same as "nothing to show" for one of those. The shelf tile
+    // here carries no episodes either way, only the channel's name and art.
+    if (!payload) continue;
+    if (!payload.dynamic && (!payload.items || !payload.items.length)) continue;
     const channelId = payload.channelId || entry.id;
     const name = payload.name || entry.name;
     
@@ -13155,6 +13406,21 @@ function seededShuffle(arr, seed) {
 const CHANNEL_ROTATION_SHOWS_PER_DAY = 24;
 const CHANNEL_ROTATION_EPISODES_PER_SHOW = 3;
 
+// How far a custom channel's own broadcast-schedule dials may be turned
+// (see channelRotationPlan below). The ceilings are not arbitrary: 48 shows
+// x 12 episodes is 576 videos in one day's meta response, already well past
+// anything watchable, and a client has to parse the whole thing before it
+// can render the channel at all.
+const CHANNEL_ROTATION_MAX_SHOWS_PER_DAY = 48;
+const CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW = 12;
+
+// How many episodes one multi-part story may glue together (see
+// glueMultiPartEpisodes). Two- and three-parters are the norm and a
+// five-network crossover is the outer edge of the real world; a cap stops a
+// mis-detection -- a show whose every episode is titled "Chapter One",
+// "Chapter Two" -- from gluing a whole season into one unbreakable block.
+const CHANNEL_PART_GROUP_MAX = 6;
+
 // --- channel video ids -------------------------------------------------
 //
 // A channel video's `id` IS the stream request: Stremio asks every stream
@@ -13239,6 +13505,1053 @@ function sortChannelItemsByAired(items) {
     .map((w) => w.it);
 }
 
+// --- sharing a channel --------------------------------------------------
+//
+// A channel someone shares, or publishes to the Explore Channels directory,
+// is stored server-side under a short code rather than packed into the link
+// itself: a full channel is thousands of episodes and megabytes of JSON, and
+// no URL survives that. What travels is the code.
+//
+// Everything that comes back out of that store is rebuilt field by field
+// here rather than round-tripped whole. A shared channel is a stranger's
+// JSON that this add-on then renders, saves into another person's browser
+// and serves back as a catalog, so the shape it is allowed to have is
+// spelled out in one place -- and a field this version does not know about
+// is dropped rather than carried.
+const SHARED_CHANNEL_ITEMS_MAX = 5000;
+const SHARED_CHANNEL_NAME_MAX = 200;
+const SHARED_CHANNEL_DESCRIPTION_MAX = 400;
+// Hand-made pairings a shared channel may carry. Generous next to the number
+// of multi-parters in any real channel, and small enough that the field
+// cannot be used to inflate a share.
+const SHARED_CHANNEL_PAIRS_MAX = 200;
+
+function sharedChannelString(value, max) {
+  return String(value == null ? "" : value).trim().slice(0, max);
+}
+
+// Only http(s) art is kept. A shared channel's poster is rendered straight
+// into an <img>, so a "javascript:" or "data:" URL from a stranger has no
+// business surviving the trip.
+function sharedChannelImageUrl(value) {
+  const url = sharedChannelString(value, 600);
+  return /^https?:\/\//i.test(url) ? url : "";
+}
+
+function sanitizeSharedChannelItem(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const kind = raw.kind === "movie" ? "movie" : "episode";
+  const item = {
+    kind: kind,
+    imdbId: sharedChannelString(raw.imdbId, 40),
+    season: channelItemNumber(raw.season),
+    episode: channelItemNumber(raw.episode),
+    showName: sharedChannelString(raw.showName, 200),
+    epName: sharedChannelString(raw.epName, 200),
+    title: sharedChannelString(raw.title, 300),
+  };
+  if (kind === "movie") {
+    item.season = item.season === null ? 1 : item.season;
+    item.episode = item.episode === null ? 1 : item.episode;
+  }
+  if (!channelItemStreamId(item)) return null;
+  const released = sharedChannelString(raw.released, 10);
+  if (released) item.released = released;
+  const runtime = typeof raw.runtime === "number" ? raw.runtime : parseInt(raw.runtime, 10);
+  if (Number.isInteger(runtime) && runtime > 0 && runtime < 1000) item.runtime = runtime;
+  const poster = sharedChannelImageUrl(raw.poster);
+  const thumbnail = sharedChannelImageUrl(raw.thumbnail);
+  const showPoster = sharedChannelImageUrl(raw.showPoster);
+  const backdrop = sharedChannelImageUrl(raw.backdrop);
+  if (poster) item.poster = poster;
+  if (thumbnail) item.thumbnail = thumbnail;
+  if (showPoster) item.showPoster = showPoster;
+  if (backdrop) item.backdrop = backdrop;
+  return item;
+}
+
+// A channel as it is safe to store and hand back out. Returns null when
+// there is nothing playable left, which is what the routes answer 400 on.
+// Pairs survive a share only where both halves do: every key is checked
+// against the picks that actually came through, and a group left with fewer
+// than two members is dropped rather than travelling as a rule about one
+// episode.
+function sanitizeSharedPairedGroups(raw, items) {
+  const keys = new Set();
+  for (const it of items) {
+    const key = channelItemStreamId(it);
+    if (key) keys.add(key);
+  }
+  const out = [];
+  for (const group of (Array.isArray(raw) ? raw : []).slice(0, SHARED_CHANNEL_PAIRS_MAX)) {
+    if (!Array.isArray(group)) continue;
+    const kept = [];
+    for (const k of group) {
+      const key = sharedChannelString(k, 60);
+      if (key && keys.has(key) && kept.indexOf(key) === -1) kept.push(key);
+      if (kept.length >= CHANNEL_PART_GROUP_MAX) break;
+    }
+    if (kept.length > 1) out.push(kept);
+  }
+  return out;
+}
+
+function sanitizeSharedChannel(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const items = (Array.isArray(raw.items) ? raw.items : [])
+    .slice(0, SHARED_CHANNEL_ITEMS_MAX)
+    .map(sanitizeSharedChannelItem)
+    .filter(Boolean);
+  const dynamic = raw.dynamic === "next-up" ? "next-up" : "";
+  // A dynamic channel is the one shape allowed to arrive with no picks --
+  // it has none by design. Everything else with nothing playable in it is
+  // not a channel.
+  if (!items.length && !dynamic) return null;
+  const plan = channelRotationPlan(raw);
+  const itemKeys = new Set(items.map(channelItemShowKey));
+  const out = {
+    name: sharedChannelString(raw.name, SHARED_CHANNEL_NAME_MAX) || "Shared Channel",
+    // The channel's own description, not the directory listing's. They used
+    // to be the same string, stored only on the listing -- so unpublishing a
+    // channel deleted the sentence describing it, and a channel shared by
+    // link had nowhere to carry one at all.
+    description: sharedChannelString(raw.description, SHARED_CHANNEL_DESCRIPTION_MAX),
+    poster: sharedChannelImageUrl(raw.poster) || null,
+    backdrop: sharedChannelImageUrl(raw.backdrop) || null,
+    items: items,
+    shuffle: !!raw.shuffle,
+    autoSort: sharedChannelString(raw.autoSort, 32),
+    sortByAired: !!raw.sortByAired,
+    dailyRotate: !!raw.dailyRotate,
+    hideWatched: !!raw.hideWatched,
+    // Locks for shows the shared picks no longer contain are dropped, so a
+    // shared channel never arrives carrying rules about titles it has not
+    // got.
+    storyLocked: (Array.isArray(raw.storyLocked) ? raw.storyLocked : [])
+      .map((k) => sharedChannelString(k, 120))
+      .filter((k) => k && itemKeys.has(k)),
+    pairParts: !!raw.pairParts,
+    // A channel that keeps up with its shows keeps doing so for whoever
+    // takes a copy -- it is the whole point of the flag, and it costs the
+    // receiving side nothing until they actually open the channel.
+    autoNewEpisodes: !!raw.autoNewEpisodes,
+    newEpisodesAtTop: !!raw.newEpisodesAtTop,
+    // Hand-made pairs, kept only for episodes the shared picks actually
+    // contain -- the same rule Story Lock follows above, for the same
+    // reason: a shared channel should never arrive carrying rules about
+    // titles it has not got.
+    pairedGroups: sanitizeSharedPairedGroups(raw.pairedGroups, items),
+    dynamic: dynamic,
+  };
+  if (out.dailyRotate) {
+    out.rotateShows = plan.shows;
+    out.rotateEpisodes = plan.episodes;
+    out.rotateTurnover = plan.turnover;
+    out.rotateTurnoverTime = sharedChannelString(raw.rotateTurnoverTime, 5);
+    out.rotateTurnoverZone = raw.rotateTurnoverZone === "local" ? "local" : "utc";
+  }
+  // Live Cloud Sync travels only when there is a real list URL behind it --
+  // the receiving end rebuilds the pool from that URL, so an unusable one
+  // would just leave the flag on with nothing to sync.
+  const sourceUrl = sharedChannelString(raw.sourceUrl, 600);
+  if (raw.liveSync && /^https?:\/\//i.test(sourceUrl)) {
+    out.liveSync = true;
+    out.sourceUrl = sourceUrl;
+  }
+  return out;
+}
+
+// The one-line record the Explore Channels directory lists. Deliberately
+// tiny: the directory is a single index that has to stay cheap to read, and
+// the full channel is one code lookup away.
+function sharedChannelSummary(code, record) {
+  const channel = record.channel || {};
+  const showKeys = new Set((channel.items || []).map(channelItemShowKey));
+  return {
+    code: code,
+    name: channel.name || "Shared Channel",
+    // The listing's own line when it has one, and the channel's otherwise --
+    // so a channel that describes itself needs nothing typed again to be
+    // published, and keeps that sentence when it is unpublished.
+    description: record.description || channel.description || "",
+    likes: Number(record.likes) || 0,
+    adds: Number(record.adds) || 0,
+    poster: channel.poster || null,
+    backdrop: channel.backdrop || null,
+    itemCount: (channel.items || []).length,
+    showCount: showKeys.size,
+    dailyRotate: !!channel.dailyRotate,
+    shuffle: !!channel.shuffle,
+    autoSort: channel.autoSort || "",
+    dynamic: channel.dynamic || "",
+    owner: record.owner || "",
+    publishedAt: record.publishedAt || 0,
+  };
+}
+
+// --- how a channel's day is put together -------------------------------
+//
+// Five payload flags shape a channel's lineup, and they are deliberately
+// separate from the picks themselves so none of them rewrites what someone
+// saved:
+//
+//   dailyRotate  a pool bigger than a day, cut into a fresh day's lineup
+//                (Quick Add's networks, and now any custom channel that
+//                asks for a broadcast schedule)
+//   autoSort     a static arrangement, applied to the lineup after it is
+//                picked -- "interleave" is the one the Worker acts on
+//   storyLocked  shows that must advance in sequence through a shuffle or
+//                a rotation instead of jumping around
+//   hideWatched  drop picks the account has already seen, until it has
+//                seen them all
+//   dynamic      a channel with no stored picks at all, re-derived per
+//                request from the account's own tracking
+//
+// Everything below is the machinery for those. A payload carrying none of
+// them plays exactly as it did before any of this existed.
+
+// The show one channel item belongs to, as a stable grouping key. The daily
+// rotation has always grouped by this expression; it is pulled out here so
+// Story Lock, the interleaver and "Hide watched" group a channel the SAME
+// way -- an item that rotates as part of "The Simpsons" has to lock and
+// interleave as part of it too.
+function channelItemShowKey(it) {
+  if (!it) return "";
+  return it.imdbId || `${it.kind || "episode"}:${it.title || ""}`;
+}
+
+// Broadcast order within one show. Only ever applied to a show that is
+// story-locked, and only to that show's own run -- it never reorders one
+// show against another.
+function sortChannelItemsSequential(list) {
+  return list.slice().sort((a, b) => {
+    const sa = channelItemNumber(a.season);
+    const sb = channelItemNumber(b.season);
+    if (sa !== sb) return (sa === null ? 0 : sa) - (sb === null ? 0 : sb);
+    const ea = channelItemNumber(a.episode);
+    const eb = channelItemNumber(b.episode);
+    return (ea === null ? 0 : ea) - (eb === null ? 0 : eb);
+  });
+}
+
+// Round-robin across shows: one pick from each show in turn, then round
+// again -- Simpsons S1E1, King of the Hill S1E1, Malcolm S1E1, Simpsons
+// S1E2, and so on. What a 90s prime-time block actually felt like, and the
+// opposite of playing fifty episodes of one show before the next one starts.
+//
+// Shows keep the order they first appear in and each show's own run keeps
+// the order it arrived in, so this only changes WHEN each pick plays. It
+// never reorders a show against itself, which is what makes it safe to run
+// over a story-locked show, and it is idempotent -- interleaving an already
+// interleaved lineup is a no-op, so the builder applying it to the saved
+// order and the Worker applying it again here cannot fight.
+function interleaveChannelItems(items) {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length < 2) return list;
+  const runs = new Map();
+  for (const it of list) {
+    const key = channelItemShowKey(it);
+    if (!runs.has(key)) runs.set(key, []);
+    runs.get(key).push(it);
+  }
+  if (runs.size < 2) return list;
+  const lists = [...runs.values()];
+  const longest = lists.reduce((n, l) => Math.max(n, l.length), 0);
+  const out = [];
+  for (let round = 0; round < longest; round++) {
+    for (const run of lists) {
+      if (round < run.length) out.push(run[round]);
+    }
+  }
+  return out;
+}
+
+// The shows a channel marks as serialized. Stored as the same show keys
+// channelItemShowKey produces, so a lock survives a show being re-added.
+function channelStoryLockedKeys(payload) {
+  const raw = Array.isArray(payload && payload.storyLocked) ? payload.storyLocked : [];
+  return new Set(raw.map((k) => String(k || "").trim()).filter(Boolean));
+}
+
+// Puts story-locked shows back into sequence after a shuffle.
+//
+// The POSITIONS a locked show occupies stay shuffled -- so it is still
+// spread through the day rather than stuck in one block -- but the episodes
+// that land in them are dealt out in broadcast order, so the show still
+// advances E1, E2, E3 wherever it turns up. That is the whole point of the
+// lock: daily variety without walking into the back half of a season.
+function resequenceLockedShows(shuffled, sourceOrder, lockedKeys) {
+  if (!lockedKeys || !lockedKeys.size) return shuffled;
+  const queues = new Map();
+  for (const it of sourceOrder) {
+    const key = channelItemShowKey(it);
+    if (!lockedKeys.has(key)) continue;
+    if (!queues.has(key)) queues.set(key, []);
+    queues.get(key).push(it);
+  }
+  if (!queues.size) return shuffled;
+  for (const [key, queue] of queues) queues.set(key, sortChannelItemsSequential(queue));
+  const cursors = new Map();
+  return shuffled.map((it) => {
+    const key = channelItemShowKey(it);
+    const queue = queues.get(key);
+    if (!queue) return it;
+    const at = cursors.get(key) || 0;
+    cursors.set(key, at + 1);
+    return queue[at] || it;
+  });
+}
+
+function shuffleChannelItems(items, seed, lockedKeys) {
+  return resequenceLockedShows(seededShuffle(items, seed), items, lockedKeys);
+}
+
+// --- pairing glue: multi-part episodes stay together ---------------------
+//
+// A rotation deals a contiguous block out of a show's run and a shuffle
+// scatters it, and neither knows that "The Best of Both Worlds, Part I" is
+// half a story. Part II landing tomorrow -- or three hours later, after four
+// other shows -- is the one ordering result nobody wants.
+//
+// "Keep multi-part episodes together" turns on the detection below; a pair
+// made by hand in the builder always applies, toggle or not, because it was
+// asked for explicitly. Either way the rule is the same: the first part of a
+// story to be drawn brings the rest of it along, immediately after, in part
+// order.
+
+// Roman numerals up to the group cap. Deliberately not a general parser:
+// this only ever reads the "II" in "Part II", and a show with a Part XLII is
+// not a show this needs to get right.
+const CHANNEL_PART_ROMAN = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10 };
+
+// Splits an episode title into the story it belongs to and which part of it
+// this is: "The Best of Both Worlds, Part II" -> { base: "the best of both
+// worlds", part: 2 }. Returns null for a title that names no part, which is
+// almost every episode ever made.
+function channelPartTitleSplit(rawName) {
+  const name = String(rawName == null ? "" : rawName).trim();
+  if (!name) return null;
+  // "... Part 2", "... Pt. II", "... part two" is not matched on purpose:
+  // a spelled-out number is rare and the words are common enough in a
+  // title ("Part of the Family") to be worth leaving alone.
+  const worded = name.match(/^(.*?)[\s,:;–—-]*\(?\s*(?:part|pt\.?)\s*([0-9]{1,2}|[ivxIVX]{1,4})\s*\)?[\s.]*$/i);
+  if (worded) {
+    const raw = worded[2].toLowerCase();
+    const part = /^[0-9]+$/.test(raw) ? parseInt(raw, 10) : (CHANNEL_PART_ROMAN[raw] || 0);
+    if (part > 0 && worded[1].trim()) return { base: channelPartBaseKey(worded[1]), part: part };
+    return null;
+  }
+  // The other form TMDB carries: a bare "(1)" / "(2)" suffix.
+  const bracketed = name.match(/^(.*?)[\s,:;–—-]*\(([0-9]{1,2})\)[\s.]*$/);
+  if (bracketed) {
+    const part = parseInt(bracketed[2], 10);
+    if (part > 0 && bracketed[1].trim()) return { base: channelPartBaseKey(bracketed[1]), part: part };
+  }
+  return null;
+}
+
+// Two halves of one story have to agree on their name to be recognized as
+// halves, and they routinely differ in punctuation alone ("Worlds, Part I"
+// vs "Worlds Part II"), so the comparison is made on letters and digits.
+function channelPartBaseKey(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// The key a pairing is stored and looked up under: the item's stream id, so
+// a pair made in the builder survives the channel being re-sorted, re-saved
+// or shared, none of which keep array positions.
+function channelItemPairKey(it) {
+  return channelItemStreamId(it);
+}
+
+// Pairs the builder stored by hand, as arrays of stream ids.
+function channelManualPairGroups(payload) {
+  const raw = Array.isArray(payload && payload.pairedGroups) ? payload.pairedGroups : [];
+  const out = [];
+  for (const group of raw) {
+    if (!Array.isArray(group)) continue;
+    const keys = [];
+    for (const k of group) {
+      const key = String(k || "").trim();
+      if (key && keys.indexOf(key) === -1) keys.push(key);
+      if (keys.length >= CHANNEL_PART_GROUP_MAX) break;
+    }
+    if (keys.length > 1) out.push(keys);
+  }
+  return out;
+}
+
+// Every multi-part story in a pool, as a lookup from each member's key to
+// the whole story in part order.
+//
+// A manual pair wins over a detected one for the same episode: it was asked
+// for by hand, against a title the detection can only guess at.
+function channelPartGroups(payload, poolItems) {
+  const byKey = new Map();
+  for (const it of poolItems) {
+    const key = channelItemPairKey(it);
+    if (key && !byKey.has(key)) byKey.set(key, it);
+  }
+  const lookup = new Map();
+  const claim = (members) => {
+    if (members.length < 2) return;
+    const capped = members.slice(0, CHANNEL_PART_GROUP_MAX);
+    if (capped.some((it) => lookup.has(channelItemPairKey(it)))) return;
+    for (const it of capped) lookup.set(channelItemPairKey(it), capped);
+  };
+  for (const keys of channelManualPairGroups(payload)) {
+    const members = keys.map((k) => byKey.get(k)).filter(Boolean);
+    claim(members);
+  }
+  if (!payload.pairParts) return lookup;
+  // Detected pairs: same show, same season, same story name, different part
+  // numbers. Season matters -- a remake's "Part 1" ten seasons later is a
+  // different story with the same name.
+  const stories = new Map();
+  for (const it of poolItems) {
+    if (!it || it.kind === "movie") continue;
+    const key = channelItemPairKey(it);
+    if (!key) continue;
+    const split = channelPartTitleSplit(it.epName);
+    if (!split) continue;
+    const season = channelItemNumber(it.season);
+    const storyKey = `${channelItemShowKey(it)}|${season === null ? "" : season}|${split.base}`;
+    if (!stories.has(storyKey)) stories.set(storyKey, []);
+    stories.get(storyKey).push({ item: it, part: split.part });
+  }
+  for (const entries of stories.values()) {
+    const seenParts = new Set();
+    const members = [];
+    for (const e of entries.slice().sort((a, b) => a.part - b.part)) {
+      if (seenParts.has(e.part)) continue;
+      seenParts.add(e.part);
+      members.push(e.item);
+    }
+    claim(members);
+  }
+  return lookup;
+}
+
+// Applies those groups to a finished lineup.
+//
+// Wherever the first-drawn member of a story appears, the WHOLE story is
+// played there, in part order, and its other members are dropped from
+// wherever else they landed. A part that was not drawn at all is pulled in
+// from the pool: a channel that gave you Part 1 and made you wait a day for
+// Part 2 is the exact complaint this answers. A part that is not in the pool
+// (never added, or filtered out by "Hide watched") simply is not there, and
+// the rest still play together.
+//
+// Drawing Part 2 first plays the story from Part 1, for the same reason:
+// the back half of a story on its own is worse than a minute of extra
+// runtime.
+function glueMultiPartEpisodes(items, poolItems, payload) {
+  const groups = channelPartGroups(payload, poolItems);
+  if (!groups.size) return items;
+  const played = new Set();
+  const out = [];
+  for (const it of items) {
+    const members = groups.get(channelItemPairKey(it));
+    if (!members) {
+      out.push(it);
+      continue;
+    }
+    const storyId = channelItemPairKey(members[0]);
+    if (played.has(storyId)) continue;
+    played.add(storyId);
+    for (const member of members) out.push(member);
+  }
+  return out;
+}
+
+// The dials behind a daily broadcast schedule. Quick Add's network channels
+// have always rotated 24 shows x 3 episodes off midnight UTC; a custom
+// channel can now say how many shows a day it runs, how many back-to-back
+// episodes make up one show's block, and what time of day the lineup turns
+// over. A payload that sets none of them keeps the network numbers, so every
+// channel saved before this reads exactly as it did.
+function channelRotationPlan(payload) {
+  const dial = (raw, lo, hi, fallback) => {
+    const n = typeof raw === "number" ? raw : parseInt(raw, 10);
+    if (!Number.isInteger(n)) return fallback;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  // A saved channel stores 0 for a dial it never set -- the builder writes 0
+  // for both counts whenever the schedule panel is closed, and an older
+  // payload has no dials at all. 0 means "use the network numbers", not "run
+  // one show a day", so it falls through to the fallback instead of being
+  // clamped up to the floor of 1.
+  const count = (raw, hi, fallback) => {
+    const n = typeof raw === "number" ? raw : parseInt(raw, 10);
+    if (!Number.isInteger(n) || n <= 0) return fallback;
+    return Math.min(hi, n);
+  };
+  return {
+    shows: count(payload.rotateShows, CHANNEL_ROTATION_MAX_SHOWS_PER_DAY, CHANNEL_ROTATION_SHOWS_PER_DAY),
+    episodes: count(payload.rotateEpisodes, CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW, CHANNEL_ROTATION_EPISODES_PER_SHOW),
+    // Minutes past midnight UTC at which today's lineup becomes tomorrow's.
+    // 0 is midnight UTC, which is what every rotating channel did before
+    // this existed; a viewer in UTC-5 stores 300 so the channel turns over
+    // at their own midnight rather than at 7pm the evening before.
+    turnover: ((dial(payload.rotateTurnover, -1439, 1439, 0) % 1440) + 1440) % 1440,
+  };
+}
+
+// Which day's lineup to serve -- days counted from the channel's own
+// turnover time rather than from midnight UTC.
+function channelRotationDay(now, turnoverMinutes) {
+  return daysSinceEpochUTC(new Date(now.getTime() - turnoverMinutes * 60000));
+}
+
+// One day's lineup out of a pool: a handful of different shows with a few
+// episodes each, rather than a flat random slice that could easily skew to
+// dozens of episodes of one show and none of many others. Stable within a
+// day, different the next.
+function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys) {
+  const byShow = new Map();
+  for (const it of playableItems) {
+    const key = channelItemShowKey(it);
+    if (!byShow.has(key)) byShow.set(key, []);
+    byShow.get(key).push(it);
+  }
+  const showKeys = seededShuffle([...byShow.keys()], seed).slice(0, plan.shows);
+  const items = [];
+  showKeys.forEach((key, i) => {
+    const isLocked = lockedKeys.has(key);
+    const showEpisodes = isLocked ? sortChannelItemsSequential(byShow.get(key)) : byShow.get(key);
+    const perShow = Math.min(plan.episodes, showEpisodes.length);
+    let start;
+    if (isLocked) {
+      // A story-locked show gets no random starting point: it picks up
+      // where yesterday's block left off and walks its run in order,
+      // wrapping back to the beginning once it reaches the end.
+      const blocks = Math.max(1, Math.ceil(showEpisodes.length / perShow));
+      start = (((day % blocks) + blocks) % blocks) * perShow;
+      if (start > showEpisodes.length - perShow) start = Math.max(0, showEpisodes.length - perShow);
+    } else {
+      // A contiguous block (not scattered episodes) feels like an actual
+      // evening's run of a show -- seeded per-show so different shows
+      // don't all land on the same relative starting point.
+      const maxStart = showEpisodes.length - perShow;
+      const starts = seededShuffle(
+        Array.from({ length: maxStart + 1 }, (_, n) => n),
+        seed + i + 1
+      );
+      start = starts.length ? starts[0] : 0;
+    }
+    items.push(...showEpisodes.slice(start, start + perShow));
+  });
+  return items;
+}
+
+// --- hide watched -------------------------------------------------------
+//
+// A channel item stores the show's IMDB id plus the season and episode
+// numbers and never the episode's own TMDB id, so the numbers are the only
+// thing a channel pick and a watch-history entry share. Movies match on the
+// title id alone.
+function channelWatchedKey(showId, season, episode) {
+  const s = channelItemNumber(season);
+  const e = channelItemNumber(episode);
+  if (!showId || s === null || e === null) return "";
+  return `${showId}:${s}:${e}`;
+}
+
+function channelWatchedKeySet(watchHistory) {
+  const set = new Set();
+  if (!Array.isArray(watchHistory)) return set;
+  for (const w of watchHistory) {
+    if (!w) continue;
+    if (w.type === "movie" || (w.seasonNum == null && w.episodeNum == null)) {
+      const id = String(w.id || w.imdbId || "").trim();
+      if (id) set.add(id);
+      continue;
+    }
+    const key = channelWatchedKey(String(w.showId || w.imdbId || "").trim(), w.seasonNum, w.episodeNum);
+    if (key) set.add(key);
+  }
+  return set;
+}
+
+function channelItemIsWatched(it, watchedKeys) {
+  if (!it || !watchedKeys.size) return false;
+  const showId = String(it.imdbId || "").trim();
+  if (!showId) return false;
+  if (it.kind === "movie") return watchedKeys.has(showId);
+  const key = channelWatchedKey(showId, it.season, it.episode);
+  return !!key && watchedKeys.has(key);
+}
+
+// --- the Next Up channel ------------------------------------------------
+//
+// The next unwatched episode of every show the account has in progress.
+//
+// Continue Watching is already exactly that list -- the Auto-Track Playback
+// scrobble and the new-episode cron both maintain it (see
+// 26_api-creator-and-admin-routes.js and checkForNewEpisodes) -- so there is
+// nothing to recompute here and not one TMDB call to make. A channel built
+// this way stores no picks of its own: it is re-derived on every request, so
+// it follows what the account is actually watching instead of freezing
+// whatever happened to be true the day it was saved.
+function channelNextUpItems(continueWatching) {
+  if (!Array.isArray(continueWatching)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const cw of continueWatching) {
+    if (!cw) continue;
+    const showId = String(cw.showId || cw.imdbId || "").trim();
+    const season = channelItemNumber(cw.seasonNum);
+    const episode = channelItemNumber(cw.episodeNum);
+    if (!showId || season === null || episode === null) continue;
+    const key = `${showId}:${season}:${episode}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const showName = String(cw.showTitle || "").trim();
+    const epName = String(cw.name || "").trim() || `Episode ${episode}`;
+    const poster = cw.showPoster || cw.poster || "";
+    out.push({
+      kind: "episode",
+      imdbId: showId,
+      season: season,
+      episode: episode,
+      showName: showName,
+      epName: epName,
+      title: showName ? `${showName} S${season}E${episode} — ${epName}` : epName,
+      released: cw.released || "",
+      poster: poster,
+      thumbnail: cw.thumbnail || poster,
+      showPoster: cw.showPoster || poster,
+    });
+  }
+  return out;
+}
+
+// --- live cloud sync ----------------------------------------------------
+//
+// Importing a Trakt/MDBList/Simkl/TMDB list used to take a one-time snapshot:
+// the episodes that existed the moment "Import channel" was pressed, frozen
+// for good. A channel with `liveSync` keeps the source URL instead, and the
+// Worker rebuilds its pool from that list in the background whenever the
+// stored pool goes stale -- so a public list gaining a title gains it here
+// too, with nothing to rebuild by hand.
+//
+// The rebuild never happens on the request's own critical path. A request
+// serves whatever pool is stored (falling back to the channel's original
+// snapshot when there is none yet) and schedules the refresh with
+// ctx.waitUntil, so the first request after a list changes is no slower than
+// any other and the next one sees the new titles.
+const CHANNEL_LIVE_POOL_TTL_MS = 6 * 60 * 60 * 1000;
+const CHANNEL_LIVE_POOL_MAX_SHOWS = 24;
+const CHANNEL_LIVE_POOL_MAX_SEASONS = 3;
+const CHANNEL_LIVE_POOL_MAX_ITEMS = 1200;
+
+function channelLivePoolKey(channelId) {
+  return `channelpool:${channelId}`;
+}
+
+// Channels whose pool this isolate is already rebuilding.
+//
+// A stale pool schedules a refresh on every request that sees it, and the
+// pool only stops being stale once the first rebuild finishes -- which is
+// dozens of TMDB calls later. Without this, a channel opened three times in
+// that window runs the whole rebuild three times. Per-isolate, so it bounds
+// the common case (one viewer, one colo, several requests) rather than
+// pretending to be a distributed lock.
+const CHANNEL_LIVE_POOL_IN_FLIGHT = new Set();
+
+// Resolves a list URL to a channel-shaped pool of episodes. Deliberately
+// capped: this runs on a background task with no one waiting on it, but it
+// is still one TMDB season call per season per show.
+async function buildChannelPoolFromListUrl(sourceUrl, keys) {
+  let metas = [];
+  try {
+    metas = await fetchCatalog({ url: sourceUrl, type: "series" }, 0, keys);
+  } catch {
+    return [];
+  }
+  const shows = (metas || []).filter((m) => m && m.id).slice(0, CHANNEL_LIVE_POOL_MAX_SHOWS);
+  if (!shows.length) return [];
+  const tmdbKey = (keys && keys.tmdbKey) || TMDB_API_KEY;
+  const perShow = await mapWithConcurrency(shows, 4, async (m) => {
+    try {
+      const findRes = await fetch(
+        `https://api.themoviedb.org/3/find/${encodeURIComponent(m.id)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+      );
+      if (!findRes.ok) return [];
+      const findData = await findRes.json();
+      const match = (findData.tv_results || [])[0];
+      if (!match) return [];
+      const showPoster = match.poster_path ? `https://image.tmdb.org/t/p/w500${match.poster_path}` : (m.poster || "");
+      const showRes = await fetch(
+        `https://api.themoviedb.org/3/tv/${encodeURIComponent(match.id)}?api_key=${encodeURIComponent(tmdbKey)}`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+      );
+      if (!showRes.ok) return [];
+      const fullShow = await showRes.json();
+      const seasons = (fullShow.seasons || [])
+        .filter((s) => s && s.season_number > 0)
+        .slice(0, CHANNEL_LIVE_POOL_MAX_SEASONS);
+      const out = [];
+      for (const s of seasons) {
+        const sRes = await fetch(
+          `https://api.themoviedb.org/3/tv/${encodeURIComponent(match.id)}/season/${s.season_number}?api_key=${encodeURIComponent(tmdbKey)}`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+        );
+        if (!sRes.ok) continue;
+        const sData = await sRes.json();
+        for (const ep of (sData.episodes || [])) {
+          const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+          const epName = ep.name || `Episode ${ep.episode_number}`;
+          out.push({
+            kind: "episode",
+            imdbId: m.id,
+            season: s.season_number,
+            episode: ep.episode_number,
+            showName: fullShow.name || m.name || "",
+            epName: epName,
+            title: `${fullShow.name || m.name || ""} S${s.season_number}E${ep.episode_number} — ${epName}`,
+            released: ep.air_date || "",
+            thumbnail: stillUrl || showPoster,
+            poster: showPoster || stillUrl,
+            showPoster: showPoster,
+          });
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  });
+  const items = [];
+  for (const run of perShow) {
+    for (const it of run) {
+      if (items.length >= CHANNEL_LIVE_POOL_MAX_ITEMS) return items;
+      items.push(it);
+    }
+  }
+  return items;
+}
+
+async function refreshChannelLivePool(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.sourceUrl || !payload.channelId) return null;
+  if (CHANNEL_LIVE_POOL_IN_FLIGHT.has(payload.channelId)) return null;
+  CHANNEL_LIVE_POOL_IN_FLIGHT.add(payload.channelId);
+  try {
+    return await refreshChannelLivePoolUncoordinated(payload, opts);
+  } finally {
+    CHANNEL_LIVE_POOL_IN_FLIGHT.delete(payload.channelId);
+  }
+}
+
+async function refreshChannelLivePoolUncoordinated(payload, opts) {
+  const env = opts.env;
+  const items = await buildChannelPoolFromListUrl(payload.sourceUrl, {
+    env: env,
+    ctx: opts.ctx,
+    origin: opts.origin || "",
+    tmdbKey: opts.tmdbKey || "",
+    mdblistKey: opts.mdblistKey || "",
+    traktKey: opts.traktKey || "",
+    traktAccessToken: opts.traktAccessToken || "",
+  });
+  if (!items.length) return null;
+  await env.CONFIGS.put(
+    channelLivePoolKey(payload.channelId),
+    JSON.stringify({ sourceUrl: payload.sourceUrl, items: items, updatedAt: Date.now() }),
+    { expirationTtl: 2592000 }
+  );
+  return items;
+}
+
+async function readChannelLivePool(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  let cached = null;
+  try {
+    const raw = await env.CONFIGS.get(channelLivePoolKey(payload.channelId));
+    if (raw) cached = JSON.parse(raw);
+  } catch {
+    cached = null;
+  }
+  const usable = cached && Array.isArray(cached.items) && cached.items.length &&
+    cached.sourceUrl === payload.sourceUrl;
+  const stale = !usable || (Date.now() - (cached.updatedAt || 0)) > CHANNEL_LIVE_POOL_TTL_MS;
+  if (stale && opts.ctx && typeof opts.ctx.waitUntil === "function") {
+    opts.ctx.waitUntil(refreshChannelLivePool(payload, opts).catch(() => {}));
+  }
+  return usable ? cached.items : null;
+}
+
+// --- self-maintaining channels: new episodes arrive on their own ---------
+//
+// A channel is a snapshot: add The Last of Us today and the channel still
+// carries exactly those episodes a year later, while the show has moved on
+// without it. "Automatically add new episodes" closes that gap -- the Worker
+// re-checks each show the channel carries and folds in whatever has aired
+// since, at the top of the channel or at the end, as the channel says.
+//
+// Same shape as Live Cloud Sync above, and for the same reasons: the work is
+// dozens of TMDB calls, so it happens on a background task with nobody
+// waiting on it, the result is cached in KV, and a request serves what is
+// stored and schedules the refresh rather than paying for it.
+const CHANNEL_NEW_EPISODE_TTL_MS = 12 * 60 * 60 * 1000;
+const CHANNEL_NEW_EPISODE_MAX_SHOWS = 30;
+const CHANNEL_NEW_EPISODE_MAX_SEASONS = 2;
+const CHANNEL_NEW_EPISODE_MAX_ITEMS = 300;
+const CHANNEL_NEW_EPISODE_IN_FLIGHT = new Set();
+
+function channelNewEpisodeKey(channelId) {
+  return `channelnew:${channelId}`;
+}
+
+// What the channel already has, per show: the highest season it carries and
+// every season:episode in it. The high-water mark is what makes the check
+// cheap -- only seasons at or past it can hold anything new, so a channel of
+// ten-season shows still costs one or two season calls each.
+function channelShowWatermarks(items) {
+  const marks = new Map();
+  for (const it of items || []) {
+    if (!it || it.kind === "movie") continue;
+    const showId = channelItemShowId(it.imdbId);
+    const season = channelItemNumber(it.season);
+    const episode = channelItemNumber(it.episode);
+    if (!showId || season === null || episode === null) continue;
+    if (!marks.has(showId)) {
+      marks.set(showId, {
+        showId: showId,
+        showName: it.showName || "",
+        showPoster: it.showPoster || it.poster || "",
+        maxSeason: season,
+        have: new Set(),
+      });
+    }
+    const mark = marks.get(showId);
+    if (season > mark.maxSeason) mark.maxSeason = season;
+    if (!mark.showName && it.showName) mark.showName = it.showName;
+    if (!mark.showPoster && (it.showPoster || it.poster)) mark.showPoster = it.showPoster || it.poster;
+    mark.have.add(`${season}:${episode}`);
+  }
+  return marks;
+}
+
+// Whether a cached answer still belongs to the channel that asked for it.
+// Editing the channel -- adding a show, adding a season by hand -- changes
+// the marks, and an answer computed against the old ones would re-add
+// episodes the channel now carries itself.
+function channelNewEpisodeSignature(marks) {
+  const parts = [];
+  for (const mark of marks.values()) parts.push(`${mark.showId}:${mark.maxSeason}:${mark.have.size}`);
+  return String(hashStringToInt(parts.sort().join("|")));
+}
+
+// Everything one show has aired that this channel does not already carry.
+// Unaired episodes are left alone: TMDB lists next month's episode the day
+// it is announced, and a channel slot that plays nothing is worse than a
+// channel that is a week behind.
+async function fetchShowEpisodesAfter(mark, tmdbKey, today) {
+  const idForTmdb = mark.showId.startsWith("tmdb:") ? mark.showId.slice(5) : "";
+  let tmdbId = idForTmdb;
+  if (!tmdbId) {
+    const findRes = await fetch(
+      `https://api.themoviedb.org/3/find/${encodeURIComponent(mark.showId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`,
+      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+    );
+    if (!findRes.ok) return [];
+    const findData = await findRes.json();
+    const match = (findData.tv_results || [])[0];
+    if (!match) return [];
+    tmdbId = String(match.id);
+  }
+  const showRes = await fetch(
+    `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}?api_key=${encodeURIComponent(tmdbKey)}`,
+    { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 21600, cacheEverything: true } }
+  );
+  if (!showRes.ok) return [];
+  const fullShow = await showRes.json();
+  const showName = mark.showName || fullShow.name || "";
+  const showPoster = mark.showPoster ||
+    (fullShow.poster_path ? `https://image.tmdb.org/t/p/w500${fullShow.poster_path}` : "");
+  const seasons = (fullShow.seasons || [])
+    .filter((s) => s && s.season_number >= mark.maxSeason)
+    .sort((a, b) => a.season_number - b.season_number)
+    .slice(0, CHANNEL_NEW_EPISODE_MAX_SEASONS);
+  const out = [];
+  for (const s of seasons) {
+    const sRes = await fetch(
+      `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/season/${s.season_number}?api_key=${encodeURIComponent(tmdbKey)}`,
+      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 21600, cacheEverything: true } }
+    );
+    if (!sRes.ok) continue;
+    const sData = await sRes.json();
+    for (const ep of (sData.episodes || [])) {
+      const season = channelItemNumber(s.season_number);
+      const episode = channelItemNumber(ep && ep.episode_number);
+      if (season === null || episode === null) continue;
+      if (mark.have.has(`${season}:${episode}`)) continue;
+      const aired = String(ep.air_date || "");
+      if (!aired || aired > today) continue;
+      const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+      const epName = ep.name || `Episode ${episode}`;
+      out.push({
+        kind: "episode",
+        imdbId: mark.showId,
+        season: season,
+        episode: episode,
+        showName: showName,
+        epName: epName,
+        title: `${showName} S${season}E${episode} — ${epName}`,
+        released: aired,
+        thumbnail: stillUrl || showPoster,
+        poster: showPoster || stillUrl,
+        showPoster: showPoster,
+      });
+    }
+  }
+  return out;
+}
+
+// Newest first, so "put new episodes at top" puts the newest one at the very
+// top rather than the oldest of the new ones.
+function sortChannelNewEpisodes(items) {
+  return items.slice().sort((a, b) => {
+    const da = String(a.released || "");
+    const db = String(b.released || "");
+    if (da !== db) return db < da ? -1 : 1;
+    const sa = channelItemNumber(a.season) || 0;
+    const sb = channelItemNumber(b.season) || 0;
+    if (sa !== sb) return sb - sa;
+    return (channelItemNumber(b.episode) || 0) - (channelItemNumber(a.episode) || 0);
+  });
+}
+
+async function buildChannelNewEpisodes(marks, keys) {
+  const tmdbKey = (keys && keys.tmdbKey) || TMDB_API_KEY;
+  const today = new Date().toISOString().slice(0, 10);
+  const shortlist = [...marks.values()].slice(0, CHANNEL_NEW_EPISODE_MAX_SHOWS);
+  const perShow = await mapWithConcurrency(shortlist, 4, async (mark) => {
+    try {
+      return await fetchShowEpisodesAfter(mark, tmdbKey, today);
+    } catch {
+      return [];
+    }
+  });
+  const found = [];
+  for (const run of perShow) {
+    for (const it of run) found.push(it);
+  }
+  return sortChannelNewEpisodes(found).slice(0, CHANNEL_NEW_EPISODE_MAX_ITEMS);
+}
+
+async function refreshChannelNewEpisodes(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  if (CHANNEL_NEW_EPISODE_IN_FLIGHT.has(payload.channelId)) return null;
+  CHANNEL_NEW_EPISODE_IN_FLIGHT.add(payload.channelId);
+  try {
+    const marks = channelShowWatermarks(Array.isArray(payload.items) ? payload.items : []);
+    if (!marks.size) return null;
+    const items = await buildChannelNewEpisodes(marks, {
+      tmdbKey: opts.tmdbKey || "",
+    });
+    await env.CONFIGS.put(
+      channelNewEpisodeKey(payload.channelId),
+      JSON.stringify({
+        signature: channelNewEpisodeSignature(marks),
+        items: items,
+        updatedAt: Date.now(),
+      }),
+      { expirationTtl: 2592000 }
+    );
+    return items;
+  } finally {
+    CHANNEL_NEW_EPISODE_IN_FLIGHT.delete(payload.channelId);
+  }
+}
+
+// An empty answer is cached like any other -- a channel whose shows are all
+// finished would otherwise re-check every single request forever.
+async function readChannelNewEpisodes(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  let cached = null;
+  try {
+    const raw = await env.CONFIGS.get(channelNewEpisodeKey(payload.channelId));
+    if (raw) cached = JSON.parse(raw);
+  } catch {
+    cached = null;
+  }
+  const marks = channelShowWatermarks(Array.isArray(payload.items) ? payload.items : []);
+  const usable = !!(cached && Array.isArray(cached.items) &&
+    cached.signature === channelNewEpisodeSignature(marks));
+  const stale = !usable || (Date.now() - (cached.updatedAt || 0)) > CHANNEL_NEW_EPISODE_TTL_MS;
+  if (stale && opts.ctx && typeof opts.ctx.waitUntil === "function") {
+    opts.ctx.waitUntil(refreshChannelNewEpisodes(payload, opts).catch(() => {}));
+  }
+  return usable ? cached.items : null;
+}
+
+// Folds the newly-aired episodes into the channel's own picks. Anything the
+// channel already carries is dropped from the new side rather than played
+// twice -- the cached answer can be a few hours older than an edit that
+// added the same episode by hand.
+function mergeChannelNewEpisodes(stored, fresh, atTop) {
+  if (!Array.isArray(fresh) || !fresh.length) return stored;
+  const have = new Set();
+  for (const it of stored) {
+    const key = channelItemStreamId(it);
+    if (key) have.add(key);
+  }
+  const added = [];
+  for (const it of fresh) {
+    const key = channelItemStreamId(it);
+    if (!key || have.has(key)) continue;
+    have.add(key);
+    added.push(it);
+  }
+  if (!added.length) return stored;
+  return atTop ? added.concat(stored) : stored.concat(added);
+}
+
+// The pool a channel draws today's lineup from, before any ordering.
+//
+// Three shapes: a normal channel plays the picks stored on it; a dynamic
+// channel (Next Up) has none and is re-derived per request from the
+// account's own tracking; a Live Cloud Sync channel prefers the pool the
+// Worker last rebuilt from the list it was imported from, and keeps its
+// stored picks as the fallback for before that first rebuild lands.
+async function channelSourceItems(payload, opts) {
+  const stored = Array.isArray(payload.items) ? payload.items : [];
+  if (payload.dynamic === "next-up") {
+    // The live answer when there is one, and the seed the builder stored
+    // otherwise.
+    //
+    // The fallback is not belt-and-braces: resolveConfig only hands over
+    // continueWatching for a config that PROVED whose it is, and a config
+    // with no personal shelf in it never does -- so for those the live
+    // derivation is empty every time and the seed is the only lineup the
+    // channel will ever have. Returning nothing there is what made this
+    // channel come back blank.
+    const live = channelNextUpItems(opts.continueWatching);
+    return live.length ? live : stored;
+  }
+  let base = stored;
+  if (payload.liveSync && payload.sourceUrl) {
+    const live = await readChannelLivePool(payload, opts).catch(() => null);
+    if (live && live.length) base = live;
+  }
+  // "Automatically add new episodes" folds in whatever has aired since the
+  // channel was built. It sits after Live Cloud Sync rather than instead of
+  // it: one keeps up with the LIST a channel came from, the other with the
+  // SHOWS in it, and a channel can reasonably want both.
+  if (payload.autoNewEpisodes) {
+    const fresh = await readChannelNewEpisodes(payload, opts).catch(() => null);
+    if (fresh && fresh.length) base = mergeChannelNewEpisodes(base, fresh, !!payload.newEpisodesAtTop);
+  }
+  return base;
+}
+
 // The full stream id for one channel item, or "" if it cannot be formed.
 function channelItemStreamId(it) {
   if (!it) return "";
@@ -13251,13 +14564,17 @@ function channelItemStreamId(it) {
   return `${showId}:${season}:${episode}`;
 }
 
-function buildChannelMeta(entry, origin) {
-  const payload = parseChannelPayload(entry.url);
-  if (!payload || !payload.items.length) return null;
-  // payload.channelId/payload.name (not entry.id/entry.name) are the real
-  // identity -- see the same note in fetchChannelCatalog above.
-  const channelId = payload.channelId || entry.id;
-  const name = payload.name || entry.name;
+// Today's lineup for one channel payload: the picks, in the order they will
+// actually play, after the pool, the rules and the arrangement have all been
+// applied.
+//
+// Split out of buildChannelMeta so the builder page can show what a rotating
+// channel is running right now (see /api/channel-lineup). The alternative --
+// a second copy of the seeded shuffle on the client -- is the kind of thing
+// that drifts by one episode after some later edit and is never noticed.
+async function resolveChannelLineup(payload, opts = {}) {
+  const sourceItems = await channelSourceItems(payload, opts);
+
   // "Randomize play order" (set once in the Channel builder, stored on the
   // payload) reshuffles once a day rather than on every single request --
   // same reasoning as Hidden Gems' daily reshuffle (see daysSinceEpochUTC
@@ -13268,46 +14585,48 @@ function buildChannelMeta(entry, origin) {
   // both) and is applied further down, after the rotation below: it needs
   // no seed because it is the same order every day.
   //
-  // dailyRotate is a step further, set by Quick Add Channel: the payload
-  // stores a much bigger pool than what's ever actually shown, and this
-  // picks a fresh, structured day's lineup from that pool -- a handful of
-  // different shows with a few episodes each (see the constants above),
-  // not a flat random slice that could easily skew to dozens of episodes
-  // of one show and none of many others. Stable within a day, different
-  // the next.
-  const seed = daysSinceEpochUTC(new Date()) + hashStringToInt(channelId);
+  // dailyRotate is a step further -- set by Quick Add Channel, and now by
+  // any custom channel that turns on a Daily Broadcast Schedule: the
+  // payload stores a much bigger pool than what's ever actually shown, and
+  // this picks a fresh, structured day's lineup from that pool -- a handful
+  // of different shows with a few episodes each (see channelRotationPlan),
+  // not a flat random slice that could easily skew to dozens of episodes of
+  // one show and none of many others. Stable within a day, different the
+  // next.
+  const plan = channelRotationPlan(payload);
+  // Duck-typed rather than `instanceof Date`: the tests evaluate this file
+  // in a vm realm of their own, where a Date built outside it is not an
+  // instanceof the Date inside it, and the injected clock would silently be
+  // ignored. A timestamp is accepted for the same reason -- there is no
+  // realm it can be wrong in.
+  const now = typeof opts.now === "number"
+    ? new Date(opts.now)
+    : (opts.now && typeof opts.now.getTime === "function" ? opts.now : new Date());
+  const day = channelRotationDay(now, plan.turnover);
+  const seed = day + hashStringToInt(String(payload.channelId || payload.name || ""));
+  const lockedKeys = channelStoryLockedKeys(payload);
   // Anything that cannot produce a real stream id (see channelItemStreamId
   // above) is dropped HERE, before the rotation or the shuffle runs, so a
   // dropped item costs the channel one slot rather than leaving a hole in
   // the middle of a day's lineup -- and so the running order below stays
   // 1..N with no gaps.
-  const playableItems = payload.items.filter((it) => channelItemStreamId(it));
+  let playableItems = sourceItems.filter((it) => channelItemStreamId(it));
+  // "Hide watched" comes before the rotation for the same reason: an
+  // already-seen episode should cost the channel nothing, not a slot in
+  // today's lineup. When the whole pool has been seen the channel resets to
+  // the full pool rather than going dark -- an empty channel reads as
+  // broken, and there is nothing else left to offer.
+  if (payload.hideWatched) {
+    const watchedKeys = channelWatchedKeySet(opts.watchHistory);
+    const unwatched = playableItems.filter((it) => !channelItemIsWatched(it, watchedKeys));
+    if (unwatched.length) playableItems = unwatched;
+  }
+  if (!playableItems.length) return null;
   let items;
   if (payload.dailyRotate) {
-    const byShow = new Map();
-    playableItems.forEach((it) => {
-      const key = it.imdbId || it.kind + ":" + it.title;
-      if (!byShow.has(key)) byShow.set(key, []);
-      byShow.get(key).push(it);
-    });
-    const showKeys = seededShuffle([...byShow.keys()], seed).slice(0, CHANNEL_ROTATION_SHOWS_PER_DAY);
-    items = [];
-    showKeys.forEach((key, i) => {
-      const showEpisodes = byShow.get(key);
-      const perShow = Math.min(CHANNEL_ROTATION_EPISODES_PER_SHOW, showEpisodes.length);
-      // A contiguous block (not scattered episodes) feels like an actual
-      // evening's run of a show -- seeded per-show so different shows
-      // don't all land on the same relative starting point.
-      const maxStart = showEpisodes.length - perShow;
-      const starts = seededShuffle(
-        Array.from({ length: maxStart + 1 }, (_, n) => n),
-        seed + i + 1
-      );
-      const start = starts.length ? starts[0] : 0;
-      items.push(...showEpisodes.slice(start, start + perShow));
-    });
+    items = rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys);
   } else if (payload.shuffle && !payload.sortByAired) {
-    items = seededShuffle(playableItems, seed);
+    items = shuffleChannelItems(playableItems, seed, lockedKeys);
   } else {
     items = playableItems;
   }
@@ -13318,10 +14637,32 @@ function buildChannelMeta(entry, origin) {
   // existed -- so the explicit sort wins here as well, rather than leaving
   // the outcome to whichever branch happened to be tested first.
   //
-  // It is applied last so it also orders a rotated day's lineup: a Quick Add
+  // It is applied last so it also orders a rotated day's lineup: a rotating
   // channel picks WHICH shows and episodes play today (above), and this
-  // decides the order they play in.
+  // decides the order they play in. Interleaving sits in the same slot for
+  // the same reason -- it is what turns a rotated day's handful of shows
+  // into an actual prime-time block instead of five blocks back to back.
   if (payload.sortByAired) items = sortChannelItemsByAired(items);
+  else if (payload.autoSort === "interleave") items = interleaveChannelItems(items);
+  // Last of all, because every step above can separate two halves of one
+  // story: the rotation deals a block that ends between them, the shuffle
+  // scatters them, the interleaver puts four other shows in between. Gluing
+  // here is the only place that cannot be undone by a later step.
+  items = glueMultiPartEpisodes(items, playableItems, payload);
+  return { items, sourceItems, plan, day, seed };
+}
+
+async function buildChannelMeta(entry, origin, opts = {}) {
+  const payload = parseChannelPayload(entry.url);
+  if (!payload) return null;
+  // payload.channelId/payload.name (not entry.id/entry.name) are the real
+  // identity -- see the same note in fetchChannelCatalog above.
+  const channelId = payload.channelId || entry.id;
+  const name = payload.name || entry.name;
+  const lineup = await resolveChannelLineup(payload, opts);
+  if (!lineup) return null;
+  const items = lineup.items;
+  const sourceItems = lineup.sourceItems;
   const videos = items.map((it, i) => {
     // TMDB's air_date/release_date (and our own year-only fallback for
     // movies) are bare "YYYY-MM-DD" dates. Stremio Web's core is compiled
@@ -13358,8 +14699,8 @@ function buildChannelMeta(entry, origin) {
   const isShowPoster = Boolean(payload.poster && payload.poster.startsWith("http") && !payload.poster.includes("/api/channel-"));
 
   let matchedBackdrop = (payload.backdrop && payload.backdrop.startsWith("http") && !payload.backdrop.includes("/api/channel-")) ? payload.backdrop : null;
-  if (isShowPoster && !matchedBackdrop && Array.isArray(payload.items)) {
-    const match = payload.items.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
+  if (isShowPoster && !matchedBackdrop && sourceItems.length) {
+    const match = sourceItems.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
     if (match) {
       matchedBackdrop = match.backdrop || match.showBackdrop || match.thumbnail || null;
     }
@@ -14758,7 +16099,7 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
     cleanTmdbId = cleanTmdbId.slice(5).trim();
   }
   cleanTmdbId = cleanTmdbId.split(":")[0].trim();
-  if (!cleanTmdbId) return { imdbId: null, videos: null, hasDigitalRelease: null };
+  if (!cleanTmdbId) return { imdbId: null, videos: null, hasDigitalRelease: null, runtime: null };
 
   const cacheKey = `user_cache:tmdb_detail:${kind}:${cleanTmdbId}`;
   const cached = getPerUserCache(cacheKey);
@@ -14788,7 +16129,7 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
     headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
-  if (!res.ok) return { imdbId: null, videos: null, hasDigitalRelease: null };
+  if (!res.ok) return { imdbId: null, videos: null, hasDigitalRelease: null, runtime: null };
   const data = await res.json();
   const imdbId = (data.external_ids && data.external_ids.imdb_id) || data.imdb_id || null;
   const videos = (data.videos && data.videos.results) || null;
@@ -14809,7 +16150,15 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
   }
   const adult = data.adult === true || data.is_adult === true;
   const genres = Array.isArray(data.genres) ? data.genres.map((g) => (typeof g === "string" ? g : g.name || "")) : undefined;
-  const result = { imdbId, videos, hasDigitalRelease, adult, genres };
+  // Minutes. A movie has one; TMDB gives a SHOW an episode_run_time array
+  // instead, whose first entry is the typical episode length -- which is the
+  // fallback a channel uses for an episode TMDB has no per-episode runtime
+  // for. Null when there is nothing to say, so nothing downstream may
+  // require it.
+  let runtime = null;
+  if (Number.isInteger(data.runtime)) runtime = data.runtime;
+  else if (Array.isArray(data.episode_run_time) && Number.isInteger(data.episode_run_time[0])) runtime = data.episode_run_time[0];
+  const result = { imdbId, videos, hasDigitalRelease, adult, genres, runtime };
   // Cache for 7 days (604800s)
   setPerUserCache(cacheKey, result, 604800, 2592000);
 
@@ -19979,6 +21328,81 @@ ${seoHeadHtml}
     gap: 8px;
     margin-top: 8px;
   }
+  /* --- Channel broadcast schedule, Story Lock & the Quick Channel wizard -- */
+  .channel-rule-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    user-select: none;
+    line-height: 1.35;
+  }
+  .channel-rule-row input[type="checkbox"] {
+    margin: 2px 0 0;
+    flex: 0 0 auto;
+  }
+  .channel-dial {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .channel-dial input,
+  .channel-dial select {
+    width: auto;
+    min-width: 76px;
+    font-size: 0.82rem;
+    padding: 5px 8px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  /* Rearranging My Channels. The handle itself is .drag-handle-list, the
+     same one a list card uses; this is only what marks the card in flight. */
+  .list-card.dragging {
+    opacity: 0.55;
+    outline: 2px dashed var(--accent);
+    outline-offset: 2px;
+  }
+  .channel-pick-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 8px;
+  }
+  .channel-pick-selected img {
+    opacity: 0.72;
+  }
+  .channel-storylock-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 6px 12px;
+    margin-top: 6px;
+  }
+  .channel-wizard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .channel-wizard-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .channel-wizard-grid select {
+    font-size: 0.85rem;
+    padding: 6px 10px;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
   @media (min-width: 641px) {
     .channel-season-grid {
       grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
@@ -22278,6 +23702,7 @@ ${seoHeadHtml}
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeMovieBtn" onclick="switchListDetailsType('movie')">Movies</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeSeriesBtn" onclick="switchListDetailsType('series')">Shows</button>
+        <button type="button" class="subnav-pill generic-type-pill" id="detailTypeLineupBtn" onclick="switchListDetailsType('lineup')" style="display:none;">On Today</button>
         <button type="button" class="subnav-pill" id="cwClearHistoryBtn" onclick="clearContinueWatchingAll()" style="display:none; color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear All</button>
       </div>
       <div id="whSortControls" style="display:flex; align-items:center; gap:8px;">
@@ -22893,6 +24318,7 @@ if ('serviceWorker' in navigator) {
     <button type="button" class="subnav-pill active" data-sub="my-channels" onclick="switchChannelsSubmenu('my-channels', this)"><span class="check-icon">&#x2713;</span> My Channels</button>
     <button type="button" class="subnav-pill" data-sub="storylines" onclick="switchChannelsSubmenu('storylines', this)">Storylines &amp; Universes</button>
     <button type="button" class="subnav-pill" data-sub="quickadd" onclick="switchChannelsSubmenu('quickadd', this)">Quick Add</button>
+    <button type="button" class="subnav-pill" data-sub="explore" onclick="switchChannelsSubmenu('explore', this)">Explore Channels</button>
     <button type="button" class="subnav-pill" data-sub="import" onclick="switchChannelsSubmenu('import', this)">Import</button>
   </div>
 
@@ -22925,9 +24351,24 @@ if ('serviceWorker' in navigator) {
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="shelf-title">My Channels</h2>
-        <button type="button" class="primary lc-btn" onclick="openBuildCustomChannel()">+ New Channel</button>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button type="button" class="secondary lc-btn" onclick="createNextUpChannel(this)" title="A channel that always plays the next episode of everything you have on the go">+ Next Up Channel</button>
+          <button type="button" class="primary lc-btn" onclick="openBuildCustomChannel()">+ New Channel</button>
+        </div>
       </div>
-      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
+      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Your custom built and saved 24/7 TV channels. Play episodes continuously in broadcast order or daily shuffle.</p>
+      <div id="channelNextUpStatus" style="margin-bottom:8px;"></div>
+      <div class="row" id="myChannelsToolbar" style="margin-bottom:10px; gap:8px;">
+        <input type="text" id="myChannelsSearchInput" aria-label="Search your channels" placeholder="Search your channels..." oninput="setMyChannelsSearch(this.value)">
+        <select id="myChannelsSortSelect" aria-label="Order your channels" onchange="setMyChannelsSort(this.value)" style="flex:none; width:auto;">
+          <option value="recent">Recently updated</option>
+          <option value="created">Recently created</option>
+          <option value="name">Name (A&ndash;Z)</option>
+          <option value="size">Most episodes</option>
+          <option value="manual">My order (drag to arrange)</option>
+        </select>
+      </div>
+      <div id="myChannelsUndoBar" style="display:none; margin-bottom:10px;"></div>
       <div id="myCreatedChannelsList"><p style="color:var(--muted); font-size:0.85rem;"><small>No channels created yet. Tap <strong>+ New Channel</strong> above or add a popular network in <strong>Quick Add</strong>.</small></p></div>
     </div>
 
@@ -22963,6 +24404,77 @@ if ('serviceWorker' in navigator) {
 
   <!-- Submenu 2: Quick Add Popular Networks -->
   <div class="channels-subpanel" id="channelsSubQuickAdd" style="display:none;">
+    <div class="panel" style="margin-bottom:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Quick Channel Wizard</h2>
+      </div>
+      <p class="qa-shelf-sub">Pick a network, an era and a mood, and we will build the channel from the top shows that match &mdash; no blank canvas to fill in.</p>
+      <div class="channel-wizard-grid">
+        <label>Network or studio
+          <select id="channelWizardNetwork">
+            <option value="">Any network</option>
+            <option value="49">HBO</option>
+            <option value="88">FX</option>
+            <option value="80">Adult Swim</option>
+            <option value="13">Nickelodeon</option>
+            <option value="56">Cartoon Network</option>
+            <option value="54">Disney Channel</option>
+            <option value="4">BBC One</option>
+            <option value="67">Showtime</option>
+            <option value="174">AMC</option>
+            <option value="47">Comedy Central</option>
+            <option value="213">Netflix</option>
+            <option value="1024">Prime Video</option>
+            <option value="2552">Apple TV+</option>
+            <option value="2739">Disney+</option>
+            <option value="19">FOX</option>
+            <option value="6">NBC</option>
+            <option value="16">CBS</option>
+            <option value="2">ABC</option>
+            <option value="71">The CW</option>
+            <option value="149">Syfy</option>
+          </select>
+        </label>
+        <label>Era
+          <select id="channelWizardEra">
+            <option value="">Any era</option>
+            <option value="1970-1979">70s</option>
+            <option value="1980-1989">80s</option>
+            <option value="1990-1999">90s classics</option>
+            <option value="2000-2009">2000s</option>
+            <option value="2010-2014">Early 2010s</option>
+            <option value="2015-2099">Modern (2015+)</option>
+          </select>
+        </label>
+        <label>Genre or mood
+          <select id="channelWizardGenre">
+            <option value="">Any genre</option>
+            <option value="80,9648">Crime &amp; thrillers</option>
+            <option value="16">Saturday morning cartoons</option>
+            <option value="35">Chill comedy</option>
+            <option value="18">Drama</option>
+            <option value="10765">Sci-fi &amp; fantasy</option>
+            <option value="10759">Action &amp; adventure</option>
+            <option value="10751">Family</option>
+            <option value="99">Documentary</option>
+            <option value="10762">Kids</option>
+            <option value="9648">Mystery</option>
+          </select>
+        </label>
+        <label>Shows in the channel
+          <select id="channelWizardSize">
+            <option value="8">Top 8 shows</option>
+            <option value="12">Top 12 shows</option>
+            <option value="16">Top 16 shows</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <input type="text" id="channelWizardNameInput" placeholder="Channel name (left blank, we will name it for you)" style="flex:1;">
+        <button type="button" class="primary" onclick="runChannelWizard(this)">Build channel</button>
+      </div>
+      <div id="channelWizardStatus" style="margin-top:8px;"></div>
+    </div>
     <div class="panel">
       <div class="shelf-header" style="margin-bottom:8px;">
         <h2 class="shelf-title">Quick Add Popular Networks</h2>
@@ -23002,6 +24514,37 @@ if ('serviceWorker' in navigator) {
     </div>
   </div>
 
+  <!-- Submenu: Explore Channels (the community directory) -->
+  <div class="channels-subpanel" id="channelsSubExplore" style="display:none;">
+    <div class="panel">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Explore Channels</h2>
+        <button type="button" class="secondary lc-btn" onclick="loadChannelDirectory(true)">Refresh</button>
+      </div>
+      <p style="margin:0 0 14px; color:var(--muted); font-size:0.85rem;">
+        24/7 channels built and published by other people &mdash; &ldquo;Saturday Morning 90s&rdquo;, &ldquo;80s VHS Sci-Fi Vault&rdquo;, whatever anyone has put together. Add one to your own setup in a single click, then edit it however you like.
+      </p>
+      <div class="row" style="margin-bottom:10px; gap:8px;">
+        <input type="text" id="channelDirectorySearchInput" aria-label="Filter published channels" placeholder="Filter by name, description or creator..." oninput="renderChannelDirectory()">
+        <select id="channelDirectorySortSelect" aria-label="Order published channels" onchange="setChannelDirectorySort(this.value)" style="flex:none; width:auto;">
+          <option value="newest">Newest</option>
+          <option value="added">Most added</option>
+          <option value="liked">Most liked</option>
+          <option value="name">Name (A&ndash;Z)</option>
+        </select>
+      </div>
+      <div id="channelDirectoryFeed"><p style="color:var(--muted); font-size:0.85rem;"><small>Loading published channels&hellip;</small></p></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Publish one of your own</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Publishing needs a Creator Profile, so a listing has an owner who can take it down again. Sharing a private link does not &mdash; use <strong>Share</strong> on any channel under My Channels for that.</p>
+      <div id="channelPublishList"></div>
+    </div>
+  </div>
+
   <!-- Submenu 3: Import & Merge Tools -->
   <div class="channels-subpanel" id="channelsSubImport" style="display:none;">
     <div class="panel">
@@ -23016,6 +24559,23 @@ if ('serviceWorker' in navigator) {
         <input type="text" id="channelImportNameInput" placeholder="Channel name (e.g. Sitcom Central)">
         <button type="button" class="secondary" onclick="importChannelFromLink(this)">Import channel</button>
       </div>
+      <label class="channel-rule-row" style="margin-top:10px;">
+        <input type="checkbox" id="channelImportLiveSyncCheck" checked>
+        <span>Live Cloud Sync &mdash; keep this channel following the list instead of taking a one-time snapshot</span>
+      </label>
+      <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">The channel remembers the list URL and rebuilds its pool in the background, so titles the list gains turn up here on their own.</p>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">Add a shared channel</h2>
+      </div>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Paste a channel share link (or just its code) to rebuild that exact channel here &mdash; every pick, its play order and its broadcast schedule.</p>
+      <div class="row">
+        <input type="text" id="channelShareCodeInput" placeholder="https://... /channel/AbC123 &mdash; or the code on its own" onkeydown="if(event.key==='Enter'){event.preventDefault();importSharedChannel(this);}">
+        <button type="button" class="secondary" onclick="importSharedChannel(this)">Add channel</button>
+      </div>
+      <div id="channelShareImportStatus" style="margin-top:8px;"></div>
     </div>
   </div>
 
@@ -23029,6 +24589,7 @@ if ('serviceWorker' in navigator) {
       <div class="subnav-pills-bar" id="channelSearchTypeChips" style="margin-bottom:10px;">
         <button type="button" class="subnav-pill active" id="channelSearchTypeShowsBtn" onclick="setChannelSearchType('tv', this)"><span class="check-icon">&#x2713;</span> Shows</button>
         <button type="button" class="subnav-pill" id="channelSearchTypeMoviesBtn" onclick="setChannelSearchType('movie', this)">Movies</button>
+        <button type="button" class="subnav-pill" id="channelSearchTypePeopleBtn" onclick="setChannelSearchType('person', this)">Actors &amp; Directors</button>
       </div>
       <div class="row">
         <input type="text" id="channelSearchInput" placeholder="Search a show by name..." onkeydown="if(event.key==='Enter'){event.preventDefault();runChannelTitleSearch();}">
@@ -23039,7 +24600,26 @@ if ('serviceWorker' in navigator) {
 
       <div id="channelCrossoverSuggestions" style="display:none; margin-top:14px;"></div>
 
-      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel:</p>
+      <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this channel: <span id="channelDraftCountBadge" style="color:var(--muted); font-weight:500;"></span></p>
+      <div id="channelDraftStats" style="margin:0 0 8px; color:var(--muted); font-size:0.78rem;"></div>
+      <div class="row" style="margin-bottom:8px; gap:8px;">
+        <input type="text" id="channelDraftFilterInput" aria-label="Filter these picks" placeholder="Filter these picks by show or episode name..." oninput="setChannelDraftFilter(this.value)">
+        <button type="button" class="secondary lc-btn" id="channelDraftSelectModeBtn" style="flex:none; width:auto; white-space:nowrap;" onclick="toggleChannelDraftSelectMode()">Select</button>
+      </div>
+      <div id="channelDraftBulkBar" style="display:none; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:8px; padding:8px; border:1px solid var(--border); border-radius:8px; background:var(--surface);">
+        <span id="channelDraftSelectionCount" style="font-size:0.8rem; font-weight:600;">0 selected</span>
+        <button type="button" class="secondary lc-btn" onclick="selectAllChannelDraftShown(true)">Select shown</button>
+        <button type="button" class="secondary lc-btn" onclick="selectAllChannelDraftShown(false)">Clear</button>
+        <select id="channelDraftSelectShowSelect" onchange="selectChannelDraftByGroup(this.value); this.selectedIndex = 0;" style="font-size:0.82rem; padding:5px 8px; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+          <option value="">Select a whole show or season&hellip;</option>
+        </select>
+        <span style="flex:1;"></span>
+        <button type="button" class="secondary lc-btn" onclick="pairChannelDraftSelection()" title="Play these picks back to back, in this order">Pair</button>
+        <button type="button" class="secondary lc-btn" onclick="unpairChannelDraftSelection()" title="Drop any hand-made pairing on these picks">Unpair</button>
+        <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('top')">To top</button>
+        <button type="button" class="secondary lc-btn" onclick="moveChannelDraftSelection('bottom')">To bottom</button>
+        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeChannelDraftSelection()">Remove selected</button>
+      </div>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove all</button>
@@ -23051,12 +24631,74 @@ if ('serviceWorker' in navigator) {
           <option value="aired-asc">Air date &mdash; oldest first</option>
           <option value="aired-desc">Air date &mdash; newest first</option>
           <option value="show-season-episode">Show, then season &amp; episode</option>
+          <option value="interleave">Interleaved &mdash; one episode per show, in turn</option>
           <option value="title-az">Title A&ndash;Z</option>
           <option value="shuffle-now">Shuffle now</option>
           <option value="shuffle-daily">Shuffle daily (reshuffles every 24h)</option>
         </select>
       </div>
       <p id="channelPlayOrderHint" style="margin:6px 0 0; color:var(--muted); font-size:0.78rem;">Picks play in the order listed above &mdash; drag one, or type a new position, to change it.</p>
+
+      <!-- Broadcast schedule & smart rules -->
+      <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+        <p style="margin:0 0 8px; font-weight:600; font-size:0.85rem;">Broadcast schedule</p>
+        <label class="channel-rule-row">
+          <input type="checkbox" id="channelDailyRotateCheck" onchange="updateChannelBroadcastControls()">
+          <span>Daily Broadcast Schedule &mdash; run a fresh lineup out of these picks every day</span>
+        </label>
+        <div id="channelDailyRotateDials" style="display:none; margin:8px 0 0 24px; flex-wrap:wrap; gap:10px;">
+          <label class="channel-dial">Shows per day
+            <input type="number" id="channelRotateShowsInput" min="1" max="48" step="1" value="24" onchange="updateChannelBroadcastControls()">
+          </label>
+          <label class="channel-dial">Episodes per block
+            <input type="number" id="channelRotateEpisodesInput" min="1" max="12" step="1" value="3" onchange="updateChannelBroadcastControls()">
+          </label>
+          <label class="channel-dial">Turns over at
+            <input type="time" id="channelRotateTurnoverTime" value="00:00" onchange="updateChannelBroadcastControls()">
+          </label>
+          <label class="channel-dial">In
+            <select id="channelRotateTurnoverZone" onchange="updateChannelBroadcastControls()">
+              <option value="utc">UTC</option>
+              <option value="local">my local time</option>
+            </select>
+          </label>
+        </div>
+        <p id="channelDailyRotateHint" style="margin:6px 0 0 24px; color:var(--muted); font-size:0.78rem;">Off &mdash; every pick in this channel plays, in the order above.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelHideWatchedCheck">
+          <span>Hide watched &mdash; skip episodes already in my Watch History</span>
+        </label>
+        <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Needs Auto-track playback signed in. Once every pick has been seen, the whole channel comes back rather than going dark. Leave it off to keep watched episodes in the rotation.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelPairPartsCheck" onchange="updateChannelBroadcastControls()">
+          <span>Keep multi-part episodes together</span>
+        </label>
+        <p id="channelPairPartsHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Finds &ldquo;Part 1&rdquo; / &ldquo;Pt. II&rdquo; / &ldquo;(2)&rdquo; in episode titles. Whenever one part is on today, the rest play straight after it instead of turning up tomorrow.</p>
+
+        <label class="channel-rule-row" style="margin-top:10px;">
+          <input type="checkbox" id="channelAutoNewEpisodesCheck" onchange="updateChannelBroadcastControls()">
+          <span>Automatically add new episodes</span>
+        </label>
+        <div id="channelNewEpisodesRow" style="display:none; margin:6px 0 0 24px;">
+          <label class="channel-rule-row">
+            <input type="checkbox" id="channelNewEpisodesTopCheck">
+            <span>Put new episodes at the top</span>
+          </label>
+        </div>
+        <p id="channelAutoNewEpisodesHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Off &mdash; this channel plays the picks below and nothing else.</p>
+
+        <div id="channelLiveSyncRow" style="display:none; margin-top:10px;">
+          <label class="channel-rule-row">
+            <input type="checkbox" id="channelLiveSyncCheck">
+            <span>Live Cloud Sync &mdash; refresh this channel from its source list</span>
+          </label>
+          <p id="channelLiveSyncHint" style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;"></p>
+        </div>
+
+        <div id="channelStoryLockSection" style="margin-top:12px;"></div>
+      </div>
 
       <!-- Channel Poster Selection Section -->
       <div id="channelPosterPickerSection" style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; display:none;">
@@ -23077,6 +24719,9 @@ if ('serviceWorker' in navigator) {
       </div>
 
       <div class="row" style="margin-top:12px;">
+        <input type="text" id="channelDescriptionInput" placeholder="One line about this channel (optional) &mdash; shown wherever you share it" style="flex:1; font-size:0.85rem;" maxlength="400">
+      </div>
+      <div class="row" style="margin-top:8px;">
         <input type="text" id="channelNameInput" placeholder="Channel name (e.g. Comedy Night)" style="flex:1;">
         <button type="button" class="primary" id="channelSaveBtn" onclick="saveChannel()">Save</button>
         <button type="button" id="channelCancelEditBtn" class="secondary" style="display:none;" onclick="cancelEditChannel()">Cancel</button>
@@ -24787,7 +26432,7 @@ function showAppAlert(title, message, isSuccess = false) {
       '</h3>' +
       '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
-    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
       '<button type="button" class="primary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">OK</button>' +
     '</div>';
@@ -24816,7 +26461,7 @@ function showAppBusy(title, message) {
       '<span class="app-spinner" aria-hidden="true"></span> ' +
       escapeHtml(title) +
     '</h3>' +
-    '<p role="status" aria-live="polite" style="margin:0; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message || '') + '</p>';
+    '<p role="status" aria-live="polite" style="margin:0; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message || '') + '</p>';
   showModal(html);
 }
 
@@ -24832,7 +26477,7 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
       '</h3>' +
       '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
     '</div>' +
-    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap;">' + escapeHtml(message) + '</p>' +
+    '<p style="margin:0 0 16px; color:var(--muted); font-size:0.9rem; line-height:1.4; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word;">' + escapeHtml(message) + '</p>' +
     '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
       '<button type="button" class="secondary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">Cancel</button>' +
       '<button type="button" class="primary" id="appConfirmBtn" style="min-width:80px; padding:8px 16px; ' + confirmBtnStyle + '">' + escapeHtml(confirmBtnText || 'Confirm') + '</button>' +
@@ -34672,7 +36317,7 @@ function channelStreamShowId(imdbId, tmdbId) {
 }
 
 function setChannelSearchType(type, btn) {
-  channelSearchType = type === 'movie' ? 'movie' : 'tv';
+  channelSearchType = (type === 'movie' || type === 'person') ? type : 'tv';
   const bar = document.getElementById('channelSearchTypeChips');
   if (bar) {
     bar.querySelectorAll('.subnav-pill').forEach((p) => {
@@ -34687,11 +36332,18 @@ function setChannelSearchType(type, btn) {
   }
   const input = document.getElementById('channelSearchInput');
   if (input) {
-    input.placeholder = channelSearchType === 'movie' ? 'Search a movie by name...' : 'Search a show by name...';
+    input.placeholder = channelSearchType === 'movie'
+      ? 'Search a movie by name...'
+      : (channelSearchType === 'person'
+        ? 'Search an actor, director or creator...'
+        : 'Search a show by name...');
   }
   const box = document.getElementById('channelSearchResult');
   const epBox = document.getElementById('channelEpisodePicker');
   if (epBox) epBox.innerHTML = '';
+  // The picker below is about to be reused for a different kind of thing,
+  // so the filmography it may be holding stops being what is on screen.
+  channelPersonCredits = null;
   const q = input ? input.value.trim() : '';
   if (q) {
     runChannelTitleSearch();
@@ -34706,6 +36358,13 @@ async function runChannelTitleSearch() {
   document.getElementById('channelEpisodePicker').innerHTML = '';
   if (!q) {
     box.innerHTML = '';
+    return;
+  }
+  // A person is not a title, and the two searches answer different
+  // questions -- so Actors & Directors goes to its own endpoint and its own
+  // result card (see runChannelPersonSearch).
+  if (channelSearchType === 'person') {
+    await runChannelPersonSearch(q);
     return;
   }
   box.innerHTML = '<p><small>Searching\u2026</small></p>';
@@ -34751,6 +36410,14 @@ function renderChannelTitleResults(results, searchType = 'tv') {
 }
 
 document.getElementById('channelSearchResult').addEventListener('click', (e) => {
+  // A person card behaves like a show card: tapping the photo (or the
+  // button) opens what they have been in, below, rather than committing to
+  // a whole channel in one click.
+  const personTarget = e.target.closest('.channelPersonCard, .channelPersonBtn');
+  if (personTarget) {
+    browseChannelPerson(personTarget.dataset.personid, personTarget.dataset.personname);
+    return;
+  }
   const showTarget = e.target.closest('.channelTitleCard, .channelTitleBtn');
   if (showTarget) {
     browseChannelShow(showTarget.dataset.tmdbid, showTarget.dataset.title, showTarget.dataset.poster, showTarget.dataset.backdrop);
@@ -34769,13 +36436,18 @@ document.getElementById('channelSearchResult').addEventListener('click', (e) => 
   }
 });
 
-async function addMovieToChannelDraft(tmdbId, title, year, poster, backdrop, btn) {
+async function addMovieToChannelDraft(tmdbId, title, year, poster, backdrop, btn, duplicateChecked) {
   if (channelDraftItems.length >= CHANNEL_MAX_TOTAL_ITEMS) {
     if (typeof showAppAlert === 'function') {
       showAppAlert('Channel Limit', 'This channel has reached the maximum of ' + CHANNEL_MAX_TOTAL_ITEMS + ' items.');
     }
     return;
   }
+  if (!duplicateChecked && guardChannelDraftDuplicate(
+    title || 'That movie',
+    channelDraftItems.filter((it) => it && it.kind === 'movie' && String(it.tmdbId || '') === String(tmdbId || '')).length,
+    () => addMovieToChannelDraft(tmdbId, title, year, poster, backdrop, btn, true)
+  )) return;
   const originalText = btn ? btn.textContent : '+ Add Movie';
   if (btn) {
     btn.disabled = true;
@@ -34803,6 +36475,7 @@ async function addMovieToChannelDraft(tmdbId, title, year, poster, backdrop, btn
       showName: title,
       epName: 'Movie',
       released: year ? (year + '-01-01') : '',
+      runtime: data.runtime || 0,
       thumbnail: backdrop || poster || '',
       poster: poster || '',
       showPoster: poster || '',
@@ -34872,6 +36545,33 @@ async function browseChannelShow(tmdbId, showName, showPoster, showBackdrop) {
 }
 
 document.getElementById('channelEpisodePicker').addEventListener('click', (e) => {
+  const personMovie = e.target.closest('.channelPersonMovieCard, .channelPersonMovieBtn');
+  if (personMovie) {
+    addMovieToChannelDraft(
+      personMovie.dataset.tmdbid, personMovie.dataset.title, personMovie.dataset.year,
+      personMovie.dataset.poster, personMovie.dataset.backdrop,
+      personMovie.querySelector('.channelPersonMovieBtn') || personMovie
+    );
+    return;
+  }
+  // The button is the precise action -- only the episodes this person is
+  // in -- and the poster beside it is the escape hatch to the full season
+  // picker, for when the whole show is what you actually want.
+  const personShowBtn = e.target.closest('.channelPersonShowBtn');
+  if (personShowBtn) {
+    addPersonShowEpisodes(personShowBtn.dataset.tmdbid, personShowBtn.dataset.title, personShowBtn.dataset.poster, personShowBtn);
+    return;
+  }
+  const personShow = e.target.closest('.channelPersonShowCard');
+  if (personShow) {
+    browseChannelShow(personShow.dataset.tmdbid, personShow.dataset.title, personShow.dataset.poster, personShow.dataset.backdrop);
+    return;
+  }
+  const personAddAll = e.target.closest('.channelPersonAddAllBtn');
+  if (personAddAll) {
+    addWholeSpotlightToDraft(personAddAll);
+    return;
+  }
   const seasonBtn = e.target.closest('.channelSeasonBtn');
   if (seasonBtn) {
     loadChannelSeasonEpisodes(
@@ -34903,10 +36603,15 @@ document.getElementById('channelEpisodePicker').addEventListener('click', (e) =>
 // see /api/show-episodes) and adds all of them in original broadcast order,
 // for "just give me the whole show" instead of clicking through season by
 // season.
-async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, showBackdrop, seasonsCsv, btn) {
+async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, showBackdrop, seasonsCsv, btn, duplicateChecked) {
   const seasons = String(seasonsCsv || '').split(',').map((s) => s.trim()).filter(Boolean);
   if (!seasons.length) return;
   const showStreamId = channelStreamShowId(imdbId, tmdbId);
+  if (!duplicateChecked && guardChannelDraftDuplicate(
+    showName || 'That show',
+    channelDraftCountForShow(showStreamId, showName),
+    () => addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, showBackdrop, seasonsCsv, btn, true)
+  )) return;
   if (btn) {
     btn.disabled = true;
     btn.textContent = 'Adding every season\u2026';
@@ -34932,6 +36637,7 @@ async function addAllSeasonsToChannel(tmdbId, imdbId, showName, showPoster, show
             epName: ep.name || ('Episode ' + ep.episode),
             title: (showName ? showName + ' S' + season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.name || ('Episode ' + ep.episode)),
             released: ep.released,
+            runtime: ep.runtime || 0,
             thumbnail: ep.thumbnail || showBackdrop || showPoster,
             poster: showPoster || ep.thumbnail || showBackdrop || '',
             showPoster: showPoster || '',
@@ -34982,7 +36688,7 @@ async function loadChannelSeasonEpisodes(tmdbId, imdbId, showName, showPoster, s
     }
     const rows = data.episodes.map((ep) => {
       const epJson = escapeAttr(JSON.stringify({
-        season: parseInt(season, 10), episode: ep.episode, title: ep.name, released: ep.released, thumbnail: ep.thumbnail,
+        season: parseInt(season, 10), episode: ep.episode, title: ep.name, released: ep.released, thumbnail: ep.thumbnail, runtime: ep.runtime || 0,
       }));
       return '<label class="row quick-row" style="cursor:pointer;">' +
         '<span><input type="checkbox" class="channelEpisodeCheck" data-ep="' + epJson + '"> ' +
@@ -35033,6 +36739,7 @@ function addCheckedEpisodesToChannel(imdbId, showName, showPoster, showBackdrop,
       epName: ep.title || ('Episode ' + ep.episode),
       title: (showName ? showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.title || ('Episode ' + ep.episode)),
       released: ep.released,
+      runtime: ep.runtime || 0,
       thumbnail: ep.thumbnail || showBackdrop || showPoster,
       poster: showPoster || ep.thumbnail || showBackdrop || '',
       showPoster: showPoster || '',
@@ -35117,6 +36824,11 @@ function compactChannelItemForStorage(it) {
   if (it.released) {
     out.released = it.released.length > 10 ? it.released.slice(0, 10) : it.released;
   }
+  // Minutes, when TMDB had them. Only written when there is a real number to
+  // write -- a zero runtime on every one of 5,000 picks is 15KB of
+  // localStorage spent saying nothing.
+  const runtime = Number(it.runtime);
+  if (Number.isInteger(runtime) && runtime > 0) out.runtime = runtime;
   const poster = it.poster || it.showPoster || it.thumbnail || '';
   const thumbnail = it.thumbnail || '';
   const showPoster = it.showPoster || '';
@@ -35153,7 +36865,9 @@ function saveLocalChannelsMap(map) {
       shuffle: !!ch.shuffle,
       autoSort: ch.autoSort || '',
       sortByAired: !!ch.sortByAired,
-      dailyRotate: !!ch.dailyRotate,
+      ...channelBroadcastFields(ch),
+      ...channelShareFields(ch),
+      order: Number(ch.order) || 0,
       createdAt: ch.createdAt || Date.now(),
       updatedAt: ch.updatedAt || Date.now(),
     };
@@ -35247,7 +36961,9 @@ function ensureAllChannelsSyncedFromRows(map) {
                   shuffle: !!payload.shuffle,
                   autoSort: payload.autoSort || '',
                   sortByAired: !!payload.sortByAired,
-                  dailyRotate: !!payload.dailyRotate,
+                  ...channelBroadcastFields(payload),
+                  ...channelShareFields(payload),
+                  order: Number(payload.order) || 0,
                   createdAt: Date.now(),
                   updatedAt: Date.now(),
                 };
@@ -35280,7 +36996,11 @@ function saveLocalChannel(payload) {
     shuffle: !!payload.shuffle,
     autoSort: payload.autoSort || '',
     sortByAired: !!payload.sortByAired,
-    dailyRotate: !!payload.dailyRotate,
+    ...channelBroadcastFields(payload),
+    ...channelShareFields(payload),
+    // Kept from the existing record when a save does not carry one, so
+    // editing a channel never knocks it out of the order someone arranged.
+    order: Number(payload.order) || (existing ? Number(existing.order) : 0) || 0,
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now,
   };
@@ -35325,6 +37045,264 @@ function pruneChannelFromAllMerges(channelId) {
   return changed;
 }
 
+// --- My Channels: ordering, searching, and taking a delete back ----------
+//
+// Past a dozen or so channels the list is a long scroll with no way to find
+// anything in it, and deleting one was the only destructive action in the
+// app with no undo behind it.
+let myChannelsSort = 'recent';
+let myChannelsSearch = '';
+let _pendingChannelUndo = null;
+let _pendingChannelUndoTimer = null;
+
+function setMyChannelsSort(value) {
+  myChannelsSort = value || 'recent';
+  try { localStorage.setItem('myListAddon:myChannelsSort', myChannelsSort); } catch (e) {}
+  renderMyCreatedChannelsList();
+}
+
+function setMyChannelsSearch(value) {
+  myChannelsSearch = String(value || '');
+  renderMyCreatedChannelsList();
+}
+
+function sortMyChannels(channels, mode) {
+  const how = mode || myChannelsSort;
+  const list = channels.slice();
+  if (how === 'name') {
+    list.sort((a, b) => String(a.name || '').toLowerCase().localeCompare(String(b.name || '').toLowerCase()));
+  } else if (how === 'size') {
+    list.sort((a, b) => ((b.items || []).length - (a.items || []).length));
+  } else if (how === 'created') {
+    list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  } else if (how === 'manual') {
+    // A channel with no order yet sorts after every channel that has one,
+    // by how recently it was touched -- so a newly added channel lands at
+    // the end of an arrangement rather than somewhere in the middle of it.
+    list.sort((a, b) => {
+      const oa = Number(a.order) || 0;
+      const ob = Number(b.order) || 0;
+      if (oa && ob) return oa - ob;
+      if (oa) return -1;
+      if (ob) return 1;
+      return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
+    });
+  } else {
+    list.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  }
+  return list;
+}
+
+function filterMyChannels(channels) {
+  const q = myChannelsSearch.trim().toLowerCase();
+  if (!q) return channels;
+  return channels.filter((ch) => {
+    if (!ch) return false;
+    if (String(ch.name || '').toLowerCase().indexOf(q) !== -1) return true;
+    if (String(ch.description || '').toLowerCase().indexOf(q) !== -1) return true;
+    // A channel is also findable by what is IN it, which is usually how
+    // people remember one -- "the one with Rugrats in".
+    return (ch.items || []).some((it) => it && String(it.showName || '').toLowerCase().indexOf(q) !== -1);
+  });
+}
+
+// The undo bar, and the timer that retires it.
+//
+// Held for a minute, and cleared when it is used or when the page moves on
+// -- an Undo still sitting there ten minutes later is a promise about state
+// that has since changed underneath it.
+function offerChannelDeleteUndo(snapshot, wasInCatalogs) {
+  _pendingChannelUndo = { channel: snapshot, inCatalogs: wasInCatalogs };
+  if (_pendingChannelUndoTimer) clearTimeout(_pendingChannelUndoTimer);
+  _pendingChannelUndoTimer = setTimeout(() => {
+    _pendingChannelUndo = null;
+    renderChannelUndoBar();
+  }, 60000);
+  renderChannelUndoBar();
+}
+
+function renderChannelUndoBar() {
+  const bar = document.getElementById('myChannelsUndoBar');
+  if (!bar) return;
+  if (!_pendingChannelUndo) {
+    bar.style.display = 'none';
+    bar.innerHTML = '';
+    return;
+  }
+  const name = _pendingChannelUndo.channel.name || 'Channel';
+  bar.style.display = 'block';
+  bar.innerHTML = '<div class="row" style="gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--surface);">' +
+    '<span style="flex:1; font-size:0.85rem;">Deleted &ldquo;' + escapeHtml(name) + '&rdquo;.</span>' +
+    '<button type="button" class="secondary lc-btn" onclick="undoChannelDelete()">Undo</button>' +
+    '</div>';
+}
+
+function undoChannelDelete() {
+  if (!_pendingChannelUndo) return;
+  const { channel, inCatalogs } = _pendingChannelUndo;
+  _pendingChannelUndo = null;
+  if (_pendingChannelUndoTimer) clearTimeout(_pendingChannelUndoTimer);
+  saveLocalChannel(channel);
+  if (inCatalogs) {
+    const payload = Object.assign({}, channel);
+    addRow(channel.name || 'Channel', 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channel.channelId);
+    saveState();
+  }
+  renderChannelUndoBar();
+  renderMyCreatedChannelsList();
+  renderChannelMergeList();
+  showAddedToast('Restored channel "' + (channel.name || 'Channel') + '".');
+}
+
+
+// --- arranging My Channels by hand ---------------------------------------
+//
+// The same three ways My Lists lets a catalog row be moved -- a drag handle,
+// up/down buttons, and a position you can type -- because past a dozen
+// channels "recently updated" is not an order anyone chose.
+//
+// All three work on the list AS SHOWN. A filter or another ordering means
+// the cards on screen are a subset in a different sequence, so a move
+// permutes the visible channels among the slots they already occupy in the
+// stored arrangement and leaves every hidden channel exactly where it is --
+// the same rule the channel draft's own filtered drag follows, and for the
+// same reason: rebuilding an order from a partial view loses whatever the
+// view was hiding.
+function visibleMyChannelIds() {
+  const box = document.getElementById('myCreatedChannelsList');
+  if (!box) return [];
+  return [...box.querySelectorAll('.list-card[data-channel-id]')]
+    .map((card) => card.getAttribute('data-channel-id'))
+    .filter(Boolean);
+}
+
+// Rearranging while another ordering is on screen adopts THAT as the
+// starting arrangement, so the card lands where it was dropped rather than
+// somewhere in a stored order nobody was looking at.
+function seedMyChannelsManualOrder() {
+  const map = loadLocalChannels();
+  const displayed = sortMyChannels(Object.values(map));
+  let changed = false;
+  displayed.forEach((ch, i) => {
+    if (!ch || !map[ch.channelId]) return;
+    if (Number(map[ch.channelId].order) !== i + 1) {
+      map[ch.channelId].order = i + 1;
+      changed = true;
+    }
+  });
+  if (changed) saveLocalChannelsMap(map);
+}
+
+function applyMyChannelOrder(visibleIdsInNewOrder) {
+  const map = loadLocalChannels();
+  const all = sortMyChannels(Object.values(map), 'manual');
+  const wanted = {};
+  visibleIdsInNewOrder.forEach((id) => { wanted[id] = true; });
+  // The positions the visible channels hold in the full arrangement. The
+  // hidden ones keep theirs untouched.
+  const slots = [];
+  all.forEach((ch, i) => { if (ch && wanted[ch.channelId]) slots.push(i); });
+  const next = all.slice();
+  visibleIdsInNewOrder.forEach((id, n) => {
+    if (n < slots.length && map[id]) next[slots[n]] = map[id];
+  });
+  next.forEach((ch, i) => {
+    if (ch && map[ch.channelId]) map[ch.channelId].order = i + 1;
+  });
+  saveLocalChannelsMap(map);
+  // Arranging by hand IS choosing the hand-made order, so the dropdown
+  // follows rather than leaving the list to re-sort out from under it.
+  myChannelsSort = 'manual';
+  try { localStorage.setItem('myListAddon:myChannelsSort', 'manual'); } catch (e) {}
+  renderMyCreatedChannelsList();
+}
+
+function beginMyChannelReorder() {
+  if (myChannelsSort !== 'manual') seedMyChannelsManualOrder();
+}
+
+// Drag-to-reorder. Mouse goes through HTML5 drag-and-drop and touch/pen
+// through Pointer Events, which is the same split My Lists uses and for the
+// same reason: native drag-and-drop generally does not fire on touch at all.
+let myChannelDragCard = null;
+let myChannelTouchCard = null;
+let myChannelsDragBound = false;
+
+function myChannelDragAfterElement(container, y) {
+  const cards = [...container.querySelectorAll('.list-card[data-channel-id]:not(.dragging)')];
+  return cards.reduce((closest, child) => {
+    const box = child.getBoundingClientRect();
+    const offset = y - box.top - box.height / 2;
+    if (offset < 0 && offset > closest.offset) return { offset: offset, element: child };
+    return closest;
+  }, { offset: -Infinity, element: null }).element;
+}
+
+function moveMyChannelDragCard(container, card, clientY) {
+  const afterEl = myChannelDragAfterElement(container, clientY);
+  if (afterEl == null) container.appendChild(card);
+  else if (afterEl !== card) container.insertBefore(card, afterEl);
+}
+
+// Bound once on the container rather than per card, because the card list is
+// re-rendered wholesale on every change and per-card listeners would be
+// re-attached (and leak) each time.
+function initMyChannelsDrag() {
+  const container = document.getElementById('myCreatedChannelsList');
+  if (!container || myChannelsDragBound) return;
+  myChannelsDragBound = true;
+
+  container.addEventListener('dragstart', (e) => {
+    const handle = e.target.closest('.channel-drag-handle');
+    if (!handle) { e.preventDefault(); return; }
+    myChannelDragCard = handle.closest('.list-card[data-channel-id]');
+    if (!myChannelDragCard) return;
+    myChannelDragCard.classList.add('dragging');
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+  });
+
+  container.addEventListener('dragover', (e) => {
+    if (!myChannelDragCard) return;
+    e.preventDefault();
+    moveMyChannelDragCard(container, myChannelDragCard, e.clientY);
+  });
+
+  container.addEventListener('dragend', () => {
+    if (!myChannelDragCard) return;
+    myChannelDragCard.classList.remove('dragging');
+    myChannelDragCard = null;
+    beginMyChannelReorder();
+    applyMyChannelOrder(visibleMyChannelIds());
+  });
+
+  const onTouchMove = (e) => {
+    if (!myChannelTouchCard) return;
+    moveMyChannelDragCard(container, myChannelTouchCard, e.clientY);
+  };
+  const onTouchEnd = () => {
+    document.removeEventListener('pointermove', onTouchMove);
+    if (!myChannelTouchCard) return;
+    myChannelTouchCard.classList.remove('dragging');
+    myChannelTouchCard = null;
+    beginMyChannelReorder();
+    applyMyChannelOrder(visibleMyChannelIds());
+  };
+
+  container.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
+    const handle = e.target.closest('.channel-drag-handle');
+    if (!handle) return;
+    e.preventDefault();
+    myChannelTouchCard = handle.closest('.list-card[data-channel-id]');
+    if (!myChannelTouchCard) return;
+    myChannelTouchCard.classList.add('dragging');
+    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+    document.addEventListener('pointermove', onTouchMove);
+    document.addEventListener('pointerup', onTouchEnd, { once: true });
+    document.addEventListener('pointercancel', onTouchEnd, { once: true });
+  });
+}
+
 function deleteLocalChannel(channelId, fallbackName) {
   const map = loadLocalChannels();
   const channel = map[channelId];
@@ -35341,6 +37319,25 @@ function deleteLocalChannel(channelId, fallbackName) {
   if (!name || name === 'Channel') name = (channel && channel.name) || 'Channel';
 
   const performDelete = () => {
+    // A published channel is withdrawn from the directory as it goes.
+    //
+    // Deleting only removed this browser's copy, so a listing stayed up
+    // advertising a channel its owner had deleted -- and with the local
+    // record gone the code went too, leaving nothing to unpublish WITH.
+    // Fired before the record is dropped, for the code; the publish panel
+    // lists any that slip through anyway (see renderChannelPublishList), so
+    // this is a best effort rather than the only chance.
+    if (channel && channel.shareCode && channel.sharePublished) {
+      unpublishChannelByCode(channel.shareCode).catch(() => {});
+    }
+    // Kept whole before it goes, so Undo can put back the channel AND its
+    // place in Catalogs. A catalog row has had removeEntryWithUndo since
+    // long before this; deleting a channel -- which can be eight hundred
+    // hand-picked episodes -- was immediate and final.
+    const snapshot = channel ? JSON.parse(JSON.stringify(channel)) : null;
+    const wasInCatalogs = [...document.querySelectorAll('#lists .entry .url')]
+      .some((u) => String(u.value || '').indexOf(channelId) !== -1);
+
     delete map[channelId];
     saveLocalChannelsMap(map);
     pruneChannelFromAllMerges(channelId);
@@ -35355,6 +37352,7 @@ function deleteLocalChannel(channelId, fallbackName) {
       });
     });
     saveState();
+    if (snapshot) offerChannelDeleteUndo(snapshot, wasInCatalogs);
     renderMyCreatedChannelsList();
     renderChannelMergeList();
     showAddedToast('Deleted channel "' + name + '".');
@@ -35418,9 +37416,17 @@ function renderChannelDraftList() {
     box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p>';
     renderChannelPosterPicker();
     renderChannelCrossoverSuggestions();
+    updateChannelBroadcastControls();
+    renderChannelDraftStats();
+    renderChannelDraftGroupOptions();
     return;
   }
-  const cardsHtml = channelDraftItems.map((it, i) => {
+  // The filter decides what is drawn; every index below stays the index into
+  // channelDraftItems, never a position in the filtered view, so a drag or a
+  // typed position means the same thing filtered or not.
+  const visible = channelDraftVisibleIndices();
+  const cardsHtml = visible.map((i) => {
+    const it = channelDraftItems[i];
     let showName = it.showName || '';
     let epName = it.epName || '';
     let seasonEp = '';
@@ -35462,23 +37468,48 @@ function renderChannelDraftList() {
       ? '<img class="live-preview-poster" src="' + escapeAttr(posterSrc) + '" alt="" loading="lazy">'
       : '<div class="live-preview-poster live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
 
-    return '<div class="live-preview-poster-card channel-pick" data-idx="' + i + '" style="position:relative; cursor:grab; user-select:none; touch-action:manipulation;">' +
+    // Dragging is off while selecting: a drag and a tap-to-select on the
+    // same card are the same gesture on a touch screen, and one of the two
+    // has to give.
+    const selecting = channelDraftSelectMode;
+    const selectBox = selecting
+      ? '<div style="position:absolute; top:4px; left:4px; z-index:5;">' +
+          '<input type="checkbox" class="channelPickCheck" data-idx="' + i + '"' + (isChannelDraftSelected(i) ? ' checked' : '') +
+          ' aria-label="Select this pick" style="width:20px; height:20px; accent-color:var(--accent); cursor:pointer;">' +
+        '</div>'
+      : '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
+          '<input type="number" class="pos channelPosInput" min="1" max="' + channelDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
+        '</div>';
+    return '<div class="live-preview-poster-card channel-pick' + (selecting && isChannelDraftSelected(i) ? ' channel-pick-selected' : '') + '" data-idx="' + i + '" style="position:relative; cursor:' + (selecting ? 'pointer' : 'grab') + '; user-select:none; touch-action:manipulation;">' +
       '<div style="position:relative; width:100%;">' +
         posterEl +
-        '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
-          '<input type="number" class="pos channelPosInput" min="1" max="' + channelDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
-        '</div>' +
-        '<button type="button" class="cw-remove-btn channelRemovePickBtn" title="Remove pick" style="z-index:4;">&times;</button>' +
+        selectBox +
+        (selecting ? '' : '<button type="button" class="cw-remove-btn channelRemovePickBtn" title="Remove pick" style="z-index:4;">&times;</button>') +
       '</div>' +
       '<div class="live-preview-poster-name" title="' + escapeAttr(firstLine) + '">' + escapeHtml(firstLine) + '</div>' +
       '<div class="live-preview-poster-year" title="' + escapeAttr(secondLine) + '">' + escapeHtml(secondLine) + '</div>' +
     '</div>';
   }).join('');
   
-  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>';
+  box.innerHTML = visible.length
+    ? '<div class="poster-grid-3" style="margin-top:10px;">' + cardsHtml + '</div>'
+    : '<p style="color:var(--muted); font-size:0.85rem;"><small>No pick in this channel matches that filter.</small></p>';
+  const bulkBar = document.getElementById('channelDraftBulkBar');
+  if (bulkBar) bulkBar.style.display = channelDraftSelectMode ? 'flex' : 'none';
+  const modeBtn = document.getElementById('channelDraftSelectModeBtn');
+  if (modeBtn) modeBtn.textContent = channelDraftSelectMode ? 'Done' : 'Select';
+  renderChannelDraftGroupOptions();
+  updateChannelDraftSelectionCount();
+  renderChannelDraftStats();
+  // Bound unconditionally: the binding happens once and the handler itself
+  // stands down while selecting, so skipping the call here would only mean
+  // never binding at all if the first render happened to be in Select mode.
   initChannelHoldDrag();
   renderChannelPosterPicker();
   renderChannelCrossoverSuggestions();
+  // The schedule hint counts the draft's shows and Story Lock lists them,
+  // so both have to be redrawn whenever the picks change.
+  updateChannelBroadcastControls();
 }
 
 function renderChannelPosterPicker() {
@@ -42143,9 +44174,17 @@ async function spliceCrossoverEvent(eventId, btn) {
 
 function removeAllChannelDraftPicks() {
   if (!channelDraftItems.length) return;
-  if (!confirm('Remove all ' + channelDraftItems.length + ' picks? This cannot be undone.')) return;
-  channelDraftItems = [];
-  renderChannelDraftList();
+  const wipe = () => {
+    channelDraftItems = [];
+    channelDraftSelection = [];
+    channelDraftFilter = '';
+    const filterInput = document.getElementById('channelDraftFilterInput');
+    if (filterInput) filterInput.value = '';
+    renderChannelDraftList();
+  };
+  const message = 'Remove all ' + channelDraftItems.length + ' picks? This cannot be undone.';
+  if (typeof showAppConfirm === 'function') showAppConfirm('Remove all picks', message, 'Remove all', wipe, true);
+  else if (confirm(message)) wipe();
 }
 
 document.getElementById('channelDraftList').addEventListener('click', (e) => {
@@ -42157,6 +44196,24 @@ document.getElementById('channelDraftList').addEventListener('click', (e) => {
     renderChannelDraftList();
     return;
   }
+  // While selecting, the whole card is the checkbox -- a 20px box is not a
+  // target anyone wants to hit forty times in a row on a phone. The
+  // checkbox's own click is left alone so it is not toggled twice.
+  if (channelDraftSelectMode && !e.target.closest('.channelPickCheck')) {
+    const card = e.target.closest('.channel-pick');
+    if (card) {
+      const idx = parseInt(card.dataset.idx, 10);
+      toggleChannelDraftPick(idx, !isChannelDraftSelected(idx));
+      renderChannelDraftList();
+    }
+  }
+});
+
+document.getElementById('channelDraftList').addEventListener('change', (e) => {
+  const check = e.target.closest('.channelPickCheck');
+  if (!check) return;
+  toggleChannelDraftPick(parseInt(check.dataset.idx, 10), check.checked);
+  renderChannelDraftList();
 });
 
 document.getElementById('channelDraftList').addEventListener('change', (e) => {
@@ -42254,6 +44311,10 @@ function initChannelHoldDrag() {
 
   // Pointer events for desktop & unified pointer handling
   container.addEventListener('pointerdown', (e) => {
+    // Bound once and never removed, so Select mode has to be checked here:
+    // a hold-drag and a tap-to-select are the same gesture on a touch
+    // screen, and while selecting, selecting wins.
+    if (channelDraftSelectMode) return;
     if (e.target.closest('.channelRemovePickBtn, .channelPosInput')) return;
     const card = e.target.closest('.channel-pick');
     if (!card) return;
@@ -42348,12 +44409,30 @@ function getChannelDragAfterElement(container, x, y) {
   return closest;
 }
 
+// Rebuilds the draft order from the cards on screen after a drag.
+//
+// Only the cards ON SCREEN, which is the whole difficulty: with a filter
+// active those are a SUBSET, and rebuilding the list from them would drop
+// every pick the filter is hiding -- silently, irreversibly, on one
+// accidental drag of a channel someone spent an evening assembling.
+//
+// So the drag permutes the picks among the SLOTS they already occupied in
+// the full list, and everything else stays exactly where it is. With no
+// filter the slots are 0..N-1 and this is the plain reorder it always was.
 function reorderChannelDraftFromDom() {
   const container = document.getElementById('channelDraftList');
   const rows = [...container.querySelectorAll('.channel-pick')];
   if (rows.length) {
-    clearChannelDraftAutoSort();
-    channelDraftItems = rows.map((row) => channelDraftItems[parseInt(row.dataset.idx, 10)]).filter(Boolean);
+    const order = rows
+      .map((row) => parseInt(row.dataset.idx, 10))
+      .filter((n) => Number.isInteger(n) && n >= 0 && n < channelDraftItems.length);
+    if (order.length) {
+      clearChannelDraftAutoSort();
+      const slots = order.slice().sort((a, b) => a - b);
+      const next = channelDraftItems.slice();
+      order.forEach((fromIdx, n) => { next[slots[n]] = channelDraftItems[fromIdx]; });
+      channelDraftItems = next;
+    }
   }
   renderChannelDraftList();
 }
@@ -42381,18 +44460,20 @@ function reorderChannelDraftFromDom() {
 // so an air-date channel stays in air-date order as it grows. Moving a pick
 // by hand disarms that and puts the dropdown back to "As listed": from then
 // on the order is the person's, not the sort's.
-const CHANNEL_STATIC_SORTS = ['aired-asc', 'aired-desc', 'show-season-episode', 'title-az'];
+const CHANNEL_STATIC_SORTS = ['aired-asc', 'aired-desc', 'show-season-episode', 'interleave', 'title-az'];
 
 const CHANNEL_PLAY_ORDER_HINTS = {
   'as-listed': 'Picks play in the order listed above \u2014 drag one, or type a new position, to change it.',
   'shuffle-daily': 'The channel reshuffles itself once every 24 hours, so the order listed above is ignored while this is selected.',
   'sorted': 'Sorted now, and sorted again whenever you add more picks. Move a pick by hand and this switches back to "As listed", keeping your order.',
+  'interleave': 'One episode from each show in turn, then round again \u2014 a prime-time block rather than fifty episodes of one show before the next one starts. Re-applied whenever you add more picks.',
 };
 
 const CHANNEL_SORT_LABELS = {
   'aired-asc': 'air date order',
   'aired-desc': 'newest aired first',
   'show-season-episode': 'by show, season & episode',
+  'interleave': 'interleaved across shows',
   'title-az': 'A\u2013Z by title',
 };
 
@@ -42417,7 +44498,9 @@ function updateChannelPlayOrderHint() {
   const hint = document.getElementById('channelPlayOrderHint');
   if (!hint) return;
   const v = getChannelPlayOrder();
-  const key = v === 'shuffle-daily' ? 'shuffle-daily' : (CHANNEL_STATIC_SORTS.indexOf(v) !== -1 ? 'sorted' : 'as-listed');
+  const key = v === 'shuffle-daily' ? 'shuffle-daily'
+    : (v === 'interleave' ? 'interleave'
+      : (CHANNEL_STATIC_SORTS.indexOf(v) !== -1 ? 'sorted' : 'as-listed'));
   hint.textContent = CHANNEL_PLAY_ORDER_HINTS[key];
 }
 
@@ -42426,6 +44509,7 @@ function setChannelPlayOrder(value) {
   const v = value || 'as-listed';
   if (sel) sel.value = v;
   updateChannelPlayOrderHint();
+  updateChannelPlayOrderDependants();
 }
 
 // The static sort to re-apply when picks are added, or '' when there is
@@ -42454,6 +44538,20 @@ function channelSortComparator(key) {
       if (!da) return 1;
       if (!db) return -1;
       return (da < db ? -1 : 1) * dir;
+    };
+  }
+  if (key === 'interleave') {
+    // Round-robin: every show's first pick, then every show's second, and
+    // so on. Expressed as a comparator because that is what the rest of
+    // this machinery speaks -- runIndex is a pick's position within its
+    // OWN show's run, so ordering by it groups the lineup into rounds, and
+    // showRank keeps each round in the order the shows first appear.
+    // Neither rank reorders a show against itself, so a show's episodes
+    // stay in the order they were added.
+    return (a, b) => {
+      if (a.runIndex !== b.runIndex) return a.runIndex - b.runIndex;
+      if (a.showRank !== b.showRank) return a.showRank - b.showRank;
+      return a.i - b.i;
     };
   }
   if (key === 'show-season-episode') {
@@ -42488,10 +44586,13 @@ function channelSortComparator(key) {
 function sortChannelDraftItems(key) {
   if (!key || channelDraftItems.length < 2) return;
   const showRanks = new Map();
+  const runLengths = new Map();
   const wrapped = channelDraftItems.map((it, i) => {
     const showKey = String((it && (it.showName || it.imdbId)) || '');
     if (!showRanks.has(showKey)) showRanks.set(showKey, showRanks.size);
-    return { it: it, i: i, showRank: showRanks.get(showKey) };
+    const runIndex = runLengths.get(showKey) || 0;
+    runLengths.set(showKey, runIndex + 1);
+    return { it: it, i: i, showRank: showRanks.get(showKey), runIndex: runIndex };
   });
   wrapped.sort(channelSortComparator(key));
   channelDraftItems = wrapped.map((w) => w.it);
@@ -42522,6 +44623,15 @@ function applyChannelPlayOrder(value) {
   renderChannelDraftList();
 }
 
+// A channel whose play order is the listed one has nothing for Story Lock to
+// protect against, and renderChannelStoryLock says so -- so the dropdown has
+// to redraw it. setChannelPlayOrder is where every path through the dropdown
+// meets, including the one-shot "Shuffle now" that bounces back to
+// "As listed".
+function updateChannelPlayOrderDependants() {
+  if (typeof renderChannelStoryLock === 'function') renderChannelStoryLock();
+}
+
 function shuffleChannelDraft() {
   if (channelDraftItems.length < 2) return;
   // A one-shot, so it cannot leave a sort armed to undo it on the next
@@ -42534,6 +44644,682 @@ function shuffleChannelDraft() {
     channelDraftItems[j] = tmp;
   }
   renderChannelDraftList();
+}
+
+// --- broadcast schedule & smart rules -----------------------------------
+//
+// Five fields that shape HOW a channel plays rather than WHAT is in it, so
+// none of them ever rewrites the picks someone saved. The Worker reads all
+// five (see buildChannelMeta, 05_catalog-core.js); this is the half that
+// collects them and puts them back on screen when a channel is reopened.
+//
+//   dailyRotate + rotateShows/rotateEpisodes/rotateTurnover
+//                a pool bigger than one day, cut into a fresh lineup daily
+//   hideWatched  drop picks already in Watch History
+//   storyLocked  shows that must advance in sequence through a shuffle
+//   liveSync + sourceUrl
+//                rebuild the pool from the list this was imported from
+//   dynamic      no stored picks at all; derived per request (Next Up)
+//
+// The defaults are the numbers Quick Add's network channels have always
+// rotated on, so turning the schedule on without touching a dial gives a
+// custom channel exactly the cadence those already had.
+const CHANNEL_DEFAULT_ROTATE_SHOWS = 24;
+const CHANNEL_DEFAULT_ROTATE_EPISODES = 3;
+// The Worker's CHANNEL_PART_GROUP_MAX, which is what actually enforces this;
+// saying so here means the builder refuses a seventh episode rather than
+// silently storing a pairing that plays as six.
+const CHANNEL_DRAFT_PAIR_MAX = 6;
+
+// The draft's own copy of the three fields that have no input of their own:
+// Story Lock is a rendered list, and the last two are stamped on by whatever
+// created the channel (Import from link, the Next Up button) rather than
+// typed.
+let channelDraftStoryLocked = [];
+let channelDraftSourceUrl = '';
+let channelDraftDynamic = '';
+// Pairs made by hand in the draft: arrays of stream ids, the same keys the
+// Worker glues by. Stored as ids rather than positions because every sort,
+// filter and drag in this builder moves positions around.
+let channelDraftPairedGroups = [];
+
+// The client twin of the Worker's channelItemShowKey (05_catalog-core.js).
+// Both sides have to agree on this exactly: it is the key a Story Lock is
+// stored under here and looked up by there.
+function channelDraftShowKey(it) {
+  if (!it) return '';
+  return it.imdbId || ((it.kind || 'episode') + ':' + (it.title || ''));
+}
+
+// Every field on a saved channel that this section owns, normalized. One
+// function because three separate places persist a channel (saveLocalChannel,
+// saveLocalChannelsMap and ensureAllChannelsSyncedFromRows) and each of them
+// rebuilds the record field by field -- a flag added to only two of the three
+// is a flag that silently disappears on the next save.
+function channelBroadcastFields(src) {
+  const o = src || {};
+  return {
+    description: String(o.description || '').slice(0, 400),
+    dailyRotate: !!o.dailyRotate,
+    rotateShows: Number(o.rotateShows) || 0,
+    rotateEpisodes: Number(o.rotateEpisodes) || 0,
+    rotateTurnover: Number(o.rotateTurnover) || 0,
+    rotateTurnoverTime: o.rotateTurnoverTime || '',
+    rotateTurnoverZone: o.rotateTurnoverZone === 'local' ? 'local' : 'utc',
+    hideWatched: !!o.hideWatched,
+    storyLocked: Array.isArray(o.storyLocked) ? o.storyLocked.slice() : [],
+    pairParts: !!o.pairParts,
+    pairedGroups: Array.isArray(o.pairedGroups)
+      ? o.pairedGroups.filter((g) => Array.isArray(g) && g.length > 1).map((g) => g.slice())
+      : [],
+    autoNewEpisodes: !!o.autoNewEpisodes,
+    newEpisodesAtTop: !!o.newEpisodesAtTop,
+    liveSync: !!o.liveSync,
+    sourceUrl: o.sourceUrl || '',
+    dynamic: o.dynamic || '',
+  };
+}
+
+// "HH:MM" in the chosen zone -> minutes past midnight UTC, which is the only
+// form the Worker stores.
+//
+// getTimezoneOffset() is minutes to ADD to local time to get UTC (300 in
+// UTC-5), so local midnight is 05:00 UTC there. It is read at save time and
+// baked in, so a channel set to local midnight drifts by an hour across a
+// DST boundary until it is saved again -- worth it to keep the Worker free
+// of timezone databases, and an hour's drift on when tomorrow's lineup
+// appears is not something a viewer can act on anyway.
+function channelTurnoverToUtcMinutes(timeStr, zone) {
+  const m = String(timeStr || '').match(/^([0-9]{1,2}):([0-9]{2})$/);
+  const local = m ? (Math.min(23, parseInt(m[1], 10)) * 60 + Math.min(59, parseInt(m[2], 10))) : 0;
+  const shift = zone === 'local' ? new Date().getTimezoneOffset() : 0;
+  return (((local + shift) % 1440) + 1440) % 1440;
+}
+
+function channelMinutesToTimeString(minutes) {
+  const total = (((Number(minutes) || 0) % 1440) + 1440) % 1440;
+  const h = Math.floor(total / 60);
+  const mm = total % 60;
+  return (h < 10 ? '0' : '') + h + ':' + (mm < 10 ? '0' : '') + mm;
+}
+
+// The distinct shows in the draft, each with the picks that belong to it --
+// what Story Lock offers, and what the "N shows" line in the schedule hint
+// counts.
+function channelDraftShowGroups() {
+  const groups = [];
+  const index = new Map();
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftShowKey(it);
+    if (!key) return;
+    if (!index.has(key)) {
+      index.set(key, groups.length);
+      groups.push({ key: key, name: it.showName || it.title || 'Untitled', count: 0, isMovie: it.kind === 'movie' });
+    }
+    groups[index.get(key)].count++;
+  });
+  return groups;
+}
+
+function isChannelShowStoryLocked(key) {
+  return channelDraftStoryLocked.indexOf(key) !== -1;
+}
+
+function toggleChannelStoryLock(key, on) {
+  const at = channelDraftStoryLocked.indexOf(key);
+  if (on && at === -1) channelDraftStoryLocked.push(key);
+  else if (!on && at !== -1) channelDraftStoryLocked.splice(at, 1);
+}
+
+// Story Lock only makes sense per SHOW, and only for a channel that shuffles
+// or rotates -- with picks playing in the order they are listed there is
+// nothing for a lock to protect against, so the section says so instead of
+// offering switches that would do nothing.
+function renderChannelStoryLock() {
+  const box = document.getElementById('channelStoryLockSection');
+  if (!box) return;
+  const groups = channelDraftShowGroups().filter((g) => !g.isMovie && g.count > 1);
+  // A lock on a show that has since been removed is dropped here rather than
+  // saved forward -- it can only confuse the next person to open this.
+  const liveKeys = groups.map((g) => g.key);
+  channelDraftStoryLocked = channelDraftStoryLocked.filter((k) => liveKeys.indexOf(k) !== -1);
+  if (!groups.length) {
+    box.innerHTML = '';
+    return;
+  }
+  const rotating = !!(document.getElementById('channelDailyRotateCheck') || {}).checked;
+  const shuffling = getChannelPlayOrder() === 'shuffle-daily';
+  const active = rotating || shuffling;
+  const rows = groups.map((g) => {
+    const id = 'channelStoryLock_' + encodeURIComponent(g.key).replace(/[^A-Za-z0-9]/g, '_');
+    return '<label class="channel-rule-row" for="' + escapeAttr(id) + '">' +
+      '<input type="checkbox" id="' + escapeAttr(id) + '"' + (isChannelShowStoryLocked(g.key) ? ' checked' : '') +
+        ' onchange="toggleChannelStoryLock(&quot;' + escapeJsAttr(g.key) + '&quot;, this.checked)">' +
+      '<span>' + escapeHtml(g.name) + ' <small style="color:var(--muted);">(' + g.count + ')</small></span>' +
+    '</label>';
+  }).join('');
+  box.innerHTML =
+    '<p style="margin:0 0 4px; font-weight:600; font-size:0.85rem;">Story Lock</p>' +
+    '<p style="margin:0 0 4px; color:var(--muted); font-size:0.78rem;">' +
+      'Shuffling suits a procedural &mdash; Seinfeld, The Office, Law &amp; Order. It ruins a serialized one. ' +
+      'Tick a show here and it always advances to its next episode in order, while everything else keeps shuffling around it.' +
+    '</p>' +
+    (active ? '' : '<p style="margin:0 0 4px; color:var(--muted); font-size:0.78rem;"><em>This channel plays in the order listed above, so nothing is being shuffled for a lock to protect against yet.</em></p>') +
+    '<div class="channel-storylock-grid">' + rows + '</div>';
+}
+
+// Keeps the schedule dials, their hint line and the Story Lock list in step
+// with each other. Called by every control in the section, and once more
+// whenever the draft is re-rendered.
+function updateChannelBroadcastControls() {
+  const check = document.getElementById('channelDailyRotateCheck');
+  const dials = document.getElementById('channelDailyRotateDials');
+  const hint = document.getElementById('channelDailyRotateHint');
+  const on = !!(check && check.checked);
+  if (dials) dials.style.display = on ? 'flex' : 'none';
+  if (hint) {
+    if (!on) {
+      hint.textContent = 'Off — every pick in this channel plays, in the order above.';
+    } else {
+      const shows = Math.max(1, Math.min(48, parseInt((document.getElementById('channelRotateShowsInput') || {}).value, 10) || CHANNEL_DEFAULT_ROTATE_SHOWS));
+      const eps = Math.max(1, Math.min(12, parseInt((document.getElementById('channelRotateEpisodesInput') || {}).value, 10) || CHANNEL_DEFAULT_ROTATE_EPISODES));
+      const available = channelDraftShowGroups().length;
+      const running = Math.min(shows, available || shows);
+      const zoneSel = document.getElementById('channelRotateTurnoverZone');
+      const zone = zoneSel && zoneSel.value === 'local' ? 'your local time' : 'UTC';
+      const timeInput = document.getElementById('channelRotateTurnoverTime');
+      const timeStr = (timeInput && timeInput.value) || '00:00';
+      hint.textContent = running + ' show' + (running === 1 ? '' : 's') + ' a day, ' + eps +
+        ' back-to-back episode' + (eps === 1 ? '' : 's') + ' each (' + (running * eps) + ' episodes), ' +
+        'refreshing at ' + timeStr + ' ' + zone + '.' +
+        (available && shows > available ? ' This channel only has ' + available + ' shows in it so far.' : '');
+    }
+  }
+  updateChannelNewEpisodeControls();
+  updateChannelPairControls();
+  renderChannelStoryLock();
+}
+
+// The sub-rule only exists while the rule above it is on: "put new episodes
+// at the top" of a channel that is not collecting any is a switch with
+// nothing behind it.
+function updateChannelNewEpisodeControls() {
+  const check = document.getElementById('channelAutoNewEpisodesCheck');
+  const row = document.getElementById('channelNewEpisodesRow');
+  const hint = document.getElementById('channelAutoNewEpisodesHint');
+  const on = !!(check && check.checked);
+  if (row) row.style.display = on ? 'block' : 'none';
+  if (!hint) return;
+  if (!on) {
+    hint.textContent = 'Off — this channel plays the picks below and nothing else.';
+    return;
+  }
+  const shows = channelDraftShowGroups().filter((g) => !g.isMovie).length;
+  const topCheck = document.getElementById('channelNewEpisodesTopCheck');
+  const where = topCheck && topCheck.checked ? 'at the top' : 'at the end';
+  hint.textContent = 'Episodes that air from now on are added ' + where + ' on their own, for ' +
+    (shows ? (shows + ' show' + (shows === 1 ? '' : 's')) : 'the shows') +
+    ' in this channel. Checked in the background a couple of times a day; already-aired episodes only.';
+}
+
+// Everything the hand-made pairs need on screen: the count, a way to drop
+// them all, and the pruning that keeps them honest when picks are removed.
+function updateChannelPairControls() {
+  const keys = {};
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftPairKey(it);
+    if (key) keys[key] = true;
+  });
+  // A pair whose other half has been removed is not a pair. Dropped here
+  // rather than saved forward, the same way a Story Lock on a removed show
+  // is.
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys[k]))
+    .filter((g) => g.length > 1);
+  const hint = document.getElementById('channelPairPartsHint');
+  if (!hint) return;
+  const base = 'Finds “Part 1” / “Pt. II” / “(2)” in episode titles. Whenever one part is on today, the rest play straight after it instead of turning up tomorrow.';
+  const made = channelDraftPairedGroups.length;
+  hint.textContent = made
+    ? (base + ' ' + made + ' pair' + (made === 1 ? '' : 's') + ' made by hand below — those play together whether this is ticked or not.')
+    : (base + ' Select picks below and hit Pair to link any two by hand.');
+}
+
+// The client twin of the Worker's channelItemStreamId: the key a pairing is
+// stored under on both sides.
+function channelDraftPairKey(it) {
+  if (!it) return '';
+  const showId = String(it.imdbId || '').trim();
+  if (!showId) return '';
+  if (it.kind === 'movie') return showId;
+  if (it.season == null || it.episode == null) return '';
+  return showId + ':' + it.season + ':' + it.episode;
+}
+
+// "Pair" over the selection: these picks play back to back, in the order
+// they are listed in the channel, wherever the first of them is drawn.
+//
+// A pick can only belong to one pair, so selecting a pick that is already in
+// one replaces that pair rather than leaving it in two places with two
+// different answers about what plays next.
+function pairChannelDraftSelection() {
+  const keys = [];
+  channelDraftSelection.slice().sort((a, b) => a - b).forEach((i) => {
+    const key = channelDraftPairKey(channelDraftItems[i]);
+    if (key && keys.indexOf(key) === -1) keys.push(key);
+  });
+  if (keys.length < 2) {
+    showAddedToast('Pick at least two episodes to pair.');
+    return;
+  }
+  if (keys.length > CHANNEL_DRAFT_PAIR_MAX) {
+    showAddedToast('A pairing can hold at most ' + CHANNEL_DRAFT_PAIR_MAX + ' episodes.');
+    return;
+  }
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys.indexOf(k) === -1))
+    .filter((g) => g.length > 1);
+  channelDraftPairedGroups.push(keys);
+  renderChannelDraftList();
+  showAddedToast(keys.length + ' episodes will play back to back.');
+}
+
+function unpairChannelDraftSelection() {
+  const keys = [];
+  channelDraftSelection.forEach((i) => {
+    const key = channelDraftPairKey(channelDraftItems[i]);
+    if (key) keys.push(key);
+  });
+  if (!keys.length) return;
+  const before = channelDraftPairedGroups.length;
+  channelDraftPairedGroups = channelDraftPairedGroups
+    .map((g) => g.filter((k) => keys.indexOf(k) === -1))
+    .filter((g) => g.length > 1);
+  renderChannelDraftList();
+  showAddedToast(before === channelDraftPairedGroups.length ? 'None of those were paired.' : 'Pairing removed.');
+}
+
+// Reads the whole section back as the payload fields the Worker understands.
+function readChannelBroadcastSettings() {
+  const check = document.getElementById('channelDailyRotateCheck');
+  const dailyRotate = !!(check && check.checked);
+  const zoneSel = document.getElementById('channelRotateTurnoverZone');
+  const zone = zoneSel && zoneSel.value === 'local' ? 'local' : 'utc';
+  const timeInput = document.getElementById('channelRotateTurnoverTime');
+  const timeStr = (timeInput && timeInput.value) || '00:00';
+  const liveCheck = document.getElementById('channelLiveSyncCheck');
+  const hideCheck = document.getElementById('channelHideWatchedCheck');
+  const pairCheck = document.getElementById('channelPairPartsCheck');
+  const newEpCheck = document.getElementById('channelAutoNewEpisodesCheck');
+  const newEpTopCheck = document.getElementById('channelNewEpisodesTopCheck');
+  const descInput = document.getElementById('channelDescriptionInput');
+  return {
+    description: descInput ? String(descInput.value || '').trim().slice(0, 400) : '',
+    dailyRotate: dailyRotate,
+    rotateShows: dailyRotate ? Math.max(1, Math.min(48, parseInt((document.getElementById('channelRotateShowsInput') || {}).value, 10) || CHANNEL_DEFAULT_ROTATE_SHOWS)) : 0,
+    rotateEpisodes: dailyRotate ? Math.max(1, Math.min(12, parseInt((document.getElementById('channelRotateEpisodesInput') || {}).value, 10) || CHANNEL_DEFAULT_ROTATE_EPISODES)) : 0,
+    rotateTurnover: dailyRotate ? channelTurnoverToUtcMinutes(timeStr, zone) : 0,
+    rotateTurnoverTime: dailyRotate ? timeStr : '',
+    rotateTurnoverZone: zone,
+    hideWatched: !!(hideCheck && hideCheck.checked),
+    storyLocked: channelDraftStoryLocked.slice(),
+    pairParts: !!(pairCheck && pairCheck.checked),
+    pairedGroups: channelDraftPairedGroups.map((g) => g.slice()),
+    autoNewEpisodes: !!(newEpCheck && newEpCheck.checked),
+    // Only meaningful with the line above on, and stored as 0 when it is
+    // off for the same reason the rotation dials are: a flag with nothing
+    // behind it reads as a rule the channel does not actually have.
+    newEpisodesAtTop: !!(newEpCheck && newEpCheck.checked && newEpTopCheck && newEpTopCheck.checked),
+    // Live Cloud Sync has nothing to sync FROM unless this channel was
+    // imported from a list, so it can only ever be on for one that was.
+    liveSync: !!(channelDraftSourceUrl && liveCheck && liveCheck.checked),
+    sourceUrl: channelDraftSourceUrl || '',
+    dynamic: channelDraftDynamic || '',
+  };
+}
+
+// Puts a saved channel's settings back on screen. The counterpart of
+// readChannelBroadcastSettings, called by every path that opens the builder.
+function applyChannelBroadcastSettings(channel) {
+  const f = channelBroadcastFields(channel);
+  const descInput = document.getElementById('channelDescriptionInput');
+  if (descInput) descInput.value = f.description;
+  channelDraftStoryLocked = f.storyLocked;
+  channelDraftPairedGroups = f.pairedGroups;
+  channelDraftSourceUrl = f.sourceUrl;
+  channelDraftDynamic = f.dynamic;
+  const check = document.getElementById('channelDailyRotateCheck');
+  if (check) check.checked = f.dailyRotate;
+  const showsInput = document.getElementById('channelRotateShowsInput');
+  if (showsInput) showsInput.value = f.rotateShows || CHANNEL_DEFAULT_ROTATE_SHOWS;
+  const epsInput = document.getElementById('channelRotateEpisodesInput');
+  if (epsInput) epsInput.value = f.rotateEpisodes || CHANNEL_DEFAULT_ROTATE_EPISODES;
+  const zoneSel = document.getElementById('channelRotateTurnoverZone');
+  if (zoneSel) zoneSel.value = f.rotateTurnoverZone;
+  const timeInput = document.getElementById('channelRotateTurnoverTime');
+  if (timeInput) {
+    // rotateTurnoverTime is what was typed; rotateTurnover is the same
+    // instant in UTC. A channel saved before the time box existed (every
+    // Quick Add network channel) only has the second one, and it is always
+    // midnight UTC, so deriving from it is exact rather than a guess.
+    timeInput.value = f.rotateTurnoverTime || channelMinutesToTimeString(f.rotateTurnover);
+  }
+  const hideCheck = document.getElementById('channelHideWatchedCheck');
+  if (hideCheck) hideCheck.checked = f.hideWatched;
+  const pairCheck = document.getElementById('channelPairPartsCheck');
+  if (pairCheck) pairCheck.checked = f.pairParts;
+  const newEpCheck = document.getElementById('channelAutoNewEpisodesCheck');
+  if (newEpCheck) newEpCheck.checked = f.autoNewEpisodes;
+  const newEpTopCheck = document.getElementById('channelNewEpisodesTopCheck');
+  if (newEpTopCheck) newEpTopCheck.checked = f.newEpisodesAtTop;
+  const liveRow = document.getElementById('channelLiveSyncRow');
+  const liveCheck = document.getElementById('channelLiveSyncCheck');
+  if (liveCheck) liveCheck.checked = f.liveSync;
+  if (liveRow) liveRow.style.display = f.sourceUrl ? 'block' : 'none';
+  const liveHint = document.getElementById('channelLiveSyncHint');
+  if (liveHint) {
+    liveHint.textContent = f.sourceUrl
+      ? ('Rebuilds this channel’s pool from ' + f.sourceUrl + ' in the background, so titles the list gains turn up here without re-importing.')
+      : '';
+  }
+  updateChannelBroadcastControls();
+}
+
+
+// --- working on a big draft ----------------------------------------------
+//
+// A channel with 800 picks was drag-one-at-a-time, type-a-position, or
+// Remove all. These three together are what make one editable: a filter to
+// find the picks you mean, selection to gather them, and bulk moves to place
+// them.
+//
+// Selection is by INDEX into channelDraftItems, and every operation that
+// reorders or removes rebuilds it, because an index that survives a reorder
+// is an index pointing at the wrong pick.
+let channelDraftFilter = '';
+let channelDraftSelectMode = false;
+let channelDraftSelection = [];
+
+// Everything about one pick that a filter should match: the show, the
+// episode, and the S/E people actually type ("s5e12").
+function channelDraftItemHaystack(it) {
+  if (!it) return '';
+  const se = (it.season != null && it.episode != null) ? ('s' + it.season + 'e' + it.episode) : '';
+  return [it.showName, it.epName, it.title, se].filter(Boolean).join(' ').toLowerCase();
+}
+
+// The indices currently on screen -- which is what "shown" means in every
+// bulk action, so a filtered list cannot act on picks nobody can see.
+function channelDraftVisibleIndices() {
+  const q = channelDraftFilter.trim().toLowerCase();
+  const out = [];
+  channelDraftItems.forEach((it, i) => {
+    if (!q || channelDraftItemHaystack(it).indexOf(q) !== -1) out.push(i);
+  });
+  return out;
+}
+
+// The filter and the selection are about the EDITING SESSION, not the
+// channel, so every path that opens the builder on something else clears
+// them -- otherwise a filter typed for one channel silently hides most of
+// the next one.
+function resetChannelDraftWorkspace() {
+  channelDraftFilter = '';
+  channelDraftSelectMode = false;
+  channelDraftSelection = [];
+  const filterInput = document.getElementById('channelDraftFilterInput');
+  if (filterInput) filterInput.value = '';
+}
+
+function setChannelDraftFilter(value) {
+  channelDraftFilter = String(value || '');
+  renderChannelDraftList();
+}
+
+function toggleChannelDraftSelectMode() {
+  channelDraftSelectMode = !channelDraftSelectMode;
+  if (!channelDraftSelectMode) channelDraftSelection = [];
+  renderChannelDraftList();
+}
+
+function isChannelDraftSelected(index) {
+  return channelDraftSelection.indexOf(index) !== -1;
+}
+
+function toggleChannelDraftPick(index, on) {
+  const at = channelDraftSelection.indexOf(index);
+  if (on && at === -1) channelDraftSelection.push(index);
+  else if (!on && at !== -1) channelDraftSelection.splice(at, 1);
+  updateChannelDraftSelectionCount();
+}
+
+function selectAllChannelDraftShown(on) {
+  if (!on) {
+    channelDraftSelection = [];
+  } else {
+    channelDraftVisibleIndices().forEach((i) => {
+      if (channelDraftSelection.indexOf(i) === -1) channelDraftSelection.push(i);
+    });
+  }
+  renderChannelDraftList();
+}
+
+// "Select a whole show or season" -- the two groupings anyone actually wants
+// to act on at once. The option value is JSON rather than a delimited
+// string: a show key is either an IMDb id or "kind:title", and a title with
+// a colon in it would split any separator worth typing.
+function selectChannelDraftByGroup(value) {
+  if (!value) return;
+  let showKey = '';
+  let season = null;
+  try {
+    const parsed = JSON.parse(value);
+    showKey = parsed[0];
+    season = parsed.length > 1 && parsed[1] !== null ? Number(parsed[1]) : null;
+  } catch (e) {
+    return;
+  }
+  channelDraftItems.forEach((it, i) => {
+    if (channelDraftShowKey(it) !== showKey) return;
+    if (season !== null && Number(it.season) !== season) return;
+    if (channelDraftSelection.indexOf(i) === -1) channelDraftSelection.push(i);
+  });
+  renderChannelDraftList();
+}
+
+function updateChannelDraftSelectionCount() {
+  const el = document.getElementById('channelDraftSelectionCount');
+  if (el) el.textContent = channelDraftSelection.length + ' selected';
+}
+
+function removeChannelDraftSelection() {
+  if (!channelDraftSelection.length) return;
+  const drop = {};
+  channelDraftSelection.forEach((i) => { drop[i] = true; });
+  channelDraftItems = channelDraftItems.filter((_, i) => !drop[i]);
+  channelDraftSelection = [];
+  // A hand-made change to the order, so a remembered sort must not undo it
+  // on the re-render -- the rule every other manual move follows.
+  clearChannelDraftAutoSort();
+  renderChannelDraftList();
+}
+
+function moveChannelDraftSelection(where) {
+  if (!channelDraftSelection.length) return;
+  const picked = {};
+  channelDraftSelection.forEach((i) => { picked[i] = true; });
+  const moved = channelDraftItems.filter((_, i) => picked[i]);
+  const rest = channelDraftItems.filter((_, i) => !picked[i]);
+  channelDraftItems = where === 'bottom' ? rest.concat(moved) : moved.concat(rest);
+  // The moved picks are now a contiguous run at one end, so the selection is
+  // rebuilt to point at where they actually ended up.
+  channelDraftSelection = moved.map((_, n) => (where === 'bottom' ? rest.length + n : n));
+  clearChannelDraftAutoSort();
+  renderChannelDraftList();
+}
+
+// The show/season menu, rebuilt from the draft on each render so it cannot
+// offer a show that is no longer in the channel.
+function renderChannelDraftGroupOptions() {
+  const sel = document.getElementById('channelDraftSelectShowSelect');
+  if (!sel) return;
+  const groups = [];
+  const index = new Map();
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftShowKey(it);
+    if (!key) return;
+    if (!index.has(key)) {
+      index.set(key, groups.length);
+      groups.push({ key: key, name: it.showName || it.title || 'Untitled', count: 0, seasons: new Map() });
+    }
+    const g = groups[index.get(key)];
+    g.count++;
+    const season = Number(it.season);
+    if (Number.isInteger(season)) g.seasons.set(season, (g.seasons.get(season) || 0) + 1);
+  });
+  const options = ['<option value="">Select a whole show or season…</option>'];
+  groups.forEach((g) => {
+    options.push('<option value="' + escapeAttr(JSON.stringify([g.key])) + '">' +
+      escapeHtml(g.name) + ' — all ' + g.count + '</option>');
+    if (g.seasons.size > 1) {
+      [...g.seasons.keys()].sort((a, b) => a - b).forEach((season) => {
+        options.push('<option value="' + escapeAttr(JSON.stringify([g.key, season])) + '">' +
+          escapeHtml(g.name) + ' — season ' + season + ' (' + g.seasons.get(season) + ')</option>');
+      });
+    }
+  });
+  sel.innerHTML = options.join('');
+}
+
+// --- what this channel adds up to ----------------------------------------
+//
+// Shows, episodes, hours, the years it spans, and which rules are in force.
+// Cheap to compute, and it turns a channel from a blob of eight hundred rows
+// into something you can tell apart from the last one you built.
+//
+// Runtime is only known for picks added since it started being stored, so
+// the hours are an estimate and SAY SO rather than being quietly wrong: a
+// pick with no runtime is counted at this channel's own average, or at half
+// an hour when nothing at all is known.
+function channelDraftSummary(items, settings) {
+  const list = Array.isArray(items) ? items : [];
+  const shows = new Set();
+  let episodes = 0;
+  let movies = 0;
+  let knownMinutes = 0;
+  let knownCount = 0;
+  let earliest = '';
+  let latest = '';
+  list.forEach((it) => {
+    if (!it) return;
+    const key = channelDraftShowKey(it);
+    if (key) shows.add(key);
+    if (it.kind === 'movie') movies++;
+    else episodes++;
+    const runtime = Number(it.runtime);
+    if (Number.isInteger(runtime) && runtime > 0) {
+      knownMinutes += runtime;
+      knownCount++;
+    }
+    const date = channelItemAiredDateClient(it);
+    if (date) {
+      if (!earliest || date < earliest) earliest = date;
+      if (!latest || date > latest) latest = date;
+    }
+  });
+  const average = knownCount ? (knownMinutes / knownCount) : 30;
+  const totalMinutes = knownMinutes + ((list.length - knownCount) * average);
+  const s = settings || {};
+  const rules = [];
+  if (s.dailyRotate) {
+    rules.push((s.rotateShows || CHANNEL_DEFAULT_ROTATE_SHOWS) + ' shows × ' +
+      (s.rotateEpisodes || CHANNEL_DEFAULT_ROTATE_EPISODES) + ' a day');
+  }
+  if ((s.storyLocked || []).length) rules.push((s.storyLocked || []).length + ' story-locked');
+  if (s.hideWatched) rules.push('hides watched');
+  if (s.pairParts) rules.push('parts stay together');
+  else if ((s.pairedGroups || []).length) rules.push((s.pairedGroups || []).length + ' paired');
+  if (s.autoNewEpisodes) rules.push('auto-adds new episodes' + (s.newEpisodesAtTop ? ' at the top' : ''));
+  if (s.liveSync) rules.push('live cloud sync');
+  return {
+    shows: shows.size,
+    episodes: episodes,
+    movies: movies,
+    total: list.length,
+    hours: Math.round(totalMinutes / 60),
+    estimated: knownCount < list.length,
+    firstYear: earliest ? earliest.slice(0, 4) : '',
+    lastYear: latest ? latest.slice(0, 4) : '',
+    rules: rules,
+  };
+}
+
+// The summary as one line. Used under the draft and on a saved channel's
+// card, so both say the same thing the same way.
+function channelSummaryLine(summary) {
+  if (!summary || !summary.total) return '';
+  const bits = [];
+  if (summary.shows) bits.push(summary.shows + (summary.shows === 1 ? ' show' : ' shows'));
+  if (summary.episodes) bits.push(summary.episodes + (summary.episodes === 1 ? ' episode' : ' episodes'));
+  if (summary.movies) bits.push(summary.movies + (summary.movies === 1 ? ' movie' : ' movies'));
+  if (summary.hours) bits.push((summary.estimated ? '~' : '') + summary.hours + (summary.hours === 1 ? ' hour' : ' hours'));
+  if (summary.firstYear) {
+    bits.push(summary.firstYear === summary.lastYear ? summary.firstYear : (summary.firstYear + '–' + summary.lastYear));
+  }
+  return bits.concat(summary.rules).join(' · ');
+}
+
+function renderChannelDraftStats() {
+  const box = document.getElementById('channelDraftStats');
+  if (!box) return;
+  if (!channelDraftItems.length) {
+    box.textContent = '';
+    return;
+  }
+  const line = channelSummaryLine(channelDraftSummary(channelDraftItems, readChannelBroadcastSettings()));
+  box.textContent = line;
+  box.title = line;
+}
+
+// --- adding something that is already here -------------------------------
+//
+// Adding a show twice from two different places, or splicing the same
+// crossover in again, used to just work -- and you found out later, by which
+// point the duplicate is somewhere in eight hundred rows.
+function channelDraftCountForShow(imdbId, showName) {
+  const id = String(imdbId || '').trim();
+  const name = String(showName || '').trim().toLowerCase();
+  if (!id && !name) return 0;
+  return channelDraftItems.filter((it) => {
+    if (!it) return false;
+    if (id && String(it.imdbId || '').trim() === id) return true;
+    return !!name && String(it.showName || '').trim().toLowerCase() === name;
+  }).length;
+}
+
+// True when the caller should STOP: the dialog is up, and confirming it calls
+// the retry callback, which is the caller again with the check already done.
+//
+// Deliberately not a promise. showAppConfirm has no cancel callback -- the X,
+// the Cancel button, the backdrop and Escape all just close it -- so a
+// promise here could only resolve on "yes" and would hang forever on every
+// "no". A dangling promise per declined add is a leak in the browser and a
+// hung test everywhere else.
+//
+// With no dialog available it lets the add through rather than refusing: a
+// missing confirmation must not become a missing feature.
+function guardChannelDraftDuplicate(label, existingCount, retry) {
+  if (!existingCount) return false;
+  if (typeof showAppConfirm !== 'function') return false;
+  showAppConfirm(
+    'Already in this channel',
+    label + ' is already in this channel (' + existingCount + ' pick' + (existingCount === 1 ? '' : 's') +
+      '). Add it again anyway?',
+    'Add anyway',
+    retry,
+    false
+  );
+  return true;
 }
 
 let editingChannelId = null;
@@ -42574,9 +45360,8 @@ function saveChannel() {
 
   const map = loadLocalChannels();
   const channelId = editingChannelId || generateChannelId();
-  const existing = map[channelId] || {};
   
-  const payload = {
+  const payload = Object.assign({
     channelId: channelId,
     name: name,
     poster: verticalPoster,
@@ -42588,8 +45373,14 @@ function saveChannel() {
     // Worker on every request, and its picks have just been sorted for real
     // (see editChannelById) -- so the stored order is now the answer.
     sortByAired: false,
-    dailyRotate: existing.dailyRotate || false
-  };
+  // The broadcast schedule, Story Lock, Hide watched and Live Cloud Sync,
+  // read straight off the panel below the play-order dropdown. The saved
+  // channel is no longer consulted for dailyRotate: the panel was populated
+  // FROM it when the builder opened (applyChannelBroadcastSettings), so what
+  // is on screen is the full picture including anything Quick Add set, and
+  // reading it back is what lets someone turn a network channel's rotation
+  // off.
+  }, readChannelBroadcastSettings());
 
   saveLocalChannel(payload);
 
@@ -43264,6 +46055,7 @@ function switchChannelsSubmenu(name, btn) {
     'my-channels': document.getElementById('channelsSubMyChannels'),
     'storylines': document.getElementById('channelsSubStorylines'),
     'quickadd': document.getElementById('channelsSubQuickAdd'),
+    'explore': document.getElementById('channelsSubExplore'),
     'import': document.getElementById('channelsSubImport'),
     'build': document.getElementById('channelsSubBuild')
   };
@@ -43283,6 +46075,10 @@ function switchChannelsSubmenu(name, btn) {
     renderChannelMergeList();
   } else if (name === 'storylines') {
     renderStorylinesUniverseList();
+  } else if (name === 'explore') {
+    loadChannelDirectory(false);
+    renderChannelPublishList();
+    loadOrphanedPublishedChannels();
   } else if (name === 'import') {
     renderChannelMergeList();
   }
@@ -43294,9 +46090,13 @@ function openBuildCustomChannel() {
   channelDraftItems = [];
   channelDraftPoster = null;
   channelDraftBackdrop = null;
+  resetChannelDraftWorkspace();
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
+  const descInput = document.getElementById('channelDescriptionInput');
+  if (descInput) descInput.value = '';
   setChannelPlayOrder('as-listed');
+  applyChannelBroadcastSettings(null);
   const searchInput = document.getElementById('channelSearchInput');
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('channelSearchResult');
@@ -43327,6 +46127,7 @@ function editChannelById(channelId) {
   }
   editingChannelId = channelId;
   editingChannelUrlInput = null;
+  resetChannelDraftWorkspace();
   channelDraftItems = (channel.items || []).slice();
   channelDraftPoster = channel.poster || null;
   channelDraftBackdrop = channel.backdrop || null;
@@ -43339,6 +46140,7 @@ function editChannelById(channelId) {
   // flag cleared. Until it is edited the Worker keeps sorting it, so nothing
   // changes for a channel nobody opens.
   setChannelPlayOrder(channel.shuffle ? 'shuffle-daily' : (channel.sortByAired ? 'aired-asc' : (channel.autoSort || 'as-listed')));
+  applyChannelBroadcastSettings(channel);
   
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
@@ -43421,9 +46223,14 @@ function channelItemsInPlayOrder(items, channel) {
     .map((w) => w.it);
 }
 
-function openChannelDetailsPage(channelIdOrDivId) {
+// channelOverride is a channel this browser does not own -- one fetched from
+// Explore Channels, so it can be looked through before it is added. Every
+// lookup below is about finding a channel that IS saved here, and none of
+// them can find one that is not, so a caller holding the channel already
+// hands it straight over.
+function openChannelDetailsPage(channelIdOrDivId, channelOverride) {
   const map = loadLocalChannels();
-  let channel = map[channelIdOrDivId];
+  let channel = channelOverride || map[channelIdOrDivId];
   if (!channel) {
     for (const ch of Object.values(map)) {
       if (ch && (ch.channelId === channelIdOrDivId || ch.name === channelIdOrDivId)) {
@@ -43496,7 +46303,12 @@ function openChannelDetailsPage(channelIdOrDivId) {
   }
   if (!channel) return;
 
-  if (channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
+  // A channel reconstructed from a row is worth keeping in the in-memory
+  // map, because it IS one of this browser's channels and the map is just
+  // behind. A previewed one is not: it belongs to someone else and has not
+  // been added, so writing it here would put it in My Channels for simply
+  // having been looked at.
+  if (!channelOverride && channel.channelId && (!map[channel.channelId] || (channel.items && channel.items.length > (map[channel.channelId].items || []).length))) {
     map[channel.channelId] = channel;
     _memoryChannelsMap = map;
   }
@@ -43632,15 +46444,44 @@ function renderMyCreatedChannelsList() {
     return;
   }
   
-  channels.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  renderChannelUndoBar();
+  const sortSel = document.getElementById('myChannelsSortSelect');
+  if (sortSel && sortSel.value !== myChannelsSort) sortSel.value = myChannelsSort;
+  const shown = sortMyChannels(filterMyChannels(channels));
+  if (!shown.length) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No channel matches that search.</small></p>';
+    return;
+  }
 
-  box.innerHTML = channels.map((ch) => {
+  box.innerHTML = shown.map((ch) => {
     const isAdded = [...document.querySelectorAll('#lists .entry .url')].some((u) => u.value.includes(ch.channelId));
     const allItems = ch.items || [];
     const totalEpisodes = allItems.length;
+    // Every rule a channel carries, spelled out on its card -- a channel
+    // that hides watched episodes or locks a show behaves visibly
+    // differently from one that does not, and the card is the only place
+    // that is visible without opening the editor.
     const orderLabel = channelPlayOrderLabel(ch);
-    const metaText = '24/7 TV Channel &middot; ' + totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's') +
-      (orderLabel ? ' &middot; ' + orderLabel : '');
+    const metaBits = ['24/7 TV Channel'];
+    if (ch.dynamic === 'next-up') metaBits.push('fills itself in from Continue Watching');
+    else metaBits.push(totalEpisodes + ' episode' + (totalEpisodes === 1 ? '' : 's'));
+    if (ch.dailyRotate) {
+      metaBits.push((ch.rotateShows || CHANNEL_DEFAULT_ROTATE_SHOWS) + ' shows \u00d7 ' +
+        (ch.rotateEpisodes || CHANNEL_DEFAULT_ROTATE_EPISODES) + ' daily');
+    }
+    if (orderLabel) metaBits.push(orderLabel);
+    if (ch.hideWatched) metaBits.push('hides watched');
+    if ((ch.storyLocked || []).length) metaBits.push((ch.storyLocked || []).length + ' story-locked');
+    if (ch.pairParts) metaBits.push('parts stay together');
+    else if ((ch.pairedGroups || []).length) metaBits.push((ch.pairedGroups || []).length + ' paired');
+    if (ch.autoNewEpisodes) metaBits.push('auto-adds new episodes' + (ch.newEpisodesAtTop ? ' at the top' : ''));
+    if (ch.liveSync) metaBits.push('live cloud sync');
+    if (ch.sharePublished) metaBits.push('published');
+    const metaText = metaBits.map(escapeHtml).join(' &middot; ');
+    // The second line: what this channel actually holds. Same function the
+    // builder's own stats line uses, so a channel reads the same before and
+    // after it is saved.
+    const summaryLine = ch.dynamic === 'next-up' ? '' : channelSummaryLine(channelDraftSummary(allItems, ch));
     
     const allPosters = allItems.slice(0, 9);
     const posterThumbs = allPosters.map((it, i) => {
@@ -43737,13 +46578,25 @@ function renderMyCreatedChannelsList() {
     return '<div class="list-card" style="margin-bottom:12px;" data-channel-id="' + escapeAttr(ch.channelId) + '">' +
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
-          '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' + escapeHtml(ch.name) + '</div>' +
+          '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' +
+            '<span class="drag-handle-list channel-drag-handle" draggable="true" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
+            escapeHtml(ch.name) +
+          '</div>' +
+          (ch.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(ch.description) + '</div>' : '') +
           '<div class="list-card-meta">' +
             '<span>' + metaText + '</span>' +
           '</div>' +
+          (summaryLine ? '<div class="list-card-meta"><span>' + escapeHtml(summaryLine) + '</span></div>' : '') +
         '</div>' +
         '<div class="list-card-actions">' +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">Edit</button>' +
+          (ch.shareCode
+            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Copy this channel\u2019s share link">Copy link</button>' +
+              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Push your latest edits to the link people already have">Update link</button>'
+            : '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Create a link that rebuilds this channel anywhere">Share</button>') +
+          (ch.dynamic === 'next-up'
+            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshNextUpChannelSeed(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Pull in whatever you have started watching since">Refresh</button>'
+            : '') +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalChannel(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, &quot;' + escapeJsAttr(ch.name) + '&quot;)">Delete</button>' +
           addBtnHtml +
         '</div>' +
@@ -43751,6 +46604,7 @@ function renderMyCreatedChannelsList() {
       (posterThumbs ? '<div class="list-card-posters poster-preview-static">' + posterThumbs + '</div>' : '') +
     '</div>';
   }).join('');
+  initMyChannelsDrag();
 }
 
 function cancelEditChannel() {
@@ -43759,9 +46613,13 @@ function cancelEditChannel() {
   channelDraftItems = [];
   channelDraftPoster = null;
   channelDraftBackdrop = null;
+  resetChannelDraftWorkspace();
   const nameInput = document.getElementById('channelNameInput');
   if (nameInput) nameInput.value = '';
+  const descInput = document.getElementById('channelDescriptionInput');
+  if (descInput) descInput.value = '';
   setChannelPlayOrder('as-listed');
+  applyChannelBroadcastSettings(null);
   renderChannelDraftList();
   updateChannelSaveButtonLabel();
   switchChannelsSubmenu('my-channels', document.querySelector('#channelsSubnavBar button:nth-child(1)'));
@@ -43843,7 +46701,82 @@ const CHANNEL_POOL_MAX_ITEMS = 5000;
 const CHANNEL_ROTATION_SHOWS_PER_DAY = 24;
 const CHANNEL_ROTATION_EPISODES_PER_SHOW = 3;
 
-async function quickAddChannel(name, listUrl, networkId, btn) {
+// --- turning a list of shows into channel picks -------------------------
+//
+// Three features now start from "here are some shows, make a channel out of
+// them": Quick Add's network buttons, the Quick Channel Wizard, and an
+// actor's TV credits in a Spotlight channel. All three need the same two
+// rounds of fetching -- each show's seasons, then each season's episodes --
+// and the same two caps, so it lives here once rather than three times.
+//
+// Never throws: a show whose seasons or episodes cannot be read is skipped
+// and the rest of the channel is still built. One unreachable show is not a
+// reason to hand back nothing.
+async function buildChannelItemsFromShows(shows, opts) {
+  const o = opts || {};
+  const maxItems = o.maxItems || CHANNEL_POOL_MAX_ITEMS;
+  const maxPerShow = o.maxEpisodesPerShow || CHANNEL_MAX_EPISODES_PER_SHOW;
+  const onProgress = typeof o.onProgress === 'function' ? o.onProgress : null;
+  const items = [];
+  let poster = o.poster || null;
+  let backdrop = o.backdrop || null;
+  for (let i = 0; i < shows.length; i++) {
+    if (items.length >= maxItems) break;
+    const show = shows[i];
+    if (onProgress) onProgress(i, shows.length, show);
+    if (!poster && show.poster) poster = show.poster;
+    if (!backdrop && (show.backdrop || show.thumbnail)) backdrop = show.backdrop || show.thumbnail;
+    try {
+      const seasonsRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(show.tmdbId), { cache: 'no-store' });
+      const seasonsData = await seasonsRes.json();
+      if (!seasonsData.ok) continue;
+      const seasonResults = await Promise.all(seasonsData.seasons.map((s) =>
+        fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(show.tmdbId) + '&season=' + encodeURIComponent(s.season), { cache: 'no-store' })
+          .then((r) => r.json())
+          .then((d) => ({ season: s.season, episodes: d.ok ? d.episodes : [] }))
+          .catch(() => ({ season: s.season, episodes: [] }))
+      ));
+      const showEpisodes = [];
+      seasonResults
+        .sort((a, b) => a.season - b.season)
+        .forEach(({ season, episodes }) => {
+          episodes.forEach((ep) => {
+            const stillUrl = ep.thumbnail || show.backdrop || show.poster || '';
+            const showPosterUrl = show.poster || '';
+            showEpisodes.push({
+              kind: 'episode',
+              imdbId: channelStreamShowId(show.imdbId, show.tmdbId),
+              season: season,
+              episode: ep.episode,
+              showName: show.name || '',
+              epName: ep.name || ('Episode ' + ep.episode),
+              title: (show.name ? show.name + ' S' + season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.name || ('Episode ' + ep.episode)),
+              released: ep.released || '',
+              runtime: ep.runtime || 0,
+              thumbnail: stillUrl || showPosterUrl,
+              poster: showPosterUrl || stillUrl,
+              showPoster: showPosterUrl,
+            });
+          });
+        });
+      // The LAST maxPerShow episodes, not the first: a long-running show's
+      // most recent seasons are the ones most likely to be watchable.
+      let finalShowEpisodes = showEpisodes.length > maxPerShow
+        ? showEpisodes.slice(-maxPerShow)
+        : showEpisodes;
+      const remainingBudget = maxItems - items.length;
+      if (finalShowEpisodes.length > remainingBudget) {
+        finalShowEpisodes = finalShowEpisodes.slice(0, remainingBudget);
+      }
+      items.push(...finalShowEpisodes);
+    } catch (e) {
+      continue;
+    }
+  }
+  return { items: items, poster: poster, backdrop: backdrop };
+}
+
+async function quickAddChannel(name, listUrl, networkId, btn, options) {
   const statusBox = document.getElementById('channelQuickAddStatus');
   const originalLabel = btn ? btn.textContent : '';
   if (btn) {
@@ -43858,7 +46791,7 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
         const data = await res.json();
         if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_POOL_MAX_ITEMS) {
           const channelId = generateChannelId();
-          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name });
+          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '' });
           saveLocalChannel(payload);
           addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
           renderMyCreatedChannelsList();
@@ -43899,71 +46832,18 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
       shows[i] = shows[j];
       shows[j] = tmp;
     }
-    const items = [];
-    let poster = data.networkLogo || null;
-    let backdrop = null;
-    let showsIncluded = 0;
-    let showsTrimmed = 0;
-    let stoppedEarly = false;
-    for (let i = 0; i < shows.length; i++) {
-      if (items.length >= CHANNEL_POOL_MAX_ITEMS) {
-        stoppedEarly = true;
-        break;
-      }
-      const show = shows[i];
-      if (statusBox) {
-        statusBox.innerHTML = '<p><small>Building ' + escapeHtml(name) + '\u2026 show ' + (i + 1) + ' of ' + shows.length +
-          ' (' + escapeHtml(show.name) + ')</small></p>';
-      }
-      if (!poster && show.poster) poster = show.poster;
-      if (!backdrop && (show.backdrop || show.thumbnail)) backdrop = show.backdrop || show.thumbnail;
-      try {
-        const seasonsRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(show.tmdbId), { cache: 'no-store' });
-        const seasonsData = await seasonsRes.json();
-        if (!seasonsData.ok) continue;
-        const seasonResults = await Promise.all(seasonsData.seasons.map((s) =>
-          fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(show.tmdbId) + '&season=' + encodeURIComponent(s.season), { cache: 'no-store' })
-            .then((r) => r.json())
-            .then((d) => ({ season: s.season, episodes: d.ok ? d.episodes : [] }))
-            .catch(() => ({ season: s.season, episodes: [] }))
-        ));
-        const showEpisodes = [];
-        seasonResults
-          .sort((a, b) => a.season - b.season)
-          .forEach(({ season, episodes }) => {
-            episodes.forEach((ep) => {
-              const stillUrl = ep.thumbnail || show.backdrop || show.poster || '';
-              const showPosterUrl = show.poster || '';
-              showEpisodes.push({
-                kind: 'episode',
-                imdbId: channelStreamShowId(show.imdbId, show.tmdbId),
-                season: season,
-                episode: ep.episode,
-                showName: show.name || '',
-                epName: ep.name || ('Episode ' + ep.episode),
-                title: (show.name ? show.name + ' S' + season + 'E' + ep.episode + ' \u2014 ' : '') + (ep.name || ('Episode ' + ep.episode)),
-                released: ep.released || '',
-                thumbnail: stillUrl || showPosterUrl,
-                poster: showPosterUrl || stillUrl,
-                showPoster: showPosterUrl,
-              });
-            });
-          });
-        let finalShowEpisodes = showEpisodes.length > CHANNEL_MAX_EPISODES_PER_SHOW
-          ? showEpisodes.slice(-CHANNEL_MAX_EPISODES_PER_SHOW)
-          : showEpisodes;
-        if (finalShowEpisodes.length < showEpisodes.length) showsTrimmed++;
-        const remainingBudget = CHANNEL_POOL_MAX_ITEMS - items.length;
-        if (finalShowEpisodes.length > remainingBudget) {
-          finalShowEpisodes = finalShowEpisodes.slice(0, remainingBudget);
-          stoppedEarly = true;
+    const built = await buildChannelItemsFromShows(shows, {
+      poster: data.networkLogo || null,
+      onProgress: function (i, total, show) {
+        if (statusBox) {
+          statusBox.innerHTML = '<p><small>Building ' + escapeHtml(name) + '\u2026 show ' + (i + 1) + ' of ' + total +
+            ' (' + escapeHtml(show.name) + ')</small></p>';
         }
-        if (finalShowEpisodes.length) showsIncluded++;
-        items.push(...finalShowEpisodes);
-      } catch (e) {
-        continue;
-      }
-    }
+      },
+    });
+    const items = built.items;
+    const poster = built.poster;
+    const backdrop = built.backdrop;
     if (!items.length) {
       if (typeof showAppAlert === 'function') {
         showAppAlert('Could Not Build Channel', 'Could not build ' + name + ' -- no episodes were found.');
@@ -43973,7 +46853,21 @@ async function quickAddChannel(name, listUrl, networkId, btn) {
       return;
     }
     const channelId = generateChannelId();
-    const payload = { channelId: channelId, name: name, poster: poster, backdrop: backdrop || poster, items: items, shuffle: false, dailyRotate: true };
+    const payload = {
+      channelId: channelId,
+      name: name,
+      poster: poster,
+      backdrop: backdrop || poster,
+      items: items,
+      shuffle: false,
+      dailyRotate: true,
+      // Live Cloud Sync, when this came from a pasted list link and the
+      // Import tab's toggle was left on: the channel keeps the URL, and the
+      // Worker rebuilds its pool from that list in the background instead of
+      // this staying the one-time snapshot it used to be.
+      liveSync: !!(options && options.liveSync && listUrl),
+      sourceUrl: (options && options.liveSync && listUrl) ? listUrl : '',
+    };
     saveLocalChannel(payload);
     addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
     renderMyCreatedChannelsList();
@@ -44025,11 +46919,1320 @@ async function importChannelFromLink(btn) {
     }
     return;
   }
-  await quickAddChannel(name, listUrl, null, btn);
+  const liveCheck = document.getElementById('channelImportLiveSyncCheck');
+  await quickAddChannel(name, listUrl, null, btn, { liveSync: !liveCheck || liveCheck.checked });
   urlInput.value = '';
   nameInput.value = '';
 }
 
+
+// --- the Next Up channel ------------------------------------------------
+//
+// One channel that always plays the next unwatched episode of everything on
+// the go. Unlike every other channel it stores no picks at all: the payload
+// carries dynamic:'next-up' and the Worker derives the lineup from the
+// account's own Continue Watching on each request (see channelNextUpItems,
+// 05_catalog-core.js), so it follows what is actually being watched rather
+// than freezing the day it was made.
+//
+// That also means it only works signed in with Auto-track playback on --
+// there is no other way for this Worker to know what has been watched -- so
+// this says so up front rather than saving a channel that would come back
+// empty.
+const NEXT_UP_CHANNEL_NAME = 'Next Up';
+
+// The picks a Next Up channel is SEEDED with, out of this browser's own
+// Continue Watching list.
+//
+// The Worker re-derives the lineup per request and that stays the channel's
+// real answer -- but it can only do so for an install config that proved
+// which account it speaks for (see trackOwner in resolveConfig), and a
+// config with no personal shelf in it does not. A channel that stored
+// nothing therefore came back EMPTY for exactly the people most likely to
+// try it first. Seeding fixes that: the channel works the moment it is
+// saved, and the Worker's live answer replaces the seed whenever it has one.
+function channelNextUpSeedItems() {
+  let cw = [];
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    const list = map && map['continue-watching'];
+    cw = (list && Array.isArray(list.items)) ? list.items : [];
+  } catch (e) {
+    cw = [];
+  }
+  const out = [];
+  const seen = {};
+  cw.forEach((it) => {
+    if (!it) return;
+    const showId = String(it.showId || it.imdbId || '').trim();
+    const season = Number(it.seasonNum);
+    const episode = Number(it.episodeNum);
+    if (!showId || !Number.isInteger(season) || !Number.isInteger(episode)) return;
+    const key = showId + ':' + season + ':' + episode;
+    if (seen[key]) return;
+    seen[key] = true;
+    const showName = String(it.showTitle || '').trim();
+    const epName = String(it.name || '').trim() || ('Episode ' + episode);
+    const poster = it.showPoster || it.poster || '';
+    out.push({
+      kind: 'episode',
+      imdbId: showId,
+      season: season,
+      episode: episode,
+      showName: showName,
+      epName: epName,
+      title: showName ? (showName + ' S' + season + 'E' + episode + ' — ' + epName) : epName,
+      released: it.released || '',
+      thumbnail: poster,
+      poster: poster,
+      showPoster: poster,
+    });
+  });
+  return out;
+}
+
+// Re-seeds a saved Next Up channel from Continue Watching as it stands now,
+// and rewrites the catalog row that carries it. What the card's Refresh
+// button does.
+function refreshNextUpChannelSeed(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch || ch.dynamic !== 'next-up') return 0;
+  const items = channelNextUpSeedItems();
+  ch.items = items;
+  saveLocalChannelsMap(map);
+  const payload = Object.assign({}, ch, { items: items });
+  const rows = [...document.querySelectorAll('#lists .entry')];
+  rows.forEach((row) => {
+    [...row.querySelectorAll('.url')].forEach((u) => {
+      if (String(u.value || '').indexOf(channelId) !== -1) u.value = 'channel:v1:' + JSON.stringify(payload);
+    });
+  });
+  if (typeof saveState === 'function') saveState();
+  renderMyCreatedChannelsList();
+  if (btn) {
+    btn.textContent = items.length + ' up next ✓';
+    setTimeout(() => { if (btn) btn.textContent = 'Refresh'; }, 1800);
+  }
+  return items.length;
+}
+
+function createNextUpChannel(btn) {
+  const status = document.getElementById('channelNextUpStatus');
+  const say = (html) => { if (status) status.innerHTML = html; };
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (!signedIn) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ A Next Up channel reads your watch history, so it needs a Creator Profile with Auto-track playback switched on.</p>');
+    return;
+  }
+  const map = loadLocalChannels();
+  const already = Object.values(map).find((ch) => ch && ch.dynamic === 'next-up');
+  if (already) {
+    say('<p class="testresult ok" style="margin:4px 0 0;">You already have one — "' + escapeHtml(already.name) + '".</p>');
+    openChannelDetailsPage(already.channelId);
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    const channelId = generateChannelId();
+    const payload = {
+      channelId: channelId,
+      name: NEXT_UP_CHANNEL_NAME,
+      poster: null,
+      backdrop: null,
+      // A seed, not the answer. The Worker re-derives the lineup on every
+      // request and that replaces this -- but only for a config that can
+      // prove whose it is, so this is what the channel plays until then and
+      // what it falls back to if that proof is ever missing.
+      items: channelNextUpSeedItems(),
+      shuffle: false,
+      autoSort: '',
+      sortByAired: false,
+      dailyRotate: false,
+      dynamic: 'next-up',
+    };
+    saveLocalChannel(payload);
+    addRow(NEXT_UP_CHANNEL_NAME, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+    renderMyCreatedChannelsList();
+    renderChannelMergeList();
+    showAddedToast('"' + NEXT_UP_CHANNEL_NAME + '" added to your Catalogs.');
+    const seeded = payload.items.length;
+    say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + NEXT_UP_CHANNEL_NAME + '" added with ' + seeded +
+      ' show' + (seeded === 1 ? '' : 's') + ' up next, and it refreshes itself from Continue Watching as you watch.' +
+      (seeded ? '' : ' Nothing is in progress yet — it fills in once you have started something.') + '</p>');
+    setTimeout(() => { if (status) status.innerHTML = ''; }, 8000);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// --- the Quick Channel Wizard -------------------------------------------
+//
+// Network x era x genre -> a finished 24/7 channel. The server answers with
+// a list of shows (see /api/wizard-channel-shows) and the rest is the same
+// path Quick Add's network buttons take, so a wizard channel behaves
+// exactly like one of those: a rotating daily lineup out of a large pool.
+function channelWizardName() {
+  const typed = (document.getElementById('channelWizardNameInput') || {}).value;
+  if (typed && typed.trim()) return typed.trim();
+  const pick = (id) => {
+    const sel = document.getElementById(id);
+    if (!sel || !sel.value) return '';
+    return sel.options[sel.selectedIndex].textContent.trim();
+  };
+  const network = pick('channelWizardNetwork');
+  const era = pick('channelWizardEra');
+  const genre = pick('channelWizardGenre');
+  const parts = [era, network, genre].filter(Boolean);
+  return parts.length ? parts.join(' ') : 'My Channel';
+}
+
+async function runChannelWizard(btn) {
+  const statusBox = document.getElementById('channelWizardStatus');
+  const say = (html) => { if (statusBox) statusBox.innerHTML = html; };
+  const networkId = (document.getElementById('channelWizardNetwork') || {}).value || '';
+  const era = (document.getElementById('channelWizardEra') || {}).value || '';
+  const genres = (document.getElementById('channelWizardGenre') || {}).value || '';
+  const limit = parseInt((document.getElementById('channelWizardSize') || {}).value, 10) || 8;
+  if (!networkId && !era && !genres) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ Choose at least one of network, era or genre first.</p>');
+    return;
+  }
+  const name = channelWizardName();
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Building…';
+  }
+  try {
+    say('<p><small>Finding the top shows for ' + escapeHtml(name) + '…</small></p>');
+    let params = 'limit=' + encodeURIComponent(limit);
+    if (networkId) params += '&networkId=' + encodeURIComponent(networkId);
+    if (era) params += '&era=' + encodeURIComponent(era);
+    if (genres) params += '&genres=' + encodeURIComponent(genres);
+    const res = await fetch(ORIGIN + '/api/wizard-channel-shows?' + params, { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok || !Array.isArray(data.shows) || !data.shows.length) {
+      say('<p class="testresult err" style="margin:4px 0 0;">✗ ' + escapeHtml(data.error || 'Nothing matched that combination.') + '</p>');
+      return;
+    }
+    const built = await buildChannelItemsFromShows(data.shows, {
+      poster: data.networkLogo || null,
+      onProgress: function (i, total, show) {
+        say('<p><small>Building ' + escapeHtml(name) + '… show ' + (i + 1) + ' of ' + total +
+          ' (' + escapeHtml(show.name || '') + ')</small></p>');
+      },
+    });
+    if (!built.items.length) {
+      say('<p class="testresult err" style="margin:4px 0 0;">✗ Found those shows but could not read any episodes for them.</p>');
+      return;
+    }
+    const channelId = generateChannelId();
+    const payload = {
+      channelId: channelId,
+      name: name,
+      poster: built.poster,
+      backdrop: built.backdrop || built.poster,
+      items: built.items,
+      shuffle: false,
+      // A wizard channel is a pool, not a playlist, so it rotates like a
+      // network channel -- and interleaves, which is what makes a lineup of
+      // eight shows read as a block rather than eight blocks in a row.
+      autoSort: 'interleave',
+      dailyRotate: true,
+    };
+    saveLocalChannel(payload);
+    addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+    renderMyCreatedChannelsList();
+    renderChannelMergeList();
+    showAddedToast('Channel "' + name + '" added to your Catalogs.');
+    say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + escapeHtml(name) + '" built from ' + data.shows.length +
+      ' shows (' + built.items.length + ' episodes), rotating a fresh lineup daily.</p>');
+    const nameInput = document.getElementById('channelWizardNameInput');
+    if (nameInput) nameInput.value = '';
+  } catch (e) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ Network error while building that channel.</p>');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// --- Spotlight channels (an actor, a director, a creator) ---------------
+//
+// Searching a PERSON answers a different question from searching a title,
+// so it gets its own result card and its own builder: pick someone and the
+// whole channel -- their best films plus the shows they were in -- is put
+// together in one go, rather than searching and adding fifteen titles by
+// hand.
+let channelSpotlightSort = 'chronological';
+
+function setChannelSpotlightSort(value) {
+  channelSpotlightSort = value === 'rating' ? 'rating' : 'chronological';
+}
+
+async function runChannelPersonSearch(q) {
+  const box = document.getElementById('channelSearchResult');
+  box.innerHTML = '<p><small>Searching…</small></p>';
+  try {
+    const res = await fetch(ORIGIN + '/api/person-search?q=' + encodeURIComponent(q), { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Search failed.') + '</p>';
+      return;
+    }
+    renderChannelPersonResults(data.results || []);
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">✗ Network error while searching.</p>';
+  }
+}
+
+function renderChannelPersonResults(results) {
+  const box = document.getElementById('channelSearchResult');
+  if (!results.length) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No one by that name.</small></p>';
+    return;
+  }
+  const cards = results.map((p) => {
+    const img = p.poster
+      ? '<img class="preview-thumb" src="' + escapeAttr(p.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+      : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No photo</div>';
+    const data = ' data-personid="' + escapeAttr(String(p.personId)) + '" data-personname="' + escapeAttr(p.name) + '"';
+    return '<div class="custom-list-search-item channelPersonCard" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
+      img +
+      '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(p.name) + '">' + escapeHtml(p.name) + '</div>' +
+      '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; width:100%;" title="' + escapeAttr(p.knownFor || p.department || '') + '">' +
+        escapeHtml(p.knownFor || p.department || '') +
+      '</div>' +
+      '<button type="button" class="lc-btn secondary channelPersonBtn" style="width:100%; padding:4px 6px; font-size:0.75rem;"' + data + '>+ Browse</button>' +
+      '</div>';
+  }).join('');
+  box.innerHTML = '<div class="poster-grid-3" style="margin-top:10px;">' + cards + '</div>';
+}
+
+// --- browsing one person's filmography ----------------------------------
+//
+// The same shape as browsing a show: tap the card and everything they have
+// been in opens BELOW, where each title can be added on its own -- rather
+// than the whole channel being committed in one click, which gave no way to
+// drop the one film you have seen too often.
+//
+// A film is added directly. A TV credit hands off to browseChannelShow, so
+// picking seasons and episodes of a show someone was in is the same journey
+// as picking them from the Shows tab, with the same controls.
+let channelPersonCredits = null;
+
+async function browseChannelPerson(personId, personName) {
+  const box = document.getElementById('channelEpisodePicker');
+  if (!box) return;
+  box.innerHTML = '<p><small>Loading ' + escapeHtml(personName || 'their') + '\u2019s filmography\u2026</small></p>';
+  box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  try {
+    const res = await fetch(ORIGIN + '/api/person-credits?personId=' + encodeURIComponent(personId) +
+      '&sort=' + encodeURIComponent(channelSpotlightSort) + '&movies=120&shows=60', { cache: 'no-store' });
+    const data = await res.json();
+    if (!data.ok) {
+      box.innerHTML = '<p class="testresult err">\u2717 ' + escapeHtml(data.error || 'Could not read that filmography.') + '</p>';
+      return;
+    }
+    channelPersonCredits = {
+      personId: String(personId),
+      name: data.name || personName || '',
+      poster: data.poster || null,
+      backdrop: data.backdrop || null,
+      movies: data.movies || [],
+      shows: data.shows || [],
+    };
+    renderChannelPersonCredits();
+  } catch (e) {
+    box.innerHTML = '<p class="testresult err">\u2717 Network error loading that filmography.</p>';
+  }
+}
+
+// The sort is a property of the whole filmography, so changing it re-asks
+// the server rather than re-ordering here: which credits make the cut is
+// decided by popularity and only their ORDER is the sort, so sorting a
+// fetched page locally would be sorting the wrong forty titles.
+function setChannelSpotlightSortAndReload(value) {
+  setChannelSpotlightSort(value);
+  if (channelPersonCredits) browseChannelPerson(channelPersonCredits.personId, channelPersonCredits.name);
+}
+
+function channelPersonCreditCardHtml(credit, isShow) {
+  const poster = credit.poster || '';
+  const img = poster
+    ? '<img class="preview-thumb" src="' + escapeAttr(poster) + '" alt="" loading="lazy">'
+    : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
+  const data =
+    ' data-tmdbid="' + escapeAttr(String(credit.tmdbId)) + '"' +
+    ' data-title="' + escapeAttr(credit.title) + '"' +
+    ' data-year="' + escapeAttr(credit.year || '') + '"' +
+    ' data-poster="' + escapeAttr(poster) + '"' +
+    ' data-backdrop="' + escapeAttr(credit.backdrop || '') + '"';
+  const cardClass = isShow ? 'channelPersonShowCard' : 'channelPersonMovieCard';
+  const btnClass = isShow ? 'channelPersonShowBtn' : 'channelPersonMovieBtn';
+  const btnLabel = isShow ? '+ Their episodes' : '+ Add';
+  const sub = [credit.year, credit.role].filter(Boolean).join(' \u00b7 ');
+  return '<div class="custom-list-search-item ' + cardClass + '" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
+    img +
+    '<div style="width:100%; font-size:0.75rem; font-weight:600; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin:4px 0 1px;" title="' + escapeAttr(credit.title) + '">' +
+      escapeHtml(credit.title) +
+    '</div>' +
+    '<div style="font-size:0.7rem; color:var(--muted); text-align:center; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; width:100%;" title="' + escapeAttr(sub) + '">' + escapeHtml(sub) + '</div>' +
+    '<button type="button" class="lc-btn secondary ' + btnClass + '" style="width:100%; padding:4px 6px; font-size:0.75rem;"' + data + '>' + btnLabel + '</button>' +
+    '</div>';
+}
+
+function renderChannelPersonCredits() {
+  const box = document.getElementById('channelEpisodePicker');
+  if (!box || !channelPersonCredits) return;
+  const c = channelPersonCredits;
+  if (!c.movies.length && !c.shows.length) {
+    box.innerHTML = '<p class="testresult err">\u2717 TMDB has no credits we can build a channel from for ' + escapeHtml(c.name) + '.</p>';
+    return;
+  }
+  const header =
+    '<div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px;">' +
+      '<p style="margin:0; font-weight:600; font-size:0.9rem; flex:1; min-width:160px;">' +
+        escapeHtml(c.name) + ' \u2014 ' + c.movies.length + ' film' + (c.movies.length === 1 ? '' : 's') +
+        (c.shows.length ? ' and ' + c.shows.length + ' show' + (c.shows.length === 1 ? '' : 's') : '') +
+      '</p>' +
+      '<label for="channelSpotlightSortSelect" style="font-size:0.8rem; font-weight:600;">Order:</label>' +
+      '<select id="channelSpotlightSortSelect" onchange="setChannelSpotlightSortAndReload(this.value)" style="font-size:0.82rem; padding:5px 8px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">' +
+        '<option value="chronological"' + (channelSpotlightSort === 'chronological' ? ' selected' : '') + '>Career order</option>' +
+        '<option value="rating"' + (channelSpotlightSort === 'rating' ? ' selected' : '') + '>Best first</option>' +
+      '</select>' +
+    '</div>' +
+    '<div class="actions" style="flex-wrap:wrap; margin-bottom:10px;">' +
+      '<button type="button" class="secondary channelPersonAddAllBtn">Add everything as a Spotlight channel</button>' +
+    '</div>';
+  const movies = c.movies.length
+    ? '<p style="margin:10px 0 4px; font-weight:600; font-size:0.85rem;">Films</p>' +
+      '<div class="poster-grid-3">' + c.movies.map((m) => channelPersonCreditCardHtml(m, false)).join('') + '</div>'
+    : '';
+  const shows = c.shows.length
+    ? '<p style="margin:14px 0 4px; font-weight:600; font-size:0.85rem;">Television</p>' +
+      '<p style="margin:0 0 6px; color:var(--muted); font-size:0.78rem;">The button adds only the episodes they are actually in. Tap the poster instead to pick seasons and episodes yourself, the same way you would from the Shows tab.</p>' +
+      '<div class="poster-grid-3">' + c.shows.map((sh) => channelPersonCreditCardHtml(sh, true)).join('') + '</div>' +
+      '<div id="channelEpisodeList"></div>'
+    : '<div id="channelEpisodeList"></div>';
+  box.innerHTML = header + movies + shows;
+}
+
+// "Add everything as a Spotlight channel".
+//
+// Everything means everything: every film listed above, and every episode of
+// every show listed above that this person is ACTUALLY in -- not a slice of
+// each, and not a show's opening episodes because they happened to appear in
+// one of them (see /api/person-show-episodes, which is what settles which
+// episodes those are).
+//
+// The whole lot is then ordered TOGETHER by the chosen sort. Films first and
+// television after was the old shape, and it read as broken: a 1994 guest
+// appearance played after a 2021 film in what was supposed to be career
+// order. Sorting the items rather than the credits is what puts each episode
+// where it actually belongs among the films.
+function spotlightItemSortDate(it) {
+  return channelItemAiredDateClient(it) || '';
+}
+
+function sortSpotlightItems(items, mode) {
+  const wrapped = items.map((it, i) => ({ it: it, i: i }));
+  if (mode === 'rating') {
+    // An episode has no rating of its own worth ranking by, so it inherits
+    // its show's -- which keeps a show's run together, in broadcast order,
+    // sitting where that show ranks among the films.
+    wrapped.sort((a, b) => {
+      const ra = Number(a.it.spotlightRating) || 0;
+      const rb = Number(b.it.spotlightRating) || 0;
+      if (ra !== rb) return rb - ra;
+      return a.i - b.i;
+    });
+  } else {
+    wrapped.sort((a, b) => {
+      const da = spotlightItemSortDate(a.it);
+      const db = spotlightItemSortDate(b.it);
+      if (da === db) return a.i - b.i;
+      // Undated last, never first: being unable to place something is no
+      // reason to open a tribute with it. Same call sortChannelItemsByAired
+      // makes server-side.
+      if (!da) return 1;
+      if (!db) return -1;
+      return da < db ? -1 : 1;
+    });
+  }
+  return wrapped.map((w) => {
+    const out = Object.assign({}, w.it);
+    delete out.spotlightRating;
+    return out;
+  });
+}
+
+// Adds one show's worth of a person's own episodes -- the per-show version
+// of what "Add everything" does, for when only that credit is wanted.
+async function addPersonShowEpisodes(tmdbId, showTitle, showPoster, btn, duplicateChecked) {
+  if (!channelPersonCredits) return;
+  const c = channelPersonCredits;
+  if (!duplicateChecked && guardChannelDraftDuplicate(
+    showTitle || 'That show',
+    channelDraftCountForShow('', showTitle),
+    () => addPersonShowEpisodes(tmdbId, showTitle, showPoster, btn, true)
+  )) return;
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Finding\u2026';
+  }
+  try {
+    const r = await fetch(ORIGIN + '/api/person-show-episodes?personId=' + encodeURIComponent(c.personId) +
+      '&tmdbId=' + encodeURIComponent(tmdbId), { cache: 'no-store' });
+    const d = await r.json();
+    if (!d.ok || !Array.isArray(d.episodes) || !d.episodes.length) {
+      if (btn) btn.textContent = 'None found';
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+      return;
+    }
+    const poster = d.poster || showPoster || '';
+    const showName = d.showName || showTitle || '';
+    const items = d.episodes.map((ep) => ({
+      kind: 'episode',
+      imdbId: channelStreamShowId(d.imdbId, tmdbId),
+      season: ep.season,
+      episode: ep.episode,
+      showName: showName,
+      epName: ep.name,
+      title: showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + ep.name,
+      released: ep.released || '',
+      runtime: ep.runtime || 0,
+      thumbnail: ep.thumbnail || poster,
+      poster: poster || ep.thumbnail || '',
+      showPoster: poster,
+    }));
+    channelDraftItems = channelDraftItems.concat(items);
+    renderChannelDraftList();
+    updateChannelSaveButtonLabel();
+    if (btn) {
+      btn.textContent = '+' + items.length + ' \u2713';
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+    }
+  } catch (e) {
+    if (btn) btn.textContent = 'Failed';
+    setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1800);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function addWholeSpotlightToDraft(btn) {
+  if (!channelPersonCredits) return;
+  const c = channelPersonCredits;
+  const box = document.getElementById('channelEpisodePicker');
+  const say = (html) => { if (box) box.innerHTML = html; };
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Building\u2026';
+  }
+  try {
+    // A film needs its IMDB id resolved one by one: a channel item's id IS
+    // the stream request (see channelItemStreamId server-side), so a movie
+    // with no id would play as nothing.
+    const movieItems = [];
+    for (let i = 0; i < c.movies.length; i++) {
+      const m = c.movies[i];
+      say('<p><small>Resolving films\u2026 ' + (i + 1) + ' of ' + c.movies.length + ' (' + escapeHtml(m.title) + ')</small></p>');
+      try {
+        const r = await fetch(ORIGIN + '/api/resolve-movie?tmdbId=' + encodeURIComponent(m.tmdbId), { cache: 'no-store' });
+        const d = await r.json();
+        if (!d.ok || !d.imdbId) continue;
+        movieItems.push({
+          kind: 'movie',
+          imdbId: d.imdbId,
+          tmdbId: m.tmdbId,
+          title: m.title,
+          year: m.year || '',
+          showName: m.title,
+          epName: 'Movie',
+          released: m.released || (m.year ? m.year + '-01-01' : ''),
+          runtime: d.runtime || 0,
+          thumbnail: m.backdrop || m.poster || '',
+          poster: m.poster || '',
+          showPoster: m.poster || '',
+          backdrop: m.backdrop || '',
+          spotlightRating: m.rating || 0,
+        });
+      } catch (e) {
+        continue;
+      }
+    }
+
+    const episodeItems = [];
+    let guestShows = 0;
+    for (let i = 0; i < c.shows.length; i++) {
+      const sh = c.shows[i];
+      say('<p><small>Finding ' + escapeHtml(c.name) + '\u2019s episodes\u2026 show ' + (i + 1) + ' of ' + c.shows.length +
+        ' (' + escapeHtml(sh.title) + ')</small></p>');
+      try {
+        const r = await fetch(ORIGIN + '/api/person-show-episodes?personId=' + encodeURIComponent(c.personId) +
+          '&tmdbId=' + encodeURIComponent(sh.tmdbId), { cache: 'no-store' });
+        const d = await r.json();
+        if (!d.ok || !Array.isArray(d.episodes) || !d.episodes.length) continue;
+        if (!d.regular) guestShows++;
+        const showPoster = d.poster || sh.poster || '';
+        const showName = d.showName || sh.title || '';
+        d.episodes.forEach((ep) => {
+          episodeItems.push({
+            kind: 'episode',
+            imdbId: channelStreamShowId(d.imdbId, sh.tmdbId),
+            season: ep.season,
+            episode: ep.episode,
+            showName: showName,
+            epName: ep.name,
+            title: showName + ' S' + ep.season + 'E' + ep.episode + ' \u2014 ' + ep.name,
+            released: ep.released || '',
+            runtime: ep.runtime || 0,
+            thumbnail: ep.thumbnail || showPoster,
+            poster: showPoster || ep.thumbnail || '',
+            showPoster: showPoster,
+            spotlightRating: sh.rating || 0,
+          });
+        });
+      } catch (e) {
+        continue;
+      }
+    }
+
+    const items = sortSpotlightItems(movieItems.concat(episodeItems), channelSpotlightSort);
+    if (!items.length) {
+      say('<p class="testresult err">\u2717 Could not resolve any of ' + escapeHtml(c.name) + '\u2019s credits to something playable.</p>');
+      return;
+    }
+    channelDraftItems = channelDraftItems.concat(items);
+    if (!channelDraftPoster) channelDraftPoster = c.poster || (c.movies[0] && c.movies[0].poster) || null;
+    if (!channelDraftBackdrop) channelDraftBackdrop = c.backdrop || null;
+    const nameInput = document.getElementById('channelNameInput');
+    if (nameInput && !nameInput.value.trim()) nameInput.value = c.name + ' Spotlight';
+    // The items have just been put in the order that was asked for, so the
+    // draft stays "As listed" -- arming an auto-sort here would re-sort them
+    // on the next render and throw that ordering away.
+    setChannelPlayOrder('as-listed');
+    renderChannelDraftList();
+    updateChannelSaveButtonLabel();
+    say('<p class="testresult ok" style="margin:4px 0 0;">\u2713 Added ' + movieItems.length + ' film' + (movieItems.length === 1 ? '' : 's') +
+      (episodeItems.length ? ' and ' + episodeItems.length + ' episode' + (episodeItems.length === 1 ? '' : 's') : '') +
+      ', ' + (channelSpotlightSort === 'rating' ? 'best first' : 'in career order') + '.' +
+      (guestShows ? ' Guest appearances are only the episodes ' + escapeHtml(c.name) + ' is in.' : '') +
+      ' Tune the picks below, then Save.</p>');
+  } catch (e) {
+    say('<p class="testresult err">\u2717 Network error while building that spotlight.</p>');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// --- sharing a channel, and the Explore Channels directory --------------
+//
+// A channel is thousands of episodes, so a share link cannot carry it: what
+// travels is a short code, and the channel itself is stored server-side
+// under channelshare:{code} (see /api/channel/share). Pasting the link -- or
+// opening it -- rebuilds the channel here, picks, play order, broadcast
+// schedule and all.
+//
+// Sharing is unlisted and needs no account. PUBLISHING to the directory
+// does need a Creator Profile, so every listing has an owner who can take it
+// back down.
+
+// Every field a share carries. Kept out of channelBroadcastFields because
+// these say where a channel has BEEN rather than how it plays -- but carried
+// through the same three persistence points for the same reason: a field
+// only two of the three know about is a field that disappears on the next
+// save.
+function channelShareFields(src) {
+  const o = src || {};
+  return {
+    shareCode: String(o.shareCode || ''),
+    sharePublished: !!o.sharePublished,
+  };
+}
+
+function channelShareUrl(code) {
+  return ORIGIN.replace(/\\/+$/, '') + '/channel/' + encodeURIComponent(code);
+}
+
+// The code inside whatever got pasted: a full share URL, a "channel:share:"
+// prefix, the fragment a share link redirects to, or the bare code.
+function parseChannelShareCode(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  const fromUrl = text.match(/\\/channel\\/([A-Za-z0-9_-]{1,64})/);
+  if (fromUrl) return fromUrl[1];
+  const fromHash = text.match(/[#&?]channel=([A-Za-z0-9_-]{1,64})/);
+  if (fromHash) return fromHash[1];
+  const fromScheme = text.match(/^channel:share:([A-Za-z0-9_-]{1,64})$/);
+  if (fromScheme) return fromScheme[1];
+  return /^[A-Za-z0-9_-]{1,64}$/.test(text) ? text : '';
+}
+
+// The payload a share sends. Deliberately NOT the stored record: a saved
+// channel carries local bookkeeping (createdAt, the share code itself) that
+// has no meaning on anyone else's device.
+function channelSharePayload(ch) {
+  return Object.assign({
+    name: ch.name,
+    poster: ch.poster,
+    backdrop: ch.backdrop,
+    items: ch.items || [],
+    shuffle: !!ch.shuffle,
+    autoSort: ch.autoSort || '',
+    sortByAired: !!ch.sortByAired,
+  }, channelBroadcastFields(ch));
+}
+
+async function postChannelShare(ch, opts) {
+  const o = opts || {};
+  const body = {
+    channel: channelSharePayload(ch),
+    code: ch.shareCode || '',
+    description: o.description || '',
+    publish: !!o.publish,
+  };
+  // Credentials go with a re-share too, not only with a publish.
+  //
+  // Re-sharing writes over an existing record, and a record created by
+  // PUBLISHING has an owner -- so an unlisted re-share that proved nothing
+  // was refused as "that share link belongs to someone else", by its own
+  // owner. Sent whenever they are available: an unlisted share of a channel
+  // nobody has published still needs nothing, and the server only uses them
+  // to decide who is writing.
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (signedIn && (o.publish || ch.shareCode)) {
+    body.creatorName = activeCreator.creatorName;
+    body.creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  }
+  const res = await fetch(ORIGIN + '/api/channel/share', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+// Remembers the code on the local channel, so sharing the same channel again
+// after an edit updates the link people already have rather than minting a
+// second one beside it.
+function rememberChannelShare(channelId, code, published) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch) return;
+  ch.shareCode = code;
+  ch.sharePublished = !!published;
+  saveLocalChannelsMap(map);
+}
+
+// Copies the link a channel already has, without re-uploading it.
+//
+// The modal that appears after sharing or publishing is not a place to keep
+// something: it closes, and the link goes with it. A channel that has a code
+// carries this button from then on, so the link is always one tap away.
+async function copyChannelShareLink(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch || !ch.shareCode) return;
+  const link = channelShareUrl(ch.shareCode);
+  let copied = false;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(link);
+      copied = true;
+    }
+  } catch (e) {
+    copied = false;
+  }
+  if (copied) {
+    if (btn) {
+      const label = btn.textContent;
+      btn.textContent = 'Copied \u2713';
+      setTimeout(() => { if (btn) btn.textContent = label; }, 1600);
+    }
+    showAddedToast('Link to "' + ch.name + '" copied.');
+    return;
+  }
+  // No clipboard (an insecure origin, or a browser that refuses): the link
+  // still has to be gettable, so it goes on screen to be selected by hand.
+  showAppAlert('Link to "' + ch.name + '"', link, true);
+}
+
+async function shareChannelById(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch) return;
+  const originalLabel = btn ? btn.textContent : 'Share';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Sharing…';
+  }
+  try {
+    const data = await postChannelShare(ch, { publish: false });
+    if (!data.ok) {
+      showAppAlert('Share Channel', data.error || 'Could not create a share link for that channel.');
+      return;
+    }
+    rememberChannelShare(channelId, data.code, data.published);
+    const link = data.url || channelShareUrl(data.code);
+    let copied = false;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(link);
+        copied = true;
+      }
+    } catch (e) {
+      copied = false;
+    }
+    showAppAlert(
+      'Share "' + ch.name + '"',
+      (copied ? 'Link copied to your clipboard:\\n\\n' : 'Copy this link:\\n\\n') + link +
+        '\\n\\nAnyone who opens it gets this exact channel — every pick, its play order and its broadcast schedule.',
+      true
+    );
+    renderMyCreatedChannelsList();
+  } catch (e) {
+    showAppAlert('Share Channel', 'Network error while creating that share link.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// Saves a shared channel locally and adds it to Catalogs. Shared by the
+// Import tab, the Explore Channels cards and the share-link deep link, so
+// all three land a channel the same way.
+function acceptSharedChannel(channel, code) {
+  const channelId = generateChannelId();
+  const payload = Object.assign({}, channel, {
+    channelId: channelId,
+    // The code travels with the copy so its owner's later edits can be
+    // pulled in again, but sharePublished stays false: this copy is not the
+    // one listed in the directory, and marking it so would offer an
+    // "Unpublish" that belongs to someone else.
+    shareCode: code || '',
+    sharePublished: false,
+  });
+  saveLocalChannel(payload);
+  addRow(payload.name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+  renderMyCreatedChannelsList();
+  renderChannelMergeList();
+  showAddedToast('Channel "' + payload.name + '" added to your Catalogs.');
+  return channelId;
+}
+
+async function fetchSharedChannel(code) {
+  const res = await fetch(ORIGIN + '/api/channel/share?code=' + encodeURIComponent(code), { cache: 'no-store' });
+  return res.json();
+}
+
+async function importSharedChannel(btn) {
+  const input = document.getElementById('channelShareCodeInput');
+  const statusBox = document.getElementById('channelShareImportStatus');
+  const say = (html) => { if (statusBox) statusBox.innerHTML = html; };
+  const code = parseChannelShareCode(input ? input.value : '');
+  if (!code) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ That does not look like a channel share link or code.</p>');
+    return;
+  }
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Adding…';
+  }
+  try {
+    say('<p><small>Fetching that channel…</small></p>');
+    const data = await fetchSharedChannel(code);
+    if (!data.ok || !data.channel) {
+      say('<p class="testresult err" style="margin:4px 0 0;">✗ ' + escapeHtml(data.error || 'That channel link could not be read.') + '</p>');
+      return;
+    }
+    acceptSharedChannel(data.channel, code);
+    say('<p class="testresult ok" style="margin:4px 0 0;">✓ "' + escapeHtml(data.channel.name || 'Channel') + '" added (' +
+      (data.channel.items || []).length + ' picks).</p>');
+    if (input) input.value = '';
+  } catch (e) {
+    say('<p class="testresult err" style="margin:4px 0 0;">✗ Network error while fetching that channel.</p>');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// A share link opened directly lands on /configure#channel=<code> (see the
+// /channel/<code> redirect in 25_api-catalog-routes.js). Picking it up here
+// rather than at the server keeps the code out of the request URL, and
+// therefore out of any log: for an unlisted channel the code is the only
+// thing standing between it and everyone.
+async function handleChannelShareDeepLink() {
+  let code = '';
+  try {
+    code = parseChannelShareCode(window.location.hash || '');
+  } catch (e) {
+    code = '';
+  }
+  if (!code) return false;
+  try {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+  } catch (e) {}
+  switchTab('channels');
+  switchChannelsSubmenu('import', document.querySelector('#channelsSubnavBar [data-sub="import"]'));
+  const input = document.getElementById('channelShareCodeInput');
+  if (input) input.value = code;
+  await importSharedChannel(null);
+  return true;
+}
+
+// --- the directory ------------------------------------------------------
+let _channelDirectoryEntries = null;
+let _channelDirectoryLoading = false;
+let _channelDirectorySort = 'newest';
+// Which listings this browser has voted for. The server is authoritative --
+// its ledger is what decides -- but the heart has to fill in before a round
+// trip or it flickers on every render.
+let _channelDirectoryLiked = {};
+
+function setChannelDirectorySort(value) {
+  const next = value || 'newest';
+  if (next === _channelDirectorySort) return;
+  _channelDirectorySort = next;
+  // The ORDER is the server's to decide -- it sees likes and adds from every
+  // visitor, this page sees one page of them -- so a change re-asks rather
+  // than re-sorting what is already here.
+  loadChannelDirectory(true);
+}
+
+async function loadChannelDirectory(force) {
+  const feed = document.getElementById('channelDirectoryFeed');
+  if (_channelDirectoryLoading) return;
+  if (_channelDirectoryEntries && !force) {
+    renderChannelDirectory();
+    return;
+  }
+  _channelDirectoryLoading = true;
+  if (feed) feed.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Loading published channels…</small></p>';
+  try {
+    const res = await fetch(ORIGIN + '/api/channel/directory?limit=60&sort=' + encodeURIComponent(_channelDirectorySort),
+      { cache: force ? 'no-store' : 'default' });
+    const data = await res.json();
+    _channelDirectoryEntries = (data && data.ok && Array.isArray(data.channels)) ? data.channels : [];
+  } catch (e) {
+    _channelDirectoryEntries = null;
+    if (feed) feed.innerHTML = '<p class="testresult err">✗ Could not reach the channel directory just now.</p>';
+    _channelDirectoryLoading = false;
+    return;
+  }
+  _channelDirectoryLoading = false;
+  renderChannelDirectory();
+}
+
+function channelDirectoryMetaLine(entry) {
+  const bits = [];
+  if (entry.dynamic === 'next-up') bits.push('follows its owner’s watch history');
+  else bits.push(entry.itemCount + ' episode' + (entry.itemCount === 1 ? '' : 's'));
+  if (entry.showCount > 1) bits.push(entry.showCount + ' shows');
+  if (entry.dailyRotate) bits.push('daily lineup');
+  else if (entry.shuffle) bits.push('shuffled daily');
+  if (entry.autoSort === 'interleave') bits.push('interleaved');
+  if (entry.owner) bits.push('by ' + entry.owner);
+  if (entry.adds) bits.push(entry.adds + ' added');
+  return bits.join(' · ');
+}
+
+function renderChannelDirectory() {
+  const feed = document.getElementById('channelDirectoryFeed');
+  if (!feed) return;
+  const entries = _channelDirectoryEntries || [];
+  if (!entries.length) {
+    feed.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Nothing published yet. Build a channel and be the first — publish it from the panel below.</small></p>';
+    return;
+  }
+  const filterInput = document.getElementById('channelDirectorySearchInput');
+  const q = (filterInput ? filterInput.value : '').trim().toLowerCase();
+  const shown = q
+    ? entries.filter((e) => (
+        String(e.name || '').toLowerCase().indexOf(q) !== -1 ||
+        String(e.description || '').toLowerCase().indexOf(q) !== -1 ||
+        String(e.owner || '').toLowerCase().indexOf(q) !== -1
+      ))
+    : entries;
+  if (!shown.length) {
+    feed.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No published channel matches that.</small></p>';
+    return;
+  }
+  feed.innerHTML = shown.map((e) => channelListingCardHtml(
+    e,
+    '<button type="button" class="lc-btn searchLikeExternalBtn' + (_channelDirectoryLiked[e.code] ? ' liked' : '') + '"' +
+      ' aria-label="Like this channel" title="Like this channel"' +
+      ' onclick="toggleChannelDirectoryLike(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">' +
+      (_channelDirectoryLiked[e.code] ? '\u2665' : '\u2661') + (e.likes ? ' ' + e.likes : '') +
+    '</button>' +
+    '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">See all</button>' +
+    '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="addDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">+ Add</button>',
+    ''
+  )).join('');
+}
+
+// Look through a published channel before taking it.
+//
+// A directory row is a one-line summary by design -- the index has to stay
+// cheap to read -- so seeing what is actually IN a channel means fetching
+// it. Which is the same fetch adding it makes, so a preview costs a person
+// nothing they were not about to spend anyway, and answers the question the
+// summary cannot: is this the lineup I want?
+async function previewDirectoryChannel(code, btn) {
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn && btn.tagName === 'BUTTON') {
+    btn.disabled = true;
+    btn.textContent = 'Opening\u2026';
+  }
+  try {
+    const data = await fetchSharedChannel(code);
+    if (!data.ok || !data.channel) {
+      showAppAlert('Explore Channels', data.error || 'That channel could not be read.');
+      return;
+    }
+    // A synthetic id: this channel is not saved here, and giving it one that
+    // could collide with a saved channel's would make "+ Add" on the details
+    // page act on the wrong one.
+    const preview = Object.assign({}, data.channel, { channelId: 'directory:' + code });
+    openChannelDetailsPage(preview.channelId, preview);
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while opening that channel.');
+  } finally {
+    if (btn && btn.tagName === 'BUTTON') {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+async function toggleChannelDirectoryLike(code, btn) {
+  const wasLiked = !!_channelDirectoryLiked[code];
+  // Filled in before the round trip so the heart answers the tap, and put
+  // back if the server disagrees -- it holds the ledger, this does not.
+  _channelDirectoryLiked[code] = !wasLiked;
+  renderChannelDirectory();
+  try {
+    const body = { code: code, action: wasLiked ? 'unlike' : 'like' };
+    const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+    if (signedIn) {
+      body.creatorName = activeCreator.creatorName;
+      body.creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+    }
+    const res = await fetch(ORIGIN + '/api/channel/like', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      _channelDirectoryLiked[code] = wasLiked;
+      renderChannelDirectory();
+      return;
+    }
+    _channelDirectoryLiked[code] = !!data.liked;
+    const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
+    if (entry) entry.likes = data.likes;
+    renderChannelDirectory();
+  } catch (e) {
+    _channelDirectoryLiked[code] = wasLiked;
+    renderChannelDirectory();
+  }
+}
+
+async function addDirectoryChannel(code, btn) {
+  const originalLabel = btn ? btn.textContent : '+ Add';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Adding…';
+  }
+  try {
+    const data = await fetchSharedChannel(code);
+    if (!data.ok || !data.channel) {
+      showAppAlert('Explore Channels', data.error || 'That channel could not be read.');
+      return;
+    }
+    acceptSharedChannel(data.channel, code);
+    // Taking a channel is the signal "most added" ranks on. Best effort by
+    // design: it must never be the reason an add fails.
+    fetch(ORIGIN + '/api/channel/added', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: code }),
+    }).catch(() => {});
+    const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
+    if (entry) entry.adds = (Number(entry.adds) || 0) + 1;
+    if (btn) btn.textContent = 'Added ✓';
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while adding that channel.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1500);
+    }
+  }
+}
+
+// The "publish one of your own" half of the Explore tab: every saved channel
+// with a control to list it, or take it back down.
+// One card, drawn the way Explore Channels draws one.
+//
+// The publish panel and the directory show the same thing -- a channel, as
+// other people will see it -- so they are built by the same function and
+// differ only in the buttons on the right. Two card shapes for one object is
+// how a description ends up shown in one place and not the other.
+function channelListingCardHtml(entry, actionsHtml, extraHtml) {
+  const art = entry.backdrop || entry.poster || '';
+  const thumb = art
+    ? '<img src="' + escapeAttr(art) + '" alt="" loading="lazy" style="width:88px; height:56px; object-fit:cover; border-radius:6px; border:1px solid var(--border); flex:0 0 auto;">'
+    : '';
+  const openAttr = entry.code
+    ? ' style="cursor:pointer;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(entry.code) + '&quot;, this)" title="See everything in this channel"'
+    : '';
+  return '<div class="list-card" style="margin-bottom:10px;">' +
+    '<div class="list-card-header" style="gap:10px; align-items:center;">' +
+      (thumb ? '<div' + openAttr + '>' + thumb + '</div>' : '') +
+      '<div class="list-card-body">' +
+        '<div class="list-card-title"' + openAttr + '>' + escapeHtml(entry.name || 'Channel') + '</div>' +
+        (entry.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(entry.description) + '</div>' : '') +
+        '<div class="list-card-meta"><span>' + escapeHtml(channelDirectoryMetaLine(entry)) + '</span></div>' +
+      '</div>' +
+      '<div class="list-card-actions">' + actionsHtml + '</div>' +
+    '</div>' +
+    (extraHtml || '') +
+  '</div>';
+}
+
+// A saved channel, described the way a directory row describes one -- so the
+// panel can preview what publishing it would actually look like.
+function channelAsListingEntry(ch) {
+  const items = ch.items || [];
+  const showKeys = {};
+  items.forEach((it) => { const k = channelDraftShowKey(it); if (k) showKeys[k] = true; });
+  return {
+    code: ch.sharePublished ? ch.shareCode : '',
+    name: ch.name,
+    description: ch.description || '',
+    poster: ch.poster || null,
+    backdrop: ch.backdrop || null,
+    itemCount: items.length,
+    showCount: Object.keys(showKeys).length,
+    dailyRotate: !!ch.dailyRotate,
+    shuffle: !!ch.shuffle,
+    autoSort: ch.autoSort || '',
+    dynamic: ch.dynamic || '',
+    owner: ch.sharePublished && typeof activeCreator !== 'undefined' && activeCreator ? activeCreator.creatorName : '',
+    likes: 0,
+    adds: 0,
+  };
+}
+
+let _orphanedPublishedChannels = [];
+
+// Listings this account still has up whose channel is gone from this
+// browser. Fetched rather than inferred: the local store is exactly what
+// cannot answer this, because the record that knew the code is the one that
+// was deleted.
+async function loadOrphanedPublishedChannels() {
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (!signedIn) {
+    _orphanedPublishedChannels = [];
+    return;
+  }
+  try {
+    const res = await fetch(ORIGIN + '/api/channel/mine', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: localStorage.getItem('myListAddon:creatorKey') || '',
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) return;
+    const mine = loadLocalChannels();
+    const known = {};
+    Object.values(mine).forEach((ch) => { if (ch && ch.shareCode) known[ch.shareCode] = true; });
+    _orphanedPublishedChannels = (data.channels || []).filter((e) => e && !known[e.code]);
+  } catch (e) {
+    // Leave whatever was last known rather than clearing the list on a
+    // hiccup -- an orphan that vanishes from the panel is an orphan nobody
+    // can take down.
+  }
+  renderChannelPublishList();
+}
+
+function renderChannelPublishList() {
+  const box = document.getElementById('channelPublishList');
+  if (!box) return;
+  const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+  if (!signedIn) {
+    box.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>Sign in to a Creator Profile under <strong>Settings</strong> to publish a channel here. You can still share any channel privately with <strong>Share</strong> under My Channels.</small></p>';
+    return;
+  }
+  const channels = Object.values(ensureAllChannelsSyncedFromRows(loadLocalChannels()));
+  channels.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+
+  const mine = channels.map((ch) => {
+    const action = ch.sharePublished
+      ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="unpublishChannelFromDirectory(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Unpublish</button>'
+      : '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="publishChannelToDirectory(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Publish</button>';
+    const extra =
+      (ch.sharePublished ? '' :
+        '<input type="text" id="channelPublishDesc_' + escapeAttr(ch.channelId) + '" placeholder="One line about this channel (optional)" style="margin-top:8px; font-size:0.82rem;" value="' + escapeAttr(ch.description || '') + '">') +
+      // A published channel's link lives here, on screen, rather than only
+      // in the modal that announced it -- that modal closes and takes the
+      // link with it.
+      (ch.shareCode
+        ? '<div class="row" style="margin-top:8px; gap:8px;">' +
+            '<input type="text" readonly value="' + escapeAttr(channelShareUrl(ch.shareCode)) + '" onclick="this.select()" style="font-size:0.8rem;">' +
+            '<button type="button" class="secondary lc-btn" style="flex:none; width:auto; white-space:nowrap;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Copy</button>' +
+          '</div>'
+        : '');
+    return channelListingCardHtml(channelAsListingEntry(ch), action, extra);
+  }).join('');
+
+  // Listings with no channel left behind them. Shown apart from the rest
+  // because there is nothing to edit, publish or copy -- only to withdraw.
+  const orphans = _orphanedPublishedChannels.map((entry) => channelListingCardHtml(
+    entry,
+    '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="unpublishOrphanedChannel(&quot;' + escapeJsAttr(entry.code) + '&quot;, this)">Unpublish</button>',
+    ''
+  )).join('');
+
+  box.innerHTML =
+    (channels.length ? mine : '<p style="color:var(--muted); font-size:0.85rem;"><small>No channels yet \u2014 build one first.</small></p>') +
+    (orphans
+      ? '<p style="margin:16px 0 6px; font-weight:600; font-size:0.85rem;">Still listed, but no longer on this device</p>' +
+        '<p style="margin:0 0 8px; color:var(--muted); font-size:0.78rem;">You published these and the channel has since been deleted here. They are still in Explore Channels until you take them down.</p>' +
+        orphans
+      : '');
+}
+
+async function publishChannelToDirectory(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch) return;
+  const descInput = document.getElementById('channelPublishDesc_' + channelId);
+  const originalLabel = btn ? btn.textContent : 'Publish';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Publishing…';
+  }
+  try {
+    const data = await postChannelShare(ch, {
+      publish: true,
+      description: descInput ? descInput.value.trim() : '',
+    });
+    if (!data.ok) {
+      showAppAlert('Publish Channel', data.error || 'Could not publish that channel.');
+      return;
+    }
+    rememberChannelShare(channelId, data.code, true);
+    showAppAlert(
+      'Published',
+      '"' + ch.name + '" is now listed in Explore Channels.\\n\\nIts direct link is ' + (data.url || channelShareUrl(data.code)),
+      true
+    );
+    renderChannelPublishList();
+    loadChannelDirectory(true);
+  } catch (e) {
+    showAppAlert('Publish Channel', 'Network error while publishing that channel.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// Withdraws one listing by its code. The one place that call lives, so
+// deleting a channel, unpublishing from the panel, and clearing an orphaned
+// listing all do exactly the same thing.
+async function unpublishChannelByCode(code) {
+  if (!code) return { ok: false, error: 'No code.' };
+  const res = await fetch(ORIGIN + '/api/channel/unpublish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      code: code,
+      creatorName: (typeof activeCreator !== 'undefined' && activeCreator) ? activeCreator.creatorName : '',
+      creatorKey: localStorage.getItem('myListAddon:creatorKey') || '',
+    }),
+  });
+  return res.json();
+}
+
+async function unpublishChannelFromDirectory(channelId, btn) {
+  const map = loadLocalChannels();
+  const ch = map[channelId];
+  if (!ch || !ch.shareCode) return;
+  const originalLabel = btn ? btn.textContent : 'Unpublish';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Removing…';
+  }
+  try {
+    const data = await unpublishChannelByCode(ch.shareCode);
+    if (!data.ok) {
+      showAppAlert('Explore Channels', data.error || 'Could not remove that listing.');
+      return;
+    }
+    // Only the LISTING goes. The share link keeps working, because "stop
+    // advertising this" and "break everyone's link" are different asks.
+    rememberChannelShare(channelId, ch.shareCode, false);
+    renderChannelPublishList();
+    loadChannelDirectory(true);
+    loadOrphanedPublishedChannels();
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while removing that listing.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
+
+// A listing whose channel is no longer in this browser. Nothing local is
+// left to update, so this only withdraws it and redraws the panel.
+async function unpublishOrphanedChannel(code, btn) {
+  const originalLabel = btn ? btn.textContent : 'Unpublish';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Removing…';
+  }
+  try {
+    const data = await unpublishChannelByCode(code);
+    if (!data.ok) {
+      showAppAlert('Explore Channels', data.error || 'Could not remove that listing.');
+      return;
+    }
+    renderChannelPublishList();
+    loadChannelDirectory(true);
+  } catch (e) {
+    showAppAlert('Explore Channels', 'Network error while removing that listing.');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
+    }
+  }
+}
 
 //
 const LOCAL_MERGED_CHANNELS_KEY = 'myListAddon:localMergedChannels';
@@ -56176,6 +60379,93 @@ function renderWatchHistoryGrid() {
 }
 window.renderWatchHistoryGrid = renderWatchHistoryGrid;
 
+
+// --- "On Today": what this channel is actually running --------------------
+//
+// A rotating channel stores a pool much bigger than a day, and until now the
+// only way to see which shows and episodes today's lineup had drawn from it
+// was to open the channel in Stremio. So you could set 24 shows x 3 episodes
+// and have no idea what that produced.
+//
+// The Worker answers it (see /api/channel-lineup), which matters: the
+// rotation is a seeded shuffle, and a second copy of that PRNG living on
+// this page is the kind of thing that drifts by one episode after some later
+// edit and is never noticed. This asks the same function the meta route uses.
+async function renderChannelLineupTab(params) {
+  const gridEl = document.getElementById('detailGrid');
+  const statusEl = document.getElementById('detailStatus');
+  const subEl = document.getElementById('detailSubtitle');
+  if (!gridEl) return;
+  const listUrl = (params && params.listUrl) || '';
+  const channelId = listUrl.startsWith('channel:id:') ? listUrl.slice('channel:id:'.length) : '';
+  const channel = channelId && typeof loadLocalChannels === 'function' ? loadLocalChannels()[channelId] : null;
+  if (!channel) {
+    if (statusEl) statusEl.innerHTML = '<small>This channel is not saved in this browser, so there is nothing to look up.</small>';
+    return;
+  }
+  gridEl.innerHTML = '';
+  // The lineup rewrites the page subtitle with today's numbers, so hold on to
+  // the list's own subtitle -- All has to put it back.
+  if (subEl && typeof window._listDetailsSubtitleBeforeLineup !== 'string') {
+    window._listDetailsSubtitleBeforeLineup = subEl.textContent || '';
+  }
+  if (statusEl) statusEl.innerHTML = '<small>Working out what is on&hellip;</small>';
+  try {
+    const res = await fetch(ORIGIN + '/api/channel-lineup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'channel:v1:' + JSON.stringify(channel) }),
+      cache: 'no-store',
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      if (statusEl) statusEl.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Could not work out this channel’s lineup.') + '</p>';
+      return;
+    }
+    const items = data.items || [];
+    if (!items.length) {
+      if (statusEl) statusEl.innerHTML = '<small>Nothing is scheduled for this channel right now.</small>';
+      return;
+    }
+    const tiles = items.map((it, idx) => {
+      const seasonEp = (it.season != null && it.episode != null && it.kind !== 'movie')
+        ? ('S' + it.season + 'E' + it.episode) : '';
+      const showName = it.showName || it.title || 'Untitled';
+      return {
+        id: (typeof channelItemId === 'function' ? channelItemId(it, idx) : (it.imdbId || String(idx))),
+        type: it.kind === 'movie' ? 'movie' : 'series',
+        // The running order IS the answer here, so each tile is numbered:
+        // "12." is the twelfth thing this channel plays today.
+        name: (idx + 1) + '. ' + showName + (seasonEp ? ' ' + seasonEp : ''),
+        subtitle: it.epName || '',
+        title: it.title || showName,
+        poster: it.thumbnail || it.poster || it.showPoster || channel.poster || '',
+        thumbnail: it.thumbnail || it.poster || '',
+        year: it.released ? String(it.released).slice(0, 4) : '',
+        listUrl: listUrl,
+        listName: channel.name || '',
+      };
+    });
+    if (typeof renderPosterGridChunked === 'function') renderPosterGridChunked(gridEl, tiles);
+    const bits = [items.length + ' playing today'];
+    if (data.rotating && data.plan) {
+      bits.push('out of ' + data.poolSize + ', ' + data.plan.shows + ' shows × ' + data.plan.episodes + ' episodes');
+    }
+    // An honest label rather than a lineup that differs from what will play:
+    // this endpoint is unauthenticated and cannot read anyone's history, so
+    // a channel whose rules depend on one is previewed without them.
+    if ((data.unappliedRules || []).length) {
+      bits.push('shown without ' + (data.unappliedRules.indexOf('dynamic') !== -1
+        ? 'your Continue Watching'
+        : 'the watched-episode filter') + ', which only applies once installed');
+    }
+    if (subEl) subEl.textContent = bits.join(' · ');
+    if (statusEl) statusEl.innerHTML = '';
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = '<p class="testresult err">✗ Network error working out this channel’s lineup.</p>';
+  }
+}
+
 window.switchListDetailsType = function(newType) {
   if (!window._currentListDetailsParams) return;
   const p = window._currentListDetailsParams;
@@ -56185,9 +60475,33 @@ window.switchListDetailsType = function(newType) {
   const aBtn = document.getElementById('detailTypeAllBtn');
   const mBtn = document.getElementById('detailTypeMovieBtn');
   const sBtn = document.getElementById('detailTypeSeriesBtn');
+  const lBtn = document.getElementById('detailTypeLineupBtn');
   if (aBtn) aBtn.classList.toggle('active', newType === 'all');
   if (mBtn) mBtn.classList.toggle('active', newType === 'movie');
   if (sBtn) sBtn.classList.toggle('active', newType === 'series');
+  if (lBtn) lBtn.classList.toggle('active', newType === 'lineup');
+
+  // "On Today" is not a filter over what is loaded -- it is a different
+  // question, answered by the Worker: out of this channel's whole pool,
+  // which picks is it actually running right now? See renderChannelLineupTab.
+  if (newType === 'lineup') {
+    if (typeof renderChannelLineupTab === 'function') renderChannelLineupTab(p);
+    return;
+  }
+
+  // Coming back off On Today: restore the subtitle it borrowed, so All reads
+  // as the list again rather than keeping today's running-order line.
+  if (typeof window._listDetailsSubtitleBeforeLineup === 'string') {
+    if (typeof window._listDetailsSubtitleRefresh === 'function') {
+      window._listDetailsSubtitleRefresh();
+    } else {
+      const subEl = document.getElementById('detailSubtitle');
+      if (subEl) subEl.textContent = window._listDetailsSubtitleBeforeLineup;
+    }
+    const statusEl = document.getElementById('detailStatus');
+    if (statusEl) statusEl.innerHTML = '';
+    window._listDetailsSubtitleBeforeLineup = null;
+  }
 
   // If this is a dual-type chart (separate endpoint for movies vs series)
   let isDualTypeChart = false;
@@ -56825,6 +61139,10 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   window._currentListDetailsParams = { name, type, listUrl };
   window._currentListDetailsFilter = (isDualTypeChart && !isContinueWatching) ? type : 'all';
   window._currentListDetailsAllItems = [];
+  // A fresh list page: whatever subtitle On Today had stashed belongs to the
+  // list we just left.
+  window._listDetailsSubtitleBeforeLineup = null;
+  window._listDetailsSubtitleRefresh = null;
   const filterBar = document.getElementById('detailFilterBar');
   const isExternalHistory = !!(
     (listUrl && (listUrl === 'trakt:history' || listUrl.startsWith('trakt:history') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/history')))) ||
@@ -56838,6 +61156,18 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     listUrl === 'watch-history'
   );
   const isMixedList = type === 'mixed' || isDualTypeChart || isExternalHistory || (preloaded && preloaded.sample && preloaded.sample.some((it) => it.type === 'series' || it.showId) && preloaded.sample.some((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'))) || (listUrl && (listUrl.includes('watchlist') || listUrl.includes('continue-watching') || listUrl.startsWith('autotrack:')));
+
+  // A channel saved in this browser -- the only thing that HAS a "today" to
+  // show, and the only one whose payload is here to ask about. A directory
+  // preview is somebody else's channel and is not in the local store.
+  const lineupChannelId = (listUrl && listUrl.startsWith('channel:id:')) ? listUrl.slice('channel:id:'.length) : '';
+  const canShowLineup = !!(lineupChannelId && typeof loadLocalChannels === 'function' && loadLocalChannels()[lineupChannelId]);
+  // Whether the Movies/Shows pills have anything to divide. A channel of
+  // only episodes has nothing to filter, but it still has a lineup -- which
+  // is why the bar can no longer be gated on being mixed.
+  const channelHasBothTypes = !!(preloaded && preloaded.sample &&
+    preloaded.sample.some((it) => it && it.type === 'movie') &&
+    preloaded.sample.some((it) => it && it.type !== 'movie'));
 
   const whControls = document.getElementById('whFilterControls');
   const whSortControls = document.getElementById('whSortControls');
@@ -56864,7 +61194,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       filterBar.querySelectorAll('.wh-filter-pill').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.whFilter === curFilter);
       });
-    } else if (isDualTypeChart || isMixedList) {
+    } else if (isDualTypeChart || isMixedList || canShowLineup) {
       filterBar.style.display = 'flex';
       if (whControls) whControls.style.display = 'none';
       if (whSortControls) whSortControls.style.display = 'none';
@@ -56876,8 +61206,24 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         const aBtn = document.getElementById('detailTypeAllBtn');
         const mBtn = document.getElementById('detailTypeMovieBtn');
         const sBtn = document.getElementById('detailTypeSeriesBtn');
+        const lBtn = document.getElementById('detailTypeLineupBtn');
+        if (lBtn) {
+          lBtn.style.display = canShowLineup ? '' : 'none';
+          lBtn.classList.remove('active');
+        }
         const isExternalProvider = isExternalHistory || (listUrl && (listUrl.includes('trakt:watchlist') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/watchlist')) || listUrl.includes('mdblist:watchlist')));
-        if (isDualTypeChart && !isExternalProvider) {
+        if (canShowLineup && !channelHasBothTypes) {
+          // One kind of thing in this channel, so Movies and Shows would be
+          // two pills showing the same list. All stays: it is the whole
+          // channel, and the way back from On Today.
+          const curFilter = window._currentListDetailsFilter || 'all';
+          if (aBtn) {
+            aBtn.style.display = '';
+            aBtn.classList.toggle('active', curFilter !== 'lineup');
+          }
+          if (mBtn) mBtn.style.display = 'none';
+          if (sBtn) sBtn.style.display = 'none';
+        } else if (isDualTypeChart && !isExternalProvider) {
           // On dual-type charts (Catalogs Quick Add & Discover), hide 'All' and show only 'Movies' & 'Shows'
           if (aBtn) aBtn.style.display = 'none';
           if (mBtn) {
@@ -57189,32 +61535,45 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     // why: this is the path a large Custom List, Watchlist, or paginated
     // chart takes as the user scrolls, and it used to tear down and
     // rebuild every already-rendered poster on every page that arrived.
-    appendPosterGridItems(gridEl, newlyMatching);
+    // On Today owns the grid, the status line and the subtitle while it is
+    // the open tab, so a page that lands behind it is only accumulated --
+    // All re-renders from the accumulated items the moment it is clicked.
+    if (window._currentListDetailsFilter !== 'lineup') appendPosterGridItems(gridEl, newlyMatching);
     loadedCount = window._currentListDetailsAllItems.length;
     return newCount;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
+    const onLineup = window._currentListDetailsFilter === 'lineup';
     if (!maybeMore || itemsThisPage === 0 || pagesLoaded >= MAX_PAGES) {
       done = true;
-      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
-    } else {
+      if (!onLineup) statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
+    } else if (!onLineup) {
       statusEl.innerHTML = '<small>Scroll for more\u2026</small>';
     }
     // Set before the subtitle is written, not after: the subtitle says "100+"
     // rather than "100" precisely when this is true.
     moreToLoad = !done;
-    subEl.textContent = formatSubtitle(loadedCount);
+    if (!onLineup) subEl.textContent = formatSubtitle(loadedCount);
   }
+  // How All puts the list's own subtitle back after On Today borrowed it --
+  // recomputed rather than restored from a string, so a count that grew while
+  // On Today was open is still right.
+  window._listDetailsSubtitleRefresh = function() {
+    subEl.textContent = formatSubtitle(loadedCount);
+  };
 
   async function loadNextPage() {
     if (loading || done) return;
+    // Same reason as in appendItems: while On Today is the open tab the status
+    // line is its, so a page loading behind it says nothing.
+    const quiet = window._currentListDetailsFilter === 'lineup';
     if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
       done = true;
-      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
+      if (!quiet) statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
       return;
     }
     loading = true;
-    statusEl.innerHTML = '<small>Loading\u2026</small>';
+    if (!quiet) statusEl.innerHTML = '<small>Loading\u2026</small>';
     try {
       const body = { url: listUrl, type: type, skip: skip, sample: 100 };
       if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
@@ -59807,6 +64166,14 @@ tryAutoRestoreCreatorProfile();
 // link, or a plain page refresh lands back on that exact page instead of
 // always falling back to whatever tab was last active.
 (function handleInitialDeepLink() {
+  // A channel share link (/channel/<code>) redirects here carrying the code
+  // in the fragment. Checked first and returned on, because it is the one
+  // deep link that does something to this browser's own data rather than
+  // opening a page -- see handleChannelShareDeepLink.
+  if (typeof handleChannelShareDeepLink === 'function' && /[#&?]channel=/.test(location.hash || '')) {
+    handleChannelShareDeepLink();
+    return;
+  }
   if (SERVER_DEEP_LINK_LIST) {
     openListDetailsPage(SERVER_DEEP_LINK_LIST.name, SERVER_DEEP_LINK_LIST.type, SERVER_DEEP_LINK_LIST.url, SERVER_DEEP_LINK_LIST, { skipPushState: true });
     return;
@@ -61480,6 +65847,28 @@ async function handleFetch(request, env, ctx) {
       );
     }
 
+    // /channel/<code> -- what a channel share link actually points at.
+    //
+    // A redirect rather than its own page: everything needed to accept a
+    // shared channel (the local channel store, the Catalogs rows, the
+    // Channels tab) already lives on the builder page, so this hands the
+    // code to it in the fragment and handleInitialDeepLink takes it from
+    // there. The fragment, not the query string, because a fragment is
+    // never sent to the server or written into its logs -- an unlisted
+    // channel's code is the only thing protecting it.
+    m = path.match(/^\/channel\/([A-Za-z0-9_-]{1,64})$/);
+    if (m) {
+      ctx.waitUntil(bumpStat(env, "pageviews"));
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: `${url.origin}/configure#channel=${encodeURIComponent(m[1])}`,
+          "Cache-Control": "no-store",
+          ...corsHeaders(),
+        },
+      });
+    }
+
     // bare /configure (no config yet) -> same builder, empty/default state
     if (path === "/configure") {
       ctx.waitUntil(bumpStat(env, "pageviews"));
@@ -62181,7 +66570,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
         if (metaType !== "series") return jsonPublic({ meta: null });
         const wantedChannelId = id.slice("channel_".length);
         try {
-          const { entries } = await resolveConfig(config, env);
+          // watchHistory/continueWatching feed the channel flags that read
+          // the account rather than the payload -- "Hide watched" and the
+          // dynamic Next Up channel. resolveConfig only fills them in for a
+          // config that PROVED whose it is (see trackOwner there), so an
+          // unverified config simply gets a channel with neither applied.
+          const { entries, watchHistory, continueWatching, tmdbKey, mdblistKey, traktKey, traktAccessToken } = await resolveConfig(config, env);
           let matchedEntry = null;
           for (const e of entries) {
             if (e.enabled === false) continue;
@@ -62197,7 +66591,11 @@ Sitemap: ${url.origin}/sitemap.xml`;
             if (matchedEntry) break;
           }
           if (!matchedEntry) return jsonPublic({ meta: null });
-          const meta = buildChannelMeta(matchedEntry, url.origin);
+          const meta = await buildChannelMeta(matchedEntry, url.origin, {
+            env, ctx, origin: url.origin,
+            watchHistory, continueWatching,
+            tmdbKey, mdblistKey, traktKey, traktAccessToken,
+          });
           return jsonPublic({ meta: meta || null });
         } catch (err) {
           return jsonPublic({ meta: null, error: safeErrorMessage(err) });
@@ -62310,7 +66708,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
   <image x="100" y="300" width="400" height="240" preserveAspectRatio="xMidYMid meet" href="${dataUri}"/>
   <g transform="translate(300, 780)">
     <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGradP)"/>
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
   </g>
 </svg>`;
 
@@ -62886,6 +67284,7 @@ function generateSearchVariations(query) {
             name: e.name,
             released: e.air_date || null,
             thumbnail: e.still_path || null,
+            runtime: Number.isInteger(e.runtime) ? e.runtime : null,
           }));
           return json({ ok: true, episodes });
         }
@@ -62907,6 +67306,7 @@ function generateSearchVariations(query) {
               name: e.name,
               released: e.air_date || null,
               thumbnail: e.still_path || null,
+              runtime: Number.isInteger(e.runtime) ? e.runtime : null,
             }));
             return json({ ok: true, episodes });
           }
@@ -62918,6 +67318,12 @@ function generateSearchVariations(query) {
           name: e.name,
           released: e.air_date || null,
           thumbnail: e.still_path ? `https://image.tmdb.org/t/p/w780${e.still_path}` : null,
+          // Minutes, when TMDB has them. Carried onto the channel pick so a
+          // channel can say how many hours of television it holds -- and so
+          // a schedule can one day be built from real block lengths rather
+          // than an assumed half hour. Often null, which is why nothing
+          // downstream may require it.
+          runtime: Number.isInteger(e.runtime) ? e.runtime : null,
         }));
         return json({ ok: true, episodes });
       } catch (err) {
@@ -63074,6 +67480,389 @@ function generateSearchVariations(query) {
       }
     }
 
+    // /api/channel-lineup  (POST)  { url, watchHistory?, continueWatching? }
+    //   -> { ok, items, rotating, plan, generatedAt }
+    //
+    // What this channel is running RIGHT NOW -- the same lineup the meta
+    // route would serve, produced by the same function (resolveChannelLineup)
+    // rather than by a second copy of the seeded shuffle living on the page.
+    //
+    // POST, like /api/preview and for the same reason: a channel's url is its
+    // whole payload and routinely exceeds what a query string can carry.
+    //
+    // Unauthenticated, and it reads nothing it is not given: "Hide watched"
+    // and a dynamic channel both depend on an account's tracking, and this
+    // route has no way to prove whose it is -- so a preview of one of those
+    // shows the channel WITHOUT those rules applied and says so, rather than
+    // quietly reading somebody's history on an unproven claim.
+    if (path === "/api/channel-lineup" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const payload = parseChannelPayload(body.url || "");
+      if (!payload) return json({ ok: false, error: "That is not a channel." }, 400);
+      try {
+        const lineup = await resolveChannelLineup(payload, {
+          env, ctx, origin: url.origin,
+          now: typeof body.now === "number" ? body.now : undefined,
+        });
+        if (!lineup) return json({ ok: true, items: [], rotating: !!payload.dailyRotate, plan: null });
+        const needsAccount = !!(payload.hideWatched || payload.dynamic);
+        return json({
+          ok: true,
+          rotating: !!payload.dailyRotate,
+          // Named so the page can say "24 shows x 3 episodes" from the same
+          // numbers the Worker clamped, not from what the inputs say.
+          plan: lineup.plan,
+          poolSize: lineup.sourceItems.length,
+          // The two rules this route cannot honour, so the page can label
+          // the preview honestly instead of showing a lineup that differs
+          // from what will actually play.
+          unappliedRules: needsAccount
+            ? [payload.hideWatched ? "hideWatched" : null, payload.dynamic ? "dynamic" : null].filter(Boolean)
+            : [],
+          generatedAt: Date.now(),
+          items: lineup.items,
+        }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) }, 500, { "Cache-Control": "no-store" });
+      }
+    }
+
+    // /api/person-search?q=<name>
+    //   -> { ok, results: [{ personId, name, department, knownFor, poster }] }
+    //
+    // The third search type in the Channel builder, alongside Shows and
+    // Movies. Searching a PERSON is a different question from searching a
+    // title -- "everything Robin Williams was in" rather than one film -- so
+    // it gets its own endpoint rather than another branch of title-search,
+    // whose whole response shape is built around a title.
+    if (path === "/api/person-search") {
+      const q = (url.searchParams.get("q") || "").trim();
+      if (!q) return json({ ok: true, results: [] });
+      try {
+        ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
+        const res = await fetch(
+          `https://api.themoviedb.org/3/search/person?api_key=${encodeURIComponent(TMDB_API_KEY)}&query=${encodeURIComponent(q)}&include_adult=false&page=1`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 3600, cacheEverything: true } }
+        );
+        if (!res.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${res.status}).` });
+        const data = await res.json();
+        const results = (data.results || [])
+          .filter((p) => p && p.id && !p.adult)
+          .slice(0, 20)
+          .map((p) => ({
+            personId: p.id,
+            name: p.name || "",
+            department: p.known_for_department || "",
+            // The two or three titles TMDB thinks this person is known for,
+            // shown under the name because "Chris Evans" alone is not enough
+            // to pick the right one out of a search result.
+            knownFor: (p.known_for || [])
+              .map((k) => k && (k.title || k.name))
+              .filter(Boolean)
+              .slice(0, 3)
+              .join(", "),
+            poster: p.profile_path ? `https://image.tmdb.org/t/p/w200${p.profile_path}` : null,
+          }));
+        return json({ ok: true, results }, 200, { "Cache-Control": "public, max-age=3600" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/person-credits?personId=<id>&sort=chronological|rating&movies=N&shows=N
+    //   -> { ok, name, poster, backdrop, movies: [...], shows: [...] }
+    //
+    // What a Spotlight channel is built from. Acting credits and directing/
+    // creating credits both count -- a Nolan or a Miyazaki spotlight is the
+    // films they MADE, and TMDB files those under crew rather than cast.
+    //
+    // Both lists come back already cut and ordered, because the ordering is
+    // the whole feature: "chronological" walks a career forward, "rating"
+    // opens with the best of it.
+    if (path === "/api/person-credits") {
+      const personId = (url.searchParams.get("personId") || "").trim();
+      if (!/^[0-9]+$/.test(personId)) return json({ ok: false, error: "Missing personId." }, 400);
+      const sort = url.searchParams.get("sort") === "rating" ? "rating" : "chronological";
+      // A filmography is the whole point here, so the ceilings are a career
+      // rather than a shelf. Popularity still decides the ORDER these are
+      // cut in (see byWeight below), so asking for fewer gives the best of
+      // them rather than an arbitrary slice.
+      const movieLimit = Math.min(Math.max(parseInt(url.searchParams.get("movies") || "12", 10) || 12, 0), 120);
+      const showLimit = Math.min(Math.max(parseInt(url.searchParams.get("shows") || "4", 10) || 4, 0), 60);
+      try {
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 2));
+        const [personRes, creditsRes] = await Promise.all([
+          fetch(
+            `https://api.themoviedb.org/3/person/${encodeURIComponent(personId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+          ),
+          fetch(
+            `https://api.themoviedb.org/3/person/${encodeURIComponent(personId)}/combined_credits?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+          ),
+        ]);
+        if (!creditsRes.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${creditsRes.status}).` });
+        const person = personRes.ok ? await personRes.json() : {};
+        const credits = await creditsRes.json();
+        const DIRECTING_JOBS = /^(director|writer|creator|screenplay|executive producer)$/i;
+        const seen = new Set();
+        const collect = (list, isCrew) => {
+          const out = [];
+          for (const c of (list || [])) {
+            if (!c || !c.id || c.adult) continue;
+            if (isCrew && !DIRECTING_JOBS.test(String(c.job || ""))) continue;
+            const mediaType = c.media_type === "tv" ? "tv" : "movie";
+            const key = `${mediaType}:${c.id}`;
+            if (seen.has(key)) continue;
+            // A talk-show or awards-ceremony appearance is a credit but not
+            // a title anyone wants in a tribute channel, and TMDB marks
+            // those 10767/10763 (talk / news). Same for a person's own
+            // documentary interviews showing up with no votes at all.
+            const genres = Array.isArray(c.genre_ids) ? c.genre_ids : [];
+            if (genres.includes(10767) || genres.includes(10763)) continue;
+            const votes = Number(c.vote_count) || 0;
+            if (votes < 20) continue;
+            seen.add(key);
+            const date = c.release_date || c.first_air_date || "";
+            out.push({
+              tmdbId: c.id,
+              type: mediaType,
+              title: c.title || c.name || "",
+              year: String(date).slice(0, 4),
+              released: date || "",
+              rating: typeof c.vote_average === "number" ? Math.round(c.vote_average * 10) / 10 : 0,
+              votes: votes,
+              poster: c.poster_path ? `https://image.tmdb.org/t/p/w500${c.poster_path}` : null,
+              backdrop: c.backdrop_path ? `https://image.tmdb.org/t/p/w780${c.backdrop_path}` : null,
+              role: isCrew ? (c.job || "Crew") : (c.character || "Cast"),
+            });
+          }
+          return out;
+        };
+        const all = [...collect(credits.cast, false), ...collect(credits.crew, true)];
+        const order = (a, b) => {
+          if (sort === "rating") {
+            if (b.rating !== a.rating) return b.rating - a.rating;
+            return b.votes - a.votes;
+          }
+          // Chronological, and an undated credit goes last rather than
+          // opening the channel -- the same call sortChannelItemsByAired
+          // makes for the same reason.
+          if (!a.year) return 1;
+          if (!b.year) return -1;
+          if (a.year !== b.year) return a.year < b.year ? -1 : 1;
+          return b.votes - a.votes;
+        };
+        // Popularity picks WHICH credits make the cut; the chosen sort then
+        // decides what order they play in. Ranking by the sort itself would
+        // make "chronological" mean "their earliest 12 credits", which for
+        // most careers is the student films.
+        const byWeight = (a, b) => (b.rating * 10 + Math.log10(b.votes + 1)) - (a.rating * 10 + Math.log10(a.votes + 1));
+        const movies = all.filter((c) => c.type === "movie").sort(byWeight).slice(0, movieLimit).sort(order);
+        const shows = all.filter((c) => c.type === "tv").sort(byWeight).slice(0, showLimit).sort(order);
+        return json({
+          ok: true,
+          name: person.name || "",
+          poster: person.profile_path ? `https://image.tmdb.org/t/p/w500${person.profile_path}` : null,
+          backdrop: (movies[0] && movies[0].backdrop) || (shows[0] && shows[0].backdrop) || null,
+          movies,
+          shows,
+        }, 200, { "Cache-Control": "public, max-age=86400" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/person-show-episodes?personId=<id>&tmdbId=<show id>
+    //   -> { ok, imdbId, showName, poster, backdrop, regular, episodes: [...] }
+    //
+    // The episodes of one show that a given person is ACTUALLY in.
+    //
+    // A Spotlight channel used to take a show's first N episodes whenever a
+    // person had any TV credit on it, so Tobey Maguire's single guest
+    // appearance in Roseanne put ten Roseanne episodes into the channel --
+    // nine of which he is not in. TMDB does not answer "which episodes" in
+    // one call, but it does carry the two facts that settle it:
+    //
+    //   * a season's own `credits.cast` is that season's REGULARS, who are
+    //     in every episode of it without being listed on each one;
+    //   * each episode's `guest_stars` and `crew` name everyone else --
+    //     which is where a one-episode guest, and a director, turn up.
+    //
+    // So: a regular contributes the whole season, and anyone else
+    // contributes exactly the episodes that name them.
+    if (path === "/api/person-show-episodes") {
+      const personId = (url.searchParams.get("personId") || "").trim();
+      const tmdbId = (url.searchParams.get("tmdbId") || "").trim();
+      if (!/^[0-9]+$/.test(personId) || !/^[0-9]+$/.test(tmdbId)) {
+        return json({ ok: false, error: "Missing personId or tmdbId." }, 400);
+      }
+      const wantedPerson = parseInt(personId, 10);
+      try {
+        const showRes = await fetch(
+          `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+        );
+        if (!showRes.ok) return json({ ok: false, error: `TMDB lookup failed (HTTP ${showRes.status}).` });
+        const show = await showRes.json();
+        const imdbId = (show.external_ids && show.external_ids.imdb_id) || `tmdb:${tmdbId}`;
+        const showPoster = show.poster_path ? `https://image.tmdb.org/t/p/w500${show.poster_path}` : "";
+        const showBackdrop = show.backdrop_path ? `https://image.tmdb.org/t/p/w780${show.backdrop_path}` : "";
+        // Specials (season 0) are left out: they are recaps, gag reels and
+        // clip shows as often as they are episodes, and a channel built out
+        // of them plays badly.
+        const seasons = (show.seasons || [])
+          .filter((s) => s && s.season_number > 0)
+          .map((s) => s.season_number)
+          .slice(0, PERSON_SHOW_MAX_SEASONS);
+        let anyRegular = false;
+        const perSeason = await mapWithConcurrency(seasons, 4, async (seasonNumber) => {
+          try {
+            const sRes = await fetch(
+              `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/season/${seasonNumber}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=credits`,
+              { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+            );
+            if (!sRes.ok) return [];
+            const sData = await sRes.json();
+            const seasonCast = (sData.credits && Array.isArray(sData.credits.cast)) ? sData.credits.cast : [];
+            const seasonCrew = (sData.credits && Array.isArray(sData.credits.crew)) ? sData.credits.crew : [];
+            const isRegular =
+              seasonCast.some((c) => c && c.id === wantedPerson) ||
+              seasonCrew.some((c) => c && c.id === wantedPerson && /^(creator|executive producer)$/i.test(String(c.job || "")));
+            if (isRegular) anyRegular = true;
+            const out = [];
+            for (const ep of (sData.episodes || [])) {
+              if (!ep || !Number.isInteger(ep.episode_number)) continue;
+              if (!isRegular) {
+                const named =
+                  (ep.guest_stars || []).some((g) => g && g.id === wantedPerson) ||
+                  (ep.crew || []).some((c) => c && c.id === wantedPerson);
+                if (!named) continue;
+              }
+              const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+              out.push({
+                season: seasonNumber,
+                episode: ep.episode_number,
+                name: ep.name || `Episode ${ep.episode_number}`,
+                released: ep.air_date || "",
+                thumbnail: stillUrl,
+                runtime: Number.isInteger(ep.runtime) ? ep.runtime : null,
+              });
+            }
+            return out;
+          } catch {
+            return [];
+          }
+        });
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", 1 + seasons.length));
+        const episodes = [];
+        for (const run of perSeason) episodes.push(...run);
+        episodes.sort((a, b) => (a.season - b.season) || (a.episode - b.episode));
+        return json({
+          ok: true,
+          imdbId,
+          showName: show.name || "",
+          poster: showPoster,
+          backdrop: showBackdrop,
+          // True when the person is a season regular somewhere in this show,
+          // which is what "every episode of that season" above is standing
+          // on -- surfaced so the client can say which of the two answers
+          // it got rather than presenting a guess as a fact.
+          regular: anyRegular,
+          episodes: episodes.slice(0, PERSON_SHOW_MAX_EPISODES),
+        }, 200, { "Cache-Control": "public, max-age=86400" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /api/wizard-channel-shows?networkId=&era=&genres=&limit=
+    //   -> { ok, name, shows: [...], networkLogo }
+    //
+    // The Quick Channel Wizard's one server call. Same shape of answer as
+    // /api/quick-channel-shows (the client builds the channel from it the
+    // same way), but the pool is a TMDB discover query crossing a network
+    // with an era and a genre rather than a network on its own.
+    if (path === "/api/wizard-channel-shows") {
+      const networkId = (url.searchParams.get("networkId") || "").trim();
+      const era = (url.searchParams.get("era") || "").trim();
+      const genres = (url.searchParams.get("genres") || "").trim();
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "8", 10) || 8, 1), 24);
+      if (networkId && !/^[0-9]+$/.test(networkId)) return json({ ok: false, error: "Bad networkId." }, 400);
+      if (genres && !/^[0-9]+(,[0-9]+)*$/.test(genres)) return json({ ok: false, error: "Bad genres." }, 400);
+      const eraMatch = era.match(/^([0-9]{4})-([0-9]{4})$/);
+      try {
+        let params = `api_key=${encodeURIComponent(TMDB_API_KEY)}&sort_by=popularity.desc&include_adult=false&include_null_first_air_dates=false`;
+        if (networkId) params += `&with_networks=${encodeURIComponent(networkId)}`;
+        if (genres) params += `&with_genres=${encodeURIComponent(genres)}`;
+        if (eraMatch) {
+          params += `&first_air_date.gte=${eraMatch[1]}-01-01&first_air_date.lte=${eraMatch[2]}-12-31`;
+        }
+        // Enough votes that the result is a show people have heard of. A
+        // network-plus-era-plus-genre query can otherwise bottom out in
+        // one-episode pilots that never aired, which makes a wizard channel
+        // feel broken rather than curated.
+        params += "&vote_count.gte=50";
+        const discovered = [];
+        let pagesFetched = 0;
+        for (let page = 1; page <= 3 && discovered.length < limit * 3; page++) {
+          pagesFetched++;
+          const res = await fetch(
+            `https://api.themoviedb.org/3/discover/tv?${params}&page=${page}`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 3600, cacheEverything: true } }
+          );
+          if (!res.ok) break;
+          const data = await res.json();
+          discovered.push(...(data.results || []));
+          if (page >= (data.total_pages || 1)) break;
+        }
+        if (!discovered.length) {
+          return json({ ok: false, error: "Nothing matched that combination. Try widening the era or the genre." });
+        }
+        let networkLogo = null;
+        if (networkId) {
+          try {
+            const networkRes = await fetch(
+              `https://api.themoviedb.org/3/network/${encodeURIComponent(networkId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+              { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+            );
+            if (networkRes.ok) {
+              const networkData = await networkRes.json();
+              // A fixed pixel size, never "original" -- see the same note on
+              // /api/quick-channel-shows, where an SVG logo silently failed
+              // to render as a poster.
+              if (networkData.logo_path) networkLogo = `${url.origin}/api/channel-logo?path=${encodeURIComponent(networkData.logo_path)}`;
+            }
+          } catch {
+            // best-effort; the client falls back to a show poster
+          }
+        }
+        const candidates = discovered.slice(0, limit * 2);
+        const resolved = await mapWithConcurrency(candidates, 8, async (show) => {
+          const details = await fetchTmdbDetails(show.id, "tv", TMDB_API_KEY);
+          if (!details.imdbId) return null;
+          return {
+            imdbId: details.imdbId,
+            tmdbId: show.id,
+            name: show.name,
+            poster: show.poster_path ? `https://image.tmdb.org/t/p/w500${show.poster_path}` : null,
+            backdrop: show.backdrop_path ? `https://image.tmdb.org/t/p/w780${show.backdrop_path}` : null,
+          };
+        });
+        ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", pagesFetched + (networkId ? 1 : 0) + candidates.length));
+        const shows = resolved.filter(Boolean).slice(0, limit);
+        if (!shows.length) return json({ ok: false, error: "Couldn't resolve any of those shows to IMDB." });
+        return json({ ok: true, shows, networkLogo });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
     //
     // Three sources feed this: any mdblist.com/trakt.tv/themoviedb.org list
     // link (someone else's hand-picked lineup, or "Import from link"'s own
@@ -63216,7 +68005,7 @@ function generateSearchVariations(query) {
         ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
         const details = await fetchTmdbDetails(tmdbId, "movie", TMDB_API_KEY);
         if (!details.imdbId) return json({ ok: false, error: "Couldn't resolve an IMDB id for this movie." });
-        return json({ ok: true, imdbId: details.imdbId });
+        return json({ ok: true, imdbId: details.imdbId, runtime: Number.isInteger(details.runtime) ? details.runtime : null });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }
@@ -69934,6 +74723,319 @@ function generateSearchVariations(query) {
       });
     }
 
+    // --- Sharing a channel, and the Explore Channels directory -----------
+    //
+    // A channel is thousands of episodes; a link is a few hundred characters.
+    // So a share link carries a short code and the channel itself lives here
+    // under channelshare:{code}, which is also what the directory indexes.
+    //
+    // Two levels, deliberately distinct:
+    //   * a SHARE is unlisted and needs no account -- anyone with the code
+    //     can rebuild the channel, nobody can find it who was not given it.
+    //   * PUBLISHING adds it to the Explore Channels directory, and that
+    //     does need a Creator Profile: a listing everyone can see needs an
+    //     owner who can take it down again.
+
+    // /api/channel/share  (POST)
+    //   { channel, description?, publish?, creatorName?, creatorKey? }
+    //     -> { ok, code, url, published }
+    if (path === "/api/channel/share" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const channel = sanitizeSharedChannel(body.channel);
+      if (!channel) {
+        return json({ ok: false, error: "That channel has nothing playable in it to share." }, 400);
+      }
+      const publish = !!body.publish;
+      // Who is writing, when they say so.
+      //
+      // Publishing REQUIRES it -- a listing everyone can see needs an owner
+      // who can take it down. An unlisted share does not, but it may still
+      // carry credentials, and it has to: re-sharing writes over an existing
+      // record, and one created by publishing has an owner, so a re-share
+      // that proved nothing was refused as someone else's link by the very
+      // person who owned it.
+      let owner = "";
+      if (publish) {
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (!auth.ok) return authFailureResponse(auth);
+        owner = auth.username;
+      } else if (body.creatorName && body.creatorKey) {
+        // Best-effort: bad credentials on an unlisted share are simply not
+        // proof, and fall through to the unowned path below. They cannot
+        // buy access to someone else's record either way -- the ownership
+        // check is against `owner`, which stays "" unless this succeeded.
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (auth.ok) owner = auth.username;
+      }
+      const description = (String(body.description || "").trim() || channel.description || "").slice(0, SHARED_CHANNEL_DESCRIPTION_MAX);
+      // Reusing the code someone already has is what makes "Share" on an
+      // edited channel update the link they handed out rather than mint a
+      // second one beside it. Only the owner of a PUBLISHED code may do
+      // that; an unlisted code is its own proof, the same way the link is.
+      let code = String(body.code || "").trim().slice(0, 64);
+      if (code && !/^[A-Za-z0-9_-]+$/.test(code)) code = "";
+      let existing = null;
+      if (code) {
+        try {
+          const raw = await env.CONFIGS.get(`channelshare:${code}`);
+          existing = raw ? JSON.parse(raw) : null;
+        } catch {
+          existing = null;
+        }
+        if (existing && existing.owner && existing.owner !== owner) {
+          return json({ ok: false, error: "That share link belongs to someone else." }, 403);
+        }
+        if (!existing) code = "";
+      }
+      if (!code) code = generateShortId();
+      const record = {
+        code: code,
+        channel: channel,
+        description: description,
+        owner: owner || (existing && existing.owner) || "",
+        published: publish || !!(existing && existing.published),
+        publishedAt: (existing && existing.publishedAt) || Date.now(),
+        updatedAt: Date.now(),
+      };
+      const serialized = JSON.stringify(record);
+      if (serialized.length > SHARED_CHANNEL_BYTES_MAX) {
+        return json({
+          ok: false,
+          error: "That channel is too large to share. Trim it down and try again.",
+        }, 413);
+      }
+      try {
+        await env.CONFIGS.put(`channelshare:${code}`, serialized);
+      } catch {
+        return json({ ok: false, error: "Couldn't save that share link. Please try again." }, 500);
+      }
+      if (record.published) {
+        await upsertPublicChannelIndex(env, code, record).catch(() => {});
+      }
+      ctx.waitUntil(bumpStat(env, publish ? "channels:published" : "channels:shared"));
+      return json({
+        ok: true,
+        code: code,
+        url: `${url.origin}/channel/${code}`,
+        published: record.published,
+      });
+    }
+
+    // /api/channel/share?code=...  (GET) -> { ok, channel, description, owner }
+    //
+    // The import half. Unauthenticated by design: the code IS the
+    // credential for an unlisted channel, and a published one is public.
+    if (path === "/api/channel/share" && request.method === "GET") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      const code = String(url.searchParams.get("code") || "").trim();
+      if (!code || !/^[A-Za-z0-9_-]{1,64}$/.test(code)) {
+        return json({ ok: false, error: "That doesn't look like a channel share link." }, 400);
+      }
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      if (!record || !record.channel) {
+        return json({ ok: false, error: "That channel link has expired or was removed." }, 404);
+      }
+      // Sanitized again on the way out, not only on the way in: a record
+      // written by an older build of this Worker has only been through
+      // whatever that build checked.
+      const channel = sanitizeSharedChannel(record.channel);
+      if (!channel) return json({ ok: false, error: "That channel link is no longer readable." }, 404);
+      return json({
+        ok: true,
+        code: code,
+        channel: channel,
+        description: record.description || "",
+        owner: record.owner || "",
+        published: !!record.published,
+      }, 200, { "Cache-Control": "public, max-age=60" });
+    }
+
+    // /api/channel/directory  (GET)  ?limit=
+    //   -> { ok, channels: [summary, ...] }
+    //
+    // Explore Channels. One index key rather than a KV scan: the directory
+    // is read on every visit to the tab and a prefix scan plus one GET per
+    // entry would be dozens of round trips for a page of cards.
+    if (path === "/api/channel/directory" && request.method === "GET") {
+      if (!env || !env.CONFIGS) return json({ ok: true, channels: [] });
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "60", 10) || 60, 1), PUBLIC_CHANNEL_INDEX_MAX);
+      const sort = String(url.searchParams.get("sort") || "newest");
+      const index = sortPublicChannelIndex(await readPublicChannelIndex(env), sort);
+      return json({
+        ok: true,
+        total: index.length,
+        sort,
+        channels: index.slice(0, limit),
+      }, 200, { "Cache-Control": "public, max-age=120" });
+    }
+
+    // /api/channel/like  (POST)  { code, action: "like"|"unlike", creatorName?, creatorKey? }
+    //   -> { ok, likes, liked }
+    //
+    // The same one-identity-one-vote machinery lists use (applyLikeVote /
+    // likeVoterId): a signed-in visitor votes as themselves, everyone else
+    // as a per-channel hash of their IP, and the count is always DERIVED
+    // from the ledger rather than incremented -- so it cannot drift upward
+    // on its own.
+    //
+    // Only a PUBLISHED channel is likeable. An unlisted share is reachable
+    // by anyone holding its code, and letting those be voted on would mint
+    // a permanent ledger key for every link ever handed out.
+    if (path === "/api/channel/like" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Channel not found." }, 404);
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      // The same answer for "no such channel" and "not published",
+      // deliberately: a distinguishable response is an oracle for which
+      // unlisted codes exist.
+      if (!record || !record.published) return json({ ok: false, error: "Channel not found." }, 404);
+
+      let voterName = "";
+      if (body.creatorName && body.creatorKey) {
+        const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+        if (auth.ok) voterName = auth.username;
+      }
+      const voterId = await likeVoterId(request, env, voterName, `channel:${code}`);
+      if (!voterId) return json({ ok: false, error: "Could not process this request." }, 400);
+      const liked = body.action !== "unlike";
+      const { count, capped } = await applyLikeVote(env, `channellikevoters:${code}`, voterId, liked);
+
+      // The count is denormalised onto both the record and the directory
+      // row, because the directory reads one key and must not open a ledger
+      // per listing. Re-read before writing, and write only this one field:
+      // the record may have been re-published while the ledger was being
+      // updated, and putting a stale snapshot back would take the channel
+      // with it.
+      try {
+        const freshRaw = await env.CONFIGS.get(`channelshare:${code}`);
+        if (freshRaw) {
+          const fresh = JSON.parse(freshRaw);
+          if ((fresh.likes || 0) !== count) {
+            fresh.likes = count;
+            await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(fresh));
+          }
+        }
+      } catch {
+        // The ledger already holds the vote; the denormalised copy catches
+        // up on the next one rather than this failing the request.
+      }
+      await updatePublicChannelIndexEntry(env, code, { likes: count }).catch(() => {});
+      return json({ ok: true, likes: count, liked, capped: capped || undefined }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/added  (POST)  { code }
+    //
+    // "Someone took this channel." Counted so the directory can rank by what
+    // people actually use rather than only by what they upvote -- taking a
+    // channel costs something, so it is the better signal of the two.
+    //
+    // Deliberately not a vote: it is a counter, it only goes up, and it is
+    // best-effort. Nothing is shown to the caller and nothing fails if it
+    // does not land.
+    if (path === "/api/channel/added" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: true });
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: true });
+      const entries = await readPublicChannelIndex(env);
+      const row = entries.find((e) => e && e.code === code);
+      if (!row) return json({ ok: true });
+      await updatePublicChannelIndexEntry(env, code, { adds: (Number(row.adds) || 0) + 1 }).catch(() => {});
+      return json({ ok: true }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/mine  (POST)  { creatorName, creatorKey } -> { ok, channels }
+    //
+    // Everything this creator currently has listed in the directory.
+    //
+    // Exists because a listing can outlive the local channel it came from:
+    // deleting a channel in the builder removes this browser's copy, and if
+    // the withdrawal did not also land -- offline, signed out, a failed
+    // request -- the listing stayed up with nothing left on the device that
+    // knew its code. That is an advertised channel its own owner could no
+    // longer take down. This is how they find it again.
+    if (path === "/api/channel/mine" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: true, channels: [] });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+      const entries = await readPublicChannelIndex(env);
+      const mine = entries.filter((e) => e && e.owner === auth.username);
+      return json({ ok: true, channels: mine }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/channel/unpublish  (POST)  { code, creatorName, creatorKey }
+    //
+    // Takes a channel out of the directory. The stored channel itself stays,
+    // so a link already handed out keeps working -- "stop advertising this"
+    // and "break everyone's link" are different asks.
+    if (path === "/api/channel/unpublish" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+      const code = String(body.code || "").trim();
+      if (!code || !/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Missing code." }, 400);
+      let record = null;
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        record = raw ? JSON.parse(raw) : null;
+      } catch {
+        record = null;
+      }
+      if (!record) return json({ ok: false, error: "No such channel." }, 404);
+      if (record.owner && record.owner !== auth.username) {
+        return json({ ok: false, error: "That channel belongs to someone else." }, 403);
+      }
+      record.published = false;
+      record.updatedAt = Date.now();
+      try {
+        await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(record));
+      } catch {}
+      await removePublicChannelIndex(env, code).catch(() => {});
+      return json({ ok: true });
+    }
+
     // /api/creator/lists/delete  (POST)  { creatorName, creatorKey, slug }
     if (path === "/api/creator/lists/delete" && request.method === "POST") {
       let body;
@@ -73090,6 +78192,164 @@ function generateSearchVariations(query) {
         publicIndex,
         databaseStats,
       }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/published-channels  (GET)  ?limit=&cursor=
+    //   -> { ok, count, channels: [...], cursor, done }
+    //
+    // The operator's view of the Explore Channels directory.
+    //
+    // Publishing a channel was owner-only with no operator path at all: if
+    // someone published something abusive, the only person who could take it
+    // down was the person who put it there. Published LISTS have had
+    // /admin/api/published-lists for exactly this reason; this is the same
+    // door for channels.
+    //
+    // Two sources, deliberately. The directory index is what the public
+    // actually sees and is one cheap read. The channelshare: keyspace is
+    // everything ever stored, listed or not -- which is where a channel that
+    // was published, reported, and then quietly unpublished still lives, and
+    // where an index write that lost a race leaves an orphan. An operator
+    // needs to be able to see both.
+    if (path === "/admin/api/published-channels" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-storage" });
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 1), 200);
+      const scope = url.searchParams.get("scope") === "all" ? "all" : "listed";
+
+      if (scope === "listed") {
+        const index = await readPublicChannelIndex(env);
+        return json({
+          ok: true,
+          scope,
+          count: index.length,
+          channels: index.slice(0, limit).map((e) => Object.assign({}, e, {
+            url: `${url.origin}/channel/${e.code}`,
+            listed: true,
+          })),
+          done: index.length <= limit,
+          cursor: null,
+        }, 200, { "Cache-Control": "no-store" });
+      }
+
+      const cursor = url.searchParams.get("cursor") || "";
+      let listed;
+      try {
+        listed = await env.CONFIGS.list({ prefix: "channelshare:", limit, ...(cursor ? { cursor } : {}) });
+      } catch {
+        return json({ ok: false, error: "Could not read the stored channels right now." }, 500, { "Cache-Control": "no-store" });
+      }
+      const channels = await Promise.all((listed.keys || []).map(async (k) => {
+        const code = k.name.slice("channelshare:".length);
+        let record = null;
+        try {
+          const raw = await env.CONFIGS.get(k.name);
+          record = raw ? JSON.parse(raw) : null;
+        } catch {
+          record = null;
+        }
+        if (!record) {
+          return { code, name: "(unreadable record)", listed: false, url: `${url.origin}/channel/${code}` };
+        }
+        const channel = record.channel || {};
+        return {
+          code,
+          name: channel.name || "(untitled)",
+          description: record.description || channel.description || "",
+          owner: record.owner || "",
+          listed: !!record.published,
+          itemCount: Array.isArray(channel.items) ? channel.items.length : 0,
+          likes: Number(record.likes) || 0,
+          publishedAt: record.publishedAt || null,
+          updatedAt: record.updatedAt || null,
+          url: `${url.origin}/channel/${code}`,
+        };
+      }));
+      return json({
+        ok: true,
+        scope,
+        count: channels.length,
+        channels,
+        cursor: listed.list_complete ? null : (listed.cursor || null),
+        done: !!listed.list_complete,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /admin/api/channel-moderate  (POST)  { code, action: "unlist"|"delete" }
+    //
+    // Two different acts, kept apart on purpose.
+    //
+    // "unlist" takes the channel out of the directory and leaves the stored
+    // record alone, so a link already handed out keeps working -- the same
+    // thing the owner's own Unpublish does, which is the right response to
+    // "this does not belong in a public directory".
+    //
+    // "delete" removes the record itself, so every link to it stops working.
+    // That is the response to content that should not exist at all, and it
+    // takes the like ledger with it rather than leaving one behind for
+    // whoever mints the same code next.
+    if (path === "/admin/api/channel-moderate" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-storage" });
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const code = String(body.code || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(code)) return json({ ok: false, error: "Missing code." }, 400);
+      const action = body.action === "delete" ? "delete" : "unlist";
+
+      // The directory row goes either way, and its removal is checked
+      // rather than assumed: reporting success on a takedown that left the
+      // channel advertised is the failure mode worth designing against.
+      let removedFromIndex = true;
+      try {
+        await removePublicChannelIndex(env, code);
+      } catch {
+        removedFromIndex = false;
+      }
+
+      if (action === "delete") {
+        try {
+          await env.CONFIGS.delete(`channelshare:${code}`);
+          await env.CONFIGS.delete(`channellikevoters:${code}`);
+        } catch {
+          return json({
+            ok: false,
+            error: "Couldn't finish removing that channel. It may still be reachable -- please try again.",
+          }, 500, { "Cache-Control": "no-store" });
+        }
+        if (!removedFromIndex) {
+          return json({
+            ok: false,
+            error: "The channel was deleted but its directory listing could not be removed. Please try again.",
+          }, 500, { "Cache-Control": "no-store" });
+        }
+        return json({ ok: true, action, code }, 200, { "Cache-Control": "no-store" });
+      }
+
+      try {
+        const raw = await env.CONFIGS.get(`channelshare:${code}`);
+        if (raw) {
+          const record = JSON.parse(raw);
+          record.published = false;
+          record.updatedAt = Date.now();
+          await env.CONFIGS.put(`channelshare:${code}`, JSON.stringify(record));
+        }
+      } catch {
+        return json({
+          ok: false,
+          error: "Couldn't mark that channel unlisted. Please try again.",
+        }, 500, { "Cache-Control": "no-store" });
+      }
+      if (!removedFromIndex) {
+        return json({ ok: false, error: "That channel is still listed. Please try again." }, 500, { "Cache-Control": "no-store" });
+      }
+      return json({ ok: true, action, code }, 200, { "Cache-Control": "no-store" });
     }
 
     // /admin/api/published-lists  (GET)  ?limit=&cursor=

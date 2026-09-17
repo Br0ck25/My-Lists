@@ -1649,6 +1649,93 @@ function renderWatchHistoryGrid() {
 }
 window.renderWatchHistoryGrid = renderWatchHistoryGrid;
 
+
+// --- "On Today": what this channel is actually running --------------------
+//
+// A rotating channel stores a pool much bigger than a day, and until now the
+// only way to see which shows and episodes today's lineup had drawn from it
+// was to open the channel in Stremio. So you could set 24 shows x 3 episodes
+// and have no idea what that produced.
+//
+// The Worker answers it (see /api/channel-lineup), which matters: the
+// rotation is a seeded shuffle, and a second copy of that PRNG living on
+// this page is the kind of thing that drifts by one episode after some later
+// edit and is never noticed. This asks the same function the meta route uses.
+async function renderChannelLineupTab(params) {
+  const gridEl = document.getElementById('detailGrid');
+  const statusEl = document.getElementById('detailStatus');
+  const subEl = document.getElementById('detailSubtitle');
+  if (!gridEl) return;
+  const listUrl = (params && params.listUrl) || '';
+  const channelId = listUrl.startsWith('channel:id:') ? listUrl.slice('channel:id:'.length) : '';
+  const channel = channelId && typeof loadLocalChannels === 'function' ? loadLocalChannels()[channelId] : null;
+  if (!channel) {
+    if (statusEl) statusEl.innerHTML = '<small>This channel is not saved in this browser, so there is nothing to look up.</small>';
+    return;
+  }
+  gridEl.innerHTML = '';
+  // The lineup rewrites the page subtitle with today's numbers, so hold on to
+  // the list's own subtitle -- All has to put it back.
+  if (subEl && typeof window._listDetailsSubtitleBeforeLineup !== 'string') {
+    window._listDetailsSubtitleBeforeLineup = subEl.textContent || '';
+  }
+  if (statusEl) statusEl.innerHTML = '<small>Working out what is on&hellip;</small>';
+  try {
+    const res = await fetch(ORIGIN + '/api/channel-lineup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: 'channel:v1:' + JSON.stringify(channel) }),
+      cache: 'no-store',
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      if (statusEl) statusEl.innerHTML = '<p class="testresult err">✗ ' + escapeHtml(data.error || 'Could not work out this channel’s lineup.') + '</p>';
+      return;
+    }
+    const items = data.items || [];
+    if (!items.length) {
+      if (statusEl) statusEl.innerHTML = '<small>Nothing is scheduled for this channel right now.</small>';
+      return;
+    }
+    const tiles = items.map((it, idx) => {
+      const seasonEp = (it.season != null && it.episode != null && it.kind !== 'movie')
+        ? ('S' + it.season + 'E' + it.episode) : '';
+      const showName = it.showName || it.title || 'Untitled';
+      return {
+        id: (typeof channelItemId === 'function' ? channelItemId(it, idx) : (it.imdbId || String(idx))),
+        type: it.kind === 'movie' ? 'movie' : 'series',
+        // The running order IS the answer here, so each tile is numbered:
+        // "12." is the twelfth thing this channel plays today.
+        name: (idx + 1) + '. ' + showName + (seasonEp ? ' ' + seasonEp : ''),
+        subtitle: it.epName || '',
+        title: it.title || showName,
+        poster: it.thumbnail || it.poster || it.showPoster || channel.poster || '',
+        thumbnail: it.thumbnail || it.poster || '',
+        year: it.released ? String(it.released).slice(0, 4) : '',
+        listUrl: listUrl,
+        listName: channel.name || '',
+      };
+    });
+    if (typeof renderPosterGridChunked === 'function') renderPosterGridChunked(gridEl, tiles);
+    const bits = [items.length + ' playing today'];
+    if (data.rotating && data.plan) {
+      bits.push('out of ' + data.poolSize + ', ' + data.plan.shows + ' shows × ' + data.plan.episodes + ' episodes');
+    }
+    // An honest label rather than a lineup that differs from what will play:
+    // this endpoint is unauthenticated and cannot read anyone's history, so
+    // a channel whose rules depend on one is previewed without them.
+    if ((data.unappliedRules || []).length) {
+      bits.push('shown without ' + (data.unappliedRules.indexOf('dynamic') !== -1
+        ? 'your Continue Watching'
+        : 'the watched-episode filter') + ', which only applies once installed');
+    }
+    if (subEl) subEl.textContent = bits.join(' · ');
+    if (statusEl) statusEl.innerHTML = '';
+  } catch (e) {
+    if (statusEl) statusEl.innerHTML = '<p class="testresult err">✗ Network error working out this channel’s lineup.</p>';
+  }
+}
+
 window.switchListDetailsType = function(newType) {
   if (!window._currentListDetailsParams) return;
   const p = window._currentListDetailsParams;
@@ -1658,9 +1745,33 @@ window.switchListDetailsType = function(newType) {
   const aBtn = document.getElementById('detailTypeAllBtn');
   const mBtn = document.getElementById('detailTypeMovieBtn');
   const sBtn = document.getElementById('detailTypeSeriesBtn');
+  const lBtn = document.getElementById('detailTypeLineupBtn');
   if (aBtn) aBtn.classList.toggle('active', newType === 'all');
   if (mBtn) mBtn.classList.toggle('active', newType === 'movie');
   if (sBtn) sBtn.classList.toggle('active', newType === 'series');
+  if (lBtn) lBtn.classList.toggle('active', newType === 'lineup');
+
+  // "On Today" is not a filter over what is loaded -- it is a different
+  // question, answered by the Worker: out of this channel's whole pool,
+  // which picks is it actually running right now? See renderChannelLineupTab.
+  if (newType === 'lineup') {
+    if (typeof renderChannelLineupTab === 'function') renderChannelLineupTab(p);
+    return;
+  }
+
+  // Coming back off On Today: restore the subtitle it borrowed, so All reads
+  // as the list again rather than keeping today's running-order line.
+  if (typeof window._listDetailsSubtitleBeforeLineup === 'string') {
+    if (typeof window._listDetailsSubtitleRefresh === 'function') {
+      window._listDetailsSubtitleRefresh();
+    } else {
+      const subEl = document.getElementById('detailSubtitle');
+      if (subEl) subEl.textContent = window._listDetailsSubtitleBeforeLineup;
+    }
+    const statusEl = document.getElementById('detailStatus');
+    if (statusEl) statusEl.innerHTML = '';
+    window._listDetailsSubtitleBeforeLineup = null;
+  }
 
   // If this is a dual-type chart (separate endpoint for movies vs series)
   let isDualTypeChart = false;
@@ -2298,6 +2409,10 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   window._currentListDetailsParams = { name, type, listUrl };
   window._currentListDetailsFilter = (isDualTypeChart && !isContinueWatching) ? type : 'all';
   window._currentListDetailsAllItems = [];
+  // A fresh list page: whatever subtitle On Today had stashed belongs to the
+  // list we just left.
+  window._listDetailsSubtitleBeforeLineup = null;
+  window._listDetailsSubtitleRefresh = null;
   const filterBar = document.getElementById('detailFilterBar');
   const isExternalHistory = !!(
     (listUrl && (listUrl === 'trakt:history' || listUrl.startsWith('trakt:history') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/history')))) ||
@@ -2311,6 +2426,18 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     listUrl === 'watch-history'
   );
   const isMixedList = type === 'mixed' || isDualTypeChart || isExternalHistory || (preloaded && preloaded.sample && preloaded.sample.some((it) => it.type === 'series' || it.showId) && preloaded.sample.some((it) => it.type === 'movie' || (!it.showId && it.type !== 'series' && it.type !== 'episode'))) || (listUrl && (listUrl.includes('watchlist') || listUrl.includes('continue-watching') || listUrl.startsWith('autotrack:')));
+
+  // A channel saved in this browser -- the only thing that HAS a "today" to
+  // show, and the only one whose payload is here to ask about. A directory
+  // preview is somebody else's channel and is not in the local store.
+  const lineupChannelId = (listUrl && listUrl.startsWith('channel:id:')) ? listUrl.slice('channel:id:'.length) : '';
+  const canShowLineup = !!(lineupChannelId && typeof loadLocalChannels === 'function' && loadLocalChannels()[lineupChannelId]);
+  // Whether the Movies/Shows pills have anything to divide. A channel of
+  // only episodes has nothing to filter, but it still has a lineup -- which
+  // is why the bar can no longer be gated on being mixed.
+  const channelHasBothTypes = !!(preloaded && preloaded.sample &&
+    preloaded.sample.some((it) => it && it.type === 'movie') &&
+    preloaded.sample.some((it) => it && it.type !== 'movie'));
 
   const whControls = document.getElementById('whFilterControls');
   const whSortControls = document.getElementById('whSortControls');
@@ -2337,7 +2464,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       filterBar.querySelectorAll('.wh-filter-pill').forEach((btn) => {
         btn.classList.toggle('active', btn.dataset.whFilter === curFilter);
       });
-    } else if (isDualTypeChart || isMixedList) {
+    } else if (isDualTypeChart || isMixedList || canShowLineup) {
       filterBar.style.display = 'flex';
       if (whControls) whControls.style.display = 'none';
       if (whSortControls) whSortControls.style.display = 'none';
@@ -2349,8 +2476,24 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         const aBtn = document.getElementById('detailTypeAllBtn');
         const mBtn = document.getElementById('detailTypeMovieBtn');
         const sBtn = document.getElementById('detailTypeSeriesBtn');
+        const lBtn = document.getElementById('detailTypeLineupBtn');
+        if (lBtn) {
+          lBtn.style.display = canShowLineup ? '' : 'none';
+          lBtn.classList.remove('active');
+        }
         const isExternalProvider = isExternalHistory || (listUrl && (listUrl.includes('trakt:watchlist') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/watchlist')) || listUrl.includes('mdblist:watchlist')));
-        if (isDualTypeChart && !isExternalProvider) {
+        if (canShowLineup && !channelHasBothTypes) {
+          // One kind of thing in this channel, so Movies and Shows would be
+          // two pills showing the same list. All stays: it is the whole
+          // channel, and the way back from On Today.
+          const curFilter = window._currentListDetailsFilter || 'all';
+          if (aBtn) {
+            aBtn.style.display = '';
+            aBtn.classList.toggle('active', curFilter !== 'lineup');
+          }
+          if (mBtn) mBtn.style.display = 'none';
+          if (sBtn) sBtn.style.display = 'none';
+        } else if (isDualTypeChart && !isExternalProvider) {
           // On dual-type charts (Catalogs Quick Add & Discover), hide 'All' and show only 'Movies' & 'Shows'
           if (aBtn) aBtn.style.display = 'none';
           if (mBtn) {
@@ -2662,32 +2805,45 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     // why: this is the path a large Custom List, Watchlist, or paginated
     // chart takes as the user scrolls, and it used to tear down and
     // rebuild every already-rendered poster on every page that arrived.
-    appendPosterGridItems(gridEl, newlyMatching);
+    // On Today owns the grid, the status line and the subtitle while it is
+    // the open tab, so a page that lands behind it is only accumulated --
+    // All re-renders from the accumulated items the moment it is clicked.
+    if (window._currentListDetailsFilter !== 'lineup') appendPosterGridItems(gridEl, newlyMatching);
     loadedCount = window._currentListDetailsAllItems.length;
     return newCount;
   }
   function updateStatusAfterPage(maybeMore, itemsThisPage) {
+    const onLineup = window._currentListDetailsFilter === 'lineup';
     if (!maybeMore || itemsThisPage === 0 || pagesLoaded >= MAX_PAGES) {
       done = true;
-      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
-    } else {
+      if (!onLineup) statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
+    } else if (!onLineup) {
       statusEl.innerHTML = '<small>Scroll for more\u2026</small>';
     }
     // Set before the subtitle is written, not after: the subtitle says "100+"
     // rather than "100" precisely when this is true.
     moreToLoad = !done;
-    subEl.textContent = formatSubtitle(loadedCount);
+    if (!onLineup) subEl.textContent = formatSubtitle(loadedCount);
   }
+  // How All puts the list's own subtitle back after On Today borrowed it --
+  // recomputed rather than restored from a string, so a count that grew while
+  // On Today was open is still right.
+  window._listDetailsSubtitleRefresh = function() {
+    subEl.textContent = formatSubtitle(loadedCount);
+  };
 
   async function loadNextPage() {
     if (loading || done) return;
+    // Same reason as in appendItems: while On Today is the open tab the status
+    // line is its, so a page loading behind it says nothing.
+    const quiet = window._currentListDetailsFilter === 'lineup';
     if (!listUrl || listUrl.startsWith('custom:') || listUrl.startsWith('autotrack:')) {
       done = true;
-      statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
+      if (!quiet) statusEl.innerHTML = loadedCount ? '' : '<small>No items found.</small>';
       return;
     }
     loading = true;
-    statusEl.innerHTML = '<small>Loading\u2026</small>';
+    if (!quiet) statusEl.innerHTML = '<small>Loading\u2026</small>';
     try {
       const body = { url: listUrl, type: type, skip: skip, sample: 100 };
       if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;

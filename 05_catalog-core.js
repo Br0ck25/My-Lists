@@ -368,11 +368,12 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
     <path d="M-90,-105 Q-45,-130 0,-105 T90,-105" fill="none" stroke="url(#accentGrad)" stroke-width="4.5" stroke-linecap="round" opacity="0.85" />
 
     <!-- Channel Name Rendered STRICTLY Inside the TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="170" cy="115" r="6" fill="#007AFF" opacity="0.8" />
@@ -382,7 +383,7 @@ function generateChannelPosterSvg(name, backdropUrl = "") {
   <!-- Bottom TV Channel Pill Badge -->
   <g transform="translate(300, 780)">
     <rect x="-120" y="-20" width="240" height="40" rx="20" fill="url(#accentGrad)" />
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="900" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#FFFFFF" text-anchor="middle" letter-spacing="2.5">TV CHANNEL</text>
   </g>
 </svg>`;
 }
@@ -475,11 +476,12 @@ function generateChannelBackdropSvg(name, backdropUrl = "") {
     <path d="M-34,-24 Q-17,-32 0,-24 T34,-24" fill="none" stroke="url(#accentGradL)" stroke-width="1.5" stroke-linecap="round" opacity="0.8" />
 
     <!-- Channel Name Rendered STRICTLY Inside TV Screen -->
-    <g filter="url(#shadow)">
-      <text text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="${fontSize}" font-weight="900" fill="#FFFFFF" letter-spacing="1">
-        ${textSpans}
-      </text>
-    </g>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#000000" fill-opacity="0.7" letter-spacing="1" transform="translate(0, 5)">
+      ${textSpans}
+    </text>
+    <text x="0" y="0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="${fontSize}" font-weight="bold" fill="#FFFFFF" letter-spacing="1">
+      ${textSpans}
+    </text>
 
     <!-- TV Control Knobs / Accent Dots -->
     <circle cx="86" cy="25" r="2.5" fill="#007AFF" opacity="0.8" />
@@ -582,13 +584,13 @@ function generateBadgedPosterSvg({ posterUrl, airDateText, bottomText, bottomBg,
   const topBadgeSvg = safeAirDate ? `
     <g transform="translate(24, 24)">
       <rect x="0" y="0" width="${topPillWidth}" height="72" rx="16" ry="16" fill="#007aff" fill-opacity="0.95" stroke="#66b8ff" stroke-width="3.5" filter="drop-shadow(0px 6px 12px rgba(0,0,0,0.8))"/>
-      <text x="${topPillWidth / 2}" y="49" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="36" font-weight="900" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
+      <text x="${topPillWidth / 2}" y="49" font-family="Arial, Helvetica, sans-serif" font-size="36" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.2">${safeAirDate}</text>
     </g>` : '';
 
   const bottomBadgeSvg = safeBottom ? `
     <g transform="translate(250, 715)">
       <rect x="${-bottomPillWidth / 2}" y="-84" width="${bottomPillWidth}" height="84" rx="20" ry="20" fill="${bottomBg || '#ff9f0a'}" fill-opacity="0.95" stroke="${bottomBorder || 'rgba(255,159,10,0.7)'}" stroke-width="4.5" filter="drop-shadow(0px 8px 16px rgba(0,0,0,0.85))"/>
-      <text x="0" y="-30" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="38" font-weight="900" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
+      <text x="0" y="-30" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="bold" fill="${bottomColor || '#ffffff'}" text-anchor="middle" letter-spacing="1.5">${safeBottom}</text>
     </g>` : '';
 
   const topGradient = safeAirDate ? `
@@ -683,7 +685,7 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   <!-- Safe Badge Pill at top -->
   <g transform="translate(250, 60)" filter="url(#safeShadow)">
     <rect x="-140" y="0" width="280" height="42" rx="21" ry="21" fill="url(#shieldGrad)"/>
-    <text x="0" y="27" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="800" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
+    <text x="0" y="27" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#ffffff" text-anchor="middle" letter-spacing="1.5">SAFE POSTER</text>
   </g>
 
   <!-- Central Shield / Film Icon -->
@@ -696,21 +698,21 @@ function generateSafePosterSvg({ title, year, type, certification }) {
   </g>
 
   <!-- Title -->
-  <text x="250" y="${titleStartY}" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="34" font-weight="800" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
+  <text x="250" y="${titleStartY}" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="bold" fill="#f3f4f6" text-anchor="middle" letter-spacing="0.5" filter="url(#safeShadow)">
     ${titleTextSpans}
   </text>
 
   <!-- Metadata: Type & Year -->
   <g transform="translate(250, 560)">
     <rect x="-90" y="-18" width="180" height="36" rx="8" fill="rgba(255,255,255,0.06)" stroke="rgba(255,255,255,0.12)" stroke-width="1.5"/>
-    <text x="0" y="6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16" font-weight="700" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
+    <text x="0" y="6" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#9ca3af" text-anchor="middle" letter-spacing="1">
       ${safeType}${safeYear ? ' • ' + safeYear : ''}
     </text>
   </g>
 
   <!-- Certification / Footer -->
   <g transform="translate(250, 680)">
-    <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
+    <text x="0" y="0" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="600" fill="#6b7280" text-anchor="middle" letter-spacing="0.8">
       ${safeCert ? safeCert + ' • ' : ''}AGE-APPROPRIATE FILTER ACTIVE
     </text>
   </g>
@@ -799,7 +801,12 @@ function fetchChannelCatalog(entry, origin) {
   const isLandscapeShelf = entry.posterShape === "landscape";
   for (const rawUrl of rawUrls) {
     const payload = parseChannelPayload(rawUrl);
-    if (!payload || !payload.items || !payload.items.length) continue;
+    // A dynamic channel (Next Up) deliberately stores no picks of its own --
+    // its lineup is derived per request in buildChannelMeta -- so "no items"
+    // is not the same as "nothing to show" for one of those. The shelf tile
+    // here carries no episodes either way, only the channel's name and art.
+    if (!payload) continue;
+    if (!payload.dynamic && (!payload.items || !payload.items.length)) continue;
     const channelId = payload.channelId || entry.id;
     const name = payload.name || entry.name;
     
@@ -1720,6 +1727,21 @@ function seededShuffle(arr, seed) {
 const CHANNEL_ROTATION_SHOWS_PER_DAY = 24;
 const CHANNEL_ROTATION_EPISODES_PER_SHOW = 3;
 
+// How far a custom channel's own broadcast-schedule dials may be turned
+// (see channelRotationPlan below). The ceilings are not arbitrary: 48 shows
+// x 12 episodes is 576 videos in one day's meta response, already well past
+// anything watchable, and a client has to parse the whole thing before it
+// can render the channel at all.
+const CHANNEL_ROTATION_MAX_SHOWS_PER_DAY = 48;
+const CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW = 12;
+
+// How many episodes one multi-part story may glue together (see
+// glueMultiPartEpisodes). Two- and three-parters are the norm and a
+// five-network crossover is the outer edge of the real world; a cap stops a
+// mis-detection -- a show whose every episode is titled "Chapter One",
+// "Chapter Two" -- from gluing a whole season into one unbreakable block.
+const CHANNEL_PART_GROUP_MAX = 6;
+
 // --- channel video ids -------------------------------------------------
 //
 // A channel video's `id` IS the stream request: Stremio asks every stream
@@ -1804,6 +1826,1053 @@ function sortChannelItemsByAired(items) {
     .map((w) => w.it);
 }
 
+// --- sharing a channel --------------------------------------------------
+//
+// A channel someone shares, or publishes to the Explore Channels directory,
+// is stored server-side under a short code rather than packed into the link
+// itself: a full channel is thousands of episodes and megabytes of JSON, and
+// no URL survives that. What travels is the code.
+//
+// Everything that comes back out of that store is rebuilt field by field
+// here rather than round-tripped whole. A shared channel is a stranger's
+// JSON that this add-on then renders, saves into another person's browser
+// and serves back as a catalog, so the shape it is allowed to have is
+// spelled out in one place -- and a field this version does not know about
+// is dropped rather than carried.
+const SHARED_CHANNEL_ITEMS_MAX = 5000;
+const SHARED_CHANNEL_NAME_MAX = 200;
+const SHARED_CHANNEL_DESCRIPTION_MAX = 400;
+// Hand-made pairings a shared channel may carry. Generous next to the number
+// of multi-parters in any real channel, and small enough that the field
+// cannot be used to inflate a share.
+const SHARED_CHANNEL_PAIRS_MAX = 200;
+
+function sharedChannelString(value, max) {
+  return String(value == null ? "" : value).trim().slice(0, max);
+}
+
+// Only http(s) art is kept. A shared channel's poster is rendered straight
+// into an <img>, so a "javascript:" or "data:" URL from a stranger has no
+// business surviving the trip.
+function sharedChannelImageUrl(value) {
+  const url = sharedChannelString(value, 600);
+  return /^https?:\/\//i.test(url) ? url : "";
+}
+
+function sanitizeSharedChannelItem(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const kind = raw.kind === "movie" ? "movie" : "episode";
+  const item = {
+    kind: kind,
+    imdbId: sharedChannelString(raw.imdbId, 40),
+    season: channelItemNumber(raw.season),
+    episode: channelItemNumber(raw.episode),
+    showName: sharedChannelString(raw.showName, 200),
+    epName: sharedChannelString(raw.epName, 200),
+    title: sharedChannelString(raw.title, 300),
+  };
+  if (kind === "movie") {
+    item.season = item.season === null ? 1 : item.season;
+    item.episode = item.episode === null ? 1 : item.episode;
+  }
+  if (!channelItemStreamId(item)) return null;
+  const released = sharedChannelString(raw.released, 10);
+  if (released) item.released = released;
+  const runtime = typeof raw.runtime === "number" ? raw.runtime : parseInt(raw.runtime, 10);
+  if (Number.isInteger(runtime) && runtime > 0 && runtime < 1000) item.runtime = runtime;
+  const poster = sharedChannelImageUrl(raw.poster);
+  const thumbnail = sharedChannelImageUrl(raw.thumbnail);
+  const showPoster = sharedChannelImageUrl(raw.showPoster);
+  const backdrop = sharedChannelImageUrl(raw.backdrop);
+  if (poster) item.poster = poster;
+  if (thumbnail) item.thumbnail = thumbnail;
+  if (showPoster) item.showPoster = showPoster;
+  if (backdrop) item.backdrop = backdrop;
+  return item;
+}
+
+// A channel as it is safe to store and hand back out. Returns null when
+// there is nothing playable left, which is what the routes answer 400 on.
+// Pairs survive a share only where both halves do: every key is checked
+// against the picks that actually came through, and a group left with fewer
+// than two members is dropped rather than travelling as a rule about one
+// episode.
+function sanitizeSharedPairedGroups(raw, items) {
+  const keys = new Set();
+  for (const it of items) {
+    const key = channelItemStreamId(it);
+    if (key) keys.add(key);
+  }
+  const out = [];
+  for (const group of (Array.isArray(raw) ? raw : []).slice(0, SHARED_CHANNEL_PAIRS_MAX)) {
+    if (!Array.isArray(group)) continue;
+    const kept = [];
+    for (const k of group) {
+      const key = sharedChannelString(k, 60);
+      if (key && keys.has(key) && kept.indexOf(key) === -1) kept.push(key);
+      if (kept.length >= CHANNEL_PART_GROUP_MAX) break;
+    }
+    if (kept.length > 1) out.push(kept);
+  }
+  return out;
+}
+
+function sanitizeSharedChannel(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const items = (Array.isArray(raw.items) ? raw.items : [])
+    .slice(0, SHARED_CHANNEL_ITEMS_MAX)
+    .map(sanitizeSharedChannelItem)
+    .filter(Boolean);
+  const dynamic = raw.dynamic === "next-up" ? "next-up" : "";
+  // A dynamic channel is the one shape allowed to arrive with no picks --
+  // it has none by design. Everything else with nothing playable in it is
+  // not a channel.
+  if (!items.length && !dynamic) return null;
+  const plan = channelRotationPlan(raw);
+  const itemKeys = new Set(items.map(channelItemShowKey));
+  const out = {
+    name: sharedChannelString(raw.name, SHARED_CHANNEL_NAME_MAX) || "Shared Channel",
+    // The channel's own description, not the directory listing's. They used
+    // to be the same string, stored only on the listing -- so unpublishing a
+    // channel deleted the sentence describing it, and a channel shared by
+    // link had nowhere to carry one at all.
+    description: sharedChannelString(raw.description, SHARED_CHANNEL_DESCRIPTION_MAX),
+    poster: sharedChannelImageUrl(raw.poster) || null,
+    backdrop: sharedChannelImageUrl(raw.backdrop) || null,
+    items: items,
+    shuffle: !!raw.shuffle,
+    autoSort: sharedChannelString(raw.autoSort, 32),
+    sortByAired: !!raw.sortByAired,
+    dailyRotate: !!raw.dailyRotate,
+    hideWatched: !!raw.hideWatched,
+    // Locks for shows the shared picks no longer contain are dropped, so a
+    // shared channel never arrives carrying rules about titles it has not
+    // got.
+    storyLocked: (Array.isArray(raw.storyLocked) ? raw.storyLocked : [])
+      .map((k) => sharedChannelString(k, 120))
+      .filter((k) => k && itemKeys.has(k)),
+    pairParts: !!raw.pairParts,
+    // A channel that keeps up with its shows keeps doing so for whoever
+    // takes a copy -- it is the whole point of the flag, and it costs the
+    // receiving side nothing until they actually open the channel.
+    autoNewEpisodes: !!raw.autoNewEpisodes,
+    newEpisodesAtTop: !!raw.newEpisodesAtTop,
+    // Hand-made pairs, kept only for episodes the shared picks actually
+    // contain -- the same rule Story Lock follows above, for the same
+    // reason: a shared channel should never arrive carrying rules about
+    // titles it has not got.
+    pairedGroups: sanitizeSharedPairedGroups(raw.pairedGroups, items),
+    dynamic: dynamic,
+  };
+  if (out.dailyRotate) {
+    out.rotateShows = plan.shows;
+    out.rotateEpisodes = plan.episodes;
+    out.rotateTurnover = plan.turnover;
+    out.rotateTurnoverTime = sharedChannelString(raw.rotateTurnoverTime, 5);
+    out.rotateTurnoverZone = raw.rotateTurnoverZone === "local" ? "local" : "utc";
+  }
+  // Live Cloud Sync travels only when there is a real list URL behind it --
+  // the receiving end rebuilds the pool from that URL, so an unusable one
+  // would just leave the flag on with nothing to sync.
+  const sourceUrl = sharedChannelString(raw.sourceUrl, 600);
+  if (raw.liveSync && /^https?:\/\//i.test(sourceUrl)) {
+    out.liveSync = true;
+    out.sourceUrl = sourceUrl;
+  }
+  return out;
+}
+
+// The one-line record the Explore Channels directory lists. Deliberately
+// tiny: the directory is a single index that has to stay cheap to read, and
+// the full channel is one code lookup away.
+function sharedChannelSummary(code, record) {
+  const channel = record.channel || {};
+  const showKeys = new Set((channel.items || []).map(channelItemShowKey));
+  return {
+    code: code,
+    name: channel.name || "Shared Channel",
+    // The listing's own line when it has one, and the channel's otherwise --
+    // so a channel that describes itself needs nothing typed again to be
+    // published, and keeps that sentence when it is unpublished.
+    description: record.description || channel.description || "",
+    likes: Number(record.likes) || 0,
+    adds: Number(record.adds) || 0,
+    poster: channel.poster || null,
+    backdrop: channel.backdrop || null,
+    itemCount: (channel.items || []).length,
+    showCount: showKeys.size,
+    dailyRotate: !!channel.dailyRotate,
+    shuffle: !!channel.shuffle,
+    autoSort: channel.autoSort || "",
+    dynamic: channel.dynamic || "",
+    owner: record.owner || "",
+    publishedAt: record.publishedAt || 0,
+  };
+}
+
+// --- how a channel's day is put together -------------------------------
+//
+// Five payload flags shape a channel's lineup, and they are deliberately
+// separate from the picks themselves so none of them rewrites what someone
+// saved:
+//
+//   dailyRotate  a pool bigger than a day, cut into a fresh day's lineup
+//                (Quick Add's networks, and now any custom channel that
+//                asks for a broadcast schedule)
+//   autoSort     a static arrangement, applied to the lineup after it is
+//                picked -- "interleave" is the one the Worker acts on
+//   storyLocked  shows that must advance in sequence through a shuffle or
+//                a rotation instead of jumping around
+//   hideWatched  drop picks the account has already seen, until it has
+//                seen them all
+//   dynamic      a channel with no stored picks at all, re-derived per
+//                request from the account's own tracking
+//
+// Everything below is the machinery for those. A payload carrying none of
+// them plays exactly as it did before any of this existed.
+
+// The show one channel item belongs to, as a stable grouping key. The daily
+// rotation has always grouped by this expression; it is pulled out here so
+// Story Lock, the interleaver and "Hide watched" group a channel the SAME
+// way -- an item that rotates as part of "The Simpsons" has to lock and
+// interleave as part of it too.
+function channelItemShowKey(it) {
+  if (!it) return "";
+  return it.imdbId || `${it.kind || "episode"}:${it.title || ""}`;
+}
+
+// Broadcast order within one show. Only ever applied to a show that is
+// story-locked, and only to that show's own run -- it never reorders one
+// show against another.
+function sortChannelItemsSequential(list) {
+  return list.slice().sort((a, b) => {
+    const sa = channelItemNumber(a.season);
+    const sb = channelItemNumber(b.season);
+    if (sa !== sb) return (sa === null ? 0 : sa) - (sb === null ? 0 : sb);
+    const ea = channelItemNumber(a.episode);
+    const eb = channelItemNumber(b.episode);
+    return (ea === null ? 0 : ea) - (eb === null ? 0 : eb);
+  });
+}
+
+// Round-robin across shows: one pick from each show in turn, then round
+// again -- Simpsons S1E1, King of the Hill S1E1, Malcolm S1E1, Simpsons
+// S1E2, and so on. What a 90s prime-time block actually felt like, and the
+// opposite of playing fifty episodes of one show before the next one starts.
+//
+// Shows keep the order they first appear in and each show's own run keeps
+// the order it arrived in, so this only changes WHEN each pick plays. It
+// never reorders a show against itself, which is what makes it safe to run
+// over a story-locked show, and it is idempotent -- interleaving an already
+// interleaved lineup is a no-op, so the builder applying it to the saved
+// order and the Worker applying it again here cannot fight.
+function interleaveChannelItems(items) {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length < 2) return list;
+  const runs = new Map();
+  for (const it of list) {
+    const key = channelItemShowKey(it);
+    if (!runs.has(key)) runs.set(key, []);
+    runs.get(key).push(it);
+  }
+  if (runs.size < 2) return list;
+  const lists = [...runs.values()];
+  const longest = lists.reduce((n, l) => Math.max(n, l.length), 0);
+  const out = [];
+  for (let round = 0; round < longest; round++) {
+    for (const run of lists) {
+      if (round < run.length) out.push(run[round]);
+    }
+  }
+  return out;
+}
+
+// The shows a channel marks as serialized. Stored as the same show keys
+// channelItemShowKey produces, so a lock survives a show being re-added.
+function channelStoryLockedKeys(payload) {
+  const raw = Array.isArray(payload && payload.storyLocked) ? payload.storyLocked : [];
+  return new Set(raw.map((k) => String(k || "").trim()).filter(Boolean));
+}
+
+// Puts story-locked shows back into sequence after a shuffle.
+//
+// The POSITIONS a locked show occupies stay shuffled -- so it is still
+// spread through the day rather than stuck in one block -- but the episodes
+// that land in them are dealt out in broadcast order, so the show still
+// advances E1, E2, E3 wherever it turns up. That is the whole point of the
+// lock: daily variety without walking into the back half of a season.
+function resequenceLockedShows(shuffled, sourceOrder, lockedKeys) {
+  if (!lockedKeys || !lockedKeys.size) return shuffled;
+  const queues = new Map();
+  for (const it of sourceOrder) {
+    const key = channelItemShowKey(it);
+    if (!lockedKeys.has(key)) continue;
+    if (!queues.has(key)) queues.set(key, []);
+    queues.get(key).push(it);
+  }
+  if (!queues.size) return shuffled;
+  for (const [key, queue] of queues) queues.set(key, sortChannelItemsSequential(queue));
+  const cursors = new Map();
+  return shuffled.map((it) => {
+    const key = channelItemShowKey(it);
+    const queue = queues.get(key);
+    if (!queue) return it;
+    const at = cursors.get(key) || 0;
+    cursors.set(key, at + 1);
+    return queue[at] || it;
+  });
+}
+
+function shuffleChannelItems(items, seed, lockedKeys) {
+  return resequenceLockedShows(seededShuffle(items, seed), items, lockedKeys);
+}
+
+// --- pairing glue: multi-part episodes stay together ---------------------
+//
+// A rotation deals a contiguous block out of a show's run and a shuffle
+// scatters it, and neither knows that "The Best of Both Worlds, Part I" is
+// half a story. Part II landing tomorrow -- or three hours later, after four
+// other shows -- is the one ordering result nobody wants.
+//
+// "Keep multi-part episodes together" turns on the detection below; a pair
+// made by hand in the builder always applies, toggle or not, because it was
+// asked for explicitly. Either way the rule is the same: the first part of a
+// story to be drawn brings the rest of it along, immediately after, in part
+// order.
+
+// Roman numerals up to the group cap. Deliberately not a general parser:
+// this only ever reads the "II" in "Part II", and a show with a Part XLII is
+// not a show this needs to get right.
+const CHANNEL_PART_ROMAN = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10 };
+
+// Splits an episode title into the story it belongs to and which part of it
+// this is: "The Best of Both Worlds, Part II" -> { base: "the best of both
+// worlds", part: 2 }. Returns null for a title that names no part, which is
+// almost every episode ever made.
+function channelPartTitleSplit(rawName) {
+  const name = String(rawName == null ? "" : rawName).trim();
+  if (!name) return null;
+  // "... Part 2", "... Pt. II", "... part two" is not matched on purpose:
+  // a spelled-out number is rare and the words are common enough in a
+  // title ("Part of the Family") to be worth leaving alone.
+  const worded = name.match(/^(.*?)[\s,:;–—-]*\(?\s*(?:part|pt\.?)\s*([0-9]{1,2}|[ivxIVX]{1,4})\s*\)?[\s.]*$/i);
+  if (worded) {
+    const raw = worded[2].toLowerCase();
+    const part = /^[0-9]+$/.test(raw) ? parseInt(raw, 10) : (CHANNEL_PART_ROMAN[raw] || 0);
+    if (part > 0 && worded[1].trim()) return { base: channelPartBaseKey(worded[1]), part: part };
+    return null;
+  }
+  // The other form TMDB carries: a bare "(1)" / "(2)" suffix.
+  const bracketed = name.match(/^(.*?)[\s,:;–—-]*\(([0-9]{1,2})\)[\s.]*$/);
+  if (bracketed) {
+    const part = parseInt(bracketed[2], 10);
+    if (part > 0 && bracketed[1].trim()) return { base: channelPartBaseKey(bracketed[1]), part: part };
+  }
+  return null;
+}
+
+// Two halves of one story have to agree on their name to be recognized as
+// halves, and they routinely differ in punctuation alone ("Worlds, Part I"
+// vs "Worlds Part II"), so the comparison is made on letters and digits.
+function channelPartBaseKey(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+// The key a pairing is stored and looked up under: the item's stream id, so
+// a pair made in the builder survives the channel being re-sorted, re-saved
+// or shared, none of which keep array positions.
+function channelItemPairKey(it) {
+  return channelItemStreamId(it);
+}
+
+// Pairs the builder stored by hand, as arrays of stream ids.
+function channelManualPairGroups(payload) {
+  const raw = Array.isArray(payload && payload.pairedGroups) ? payload.pairedGroups : [];
+  const out = [];
+  for (const group of raw) {
+    if (!Array.isArray(group)) continue;
+    const keys = [];
+    for (const k of group) {
+      const key = String(k || "").trim();
+      if (key && keys.indexOf(key) === -1) keys.push(key);
+      if (keys.length >= CHANNEL_PART_GROUP_MAX) break;
+    }
+    if (keys.length > 1) out.push(keys);
+  }
+  return out;
+}
+
+// Every multi-part story in a pool, as a lookup from each member's key to
+// the whole story in part order.
+//
+// A manual pair wins over a detected one for the same episode: it was asked
+// for by hand, against a title the detection can only guess at.
+function channelPartGroups(payload, poolItems) {
+  const byKey = new Map();
+  for (const it of poolItems) {
+    const key = channelItemPairKey(it);
+    if (key && !byKey.has(key)) byKey.set(key, it);
+  }
+  const lookup = new Map();
+  const claim = (members) => {
+    if (members.length < 2) return;
+    const capped = members.slice(0, CHANNEL_PART_GROUP_MAX);
+    if (capped.some((it) => lookup.has(channelItemPairKey(it)))) return;
+    for (const it of capped) lookup.set(channelItemPairKey(it), capped);
+  };
+  for (const keys of channelManualPairGroups(payload)) {
+    const members = keys.map((k) => byKey.get(k)).filter(Boolean);
+    claim(members);
+  }
+  if (!payload.pairParts) return lookup;
+  // Detected pairs: same show, same season, same story name, different part
+  // numbers. Season matters -- a remake's "Part 1" ten seasons later is a
+  // different story with the same name.
+  const stories = new Map();
+  for (const it of poolItems) {
+    if (!it || it.kind === "movie") continue;
+    const key = channelItemPairKey(it);
+    if (!key) continue;
+    const split = channelPartTitleSplit(it.epName);
+    if (!split) continue;
+    const season = channelItemNumber(it.season);
+    const storyKey = `${channelItemShowKey(it)}|${season === null ? "" : season}|${split.base}`;
+    if (!stories.has(storyKey)) stories.set(storyKey, []);
+    stories.get(storyKey).push({ item: it, part: split.part });
+  }
+  for (const entries of stories.values()) {
+    const seenParts = new Set();
+    const members = [];
+    for (const e of entries.slice().sort((a, b) => a.part - b.part)) {
+      if (seenParts.has(e.part)) continue;
+      seenParts.add(e.part);
+      members.push(e.item);
+    }
+    claim(members);
+  }
+  return lookup;
+}
+
+// Applies those groups to a finished lineup.
+//
+// Wherever the first-drawn member of a story appears, the WHOLE story is
+// played there, in part order, and its other members are dropped from
+// wherever else they landed. A part that was not drawn at all is pulled in
+// from the pool: a channel that gave you Part 1 and made you wait a day for
+// Part 2 is the exact complaint this answers. A part that is not in the pool
+// (never added, or filtered out by "Hide watched") simply is not there, and
+// the rest still play together.
+//
+// Drawing Part 2 first plays the story from Part 1, for the same reason:
+// the back half of a story on its own is worse than a minute of extra
+// runtime.
+function glueMultiPartEpisodes(items, poolItems, payload) {
+  const groups = channelPartGroups(payload, poolItems);
+  if (!groups.size) return items;
+  const played = new Set();
+  const out = [];
+  for (const it of items) {
+    const members = groups.get(channelItemPairKey(it));
+    if (!members) {
+      out.push(it);
+      continue;
+    }
+    const storyId = channelItemPairKey(members[0]);
+    if (played.has(storyId)) continue;
+    played.add(storyId);
+    for (const member of members) out.push(member);
+  }
+  return out;
+}
+
+// The dials behind a daily broadcast schedule. Quick Add's network channels
+// have always rotated 24 shows x 3 episodes off midnight UTC; a custom
+// channel can now say how many shows a day it runs, how many back-to-back
+// episodes make up one show's block, and what time of day the lineup turns
+// over. A payload that sets none of them keeps the network numbers, so every
+// channel saved before this reads exactly as it did.
+function channelRotationPlan(payload) {
+  const dial = (raw, lo, hi, fallback) => {
+    const n = typeof raw === "number" ? raw : parseInt(raw, 10);
+    if (!Number.isInteger(n)) return fallback;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  // A saved channel stores 0 for a dial it never set -- the builder writes 0
+  // for both counts whenever the schedule panel is closed, and an older
+  // payload has no dials at all. 0 means "use the network numbers", not "run
+  // one show a day", so it falls through to the fallback instead of being
+  // clamped up to the floor of 1.
+  const count = (raw, hi, fallback) => {
+    const n = typeof raw === "number" ? raw : parseInt(raw, 10);
+    if (!Number.isInteger(n) || n <= 0) return fallback;
+    return Math.min(hi, n);
+  };
+  return {
+    shows: count(payload.rotateShows, CHANNEL_ROTATION_MAX_SHOWS_PER_DAY, CHANNEL_ROTATION_SHOWS_PER_DAY),
+    episodes: count(payload.rotateEpisodes, CHANNEL_ROTATION_MAX_EPISODES_PER_SHOW, CHANNEL_ROTATION_EPISODES_PER_SHOW),
+    // Minutes past midnight UTC at which today's lineup becomes tomorrow's.
+    // 0 is midnight UTC, which is what every rotating channel did before
+    // this existed; a viewer in UTC-5 stores 300 so the channel turns over
+    // at their own midnight rather than at 7pm the evening before.
+    turnover: ((dial(payload.rotateTurnover, -1439, 1439, 0) % 1440) + 1440) % 1440,
+  };
+}
+
+// Which day's lineup to serve -- days counted from the channel's own
+// turnover time rather than from midnight UTC.
+function channelRotationDay(now, turnoverMinutes) {
+  return daysSinceEpochUTC(new Date(now.getTime() - turnoverMinutes * 60000));
+}
+
+// One day's lineup out of a pool: a handful of different shows with a few
+// episodes each, rather than a flat random slice that could easily skew to
+// dozens of episodes of one show and none of many others. Stable within a
+// day, different the next.
+function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys) {
+  const byShow = new Map();
+  for (const it of playableItems) {
+    const key = channelItemShowKey(it);
+    if (!byShow.has(key)) byShow.set(key, []);
+    byShow.get(key).push(it);
+  }
+  const showKeys = seededShuffle([...byShow.keys()], seed).slice(0, plan.shows);
+  const items = [];
+  showKeys.forEach((key, i) => {
+    const isLocked = lockedKeys.has(key);
+    const showEpisodes = isLocked ? sortChannelItemsSequential(byShow.get(key)) : byShow.get(key);
+    const perShow = Math.min(plan.episodes, showEpisodes.length);
+    let start;
+    if (isLocked) {
+      // A story-locked show gets no random starting point: it picks up
+      // where yesterday's block left off and walks its run in order,
+      // wrapping back to the beginning once it reaches the end.
+      const blocks = Math.max(1, Math.ceil(showEpisodes.length / perShow));
+      start = (((day % blocks) + blocks) % blocks) * perShow;
+      if (start > showEpisodes.length - perShow) start = Math.max(0, showEpisodes.length - perShow);
+    } else {
+      // A contiguous block (not scattered episodes) feels like an actual
+      // evening's run of a show -- seeded per-show so different shows
+      // don't all land on the same relative starting point.
+      const maxStart = showEpisodes.length - perShow;
+      const starts = seededShuffle(
+        Array.from({ length: maxStart + 1 }, (_, n) => n),
+        seed + i + 1
+      );
+      start = starts.length ? starts[0] : 0;
+    }
+    items.push(...showEpisodes.slice(start, start + perShow));
+  });
+  return items;
+}
+
+// --- hide watched -------------------------------------------------------
+//
+// A channel item stores the show's IMDB id plus the season and episode
+// numbers and never the episode's own TMDB id, so the numbers are the only
+// thing a channel pick and a watch-history entry share. Movies match on the
+// title id alone.
+function channelWatchedKey(showId, season, episode) {
+  const s = channelItemNumber(season);
+  const e = channelItemNumber(episode);
+  if (!showId || s === null || e === null) return "";
+  return `${showId}:${s}:${e}`;
+}
+
+function channelWatchedKeySet(watchHistory) {
+  const set = new Set();
+  if (!Array.isArray(watchHistory)) return set;
+  for (const w of watchHistory) {
+    if (!w) continue;
+    if (w.type === "movie" || (w.seasonNum == null && w.episodeNum == null)) {
+      const id = String(w.id || w.imdbId || "").trim();
+      if (id) set.add(id);
+      continue;
+    }
+    const key = channelWatchedKey(String(w.showId || w.imdbId || "").trim(), w.seasonNum, w.episodeNum);
+    if (key) set.add(key);
+  }
+  return set;
+}
+
+function channelItemIsWatched(it, watchedKeys) {
+  if (!it || !watchedKeys.size) return false;
+  const showId = String(it.imdbId || "").trim();
+  if (!showId) return false;
+  if (it.kind === "movie") return watchedKeys.has(showId);
+  const key = channelWatchedKey(showId, it.season, it.episode);
+  return !!key && watchedKeys.has(key);
+}
+
+// --- the Next Up channel ------------------------------------------------
+//
+// The next unwatched episode of every show the account has in progress.
+//
+// Continue Watching is already exactly that list -- the Auto-Track Playback
+// scrobble and the new-episode cron both maintain it (see
+// 26_api-creator-and-admin-routes.js and checkForNewEpisodes) -- so there is
+// nothing to recompute here and not one TMDB call to make. A channel built
+// this way stores no picks of its own: it is re-derived on every request, so
+// it follows what the account is actually watching instead of freezing
+// whatever happened to be true the day it was saved.
+function channelNextUpItems(continueWatching) {
+  if (!Array.isArray(continueWatching)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const cw of continueWatching) {
+    if (!cw) continue;
+    const showId = String(cw.showId || cw.imdbId || "").trim();
+    const season = channelItemNumber(cw.seasonNum);
+    const episode = channelItemNumber(cw.episodeNum);
+    if (!showId || season === null || episode === null) continue;
+    const key = `${showId}:${season}:${episode}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const showName = String(cw.showTitle || "").trim();
+    const epName = String(cw.name || "").trim() || `Episode ${episode}`;
+    const poster = cw.showPoster || cw.poster || "";
+    out.push({
+      kind: "episode",
+      imdbId: showId,
+      season: season,
+      episode: episode,
+      showName: showName,
+      epName: epName,
+      title: showName ? `${showName} S${season}E${episode} — ${epName}` : epName,
+      released: cw.released || "",
+      poster: poster,
+      thumbnail: cw.thumbnail || poster,
+      showPoster: cw.showPoster || poster,
+    });
+  }
+  return out;
+}
+
+// --- live cloud sync ----------------------------------------------------
+//
+// Importing a Trakt/MDBList/Simkl/TMDB list used to take a one-time snapshot:
+// the episodes that existed the moment "Import channel" was pressed, frozen
+// for good. A channel with `liveSync` keeps the source URL instead, and the
+// Worker rebuilds its pool from that list in the background whenever the
+// stored pool goes stale -- so a public list gaining a title gains it here
+// too, with nothing to rebuild by hand.
+//
+// The rebuild never happens on the request's own critical path. A request
+// serves whatever pool is stored (falling back to the channel's original
+// snapshot when there is none yet) and schedules the refresh with
+// ctx.waitUntil, so the first request after a list changes is no slower than
+// any other and the next one sees the new titles.
+const CHANNEL_LIVE_POOL_TTL_MS = 6 * 60 * 60 * 1000;
+const CHANNEL_LIVE_POOL_MAX_SHOWS = 24;
+const CHANNEL_LIVE_POOL_MAX_SEASONS = 3;
+const CHANNEL_LIVE_POOL_MAX_ITEMS = 1200;
+
+function channelLivePoolKey(channelId) {
+  return `channelpool:${channelId}`;
+}
+
+// Channels whose pool this isolate is already rebuilding.
+//
+// A stale pool schedules a refresh on every request that sees it, and the
+// pool only stops being stale once the first rebuild finishes -- which is
+// dozens of TMDB calls later. Without this, a channel opened three times in
+// that window runs the whole rebuild three times. Per-isolate, so it bounds
+// the common case (one viewer, one colo, several requests) rather than
+// pretending to be a distributed lock.
+const CHANNEL_LIVE_POOL_IN_FLIGHT = new Set();
+
+// Resolves a list URL to a channel-shaped pool of episodes. Deliberately
+// capped: this runs on a background task with no one waiting on it, but it
+// is still one TMDB season call per season per show.
+async function buildChannelPoolFromListUrl(sourceUrl, keys) {
+  let metas = [];
+  try {
+    metas = await fetchCatalog({ url: sourceUrl, type: "series" }, 0, keys);
+  } catch {
+    return [];
+  }
+  const shows = (metas || []).filter((m) => m && m.id).slice(0, CHANNEL_LIVE_POOL_MAX_SHOWS);
+  if (!shows.length) return [];
+  const tmdbKey = (keys && keys.tmdbKey) || TMDB_API_KEY;
+  const perShow = await mapWithConcurrency(shows, 4, async (m) => {
+    try {
+      const findRes = await fetch(
+        `https://api.themoviedb.org/3/find/${encodeURIComponent(m.id)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+      );
+      if (!findRes.ok) return [];
+      const findData = await findRes.json();
+      const match = (findData.tv_results || [])[0];
+      if (!match) return [];
+      const showPoster = match.poster_path ? `https://image.tmdb.org/t/p/w500${match.poster_path}` : (m.poster || "");
+      const showRes = await fetch(
+        `https://api.themoviedb.org/3/tv/${encodeURIComponent(match.id)}?api_key=${encodeURIComponent(tmdbKey)}`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+      );
+      if (!showRes.ok) return [];
+      const fullShow = await showRes.json();
+      const seasons = (fullShow.seasons || [])
+        .filter((s) => s && s.season_number > 0)
+        .slice(0, CHANNEL_LIVE_POOL_MAX_SEASONS);
+      const out = [];
+      for (const s of seasons) {
+        const sRes = await fetch(
+          `https://api.themoviedb.org/3/tv/${encodeURIComponent(match.id)}/season/${s.season_number}?api_key=${encodeURIComponent(tmdbKey)}`,
+          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+        );
+        if (!sRes.ok) continue;
+        const sData = await sRes.json();
+        for (const ep of (sData.episodes || [])) {
+          const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+          const epName = ep.name || `Episode ${ep.episode_number}`;
+          out.push({
+            kind: "episode",
+            imdbId: m.id,
+            season: s.season_number,
+            episode: ep.episode_number,
+            showName: fullShow.name || m.name || "",
+            epName: epName,
+            title: `${fullShow.name || m.name || ""} S${s.season_number}E${ep.episode_number} — ${epName}`,
+            released: ep.air_date || "",
+            thumbnail: stillUrl || showPoster,
+            poster: showPoster || stillUrl,
+            showPoster: showPoster,
+          });
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  });
+  const items = [];
+  for (const run of perShow) {
+    for (const it of run) {
+      if (items.length >= CHANNEL_LIVE_POOL_MAX_ITEMS) return items;
+      items.push(it);
+    }
+  }
+  return items;
+}
+
+async function refreshChannelLivePool(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.sourceUrl || !payload.channelId) return null;
+  if (CHANNEL_LIVE_POOL_IN_FLIGHT.has(payload.channelId)) return null;
+  CHANNEL_LIVE_POOL_IN_FLIGHT.add(payload.channelId);
+  try {
+    return await refreshChannelLivePoolUncoordinated(payload, opts);
+  } finally {
+    CHANNEL_LIVE_POOL_IN_FLIGHT.delete(payload.channelId);
+  }
+}
+
+async function refreshChannelLivePoolUncoordinated(payload, opts) {
+  const env = opts.env;
+  const items = await buildChannelPoolFromListUrl(payload.sourceUrl, {
+    env: env,
+    ctx: opts.ctx,
+    origin: opts.origin || "",
+    tmdbKey: opts.tmdbKey || "",
+    mdblistKey: opts.mdblistKey || "",
+    traktKey: opts.traktKey || "",
+    traktAccessToken: opts.traktAccessToken || "",
+  });
+  if (!items.length) return null;
+  await env.CONFIGS.put(
+    channelLivePoolKey(payload.channelId),
+    JSON.stringify({ sourceUrl: payload.sourceUrl, items: items, updatedAt: Date.now() }),
+    { expirationTtl: 2592000 }
+  );
+  return items;
+}
+
+async function readChannelLivePool(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  let cached = null;
+  try {
+    const raw = await env.CONFIGS.get(channelLivePoolKey(payload.channelId));
+    if (raw) cached = JSON.parse(raw);
+  } catch {
+    cached = null;
+  }
+  const usable = cached && Array.isArray(cached.items) && cached.items.length &&
+    cached.sourceUrl === payload.sourceUrl;
+  const stale = !usable || (Date.now() - (cached.updatedAt || 0)) > CHANNEL_LIVE_POOL_TTL_MS;
+  if (stale && opts.ctx && typeof opts.ctx.waitUntil === "function") {
+    opts.ctx.waitUntil(refreshChannelLivePool(payload, opts).catch(() => {}));
+  }
+  return usable ? cached.items : null;
+}
+
+// --- self-maintaining channels: new episodes arrive on their own ---------
+//
+// A channel is a snapshot: add The Last of Us today and the channel still
+// carries exactly those episodes a year later, while the show has moved on
+// without it. "Automatically add new episodes" closes that gap -- the Worker
+// re-checks each show the channel carries and folds in whatever has aired
+// since, at the top of the channel or at the end, as the channel says.
+//
+// Same shape as Live Cloud Sync above, and for the same reasons: the work is
+// dozens of TMDB calls, so it happens on a background task with nobody
+// waiting on it, the result is cached in KV, and a request serves what is
+// stored and schedules the refresh rather than paying for it.
+const CHANNEL_NEW_EPISODE_TTL_MS = 12 * 60 * 60 * 1000;
+const CHANNEL_NEW_EPISODE_MAX_SHOWS = 30;
+const CHANNEL_NEW_EPISODE_MAX_SEASONS = 2;
+const CHANNEL_NEW_EPISODE_MAX_ITEMS = 300;
+const CHANNEL_NEW_EPISODE_IN_FLIGHT = new Set();
+
+function channelNewEpisodeKey(channelId) {
+  return `channelnew:${channelId}`;
+}
+
+// What the channel already has, per show: the highest season it carries and
+// every season:episode in it. The high-water mark is what makes the check
+// cheap -- only seasons at or past it can hold anything new, so a channel of
+// ten-season shows still costs one or two season calls each.
+function channelShowWatermarks(items) {
+  const marks = new Map();
+  for (const it of items || []) {
+    if (!it || it.kind === "movie") continue;
+    const showId = channelItemShowId(it.imdbId);
+    const season = channelItemNumber(it.season);
+    const episode = channelItemNumber(it.episode);
+    if (!showId || season === null || episode === null) continue;
+    if (!marks.has(showId)) {
+      marks.set(showId, {
+        showId: showId,
+        showName: it.showName || "",
+        showPoster: it.showPoster || it.poster || "",
+        maxSeason: season,
+        have: new Set(),
+      });
+    }
+    const mark = marks.get(showId);
+    if (season > mark.maxSeason) mark.maxSeason = season;
+    if (!mark.showName && it.showName) mark.showName = it.showName;
+    if (!mark.showPoster && (it.showPoster || it.poster)) mark.showPoster = it.showPoster || it.poster;
+    mark.have.add(`${season}:${episode}`);
+  }
+  return marks;
+}
+
+// Whether a cached answer still belongs to the channel that asked for it.
+// Editing the channel -- adding a show, adding a season by hand -- changes
+// the marks, and an answer computed against the old ones would re-add
+// episodes the channel now carries itself.
+function channelNewEpisodeSignature(marks) {
+  const parts = [];
+  for (const mark of marks.values()) parts.push(`${mark.showId}:${mark.maxSeason}:${mark.have.size}`);
+  return String(hashStringToInt(parts.sort().join("|")));
+}
+
+// Everything one show has aired that this channel does not already carry.
+// Unaired episodes are left alone: TMDB lists next month's episode the day
+// it is announced, and a channel slot that plays nothing is worse than a
+// channel that is a week behind.
+async function fetchShowEpisodesAfter(mark, tmdbKey, today) {
+  const idForTmdb = mark.showId.startsWith("tmdb:") ? mark.showId.slice(5) : "";
+  let tmdbId = idForTmdb;
+  if (!tmdbId) {
+    const findRes = await fetch(
+      `https://api.themoviedb.org/3/find/${encodeURIComponent(mark.showId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`,
+      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+    );
+    if (!findRes.ok) return [];
+    const findData = await findRes.json();
+    const match = (findData.tv_results || [])[0];
+    if (!match) return [];
+    tmdbId = String(match.id);
+  }
+  const showRes = await fetch(
+    `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}?api_key=${encodeURIComponent(tmdbKey)}`,
+    { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 21600, cacheEverything: true } }
+  );
+  if (!showRes.ok) return [];
+  const fullShow = await showRes.json();
+  const showName = mark.showName || fullShow.name || "";
+  const showPoster = mark.showPoster ||
+    (fullShow.poster_path ? `https://image.tmdb.org/t/p/w500${fullShow.poster_path}` : "");
+  const seasons = (fullShow.seasons || [])
+    .filter((s) => s && s.season_number >= mark.maxSeason)
+    .sort((a, b) => a.season_number - b.season_number)
+    .slice(0, CHANNEL_NEW_EPISODE_MAX_SEASONS);
+  const out = [];
+  for (const s of seasons) {
+    const sRes = await fetch(
+      `https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/season/${s.season_number}?api_key=${encodeURIComponent(tmdbKey)}`,
+      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 21600, cacheEverything: true } }
+    );
+    if (!sRes.ok) continue;
+    const sData = await sRes.json();
+    for (const ep of (sData.episodes || [])) {
+      const season = channelItemNumber(s.season_number);
+      const episode = channelItemNumber(ep && ep.episode_number);
+      if (season === null || episode === null) continue;
+      if (mark.have.has(`${season}:${episode}`)) continue;
+      const aired = String(ep.air_date || "");
+      if (!aired || aired > today) continue;
+      const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+      const epName = ep.name || `Episode ${episode}`;
+      out.push({
+        kind: "episode",
+        imdbId: mark.showId,
+        season: season,
+        episode: episode,
+        showName: showName,
+        epName: epName,
+        title: `${showName} S${season}E${episode} — ${epName}`,
+        released: aired,
+        thumbnail: stillUrl || showPoster,
+        poster: showPoster || stillUrl,
+        showPoster: showPoster,
+      });
+    }
+  }
+  return out;
+}
+
+// Newest first, so "put new episodes at top" puts the newest one at the very
+// top rather than the oldest of the new ones.
+function sortChannelNewEpisodes(items) {
+  return items.slice().sort((a, b) => {
+    const da = String(a.released || "");
+    const db = String(b.released || "");
+    if (da !== db) return db < da ? -1 : 1;
+    const sa = channelItemNumber(a.season) || 0;
+    const sb = channelItemNumber(b.season) || 0;
+    if (sa !== sb) return sb - sa;
+    return (channelItemNumber(b.episode) || 0) - (channelItemNumber(a.episode) || 0);
+  });
+}
+
+async function buildChannelNewEpisodes(marks, keys) {
+  const tmdbKey = (keys && keys.tmdbKey) || TMDB_API_KEY;
+  const today = new Date().toISOString().slice(0, 10);
+  const shortlist = [...marks.values()].slice(0, CHANNEL_NEW_EPISODE_MAX_SHOWS);
+  const perShow = await mapWithConcurrency(shortlist, 4, async (mark) => {
+    try {
+      return await fetchShowEpisodesAfter(mark, tmdbKey, today);
+    } catch {
+      return [];
+    }
+  });
+  const found = [];
+  for (const run of perShow) {
+    for (const it of run) found.push(it);
+  }
+  return sortChannelNewEpisodes(found).slice(0, CHANNEL_NEW_EPISODE_MAX_ITEMS);
+}
+
+async function refreshChannelNewEpisodes(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  if (CHANNEL_NEW_EPISODE_IN_FLIGHT.has(payload.channelId)) return null;
+  CHANNEL_NEW_EPISODE_IN_FLIGHT.add(payload.channelId);
+  try {
+    const marks = channelShowWatermarks(Array.isArray(payload.items) ? payload.items : []);
+    if (!marks.size) return null;
+    const items = await buildChannelNewEpisodes(marks, {
+      tmdbKey: opts.tmdbKey || "",
+    });
+    await env.CONFIGS.put(
+      channelNewEpisodeKey(payload.channelId),
+      JSON.stringify({
+        signature: channelNewEpisodeSignature(marks),
+        items: items,
+        updatedAt: Date.now(),
+      }),
+      { expirationTtl: 2592000 }
+    );
+    return items;
+  } finally {
+    CHANNEL_NEW_EPISODE_IN_FLIGHT.delete(payload.channelId);
+  }
+}
+
+// An empty answer is cached like any other -- a channel whose shows are all
+// finished would otherwise re-check every single request forever.
+async function readChannelNewEpisodes(payload, opts) {
+  const env = opts && opts.env;
+  if (!env || !env.CONFIGS || !payload.channelId) return null;
+  let cached = null;
+  try {
+    const raw = await env.CONFIGS.get(channelNewEpisodeKey(payload.channelId));
+    if (raw) cached = JSON.parse(raw);
+  } catch {
+    cached = null;
+  }
+  const marks = channelShowWatermarks(Array.isArray(payload.items) ? payload.items : []);
+  const usable = !!(cached && Array.isArray(cached.items) &&
+    cached.signature === channelNewEpisodeSignature(marks));
+  const stale = !usable || (Date.now() - (cached.updatedAt || 0)) > CHANNEL_NEW_EPISODE_TTL_MS;
+  if (stale && opts.ctx && typeof opts.ctx.waitUntil === "function") {
+    opts.ctx.waitUntil(refreshChannelNewEpisodes(payload, opts).catch(() => {}));
+  }
+  return usable ? cached.items : null;
+}
+
+// Folds the newly-aired episodes into the channel's own picks. Anything the
+// channel already carries is dropped from the new side rather than played
+// twice -- the cached answer can be a few hours older than an edit that
+// added the same episode by hand.
+function mergeChannelNewEpisodes(stored, fresh, atTop) {
+  if (!Array.isArray(fresh) || !fresh.length) return stored;
+  const have = new Set();
+  for (const it of stored) {
+    const key = channelItemStreamId(it);
+    if (key) have.add(key);
+  }
+  const added = [];
+  for (const it of fresh) {
+    const key = channelItemStreamId(it);
+    if (!key || have.has(key)) continue;
+    have.add(key);
+    added.push(it);
+  }
+  if (!added.length) return stored;
+  return atTop ? added.concat(stored) : stored.concat(added);
+}
+
+// The pool a channel draws today's lineup from, before any ordering.
+//
+// Three shapes: a normal channel plays the picks stored on it; a dynamic
+// channel (Next Up) has none and is re-derived per request from the
+// account's own tracking; a Live Cloud Sync channel prefers the pool the
+// Worker last rebuilt from the list it was imported from, and keeps its
+// stored picks as the fallback for before that first rebuild lands.
+async function channelSourceItems(payload, opts) {
+  const stored = Array.isArray(payload.items) ? payload.items : [];
+  if (payload.dynamic === "next-up") {
+    // The live answer when there is one, and the seed the builder stored
+    // otherwise.
+    //
+    // The fallback is not belt-and-braces: resolveConfig only hands over
+    // continueWatching for a config that PROVED whose it is, and a config
+    // with no personal shelf in it never does -- so for those the live
+    // derivation is empty every time and the seed is the only lineup the
+    // channel will ever have. Returning nothing there is what made this
+    // channel come back blank.
+    const live = channelNextUpItems(opts.continueWatching);
+    return live.length ? live : stored;
+  }
+  let base = stored;
+  if (payload.liveSync && payload.sourceUrl) {
+    const live = await readChannelLivePool(payload, opts).catch(() => null);
+    if (live && live.length) base = live;
+  }
+  // "Automatically add new episodes" folds in whatever has aired since the
+  // channel was built. It sits after Live Cloud Sync rather than instead of
+  // it: one keeps up with the LIST a channel came from, the other with the
+  // SHOWS in it, and a channel can reasonably want both.
+  if (payload.autoNewEpisodes) {
+    const fresh = await readChannelNewEpisodes(payload, opts).catch(() => null);
+    if (fresh && fresh.length) base = mergeChannelNewEpisodes(base, fresh, !!payload.newEpisodesAtTop);
+  }
+  return base;
+}
+
 // The full stream id for one channel item, or "" if it cannot be formed.
 function channelItemStreamId(it) {
   if (!it) return "";
@@ -1816,13 +2885,17 @@ function channelItemStreamId(it) {
   return `${showId}:${season}:${episode}`;
 }
 
-function buildChannelMeta(entry, origin) {
-  const payload = parseChannelPayload(entry.url);
-  if (!payload || !payload.items.length) return null;
-  // payload.channelId/payload.name (not entry.id/entry.name) are the real
-  // identity -- see the same note in fetchChannelCatalog above.
-  const channelId = payload.channelId || entry.id;
-  const name = payload.name || entry.name;
+// Today's lineup for one channel payload: the picks, in the order they will
+// actually play, after the pool, the rules and the arrangement have all been
+// applied.
+//
+// Split out of buildChannelMeta so the builder page can show what a rotating
+// channel is running right now (see /api/channel-lineup). The alternative --
+// a second copy of the seeded shuffle on the client -- is the kind of thing
+// that drifts by one episode after some later edit and is never noticed.
+async function resolveChannelLineup(payload, opts = {}) {
+  const sourceItems = await channelSourceItems(payload, opts);
+
   // "Randomize play order" (set once in the Channel builder, stored on the
   // payload) reshuffles once a day rather than on every single request --
   // same reasoning as Hidden Gems' daily reshuffle (see daysSinceEpochUTC
@@ -1833,46 +2906,48 @@ function buildChannelMeta(entry, origin) {
   // both) and is applied further down, after the rotation below: it needs
   // no seed because it is the same order every day.
   //
-  // dailyRotate is a step further, set by Quick Add Channel: the payload
-  // stores a much bigger pool than what's ever actually shown, and this
-  // picks a fresh, structured day's lineup from that pool -- a handful of
-  // different shows with a few episodes each (see the constants above),
-  // not a flat random slice that could easily skew to dozens of episodes
-  // of one show and none of many others. Stable within a day, different
-  // the next.
-  const seed = daysSinceEpochUTC(new Date()) + hashStringToInt(channelId);
+  // dailyRotate is a step further -- set by Quick Add Channel, and now by
+  // any custom channel that turns on a Daily Broadcast Schedule: the
+  // payload stores a much bigger pool than what's ever actually shown, and
+  // this picks a fresh, structured day's lineup from that pool -- a handful
+  // of different shows with a few episodes each (see channelRotationPlan),
+  // not a flat random slice that could easily skew to dozens of episodes of
+  // one show and none of many others. Stable within a day, different the
+  // next.
+  const plan = channelRotationPlan(payload);
+  // Duck-typed rather than `instanceof Date`: the tests evaluate this file
+  // in a vm realm of their own, where a Date built outside it is not an
+  // instanceof the Date inside it, and the injected clock would silently be
+  // ignored. A timestamp is accepted for the same reason -- there is no
+  // realm it can be wrong in.
+  const now = typeof opts.now === "number"
+    ? new Date(opts.now)
+    : (opts.now && typeof opts.now.getTime === "function" ? opts.now : new Date());
+  const day = channelRotationDay(now, plan.turnover);
+  const seed = day + hashStringToInt(String(payload.channelId || payload.name || ""));
+  const lockedKeys = channelStoryLockedKeys(payload);
   // Anything that cannot produce a real stream id (see channelItemStreamId
   // above) is dropped HERE, before the rotation or the shuffle runs, so a
   // dropped item costs the channel one slot rather than leaving a hole in
   // the middle of a day's lineup -- and so the running order below stays
   // 1..N with no gaps.
-  const playableItems = payload.items.filter((it) => channelItemStreamId(it));
+  let playableItems = sourceItems.filter((it) => channelItemStreamId(it));
+  // "Hide watched" comes before the rotation for the same reason: an
+  // already-seen episode should cost the channel nothing, not a slot in
+  // today's lineup. When the whole pool has been seen the channel resets to
+  // the full pool rather than going dark -- an empty channel reads as
+  // broken, and there is nothing else left to offer.
+  if (payload.hideWatched) {
+    const watchedKeys = channelWatchedKeySet(opts.watchHistory);
+    const unwatched = playableItems.filter((it) => !channelItemIsWatched(it, watchedKeys));
+    if (unwatched.length) playableItems = unwatched;
+  }
+  if (!playableItems.length) return null;
   let items;
   if (payload.dailyRotate) {
-    const byShow = new Map();
-    playableItems.forEach((it) => {
-      const key = it.imdbId || it.kind + ":" + it.title;
-      if (!byShow.has(key)) byShow.set(key, []);
-      byShow.get(key).push(it);
-    });
-    const showKeys = seededShuffle([...byShow.keys()], seed).slice(0, CHANNEL_ROTATION_SHOWS_PER_DAY);
-    items = [];
-    showKeys.forEach((key, i) => {
-      const showEpisodes = byShow.get(key);
-      const perShow = Math.min(CHANNEL_ROTATION_EPISODES_PER_SHOW, showEpisodes.length);
-      // A contiguous block (not scattered episodes) feels like an actual
-      // evening's run of a show -- seeded per-show so different shows
-      // don't all land on the same relative starting point.
-      const maxStart = showEpisodes.length - perShow;
-      const starts = seededShuffle(
-        Array.from({ length: maxStart + 1 }, (_, n) => n),
-        seed + i + 1
-      );
-      const start = starts.length ? starts[0] : 0;
-      items.push(...showEpisodes.slice(start, start + perShow));
-    });
+    items = rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys);
   } else if (payload.shuffle && !payload.sortByAired) {
-    items = seededShuffle(playableItems, seed);
+    items = shuffleChannelItems(playableItems, seed, lockedKeys);
   } else {
     items = playableItems;
   }
@@ -1883,10 +2958,32 @@ function buildChannelMeta(entry, origin) {
   // existed -- so the explicit sort wins here as well, rather than leaving
   // the outcome to whichever branch happened to be tested first.
   //
-  // It is applied last so it also orders a rotated day's lineup: a Quick Add
+  // It is applied last so it also orders a rotated day's lineup: a rotating
   // channel picks WHICH shows and episodes play today (above), and this
-  // decides the order they play in.
+  // decides the order they play in. Interleaving sits in the same slot for
+  // the same reason -- it is what turns a rotated day's handful of shows
+  // into an actual prime-time block instead of five blocks back to back.
   if (payload.sortByAired) items = sortChannelItemsByAired(items);
+  else if (payload.autoSort === "interleave") items = interleaveChannelItems(items);
+  // Last of all, because every step above can separate two halves of one
+  // story: the rotation deals a block that ends between them, the shuffle
+  // scatters them, the interleaver puts four other shows in between. Gluing
+  // here is the only place that cannot be undone by a later step.
+  items = glueMultiPartEpisodes(items, playableItems, payload);
+  return { items, sourceItems, plan, day, seed };
+}
+
+async function buildChannelMeta(entry, origin, opts = {}) {
+  const payload = parseChannelPayload(entry.url);
+  if (!payload) return null;
+  // payload.channelId/payload.name (not entry.id/entry.name) are the real
+  // identity -- see the same note in fetchChannelCatalog above.
+  const channelId = payload.channelId || entry.id;
+  const name = payload.name || entry.name;
+  const lineup = await resolveChannelLineup(payload, opts);
+  if (!lineup) return null;
+  const items = lineup.items;
+  const sourceItems = lineup.sourceItems;
   const videos = items.map((it, i) => {
     // TMDB's air_date/release_date (and our own year-only fallback for
     // movies) are bare "YYYY-MM-DD" dates. Stremio Web's core is compiled
@@ -1923,8 +3020,8 @@ function buildChannelMeta(entry, origin) {
   const isShowPoster = Boolean(payload.poster && payload.poster.startsWith("http") && !payload.poster.includes("/api/channel-"));
 
   let matchedBackdrop = (payload.backdrop && payload.backdrop.startsWith("http") && !payload.backdrop.includes("/api/channel-")) ? payload.backdrop : null;
-  if (isShowPoster && !matchedBackdrop && Array.isArray(payload.items)) {
-    const match = payload.items.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
+  if (isShowPoster && !matchedBackdrop && sourceItems.length) {
+    const match = sourceItems.find((it) => it && (it.showPoster === payload.poster || it.poster === payload.poster));
     if (match) {
       matchedBackdrop = match.backdrop || match.showBackdrop || match.thumbnail || null;
     }

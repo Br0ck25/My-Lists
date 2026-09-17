@@ -391,7 +391,7 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
     cleanTmdbId = cleanTmdbId.slice(5).trim();
   }
   cleanTmdbId = cleanTmdbId.split(":")[0].trim();
-  if (!cleanTmdbId) return { imdbId: null, videos: null, hasDigitalRelease: null };
+  if (!cleanTmdbId) return { imdbId: null, videos: null, hasDigitalRelease: null, runtime: null };
 
   const cacheKey = `user_cache:tmdb_detail:${kind}:${cleanTmdbId}`;
   const cached = getPerUserCache(cacheKey);
@@ -421,7 +421,7 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
     headers: { "User-Agent": `my-list-addon/${ADDON_VERSION}` },
     cf: { cacheTtl: 604800, cacheEverything: true },
   });
-  if (!res.ok) return { imdbId: null, videos: null, hasDigitalRelease: null };
+  if (!res.ok) return { imdbId: null, videos: null, hasDigitalRelease: null, runtime: null };
   const data = await res.json();
   const imdbId = (data.external_ids && data.external_ids.imdb_id) || data.imdb_id || null;
   const videos = (data.videos && data.videos.results) || null;
@@ -442,7 +442,15 @@ async function fetchTmdbDetails(tmdbId, kind, apiKey, env = null) {
   }
   const adult = data.adult === true || data.is_adult === true;
   const genres = Array.isArray(data.genres) ? data.genres.map((g) => (typeof g === "string" ? g : g.name || "")) : undefined;
-  const result = { imdbId, videos, hasDigitalRelease, adult, genres };
+  // Minutes. A movie has one; TMDB gives a SHOW an episode_run_time array
+  // instead, whose first entry is the typical episode length -- which is the
+  // fallback a channel uses for an episode TMDB has no per-episode runtime
+  // for. Null when there is nothing to say, so nothing downstream may
+  // require it.
+  let runtime = null;
+  if (Number.isInteger(data.runtime)) runtime = data.runtime;
+  else if (Array.isArray(data.episode_run_time) && Number.isInteger(data.episode_run_time[0])) runtime = data.episode_run_time[0];
+  const result = { imdbId, videos, hasDigitalRelease, adult, genres, runtime };
   // Cache for 7 days (604800s)
   setPerUserCache(cacheKey, result, 604800, 2592000);
 
