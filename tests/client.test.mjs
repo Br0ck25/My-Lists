@@ -6100,3 +6100,79 @@ describe("client: one card shape for a channel listing", () => {
     assert.match(listed, /previewDirectoryChannel/);
   });
 });
+
+describe("client: Quick List Wizard in Catalogs Quick Add", () => {
+  it("names lists using custom input or chosen dropdowns", () => {
+    const client = loadClient({ routes: {} });
+    const nameInput = client.document.getElementById("catalogWizardNameInput");
+    nameInput.value = "Sci-Fi Favorites";
+    assert.equal(client.call("catalogWizardName", "(Movies)"), "Sci-Fi Favorites (Movies)");
+    assert.equal(client.call("catalogWizardName", "(Shows)"), "Sci-Fi Favorites (Shows)");
+    nameInput.value = "Action Classics (Movies)";
+    assert.equal(client.call("catalogWizardName", "(Movies)"), "Action Classics (Movies)");
+
+    nameInput.value = "";
+    const network = client.document.getElementById("catalogWizardNetwork");
+    network.value = "49";
+    network.selectedIndex = 0;
+    network.options = [{ textContent: "HBO" }];
+
+    const era = client.document.getElementById("catalogWizardEra");
+    era.value = "1990-1999";
+    era.selectedIndex = 0;
+    era.options = [{ textContent: "90s classics" }];
+
+    const genre = client.document.getElementById("catalogWizardGenre");
+    genre.value = "18";
+    genre.selectedIndex = 0;
+    genre.options = [{ textContent: "Drama" }];
+
+    assert.equal(client.call("catalogWizardName", "(Movies)"), "90s classics HBO Drama (Movies)");
+    assert.equal(client.call("catalogWizardName", "(Shows)"), "90s classics HBO Drama (Shows)");
+  });
+
+  it("builds separate movie and show lists (not combined) when run with 'both'", async () => {
+    const requests = [];
+    const client = loadClient({
+      routes: {
+        "/api/wizard-channel-shows": (req) => {
+          requests.push(req.url);
+          const isMovie = req.url.includes("type=movie");
+          return {
+            json: {
+              ok: true,
+              items: [
+                {
+                  imdbId: isMovie ? "tt101" : "tt201",
+                  name: isMovie ? "Film One" : "Show One",
+                  year: "2021",
+                  poster: "https://img.example/poster.jpg",
+                },
+              ],
+            },
+          };
+        },
+      },
+    });
+
+    const net = client.document.getElementById("catalogWizardNetwork");
+    net.value = "49";
+    net.selectedIndex = 0;
+    net.options = [{ textContent: "HBO" }];
+
+    await client.call("runCatalogListWizard", "both", null);
+
+    assert.equal(requests.length, 2, "must fetch movies and shows separately");
+    assert.ok(requests[0].includes("type=movie"), "first request asks for movies");
+    assert.ok(requests[1].includes("type=series"), "second request asks for series");
+
+    const localMap = client.get("loadLocalCustomLists()");
+    assert.ok(localMap["hbo-movies"], "creates a dedicated movies list");
+    assert.ok(localMap["hbo-shows"], "creates a dedicated shows list");
+    assert.equal(localMap["hbo-movies"].type, "movie", "movie list has movie type");
+    assert.equal(localMap["hbo-shows"].type, "series", "show list has series type");
+    assert.equal(localMap["hbo-movies"].items[0].imdbId, "tt101");
+    assert.equal(localMap["hbo-shows"].items[0].imdbId, "tt201");
+  });
+});
+
