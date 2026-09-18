@@ -41,14 +41,43 @@ function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
     resources,
     types: ["movie", "series"],
     idPrefixes,
-    catalogs: active.map((e) => ({
-      type: e.type,
-      id: e.id,
-      name: e.name,
-      // Lets wako/Stremio page through lists longer than one screen by
-      // re-requesting the catalog with an increasing `skip`.
-      extra: [{ name: "skip", isRequired: false }],
-    })),
+    catalogs: [
+      ...active.map((e) => ({
+        type: e.type,
+        id: e.id,
+        name: e.name,
+        // Lets wako/Stremio page through lists longer than one screen by
+        // re-requesting the catalog with an increasing `skip`.
+        extra: [{ name: "skip", isRequired: false }],
+      })),
+      // Dedicated search catalogs for movies and series.
+      // With isRequired: true / extraRequired: ["search"], Stremio and Nuvio
+      // recognize that this add-on provides catalog search resources (fixing the
+      // "Missing search interface" error when this is the sole metadata source),
+      // while preventing these catalogs from cluttering the home or discover shelves.
+      {
+        type: "movie",
+        id: "search_movies",
+        name: "Movies",
+        extra: [
+          { name: "search", isRequired: true },
+          { name: "skip", isRequired: false },
+        ],
+        extraSupported: ["search", "skip"],
+        extraRequired: ["search"],
+      },
+      {
+        type: "series",
+        id: "search_series",
+        name: "Series",
+        extra: [
+          { name: "search", isRequired: true },
+          { name: "skip", isRequired: false },
+        ],
+        extraSupported: ["search", "skip"],
+        extraRequired: ["search"],
+      },
+    ],
     behaviorHints: {
       configurable: true,
       configurationRequired: active.length === 0,

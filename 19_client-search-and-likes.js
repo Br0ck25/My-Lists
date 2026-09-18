@@ -3121,7 +3121,7 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
         '<div class="clickable-episode" data-id="' + ep.id + '" data-season="' + seasonNum + '" data-episode="' + ep.episode_number + '" data-show-id="' + escapeAttr(imdbId || '') + '" style="display:flex; flex-direction:column; gap:4px; cursor:pointer;" onclick="openEpisodeDetails(' + ep.episode_number + ')">' +
           '<div style="width:100%; aspect-ratio:16/9; background:#222; border-radius:6px; overflow:hidden; position:relative; box-shadow:0 2px 6px rgba(0,0,0,0.4);">' +
             (still ? '<img src="' + still + '" style="width:100%; height:100%; object-fit:cover;">' : '') +
-            '<div style="position:absolute; bottom:4px; left:4px; background:rgba(0,0,0,0.8); color:var(--brand); padding:2px 6px; border-radius:4px; font-weight:bold; font-size:0.8rem;">E' + ep.episode_number + '</div>' +
+            '<div class="episode-num-badge" style="position:absolute; bottom:4px; left:4px; background:var(--accent); color:#ffffff; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:0.8rem; box-shadow:0 1px 4px rgba(0,0,0,0.4);">E' + ep.episode_number + '</div>' +
           '</div>' +
           '<div style="font-size:0.9rem; color:var(--text); line-height:1.2; padding-top:4px;">' + escapeHtml(ep.name) + '</div>' +
         '</div>';

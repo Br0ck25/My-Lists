@@ -12545,3 +12545,123 @@ describe("worker: finding your own listings again", () => {
     assert.deepEqual(mine.body.channels, []);
   });
 });
+
+describe("worker: Stremio / Nuvio Catalog Search Interface", () => {
+  it("declares search catalogs in manifest with extraRequired: ['search']", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const bare = await call(env, "/manifest.json");
+    assert.equal(bare.status, 200);
+    const movieSearch = (bare.body.catalogs || []).find((c) => c.id === "search_movies");
+    const seriesSearch = (bare.body.catalogs || []).find((c) => c.id === "search_series");
+
+    assert.ok(movieSearch, "manifest must declare search_movies catalog");
+    assert.equal(movieSearch.type, "movie");
+    assert.deepEqual(movieSearch.extraRequired, ["search"]);
+    assert.ok(movieSearch.extra.some((e) => e.name === "search" && e.isRequired === true));
+
+    assert.ok(seriesSearch, "manifest must declare search_series catalog");
+    assert.equal(seriesSearch.type, "series");
+    assert.deepEqual(seriesSearch.extraRequired, ["search"]);
+    assert.ok(seriesSearch.extra.some((e) => e.name === "search" && e.isRequired === true));
+  });
+
+  it("returns empty metas when search catalog is requested without a search query", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const res = await call(env, "/catalog/movie/search_movies.json");
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.metas, []);
+  });
+
+  it("executes movie search query and returns populated Stremio metas", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const u = String(input && input.url ? input.url : input);
+      if (u.includes("/search/movie")) {
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: 27205,
+              title: "Inception",
+              overview: "A thief who steals corporate secrets through the use of dream-sharing technology.",
+              release_date: "2010-07-16",
+              poster_path: "/oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg",
+              backdrop_path: "/s3TBrRGB1jav7Z418i96r8QNu5G.jpg",
+              vote_average: 8.4,
+            },
+          ],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (u.includes("/movie/27205")) {
+        return new Response(JSON.stringify({
+          id: 27205,
+          imdb_id: "tt1375666",
+          external_ids: { imdb_id: "tt1375666" },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return realFetch(input, init);
+    };
+
+    try {
+      const res = await call(env, "/catalog/movie/search_movies/search=Inception.json");
+      assert.equal(res.status, 200);
+      assert.ok(Array.isArray(res.body.metas) && res.body.metas.length === 1);
+      const meta = res.body.metas[0];
+      assert.equal(meta.id, "tt1375666");
+      assert.equal(meta.type, "movie");
+      assert.equal(meta.name, "Inception");
+      assert.equal(meta.releaseInfo, "2010");
+      assert.equal(meta.imdbRating, "8.4");
+      assert.ok(meta.poster && meta.poster.includes("oYuLEt3zVCKq57qu2F8dT7NIa6f.jpg"));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("executes series search query and returns populated Stremio metas", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const u = String(input && input.url ? input.url : input);
+      if (u.includes("/search/tv")) {
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: 1396,
+              name: "Breaking Bad",
+              overview: "A chemistry teacher diagnosed with inoperable lung cancer turns to manufacturing and selling methamphetamine.",
+              first_air_date: "2008-01-20",
+              poster_path: "/ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg",
+              backdrop_path: "/tsRy63Mu5cu8etL1X7ZLyf7UP1M.jpg",
+              vote_average: 8.9,
+            },
+          ],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (u.includes("/tv/1396")) {
+        return new Response(JSON.stringify({
+          id: 1396,
+          imdb_id: "tt0903747",
+          external_ids: { imdb_id: "tt0903747" },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return realFetch(input, init);
+    };
+
+    try {
+      const res = await call(env, "/catalog/series/search_series/search=Breaking%20Bad.json");
+      assert.equal(res.status, 200);
+      assert.ok(Array.isArray(res.body.metas) && res.body.metas.length === 1);
+      const meta = res.body.metas[0];
+      assert.equal(meta.id, "tt0903747");
+      assert.equal(meta.type, "series");
+      assert.equal(meta.name, "Breaking Bad");
+      assert.equal(meta.releaseInfo, "2008");
+      assert.equal(meta.imdbRating, "8.9");
+      assert.ok(meta.poster && meta.poster.includes("ztkUQFLlC19CCMYHW9o1zWhJRNq.jpg"));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+

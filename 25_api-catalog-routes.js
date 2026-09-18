@@ -803,13 +803,27 @@ Sitemap: ${url.origin}/sitemap.xml`;
       });
     }
 
-    // /:config/catalog/:type/:id.json  (optionally /:config/catalog/:type/:id/skip=N.json)
-    m = path.match(/^\/([^/]+)\/catalog\/([^/]+)\/(.+)\.json$/);
+    // /:config/catalog/:type/:id.json (or /catalog/:type/:id.json)
+    // optionally /:config/catalog/:type/:id/skip=N.json or /:config/catalog/:type/:id/search=Q.json
+    m = path.match(/^(?:\/([^/]+))?\/catalog\/([^/]+)\/(.+)\.json$/);
     if (m) {
       const [, config, type, idWithExtra] = m;
       const [id, extraStr] = idWithExtra.split("/");
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
+      const searchQuery = extra.search ? decodeURIComponent(extra.search).trim() : "";
+
+      // Dedicated search catalogs for Stremio and Nuvio
+      const isSearchCatalog = id === "search_movies" || id === "search_series" || id === "search" || id === "search_movie" || (id === "top" && searchQuery);
+      if (isSearchCatalog) {
+        if (!searchQuery) return jsonPublic({ metas: [] });
+        const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
+        const effectiveTmdbKey = tmdbKey || TMDB_API_KEY;
+        const metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400" });
+      }
+
+      if (!config) return jsonPublic({ metas: [] });
 
       const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
@@ -833,8 +847,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // to a config that PROVED it belongs to that account. See resolveConfig
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
-        if (staleKey && skip === 0 && metas.length > 0) {
+        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        if (searchQuery && Array.isArray(metas) && metas.length > 0) {
+          const sq = searchQuery.toLowerCase();
+          metas = metas.filter((it) => (it.name && it.name.toLowerCase().includes(sq)) || (it.title && it.title.toLowerCase().includes(sq)));
+        }
+        if (staleKey && skip === 0 && metas.length > 0 && !searchQuery) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
             env.CONFIGS.put(staleKey, JSON.stringify(metas), { expirationTtl: 2592000 })

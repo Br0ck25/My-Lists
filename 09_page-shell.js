@@ -195,6 +195,7 @@ ${seoHeadHtml}
     --text-2:       #3A3A3C;
     --muted:        #8E8E93;
     --accent:       #007AFF;
+    --brand:        #007AFF;
     --accent-hover: #0062CC;
     --accent-2:     #34AADC;
     --danger:       #FF3B30;
@@ -1962,6 +1963,19 @@ ${seoHeadHtml}
     max-width: calc(100% - 8px);
     text-overflow: ellipsis;
     overflow: hidden;
+  }
+  .episode-num-badge {
+    position: absolute;
+    bottom: 4px;
+    left: 4px;
+    background: var(--accent);
+    color: #ffffff;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: bold;
+    font-size: 0.8rem;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+    z-index: 2;
   }
   body.hide-badge-air-date .cw-date-badge:not(.cw-date-badge-premiere):not(.cw-date-badge-finale):not(.cw-date-badge-finale-date):not(.cw-date-badge-companion) { display: none !important; }
   body.hide-badge-season-premiere .cw-date-badge-premiere { display: none !important; }

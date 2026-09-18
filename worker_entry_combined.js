@@ -11720,14 +11720,43 @@ function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
     resources,
     types: ["movie", "series"],
     idPrefixes,
-    catalogs: active.map((e) => ({
-      type: e.type,
-      id: e.id,
-      name: e.name,
-      // Lets wako/Stremio page through lists longer than one screen by
-      // re-requesting the catalog with an increasing `skip`.
-      extra: [{ name: "skip", isRequired: false }],
-    })),
+    catalogs: [
+      ...active.map((e) => ({
+        type: e.type,
+        id: e.id,
+        name: e.name,
+        // Lets wako/Stremio page through lists longer than one screen by
+        // re-requesting the catalog with an increasing `skip`.
+        extra: [{ name: "skip", isRequired: false }],
+      })),
+      // Dedicated search catalogs for movies and series.
+      // With isRequired: true / extraRequired: ["search"], Stremio and Nuvio
+      // recognize that this add-on provides catalog search resources (fixing the
+      // "Missing search interface" error when this is the sole metadata source),
+      // while preventing these catalogs from cluttering the home or discover shelves.
+      {
+        type: "movie",
+        id: "search_movies",
+        name: "Movies",
+        extra: [
+          { name: "search", isRequired: true },
+          { name: "skip", isRequired: false },
+        ],
+        extraSupported: ["search", "skip"],
+        extraRequired: ["search"],
+      },
+      {
+        type: "series",
+        id: "search_series",
+        name: "Series",
+        extra: [
+          { name: "search", isRequired: true },
+          { name: "skip", isRequired: false },
+        ],
+        extraSupported: ["search", "skip"],
+        extraRequired: ["search"],
+      },
+    ],
     behaviorHints: {
       configurable: true,
       configurationRequired: active.length === 0,
@@ -18886,6 +18915,100 @@ async function fetchStandardItemMeta(imdbId, type, apiKey, env = null, ctx = nul
   return meta;
 }
 
+// --- catalog search for Stremio / Nuvio ---------------------------------
+//
+// When My Lists is the sole metadata source (or when Cinemeta is uninstalled),
+// Stremio and Nuvio rely on catalog search resources declared in the manifest.
+// This executes TMDB search queries with pagination, resolves IMDb IDs with KV caching,
+// and falls back to Cinemeta fuzzy search when needed.
+async function searchCatalogMetas(query, type, skip, apiKey, env, ctx, origin) {
+  if (!query || typeof query !== "string") return [];
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) return [];
+
+  const wantType = type === "series" ? "series" : "movie";
+  const kind = wantType === "series" ? "tv" : "movie";
+  const effectiveKey = apiKey || TMDB_API_KEY;
+  const page = Math.floor((skip || 0) / 20) + 1;
+
+  if (ctx && typeof bumpStat === "function" && env) {
+    ctx.waitUntil(bumpStat(env, "apiuse:tmdb"));
+  }
+
+  let rawItems = [];
+  try {
+    const tmdbUrl = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(effectiveKey)}&query=${encodeURIComponent(trimmedQuery)}&page=${page}&include_adult=false`;
+    const res = await fetch(tmdbUrl, {
+      headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+      cf: { cacheTtl: 3600, cacheEverything: true },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.results)) {
+        rawItems = data.results;
+      }
+    }
+  } catch {}
+
+  // Fallback to Cinemeta fuzzy search if TMDB returned no results on page 1
+  if (rawItems.length === 0 && page === 1) {
+    try {
+      const cinemetaType = wantType === "series" ? "series" : "movie";
+      const cUrl = `https://v3-cinemeta.strem.io/catalog/${cinemetaType}/top/search=${encodeURIComponent(trimmedQuery)}.json`;
+      const cRes = await fetch(cUrl, {
+        headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+        cf: { cacheTtl: 86400, cacheEverything: true },
+      });
+      if (cRes.ok) {
+        const cData = await cRes.json();
+        if (Array.isArray(cData.metas) && cData.metas.length > 0) {
+          return cData.metas.slice(0, 20).map((m) => ({
+            id: m.id,
+            type: wantType,
+            name: m.name || "Untitled",
+            poster: m.poster || (origin ? `${origin}/unavailable-poster.svg` : undefined),
+            background: m.background || undefined,
+            description: m.description || undefined,
+            releaseInfo: m.releaseInfo || m.year || undefined,
+            imdbRating: m.imdbRating || undefined,
+            behaviorHints: wantType === "movie" ? { defaultVideoId: m.id } : undefined,
+          }));
+        }
+      }
+    } catch {}
+  }
+
+  if (rawItems.length === 0) return [];
+
+  // Resolve IMDb IDs for TMDB results (up to 20 items)
+  const candidates = rawItems.slice(0, 20);
+  const resolved = await mapWithConcurrency(candidates, 8, async (item) => {
+    let imdbId = null;
+    try {
+      const details = await fetchTmdbDetails(item.id, kind, effectiveKey, env);
+      if (details && details.imdbId) imdbId = details.imdbId;
+    } catch {}
+
+    const finalId = imdbId || `tmdb:${item.id}`;
+    const releaseDate = kind === "tv" ? item.first_air_date : item.release_date;
+    const year = (releaseDate || "").slice(0, 4);
+
+    return {
+      id: finalId,
+      type: wantType,
+      name: item.title || item.name || "Untitled",
+      poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : (origin ? `${origin}/unavailable-poster.svg` : undefined),
+      background: item.backdrop_path ? `https://image.tmdb.org/t/p/w1280${item.backdrop_path}` : undefined,
+      description: item.overview || undefined,
+      releaseInfo: year || undefined,
+      imdbRating: typeof item.vote_average === "number" && item.vote_average > 0 ? String(Math.round(item.vote_average * 10) / 10) : undefined,
+      behaviorHints: wantType === "movie" ? { defaultVideoId: finalId } : undefined,
+    };
+  });
+
+  return resolved.filter(Boolean);
+}
+
 // Server-side "is this episode aired yet" check -- same rule the client's
 // isEpisodeAired uses (19_client-search-and-likes.js), reimplemented here
 // because nothing in the client-side files (09 onward) is real, callable
@@ -20265,6 +20388,7 @@ ${seoHeadHtml}
     --text-2:       #3A3A3C;
     --muted:        #8E8E93;
     --accent:       #007AFF;
+    --brand:        #007AFF;
     --accent-hover: #0062CC;
     --accent-2:     #34AADC;
     --danger:       #FF3B30;
@@ -22032,6 +22156,19 @@ ${seoHeadHtml}
     max-width: calc(100% - 8px);
     text-overflow: ellipsis;
     overflow: hidden;
+  }
+  .episode-num-badge {
+    position: absolute;
+    bottom: 4px;
+    left: 4px;
+    background: var(--accent);
+    color: #ffffff;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: bold;
+    font-size: 0.8rem;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+    z-index: 2;
   }
   body.hide-badge-air-date .cw-date-badge:not(.cw-date-badge-premiere):not(.cw-date-badge-finale):not(.cw-date-badge-finale-date):not(.cw-date-badge-companion) { display: none !important; }
   body.hide-badge-season-premiere .cw-date-badge-premiere { display: none !important; }
@@ -35044,7 +35181,7 @@ async function toggleSeasonEpisodes(headerEl, seasonNum, imdbId) {
         '<div class="clickable-episode" data-id="' + ep.id + '" data-season="' + seasonNum + '" data-episode="' + ep.episode_number + '" data-show-id="' + escapeAttr(imdbId || '') + '" style="display:flex; flex-direction:column; gap:4px; cursor:pointer;" onclick="openEpisodeDetails(' + ep.episode_number + ')">' +
           '<div style="width:100%; aspect-ratio:16/9; background:#222; border-radius:6px; overflow:hidden; position:relative; box-shadow:0 2px 6px rgba(0,0,0,0.4);">' +
             (still ? '<img src="' + still + '" style="width:100%; height:100%; object-fit:cover;">' : '') +
-            '<div style="position:absolute; bottom:4px; left:4px; background:rgba(0,0,0,0.8); color:var(--brand); padding:2px 6px; border-radius:4px; font-weight:bold; font-size:0.8rem;">E' + ep.episode_number + '</div>' +
+            '<div class="episode-num-badge" style="position:absolute; bottom:4px; left:4px; background:var(--accent); color:#ffffff; padding:2px 6px; border-radius:4px; font-weight:bold; font-size:0.8rem; box-shadow:0 1px 4px rgba(0,0,0,0.4);">E' + ep.episode_number + '</div>' +
           '</div>' +
           '<div style="font-size:0.9rem; color:var(--text); line-height:1.2; padding-top:4px;">' + escapeHtml(ep.name) + '</div>' +
         '</div>';
@@ -66509,13 +66646,27 @@ Sitemap: ${url.origin}/sitemap.xml`;
       });
     }
 
-    // /:config/catalog/:type/:id.json  (optionally /:config/catalog/:type/:id/skip=N.json)
-    m = path.match(/^\/([^/]+)\/catalog\/([^/]+)\/(.+)\.json$/);
+    // /:config/catalog/:type/:id.json (or /catalog/:type/:id.json)
+    // optionally /:config/catalog/:type/:id/skip=N.json or /:config/catalog/:type/:id/search=Q.json
+    m = path.match(/^(?:\/([^/]+))?\/catalog\/([^/]+)\/(.+)\.json$/);
     if (m) {
       const [, config, type, idWithExtra] = m;
       const [id, extraStr] = idWithExtra.split("/");
       const extra = Object.fromEntries(new URLSearchParams(extraStr || ""));
       const skip = parseInt(extra.skip, 10) || 0;
+      const searchQuery = extra.search ? decodeURIComponent(extra.search).trim() : "";
+
+      // Dedicated search catalogs for Stremio and Nuvio
+      const isSearchCatalog = id === "search_movies" || id === "search_series" || id === "search" || id === "search_movie" || (id === "top" && searchQuery);
+      if (isSearchCatalog) {
+        if (!searchQuery) return jsonPublic({ metas: [] });
+        const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
+        const effectiveTmdbKey = tmdbKey || TMDB_API_KEY;
+        const metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400" });
+      }
+
+      if (!config) return jsonPublic({ metas: [] });
 
       const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
       const entry = entries.find((e) => e.id === id && e.type === type);
@@ -66539,8 +66690,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // to a config that PROVED it belongs to that account. See resolveConfig
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
-        const metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
-        if (staleKey && skip === 0 && metas.length > 0) {
+        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        if (searchQuery && Array.isArray(metas) && metas.length > 0) {
+          const sq = searchQuery.toLowerCase();
+          metas = metas.filter((it) => (it.name && it.name.toLowerCase().includes(sq)) || (it.title && it.title.toLowerCase().includes(sq)));
+        }
+        if (staleKey && skip === 0 && metas.length > 0 && !searchQuery) {
           // Fire-and-forget -- the response doesn't wait on this write.
           ctx.waitUntil(
             env.CONFIGS.put(staleKey, JSON.stringify(metas), { expirationTtl: 2592000 })
