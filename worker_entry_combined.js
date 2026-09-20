@@ -18760,9 +18760,10 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
 
 // --- Quick Add network channel presets ---------------------------------------
 //
-// Builds the episode pool for one "Quick Add Popular Networks" channel (top
-// 10 shows on that TMDB network, up to 3 seasons each, capped at 200
-// episodes total) and caches it in KV under channel:preset:v2:<networkId>
+// Builds the episode pool for one "Quick Add Popular Networks" channel (up
+// to CHANNEL_PRESET_DISCOVER_PAGES pages of candidate shows on that TMDB
+// network, up to 3 seasons each, capped at CHANNEL_POOL_MAX_ITEMS episodes
+// total) and caches it in KV under channel:preset:v2:<networkId>
 // for 24h. Shared by the /api/channel-preset route (25_api-catalog-routes.js,
 // which a Quick Add click reads on the way to adding the channel) and
 // prewarmChannelPresets below (the cron sweep that keeps that cache from
@@ -49110,7 +49111,7 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
   try {
     if (networkId) {
       try {
-        const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name));
+        const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name), { cache: 'no-store' });
         const data = await res.json();
         if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_PRESET_MIN_ITEMS) {
           const channelId = generateChannelId();
@@ -70756,7 +70757,16 @@ function generateSearchVariations(query) {
       // 20_client-channel-builder.js), not this whole response.
       const result = await buildNetworkChannelPreset(networkId, name, url.origin, { env, ctx });
       if (!result.ok) return json({ ok: false, error: result.error }, result.status || 200);
-      return json({ ok: true, channel: result.channel }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+      // no-store, not the usual max-age=3600 default: the KV cache this
+      // reads from (channel:preset:v2:<networkId>, 24h TTL) is already the
+      // caching layer, invalidated instantly by the admin Channel Presets
+      // tab's Clear/Rebuild buttons. A public, 24h Cache-Control on top of
+      // that used to let a browser (or a shared/CDN cache, from "public")
+      // keep replaying a stale response -- including a pre-fix 200-episode
+      // build from long before this endpoint's pool cap was raised to
+      // CHANNEL_POOL_MAX_ITEMS -- for up to a full day after an admin
+      // rebuild, no matter how fresh the KV entry actually was.
+      return json({ ok: true, channel: result.channel }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/channel-lineup  (POST)  { url, watchHistory?, continueWatching? }

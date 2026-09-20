@@ -1994,7 +1994,16 @@ function generateSearchVariations(query) {
       // 20_client-channel-builder.js), not this whole response.
       const result = await buildNetworkChannelPreset(networkId, name, url.origin, { env, ctx });
       if (!result.ok) return json({ ok: false, error: result.error }, result.status || 200);
-      return json({ ok: true, channel: result.channel }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+      // no-store, not the usual max-age=3600 default: the KV cache this
+      // reads from (channel:preset:v2:<networkId>, 24h TTL) is already the
+      // caching layer, invalidated instantly by the admin Channel Presets
+      // tab's Clear/Rebuild buttons. A public, 24h Cache-Control on top of
+      // that used to let a browser (or a shared/CDN cache, from "public")
+      // keep replaying a stale response -- including a pre-fix 200-episode
+      // build from long before this endpoint's pool cap was raised to
+      // CHANNEL_POOL_MAX_ITEMS -- for up to a full day after an admin
+      // rebuild, no matter how fresh the KV entry actually was.
+      return json({ ok: true, channel: result.channel }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/channel-lineup  (POST)  { url, watchHistory?, continueWatching? }

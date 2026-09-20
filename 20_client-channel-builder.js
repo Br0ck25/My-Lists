@@ -10410,7 +10410,7 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
   try {
     if (networkId) {
       try {
-        const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name));
+        const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name), { cache: 'no-store' });
         const data = await res.json();
         if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_PRESET_MIN_ITEMS) {
           const channelId = generateChannelId();

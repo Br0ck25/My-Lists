@@ -2060,9 +2060,10 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
 
 // --- Quick Add network channel presets ---------------------------------------
 //
-// Builds the episode pool for one "Quick Add Popular Networks" channel (top
-// 10 shows on that TMDB network, up to 3 seasons each, capped at 200
-// episodes total) and caches it in KV under channel:preset:v2:<networkId>
+// Builds the episode pool for one "Quick Add Popular Networks" channel (up
+// to CHANNEL_PRESET_DISCOVER_PAGES pages of candidate shows on that TMDB
+// network, up to 3 seasons each, capped at CHANNEL_POOL_MAX_ITEMS episodes
+// total) and caches it in KV under channel:preset:v2:<networkId>
 // for 24h. Shared by the /api/channel-preset route (25_api-catalog-routes.js,
 // which a Quick Add click reads on the way to adding the channel) and
 // prewarmChannelPresets below (the cron sweep that keeps that cache from
