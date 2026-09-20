@@ -752,6 +752,31 @@ function _liveMergeShowKey(item) {
   return _liveMergeBaseId(item && (item.showId || item.id));
 }
 
+// Normalises a fallback/cached item (My Lists' own Continue Watching or
+// Airing Next data) into the same meta shape the live /api/preview sample
+// uses, for the shelves below that fall back to it.
+function _liveFallbackMeta(it, defaultType) {
+  return {
+    id: it.id,
+    showId: it.showId || it.id,
+    type: it.type || defaultType || (it.episodeTitle ? 'series' : 'series'),
+    name: it.name || it.title,
+    poster: it.poster,
+    year: it.year || it.releaseInfo,
+    showTitle: it.showTitle || it.name || it.title,
+    seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
+    episodeNum: it.episodeNum != null ? it.episodeNum : it.episode,
+    airDate: it.airDate,
+    airTime: it.airTime,
+    isUnaired: it.isUnaired,
+    isSeasonPremiere: it.isSeasonPremiere,
+    isSeasonFinale: it.isSeasonFinale,
+    imdbRating: it.imdbRating,
+    rating: it.rating,
+    vote_average: it.vote_average,
+  };
+}
+
 async function renderLivePreview() {
   const container = document.getElementById('lists');
   if (!container) return;
@@ -809,6 +834,23 @@ async function renderLivePreview() {
       const sName = (s.name || '').toLowerCase();
       const isCwShelf = sUrl.includes('continue-watching') || sUrl.includes('continue_watching') || sName.includes('continue watching');
       const isAiringShelf = sUrl.includes('airing-next') || sUrl.includes('airing_next') || sName.includes('airing next');
+      // A personal/auto-tracked shelf (Continue Watching, Watchlist, Watch
+      // History, Airing Next -- this add-on's own or a connected Trakt/
+      // MDBList/Simkl account's) is legitimately empty a lot of the time --
+      // nothing in progress, nothing upcoming -- and that is not a
+      // misconfiguration worth a "No items found." block sitting in the
+      // editor. A row for any other list being empty usually does mean
+      // something is wrong (a bad URL, a list that got deleted upstream),
+      // so only these get hidden rather than shown empty; the row's config
+      // is untouched, so the moment the account has something in it again,
+      // the same row picks it back up as it normally would.
+      const isPersonalTrackedShelf = (s.url || '').split('\\n').some((line) => {
+        const u = line.trim().toLowerCase();
+        return u.startsWith('autotrack:') ||
+          u.startsWith('trakt:watchlist') || u.startsWith('trakt:history') || u.startsWith('trakt:airing-next') || u.startsWith('trakt:continue-watching') || u.startsWith('trakt:user:') ||
+          u.startsWith('mdblist:watchlist') || u.startsWith('mdblist:history') || u.startsWith('mdblist:airing-next') || u.startsWith('mdblist:upnext') || u.startsWith('mdblist:user:') ||
+          u.startsWith('simkl:watchlist') || u.startsWith('simkl:history') || u.startsWith('simkl:airing-next') || u.startsWith('simkl:user:');
+      });
 
       if (s.name && s.name.toLowerCase().includes('watch history')) {
         postersContainer.classList.add('is-watch-history-shelf');
@@ -894,25 +936,7 @@ async function renderLivePreview() {
           const fallback = getFallbackShelfSample();
           if (fallback && fallback.length) {
             data.ok = true;
-            data.sample = fallback.map(it => ({
-              id: it.id,
-              showId: it.showId || it.id,
-              type: it.type || (it.episodeTitle ? 'series' : (s.type === 'movie' ? 'movie' : 'series')),
-              name: it.name || it.title,
-              poster: it.poster,
-              year: it.year || it.releaseInfo,
-              showTitle: it.showTitle || it.name || it.title,
-              seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
-              episodeNum: it.episodeNum != null ? it.episodeNum : it.episode,
-              airDate: it.airDate,
-              airTime: it.airTime,
-              isUnaired: it.isUnaired,
-              isSeasonPremiere: it.isSeasonPremiere,
-              isSeasonFinale: it.isSeasonFinale,
-              imdbRating: it.imdbRating,
-              rating: it.rating,
-              vote_average: it.vote_average,
-            }));
+            data.sample = fallback.map(it => _liveFallbackMeta(it, s.type === 'movie' ? 'movie' : 'series'));
             data.totalItems = fallback.length;
           }
         }
@@ -922,100 +946,56 @@ async function renderLivePreview() {
               // Ensure movie shelf only contains movie items, never TV shows
               data.sample = data.sample.filter(it => it && (it.type === 'movie' || it.kind === 'movie') && !it.seasonNum && !it.episodeNum && !it.episodeTitle);
             } else if (s.type === 'series') {
-              // Ensure series shelf includes all known continue watching series from private Trakt lists
+              // Prefer the "My Lists" sample over the live /api/preview sample
+              // when one is available, rather than unioning the two. The two
+              // used to get merged: every item the live fetch returned, plus
+              // any item from "My Lists" not already present. That could
+              // pull in a show the live fetch has that "My Lists" does not
+              // (or the reverse), so this shelf's count and "My Lists"'s
+              // count for what is supposed to be the same list could
+              // disagree -- confusing when they're shown side by side. It
+              // also meant inconsistent rating badges: fetchTraktContinueWatching's
+              // live sample never carries a rating (its own dashboard fetch
+              // path is the only place these items get enriched with one),
+              // so a tile's rating badge depended on which of the two
+              // sources happened to supply that particular item. Falling
+              // through to the live sample only when "My Lists" has not
+              // loaded yet this session preserves the original purpose of
+              // the merge (covering a live fetch truncated by Workers'
+              // subrequest cap) without either inconsistency.
               const fallback = getFallbackShelfSample();
               if (fallback && Array.isArray(fallback) && fallback.length) {
-                const seen = new Set();
-                const merged = [];
-                for (const item of data.sample) {
-                  const id = _liveMergeShowKey(item);
-                  if (id && !seen.has(id)) {
-                    seen.add(id);
-                    merged.push(item);
-                  }
-                }
-                for (const item of fallback) {
-                  const id = _liveMergeShowKey(item);
-                  if (id && !seen.has(id)) {
-                    seen.add(id);
-                    merged.push({
-                      id: item.id,
-                      showId: item.showId || item.id,
-                      type: 'series',
-                      name: item.name || item.title,
-                      poster: item.poster,
-                      year: item.year || item.releaseInfo,
-                      showTitle: item.showTitle || item.name || item.title,
-                      seasonNum: item.seasonNum != null ? item.seasonNum : item.season,
-                      episodeNum: item.episodeNum != null ? item.episodeNum : item.episode,
-                      airDate: item.airDate,
-                      airTime: item.airTime,
-                      isUnaired: item.isUnaired,
-                      isSeasonPremiere: item.isSeasonPremiere,
-                      isSeasonFinale: item.isSeasonFinale,
-                      imdbRating: item.imdbRating,
-                      rating: item.rating,
-                      vote_average: item.vote_average,
-                    });
-                  }
-                }
-                data.sample = merged;
-                data.totalItems = merged.length;
+                data.sample = fallback.map(item => _liveFallbackMeta(item, 'series'));
+                data.totalItems = data.sample.length;
               }
             }
           } else if (isAiringShelf) {
+            // Same reasoning as the Continue Watching series shelf above --
+            // see its comment.
             const fallback = getFallbackShelfSample();
             if (fallback && Array.isArray(fallback) && fallback.length) {
-              const seen = new Set();
-              const merged = [];
-              for (const item of data.sample) {
-                const id = _liveMergeShowKey(item);
-                if (id && !seen.has(id)) {
-                  seen.add(id);
-                  merged.push(item);
-                }
-              }
-              for (const item of fallback) {
-                const id = _liveMergeShowKey(item);
-                if (id && !seen.has(id)) {
-                  seen.add(id);
-                  merged.push({
-                    id: item.id,
-                    showId: item.showId || item.id,
-                    type: 'series',
-                    name: item.name || item.title,
-                    poster: item.poster,
-                    year: item.year || item.releaseInfo,
-                    showTitle: item.showTitle || item.name || item.title,
-                    seasonNum: item.seasonNum != null ? item.seasonNum : item.season,
-                    episodeNum: item.episodeNum != null ? item.episodeNum : item.episode,
-                    airDate: item.airDate,
-                    airTime: item.airTime,
-                    isUnaired: item.isUnaired,
-                    isSeasonPremiere: item.isSeasonPremiere,
-                    isSeasonFinale: item.isSeasonFinale,
-                    imdbRating: item.imdbRating,
-                    rating: item.rating,
-                    vote_average: item.vote_average,
-                  });
-                }
-              }
-              if (merged.length) {
-                merged.sort((a, b) => (a.airDate || '9999').localeCompare(b.airDate || '9999'));
-                data.sample = merged;
-                data.totalItems = merged.length;
-              }
+              const sample = fallback.map(item => _liveFallbackMeta(item, 'series'));
+              sample.sort((a, b) => (a.airDate || '9999').localeCompare(b.airDate || '9999'));
+              data.sample = sample;
+              data.totalItems = sample.length;
             }
           }
         }
         if (!data.ok) {
+          entryDOM.style.display = '';
           postersContainer.innerHTML = '<p class="testresult err">&#x2717; ' + escapeHtml(data.error || 'Could not load this catalog.') + '</p>';
           continue;
         }
         if (!data.sample || !data.sample.length) {
-          postersContainer.innerHTML = '<p><small>No items found.</small></p>';
+          if (isPersonalTrackedShelf) {
+            entryDOM.style.display = 'none';
+          } else {
+            entryDOM.style.display = '';
+            postersContainer.innerHTML = '<p><small>No items found.</small></p>';
+          }
           continue;
         }
+        entryDOM.style.display = '';
         livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample: data.sample, maybeMore: data.maybeMore, totalItems: data.totalItems };
         const sliced = data.sample.slice(0, visibleCount);
         sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; item.isLivePreviewShelf = true; });
@@ -1025,31 +1005,15 @@ async function renderLivePreview() {
         if (statusEl) statusEl.innerHTML = '';
         const fallback = getFallbackShelfSample();
         if (fallback && fallback.length) {
-          const sample = fallback.map(it => ({
-            id: it.id,
-            showId: it.showId || it.id,
-            type: it.type || (it.episodeTitle ? 'series' : (s.type === 'movie' ? 'movie' : 'series')),
-            name: it.name || it.title,
-            poster: it.poster,
-            year: it.year || it.releaseInfo,
-            showTitle: it.showTitle || it.name || it.title,
-            seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
-            episodeNum: it.episodeNum != null ? it.episodeNum : it.episode,
-            airDate: it.airDate,
-            airTime: it.airTime,
-            isUnaired: it.isUnaired,
-            isSeasonPremiere: it.isSeasonPremiere,
-            isSeasonFinale: it.isSeasonFinale,
-            imdbRating: it.imdbRating,
-            rating: it.rating,
-            vote_average: it.vote_average,
-          }));
+          entryDOM.style.display = '';
+          const sample = fallback.map(it => _liveFallbackMeta(it, s.type === 'movie' ? 'movie' : 'series'));
           livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample, maybeMore: false, totalItems: sample.length };
           const sliced = sample.slice(0, visibleCount);
           sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; item.isLivePreviewShelf = true; });
           postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
           if (seeAllBtn && sample.length > visibleCount) seeAllBtn.disabled = false;
         } else {
+          entryDOM.style.display = '';
           postersContainer.innerHTML = '<p class="testresult err">&#x2717; Network error loading this catalog.</p>';
         }
       }

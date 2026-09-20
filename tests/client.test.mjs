@@ -3905,6 +3905,7 @@ describe("client: Live Preview proves who is asking before reading a personal sh
     const status = { innerHTML: "" };
     const entry = {
       dataset: {},
+      style: {},
       posters,
       status,
       querySelector(sel) {
@@ -6837,7 +6838,15 @@ describe("client: Trakt Continue Watching and Airing Next live preview and fallb
     assert.equal(movieItems.length, 0, "no series leaked into movie items");
   });
 
-  it("renderLivePreview merges all 12 cached Airing Next shows when server returns partial 7-show set", async () => {
+  it("renderLivePreview prefers the full cached Airing Next list over a partial server sample", async () => {
+    // renderLivePreview used to union a partial server sample with the
+    // cached "My Lists" sample (see git history), which could make this
+    // shelf's item count -- and which items carried a rating badge --
+    // disagree with what "My Lists" itself showed for the very same list,
+    // since the two sources can each have items the other lacks. It now
+    // prefers the cached sample outright whenever one is available (see
+    // getFallbackShelfSample's callers in 23_client-list-management.js),
+    // falling through to the live sample only when nothing is cached yet.
     const cachedItems = Array.from({ length: 12 }, (_, i) => ({
       id: `tt${1000 + i}`,
       showId: `tt${1000 + i}`,
@@ -6847,27 +6856,10 @@ describe("client: Trakt Continue Watching and Airing Next live preview and fallb
     }));
 
     const serverItems = cachedItems.slice(0, 7);
+    const preferred = cachedItems.length ? cachedItems : serverItems;
 
-    // Merge simulation matching renderLivePreview logic
-    const seen = new Set();
-    const merged = [];
-    for (const item of serverItems) {
-      const id = String(item.showId || item.id || "").toLowerCase().split(":")[0];
-      if (id && !seen.has(id)) {
-        seen.add(id);
-        merged.push(item);
-      }
-    }
-    for (const item of cachedItems) {
-      const id = String(item.showId || item.id || "").toLowerCase().split(":")[0];
-      if (id && !seen.has(id)) {
-        seen.add(id);
-        merged.push(item);
-      }
-    }
-
-    assert.equal(merged.length, 12, "merged all 12 airing shows");
-    assert.equal(merged[11].name, "Airing Show 12");
+    assert.equal(preferred.length, 12, "uses the full cached list rather than the partial 7-item server sample");
+    assert.equal(preferred[11].name, "Airing Show 12");
   });
 });
 
@@ -6974,6 +6966,7 @@ describe("client: list renames, dashboard CW button isolation, and sync preserva
     function fakeInput73b(v) { return { value: v, dataset: {} }; }
     const airingEntry = {
       dataset: {},
+      style: {},
       querySelector(sel) {
         if (sel === ".name") return fakeInput73b("Trakt Airing Next");
         if (sel === ".type") return fakeInput73b("series");
@@ -7002,6 +6995,7 @@ describe("client: list renames, dashboard CW button isolation, and sync preserva
       addedRows.push({ name, url, type: type || "movie", enabled, group, id });
       fakeEntries73b = addedRows.map(r => ({
         dataset: {},
+        style: {},
         querySelector(sel) {
           if (sel === ".name") return fakeInput73b(r.name);
           if (sel === ".type") return fakeInput73b(r.type);
