@@ -7277,6 +7277,11 @@ export default {
         streamingSweep,
         guard("bumpNewOnStreamingEpisodes", streamingSweep.then(() => bumpNewOnStreamingEpisodes(env, ctx, newOnStreamingBudget))),
         guard("prewarmSharedCatalogs", streamingSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
+        // One Quick Add network per tick (see prewarmChannelPresets,
+        // 07_source-fetchers-tmdb-simkl.js) -- independent of the streaming
+        // sweep chain above since it spends TMDB requests, not RapidAPI's
+        // capped quota, and has nothing to wait on.
+        guard("prewarmChannelPresets", prewarmChannelPresets(env, ctx)),
         // Cheap (one sqlite_master read per tick) and the only thing that puts
         // "you have not run migration N" somewhere an operator will see it
         // without going looking. The admin panel shows the same thing on

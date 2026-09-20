@@ -10283,6 +10283,17 @@ const CHANNEL_MAX_TOTAL_ITEMS = 5000;
 // cap that applies to the manual "Add every season" button, which has no
 // pool/rotation concept).
 const CHANNEL_POOL_MAX_ITEMS = 5000;
+// The bar quickAddChannel uses to decide the server's cached network preset
+// (up to 200 episodes -- see buildNetworkChannelPreset,
+// 07_source-fetchers-tmdb-simkl.js) is "good enough to use" rather than
+// falling through to building a channel live, show by show, in the browser.
+// This used to compare against CHANNEL_POOL_MAX_ITEMS (5000) -- a preset can
+// never reach that, since the server caps it at 200 on purpose, so that
+// check was always false and Quick Add always took the slow client-built
+// path, which has no cap of its own and could pull in thousands of items
+// per network. Ten networks' worth of that easily blew past
+// SAVED_CONFIG_BYTES_MAX (10 MB) when saving the install link.
+const CHANNEL_PRESET_MIN_ITEMS = 20;
 // What a rotating day's lineup actually looks like -- must match
 // CHANNEL_ROTATION_SHOWS_PER_DAY / CHANNEL_ROTATION_EPISODES_PER_SHOW
 // server-side. Used here only for display text (the real selection logic
@@ -10378,7 +10389,7 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
       try {
         const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name));
         const data = await res.json();
-        if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_POOL_MAX_ITEMS) {
+        if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_PRESET_MIN_ITEMS) {
           const channelId = generateChannelId();
           const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '' });
           saveLocalChannel(payload);

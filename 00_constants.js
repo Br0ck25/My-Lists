@@ -359,6 +359,52 @@ const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 // about the feature changes.
 const NEW_ON_STREAMING_IN_QUICK_ADD = false;
 
+// --- Quick Add network channel presets --------------------------------------
+//
+// Same id/name pairs as the "Quick Add Popular Networks" buttons in
+// 13_tab-channels.js -- kept as a second, server-side list rather than
+// scraped from that HTML, since the cron sweep below needs to walk them with
+// no page loaded. Adding a network button there is not "live" for this sweep
+// until its id/name pair is added here too.
+const CHANNEL_PRESET_NETWORKS = [
+  { id: "129", name: "A&E" },
+  { id: "2", name: "ABC" },
+  { id: "80", name: "Adult Swim" },
+  { id: "174", name: "AMC" },
+  { id: "4", name: "BBC One" },
+  { id: "56", name: "Cartoon Network" },
+  { id: "16", name: "CBS" },
+  { id: "47", name: "Comedy Central" },
+  { id: "64", name: "Discovery" },
+  { id: "54", name: "Disney Channel" },
+  { id: "143", name: "Food Network" },
+  { id: "19", name: "FOX" },
+  { id: "88", name: "FX" },
+  { id: "384", name: "Hallmark Channel" },
+  { id: "49", name: "HBO" },
+  { id: "209", name: "HGTV" },
+  { id: "65", name: "History" },
+  { id: "436", name: "Ion Television" },
+  { id: "738", name: "MeTV" },
+  { id: "33", name: "MTV" },
+  { id: "6", name: "NBC" },
+  { id: "13", name: "Nickelodeon" },
+  { id: "149", name: "Syfy" },
+  { id: "68", name: "TBS" },
+  { id: "71", name: "The CW" },
+  { id: "84", name: "TLC" },
+  { id: "41", name: "TNT" },
+  { id: "30", name: "USA Network" },
+];
+// buildNetworkChannelPreset (07_source-fetchers-tmdb-simkl.js) only uses this
+// to build a `/api/channel-logo?path=...` URL, and that URL is never read as
+// a live link -- every consumer (getPremadeChannelLogo/extractLogoPath,
+// 05_catalog-core.js) re-extracts just the `path=` query param and rebuilds
+// the link against the real request's origin at serve time. So the cron
+// sweep, which has no request to take an origin from, can use any placeholder
+// here without the cached preset ever pointing at a dead host.
+const CHANNEL_PRESET_PREWARM_ORIGIN = "https://prewarm.internal";
+
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
 // /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
