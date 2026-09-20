@@ -827,20 +827,27 @@ async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken 
       const d2 = new Date(d0.getTime() + 66 * 86400000).toISOString().slice(0, 10);
       const d3 = new Date(d0.getTime() + 99 * 86400000).toISOString().slice(0, 10);
       try {
+        // extended=full costs nothing extra (same request, richer response)
+        // and is what mapTraktItems above already reads obj.rating from for
+        // every other Trakt list this add-on fetches -- without it, a show
+        // pulled from this calendar could never carry a rating, and every
+        // tile on this shelf sourced from here (rather than from a client
+        // enrichment pass) would have no rating badge regardless of the
+        // showBadgeRating/showBadgeTmdbRating/showBadgeImdbRating settings.
         const calResults = await Promise.all([
-          fetchTraktWithRetry(`https://api.trakt.tv/calendars/my/shows/${today}/33`, {
+          fetchTraktWithRetry(`https://api.trakt.tv/calendars/my/shows/${today}/33?extended=full`, {
             headers,
             cf: { cacheTtl: 300, cacheEverything: false },
           }).catch(() => null),
-          fetchTraktWithRetry(`https://api.trakt.tv/calendars/my/shows/${d1}/33`, {
+          fetchTraktWithRetry(`https://api.trakt.tv/calendars/my/shows/${d1}/33?extended=full`, {
             headers,
             cf: { cacheTtl: 300, cacheEverything: false },
           }).catch(() => null),
-          fetchTraktWithRetry(`https://api.trakt.tv/calendars/my/shows/${d2}/33`, {
+          fetchTraktWithRetry(`https://api.trakt.tv/calendars/my/shows/${d2}/33?extended=full`, {
             headers,
             cf: { cacheTtl: 300, cacheEverything: false },
           }).catch(() => null),
-          fetchTraktWithRetry(`https://api.trakt.tv/calendars/my/shows/${d3}/33`, {
+          fetchTraktWithRetry(`https://api.trakt.tv/calendars/my/shows/${d3}/33?extended=full`, {
             headers,
             cf: { cacheTtl: 300, cacheEverything: false },
           }).catch(() => null),
@@ -870,6 +877,8 @@ async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken 
               const eNum = ep.number != null ? `E${String(ep.number).padStart(2, "0")}` : "";
               const epLabel = sNum && eNum ? `${sNum}${eNum}` : "";
               const poster = (imdbId && imdbId.startsWith("tt")) ? `https://images.metahub.space/poster/medium/${imdbId}/img` : (tmdbId ? `https://image.tmdb.org/t/p/w500${tmdbId}` : "");
+              const rawScore = typeof show.rating === "number" ? show.rating : undefined;
+              const traktScore = typeof rawScore === "number" && rawScore > 0 ? Math.round(rawScore * 10) / 10 : undefined;
 
               calMetas.push({
                 id: bestId,
@@ -883,6 +892,8 @@ async function fetchTraktAiringNext(entry, skip = 0, traktKey = "", accessToken 
                 seasonNum: ep.season != null ? ep.season : undefined,
                 episodeNum: ep.number != null ? ep.number : undefined,
                 description: epLabel ? `Next Episode: ${epLabel}${ep.title ? ` — ${ep.title}` : ""} · Airs ${airDate}` : undefined,
+                vote_average: traktScore,
+                rating: traktScore,
               });
             }
           }

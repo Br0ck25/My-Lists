@@ -1493,7 +1493,7 @@ function generateSearchVariations(query) {
         if (!q) {
           // When no query is provided, return the top 20 trending/popular titles
           const src = `https://api.themoviedb.org/3/trending/${kind}/week?api_key=${encodeURIComponent(TMDB_API_KEY)}&page=1`;
-          const res = await fetch(src, {
+          const res = await fetchWithTimeout(src, {
             headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
             cf: { cacheTtl: 3600, cacheEverything: true },
           });
@@ -1535,7 +1535,7 @@ function generateSearchVariations(query) {
         const page1Src = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
           TMDB_API_KEY
         )}&query=${encodeURIComponent(q)}&include_adult=true&page=1`;
-        const page1Res = await fetch(page1Src, {
+        const page1Res = await fetchWithTimeout(page1Src, {
           headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
           cf: { cacheTtl: 3600, cacheEverything: true },
         });
@@ -1556,7 +1556,7 @@ function generateSearchVariations(query) {
                 const pSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
                   TMDB_API_KEY
                 )}&query=${encodeURIComponent(q)}&include_adult=true&page=${p}`;
-                const pRes = await fetch(pSrc, {
+                const pRes = await fetchWithTimeout(pSrc, {
                   headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                   cf: { cacheTtl: 3600, cacheEverything: true },
                 });
@@ -1581,7 +1581,7 @@ function generateSearchVariations(query) {
               const altSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
                 TMDB_API_KEY
               )}&query=${encodeURIComponent(altQ)}&include_adult=true&page=1`;
-              const altRes = await fetch(altSrc, {
+              const altRes = await fetchWithTimeout(altSrc, {
                 headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                 cf: { cacheTtl: 3600, cacheEverything: true },
               });
@@ -1601,7 +1601,7 @@ function generateSearchVariations(query) {
           try {
             const cinemetaType = kind === "tv" ? "series" : "movie";
             const cUrl = `https://v3-cinemeta.strem.io/catalog/${cinemetaType}/top/search=${encodeURIComponent(q)}.json`;
-            const cRes = await fetch(cUrl, {
+            const cRes = await fetchWithTimeout(cUrl, {
               headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
               cf: { cacheTtl: 86400, cacheEverything: true },
             });
@@ -1617,7 +1617,7 @@ function generateSearchVariations(query) {
                       if (!imdbId) return null;
                       try {
                         const findUrl = `https://api.themoviedb.org/3/find/${encodeURIComponent(imdbId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&external_source=imdb_id`;
-                        const fRes = await fetch(findUrl, {
+                        const fRes = await fetchWithTimeout(findUrl, {
                           headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                           cf: { cacheTtl: 604800, cacheEverything: true },
                         });
@@ -1645,7 +1645,7 @@ function generateSearchVariations(query) {
                       const tSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
                         TMDB_API_KEY
                       )}&query=${encodeURIComponent(cleanTopTitle)}&include_adult=true&page=1`;
-                      const tRes = await fetch(tSrc, {
+                      const tRes = await fetchWithTimeout(tSrc, {
                         headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                         cf: { cacheTtl: 3600, cacheEverything: true },
                       });
@@ -1698,28 +1698,20 @@ function generateSearchVariations(query) {
             const backdrop = it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : (it.direct_backdrop || poster || null);
             const isAdultItem = it.adult === true || it.is_adult === true || isAdultOrNsfw(it);
 
-            // If TMDB poster is missing, try backdrop or Cinemeta fallback
-            if (!poster) {
-              if (backdrop) {
-                poster = backdrop;
-              } else if (it.title || it.name) {
-                try {
-                  const cSearchRes = await fetch(
-                    `https://v3-cinemeta.strem.io/catalog/${kind === "tv" ? "series" : "movie"}/top/search=${encodeURIComponent(
-                      it.title || it.name
-                    )}.json`,
-                    { cf: { cacheTtl: 86400, cacheEverything: true } }
-                  );
-                  if (cSearchRes.ok) {
-                    const cData = await cSearchRes.json();
-                    const metas = Array.isArray(cData.metas) ? cData.metas : [];
-                    const exact = metas.find(
-                      (m) => m.name && m.name.toLowerCase() === (it.title || it.name).toLowerCase() && m.poster
-                    );
-                    poster = (exact && exact.poster) || (metas[0] && metas[0].poster) || null;
-                  }
-                } catch {}
-              }
+            // If TMDB poster is missing, fall back to the backdrop (already in
+            // hand, no extra request). A still-missing poster is left null
+            // rather than resolved here with a live per-item Cinemeta lookup:
+            // with up to ~100 results in rawResults, that was up to ~100
+            // uncapped, un-timed-out outbound fetches gating the whole
+            // response on whichever one was slowest. The client already
+            // resolves a null poster itself, the same way it resolves any
+            // <img> that fails to load: renderTitlePosterCards marks it
+            // data-needs-fallback="1" and calls resolveMissingPostersInDom
+            // right after rendering (16_client-row-core.js), which hits
+            // /api/poster-fallback per item, off the critical path and
+            // without holding up the rest of the results.
+            if (!poster && backdrop) {
+              poster = backdrop;
             }
 
             if (isAdultFilterActive && isAdultItem) {

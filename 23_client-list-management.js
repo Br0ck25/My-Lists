@@ -731,6 +731,52 @@ document.addEventListener('DOMContentLoaded', () => {
 // livePreviewShelfData is declared globally at script start
 
 
+// Normalises a show id down to its show-level key. Plain \`id.split(':')[0]\`
+// collapses every \`tmdb:\`-prefixed show to the literal string "tmdb", so a
+// second (and third, and fourth...) tmdb-identified show reads as a
+// duplicate of the first one wherever this key is used to dedupe a merge or
+// index a lookup map -- the same normalisation bug documented as
+// DB-002/BE-002 and already fixed server-side via trackingShowKey
+// (02_http-and-creator-utils.js). This is that same fix, reimplemented
+// locally since this file runs in the browser, not the Worker.
+function _liveMergeBaseId(raw) {
+  const s = String(raw || '').toLowerCase();
+  if (!s) return '';
+  if (s.startsWith('tmdb:')) {
+    const parts = s.split(':');
+    return parts.length >= 2 ? parts[0] + ':' + parts[1] : s;
+  }
+  return s.split(':')[0];
+}
+function _liveMergeShowKey(item) {
+  return _liveMergeBaseId(item && (item.showId || item.id));
+}
+
+// Normalises a fallback/cached item (My Lists' own Continue Watching or
+// Airing Next data) into the same meta shape the live /api/preview sample
+// uses, for the shelves below that fall back to it.
+function _liveFallbackMeta(it, defaultType) {
+  return {
+    id: it.id,
+    showId: it.showId || it.id,
+    type: it.type || defaultType || (it.episodeTitle ? 'series' : 'series'),
+    name: it.name || it.title,
+    poster: it.poster,
+    year: it.year || it.releaseInfo,
+    showTitle: it.showTitle || it.name || it.title,
+    seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
+    episodeNum: it.episodeNum != null ? it.episodeNum : it.episode,
+    airDate: it.airDate,
+    airTime: it.airTime,
+    isUnaired: it.isUnaired,
+    isSeasonPremiere: it.isSeasonPremiere,
+    isSeasonFinale: it.isSeasonFinale,
+    imdbRating: it.imdbRating,
+    rating: it.rating,
+    vote_average: it.vote_average,
+  };
+}
+
 async function renderLivePreview() {
   const container = document.getElementById('lists');
   if (!container) return;
@@ -788,6 +834,23 @@ async function renderLivePreview() {
       const sName = (s.name || '').toLowerCase();
       const isCwShelf = sUrl.includes('continue-watching') || sUrl.includes('continue_watching') || sName.includes('continue watching');
       const isAiringShelf = sUrl.includes('airing-next') || sUrl.includes('airing_next') || sName.includes('airing next');
+      // A personal/auto-tracked shelf (Continue Watching, Watchlist, Watch
+      // History, Airing Next -- this add-on's own or a connected Trakt/
+      // MDBList/Simkl account's) is legitimately empty a lot of the time --
+      // nothing in progress, nothing upcoming -- and that is not a
+      // misconfiguration worth a "No items found." block sitting in the
+      // editor. A row for any other list being empty usually does mean
+      // something is wrong (a bad URL, a list that got deleted upstream),
+      // so only these get hidden rather than shown empty; the row's config
+      // is untouched, so the moment the account has something in it again,
+      // the same row picks it back up as it normally would.
+      const isPersonalTrackedShelf = (s.url || '').split('\\n').some((line) => {
+        const u = line.trim().toLowerCase();
+        return u.startsWith('autotrack:') ||
+          u.startsWith('trakt:watchlist') || u.startsWith('trakt:history') || u.startsWith('trakt:airing-next') || u.startsWith('trakt:continue-watching') || u.startsWith('trakt:user:') ||
+          u.startsWith('mdblist:watchlist') || u.startsWith('mdblist:history') || u.startsWith('mdblist:airing-next') || u.startsWith('mdblist:upnext') || u.startsWith('mdblist:user:') ||
+          u.startsWith('simkl:watchlist') || u.startsWith('simkl:history') || u.startsWith('simkl:airing-next') || u.startsWith('simkl:user:');
+      });
 
       if (s.name && s.name.toLowerCase().includes('watch history')) {
         postersContainer.classList.add('is-watch-history-shelf');
@@ -821,17 +884,27 @@ async function renderLivePreview() {
             return items.length ? items : null;
           }
         } else if (isAiringShelf) {
+          // Only items with a confirmed, still-upcoming air date belong on this
+          // shelf -- the same filter openTraktAiringNextDetailsPage already
+          // applies (17_client-my-lists-and-trakt-oauth.js). Without it, raw
+          // candidate shows that were never confirmed to have an upcoming
+          // episode (or whose episode has since aired) get merged in as if
+          // they were real Airing Next entries, inflating the shelf beyond
+          // what Trakt actually has scheduled.
+          const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
           let cachedAiring = null;
           try {
             cachedAiring = JSON.parse(localStorage.getItem('myListAddon:traktAiringNextCache') || 'null');
           } catch (e) {}
           if (Array.isArray(cachedAiring) && cachedAiring.length) {
-            return cachedAiring;
+            const filtered = stillUpcoming(cachedAiring);
+            if (filtered.length) return filtered;
           }
           const lists = window._myPrivateTraktLists || window._myTraktLists || [];
           const aList = lists.find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && (l.url === 'trakt:airing-next' || l.url.includes(':airing-next')))));
           if (aList && Array.isArray(aList.items) && aList.items.length) {
-            return aList.items;
+            const filtered = stillUpcoming(aList.items);
+            if (filtered.length) return filtered;
           }
         }
         return null;
@@ -863,25 +936,7 @@ async function renderLivePreview() {
           const fallback = getFallbackShelfSample();
           if (fallback && fallback.length) {
             data.ok = true;
-            data.sample = fallback.map(it => ({
-              id: it.id,
-              showId: it.showId || it.id,
-              type: it.type || (it.episodeTitle ? 'series' : (s.type === 'movie' ? 'movie' : 'series')),
-              name: it.name || it.title,
-              poster: it.poster,
-              year: it.year || it.releaseInfo,
-              showTitle: it.showTitle || it.name || it.title,
-              seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
-              episodeNum: it.episodeNum != null ? it.episodeNum : it.episode,
-              airDate: it.airDate,
-              airTime: it.airTime,
-              isUnaired: it.isUnaired,
-              isSeasonPremiere: it.isSeasonPremiere,
-              isSeasonFinale: it.isSeasonFinale,
-              imdbRating: it.imdbRating,
-              rating: it.rating,
-              vote_average: it.vote_average,
-            }));
+            data.sample = fallback.map(it => _liveFallbackMeta(it, s.type === 'movie' ? 'movie' : 'series'));
             data.totalItems = fallback.length;
           }
         }
@@ -891,100 +946,56 @@ async function renderLivePreview() {
               // Ensure movie shelf only contains movie items, never TV shows
               data.sample = data.sample.filter(it => it && (it.type === 'movie' || it.kind === 'movie') && !it.seasonNum && !it.episodeNum && !it.episodeTitle);
             } else if (s.type === 'series') {
-              // Ensure series shelf includes all known continue watching series from private Trakt lists
+              // Prefer the "My Lists" sample over the live /api/preview sample
+              // when one is available, rather than unioning the two. The two
+              // used to get merged: every item the live fetch returned, plus
+              // any item from "My Lists" not already present. That could
+              // pull in a show the live fetch has that "My Lists" does not
+              // (or the reverse), so this shelf's count and "My Lists"'s
+              // count for what is supposed to be the same list could
+              // disagree -- confusing when they're shown side by side. It
+              // also meant inconsistent rating badges: fetchTraktContinueWatching's
+              // live sample never carries a rating (its own dashboard fetch
+              // path is the only place these items get enriched with one),
+              // so a tile's rating badge depended on which of the two
+              // sources happened to supply that particular item. Falling
+              // through to the live sample only when "My Lists" has not
+              // loaded yet this session preserves the original purpose of
+              // the merge (covering a live fetch truncated by Workers'
+              // subrequest cap) without either inconsistency.
               const fallback = getFallbackShelfSample();
               if (fallback && Array.isArray(fallback) && fallback.length) {
-                const seen = new Set();
-                const merged = [];
-                for (const item of data.sample) {
-                  const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
-                  if (id && !seen.has(id)) {
-                    seen.add(id);
-                    merged.push(item);
-                  }
-                }
-                for (const item of fallback) {
-                  const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
-                  if (id && !seen.has(id)) {
-                    seen.add(id);
-                    merged.push({
-                      id: item.id,
-                      showId: item.showId || item.id,
-                      type: 'series',
-                      name: item.name || item.title,
-                      poster: item.poster,
-                      year: item.year || item.releaseInfo,
-                      showTitle: item.showTitle || item.name || item.title,
-                      seasonNum: item.seasonNum != null ? item.seasonNum : item.season,
-                      episodeNum: item.episodeNum != null ? item.episodeNum : item.episode,
-                      airDate: item.airDate,
-                      airTime: item.airTime,
-                      isUnaired: item.isUnaired,
-                      isSeasonPremiere: item.isSeasonPremiere,
-                      isSeasonFinale: item.isSeasonFinale,
-                      imdbRating: item.imdbRating,
-                      rating: item.rating,
-                      vote_average: item.vote_average,
-                    });
-                  }
-                }
-                data.sample = merged;
-                data.totalItems = merged.length;
+                data.sample = fallback.map(item => _liveFallbackMeta(item, 'series'));
+                data.totalItems = data.sample.length;
               }
             }
           } else if (isAiringShelf) {
+            // Same reasoning as the Continue Watching series shelf above --
+            // see its comment.
             const fallback = getFallbackShelfSample();
             if (fallback && Array.isArray(fallback) && fallback.length) {
-              const seen = new Set();
-              const merged = [];
-              for (const item of data.sample) {
-                const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
-                if (id && !seen.has(id)) {
-                  seen.add(id);
-                  merged.push(item);
-                }
-              }
-              for (const item of fallback) {
-                const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
-                if (id && !seen.has(id)) {
-                  seen.add(id);
-                  merged.push({
-                    id: item.id,
-                    showId: item.showId || item.id,
-                    type: 'series',
-                    name: item.name || item.title,
-                    poster: item.poster,
-                    year: item.year || item.releaseInfo,
-                    showTitle: item.showTitle || item.name || item.title,
-                    seasonNum: item.seasonNum != null ? item.seasonNum : item.season,
-                    episodeNum: item.episodeNum != null ? item.episodeNum : item.episode,
-                    airDate: item.airDate,
-                    airTime: item.airTime,
-                    isUnaired: item.isUnaired,
-                    isSeasonPremiere: item.isSeasonPremiere,
-                    isSeasonFinale: item.isSeasonFinale,
-                    imdbRating: item.imdbRating,
-                    rating: item.rating,
-                    vote_average: item.vote_average,
-                  });
-                }
-              }
-              if (merged.length) {
-                merged.sort((a, b) => (a.airDate || '9999').localeCompare(b.airDate || '9999'));
-                data.sample = merged;
-                data.totalItems = merged.length;
-              }
+              const sample = fallback.map(item => _liveFallbackMeta(item, 'series'));
+              sample.sort((a, b) => (a.airDate || '9999').localeCompare(b.airDate || '9999'));
+              data.sample = sample;
+              data.totalItems = sample.length;
             }
           }
         }
         if (!data.ok) {
+          entryDOM.style.display = '';
           postersContainer.innerHTML = '<p class="testresult err">&#x2717; ' + escapeHtml(data.error || 'Could not load this catalog.') + '</p>';
           continue;
         }
         if (!data.sample || !data.sample.length) {
-          postersContainer.innerHTML = '<p><small>No items found.</small></p>';
+          if (isPersonalTrackedShelf) {
+            entryDOM.style.display = 'none';
+          } else {
+            entryDOM.style.display = '';
+            postersContainer.innerHTML = '<p><small>No items found.</small></p>';
+          }
           continue;
         }
+        entryDOM.style.display = '';
         livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample: data.sample, maybeMore: data.maybeMore, totalItems: data.totalItems };
         const sliced = data.sample.slice(0, visibleCount);
         sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; item.isLivePreviewShelf = true; });
@@ -994,31 +1005,15 @@ async function renderLivePreview() {
         if (statusEl) statusEl.innerHTML = '';
         const fallback = getFallbackShelfSample();
         if (fallback && fallback.length) {
-          const sample = fallback.map(it => ({
-            id: it.id,
-            showId: it.showId || it.id,
-            type: it.type || (it.episodeTitle ? 'series' : (s.type === 'movie' ? 'movie' : 'series')),
-            name: it.name || it.title,
-            poster: it.poster,
-            year: it.year || it.releaseInfo,
-            showTitle: it.showTitle || it.name || it.title,
-            seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
-            episodeNum: it.episodeNum != null ? it.episodeNum : it.episode,
-            airDate: it.airDate,
-            airTime: it.airTime,
-            isUnaired: it.isUnaired,
-            isSeasonPremiere: it.isSeasonPremiere,
-            isSeasonFinale: it.isSeasonFinale,
-            imdbRating: it.imdbRating,
-            rating: it.rating,
-            vote_average: it.vote_average,
-          }));
+          entryDOM.style.display = '';
+          const sample = fallback.map(it => _liveFallbackMeta(it, s.type === 'movie' ? 'movie' : 'series'));
           livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample, maybeMore: false, totalItems: sample.length };
           const sliced = sample.slice(0, visibleCount);
           sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; item.isLivePreviewShelf = true; });
           postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
           if (seeAllBtn && sample.length > visibleCount) seeAllBtn.disabled = false;
         } else {
+          entryDOM.style.display = '';
           postersContainer.innerHTML = '<p class="testresult err">&#x2717; Network error loading this catalog.</p>';
         }
       }
@@ -1205,7 +1200,7 @@ function getAiringNextIndex() {
     var a = list[i];
     if (!a) continue;
     put(byShowId, String(a.showId || ''), a, i);
-    put(byBaseId, String(a.showId || a.id || '').split(':')[0], a, i);
+    put(byBaseId, _liveMergeShowKey(a), a, i);
     if (a.canonicalTmdbId != null) put(byTmdb, 'c' + String(a.canonicalTmdbId), a, i);
     if (a.tmdbId != null) put(byTmdb, 't' + String(a.tmdbId), a, i);
     if (a.imdbId) put(byImdb, String(a.imdbId), a, i);
@@ -1227,7 +1222,7 @@ function getAiringNextIndex() {
     var sa = scheduleItems[j];
     if (!sa) continue;
     put(byShowId, String(sa.showId || ''), sa, list.length + j);
-    put(byBaseId, String(sa.showId || sa.id || '').split(':')[0], sa, list.length + j);
+    put(byBaseId, _liveMergeShowKey(sa), sa, list.length + j);
     if (sa.canonicalTmdbId != null) put(byTmdb, 'c' + String(sa.canonicalTmdbId), sa, list.length + j);
     if (sa.tmdbId != null) put(byTmdb, 't' + String(sa.tmdbId), sa, list.length + j);
     if (sa.imdbId) put(byImdb, String(sa.imdbId), sa, list.length + j);
@@ -1252,7 +1247,7 @@ function getAiringNextIndex() {
     var pa = providerAiringItems[k];
     if (!pa) continue;
     put(byShowId, String(pa.showId || pa.id || ''), pa, baseOffset + k);
-    put(byBaseId, String(pa.showId || pa.id || '').split(':')[0], pa, baseOffset + k);
+    put(byBaseId, _liveMergeShowKey(pa), pa, baseOffset + k);
     if (pa.canonicalTmdbId != null) put(byTmdb, 'c' + String(pa.canonicalTmdbId), pa, baseOffset + k);
     if (pa.tmdbId != null) put(byTmdb, 't' + String(pa.tmdbId), pa, baseOffset + k);
     if (pa.imdbId) put(byImdb, String(pa.imdbId), pa, baseOffset + k);
@@ -1282,8 +1277,8 @@ function findAiringMatchFor(m) {
   if (m.removeShowId) consider(idx.byShowId.get(String(m.removeShowId)));
   if (m.showId) consider(idx.byShowId.get(String(m.showId)));
   if (m.imdbId) consider(idx.byShowId.get(String(m.imdbId)));
-  // Predicate 2: base id (everything before the first colon) on both sides.
-  var mBase = String(m.showId || m.id || m.removeShowId || '').split(':')[0];
+  // Predicate 2: base id (colon-normalised, tmdb-aware -- see _liveMergeBaseId) on both sides.
+  var mBase = _liveMergeBaseId(m.showId || m.id || m.removeShowId);
   if (mBase) consider(idx.byBaseId.get(mBase));
   // Predicates 3-5: canonical TMDB id, TMDB id, IMDb id.
   if (m.canonicalTmdbId != null) consider(idx.byTmdb.get('c' + String(m.canonicalTmdbId)));
