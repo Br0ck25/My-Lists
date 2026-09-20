@@ -12209,15 +12209,19 @@ async function fetchMergedCatalog(urls, type, skip, keys) {
 // implementation this feature is modeled on.
 //
 // A Quick Add network channel is the one exception to "fully
-// self-contained": its payload omits `items` and carries `presetNetworkId`
-// instead -- a pointer at the shared, cron-prewarmed pool cached under
+// self-contained": its payload carries `presetNetworkId` -- a pointer at
+// the shared, cron-prewarmed pool cached under
 // channel:preset:v2:<presetNetworkId> (buildNetworkChannelPreset,
-// 07_source-fetchers-tmdb-simkl.js), so a catalog row stays a few hundred
-// bytes instead of embedding a pool of up to CHANNEL_POOL_MAX_ITEMS (5,000)
-// episodes. `poster`/`backdrop` still ride in the payload itself (so
-// fetchChannelCatalog's tile never needs to touch that cache), and
-// channelSourceItems is where `items` actually gets filled in from it, for
-// whichever caller needed the real episode list.
+// 07_source-fetchers-tmdb-simkl.js) -- alongside a small
+// CHANNEL_POINTER_SAMPLE_ITEMS-item `items` sample of its own rather than
+// the full pool (up to CHANNEL_POOL_MAX_ITEMS, 5,000). That sample is not
+// an optimization to skip: a long list of places across this codebase read
+// a channel row's own `.items` directly as a local shortcut (the "My
+// Channels" list, "See All"'s local-preview path, and others), and a
+// pointer shipped with NO items at all left every one of those rendering a
+// broken 0-episode channel instead of falling back to something real.
+// channelSourceItems always prefers the full pool when it can reach the
+// cache, and falls back to this sample only if that lookup itself fails.
 function parseChannelPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
@@ -12225,8 +12229,9 @@ function parseChannelPayload(rawUrl) {
     const data = JSON.parse(raw.slice("channel:v1:".length));
     if (!data) return null;
     if (Array.isArray(data.items)) return data;
-    // The pointer shape: no items of its own, resolved later from
-    // channel:preset:v2:<presetNetworkId> by whoever actually needs them.
+    // Defensive only: a well-formed pointer always carries its own sample
+    // (see quickAddChannel, 20_client-channel-builder.js) -- this covers a
+    // hand-edited or older-shaped row that has presetNetworkId but no items.
     if (data.presetNetworkId) return data;
     return null;
   } catch (e) {
@@ -14864,13 +14869,16 @@ function mergeChannelNewEpisodes(stored, fresh, atTop) {
 // account's own tracking; a Live Cloud Sync channel prefers the pool the
 // Worker last rebuilt from the list it was imported from, keeping its
 // stored picks as the fallback for before that first rebuild lands; and a
-// Quick Add network channel stores no pool of its own at all -- just a
-// presetNetworkId pointer (see parseChannelPayload's own comment) -- so its
-// pool is resolved from the shared, cron-prewarmed cache right here, before
-// any of the other three shapes get a chance to run.
+// Quick Add network channel carries a presetNetworkId pointer alongside a
+// small (CHANNEL_POINTER_SAMPLE_ITEMS) sample of its own -- see
+// parseChannelPayload's own comment for why that sample exists at all. The
+// real pool always wins when it is reachable: resolved from the shared,
+// cron-prewarmed cache right here, before any of the other three shapes get
+// a chance to run, with the small sample as the fallback for the rare case
+// the cache lookup itself fails (env not wired through, or a genuine outage).
 async function channelSourceItems(payload, opts) {
   let stored = Array.isArray(payload.items) ? payload.items : [];
-  if (!stored.length && payload.presetNetworkId && opts && opts.env) {
+  if (payload.presetNetworkId && opts && opts.env) {
     try {
       const preset = await buildNetworkChannelPreset(
         String(payload.presetNetworkId),
@@ -14878,7 +14886,7 @@ async function channelSourceItems(payload, opts) {
         opts.origin || CHANNEL_PRESET_PREWARM_ORIGIN,
         { env: opts.env, ctx: opts.ctx }
       );
-      if (preset && preset.ok && preset.channel && Array.isArray(preset.channel.items)) {
+      if (preset && preset.ok && preset.channel && Array.isArray(preset.channel.items) && preset.channel.items.length) {
         stored = preset.channel.items;
       }
     } catch (e) {}
@@ -48846,6 +48854,29 @@ const CHANNEL_POOL_MAX_ITEMS = 5000;
 // per network. Ten networks' worth of that easily blew past
 // SAVED_CONFIG_BYTES_MAX (10 MB) when saving the install link.
 const CHANNEL_PRESET_MIN_ITEMS = 20;
+// A Quick Add network channel's saved catalog row carries this many items
+// alongside its presetNetworkId pointer -- never the full pool (see
+// quickAddChannel below for why), but never zero either. A long list of
+// places across this codebase treat a channel:v1: row as self-contained and
+// read its own items directly rather than going back to the server: the
+// "My Channels" list/card counts and posters (ensureAllChannelsSyncedFromRows,
+// renderMyCreatedChannelsList), the "See All" details page's local-preview
+// shortcut (openListDetailsPage, 23_client-list-management.js), and others.
+// Shipping a pointer with NO items at all satisfied the server-side resolver
+// (channelSourceItems, 05_catalog-core.js) but broke every one of those --
+// each one independently discovered a channel with 0 episodes and either
+// rendered that or fell through to a network call /api/preview was never
+// built to serve for a channel (it returns the channel's own single tile,
+// not its episode list), which is what actually produced "That URL isn't a
+// supported list source." A 50-item sample costs about 20KB per channel
+// even at a generous per-item size -- ten of them together add about 200KB
+// to a saved config, nowhere near SAVED_CONFIG_BYTES_MAX (10MB) -- and keeps
+// every one of those existing call sites working exactly as it already
+// assumed. The real, full pool (up to CHANNEL_POOL_MAX_ITEMS) is still what
+// actually plays: channelSourceItems always prefers the live cache over
+// this sample, which exists purely as what a local shortcut or a cold
+// cache falls back to.
+const CHANNEL_POINTER_SAMPLE_ITEMS = 50;
 // What a rotating day's lineup actually looks like -- must match
 // CHANNEL_ROTATION_SHOWS_PER_DAY / CHANNEL_ROTATION_EPISODES_PER_SHOW
 // server-side. Used here only for display text (the real selection logic
@@ -48946,10 +48977,12 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
           // The full pool (up to CHANNEL_POOL_MAX_ITEMS episodes) is kept
           // locally for the My Channels editor -- saveLocalChannel gets it
           // in full, exactly as before. The saved CATALOG ROW is different:
-          // it carries a slim pointer (name/poster/art + presetNetworkId),
-          // never the pool itself, so this channel's real weight lives in
-          // the shared channel:preset:v2:<networkId> cache instead of in
-          // every install link that adds it -- see parseChannelPayload and
+          // it carries a slim pointer (name/poster/art + presetNetworkId)
+          // plus a small CHANNEL_POINTER_SAMPLE_ITEMS-item sample (see that
+          // constant's own comment for why this is not empty), never the
+          // full pool, so this channel's real weight lives in the shared
+          // channel:preset:v2:<networkId> cache instead of in every install
+          // link that adds it -- see parseChannelPayload and
           // channelSourceItems (05_catalog-core.js) for how that pointer
           // resolves back to the full pool at serve time.
           const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '' });
@@ -48959,6 +48992,7 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
             name: name,
             poster: data.channel.poster,
             backdrop: data.channel.backdrop,
+            items: data.channel.items.slice(0, CHANNEL_POINTER_SAMPLE_ITEMS),
             presetNetworkId: networkId,
             shuffle: false,
             dailyRotate: true,

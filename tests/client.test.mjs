@@ -4855,6 +4855,107 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
   });
 });
 
+// --- Quick Add network channels: the saved row must stay usable on its own -
+//
+// quickAddChannel saves a Quick Add channel's real weight (up to
+// CHANNEL_POOL_MAX_ITEMS episodes) only in the shared server cache, and
+// writes a small presetNetworkId POINTER into the catalog row -- see that
+// constant's own comment (20_client-channel-builder.js) for the full design.
+// The first version of that pointer carried NO items of its own at all, on
+// the theory that channelSourceItems (05_catalog-core.js) would always
+// resolve the real pool server-side. That missed something: a long list of
+// OTHER places in this codebase read a channel row's own `.items` directly,
+// as a local shortcut, entirely independent of that server resolution --
+// ensureAllChannelsSyncedFromRows/renderMyCreatedChannelsList (the "My
+// Channels" list) and openListDetailsPage's local-preview path ("See All")
+// among them. An empty-items pointer left every one of those rendering a
+// broken 0-episode channel the moment this browser's own copy of the full
+// pool was not available (a different device, cleared storage, or -- the
+// case that actually surfaces this from real use -- saveLocalChannelsMap's
+// own quota fallback losing the write entirely once several 5,000-item
+// channels together exceed what this browser's localStorage will hold).
+// These tests hold the fix to that: the row always carries a real, small
+// sample alongside its pointer, so every one of those local-only readers
+// keeps working even when this browser has never seen the full pool at all.
+describe("client: a Quick Add channel row stays usable without its local copy", () => {
+  function fakeInput(value) {
+    return { value, dataset: {} };
+  }
+  function fakeEntry(name, url, type) {
+    return {
+      dataset: {}, style: {},
+      querySelector(sel) {
+        if (sel === ".name") return fakeInput(name);
+        if (sel === ".type") return fakeInput(type);
+        if (sel === ".url") return fakeInput(url);
+        return null;
+      },
+      querySelectorAll(sel) { return sel === ".url" ? [fakeInput(url)] : []; },
+    };
+  }
+  function withRows(client, rows) {
+    const entries = rows.map((r) => fakeEntry(r.name, r.url, r.type));
+    const doc = client.get("document");
+    const lists = doc.getElementById("lists");
+    lists.querySelectorAll = (sel) => (sel === ".entry" ? entries : []);
+    doc.querySelectorAll = (sel) => (sel === "#lists .entry" ? entries : []);
+    return entries;
+  }
+  function presetItems(n, tag) {
+    return Array.from({ length: n }, (_, i) => ({
+      kind: "episode", imdbId: "tt" + tag + i, season: 1, episode: i + 1,
+      showName: tag + " Show", epName: "Ep " + i, title: "t", released: "2024-01-01",
+    }));
+  }
+
+  it("quickAddChannel's saved row carries a real, non-empty items sample -- not just the pointer", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel-preset": () => ({
+          json: { ok: true, channel: { name: "TNT", poster: "p", backdrop: "b", items: presetItems(4000, "TNT"), shuffle: false, dailyRotate: true } },
+        }),
+      },
+    });
+    const addedRows = [];
+    client.set("addRow", (name, url) => { addedRows.push({ name, url }); });
+
+    await client.call("quickAddChannel", "TNT", null, "41", null, null);
+
+    assert.equal(addedRows.length, 1, "must save exactly one catalog row");
+    const payload = JSON.parse(addedRows[0].url.slice("channel:v1:".length));
+    assert.equal(payload.presetNetworkId, "41");
+    assert.ok(Array.isArray(payload.items) && payload.items.length > 0,
+      "the saved row must not be an empty pointer -- every local-only reader depends on this");
+    assert.ok(payload.items.length < 4000,
+      "the saved row's sample must stay small -- the full 4000-item pool belongs in the server cache, not the row");
+
+    // The LOCAL copy (My Channels editor) is unaffected -- it still gets the
+    // real, full pool, exactly as before this whole pointer design existed.
+    const local = client.call("loadLocalChannels");
+    const localChannel = Object.values(local).find((c) => c.name === "TNT");
+    assert.equal(localChannel.items.length, 4000);
+  });
+
+  it("a channel row reconstructed from scratch (this browser never had a local copy) still shows real episodes, not zero", () => {
+    const client = loadClient({});
+    // Simulates exactly what quickAddChannel now saves: a pointer plus its
+    // own small sample -- and simulates a browser that never got (or lost)
+    // this channel's full local copy, so ensureAllChannelsSyncedFromRows has
+    // to build the local record from the row alone.
+    const pointerPayload = {
+      channelId: "ch-tnt", name: "TNT", poster: "p", backdrop: "b",
+      items: presetItems(50, "TNT"), presetNetworkId: "41",
+      shuffle: false, dailyRotate: true, liveSync: false, sourceUrl: "",
+    };
+    withRows(client, [{ name: "TNT", url: "channel:v1:" + JSON.stringify(pointerPayload), type: "series" }]);
+
+    const synced = client.call("ensureAllChannelsSyncedFromRows", client.call("loadLocalChannels"));
+    assert.equal(synced["ch-tnt"].items.length, 50,
+      "must reconstruct a real sample from the row, not an empty channel");
+    assert.equal(synced["ch-tnt"].name, "TNT");
+  });
+});
+
 describe("client: the Channel builder's interleaved play order", () => {
   function withDraft(items) {
     const client = loadClient({ routes: {} });

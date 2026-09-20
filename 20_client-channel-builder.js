@@ -10294,6 +10294,29 @@ const CHANNEL_POOL_MAX_ITEMS = 5000;
 // per network. Ten networks' worth of that easily blew past
 // SAVED_CONFIG_BYTES_MAX (10 MB) when saving the install link.
 const CHANNEL_PRESET_MIN_ITEMS = 20;
+// A Quick Add network channel's saved catalog row carries this many items
+// alongside its presetNetworkId pointer -- never the full pool (see
+// quickAddChannel below for why), but never zero either. A long list of
+// places across this codebase treat a channel:v1: row as self-contained and
+// read its own items directly rather than going back to the server: the
+// "My Channels" list/card counts and posters (ensureAllChannelsSyncedFromRows,
+// renderMyCreatedChannelsList), the "See All" details page's local-preview
+// shortcut (openListDetailsPage, 23_client-list-management.js), and others.
+// Shipping a pointer with NO items at all satisfied the server-side resolver
+// (channelSourceItems, 05_catalog-core.js) but broke every one of those --
+// each one independently discovered a channel with 0 episodes and either
+// rendered that or fell through to a network call /api/preview was never
+// built to serve for a channel (it returns the channel's own single tile,
+// not its episode list), which is what actually produced "That URL isn't a
+// supported list source." A 50-item sample costs about 20KB per channel
+// even at a generous per-item size -- ten of them together add about 200KB
+// to a saved config, nowhere near SAVED_CONFIG_BYTES_MAX (10MB) -- and keeps
+// every one of those existing call sites working exactly as it already
+// assumed. The real, full pool (up to CHANNEL_POOL_MAX_ITEMS) is still what
+// actually plays: channelSourceItems always prefers the live cache over
+// this sample, which exists purely as what a local shortcut or a cold
+// cache falls back to.
+const CHANNEL_POINTER_SAMPLE_ITEMS = 50;
 // What a rotating day's lineup actually looks like -- must match
 // CHANNEL_ROTATION_SHOWS_PER_DAY / CHANNEL_ROTATION_EPISODES_PER_SHOW
 // server-side. Used here only for display text (the real selection logic
@@ -10394,10 +10417,12 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
           // The full pool (up to CHANNEL_POOL_MAX_ITEMS episodes) is kept
           // locally for the My Channels editor -- saveLocalChannel gets it
           // in full, exactly as before. The saved CATALOG ROW is different:
-          // it carries a slim pointer (name/poster/art + presetNetworkId),
-          // never the pool itself, so this channel's real weight lives in
-          // the shared channel:preset:v2:<networkId> cache instead of in
-          // every install link that adds it -- see parseChannelPayload and
+          // it carries a slim pointer (name/poster/art + presetNetworkId)
+          // plus a small CHANNEL_POINTER_SAMPLE_ITEMS-item sample (see that
+          // constant's own comment for why this is not empty), never the
+          // full pool, so this channel's real weight lives in the shared
+          // channel:preset:v2:<networkId> cache instead of in every install
+          // link that adds it -- see parseChannelPayload and
           // channelSourceItems (05_catalog-core.js) for how that pointer
           // resolves back to the full pool at serve time.
           const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '' });
@@ -10407,6 +10432,7 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
             name: name,
             poster: data.channel.poster,
             backdrop: data.channel.backdrop,
+            items: data.channel.items.slice(0, CHANNEL_POINTER_SAMPLE_ITEMS),
             presetNetworkId: networkId,
             shuffle: false,
             dailyRotate: true,

@@ -271,15 +271,19 @@ async function fetchMergedCatalog(urls, type, skip, keys) {
 // implementation this feature is modeled on.
 //
 // A Quick Add network channel is the one exception to "fully
-// self-contained": its payload omits `items` and carries `presetNetworkId`
-// instead -- a pointer at the shared, cron-prewarmed pool cached under
+// self-contained": its payload carries `presetNetworkId` -- a pointer at
+// the shared, cron-prewarmed pool cached under
 // channel:preset:v2:<presetNetworkId> (buildNetworkChannelPreset,
-// 07_source-fetchers-tmdb-simkl.js), so a catalog row stays a few hundred
-// bytes instead of embedding a pool of up to CHANNEL_POOL_MAX_ITEMS (5,000)
-// episodes. `poster`/`backdrop` still ride in the payload itself (so
-// fetchChannelCatalog's tile never needs to touch that cache), and
-// channelSourceItems is where `items` actually gets filled in from it, for
-// whichever caller needed the real episode list.
+// 07_source-fetchers-tmdb-simkl.js) -- alongside a small
+// CHANNEL_POINTER_SAMPLE_ITEMS-item `items` sample of its own rather than
+// the full pool (up to CHANNEL_POOL_MAX_ITEMS, 5,000). That sample is not
+// an optimization to skip: a long list of places across this codebase read
+// a channel row's own `.items` directly as a local shortcut (the "My
+// Channels" list, "See All"'s local-preview path, and others), and a
+// pointer shipped with NO items at all left every one of those rendering a
+// broken 0-episode channel instead of falling back to something real.
+// channelSourceItems always prefers the full pool when it can reach the
+// cache, and falls back to this sample only if that lookup itself fails.
 function parseChannelPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
@@ -287,8 +291,9 @@ function parseChannelPayload(rawUrl) {
     const data = JSON.parse(raw.slice("channel:v1:".length));
     if (!data) return null;
     if (Array.isArray(data.items)) return data;
-    // The pointer shape: no items of its own, resolved later from
-    // channel:preset:v2:<presetNetworkId> by whoever actually needs them.
+    // Defensive only: a well-formed pointer always carries its own sample
+    // (see quickAddChannel, 20_client-channel-builder.js) -- this covers a
+    // hand-edited or older-shaped row that has presetNetworkId but no items.
     if (data.presetNetworkId) return data;
     return null;
   } catch (e) {
@@ -2926,13 +2931,16 @@ function mergeChannelNewEpisodes(stored, fresh, atTop) {
 // account's own tracking; a Live Cloud Sync channel prefers the pool the
 // Worker last rebuilt from the list it was imported from, keeping its
 // stored picks as the fallback for before that first rebuild lands; and a
-// Quick Add network channel stores no pool of its own at all -- just a
-// presetNetworkId pointer (see parseChannelPayload's own comment) -- so its
-// pool is resolved from the shared, cron-prewarmed cache right here, before
-// any of the other three shapes get a chance to run.
+// Quick Add network channel carries a presetNetworkId pointer alongside a
+// small (CHANNEL_POINTER_SAMPLE_ITEMS) sample of its own -- see
+// parseChannelPayload's own comment for why that sample exists at all. The
+// real pool always wins when it is reachable: resolved from the shared,
+// cron-prewarmed cache right here, before any of the other three shapes get
+// a chance to run, with the small sample as the fallback for the rare case
+// the cache lookup itself fails (env not wired through, or a genuine outage).
 async function channelSourceItems(payload, opts) {
   let stored = Array.isArray(payload.items) ? payload.items : [];
-  if (!stored.length && payload.presetNetworkId && opts && opts.env) {
+  if (payload.presetNetworkId && opts && opts.env) {
     try {
       const preset = await buildNetworkChannelPreset(
         String(payload.presetNetworkId),
@@ -2940,7 +2948,7 @@ async function channelSourceItems(payload, opts) {
         opts.origin || CHANNEL_PRESET_PREWARM_ORIGIN,
         { env: opts.env, ctx: opts.ctx }
       );
-      if (preset && preset.ok && preset.channel && Array.isArray(preset.channel.items)) {
+      if (preset && preset.ok && preset.channel && Array.isArray(preset.channel.items) && preset.channel.items.length) {
         stored = preset.channel.items;
       }
     } catch (e) {}
