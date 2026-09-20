@@ -6,6 +6,16 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-09-20
+
+### 🐛 Trakt Airing Next: item counts, badges and slow search
+
+- **Live Preview & Editor showed more Trakt Airing Next items than Trakt actually has, and a different count than "My Lists"**: the Continue Watching (series) and Airing Next shelves merged the live `/api/preview` sample with a client-cached "My Lists" sample by union — adding whatever either side had that the other lacked. That let an unconfirmed or already-aired candidate leak in from the cache, and let a show the live fetch had (but "My Lists" did not) inflate the count past what "My Lists" showed for the same list. `renderLivePreview` (`23_client-list-management.js`) now prefers the cached "My Lists" sample outright whenever one is available, falling through to the live sample only when nothing is cached yet.
+- **Rating badges appeared on some Airing Next tiles and not others**: the live fetch (`fetchTraktAiringNext`, `06_source-fetchers-mdblist-trakt.js`) never carried a rating at all — only cache-sourced items did — so which tiles got a star badge came down to which source happened to supply that item. Added `extended=full` to the Trakt calendar fetch, the same query param `mapTraktItems` already reads `show.rating` from for every other Trakt list this add-on fetches (same request, no extra cost).
+- **Badges wrong or missing throughout the site**: the client-side `getAiringNextIndex()`/`findAiringMatchFor()` lookup used for badge matching keyed shows by `id.split(':')[0]`, which collapses every `tmdb:`-prefixed show to the literal string `"tmdb"` — the same normalisation bug already fixed server-side (DB-002/BE-002) via `trackingShowKey`. Reimplemented that fix locally in `23_client-list-management.js`.
+- **Empty personal shelves cluttered Live Preview**: Continue Watching, Watchlist, Watch History and Airing Next rows now hide themselves while genuinely empty instead of showing a "No items found." block, and reappear the moment the account has something in them again — no change to the shelf's own config.
+- **Search sometimes took a long time to load**: `/api/title-search` fired a live, uncapped, timeout-less per-result Cinemeta poster lookup for every result missing a TMDB poster — up to ~100 outbound requests gating one response. The client already resolves a missing poster itself after rendering (`resolveMissingPostersInDom` → `/api/poster-fallback`), so the eager server-side lookup was removed, and the route's remaining external calls now use the existing `fetchWithTimeout` wrapper so one slow provider response can no longer stall the whole search.
+
 ### 🐛 Trakt Continue Watching & Airing Next Live Preview Fixes
 
 - **Trakt Continue Watching Movie vs Series Isolation**:
