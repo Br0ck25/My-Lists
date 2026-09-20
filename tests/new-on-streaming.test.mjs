@@ -728,6 +728,57 @@ describe("RapidAPI Streaming Availability sweep", () => {
     }
   });
 
+  // Regular ticks are not reconstructing history -- they are catching
+  // *today's* real-time episode/season drops, so they weight the 4-page
+  // budget toward `episode` (a second page there = 50 items/tick instead of
+  // 25, RapidAPI's own page size) rather than spreading it 70/20/10 the way
+  // a backfill does. A backfill (reset: true) must keep the old weighting,
+  // since it is reconstructing which titles exist at all.
+  it("weights a regular tick's page budget toward episode changes, and keeps a backfill's show-heavy weighting", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+
+    // hasMore: true on every page (up to a generous cap) so the sweep only
+    // ever stops because it hit ITS OWN computed per-type budget, not
+    // because a no-data stub ran dry after page 1 -- that would make every
+    // type look identically page-starved regardless of the allocation math.
+    const countByType = () => {
+      const counts = {};
+      const net = stubRapidApi((url) => {
+        const u = new URL(url);
+        const itemType = u.searchParams.get("item_type");
+        if (!itemType) return { changes: [], shows: {}, hasMore: false };
+        counts[itemType] = (counts[itemType] || 0) + 1;
+        const more = counts[itemType] < 20;
+        return { changes: [], shows: {}, hasMore: more, nextCursor: more ? `cursor-${counts[itemType]}` : undefined };
+      });
+      return { net, counts };
+    };
+
+    const cookie = await adminCookie(env);
+
+    let { net, counts } = countByType();
+    try {
+      const regular = await sweep(env, cookie, 4, { reset: false, full: false });
+      assert.equal(regular.ran, true);
+      assert.equal(counts.episode, 2, "a regular tick must give episode a second page");
+      assert.equal(counts.show, 1);
+      assert.equal(counts.season, 1);
+    } finally {
+      net.restore();
+    }
+
+    ({ net, counts } = countByType());
+    try {
+      const backfill = await sweep(env, cookie, 10, { reset: true, full: true });
+      assert.equal(backfill.ran, true);
+      assert.ok(counts.show >= counts.episode, "a backfill must stay show-heavy, not episode-heavy");
+      assert.ok(counts.show >= counts.season, "a backfill must stay show-heavy, not episode-heavy");
+    } finally {
+      net.restore();
+    }
+  });
+
   it("filters out digital store buy/rent releases and preserves true subscription premiere date", async () => {
     const db = makeD1();
     const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });

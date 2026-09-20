@@ -378,12 +378,24 @@ const NEW_ON_STREAMING_REGIONS = ["US"];
 const RAPIDAPI_MONTHLY_LIMIT = 1000;
 const RAPIDAPI_MONTHLY_SAFETY_CAP = 950;
 
-// Runs every 4 hours via cron (~180 runs/month). With 1-2 pages per incremental
-// run, this uses ~180-360 requests/month, staying safely within the 1,000 limit.
+// Runs every 4 hours via cron (~180 runs/month). With 4 pages + 1 removed-check
+// per incremental run, this uses ~900 requests/month (180 * 5), staying under
+// the 950 safety cap with a small margin.
 const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 14400;
 
-// Maximum pages fetched per sweep
-const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 3;
+// Maximum pages fetched per sweep.
+//
+// RapidAPI's /changes endpoint returns only 25 changes per page (see its
+// openapi.yaml), and a regular sweep never pages past what this budget
+// allows -- there is no cursor continuation once a type's page budget for
+// the tick runs out. 8 major streaming services can easily produce more
+// than 25 real episode-arrival events in a single 4-5 hour sweep window, so
+// this is the actual ceiling on how much of the catalog's real-time bump
+// coverage comes from RapidAPI directly (the rest falls to the slower,
+// TMDB-based bumpNewOnStreamingEpisodes safety net). Raised from 3 to 4 so a
+// regular tick can give `episode` a second page (see itemTypeShares below)
+// instead of the single page every type got before.
+const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 4;
 const NEW_ON_STREAMING_PAGES_PER_TICK = NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP;
 const NEW_ON_STREAMING_SWEEP_FETCHES = 1;
 const CRON_NEW_ON_STREAMING_SHARE = 0.25;
@@ -18155,11 +18167,29 @@ async function sweepRapidApiNewOnStreaming(env, ctx, fetchBudget, maxUnits, opti
   const maxPages = Math.min(effectiveBudget, limitUnits, remainingInQuota);
 
   const writes = [];
-  const itemTypeConfigs = [
-    { type: "show", share: 0.70 },
-    { type: "episode", share: 0.20 },
-    { type: "season", share: 0.10 },
-  ];
+  // A regular tick and a backfill (isFull/isReset) want different splits.
+  // A backfill is reconstructing history across up to 30-150 pages, where
+  // `show` (a title's very first sighting) dominates and this split already
+  // reaches back 7-10 days across all 8 services (see CHANGELOG). A regular
+  // 4-page tick has a completely different job: it is not discovering new
+  // history, it is catching *today's* real-time drops -- and per-tick, that
+  // is almost entirely episode changes on shows already known to the
+  // catalog, not brand-new titles. With RapidAPI's /changes page capped at
+  // 25 items and no cursor continuation once a tick's page budget runs out,
+  // giving `episode` a second page (1 -> 2, so 25 -> 50 items/tick) is what
+  // actually moves the real ceiling on this path -- see
+  // NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP in 00_constants.js.
+  const itemTypeConfigs = (isFull || isReset)
+    ? [
+        { type: "show", share: 0.70 },
+        { type: "episode", share: 0.20 },
+        { type: "season", share: 0.10 },
+      ]
+    : [
+        { type: "show", share: 0.25 },
+        { type: "episode", share: 0.50 },
+        { type: "season", share: 0.25 },
+      ];
 
   let remainingBudget = maxPages;
 

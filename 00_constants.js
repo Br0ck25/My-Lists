@@ -328,12 +328,24 @@ const NEW_ON_STREAMING_REGIONS = ["US"];
 const RAPIDAPI_MONTHLY_LIMIT = 1000;
 const RAPIDAPI_MONTHLY_SAFETY_CAP = 950;
 
-// Runs every 4 hours via cron (~180 runs/month). With 1-2 pages per incremental
-// run, this uses ~180-360 requests/month, staying safely within the 1,000 limit.
+// Runs every 4 hours via cron (~180 runs/month). With 4 pages + 1 removed-check
+// per incremental run, this uses ~900 requests/month (180 * 5), staying under
+// the 950 safety cap with a small margin.
 const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 14400;
 
-// Maximum pages fetched per sweep
-const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 3;
+// Maximum pages fetched per sweep.
+//
+// RapidAPI's /changes endpoint returns only 25 changes per page (see its
+// openapi.yaml), and a regular sweep never pages past what this budget
+// allows -- there is no cursor continuation once a type's page budget for
+// the tick runs out. 8 major streaming services can easily produce more
+// than 25 real episode-arrival events in a single 4-5 hour sweep window, so
+// this is the actual ceiling on how much of the catalog's real-time bump
+// coverage comes from RapidAPI directly (the rest falls to the slower,
+// TMDB-based bumpNewOnStreamingEpisodes safety net). Raised from 3 to 4 so a
+// regular tick can give `episode` a second page (see itemTypeShares below)
+// instead of the single page every type got before.
+const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 4;
 const NEW_ON_STREAMING_PAGES_PER_TICK = NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP;
 const NEW_ON_STREAMING_SWEEP_FETCHES = 1;
 const CRON_NEW_ON_STREAMING_SHARE = 0.25;
