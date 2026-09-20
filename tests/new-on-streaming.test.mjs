@@ -1013,4 +1013,79 @@ describe("RapidAPI Streaming Availability sweep", () => {
       globalThis.fetch = origFetch;
     }
   });
+
+  // Regression test for the "A Love Other Than Yours" report: a show that
+  // fell behind 50 other, more-recently-active series must still get its
+  // episode bump. Under the old `ORDER BY last_event_at DESC LIMIT 50`
+  // selection, the 50 fresher fillers below would occupy every slot forever
+  // and the target would never once be selected for a TMDB check, however
+  // many ticks ran -- it would sit at its original arrival date permanently
+  // while MDBList (which does not have this ceiling) correctly showed it
+  // bumped to the new episode's air date.
+  it("still checks and bumps a series buried past the old top-50-by-recency window", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key" });
+    const cookie = await adminCookie(env);
+    const now = Math.floor(Date.now() / 1000);
+
+    for (let i = 1; i <= 50; i++) {
+      seedStreamingEvent(db, {
+        service: "netflix",
+        imdbId: `tt1000${String(i).padStart(3, "0")}`,
+        kind: "series",
+        at: now - i,
+        name: `Filler ${i}`,
+      });
+    }
+
+    const staleAt = now - 20 * 86400; // 20 days ago: stale, but inside the 30-day prune window
+    seedStreamingEvent(db, {
+      service: "primevideo",
+      imdbId: "tt9999999",
+      tmdbId: 500001,
+      kind: "series",
+      at: staleAt,
+      name: "A Love Other Than Yours",
+    });
+
+    const newEpisodeIso = new Date((now - 86400) * 1000).toISOString().slice(0, 10); // aired yesterday
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/3/tv/500001")) {
+        return new Response(JSON.stringify({
+          id: 500001,
+          name: "A Love Other Than Yours",
+          last_episode_to_air: { air_date: newEpisodeIso, season_number: 1, episode_number: 6 },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return origFetch(url, opts);
+    };
+
+    // Simulate the rotating cursor having already walked past the 50 fresher
+    // shows on earlier ticks, exactly as it would after enough real
+    // 6-minute cron ticks -- this is the state the fix is meant to reach.
+    await env.CONFIGS.put("cron:newonstreaming:bumpcursor:US", "50");
+
+    try {
+      const res = await call(env, "/admin/api/new-on-streaming/sweep", {
+        method: "POST",
+        headers: { cookie },
+        json: { units: 1, manual: true, bump: true },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true, res.body.error);
+      assert.ok(res.body.bump);
+      assert.equal(res.body.bump.bumped, 1, "the buried show must still get checked and bumped");
+
+      const row = db._db.prepare("SELECT * FROM streaming_events WHERE imdb_id = 'tt9999999'").get();
+      assert.ok(row.last_event_at > staleAt, "last_event_at must move forward to the new episode");
+      assert.equal(row.event_kind, "episode");
+      assert.equal(row.season, 1);
+      assert.equal(row.episode, 6);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 });

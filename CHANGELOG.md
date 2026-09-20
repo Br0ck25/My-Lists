@@ -6,6 +6,11 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 New on Streaming: episode bumps could never reach most of the catalog
+
+- **A show's episode/season bump could get permanently stuck at its original arrival date, falling further and further behind MDBList's dates**: `bumpNewOnStreamingEpisodes` (`07_source-fetchers-tmdb-simkl.js`) selected which active series to re-check against TMDB with `ORDER BY last_event_at DESC LIMIT 50` — the 50 shows checked *most recently*. That selection is self-reinforcing: a show not chosen this tick has (by definition) an older `last_event_at` than the 50 that were, so it is even less likely to be chosen next tick, and once more than 50 other series are more recently active it can never be selected again — the exact reproduction is now `tests/new-on-streaming.test.mjs`'s *"still checks and bumps a series buried past the old top-50-by-recency window"*. Since this job runs on every cron tick (every 6 minutes, `wrangler.toml`) rather than being gated like the RapidAPI sweep, that ceiling was crossed almost immediately in practice, silently freezing most of the catalog's episode/season bumps while the same already-fresh 50 shows kept getting re-checked. This is what left *A Love Other Than Yours* dated by its original Sep 13 arrival on this site while [mdblist.com/new-on-streaming/](https://mdblist.com/new-on-streaming/) correctly showed it bumped to Sep 19 for its new episode.
+- Replaced the selection with a rotating `OFFSET` cursor, persisted in KV (`cron:newonstreaming:bumpcursor:<region>`, same pattern as the sweep's own `cron:newonstreaming:lastsweep`) and ordered by the stable `imdb_id` key rather than the ever-shifting `last_event_at`, so every active series is walked and re-checked in turn instead of the same top 50 being re-selected forever. The cursor advances by exactly how many rows were actually TMDB-checked that tick (not by the wider fetched batch), so a small budget — such as the Admin dashboard's manual "sweep now" bump — defers rows to the next call rather than skipping them outright.
+
 ## [1.5.5] - 2026-09-20
 
 ### 🐛 Trakt Airing Next: item counts, badges and slow search

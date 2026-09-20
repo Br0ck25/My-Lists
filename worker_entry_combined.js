@@ -18322,7 +18322,20 @@ async function d1BatchInChunks(env, statements, label) {
   }
 }
 
-// Episode bumps check active streaming series against TMDB for recent air dates
+// Episode bumps check active streaming series against TMDB for recent air dates.
+//
+// Which 50 shows get checked on a given tick used to be `ORDER BY
+// last_event_at DESC LIMIT 50` -- the shows that were bumped most recently.
+// That is self-reinforcing: a show that has not had an event lately is, by
+// definition, never in that top 50, so it can never be checked, so it can
+// never be bumped, so it never re-enters the top 50 -- permanently frozen
+// the moment more than 50 other series are more recently active than it.
+// With cron ticking every 6 minutes (wrangler.toml), that ceiling is
+// crossed almost immediately, which is why a real new episode (e.g. a show
+// dozens of spots back) never got picked up here at all. A rotating OFFSET
+// cursor, persisted in KV like the sweep's own `cron:newonstreaming:lastsweep`,
+// walks the whole active-series table a batch at a time instead, so every
+// series gets checked in turn.
 async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
   const summary = { ran: false, reason: "", checked: 0, bumped: 0, errors: 0 };
   if (!env || !env.DB) {
@@ -18338,6 +18351,36 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
   const nowSec = Math.floor(Date.now() / 1000);
   const sevenDaysAgo = nowSec - (7 * 86400);
   const region = NEW_ON_STREAMING_REGIONS[0];
+  const batchSize = 50;
+
+  let totalActive = 0;
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT COUNT(DISTINCT imdb_id) AS n FROM streaming_events
+        WHERE region = ? AND kind = 'series' AND removed_at IS NULL`
+    ).bind(region).all();
+    totalActive = Number((results && results[0] && results[0].n) || 0);
+  } catch (e) {
+    summary.reason = `Database query failed: ${e && e.message ? e.message : e}`;
+    return summary;
+  }
+
+  if (!totalActive) {
+    summary.ran = true;
+    summary.reason = "No active series in database to bump";
+    return summary;
+  }
+
+  const cursorKey = `cron:newonstreaming:bumpcursor:${region}`;
+  let cursor = 0;
+  if (env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(cursorKey);
+      const n = parseInt(raw, 10);
+      if (Number.isFinite(n) && n >= 0) cursor = n;
+    } catch (e) {}
+  }
+  const offset = cursor % totalActive;
 
   let shows = [];
   try {
@@ -18345,9 +18388,9 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
       `SELECT DISTINCT imdb_id, tmdb_id, name, last_event_at
          FROM streaming_events
         WHERE region = ? AND kind = 'series' AND removed_at IS NULL
-        ORDER BY last_event_at DESC
-        LIMIT 50`
-    ).bind(region).all();
+        ORDER BY imdb_id
+        LIMIT ? OFFSET ?`
+    ).bind(region, batchSize, offset).all();
     shows = results || [];
   } catch (e) {
     summary.reason = `Database query failed: ${e && e.message ? e.message : e}`;
@@ -18360,7 +18403,18 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
     return summary;
   }
 
+  // Advance the cursor by exactly how many rows this tick actually spends a
+  // TMDB fetch on (maxChecks), never by the wider fetched batch -- a small
+  // fetchBudget (the admin dashboard's manual "sweep now" passes just 4)
+  // must not walk the cursor past rows it never checked, or those rows are
+  // silently skipped every rotation rather than merely deferred to the next one.
   const maxChecks = Math.min(shows.length, Number.isFinite(fetchBudget) ? Math.max(5, fetchBudget) : 25);
+  if (env.CONFIGS) {
+    try {
+      await env.CONFIGS.put(cursorKey, String(offset + maxChecks), { expirationTtl: 2592000 });
+    } catch (e) {}
+  }
+
   const writes = [];
 
   for (let i = 0; i < maxChecks; i++) {
