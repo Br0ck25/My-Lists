@@ -61850,6 +61850,27 @@ document.addEventListener('DOMContentLoaded', () => {
 // livePreviewShelfData is declared globally at script start
 
 
+// Normalises a show id down to its show-level key. Plain \`id.split(':')[0]\`
+// collapses every \`tmdb:\`-prefixed show to the literal string "tmdb", so a
+// second (and third, and fourth...) tmdb-identified show reads as a
+// duplicate of the first one wherever this key is used to dedupe a merge or
+// index a lookup map -- the same normalisation bug documented as
+// DB-002/BE-002 and already fixed server-side via trackingShowKey
+// (02_http-and-creator-utils.js). This is that same fix, reimplemented
+// locally since this file runs in the browser, not the Worker.
+function _liveMergeBaseId(raw) {
+  const s = String(raw || '').toLowerCase();
+  if (!s) return '';
+  if (s.startsWith('tmdb:')) {
+    const parts = s.split(':');
+    return parts.length >= 2 ? parts[0] + ':' + parts[1] : s;
+  }
+  return s.split(':')[0];
+}
+function _liveMergeShowKey(item) {
+  return _liveMergeBaseId(item && (item.showId || item.id));
+}
+
 async function renderLivePreview() {
   const container = document.getElementById('lists');
   if (!container) return;
@@ -61940,17 +61961,27 @@ async function renderLivePreview() {
             return items.length ? items : null;
           }
         } else if (isAiringShelf) {
+          // Only items with a confirmed, still-upcoming air date belong on this
+          // shelf -- the same filter openTraktAiringNextDetailsPage already
+          // applies (17_client-my-lists-and-trakt-oauth.js). Without it, raw
+          // candidate shows that were never confirmed to have an upcoming
+          // episode (or whose episode has since aired) get merged in as if
+          // they were real Airing Next entries, inflating the shelf beyond
+          // what Trakt actually has scheduled.
+          const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
           let cachedAiring = null;
           try {
             cachedAiring = JSON.parse(localStorage.getItem('myListAddon:traktAiringNextCache') || 'null');
           } catch (e) {}
           if (Array.isArray(cachedAiring) && cachedAiring.length) {
-            return cachedAiring;
+            const filtered = stillUpcoming(cachedAiring);
+            if (filtered.length) return filtered;
           }
           const lists = window._myPrivateTraktLists || window._myTraktLists || [];
           const aList = lists.find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && (l.url === 'trakt:airing-next' || l.url.includes(':airing-next')))));
           if (aList && Array.isArray(aList.items) && aList.items.length) {
-            return aList.items;
+            const filtered = stillUpcoming(aList.items);
+            if (filtered.length) return filtered;
           }
         }
         return null;
@@ -62016,14 +62047,14 @@ async function renderLivePreview() {
                 const seen = new Set();
                 const merged = [];
                 for (const item of data.sample) {
-                  const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
+                  const id = _liveMergeShowKey(item);
                   if (id && !seen.has(id)) {
                     seen.add(id);
                     merged.push(item);
                   }
                 }
                 for (const item of fallback) {
-                  const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
+                  const id = _liveMergeShowKey(item);
                   if (id && !seen.has(id)) {
                     seen.add(id);
                     merged.push({
@@ -62057,14 +62088,14 @@ async function renderLivePreview() {
               const seen = new Set();
               const merged = [];
               for (const item of data.sample) {
-                const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
+                const id = _liveMergeShowKey(item);
                 if (id && !seen.has(id)) {
                   seen.add(id);
                   merged.push(item);
                 }
               }
               for (const item of fallback) {
-                const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
+                const id = _liveMergeShowKey(item);
                 if (id && !seen.has(id)) {
                   seen.add(id);
                   merged.push({
@@ -62324,7 +62355,7 @@ function getAiringNextIndex() {
     var a = list[i];
     if (!a) continue;
     put(byShowId, String(a.showId || ''), a, i);
-    put(byBaseId, String(a.showId || a.id || '').split(':')[0], a, i);
+    put(byBaseId, _liveMergeShowKey(a), a, i);
     if (a.canonicalTmdbId != null) put(byTmdb, 'c' + String(a.canonicalTmdbId), a, i);
     if (a.tmdbId != null) put(byTmdb, 't' + String(a.tmdbId), a, i);
     if (a.imdbId) put(byImdb, String(a.imdbId), a, i);
@@ -62346,7 +62377,7 @@ function getAiringNextIndex() {
     var sa = scheduleItems[j];
     if (!sa) continue;
     put(byShowId, String(sa.showId || ''), sa, list.length + j);
-    put(byBaseId, String(sa.showId || sa.id || '').split(':')[0], sa, list.length + j);
+    put(byBaseId, _liveMergeShowKey(sa), sa, list.length + j);
     if (sa.canonicalTmdbId != null) put(byTmdb, 'c' + String(sa.canonicalTmdbId), sa, list.length + j);
     if (sa.tmdbId != null) put(byTmdb, 't' + String(sa.tmdbId), sa, list.length + j);
     if (sa.imdbId) put(byImdb, String(sa.imdbId), sa, list.length + j);
@@ -62371,7 +62402,7 @@ function getAiringNextIndex() {
     var pa = providerAiringItems[k];
     if (!pa) continue;
     put(byShowId, String(pa.showId || pa.id || ''), pa, baseOffset + k);
-    put(byBaseId, String(pa.showId || pa.id || '').split(':')[0], pa, baseOffset + k);
+    put(byBaseId, _liveMergeShowKey(pa), pa, baseOffset + k);
     if (pa.canonicalTmdbId != null) put(byTmdb, 'c' + String(pa.canonicalTmdbId), pa, baseOffset + k);
     if (pa.tmdbId != null) put(byTmdb, 't' + String(pa.tmdbId), pa, baseOffset + k);
     if (pa.imdbId) put(byImdb, String(pa.imdbId), pa, baseOffset + k);
@@ -62401,8 +62432,8 @@ function findAiringMatchFor(m) {
   if (m.removeShowId) consider(idx.byShowId.get(String(m.removeShowId)));
   if (m.showId) consider(idx.byShowId.get(String(m.showId)));
   if (m.imdbId) consider(idx.byShowId.get(String(m.imdbId)));
-  // Predicate 2: base id (everything before the first colon) on both sides.
-  var mBase = String(m.showId || m.id || m.removeShowId || '').split(':')[0];
+  // Predicate 2: base id (colon-normalised, tmdb-aware -- see _liveMergeBaseId) on both sides.
+  var mBase = _liveMergeBaseId(m.showId || m.id || m.removeShowId);
   if (mBase) consider(idx.byBaseId.get(mBase));
   // Predicates 3-5: canonical TMDB id, TMDB id, IMDb id.
   if (m.canonicalTmdbId != null) consider(idx.byTmdb.get('c' + String(m.canonicalTmdbId)));
@@ -69647,7 +69678,7 @@ function generateSearchVariations(query) {
         if (!q) {
           // When no query is provided, return the top 20 trending/popular titles
           const src = `https://api.themoviedb.org/3/trending/${kind}/week?api_key=${encodeURIComponent(TMDB_API_KEY)}&page=1`;
-          const res = await fetch(src, {
+          const res = await fetchWithTimeout(src, {
             headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
             cf: { cacheTtl: 3600, cacheEverything: true },
           });
@@ -69689,7 +69720,7 @@ function generateSearchVariations(query) {
         const page1Src = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
           TMDB_API_KEY
         )}&query=${encodeURIComponent(q)}&include_adult=true&page=1`;
-        const page1Res = await fetch(page1Src, {
+        const page1Res = await fetchWithTimeout(page1Src, {
           headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
           cf: { cacheTtl: 3600, cacheEverything: true },
         });
@@ -69710,7 +69741,7 @@ function generateSearchVariations(query) {
                 const pSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
                   TMDB_API_KEY
                 )}&query=${encodeURIComponent(q)}&include_adult=true&page=${p}`;
-                const pRes = await fetch(pSrc, {
+                const pRes = await fetchWithTimeout(pSrc, {
                   headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                   cf: { cacheTtl: 3600, cacheEverything: true },
                 });
@@ -69735,7 +69766,7 @@ function generateSearchVariations(query) {
               const altSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
                 TMDB_API_KEY
               )}&query=${encodeURIComponent(altQ)}&include_adult=true&page=1`;
-              const altRes = await fetch(altSrc, {
+              const altRes = await fetchWithTimeout(altSrc, {
                 headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                 cf: { cacheTtl: 3600, cacheEverything: true },
               });
@@ -69755,7 +69786,7 @@ function generateSearchVariations(query) {
           try {
             const cinemetaType = kind === "tv" ? "series" : "movie";
             const cUrl = `https://v3-cinemeta.strem.io/catalog/${cinemetaType}/top/search=${encodeURIComponent(q)}.json`;
-            const cRes = await fetch(cUrl, {
+            const cRes = await fetchWithTimeout(cUrl, {
               headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
               cf: { cacheTtl: 86400, cacheEverything: true },
             });
@@ -69771,7 +69802,7 @@ function generateSearchVariations(query) {
                       if (!imdbId) return null;
                       try {
                         const findUrl = `https://api.themoviedb.org/3/find/${encodeURIComponent(imdbId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&external_source=imdb_id`;
-                        const fRes = await fetch(findUrl, {
+                        const fRes = await fetchWithTimeout(findUrl, {
                           headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                           cf: { cacheTtl: 604800, cacheEverything: true },
                         });
@@ -69799,7 +69830,7 @@ function generateSearchVariations(query) {
                       const tSrc = `https://api.themoviedb.org/3/search/${kind}?api_key=${encodeURIComponent(
                         TMDB_API_KEY
                       )}&query=${encodeURIComponent(cleanTopTitle)}&include_adult=true&page=1`;
-                      const tRes = await fetch(tSrc, {
+                      const tRes = await fetchWithTimeout(tSrc, {
                         headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
                         cf: { cacheTtl: 3600, cacheEverything: true },
                       });
@@ -69852,28 +69883,20 @@ function generateSearchVariations(query) {
             const backdrop = it.backdrop_path ? `https://image.tmdb.org/t/p/w780${it.backdrop_path}` : (it.direct_backdrop || poster || null);
             const isAdultItem = it.adult === true || it.is_adult === true || isAdultOrNsfw(it);
 
-            // If TMDB poster is missing, try backdrop or Cinemeta fallback
-            if (!poster) {
-              if (backdrop) {
-                poster = backdrop;
-              } else if (it.title || it.name) {
-                try {
-                  const cSearchRes = await fetch(
-                    `https://v3-cinemeta.strem.io/catalog/${kind === "tv" ? "series" : "movie"}/top/search=${encodeURIComponent(
-                      it.title || it.name
-                    )}.json`,
-                    { cf: { cacheTtl: 86400, cacheEverything: true } }
-                  );
-                  if (cSearchRes.ok) {
-                    const cData = await cSearchRes.json();
-                    const metas = Array.isArray(cData.metas) ? cData.metas : [];
-                    const exact = metas.find(
-                      (m) => m.name && m.name.toLowerCase() === (it.title || it.name).toLowerCase() && m.poster
-                    );
-                    poster = (exact && exact.poster) || (metas[0] && metas[0].poster) || null;
-                  }
-                } catch {}
-              }
+            // If TMDB poster is missing, fall back to the backdrop (already in
+            // hand, no extra request). A still-missing poster is left null
+            // rather than resolved here with a live per-item Cinemeta lookup:
+            // with up to ~100 results in rawResults, that was up to ~100
+            // uncapped, un-timed-out outbound fetches gating the whole
+            // response on whichever one was slowest. The client already
+            // resolves a null poster itself, the same way it resolves any
+            // <img> that fails to load: renderTitlePosterCards marks it
+            // data-needs-fallback="1" and calls resolveMissingPostersInDom
+            // right after rendering (16_client-row-core.js), which hits
+            // /api/poster-fallback per item, off the critical path and
+            // without holding up the rest of the results.
+            if (!poster && backdrop) {
+              poster = backdrop;
             }
 
             if (isAdultFilterActive && isAdultItem) {
