@@ -98,7 +98,7 @@ function makeElement() {
     classList: {
       add(...cs) { cs.forEach((c) => classes.add(c)); node.className = [...classes].join(" "); },
       remove(...cs) { cs.forEach((c) => classes.delete(c)); node.className = [...classes].join(" "); },
-      toggle(c) { const has = classes.has(c); if (has) classes.delete(c); else classes.add(c); node.className = [...classes].join(" "); return !has; },
+      toggle(c, force) { const shouldAdd = (typeof force === "boolean") ? force : !classes.has(c); if (shouldAdd) classes.add(c); else classes.delete(c); node.className = [...classes].join(" "); return shouldAdd; },
       contains: (c) => classes.has(c),
     },
     appendChild() {}, removeChild() {}, remove() {}, insertAdjacentHTML() {},

@@ -306,131 +306,37 @@ const CRON_EPISODE_CHECK_SHARE = 0.5;
 // admin dashboard's Provider Preview tab. Do NOT hand-edit them from memory --
 // re-verify through that tab, the same rule that block already carries.
 const NEW_ON_STREAMING_PROVIDERS = [
-  { key: "netflix", name: "Netflix", tmdbId: 8 },
-  { key: "primevideo", name: "Prime Video", tmdbId: 9 },
-  { key: "disney", name: "Disney+", tmdbId: 337 },
-  { key: "hbomax", name: "HBO Max", tmdbId: 1899 },
-  { key: "hulu", name: "Hulu", tmdbId: 15 },
-  { key: "appletv", name: "Apple TV+", tmdbId: 350 },
-  { key: "paramount", name: "Paramount+", tmdbId: 2303 },
-  { key: "peacock", name: "Peacock", tmdbId: 387 },
+  { key: "netflix", name: "Netflix", rapidId: "netflix" },
+  { key: "primevideo", name: "Prime Video", rapidId: "prime" },
+  { key: "disney", name: "Disney+", rapidId: "disney" },
+  { key: "hbomax", name: "HBO Max", rapidId: "hbo" },
+  { key: "hulu", name: "Hulu", rapidId: "hulu" },
+  { key: "appletv", name: "Apple TV+", rapidId: "apple" },
+  { key: "paramount", name: "Paramount+", rapidId: "paramount" },
+  { key: "peacock", name: "Peacock", rapidId: "peacock" },
 ];
 
-// Which watch_region the sweep observes. One region is not a simplification
-// that can be lifted by adding entries here: each extra region multiplies the
-// walk by the number of providers again, and a region nobody has selected is
-// a full catalog walk spent on nobody. A reader whose own region is not swept
-// is served the first entry's rows instead of an empty shelf -- stated plainly
-// in the catalog's own error path rather than silently.
+const RAPIDAPI_CHANGES_URL = "https://streaming-availability.p.rapidapi.com/changes";
+const RAPIDAPI_HOST = "streaming-availability.p.rapidapi.com";
+const NEW_ON_STREAMING_WINDOW_DAYS = 30;
+const NEW_ON_STREAMING_DEFAULT_CATALOGS = "netflix,prime,hulu,disney,hbo,apple,paramount,peacock";
 const NEW_ON_STREAMING_REGIONS = ["US"];
 
-// The walk reads each provider catalog to its END, and the depth is LEARNED
-// rather than configured: every discover response carries total_pages, so the
-// sweep records how deep each provider+kind actually goes and walks exactly
-// that far.
-//
-// It shipped with a fixed 40-page horizon instead, and that quietly broke the
-// feature's whole premise. Sorted by release date descending, 40 pages is the
-// ~800 most recently RELEASED titles -- one to three years. A 2010 film added
-// to Netflix today sits far outside that window, so the sweep never fetched
-// the page it was on and the title never entered the table at all: not as an
-// arrival, not even as a seeded row. The list could only ever report new
-// releases arriving, which is the case that needed it least, and is exactly
-// the failure this feature was built to fix.
-//
-// This is the only hard bound left, and it is TMDB's, not a choice: discover
-// stops paginating at page 500 (10,000 titles). No single service's flatrate
-// catalogue in one region comes near it.
-const NEW_ON_STREAMING_MAX_PAGES_PER_CATALOG = 500;
+// RapidAPI Streaming Availability Quota Limits & Schedule:
+// Basic plan hard limit: 1,000 requests per month, 1,000 requests per hour.
+// Safety cap stops automated and manual sweeps at 950 to ensure no overages occur.
+const RAPIDAPI_MONTHLY_LIMIT = 1000;
+const RAPIDAPI_MONTHLY_SAFETY_CAP = 950;
 
-// Sweep units (one provider + kind + page) per tick.
-//
-// Raised from 12 now that a pass covers whole catalogues rather than their
-// first 40 pages. A pass is roughly 1,000-1,500 pages in total across the
-// eight services and both types -- the sweep measures the real number and the
-// admin panel reports it -- so 40 a tick brings a full pass in around three
-// hours on the recommended */6 schedule. That is the detection latency for a
-// back-catalogue arrival and, now, for a removal.
-//
-// It is not how long the shelf takes to look right: the walk is page-major
-// (see newOnStreamingCombos), so the first 16 units are page 1 of every
-// provider and kind and the newest titles everywhere are in within one tick.
-// The hours after that only add depth.
-//
-// The budget check uses NEW_ON_STREAMING_SWEEP_FETCHES (21) as a per-page
-// ceiling, so 40 pages reserves 840 against the ~1,175 the sweep is given.
-// That ceiling is only ever paid on a first walk; once IMDb ids are cached a
-// page costs one fetch.
-const NEW_ON_STREAMING_PAGES_PER_TICK = 40;
+// Runs every 4 hours via cron (~180 runs/month). With 1-2 pages per incremental
+// run, this uses ~180-360 requests/month, staying safely within the 1,000 limit.
+const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 14400;
 
-// Budget ceiling for one sweep unit: the discover page itself, plus an IMDb
-// resolution for each of its 20 items. Like CRON_CHART_WARM_FETCHES this is a
-// ceiling and not an average -- the sweep asks D1 which of the page's TMDB ids
-// it already has and resolves only the rest, so a page of titles already in
-// the table costs the single discover fetch. A first walk pays the full 21.
-const NEW_ON_STREAMING_SWEEP_FETCHES = 21;
-
-// Share of the budget the sweep may claim -- and specifically, a share of the
-// reserve the EPISODE sweep is handed but cannot reach.
-//
-// The episode half is given CRON_EPISODE_CHECK_SHARE of the tick (5,000 at the
-// default) while CRON_EPISODE_CHECK_MAX caps what it can actually spend at 300,
-// so 4,700 fetches are reserved every tick by something that will never ask for
-// them. Taking this from there rather than from the pre-warm's share is what
-// keeps the guarantee the pre-warm already had: on the default budget the
-// entire chart list still warms in ONE tick, so no chart is ever left for the
-// next one. Take it from the pre-warm instead and 35 of the 40 charts fit,
-// which is a working feature quietly degraded to pay for a new one.
-//
-// At the default that is 1,175 fetches -- comfortably more than the 252 a
-// 12-unit tick can spend at its own ceiling. On a free Worker the episode
-// reserve is 24 and fully reachable, so this comes out at 0 and the sweep
-// skips itself with one log line, exactly as chart pre-warming does.
+// Maximum pages fetched per sweep
+const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 3;
+const NEW_ON_STREAMING_PAGES_PER_TICK = NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP;
+const NEW_ON_STREAMING_SWEEP_FETCHES = 1;
 const CRON_NEW_ON_STREAMING_SHARE = 0.25;
-
-// How far back an episode counts as "just aired" for the re-bump pass, how
-// many discover pages of candidates it collects per provider, and how many
-// shows it may resolve exactly per tick.
-//
-// The window is wider than a week so a show is not missed when a tick is
-// dropped; re-bumping a show to a date it already holds is a no-op, so overlap
-// is free.
-//
-// Three pages rather than one because the candidate scan is popularity-ordered
-// and a busy service can have well over twenty shows airing inside the window
-// -- at one page, a mid-list show's new episode would simply never be seen.
-// Widening the candidate list is nearly free: candidates are then narrowed to
-// the shows this add-on already carries, and the per-show answer is KV-cached
-// for six hours, so the pages cost 3 fetches each and most of the resolutions
-// cost none.
-const NEW_ON_STREAMING_EPISODE_WINDOW_DAYS = 10;
-const NEW_ON_STREAMING_EPISODE_SCAN_PAGES = 3;
-const NEW_ON_STREAMING_EPISODE_SHOWS_PER_TICK = 40;
-
-// --- Marking a title as gone ------------------------------------------------
-//
-// A completed pass has visited every page of every catalogue, so a row it did
-// not see is a title that is no longer there. That is the only evidence
-// available, and it is worth being careful with: the cost of a false removal
-// is a title vanishing from the shelf, and then -- when the next pass finds it
-// again -- reappearing at the top as an arrival that never happened.
-//
-// Three guards, in increasing order of how badly things have to be going:
-//
-//   GRACE_WALKS   a row must be missed by this many CONSECUTIVE completed
-//                 passes before it is marked gone. Two passes is several hours
-//                 of TMDB consistently not listing it, which no ordinary
-//                 hiccup survives.
-//   MAX_PASS_ERRORS  a pass that could not read this many pages did not
-//                 establish that anything is absent; it marks nothing.
-//   MAX_REMOVAL_SHARE  and if a pass somehow still concludes that more than
-//                 this fraction of everything on record has vanished at once,
-//                 the conclusion is wrong. It marks nothing and says so
-//                 loudly, because that is a provider or an API having a bad
-//                 day, not a quarter of the catalogue leaving overnight.
-const NEW_ON_STREAMING_REMOVAL_GRACE_WALKS = 2;
-const NEW_ON_STREAMING_MAX_PASS_ERRORS = 20;
-const NEW_ON_STREAMING_MAX_REMOVAL_SHARE = 0.25;
 
 // Ships dark. The sweep, the catalog and the /lists route are live as soon as
 // this deploys -- tmdb:new-on-streaming resolves, installs into Stremio and
@@ -520,6 +426,8 @@ const CREATOR_LIST_ORDER_MAX = 5000;
 // the load-bearing half. The minimum length applies to newly set answers.
 const RESET_KEY_ACCOUNT_MAX_FAILURES = 5;
 const RECOVERY_ANSWER_MIN_LENGTH = 8;
+const FORGOT_USERNAME_IP_MAX_FAILURES = 5;
+const FORGOT_USERNAME_IP_TTL_SEC = 900;
 
 // --- Bound on /api/channel-logo's inlined image ------------------------------
 //
@@ -548,6 +456,7 @@ const CHANNEL_LOGO_MAX_BYTES = 2 * 1024 * 1024;
 // how a missing Worker secret or var normally reads.
 function applyEnvApiKeys(env) {
   TMDB_API_KEY = (env && env.TMDB_API_KEY) || "";
+  RAPIDAPI_KEY = (env && (env.RAPIDAPI_KEY || env.STREAMING_AVAILABILITY_API_KEY)) || "";
   TRAKT_CLIENT_ID = (env && env.TRAKT_CLIENT_ID) || "";
   SIMKL_CLIENT_ID = (env && env.SIMKL_CLIENT_ID) || "";
   SIMKL_CLIENT_SECRET = (env && env.SIMKL_CLIENT_SECRET) || "";
@@ -719,6 +628,7 @@ const RESOLVE_PROXY_PER_MINUTE = 20;
 // (the MDBList key / Trakt Client ID boxes in the builder page) -- these
 // are only ever the fallback for someone who hasn't filled those in.
 let TMDB_API_KEY = "";
+let RAPIDAPI_KEY = "";
 let MDBLIST_API_KEY = "";
 let MDBLIST_POPULAR_KEY = "";
 let MDBLIST_CLIENT_ID = "";
@@ -939,6 +849,14 @@ const D1_SCHEMA_MANIFEST = [
   {
     migration: "0012", kind: "column", table: "creator_show_states", name: "airing_removed_episode",
     consequence: "The other half of the pair above; without it a stored removal has no episode to be superseded by, so watching another episode could not bring the show back.",
+  },
+  {
+    migration: "0013", kind: "table", name: "creator_key_lookups",
+    consequence: "Account Key lookup index falls back to KV keylookup:* only.",
+  },
+  {
+    migration: "0013", kind: "index", name: "idx_creator_key_lookups_username",
+    consequence: "Deleting or updating an account's key lookup by username scans the table instead of an index. Slower, not broken.",
   },
 ];
 

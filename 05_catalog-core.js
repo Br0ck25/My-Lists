@@ -144,10 +144,12 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     if (source === "mdblist-watchlist") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistWatchlist(entry, skip, mdblistKey, keys.mdblistAccessToken || ""); }
     else if (source === "mdblist-history") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistHistory(entry, skip, mdblistKey, keys.mdblistAccessToken || ""); }
     else if (source === "mdblist-airing-next") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistAiringNext(entry, skip, mdblistKey, keys.mdblistAccessToken || "", keys.tmdbKey || TMDB_API_KEY, keys.env, keys.ctx); }
+    else if (source === "mdblist-upnext") { trackSharedApiUse(keys, !(keys.mdblistKey || keys.mdblistAccessToken), "mdblist"); result = await fetchMdblistUpNext(entry, skip, mdblistKey, keys.mdblistAccessToken || "", keys.tmdbKey || TMDB_API_KEY, keys.env, keys.ctx); }
     else if (source === "trakt") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTrakt(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
     else if (source === "trakt-watchlist") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktWatchlist(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
     else if (source === "trakt-history") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktHistory(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
     else if (source === "trakt-airing-next") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktAiringNext(entry, skip, traktKey, keys.traktAccessToken || "", keys.tmdbKey || TMDB_API_KEY, keys.env, keys.ctx); }
+    else if (source === "trakt-continue-watching") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktContinueWatching(entry, skip, traktKey, keys.traktAccessToken || "", keys.env, keys.ctx); }
     else if (source === "tmdb") { trackSharedApiUse(keys, true, "tmdb"); result = await fetchTmdb(entry, skip, TMDB_API_KEY); }
     else if (source === "tmdb-chart") {
       trackSharedApiUse(keys, true, "tmdb");
@@ -971,7 +973,7 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
     : sourceItems;
   const mapped = items
     .filter((it) => {
-      if (!it || !it.imdbId) return false;
+      if (!it || (!it.imdbId && !it.id && !it.showId)) return false;
       const itType = it.kind || it.type;
       if (entry.type === 'movie') {
         if (itType === 'series' || itType === 'tv') return false;
@@ -981,11 +983,25 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
       return true;
     })
     .map((it) => ({
-      id: it.imdbId,
+      id: it.imdbId || it.id || it.showId,
+      showId: it.showId || (!it.isMovie && (it.imdbId || it.id)),
       type: entry.type || (it.kind === 'series' || it.type === 'series' || it.type === 'tv' ? 'series' : 'movie'),
-      name: it.title,
-      poster: it.poster || undefined,
+      name: it.title || it.name || it.showTitle,
+      poster: it.poster || it.showPoster || undefined,
       releaseInfo: it.year || undefined,
+      seasonNum: it.seasonNum != null ? it.seasonNum : (it.season != null ? it.season : undefined),
+      episodeNum: it.episodeNum != null ? it.episodeNum : (it.episode != null ? it.episode : undefined),
+      airDate: it.airDate || undefined,
+      airTime: it.airTime || undefined,
+      isUnaired: it.isUnaired || undefined,
+      isSeasonPremiere: it.isSeasonPremiere || undefined,
+      isSeasonFinale: it.isSeasonFinale || undefined,
+      seasonFinaleAirDate: it.seasonFinaleAirDate || undefined,
+      seasonFinaleEpisodeNumber: it.seasonFinaleEpisodeNumber != null ? it.seasonFinaleEpisodeNumber : undefined,
+      isCompanion: it.isCompanion || undefined,
+      companionType: it.companionType || undefined,
+      companionNote: it.companionNote || undefined,
+      companionStoryline: it.companionStoryline || undefined,
     }));
   // Paginate like every other in-memory source (see fetchCuratedCatalog
   // just above for the same slice(skip, skip+PAGE_SIZE) + totalItems
@@ -1322,13 +1338,17 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
           ).bind(username).all().then(r => r.results || []).catch(() => null),
         ]);
         const fullyWatchedSet = new Set((fwRows || []).map(r => String(r.show_id)));
+        const airingShowSet = new Set((airingRows || []).map(r => String(r.show_id || '')).filter(Boolean));
         if (rows && rows.length) {
           items = rows.filter(r => {
             if (!r) return false;
             const sid = String(r.show_id || '');
             const base = trackingShowKey(sid);
             const isComp = r.show_title && r.show_title.startsWith('COMPANION:');
-            if (!isComp && (fullyWatchedSet.has(sid) || (base && fullyWatchedSet.has(base)))) return false;
+            if (isComp) return true;
+            if (airingShowSet.has(sid) || (base && airingShowSet.has(base))) return true;
+            if (r.is_unaired || r.isUnaired || (r.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(r.airDate)) || (r.air_date && typeof isEpisodeAired === 'function' && !isEpisodeAired(r.air_date))) return true;
+            if (fullyWatchedSet.has(sid) || (base && fullyWatchedSet.has(base))) return false;
             return true;
           }).map(r => {
             let isCompanion = undefined;
@@ -1432,11 +1452,14 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
           const fwList = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
+            const airingShowSet = new Set((airingItems || []).map(r => String((r && (r.showId || r.id)) || '')).filter(Boolean));
             items = items.filter(it => {
               if (!it) return false;
               if (it.isCompanion) return true;
               const sid = String(it.showId || it.id || '');
               const base = trackingShowKey(sid);
+              if (airingShowSet.has(sid) || (base && airingShowSet.has(base))) return true;
+              if (it.isUnaired || (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate))) return true;
               if (fwSet.has(sid) || (base && fwSet.has(base))) return false;
               return true;
             });
@@ -1452,11 +1475,14 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
           const fwList = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
+            const airingShowSet = new Set((airingItems || []).map(r => String((r && (r.showId || r.id)) || '')).filter(Boolean));
             items = items.filter(it => {
               if (!it) return false;
               if (it.isCompanion) return true;
               const sid = String(it.showId || it.id || '');
               const base = trackingShowKey(sid);
+              if (airingShowSet.has(sid) || (base && airingShowSet.has(base))) return true;
+              if (it.isUnaired || (it.airDate && typeof isEpisodeAired === 'function' && !isEpisodeAired(it.airDate))) return true;
               if (fwSet.has(sid) || (base && fwSet.has(base))) return false;
               return true;
             });
@@ -1519,9 +1545,9 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       let isSeasonFinale = it.isSeasonFinale ? true : undefined;
       let seasonFinaleAirDate = it.seasonFinaleAirDate || undefined;
       let seasonFinaleEpisodeNumber = it.seasonFinaleEpisodeNumber != null ? it.seasonFinaleEpisodeNumber : undefined;
+      let airingMatch = null;
 
       if (slug === 'continue-watching' && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
-        let airingMatch = null;
         if (it.showId && airingByShowId.has(String(it.showId))) airingMatch = airingByShowId.get(String(it.showId));
         else if (it.id && airingByShowId.has(String(it.id))) airingMatch = airingByShowId.get(String(it.id));
         else {
@@ -1544,7 +1570,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
             }
             const currentEpNum = it.episodeNum != null ? it.episodeNum : (isSameEpisode ? airingMatch.episodeNum : null);
             const hasLaterAiringEp = !!(isSameSeason && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
-            const epHasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' && isEpisodeAired(effectiveAirDate));
+            const epHasAired = (effectiveAirDate && typeof isEpisodeAired === 'function') ? isEpisodeAired(effectiveAirDate) : hasLaterAiringEp;
             if (isSeasonPremiere == null) {
               const isPremiere = !epHasAired && (currentEpNum === 1 || (currentEpNum == null && (it.isSeasonPremiere || (isSameEpisode && airingMatch.isSeasonPremiere))));
               if (isPremiere) isSeasonPremiere = true;
@@ -1582,6 +1608,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         poster: showPoster,
         releaseInfo: it.year || undefined,
         airDate: effectiveAirDate,
+        airTime: it.airTime || (airingMatch && airingMatch.airTime) || undefined,
         isUnaired: it.isUnaired ? true : undefined,
         isSeasonPremiere: isSeasonPremiere,
         isSeasonFinale: isSeasonFinale,
@@ -2017,8 +2044,10 @@ function sanitizeSharedChannel(raw) {
 function sharedChannelSummary(code, record) {
   const channel = record.channel || {};
   const showKeys = new Set((channel.items || []).map(channelItemShowKey));
+  const sampleItems = (channel.items || []).slice(0, 9);
   return {
     code: code,
+    slug: typeof slugifyServer === 'function' ? slugifyServer(channel.name || "channel") : "channel",
     name: channel.name || "Shared Channel",
     // The listing's own line when it has one, and the channel's otherwise --
     // so a channel that describes itself needs nothing typed again to be
@@ -2036,6 +2065,13 @@ function sharedChannelSummary(code, record) {
     dynamic: channel.dynamic || "",
     owner: record.owner || "",
     publishedAt: record.publishedAt || 0,
+    sample: sampleItems.map((it) => ({
+      name: it.showName || it.title || '',
+      subtitle: it.epName || (it.season != null && it.episode != null ? ('S' + it.season + 'E' + it.episode) : ''),
+      poster: it.thumbnail || it.poster || it.showPoster || it.backdrop || '',
+      id: it.imdbId || it.id || '',
+      kind: it.kind || it.type || 'series',
+    })),
   };
 }
 

@@ -257,10 +257,10 @@ function getListCleanPath(listUrl, name) {
   if (mdbMatch) {
     return '/lists/mdblist/' + mdbMatch[1] + '/' + mdbMatch[2];
   }
-  if (rawUrl === 'mdblist:watchlist' || (rawUrl.startsWith('mdblist:') && normName.includes('watchlist'))) {
+  if (rawUrl === 'mdblist:watchlist' || (rawUrl.startsWith('mdblist:') && (normName.includes('watchlist') || normName.includes('watch list')))) {
     return '/lists/mdblist/watchlist';
   }
-  if (rawUrl === 'mdblist:history' || (rawUrl.startsWith('mdblist:') && normName.includes('history'))) {
+  if (rawUrl === 'mdblist:history' || (rawUrl.startsWith('mdblist:') && (normName.includes('history') || normName.includes('watch history')))) {
     return '/lists/mdblist/history';
   }
   if (rawUrl.startsWith('mdblist:list:')) {
@@ -278,10 +278,10 @@ function getListCleanPath(listUrl, name) {
   if (traktMatch) {
     return '/lists/trakt/' + traktMatch[1] + '/' + traktMatch[2];
   }
-  if (rawUrl === 'trakt:watchlist' || (rawUrl.startsWith('trakt:') && normName.includes('watchlist'))) {
+  if (rawUrl === 'trakt:watchlist' || (rawUrl.startsWith('trakt:') && (normName.includes('watchlist') || normName.includes('watch list')))) {
     return '/lists/trakt/watchlist';
   }
-  if (rawUrl === 'trakt:history' || (rawUrl.startsWith('trakt:') && normName.includes('history'))) {
+  if (rawUrl === 'trakt:history' || (rawUrl.startsWith('trakt:') && (normName.includes('history') || normName.includes('watch history')))) {
     return '/lists/trakt/history';
   }
   if (rawUrl === 'trakt:collection' || (rawUrl.startsWith('trakt:') && normName.includes('collection'))) {
@@ -381,10 +381,21 @@ function isListAddedToConfig(url, type, slug) {
       }
     }
     if (targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
-      const nameInput = entry.querySelector('.name');
-      const cleanName = targetSlug.replace('-', ' ');
-      if (nameInput && nameInput.value.trim().toLowerCase().startsWith(cleanName)) {
-        return true;
+      const urlInputs = entry.querySelectorAll('.url');
+      let hasExternalProviderUrl = false;
+      for (const el of urlInputs) {
+        const u = el.value.trim().toLowerCase();
+        if (u.startsWith('trakt:') || u.startsWith('mdblist:') || u.startsWith('simkl:') || u.startsWith('tmdb:') || u.startsWith('letterboxd:') || u.startsWith('http://') || u.startsWith('https://')) {
+          hasExternalProviderUrl = true;
+          break;
+        }
+      }
+      if (!hasExternalProviderUrl) {
+        const nameInput = entry.querySelector('.name');
+        const cleanName = targetSlug.replace('-', ' ');
+        if (nameInput && nameInput.value.trim().toLowerCase().startsWith(cleanName)) {
+          return true;
+        }
       }
     }
   }
@@ -427,10 +438,20 @@ function removeListFromConfig(url, type, slug) {
       }
     }
     if (!match && targetSlug && (targetSlug === 'continue-watching' || targetSlug === 'watch-history' || targetSlug === 'watchlist')) {
-      const nameInput = entry.querySelector('.name');
-      const cleanName = targetSlug.replace('-', ' ');
-      if (nameInput && nameInput.value.trim().toLowerCase().startsWith(cleanName)) {
-        match = true;
+      let hasExternalProviderUrl = false;
+      for (const el of urlInputs) {
+        const u = el.value.trim().toLowerCase();
+        if (u.startsWith('trakt:') || u.startsWith('mdblist:') || u.startsWith('simkl:') || u.startsWith('tmdb:') || u.startsWith('letterboxd:') || u.startsWith('http://') || u.startsWith('https://')) {
+          hasExternalProviderUrl = true;
+          break;
+        }
+      }
+      if (!hasExternalProviderUrl) {
+        const nameInput = entry.querySelector('.name');
+        const cleanName = targetSlug.replace('-', ' ');
+        if (nameInput && nameInput.value.trim().toLowerCase().startsWith(cleanName)) {
+          match = true;
+        }
       }
     }
     if (match) {
@@ -501,10 +522,10 @@ function updateAllListAddButtons() {
   });
 
   // 5. Search result list add buttons
-  document.querySelectorAll('.list-search-add-btn').forEach((btn) => {
+  document.querySelectorAll('.list-search-add-btn, .searchAddBtn').forEach((btn) => {
     const url = btn.dataset.url;
     const type = btn.dataset.type;
-    const isAdded = isListAddedToConfig(url, type);
+    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(url, type) || isListAddedToConfig(url, 'movie') || isListAddedToConfig(url, 'series') || isListAddedToConfig(url)) : false;
     btn.classList.toggle('is-added', isAdded);
     btn.classList.toggle('secondary', isAdded);
     btn.classList.toggle('primary', !isAdded);
@@ -512,11 +533,11 @@ function updateAllListAddButtons() {
     btn.style.color = isAdded ? 'var(--danger)' : '';
   });
 
-  // 6. Provider My Lists add buttons (Simkl, Trakt, MDBList)
-  document.querySelectorAll('.myListAddBtn').forEach((btn) => {
+  // 6. Provider My Lists add buttons (Simkl, Trakt, MDBList, TMDB)
+  document.querySelectorAll('.myListAddBtn, .myPrivateListAddBtn').forEach((btn) => {
     const url = btn.dataset.url;
     const type = btn.dataset.type;
-    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(url, type) || isListAddedToConfig(null, type, url)) : false;
+    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(url, type) || isListAddedToConfig(null, type, url) || isListAddedToConfig(url, 'movie') || isListAddedToConfig(url, 'series') || isListAddedToConfig(url)) : false;
     btn.classList.toggle('is-added', isAdded);
     btn.classList.toggle('secondary', isAdded);
     btn.classList.toggle('primary', !isAdded);
@@ -848,24 +869,412 @@ function switchTab(name) {
   }
 }
 
-function showAddedToast(msg) {
-  let toast = document.getElementById('actionToast');
-  if (!toast) {
-    toast = document.createElement('div');
-    toast.id = 'actionToast';
-    toast.className = 'action-toast';
-    // Matches the static #actionToast in 09_page-shell.js, which is the copy
-    // that normally exists; this branch only runs if that one is missing.
-    toast.setAttribute('role', 'status');
-    toast.setAttribute('aria-live', 'polite');
-    document.body.appendChild(toast);
+let _appToastTimer = null;
+
+function showToast(message, type = 'info', options = {}) {
+  const duration = typeof options.duration === 'number' ? options.duration : 3000;
+  let container = document.getElementById('appToastContainer');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'appToastContainer';
+    container.className = 'app-toast-container';
+    container.setAttribute('role', 'region');
+    container.setAttribute('aria-label', 'Notifications');
+    document.body.appendChild(container);
   }
-  toast.textContent = msg || 'Added to My Catalogs \u2713';
-  toast.classList.add('show');
-  clearTimeout(toast._timer);
-  toast._timer = setTimeout(() => {
+
+  container.innerHTML = '';
+  clearTimeout(_appToastTimer);
+
+  const toast = document.createElement('div');
+  toast.className = 'app-toast app-toast--' + (type || 'info');
+  toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+  toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
+
+  const textSpan = document.createElement('span');
+  textSpan.className = 'app-toast-msg';
+  textSpan.textContent = message || '';
+  toast.appendChild(textSpan);
+
+  if (options.actionText && typeof options.onAction === 'function') {
+    const actionBtn = document.createElement('button');
+    actionBtn.type = 'button';
+    actionBtn.className = 'app-toast-action';
+    actionBtn.textContent = options.actionText;
+    actionBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      options.onAction();
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 250);
+    });
+    toast.appendChild(actionBtn);
+  }
+
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'app-toast-close';
+  closeBtn.setAttribute('aria-label', 'Close notification');
+  closeBtn.innerHTML = '\u2715';
+  closeBtn.addEventListener('click', () => {
     toast.classList.remove('show');
-  }, 2200);
+    setTimeout(() => { if (toast.parentNode) toast.remove(); }, 250);
+  });
+  toast.appendChild(closeBtn);
+
+  const dismiss = () => {
+    toast.classList.remove('show');
+    setTimeout(() => { if (toast.parentNode) toast.remove(); }, 250);
+  };
+  toast.dismiss = dismiss;
+
+  container.appendChild(toast);
+
+  requestAnimationFrame(() => {
+    toast.classList.add('show');
+  });
+
+  if (duration > 0) {
+    _appToastTimer = setTimeout(dismiss, duration);
+  }
+
+  return toast;
+}
+
+function hideToast() {
+  clearTimeout(_appToastTimer);
+  const container = document.getElementById('appToastContainer');
+  if (container) {
+    const toasts = container.querySelectorAll('.app-toast');
+    toasts.forEach((t) => {
+      t.classList.remove('show');
+      setTimeout(() => { if (t.parentNode) t.remove(); }, 250);
+    });
+  }
+}
+
+function showAddedToast(msg) {
+  showToast(msg || 'Added to My Catalogs \u2713', 'success');
+}
+
+function debounce(fn, delayMs = 300) {
+  let timer = null;
+  const debounced = function(...args) {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      fn.apply(this, args);
+    }, delayMs);
+  };
+  debounced.cancel = function() {
+    clearTimeout(timer);
+    timer = null;
+  };
+  return debounced;
+}
+
+function formatRatingBadgeHtml(item, options = {}) {
+  if (!item) return '';
+  if (options.isLivePreviewShelf || item.isLivePreviewShelf) return '';
+  if (typeof getBadgeSetting === 'function' && !getBadgeSetting('showBadgeRating')) return '';
+  let ratingNum = null;
+  let ratingType = '';
+  if (item.imdbRating != null && item.imdbRating !== '') {
+    const p = parseFloat(item.imdbRating);
+    if (!isNaN(p) && p > 0) {
+      ratingNum = p;
+      ratingType = 'imdb';
+    }
+  }
+  if (ratingNum == null && item.rating != null && item.rating !== '') {
+    const p = parseFloat(item.rating);
+    if (!isNaN(p) && p > 0) {
+      ratingNum = p;
+      ratingType = (item.ratingSource === 'imdb' || (item.id && String(item.id).startsWith('tt'))) ? 'imdb' : 'tmdb';
+    }
+  }
+  if (ratingNum == null && item.vote_average != null && item.vote_average !== '') {
+    const p = parseFloat(item.vote_average);
+    if (!isNaN(p) && p > 0) {
+      ratingNum = p;
+      ratingType = 'tmdb';
+    }
+  }
+  if (ratingNum == null && item.score != null && item.score !== '') {
+    const p = parseFloat(item.score);
+    if (!isNaN(p) && p > 0) {
+      ratingNum = p > 10 ? p / 10 : p;
+      ratingType = 'tmdb';
+    }
+  }
+  if (ratingNum == null || ratingNum <= 0) return '';
+  if (typeof getBadgeSetting === 'function') {
+    if (ratingType === 'imdb' && !getBadgeSetting('showBadgeImdbRating')) return '';
+    if (ratingType === 'tmdb' && !getBadgeSetting('showBadgeTmdbRating')) return '';
+  }
+  const scoreClass = ratingNum >= 7.5 ? 'rating-high' : (ratingNum >= 6.0 ? 'rating-mid' : 'rating-low');
+  const title = ratingType === 'imdb' ? 'IMDb: ' + ratingNum.toFixed(1) : 'TMDb: ' + ratingNum.toFixed(1);
+  return '<div class="rating-badge ' + scoreClass + '" data-rating-type="' + escapeAttr(ratingType) + '" title="' + escapeAttr(title) + '">&#9733; ' + ratingNum.toFixed(1) + '</div>';
+}
+window.formatRatingBadgeHtml = formatRatingBadgeHtml;
+
+function formatRatingSpanHtml(item, options = {}) {
+  if (!item) return '';
+  if (options.isLivePreviewShelf || item.isLivePreviewShelf) return '';
+  const source = typeof getPosterRatingSource === 'function' ? getPosterRatingSource() : 'tmdb';
+  if (source === 'none') return '';
+  if (typeof getBadgeSetting === 'function' && !getBadgeSetting('showBadgeRating')) return '';
+  if (typeof getBadgeSetting === 'function' && !getBadgeSetting('showBadgeTmdbRating')) return '';
+
+  let ratingNum = null;
+  if (item.vote_average != null && item.vote_average !== '') {
+    const p = parseFloat(item.vote_average);
+    if (!isNaN(p) && p > 0) ratingNum = p;
+  } else if (item.tmdbRating != null && item.tmdbRating !== '') {
+    const p = parseFloat(item.tmdbRating);
+    if (!isNaN(p) && p > 0) ratingNum = p;
+  } else if (item.rating != null && item.rating !== '') {
+    const p = parseFloat(item.rating);
+    if (!isNaN(p) && p > 0) ratingNum = p;
+  } else if (item.score != null && item.score !== '') {
+    const p = parseFloat(item.score);
+    if (!isNaN(p) && p > 0) ratingNum = p > 10 ? p / 10 : p;
+  } else if (item.imdbRating != null && item.imdbRating !== '') {
+    const p = parseFloat(item.imdbRating);
+    if (!isNaN(p) && p > 0) ratingNum = p;
+  }
+
+  if (ratingNum == null || ratingNum <= 0) return '';
+  return '<span class="poster-rating" data-rating-type="tmdb" style="color:#f5c518; font-weight:700; font-size:0.75rem; margin-left:auto; flex-shrink:0;">&#9733; ' + ratingNum.toFixed(1) + '</span>';
+}
+window.formatRatingSpanHtml = formatRatingSpanHtml;
+
+function renderMediaCard(item, options = {}) {
+  if (!item) return '';
+  const title = item.title || item.name || '';
+  const poster = item.poster || (typeof resolveClientPoster === 'function' ? resolveClientPoster(item, item.poster) : '');
+  const year = item.year || '';
+  
+  const cardClass = 'live-preview-poster-card' + (options.cardClass ? ' ' + options.cardClass : '');
+  
+  let dataAttrStr = '';
+  if (options.dataAttrs && typeof options.dataAttrs === 'object') {
+    for (const key in options.dataAttrs) {
+      if (options.dataAttrs[key] != null) {
+        dataAttrStr += ' data-' + escapeAttr(key) + '="' + escapeAttr(String(options.dataAttrs[key])) + '"';
+      }
+    }
+  }
+
+  const styleStr = options.style ? ' style="' + options.style + '"' : '';
+
+  const posterImg = poster
+    ? '<img class="live-preview-poster" src="' + escapeAttr(poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+    : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+
+  const topLeft = options.topLeftHtml !== undefined ? options.topLeftHtml : '';
+  const topRight = options.topRightHtml || '';
+  const overlay = options.overlayHtml || '';
+
+  let subtitle = options.subtitleHtml;
+  if (subtitle === undefined) {
+    const ratingSpan = (typeof formatRatingSpanHtml === 'function') ? formatRatingSpanHtml(item, options) : '';
+    if (ratingSpan && year) {
+      subtitle = '<div style="display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%;"><span>' + escapeHtml(String(year)) + '</span>' + ratingSpan + '</div>';
+    } else if (ratingSpan) {
+      subtitle = '<div style="display:flex; align-items:center; justify-content:flex-end; gap:4px; width:100%;">' + ratingSpan + '</div>';
+    } else {
+      subtitle = year ? escapeHtml(String(year)) : '';
+    }
+  }
+
+  return '<div class="' + escapeAttr(cardClass) + '"' + dataAttrStr + styleStr + '>' +
+    '<div style="position:relative; width:100%;">' +
+      posterImg +
+      topLeft +
+      topRight +
+      overlay +
+    '</div>' +
+    '<div class="live-preview-poster-name" title="' + escapeAttr(title) + '">' + escapeHtml(title) + '</div>' +
+    (subtitle ? '<div class="live-preview-poster-year">' + subtitle + '</div>' : '') +
+  '</div>';
+}
+
+function createSortableList(container, options = {}) {
+  if (!container) return null;
+  if (container._sortableList) return container._sortableList;
+
+  const itemSelector = options.itemSelector || '.entry';
+  const handleSelector = options.handleSelector !== undefined ? options.handleSelector : '.drag-handle, .drag-handle-list';
+  const dragClass = options.dragClass || 'dragging';
+  const onReorder = typeof options.onReorder === 'function' ? options.onReorder : () => {};
+  const axis = options.axis || 'y';
+  const holdDelay = typeof options.holdDelay === 'number' ? options.holdDelay : (handleSelector ? 0 : 120);
+
+  let activeItem = null;
+  let isDragging = false;
+  let holdTimer = null;
+  let startX = 0;
+  let startY = 0;
+
+  function cancelHold() {
+    if (holdTimer) {
+      clearTimeout(holdTimer);
+      holdTimer = null;
+    }
+  }
+
+  function moveItem(y, x) {
+    if (!activeItem) return;
+    const targetParent = activeItem.parentNode || container;
+    const items = [...targetParent.querySelectorAll(itemSelector + ':not(.' + dragClass + ')')];
+    if (axis === 'xy' && typeof x === 'number') {
+      let targetCard = null;
+      for (const child of items) {
+        const box = child.getBoundingClientRect();
+        if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) {
+          targetCard = child;
+          break;
+        }
+      }
+      if (targetCard && targetCard !== activeItem) {
+        const box = targetCard.getBoundingClientRect();
+        const isAfter = (y > box.top + box.height / 2) || (y >= box.top && x > box.left + box.width / 2);
+        if (isAfter) {
+          targetParent.insertBefore(activeItem, targetCard.nextSibling);
+        } else {
+          targetParent.insertBefore(activeItem, targetCard);
+        }
+        return;
+      }
+    }
+    const afterEl = items.reduce((closest, child) => {
+      const box = child.getBoundingClientRect();
+      const offset = y - box.top - box.height / 2;
+      if (offset < 0 && offset > closest.offset) {
+        return { offset: offset, element: child };
+      }
+      return closest;
+    }, { offset: -Infinity, element: null }).element;
+
+    if (afterEl == null) {
+      targetParent.appendChild(activeItem);
+    } else if (afterEl !== activeItem) {
+      targetParent.insertBefore(activeItem, afterEl);
+    }
+  }
+
+  function startDragging(item) {
+    isDragging = true;
+    activeItem = item;
+    activeItem.classList.add(dragClass);
+    document.body.style.userSelect = 'none';
+    if (typeof navigator !== 'undefined' && navigator.vibrate) {
+      try { navigator.vibrate(30); } catch (err) {}
+    }
+  }
+
+  function stopDragging() {
+    cancelHold();
+    if (isDragging && activeItem) {
+      activeItem.classList.remove(dragClass);
+      onReorder();
+    }
+    isDragging = false;
+    activeItem = null;
+    document.body.style.userSelect = '';
+  }
+
+  // HTML5 Drag events for desktop when handle exists
+  if (handleSelector) {
+    container.addEventListener('dragstart', (e) => {
+      if (typeof options.canDrag === 'function' && !options.canDrag(e)) return;
+      const handle = e.target.closest(handleSelector);
+      if (!handle) { e.preventDefault(); return; }
+      if (e.target.closest('input, button, select, textarea, a, .customListRemovePickBtn, .channelRemovePickBtn')) return;
+      activeItem = handle.closest(itemSelector);
+      if (!activeItem) return;
+      activeItem.classList.add(dragClass);
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', activeItem.dataset && activeItem.dataset.slug ? activeItem.dataset.slug : ''); } catch (err) {}
+      }
+    });
+
+    container.addEventListener('dragover', (e) => {
+      if (!activeItem) return;
+      e.preventDefault();
+      moveItem(e.clientY, e.clientX);
+    });
+
+    container.addEventListener('dragend', () => {
+      if (!activeItem) return;
+      activeItem.classList.remove(dragClass);
+      activeItem = null;
+      onReorder();
+    });
+  }
+
+  // Pointer events for mobile touch, and desktop hold-to-drag
+  container.addEventListener('pointerdown', (e) => {
+    if (typeof options.canDrag === 'function' && !options.canDrag(e)) return;
+    if (e.target.closest('input, button, select, textarea, a, .customListRemovePickBtn, .channelRemovePickBtn, .customListPosInput, .channelPosInput')) return;
+    const handle = handleSelector ? e.target.closest(handleSelector) : e.target.closest(itemSelector);
+    if (!handle) return;
+    const item = handle.closest(itemSelector);
+    if (!item) return;
+
+    const isTouch = e.pointerType === 'touch' || e.pointerType === 'pen';
+    if (!isTouch && handleSelector && holdDelay === 0) {
+      return;
+    }
+
+    cancelHold();
+    activeItem = item;
+    isDragging = false;
+    startX = e.clientX;
+    startY = e.clientY;
+
+    const delay = isTouch ? Math.max(holdDelay, 140) : holdDelay;
+    if (delay > 0) {
+      holdTimer = setTimeout(() => {
+        startDragging(item);
+      }, delay);
+    } else {
+      startDragging(item);
+      try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+    }
+
+    const onPointerMove = (ev) => {
+      if (!activeItem) return;
+      if (!isDragging) {
+        const dist = Math.hypot(ev.clientX - startX, ev.clientY - startY);
+        if (dist > 12) {
+          cancelHold();
+          activeItem = null;
+        }
+        return;
+      }
+      if (ev.cancelable) ev.preventDefault();
+      moveItem(ev.clientY, ev.clientX);
+    };
+
+    const onPointerEnd = () => {
+      document.removeEventListener('pointermove', onPointerMove);
+      stopDragging();
+    };
+
+    document.addEventListener('pointermove', onPointerMove, { passive: false });
+    document.addEventListener('pointerup', onPointerEnd, { once: true });
+    document.addEventListener('pointercancel', onPointerEnd, { once: true });
+  });
+
+  const instance = {
+    destroy() {
+      delete container._sortableList;
+    }
+  };
+  container._sortableList = instance;
+  return instance;
 }
 
 // handlePosterImgError used to be defined here as well. Every client
@@ -1135,6 +1544,16 @@ function showAppAlert(title, message, isSuccess = false) {
   showModal(html);
 }
 
+if (typeof window !== 'undefined') {
+  window.alert = function(message) {
+    if (typeof showToast === 'function') {
+      showToast(String(message), 'error');
+    } else if (typeof showAppAlert === 'function') {
+      showAppAlert('Notice', String(message));
+    }
+  };
+}
+
 // The third member of the showAppAlert/showAppConfirm family: a dialog for
 // the gap between confirming something slow and hearing how it went.
 //
@@ -1186,6 +1605,100 @@ function showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger = tr
       if (typeof onConfirm === 'function') onConfirm();
     };
   }
+}
+
+function confirmDialog(message, title = 'Confirm Action', confirmBtnText = 'Confirm', isDanger = true) {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const finish = (result) => {
+      if (!resolved) {
+        resolved = true;
+        resolve(result);
+      }
+    };
+    showAppConfirm(title, message, confirmBtnText, () => finish(true), isDanger);
+    const overlay = document.getElementById('activeModalOverlay');
+    if (overlay) {
+      const cancelBtn = overlay.querySelector('button.secondary');
+      if (cancelBtn) {
+        cancelBtn.onclick = () => {
+          closeModal();
+          finish(false);
+        };
+      }
+      const closeBtn = overlay.querySelector('.action-btn[aria-label="Close"]');
+      if (closeBtn) {
+        closeBtn.onclick = () => {
+          closeModal();
+          finish(false);
+        };
+      }
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) finish(false);
+      });
+      const onKey = (e) => {
+        if (e.key === 'Escape') {
+          document.removeEventListener('keydown', onKey, true);
+          finish(false);
+        }
+      };
+      document.addEventListener('keydown', onKey, true);
+    }
+  });
+}
+
+function showAppPrompt(title, message, defaultValue, onConfirm) {
+  const html =
+    '<div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">' +
+      '<h3 style="margin:0; font-size:1.1rem;">' + escapeHtml(title) + '</h3>' +
+      '<button type="button" class="action-btn" aria-label="Close" onclick="closeModal()" style="width:32px; height:32px; min-height:unset; padding:0; border-radius:50%; background:var(--bg); color:var(--muted); border:1px solid var(--border-strong); display:inline-flex; align-items:center; justify-content:center; font-size:1rem; line-height:1; cursor:pointer; flex:none;">\u2715</button>' +
+    '</div>' +
+    (message ? '<p style="margin:0 0 12px; color:var(--muted); font-size:0.9rem;">' + escapeHtml(message) + '</p>' : '') +
+    '<input type="text" id="appPromptInput" class="input" style="width:100%; margin-bottom:16px;" value="' + escapeAttr(defaultValue || '') + '" />' +
+    '<div style="display:flex; justify-content:flex-end; gap:8px;">' +
+      '<button type="button" class="secondary" onclick="closeModal()" style="min-width:80px; padding:8px 16px;">Cancel</button>' +
+      '<button type="button" class="primary" id="appPromptBtn" style="min-width:80px; padding:8px 16px;">OK</button>' +
+    '</div>';
+  showModal(html);
+  const input = document.getElementById('appPromptInput');
+  const btn = document.getElementById('appPromptBtn');
+  if (input) {
+    input.focus();
+    input.select();
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (btn) btn.click();
+      }
+    });
+  }
+  if (btn) {
+    btn.onclick = () => {
+      const val = input ? input.value : '';
+      closeModal();
+      if (typeof onConfirm === 'function') onConfirm(val);
+    };
+  }
+}
+
+function promptDialog(title, message, defaultValue = '') {
+  return new Promise((resolve) => {
+    let resolved = false;
+    showAppPrompt(title, message, defaultValue, (val) => {
+      resolved = true;
+      resolve(val);
+    });
+    const overlay = document.getElementById('activeModalOverlay');
+    if (overlay) {
+      const cancelBtn = overlay.querySelector('button.secondary');
+      if (cancelBtn) {
+        cancelBtn.onclick = () => {
+          closeModal();
+          if (!resolved) { resolved = true; resolve(null); }
+        };
+      }
+    }
+  });
 }
 
 function restoreActiveTab() {
@@ -1730,6 +2243,10 @@ function renderDiscoverChartsList(type, forceRefresh) {
   const container = document.getElementById('discoverListsFeed');
   if (!container) return;
   window._discoverFeedsCache = window._discoverFeedsCache || {};
+  if (forceRefresh) {
+    window._discoverFeedsCache[type] = null;
+    if (window._listPreviewCache) window._listPreviewCache.clear();
+  }
   if (!forceRefresh && window._discoverFeedsCache[type]) {
     container.innerHTML = window._discoverFeedsCache[type];
     window._currentDiscoverRenderedFilter = type;

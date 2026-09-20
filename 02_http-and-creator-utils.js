@@ -615,6 +615,115 @@ function generateCreatorKey() {
   return "MYL-" + groups.join("-");
 }
 
+// --- Creator Key Lookups (Blind Index for Forgot Username) -------------------
+//
+// A Creator Key is ~60 bits of entropy (12 characters from a 32-symbol alphabet).
+// The database stores only a salted PBKDF2 hash, which cannot be searched.
+// To allow a person who still has their Key (and Recovery Answer) to recover
+// their Username without admin help, a deterministic SHA-256 hash ("blind index")
+// maps the key to the username:
+//   lookup_hash = SHA-256("keylookup:" + normalizedKey)
+//
+// The lookup hash gives O(1) resolution in D1 and KV. A match then undergoes
+// full authoritative verification against key_hash and recovery_answer_hash.
+
+async function creatorKeyLookupHash(key) {
+  const normalized = String(key || "").trim().toUpperCase();
+  if (!normalized) return "";
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("keylookup:" + normalized));
+  return bufferToHex(new Uint8Array(digest));
+}
+
+function creatorKeyLookupKey(hash) {
+  return `keylookup:${hash}`;
+}
+
+function creatorLookupHashKey(username) {
+  return `creatorlookuphash:${username}`;
+}
+
+async function storeCreatorKeyLookup(env, key, username) {
+  if (!env || !key || !username) return;
+  const lookupHash = await creatorKeyLookupHash(key);
+  if (!lookupHash) return;
+  const now = Date.now();
+  if (env.DB) {
+    try {
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO creator_key_lookups (lookup_hash, username, created_at) VALUES (?, ?, ?)"
+      ).bind(lookupHash, username, now).run();
+    } catch (dbErr) {
+      console.error("D1 write error (storeCreatorKeyLookup):", dbErr);
+    }
+  }
+  if (env.CONFIGS) {
+    try {
+      const oldHash = await env.CONFIGS.get(creatorLookupHashKey(username));
+      if (oldHash && oldHash !== lookupHash) {
+        await env.CONFIGS.delete(creatorKeyLookupKey(oldHash));
+      }
+      await env.CONFIGS.put(creatorKeyLookupKey(lookupHash), username);
+      await env.CONFIGS.put(creatorLookupHashKey(username), lookupHash);
+    } catch (kvErr) {
+      console.error("KV write error (storeCreatorKeyLookup):", kvErr);
+    }
+  }
+}
+
+async function deleteCreatorKeyLookup(env, username, key) {
+  if (!env) return;
+  let lookupHash = key ? await creatorKeyLookupHash(key) : "";
+  if (env.DB) {
+    try {
+      if (lookupHash) {
+        await env.DB.prepare("DELETE FROM creator_key_lookups WHERE lookup_hash = ?").bind(lookupHash).run();
+      } else if (username) {
+        await env.DB.prepare("DELETE FROM creator_key_lookups WHERE username = ?").bind(username).run();
+      }
+    } catch (dbErr) {
+      console.error("D1 delete error (deleteCreatorKeyLookup):", dbErr);
+    }
+  }
+  if (env.CONFIGS) {
+    try {
+      if (!lookupHash && username) {
+        lookupHash = (await env.CONFIGS.get(creatorLookupHashKey(username))) || "";
+      }
+      if (lookupHash) {
+        await env.CONFIGS.delete(creatorKeyLookupKey(lookupHash));
+      }
+      if (username) {
+        await env.CONFIGS.delete(creatorLookupHashKey(username));
+      }
+    } catch (kvErr) {
+      console.error("KV delete error (deleteCreatorKeyLookup):", kvErr);
+    }
+  }
+}
+
+async function usernameForCreatorKeyLookup(env, key) {
+  if (!env || !key) return "";
+  const lookupHash = await creatorKeyLookupHash(key);
+  if (!lookupHash) return "";
+  if (env.DB) {
+    try {
+      const row = await env.DB.prepare("SELECT username FROM creator_key_lookups WHERE lookup_hash = ?").bind(lookupHash).first();
+      if (row && row.username) return row.username;
+    } catch (dbErr) {
+      console.error("D1 read error (usernameForCreatorKeyLookup):", dbErr);
+    }
+  }
+  if (env.CONFIGS) {
+    try {
+      const u = (await env.CONFIGS.get(creatorKeyLookupKey(lookupHash))) || "";
+      if (u) return u;
+    } catch (kvErr) {
+      console.error("KV read error (usernameForCreatorKeyLookup):", kvErr);
+    }
+  }
+  return "";
+}
+
 // "user" is reserved because that's the literal namespace anonymous
 // (unclaimed) published lists already live under (see /api/publish-list) --
 // a creator registering it would collide with every anonymous list ever
@@ -3018,6 +3127,7 @@ async function purgeCreatorData(env, username, options = {}) {
         await env.DB.prepare("DELETE FROM list_likes WHERE voter_id = ?").bind(`u:${u}`).run();
       }
       await env.DB.prepare("DELETE FROM scrobble_tokens WHERE username = ?").bind(u).run();
+      await env.DB.prepare("DELETE FROM creator_key_lookups WHERE username = ?").bind(u).run();
       await env.DB.prepare("DELETE FROM watch_history WHERE username = ?").bind(u).run();
       await env.DB.prepare("DELETE FROM continue_watching WHERE username = ?").bind(u).run();
       await env.DB.prepare("DELETE FROM airing_next WHERE username = ?").bind(u).run();
@@ -3045,6 +3155,18 @@ async function purgeCreatorData(env, username, options = {}) {
     // A live webhook credential for an account that is about to stop
     // existing is exactly the kind of leftover that must not be reported as
     // a clean delete.
+    dataSweepFailed = true;
+  }
+
+  try {
+    const staleLookupHash = await env.CONFIGS.get(creatorLookupHashKey(u));
+    if (staleLookupHash) {
+      await env.CONFIGS.delete(creatorKeyLookupKey(staleLookupHash));
+      await env.CONFIGS.delete(creatorLookupHashKey(u));
+      keysCleared += 2;
+    }
+  } catch (e) {
+    console.error("purgeCreatorData: could not clean creator key lookup", e);
     dataSweepFailed = true;
   }
 

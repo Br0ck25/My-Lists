@@ -430,6 +430,7 @@ function renderAccountKeySection() {
     return;
   }
   const key = localStorage.getItem('myListAddon:creatorKey') || '';
+  const hasRecovery = localStorage.getItem('myListAddon:hasRecoveryAnswer') === '1';
   box.innerHTML =
     '<div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; flex-wrap:wrap; gap:8px;">' +
     '<div>' +
@@ -445,6 +446,22 @@ function renderAccountKeySection() {
     '<button type="button" class="secondary" onclick="copyAccountKey()">Copy Key</button>' +
     '</div>' +
     '<p style="margin-top:10px;"><small>Anyone with this key can sign in as you and edit your lists &mdash; keep it somewhere safe, and don&apos;t share it.</small></p>' +
+    '<div class="recovery-section" style="margin-top:16px; padding:14px 16px; border:1px solid rgba(255,255,255,0.12); border-radius:12px; background:rgba(255,255,255,0.03);">' +
+      '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; flex-wrap:wrap; gap:6px;">' +
+        '<div style="font-weight:700; font-size:0.9rem; color:var(--text);">Account Recovery</div>' +
+        '<span style="font-size:0.75rem; font-weight:700; padding:2px 8px; border-radius:6px;' + (hasRecovery ? ' background:rgba(52,199,89,0.15); color:#34c759;' : ' background:rgba(255,149,0,0.15); color:#ff9500;') + '">' +
+          (hasRecovery ? '\u2713 Configured' : '\u26A0 Not Set') +
+        '</span>' +
+      '</div>' +
+      '<p style="margin:0 0 10px; font-size:0.82rem; color:var(--muted);">' +
+        (hasRecovery
+          ? 'Your recovery answer is active. It can reset your key if lost, or find your username.'
+          : 'You have not set a recovery answer. Add one so you can recover your username or reset your key if you ever lose them.') +
+      '</p>' +
+      '<button type="button" class="secondary lc-btn" onclick="openSetRecoveryAnswerModal()">' +
+        (hasRecovery ? 'Update Recovery Answer' : 'Set Recovery Answer') +
+      '</button>' +
+    '</div>' +
     '<div class="danger-zone" style="margin-top:20px; padding:14px 16px; border:1px solid rgba(255,149,0,0.35); border-radius:12px; background:rgba(255,149,0,0.06);">' +
       '<div style="font-weight:700; font-size:0.9rem; color:#ff9500; margin-bottom:4px;">Reset Account</div>' +
       '<p style="margin:0 0 10px; font-size:0.82rem; color:var(--muted);">Delete every list, channel, preset, watch history entry and catalog row on this account, returning it to how it was when you created it. Your account and key stay the same, and you stay signed in.</p>' +
@@ -455,6 +472,73 @@ function renderAccountKeySection() {
       '<p style="margin:0 0 10px; font-size:0.82rem; color:var(--muted);">Permanently delete your account, all published lists, and all synced data from the server.</p>' +
       '<button type="button" class="lc-btn" style="background:#ff3b30; color:#fff; border:none; padding:7px 14px; font-weight:700; border-radius:8px; cursor:pointer;" onclick="openDeleteAccountModal()">Delete Account &amp; All Data</button>' +
     '</div>';
+}
+
+function openSetRecoveryAnswerModal() {
+  const hasRecovery = localStorage.getItem('myListAddon:hasRecoveryAnswer') === '1';
+  showModal(
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+    '<h2>' + (hasRecovery ? 'Update Recovery Answer' : 'Set Recovery Answer') + '</h2>' +
+    '<p class="modal-sub">Choose an answer you will remember (e.g. your childhood pet, first school, or a passphrase). Must be at least 8 characters.</p>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="setRecoveryAnswerInput" placeholder="Recovery Answer (8+ characters)" minlength="8"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="setRecoveryAnswerConfirmInput" placeholder="Confirm Recovery Answer" minlength="8"></div>' +
+    '<div id="setRecoveryAnswerError"></div>' +
+    '<div class="actions" style="margin-top:14px;">' +
+    '<button type="button" class="primary" id="setRecoveryAnswerBtn" onclick="submitSetRecoveryAnswer()">Save Recovery Answer</button>' +
+    '<button type="button" class="secondary" onclick="closeModal()">Cancel</button>' +
+    '</div>'
+  );
+}
+
+async function submitSetRecoveryAnswer() {
+  if (!activeCreator) return;
+  const answer = document.getElementById('setRecoveryAnswerInput').value.trim();
+  const confirm = document.getElementById('setRecoveryAnswerConfirmInput').value.trim();
+  const errBox = document.getElementById('setRecoveryAnswerError');
+  if (!answer) {
+    errBox.innerHTML = '<p class="testresult err">Enter a Recovery Answer.</p>';
+    return;
+  }
+  if (answer.length < 8) {
+    errBox.innerHTML = '<p class="testresult err">Recovery Answer must be at least 8 characters.</p>';
+    return;
+  }
+  if (answer.toLowerCase() !== confirm.toLowerCase()) {
+    errBox.innerHTML = '<p class="testresult err">Answers do not match.</p>';
+    return;
+  }
+  const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
+  if (!creatorKey) {
+    errBox.innerHTML = '<p class="testresult err">Account Key missing. Please sign in again.</p>';
+    return;
+  }
+  const endSubmit = beginSubmit('setRecoveryAnswer', '#setRecoveryAnswerBtn', 'Saving\u2026');
+  if (!endSubmit) return;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/recovery-answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        creatorName: activeCreator.creatorName,
+        creatorKey: creatorKey,
+        recoveryAnswer: answer,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      errBox.innerHTML = '<p class="testresult err">' + escapeHtml(data.error || 'Could not save recovery answer.') + '</p>';
+      return;
+    }
+    localStorage.setItem('myListAddon:hasRecoveryAnswer', '1');
+    closeModal();
+    if (typeof showAddedToast === 'function') showAddedToast('Recovery Answer saved!');
+    renderAccountKeySection();
+  } catch (e) {
+    errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
+  }
 }
 
 // Empties the account without deleting it: every list, channel, preset,
@@ -472,7 +556,7 @@ async function openResetAccountModal() {
   if (!activeCreator) return;
   const confirmFn = typeof showAppConfirm === 'function'
     ? showAppConfirm
-    : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+    : (title, msg, btnText, cb) => { cb(); };
   confirmFn(
     'Reset Account Data',
     'This deletes every list, channel, preset, catalog row and watch history entry on your account, on this device and on the server. Your account name and key stay the same and you will remain signed in. This cannot be undone.',
@@ -748,12 +832,28 @@ function renderHiddenListsSettingsSection() {
     });
   }
 
+  // If provider lists are not loaded yet but credentials exist, trigger background fetch so this panel populates
+  if (!window._myPrivateTraktLists && !window._myTraktLists && ((typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken'))) {
+    if (typeof runMyPrivateTraktLists === 'function') runMyPrivateTraktLists();
+    else if (typeof runMyTraktLists === 'function') runMyTraktLists();
+  }
+  if (!window._myMdblistLists && ((typeof mdblistAccessToken !== 'undefined' && mdblistAccessToken) || localStorage.getItem('myListAddon:mdblistAccessToken') || localStorage.getItem('myListAddon:mdblistKey'))) {
+    if (typeof runMyMdblistLists === 'function') runMyMdblistLists();
+  }
+  if (!window._mySimklLists && ((typeof simklAccessToken !== 'undefined' && simklAccessToken) || localStorage.getItem('myListAddon:simklAccessToken') || localStorage.getItem('myListAddon:simklKey'))) {
+    if (typeof runMySimklLists === 'function') runMySimklLists();
+  }
+  if (!window._myTmdbLists && ((typeof tmdbSessionId !== 'undefined' && tmdbSessionId) || localStorage.getItem('myListAddon:tmdbSessionId') || localStorage.getItem('myListAddon:tmdbKey'))) {
+    if (typeof runMyTmdbLists === 'function') runMyTmdbLists();
+  }
+
   // Connected providers -- each keyed by url, matching the filter applied
   // in that provider's own render function (17_client-my-lists-and-trakt-
   // oauth.js). Simkl's own 'simkl:user:shows:airing-next' entry naturally
   // lands under its own "Simkl Airing Next" label via the url check below.
   const providerLists = [
     { arr: window._myMdblistLists, label: 'MDBList' },
+    { arr: window._myPrivateTraktLists, label: 'Trakt' },
     { arr: window._myTraktLists, label: 'Trakt' },
     { arr: window._myTmdbLists, label: 'TMDB' },
     { arr: window._mySimklLists, label: 'Simkl' },
@@ -842,28 +942,9 @@ function onHiddenSectionToggle(cb) {
 function renderRemovedAiringNextSettingsSection() {
   const box = document.getElementById('removedAiringNextSettingsSection');
   if (!box) return;
+  box.innerHTML = '';
   const panel = box.closest('.panel');
-  const shows = (typeof getRemovedAiringNextShows === 'function') ? getRemovedAiringNextShows() : [];
-  if (!shows.length) {
-    box.innerHTML = '';
-    if (panel) panel.style.display = 'none';
-    return;
-  }
-  if (panel) panel.style.display = '';
-  box.innerHTML = shows.map((sh) =>
-    '<div style="display:flex; align-items:center; gap:10px; padding:6px 0; border-bottom:1px solid var(--border);">' +
-      // onerror takes the element out rather than hiding it: a backslash in
-      // this file never reaches the browser (the whole bundle is served from
-      // inside a template literal), so an inline handler here cannot contain
-      // an escaped quote -- the admin page lost a whole day to exactly that,
-      // see CHANGELOG.md. this.remove() needs no nested string at all.
-      (sh.poster
-        ? '<img src="' + escapeAttr(sh.poster) + '" alt="" loading="lazy" style="width:34px; height:51px; object-fit:cover; border-radius:4px; flex-shrink:0;" onerror="this.remove()">'
-        : '') +
-      '<span style="font-weight:600; min-width:0; overflow-wrap:anywhere; flex:1;">' + escapeHtml(sh.title) + '</span>' +
-      '<button type="button" class="lc-btn secondary" data-show-id="' + escapeAttr(sh.showIds.join(',')) + '" onclick="onRestoreAiringNextShow(this)" style="flex-shrink:0;">Put Back</button>' +
-    '</div>'
-  ).join('');
+  if (panel) panel.style.display = 'none';
 }
 
 function onRestoreAiringNextShow(btn) {
@@ -1154,7 +1235,9 @@ function copyScrobbleWebhookUrl() {
     else if (typeof showAppAlert === 'function') showAppAlert('Copied', 'Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.', true);
     else alert('Scrobble Webhook URL copied to clipboard! Paste this URL into Plex, Jellyfin, or Emby webhooks settings.');
   }).catch(() => {
-    prompt('Copy your Scrobble Webhook URL:', input.value);
+    if (typeof showAppPrompt === 'function') {
+      showAppPrompt('Scrobble Webhook URL', 'Copy your Scrobble Webhook URL below:', input.value);
+    }
   });
 }
 
@@ -1220,7 +1303,9 @@ function copyAccountKey() {
     if (typeof showAddedToast === 'function') showAddedToast('Key copied to clipboard! \u2713');
     else alert('Key copied to your clipboard.');
   }).catch(() => {
-    prompt('Copy your Key:', key);
+    if (typeof showAppPrompt === 'function') {
+      showAppPrompt('Account Key', 'Copy your key below:', key);
+    }
   });
 }
 
@@ -1401,7 +1486,10 @@ function openRestoreModal() {
     '<button type="button" class="primary" id="restoreSubmitBtn" onclick="submitRestoreProfile()">Login</button>' +
     '<button type="button" class="secondary" onclick="closeModal(); openCreateProfileModal();">Need an account? Create one</button>' +
     '</div>' +
-    '<p class="modal-sub" style="margin-top:14px;"><a href="#" onclick="event.preventDefault(); closeModal(); openForgotKeyModal();">Forgot your key?</a></p>'
+    '<div style="display:flex; justify-content:space-between; align-items:center; margin-top:14px; font-size:0.85rem;">' +
+    '<a href="#" onclick="event.preventDefault(); closeModal(); openForgotKeyModal();">Forgot key?</a>' +
+    '<a href="#" onclick="event.preventDefault(); closeModal(); openForgotUsernameModal();">Forgot username?</a>' +
+    '</div>'
   );
 }
 
@@ -1436,6 +1524,7 @@ async function submitRestoreProfile() {
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', key);
+    localStorage.setItem('myListAddon:hasRecoveryAnswer', data.hasRecoveryAnswer ? '1' : '0');
     closeModal();
     // Released here, not in the finally below: what follows is the sign-in
     // tail, and loadCreatorSync can take as long as the network takes. Holding
@@ -1507,6 +1596,7 @@ async function submitForgotKey() {
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
+    localStorage.setItem('myListAddon:hasRecoveryAnswer', '1');
     closeModal();
     // Released before the sign-in tail, same reasoning as
     // submitRestoreProfile -- see there.
@@ -1523,6 +1613,77 @@ async function submitForgotKey() {
   } finally {
     endSubmit();
   }
+}
+
+// Self-service username lookup for anyone who has their Account Key
+// (and Recovery Answer if configured on their account).
+function openForgotUsernameModal() {
+  showModal(
+    '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+    '<h2>Find Your Username</h2>' +
+    '<p class="modal-sub">Enter your Account Key and Recovery Answer (if you set one) to retrieve your username.</p>' +
+    '<div class="row"><input type="text" id="forgotUsernameKeyInput" placeholder="Key (e.g. MYL-XXXX-XXXX-XXXX)"></div>' +
+    '<div class="row" style="margin-top:8px;"><input type="text" id="forgotUsernameAnswerInput" placeholder="Recovery Answer (if set)"></div>' +
+    '<div id="forgotUsernameModalError"></div>' +
+    '<div class="actions" style="margin-top:14px;">' +
+    '<button type="button" class="primary" id="forgotUsernameSubmitBtn" onclick="submitForgotUsername()">Find Username</button>' +
+    '<button type="button" class="secondary" onclick="closeModal(); openRestoreModal();">Back to Login</button>' +
+    '</div>'
+  );
+}
+
+async function submitForgotUsername() {
+  const key = document.getElementById('forgotUsernameKeyInput').value.trim();
+  const answer = document.getElementById('forgotUsernameAnswerInput').value.trim();
+  const errBox = document.getElementById('forgotUsernameModalError');
+  if (!key) {
+    errBox.innerHTML = '<p class="testresult err">Enter your Account Key.</p>';
+    return;
+  }
+  const endSubmit = beginSubmit('forgotUsername', '#forgotUsernameSubmitBtn', 'Searching\u2026');
+  if (!endSubmit) return;
+
+  try {
+    const res = await fetch(ORIGIN + '/api/creator/forgot-username', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ creatorKey: key, recoveryAnswer: answer || undefined }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      errBox.innerHTML = '<p class="testresult err">' + escapeHtml(data.error || 'No matching account found.') + '</p>';
+      return;
+    }
+    const username = data.username;
+    showModal(
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+      '<h2>Account Found</h2>' +
+      '<p class="modal-sub" style="margin-bottom:6px;">Your Username is:</p>' +
+      '<div class="creator-key-display" style="font-size:1.1rem; font-weight:700; user-select:all;">' + escapeHtml(username) + '</div>' +
+      (data.displayName && data.displayName !== username ? '<p class="modal-sub" style="margin-top:8px;">Display Name: <strong>' + escapeHtml(data.displayName) + '</strong></p>' : '') +
+      '<div class="actions" style="margin-top:18px;">' +
+      '<button type="button" class="primary" id="loginWithFoundUserBtn">Login with this Username</button>' +
+      '<button type="button" class="secondary" onclick="closeModal()">Done</button>' +
+      '</div>'
+    );
+    const loginBtn = document.getElementById('loginWithFoundUserBtn');
+    if (loginBtn) {
+      loginBtn.onclick = () => proceedToLoginWithUsername(username, key);
+    }
+  } catch (e) {
+    errBox.innerHTML = '<p class="testresult err">Network error.</p>';
+  } finally {
+    endSubmit();
+  }
+}
+
+function proceedToLoginWithUsername(username, key) {
+  closeModal();
+  openRestoreModal();
+  const nameInput = document.getElementById('restoreNameInput');
+  const keyInput = document.getElementById('restoreKeyInput');
+  if (nameInput) nameInput.value = username;
+  if (keyInput) keyInput.value = key;
 }
 
 
@@ -2496,9 +2657,18 @@ async function loadCreatorSync(opts) {
     // Only rebuild lists table DOM if the list config actually changed or it's a full initial load
     if (!isBackgroundResume || configChanged) {
       suppressSave = true;
+      const currentEntries = (typeof collectEntries === 'function') ? collectEntries() : [];
+      const newLocalEntries = currentEntries.filter(cur => {
+        if (!cur || !cur.url) return false;
+        const curUrl = String(cur.url).trim();
+        return !(synced.config || []).some(s => s && String(s.url).trim() === curUrl && s.type === cur.type);
+      });
       document.getElementById('lists').innerHTML = '';
       if (Array.isArray(synced.config)) {
         synced.config.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
+      }
+      if (newLocalEntries.length) {
+        newLocalEntries.forEach((e) => addRow(e.name, e.url, e.type, e.enabled, e.group, e.id));
       }
       renumber();
       suppressSave = false;
@@ -2821,6 +2991,8 @@ async function loadCreatorSync(opts) {
       const badgeKeys = [
         { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
         { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+        { key: 'showBadgesTraktContinueWatching', id: 'badgeTraktContinueWatchingCheckbox' },
+        { key: 'showBadgesMdblistUpNext', id: 'badgeMdblistUpNextCheckbox' },
         { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
         { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
         { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
@@ -2831,6 +3003,8 @@ async function loadCreatorSync(opts) {
         { key: 'showBadgeSeasonFinale', id: 'badgeSeasonFinaleCheckbox' },
         { key: 'showBadgeSeasonFinaleDate', id: 'badgeSeasonFinaleDateCheckbox' },
         { key: 'showBadgeRating', id: 'badgeRatingCheckbox' },
+        { key: 'showBadgeImdbRating', id: 'badgeImdbRatingCheckbox' },
+        { key: 'showBadgeTmdbRating', id: 'badgeTmdbRatingCheckbox' },
         { key: 'showBadgeWatched', id: 'badgeWatchedCheckbox' },
       ];
       badgeKeys.forEach(({ key, id }) => {
@@ -2840,6 +3014,23 @@ async function loadCreatorSync(opts) {
           if (el) el.checked = synced.keys[key];
         }
       });
+      if (typeof synced.keys.posterRatingSource === 'string' || typeof synced.keys.showBadgeTmdbRating !== 'undefined') {
+        const isTmdb = synced.keys.posterRatingSource === 'tmdb' || (synced.keys.posterRatingSource !== 'none' && synced.keys.showBadgeTmdbRating !== false);
+        try {
+          localStorage.setItem('myListAddon:posterRatingSource', isTmdb ? 'tmdb' : 'none');
+          localStorage.setItem('myListAddon:showBadgeTmdbRating', isTmdb ? '1' : '0');
+          localStorage.setItem('myListAddon:showBadgeRating', isTmdb ? '1' : '0');
+          localStorage.setItem('myListAddon:showBadgeImdbRating', '0');
+        } catch (e) {}
+        const tmdbCb = document.getElementById('badgeTmdbRatingCheckbox');
+        if (tmdbCb) tmdbCb.checked = isTmdb;
+        const rNone = document.getElementById('posterRatingNoneRadio');
+        const rImdb = document.getElementById('posterRatingImdbRadio');
+        const rTmdb = document.getElementById('posterRatingTmdbRadio');
+        if (rNone) rNone.checked = !isTmdb;
+        if (rImdb) rImdb.checked = false;
+        if (rTmdb) rTmdb.checked = isTmdb;
+      }
     }
 
     // Watch History / Continue Watching -- merge server tracking items with
@@ -3237,6 +3428,7 @@ async function submitCreateProfile() {
     localStorage.setItem('myListAddon:creatorName', data.creatorName);
     localStorage.setItem('myListAddon:creatorDisplayName', data.displayName || data.creatorName);
     localStorage.setItem('myListAddon:creatorKey', data.creatorKey);
+    localStorage.setItem('myListAddon:hasRecoveryAnswer', recoveryAnswer ? '1' : '0');
     renderCreatorProfileBar();
     renderAccountKeySection();
     renderWatchlistPreferencesSection();
@@ -3288,9 +3480,11 @@ function copyRevealedCreatorKey() {
     setTimeout(() => { if (btn) btn.textContent = 'Copy Key'; }, 2000);
   };
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(onCopied).catch(() => prompt('Copy this key:', text));
+    navigator.clipboard.writeText(text).then(onCopied).catch(() => {
+      if (typeof showAppPrompt === 'function') showAppPrompt('Account Key', 'Copy this key:', text);
+    });
   } else {
-    prompt('Copy this key:', text);
+    if (typeof showAppPrompt === 'function') showAppPrompt('Account Key', 'Copy this key:', text);
   }
 }
 
@@ -4125,7 +4319,7 @@ async function renderCreatorDashboard(options) {
           overlays += '<div class="list-card-count-overlay desktop-only creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
         }
         const removeBtn = isWatchlist
-          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>'
+          ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist" aria-label="Remove from Watchlist">\u2715</button>'
           : '';
         const posterType = it.kind || (it.type !== 'mixed' ? (it.type || '') : '') || (it.showId ? 'series' : (l.type === 'mixed' ? '' : (l.type || '')));
         const itemPoster = resolveItemPoster(it);
@@ -4133,16 +4327,17 @@ async function renderCreatorDashboard(options) {
         const posterEl = itemPoster
           ? '<img src="' + escapeAttr(itemPoster) + '" class="clickable-poster" data-id="' + escapeAttr(it.showId || it.imdbId || it.id || (it.tmdbId ? ('tmdb:' + it.tmdbId) : '')) + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
           : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1" style="width:100%;height:100%;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
-        return '<div class="list-card-mini-poster-tile" data-id="' + escapeAttr(it.showId || it.imdbId || it.id || '') + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '">' +
-          '<div class="list-card-mini-poster-img-wrap">' +
-            posterEl +
-            removeBtn +
-            overlays +
-          '</div>' +
-          '<div class="list-card-mini-poster-name">' + escapeHtml(label.title || it.title || it.name || '') + '</div>' +
-          (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
-          (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
-        '</div>';
+          const ratingSpan = typeof formatRatingSpanHtml === 'function' ? formatRatingSpanHtml(it) : '';
+          return '<div class="list-card-mini-poster-tile" data-id="' + escapeAttr(it.showId || it.imdbId || it.id || '') + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '">' +
+            '<div class="list-card-mini-poster-img-wrap">' +
+              posterEl +
+              removeBtn +
+              overlays +
+            '</div>' +
+            '<div class="list-card-mini-poster-name">' + escapeHtml(label.title || it.title || it.name || '') + '</div>' +
+            (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
+            ((it.year || ratingSpan) ? '<div class="list-card-mini-poster-year" style="display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%;"><span>' + escapeHtml(it.year ? String(it.year) : '') + '</span>' + ratingSpan + '</div>' : '') +
+          '</div>';
       }).join('');
       const isAdded = typeof isListAddedToConfig === 'function' ? isListAddedToConfig(null, l.type, l.slug) : false;
       const isSynced = !!(l.synced && l.sourceUrl);
@@ -4399,18 +4594,18 @@ function buildLocalListCardHtml(l) {
     let removeBtn = '';
     const cwRemoveId = it.showId || it.imdbId || it.id;
     if (l.slug === 'continue-watching' && cwRemoveId) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Continue Watching">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); dismissContinueWatchingShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Continue Watching" aria-label="Remove from Continue Watching">\u2715</button>';
     } else if (l.slug === 'airing-next' && cwRemoveId) {
       // The dashboard renders Airing Next through buildAiringNextCardHtml
       // (21_client-custom-list-builder.js), which has its own copy of this
       // button. This branch is for anything that reaches the generic card
       // with the airing-next slug, so the shelf never renders an "x" that
       // removes the wrong thing -- or, worse, none at all.
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeAiringNextShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Airing Next">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeAiringNextShow(&quot;' + escapeJsAttr(cwRemoveId) + '&quot;, this)" title="Remove from Airing Next" aria-label="Remove from Airing Next">\u2715</button>';
     } else if (isWatchlist) {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchlistItemDirect(&quot;' + escapeJsAttr(it.imdbId || it.id) + '&quot;, this)" title="Remove from Watchlist" aria-label="Remove from Watchlist">\u2715</button>';
     } else if (l.slug === 'watch-history') {
-      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeJsAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History">&times;</button>';
+      removeBtn = '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeWatchHistoryItemDirect(&quot;' + escapeJsAttr(it.id || it.imdbId) + '&quot;, this)" title="Remove from Watch History" aria-label="Remove from Watch History">\u2715</button>';
     }
     const itemPoster = resolveItemPoster(it);
     const isAiringList = l.slug === 'airing-next' || l.statusKey === 'airing-next';
@@ -4424,7 +4619,7 @@ function buildLocalListCardHtml(l) {
     const showFinaleDate = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
 
     const airingList = (isCwList && typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
-    const airingMatch = airingList.find((a) => {
+    let airingMatch = airingList.find((a) => {
       if (!a) return false;
       const aShowId = String(a.showId || a.id || '').split(':')[0];
       const itShowId = String(it.showId || it.id || posterId || '').split(':')[0];
@@ -4438,6 +4633,9 @@ function buildLocalListCardHtml(l) {
       if (aTitle && itTitle && aTitle === itTitle) return true;
       return false;
     });
+    if (!airingMatch && isCwList && typeof findAiringMatchFor === 'function') {
+      airingMatch = findAiringMatchFor(it);
+    }
     const effectiveSeasonNum = it.seasonNum != null ? it.seasonNum : (it.season != null ? it.season : null);
     const effectiveEpisodeNum = it.episodeNum != null ? it.episodeNum : (it.episode != null ? it.episode : null);
 
@@ -4456,14 +4654,17 @@ function buildLocalListCardHtml(l) {
       const effectiveAirDate = it.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
       const currentEpNum = itEpisode != null ? itEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
       const hasLaterAiringEp = !!(isSameSeason && airingMatch && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
-      const hasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false);
+      const hasAired = (effectiveAirDate && typeof isEpisodeAired === 'function') ? isEpisodeAired(effectiveAirDate) : hasLaterAiringEp;
       const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(it.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
 
       if (showAirDate && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
-        const badgeText = typeof formatAirDateBadge === 'function' ? formatAirDateBadge(effectiveAirDate) : '';
-        if (badgeText) {
-          dateBadge = '<div class="cw-date-badge" title="Airs on ' + escapeAttr(effectiveAirDate) + '">' + escapeHtml(badgeText) + '</div>';
-        }
+        const timeLabel = it.airTime || (airingMatch && airingMatch.airTime) ||
+          (typeof showAirTimeLabel === 'function' ? showAirTimeLabel(it.showId || it.id || (airingMatch && (airingMatch.showId || airingMatch.id)), itSeason, currentEpNum) : '');
+        dateBadge = typeof airDateBadgeHtml === 'function'
+          ? airDateBadgeHtml(effectiveAirDate, timeLabel)
+          : (typeof watchItemAirDateBadgeHtml === 'function'
+              ? watchItemAirDateBadgeHtml(Object.assign({}, it, { airDate: effectiveAirDate, airTime: timeLabel, showId: it.showId || it.id || (airingMatch && (airingMatch.showId || airingMatch.id)), seasonNum: itSeason, episodeNum: currentEpNum }))
+              : '');
       }
 
       const isSeasonPremiere = (currentEpNum === 1 || (currentEpNum == null && (it.isSeasonPremiere || (isSameEpisode && airingMatch && airingMatch.isSeasonPremiere))));
@@ -4489,6 +4690,7 @@ function buildLocalListCardHtml(l) {
     const posterEl = itemPoster
       ? '<img src="' + escapeAttr(itemPoster) + '" class="clickable-poster" data-id="' + escapeAttr(posterId) + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
       : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1" style="width:100%;height:100%;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
+    const ratingSpan = typeof formatRatingSpanHtml === 'function' ? formatRatingSpanHtml(it) : '';
     return '<div class="list-card-mini-poster-tile" data-id="' + escapeAttr(posterId) + '" data-type="' + escapeAttr(posterType) + '" data-title="' + escapeAttr(label.title || it.showTitle || it.title || it.name || '') + '">' +
       '<div class="list-card-mini-poster-img-wrap">' +
         posterEl +
@@ -4499,7 +4701,7 @@ function buildLocalListCardHtml(l) {
       '</div>' +
       '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
       (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
-      (it.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(it.year) + '</div>' : '') +
+      ((it.year || ratingSpan) ? '<div class="list-card-mini-poster-year" style="display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%;"><span>' + escapeHtml(it.year ? String(it.year) : '') + '</span>' + ratingSpan + '</div>' : '') +
     '</div>';
   }).join('');
   const typeLabel = l.type === 'series' ? 'Shows' : l.type === 'movie' ? 'Movies' : 'Mixed';
@@ -4798,7 +5000,7 @@ if (_creatorDashEl) {
   if (deleteBtn) {
     const slug = deleteBtn.dataset.slug;
     if (slug === 'watchlist') return;
-    const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+    const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { cb(); };
     confirmFn("Delete List", "Delete this list? This cannot be undone.", "Delete", async () => {
       const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
       recordCreatorListDeletion(slug);
@@ -4928,7 +5130,7 @@ if (_creatorDashEl) {
     // browser, it also wipes them from every signed-in device on the next
     // background account sync (a full overwrite, not a merge).
     if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') return;
-    const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+    const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { cb(); };
     confirmFn("Delete List", "Delete this list? This cannot be undone.", "Delete", () => {
       const map = loadLocalCustomLists();
       delete map[slug];
@@ -4990,7 +5192,9 @@ if (_creatorDashEl) {
           isAdded = true;
           break;
         }
-        if (nameInput && nameInput.value.trim().toLowerCase().startsWith(listMeta.name.toLowerCase())) {
+        const uVal = urlInput ? urlInput.value.trim().toLowerCase() : '';
+        const isExt = uVal.startsWith('trakt:') || uVal.startsWith('mdblist:') || uVal.startsWith('simkl:') || uVal.startsWith('tmdb:') || uVal.startsWith('letterboxd:') || uVal.startsWith('http://') || uVal.startsWith('https://');
+        if (!isExt && nameInput && nameInput.value.trim().toLowerCase().startsWith(listMeta.name.toLowerCase())) {
           isAdded = true;
           break;
         }
@@ -5040,18 +5244,23 @@ if (_creatorDashEl) {
       
       items.forEach(it => {
         const isMovie = it.kind === 'movie' || it.type === 'movie';
-        const mapped = {
+        const mapped = Object.assign({}, it, {
           imdbId: isMovie ? (it.imdbId || it.id) : (it.showId || it.imdbId || it.id),
+          showId: isMovie ? undefined : (it.showId || it.imdbId || it.id),
           title: isMovie ? (it.title || it.name) : (it.showTitle || it.title || it.name),
           poster: isMovie ? it.poster : (it.showPoster || it.poster),
           year: it.year
-        };
+        });
         
         if (isMovie) {
           movies.push(mapped);
         } else {
           // Keep only one entry per show in the catalog
-          if (!series.some(s => s.imdbId === mapped.imdbId)) {
+          const mKey = String(mapped.showId || mapped.imdbId || mapped.id || '');
+          if (!series.some(s => {
+            const sKey = String(s.showId || s.imdbId || s.id || '');
+            return (mKey && sKey && mKey === sKey) || (s.imdbId && mapped.imdbId && s.imdbId === mapped.imdbId);
+          })) {
             series.push(mapped);
           }
         }
@@ -5122,8 +5331,21 @@ function editCreatorList(slug) {
   const stEl1 = document.getElementById('customListSearchType');
   if (stEl1) stEl1.value = customListDraftType === 'series' ? 'tv' : 'movie';
   if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
-  const visSelect = document.getElementById('customListVisibilitySelect');
-  if (visSelect) visSelect.value = listMeta.visibility === 'private' ? 'private' : 'public';
+  if (typeof setCustomListDraftVisibility === 'function') {
+    setCustomListDraftVisibility(listMeta.visibility === 'private' ? 'private' : 'public');
+  } else {
+    const visSelect = document.getElementById('customListVisibilitySelect');
+    if (visSelect) visSelect.value = listMeta.visibility === 'private' ? 'private' : 'public';
+    const visToggle = document.getElementById('customListPublicToggle');
+    if (visToggle) visToggle.checked = (listMeta.visibility !== 'private');
+  }
+  const po1 = document.getElementById('customListPlayOrderSelect');
+  if (po1) {
+    po1.value = listMeta.playOrder || (listMeta.shuffle ? 'shuffle-daily' : 'as-listed');
+    if (typeof updateCustomListPlayOrderHint === 'function') updateCustomListPlayOrderHint();
+  }
+  const hw1 = document.getElementById('customListHideWatchedCheck');
+  if (hw1) hw1.checked = !!listMeta.hideWatched;
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
   switchTab('lists');
@@ -5158,8 +5380,21 @@ function editLocalCustomList(slug) {
   const stEl2 = document.getElementById('customListSearchType');
   if (stEl2) stEl2.value = customListDraftType === 'series' ? 'tv' : 'movie';
   if (typeof updateCustomListTypeRadio === 'function') updateCustomListTypeRadio(customListDraftType);
-  const visSelect = document.getElementById('customListVisibilitySelect');
-  if (visSelect) visSelect.value = (listMeta.visibility === 'public') ? 'public' : 'private';
+  if (typeof setCustomListDraftVisibility === 'function') {
+    setCustomListDraftVisibility((listMeta.visibility === 'public') ? 'public' : 'private');
+  } else {
+    const visSelect = document.getElementById('customListVisibilitySelect');
+    if (visSelect) visSelect.value = (listMeta.visibility === 'public') ? 'public' : 'private';
+    const visToggle = document.getElementById('customListPublicToggle');
+    if (visToggle) visToggle.checked = (listMeta.visibility === 'public');
+  }
+  const po2 = document.getElementById('customListPlayOrderSelect');
+  if (po2) {
+    po2.value = listMeta.playOrder || (listMeta.shuffle ? 'shuffle-daily' : 'as-listed');
+    if (typeof updateCustomListPlayOrderHint === 'function') updateCustomListPlayOrderHint();
+  }
+  const hw2 = document.getElementById('customListHideWatchedCheck');
+  if (hw2) hw2.checked = !!listMeta.hideWatched;
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
   switchTab('lists');
@@ -5213,66 +5448,15 @@ async function persistCreatorListOrderFromDom() {
 }
 
 function initCreatorListTouchDrag(handle) {
-  if (!handle) return;
-  handle.setAttribute('draggable', 'true');
-  handle.addEventListener('dragstart', (e) => {
-    creatorListDragRow = handle.closest('.creator-list-row');
-    if (creatorListDragRow) {
-      creatorListDragRow.classList.add('dragging');
-      if (e.dataTransfer) {
-        e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData('text/plain', creatorListDragRow.dataset.slug || '');
-      }
-    }
-  });
-  handle.addEventListener('dragend', () => {
-    if (creatorListDragRow) creatorListDragRow.classList.remove('dragging');
-    creatorListDragRow = null;
-    persistCreatorListOrderFromDom();
-  });
-  handle.addEventListener('pointerdown', (e) => {
-    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
-    e.preventDefault();
-    creatorListDragRow = handle.closest('.creator-list-row');
-    if (!creatorListDragRow) return;
-    creatorListDragRow.classList.add('dragging');
-    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
-    const move = (ev) => {
-      const container = document.getElementById('creatorListRows');
-      if (!container || !creatorListDragRow) return;
-      const afterEl = getCreatorListDragAfterElement(container, ev.clientY);
-      if (afterEl == null) container.appendChild(creatorListDragRow);
-      else if (afterEl !== creatorListDragRow) container.insertBefore(creatorListDragRow, afterEl);
-    };
-    const end = () => {
-      document.removeEventListener('pointermove', move);
-      if (creatorListDragRow) creatorListDragRow.classList.remove('dragging');
-      creatorListDragRow = null;
-      persistCreatorListOrderFromDom();
-    };
-    document.addEventListener('pointermove', move);
-    document.addEventListener('pointerup', end, { once: true });
-    document.addEventListener('pointercancel', end, { once: true });
-  });
-}
-
-document.addEventListener('dragover', (e) => {
-  if (!creatorListDragRow) return;
   const container = document.getElementById('creatorListRows');
   if (!container) return;
-  e.preventDefault();
-  const afterEl = getCreatorListDragAfterElement(container, e.clientY);
-  if (afterEl == null) container.appendChild(creatorListDragRow);
-  else if (afterEl !== creatorListDragRow) container.insertBefore(creatorListDragRow, afterEl);
-});
-
-document.addEventListener('drop', (e) => {
-  if (!creatorListDragRow) return;
-  e.preventDefault();
-  if (creatorListDragRow) creatorListDragRow.classList.remove('dragging');
-  creatorListDragRow = null;
-  persistCreatorListOrderFromDom();
-});
+  createSortableList(container, {
+    itemSelector: '.creator-list-row',
+    handleSelector: '.drag-handle-list',
+    dragClass: 'dragging',
+    onReorder: persistCreatorListOrderFromDom
+  });
+}
 
 // Editing a row's name/url/type or toggling its checkbox doesn't go through
 // addRow/renumber, so save on those too via delegation instead of wiring up
@@ -5613,7 +5797,7 @@ function deleteExternalListDirect(provider, listId, listName, btn) {
   if (!provider || !listId) return;
   const providerLabel = provider === 'trakt' ? 'Trakt' : (provider === 'tmdb' ? 'TMDB' : (provider === 'mdblist' ? 'MDBList' : provider));
   
-  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { cb(); };
   
   confirmFn(
     'Delete List',
@@ -5972,7 +6156,7 @@ function removeCustomListItemDirect(id, slug, btn) {
 }
 
 function clearWatchHistoryAll() {
-  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { cb(); };
   confirmFn(
     'Clear Watch History',
     'Are you sure you want to remove all items from your Watch History? This will reset your watched history and cannot be undone.',
@@ -6018,7 +6202,7 @@ function clearWatchHistoryAll() {
 window.clearWatchHistoryAll = clearWatchHistoryAll;
 
 function clearContinueWatchingAll() {
-  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { if (confirm(msg)) cb(); };
+  const confirmFn = typeof showAppConfirm === 'function' ? showAppConfirm : (title, msg, btnText, cb) => { cb(); };
   confirmFn(
     'Clear Continue Watching',
     'Are you sure you want to remove all items from Continue Watching? This will reset your in-progress movies and shows.',

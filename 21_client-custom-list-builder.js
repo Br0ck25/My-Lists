@@ -96,6 +96,22 @@ function renderCustomListDraftList() {
     const label = it.title || it.name || 'Untitled';
     const typeLabel = itType === 'series' ? 'Show' : 'Movie';
     const yearSub = (it.year ? it.year + ' \u2022 ' : '') + typeLabel;
+    const posBox = '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
+      '<input type="number" class="pos customListPosInput" min="1" max="' + customListDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
+    '</div>';
+    const removeBtn = '<button type="button" class="cw-remove-btn customListRemovePickBtn" title="Remove from list" aria-label="Remove from list" style="z-index:4;">\u2715</button>';
+
+    if (typeof renderMediaCard === 'function') {
+      return renderMediaCard({ title: label, poster: it.poster }, {
+        cardClass: 'custom-list-pick',
+        dataAttrs: { idx: i },
+        style: 'position:relative; cursor:grab; user-select:none; touch-action:manipulation;',
+        topLeftHtml: posBox,
+        topRightHtml: removeBtn,
+        subtitleHtml: escapeHtml(yearSub)
+      });
+    }
+
     const posterEl = it.poster
       ? '<img class="live-preview-poster" src="' + escapeAttr(it.poster) + '" alt="" loading="lazy">'
       : '<div class="live-preview-poster live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
@@ -103,10 +119,8 @@ function renderCustomListDraftList() {
     return '<div class="live-preview-poster-card custom-list-pick" data-idx="' + i + '" style="position:relative; cursor:grab; user-select:none; touch-action:manipulation;">' +
       '<div style="position:relative; width:100%;">' +
         posterEl +
-        '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
-          '<input type="number" class="pos customListPosInput" min="1" max="' + customListDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
-        '</div>' +
-        '<button type="button" class="cw-remove-btn customListRemovePickBtn" title="Remove from list" style="z-index:4;">&times;</button>' +
+        posBox +
+        removeBtn +
       '</div>' +
       '<div class="live-preview-poster-name" title="' + escapeAttr(label) + '">' + escapeHtml(label) + '</div>' +
       '<div class="live-preview-poster-year">' + escapeHtml(yearSub) + '</div>' +
@@ -155,138 +169,12 @@ function initCustomListHoldDrag() {
   if (!container || customListHoldDragBound) return;
   customListHoldDragBound = true;
 
-  let activeCard = null;
-  let isDragging = false;
-  let holdTimer = null;
-  let startX = 0;
-  let startY = 0;
-
-  const cancelHold = () => {
-    if (holdTimer) {
-      clearTimeout(holdTimer);
-      holdTimer = null;
-    }
-  };
-
-  const stopDrag = () => {
-    cancelHold();
-    if (isDragging && activeCard) {
-      activeCard.classList.remove('dragging');
-      reorderCustomListDraftFromDom();
-    }
-    isDragging = false;
-    activeCard = null;
-    document.body.style.userSelect = '';
-  };
-
-  const startDrag = (card) => {
-    isDragging = true;
-    activeCard = card;
-    card.classList.add('dragging');
-    document.body.style.userSelect = 'none';
-    if (typeof navigator !== 'undefined' && navigator.vibrate) {
-      try { navigator.vibrate(30); } catch (err) {}
-    }
-  };
-
-  const handleMove = (clientX, clientY, e) => {
-    if (!activeCard) return;
-
-    if (!isDragging) {
-      const dist = Math.hypot(clientX - startX, clientY - startY);
-      if (dist > 12) {
-        cancelHold();
-        activeCard = null;
-      }
-      return;
-    }
-
-    if (e && e.cancelable) {
-      e.preventDefault();
-    }
-
-    const grid = container.querySelector('.poster-grid-3') || container;
-    const targetCard = getCustomListDragAfterElement(grid, clientX, clientY);
-    if (targetCard && targetCard !== activeCard) {
-      const box = targetCard.getBoundingClientRect();
-      const isAfter = (clientY > box.top + box.height / 2) || (clientY >= box.top && clientX > box.left + box.width / 2);
-      if (isAfter) {
-        grid.insertBefore(activeCard, targetCard.nextSibling);
-      } else {
-        grid.insertBefore(activeCard, targetCard);
-      }
-    }
-  };
-
-  container.addEventListener('dragstart', (e) => { e.preventDefault(); });
-
-  // Pointer events for desktop & unified pointer handling
-  container.addEventListener('pointerdown', (e) => {
-    if (e.target.closest('.customListRemovePickBtn, .customListPosInput')) return;
-    const card = e.target.closest('.custom-list-pick');
-    if (!card) return;
-
-    cancelHold();
-    activeCard = card;
-    isDragging = false;
-    startX = e.clientX;
-    startY = e.clientY;
-
-    const isTouch = e.pointerType === 'touch' || e.pointerType === 'pen';
-    holdTimer = setTimeout(() => {
-      startDrag(card);
-    }, isTouch ? 180 : 120);
-  });
-
-  window.addEventListener('pointermove', (e) => {
-    if (!activeCard) return;
-    handleMove(e.clientX, e.clientY, e);
-  }, { passive: false });
-
-  window.addEventListener('pointerup', () => {
-    if (activeCard) stopDrag();
-  });
-
-  window.addEventListener('pointercancel', (e) => {
-    if (!isDragging) {
-      cancelHold();
-      activeCard = null;
-    } else if (e.pointerType !== 'touch') {
-      stopDrag();
-    }
-  });
-
-  // Dedicated touch listeners for guaranteed mobile gesture prevention
-  container.addEventListener('touchstart', (e) => {
-    if (e.target.closest('.customListRemovePickBtn, .customListPosInput')) return;
-    const card = e.target.closest('.custom-list-pick');
-    if (!card || e.touches.length !== 1) return;
-
-    cancelHold();
-    activeCard = card;
-    isDragging = false;
-    startX = e.touches[0].clientX;
-    startY = e.touches[0].clientY;
-
-    holdTimer = setTimeout(() => {
-      startDrag(card);
-    }, 180);
-  }, { passive: true });
-
-  window.addEventListener('touchmove', (e) => {
-    if (!activeCard || !e.touches || e.touches.length !== 1) return;
-    if (isDragging && e.cancelable) {
-      e.preventDefault();
-    }
-    handleMove(e.touches[0].clientX, e.touches[0].clientY, e);
-  }, { passive: false });
-
-  window.addEventListener('touchend', () => {
-    if (activeCard) stopDrag();
-  });
-
-  window.addEventListener('touchcancel', () => {
-    if (activeCard) stopDrag();
+  createSortableList(container, {
+    itemSelector: '.custom-list-pick',
+    handleSelector: '',
+    axis: 'xy',
+    holdDelay: 120,
+    onReorder: reorderCustomListDraftFromDom
   });
 }
 
@@ -338,9 +226,16 @@ function shuffleCustomListDraft() {
 
 function removeAllCustomListDraftPicks() {
   if (!customListDraftItems.length) return;
-  if (!confirm('Remove all ' + customListDraftItems.length + ' picks? This cannot be undone.')) return;
-  customListDraftItems = [];
-  renderCustomListDraftList();
+  const wipe = () => {
+    customListDraftItems = [];
+    renderCustomListDraftList();
+  };
+  const message = 'Remove all ' + customListDraftItems.length + ' picks? This cannot be undone.';
+  if (typeof showAppConfirm === 'function') {
+    showAppConfirm('Remove all picks', message, 'Remove All', wipe, true);
+  } else {
+    wipe();
+  }
 }
 
 // Set by editCustomList below while an existing Custom List's picks are
@@ -356,6 +251,75 @@ let editingCustomListUrlInput = null;
 // feature here), where there's no outer entry.id to fall back on for any
 // individual list's own seed.
 let customListDraftListId = null;
+
+function getCustomListDraftVisibility() {
+  const toggle = document.getElementById('customListPublicToggle');
+  if (toggle) return toggle.checked ? 'public' : 'private';
+  const visSelect = document.getElementById('customListVisibilitySelect');
+  return visSelect && visSelect.value === 'private' ? 'private' : 'public';
+}
+
+function setCustomListDraftVisibility(visibility) {
+  const isPublic = (visibility === 'public');
+  const toggle = document.getElementById('customListPublicToggle');
+  if (toggle) toggle.checked = isPublic;
+  const visSelect = document.getElementById('customListVisibilitySelect');
+  if (visSelect) visSelect.value = isPublic ? 'public' : 'private';
+}
+
+let customListDraftPlayOrder = 'as-listed';
+
+function applyCustomListPlayOrder(value) {
+  const v = value || 'as-listed';
+  if (v === 'shuffle-now') {
+    const sel = document.getElementById('customListPlayOrderSelect');
+    if (sel) sel.value = 'as-listed';
+    customListDraftPlayOrder = 'as-listed';
+    shuffleCustomListDraft();
+    updateCustomListPlayOrderHint();
+    return;
+  }
+  customListDraftPlayOrder = v;
+  if (v === 'aired-asc') {
+    customListDraftItems.sort((a, b) => {
+      const dateA = String(a.releaseDate || a.year || a.first_air_date || a.air_date || '');
+      const dateB = String(b.releaseDate || b.year || b.first_air_date || b.air_date || '');
+      return dateA.localeCompare(dateB);
+    });
+  } else if (v === 'aired-desc') {
+    customListDraftItems.sort((a, b) => {
+      const dateA = String(a.releaseDate || a.year || a.first_air_date || a.air_date || '');
+      const dateB = String(b.releaseDate || b.year || b.first_air_date || b.air_date || '');
+      return dateB.localeCompare(dateA);
+    });
+  } else if (v === 'title-az') {
+    customListDraftItems.sort((a, b) => {
+      const tA = String(a.name || a.title || '');
+      const tB = String(b.name || b.title || '');
+      return tA.localeCompare(tB);
+    });
+  }
+  renderCustomListDraftList();
+  updateCustomListPlayOrderHint();
+}
+
+function updateCustomListPlayOrderHint() {
+  const hintEl = document.getElementById('customListPlayOrderHint');
+  if (!hintEl) return;
+  const sel = document.getElementById('customListPlayOrderSelect');
+  const v = sel ? sel.value : customListDraftPlayOrder;
+  if (v === 'shuffle-daily') {
+    hintEl.textContent = 'Reshuffles once every 24 hours so the list stays fresh.';
+  } else if (v === 'aired-asc') {
+    hintEl.textContent = 'Picks sorted by release or air date, oldest first.';
+  } else if (v === 'aired-desc') {
+    hintEl.textContent = 'Picks sorted by release or air date, newest first.';
+  } else if (v === 'title-az') {
+    hintEl.textContent = 'Picks sorted alphabetically by title.';
+  } else {
+    hintEl.textContent = 'Picks play in the order you created above \u2014 drag one, or type a new position, to change it.';
+  }
+}
 
 function saveCustomList() {
   const nameInput = document.getElementById('customListNameInput');
@@ -374,11 +338,14 @@ function saveCustomList() {
     return;
   }
 
-  const shuffle = document.getElementById('customListRandomizeCheck').checked;
+  const playOrderSel = document.getElementById('customListPlayOrderSelect');
+  const playOrder = playOrderSel ? playOrderSel.value : (customListDraftPlayOrder || 'as-listed');
+  const shuffle = (playOrder === 'shuffle-daily') || (document.getElementById('customListRandomizeCheck')?.checked || false);
+  const hideWatched = !!document.getElementById('customListHideWatchedCheck')?.checked;
   const listId = customListDraftListId || generateChannelId();
   // Allow empty lists -- type defaults to 'movie' if nothing was added yet
   const listType = customListDraftType || 'movie';
-  const payload = { listId: listId, type: listType, items: customListDraftItems, shuffle: shuffle };
+  const payload = { listId: listId, type: listType, items: customListDraftItems, shuffle: shuffle, playOrder: playOrder, hideWatched: hideWatched };
   const newUrl = 'customlist:v1:' + JSON.stringify(payload);
 
   // Locate (or create) the row's actual DOM node so it can be handed
@@ -409,8 +376,7 @@ function saveCustomList() {
     if (typeof renderLivePreview === 'function') renderLivePreview();
     showAddedToast('"' + name + '" updated \u2713');
   } else {
-    const visSelect = document.getElementById('customListVisibilitySelect');
-    const visibility = visSelect && visSelect.value === 'private' ? 'private' : 'public';
+    const visibility = getCustomListDraftVisibility();
     if (activeCreator) {
       const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
       fetch(ORIGIN + '/api/creator/lists/save', {
@@ -519,8 +485,10 @@ async function saveCreatorListEdit(name) {
     return;
   }
   const creatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
-  const visSelect = document.getElementById('customListVisibilitySelect');
-  const visibility = visSelect && visSelect.value === 'private' ? 'private' : 'public';
+  const visibility = getCustomListDraftVisibility();
+  const playOrderSel = document.getElementById('customListPlayOrderSelect');
+  const playOrder = playOrderSel ? playOrderSel.value : (customListDraftPlayOrder || 'as-listed');
+  const hideWatched = !!document.getElementById('customListHideWatchedCheck')?.checked;
   // Same guard as the credential forms -- see beginSubmit
   // (22_client-creator-profile.js). A double-click here sent the whole
   // items array twice; the second overwrote the first with the same
@@ -555,6 +523,9 @@ async function saveCreatorListEdit(name) {
       type: customListDraftType,
       items: customListDraftItems,
       visibility: visibility,
+      playOrder: playOrder,
+      shuffle: (playOrder === 'shuffle-daily'),
+      hideWatched: hideWatched,
     };
     if (cached) {
       if (cached.sourceUrl) body.sourceUrl = cached.sourceUrl;
@@ -636,14 +607,19 @@ async function saveLocalCustomListEdit(name) {
   const map = loadLocalCustomLists();
   const slug = editingLocalCustomListSlug;
   const existing = map[slug];
-  const visSelect = document.getElementById('customListVisibilitySelect');
-  const visibility = visSelect && visSelect.value === 'public' ? 'public' : 'private';
+  const visibility = getCustomListDraftVisibility();
+  const playOrderSel = document.getElementById('customListPlayOrderSelect');
+  const playOrder = playOrderSel ? playOrderSel.value : (customListDraftPlayOrder || 'as-listed');
+  const hideWatched = !!document.getElementById('customListHideWatchedCheck')?.checked;
   map[slug] = {
     slug: slug,
     name: name,
     type: customListDraftType,
     items: customListDraftItems,
     visibility: visibility,
+    playOrder: playOrder,
+    shuffle: (playOrder === 'shuffle-daily'),
+    hideWatched: hideWatched,
     createdAt: existing ? existing.createdAt : Date.now(),
     updatedAt: Date.now(),
   };
@@ -769,13 +745,8 @@ async function saveLocalCustomListEdit(name) {
 // Loads an existing Custom List's picks back into the draft so they can be
 // adjusted and saved back over the same list, instead of needing to
 // delete and rebuild it from scratch.
-function editCustomList(btn) {
-  const sourceRow = btn.closest('.source-row');
-  const urlInput = sourceRow && sourceRow.querySelector('.url');
-  if (!urlInput) {
-    alert('Could not read this list to edit it.');
-    return;
-  }
+function openEditCustomListDraft(urlInput) {
+  if (!urlInput) return;
   const payload = parseCustomListPayloadClient(urlInput.value);
   if (!payload) {
     alert('Could not read this list to edit it.');
@@ -792,11 +763,31 @@ function editCustomList(btn) {
   document.getElementById('customListNameInput').value = currentName;
   const searchTypeEl = document.getElementById('customListSearchType');
   if (searchTypeEl) searchTypeEl.value = payload.type === 'series' ? 'tv' : 'movie';
-  document.getElementById('customListRandomizeCheck').checked = !!payload.shuffle;
+  const playOrderSel = document.getElementById('customListPlayOrderSelect');
+  if (playOrderSel) {
+    playOrderSel.value = payload.playOrder || (payload.shuffle ? 'shuffle-daily' : 'as-listed');
+    customListDraftPlayOrder = playOrderSel.value;
+    updateCustomListPlayOrderHint();
+  }
+  const hideWatchedCheck = document.getElementById('customListHideWatchedCheck');
+  if (hideWatchedCheck) hideWatchedCheck.checked = !!payload.hideWatched;
+  const randomizeCheck = document.getElementById('customListRandomizeCheck');
+  if (randomizeCheck) randomizeCheck.checked = !!payload.shuffle;
+  setCustomListDraftVisibility(payload.visibility || 'public');
   editingCustomListUrlInput = urlInput;
   editingCreatorListSlug = null;
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
+}
+
+function editCustomList(btn) {
+  const sourceRow = btn.closest('.source-row');
+  const urlInput = sourceRow && sourceRow.querySelector('.url');
+  if (!urlInput) {
+    alert('Could not read this list to edit it.');
+    return;
+  }
+  openEditCustomListDraft(urlInput);
 
   switchTab('lists');
   // Create List has no pill of its own -- see the matching fix in
@@ -820,7 +811,17 @@ function cancelEditCustomList() {
   if (searchInput) searchInput.value = '';
   const searchRes = document.getElementById('customListSearchResult');
   if (searchRes) searchRes.innerHTML = '';
-  document.getElementById('customListRandomizeCheck').checked = false;
+  const playOrderSel = document.getElementById('customListPlayOrderSelect');
+  if (playOrderSel) {
+    playOrderSel.value = 'as-listed';
+    customListDraftPlayOrder = 'as-listed';
+    updateCustomListPlayOrderHint();
+  }
+  const hideWatchedCheck = document.getElementById('customListHideWatchedCheck');
+  if (hideWatchedCheck) hideWatchedCheck.checked = false;
+  const randomizeCheck = document.getElementById('customListRandomizeCheck');
+  if (randomizeCheck) randomizeCheck.checked = false;
+  setCustomListDraftVisibility('public');
   renderCustomListDraftList();
   updateCustomListSaveButtonLabel();
   
@@ -2957,8 +2958,14 @@ function collectAiringNextCandidateShowIds() {
   if (window._fullyWatchedShowIds) {
     window._fullyWatchedShowIds.forEach((id) => ids.add(id));
   }
+  const cwShowIds = new Set();
+  const cwItems = (map['continue-watching'] || {}).items || [];
+  cwItems.forEach((it) => {
+    if (it && it.showId) cwShowIds.add(String(it.showId));
+    if (it && it.id) cwShowIds.add(String(it.id));
+  });
   [...ids].forEach((id) => {
-    if (isAiringNextRemoved(id)) ids.delete(id);
+    if (isAiringNextRemoved(id) && !cwShowIds.has(String(id))) ids.delete(id);
   });
   return ids;
 }
@@ -3231,7 +3238,7 @@ function syncAiringNextWatchState() {
 
   let changed = false;
   const filtered = list.items.filter((it) => {
-    const stillCandidate = it && it.showId && candidates.has(it.showId);
+    const stillCandidate = it && it.showId && candidates.has(it.showId) && !isAiringNextRemoved(it.showId);
     if (!stillCandidate) changed = true;
     return stillCandidate;
   });
@@ -3439,11 +3446,48 @@ async function refreshAiringNext(force) {
   });
   deduped.sort((a, b) => (a.airDate || '').localeCompare(b.airDate || ''));
 
+  const scheduleMap = {};
+  deduped.forEach((d) => {
+    if (d && d.showId) {
+      scheduleMap[String(d.showId)] = d;
+      if (d.canonicalTmdbId) scheduleMap['tmdb:' + d.canonicalTmdbId] = d;
+    }
+  });
+  window._airingNextScheduleMap = scheduleMap;
+  try {
+    localStorage.setItem('myListAddon:airingScheduleMap', JSON.stringify(scheduleMap));
+  } catch (e) {}
+
   const map = loadLocalCustomLists();
   const fresh = getOrCreateAiringNextList();
-  fresh.items = deduped;
+  fresh.items = deduped.filter(it => !isAiringNextRemoved(it.showId));
   fresh.updatedAt = Date.now();
   map['airing-next'] = fresh;
+
+  const cwList = map['continue-watching'];
+  if (cwList && Array.isArray(cwList.items)) {
+    let cwChanged = false;
+    cwList.items.forEach(cwItem => {
+      if (!cwItem) return;
+      const sId = String(cwItem.showId || cwItem.id || '');
+      const match = deduped.find(d => d && (d.showId === sId || (cwItem.showId && d.showId === cwItem.showId) || (d.canonicalTmdbId && cwItem.canonicalTmdbId && d.canonicalTmdbId === cwItem.canonicalTmdbId)));
+      if (match) {
+        if (cwItem.airDate !== match.airDate || cwItem.seasonFinaleAirDate !== match.seasonFinaleAirDate || cwItem.isSeasonPremiere !== match.isSeasonPremiere || cwItem.isSeasonFinale !== match.isSeasonFinale) {
+          cwItem.airDate = match.airDate;
+          cwItem.seasonFinaleAirDate = match.seasonFinaleAirDate;
+          cwItem.isSeasonPremiere = match.isSeasonPremiere;
+          cwItem.isSeasonFinale = match.isSeasonFinale;
+          cwItem.seasonFinaleEpisodeNumber = match.seasonFinaleEpisodeNumber;
+          if (match.airTime) cwItem.airTime = match.airTime;
+          cwChanged = true;
+        }
+      }
+    });
+    if (cwChanged) {
+      cwList.updatedAt = Date.now();
+    }
+  }
+
   saveLocalCustomListsMap(map);
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
   // Pushes the freshly computed list to this account's server-side
@@ -3701,8 +3745,9 @@ function buildAiringNextCardHtml() {
           subtitle: it.name || it.episodeTitle || (it.isSeasonPremiere ? 'Season Premiere' : (it.episodeNum != null ? ('Episode ' + it.episodeNum) : ''))
         };
     const removeBtn = it.showId
-      ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeAiringNextShow(&quot;' + escapeJsAttr(it.showId) + '&quot;, this)" title="Remove from Airing Next">&times;</button>'
+      ? '<button type="button" class="cw-remove-btn" onclick="event.stopPropagation(); removeAiringNextShow(&quot;' + escapeJsAttr(it.showId) + '&quot;, this)" title="Remove from Airing Next" aria-label="Remove from Airing Next">\u2715</button>'
       : '';
+    const ratingSpan = typeof formatRatingSpanHtml === 'function' ? formatRatingSpanHtml(it) : '';
     return '<div class="list-card-mini-poster-tile">' +
       '<div class="list-card-mini-poster-img-wrap">' +
         '<img src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.showPoster || '') : (it.showPoster || '')) + '" class="clickable-poster" data-id="' + escapeAttr(it.showId) + '" data-type="series" alt="" loading="lazy">' +
@@ -3713,6 +3758,7 @@ function buildAiringNextCardHtml() {
       '</div>' +
       '<div class="list-card-mini-poster-name">' + escapeHtml(label.title) + '</div>' +
       (label.subtitle ? '<div class="list-card-mini-poster-subtitle">' + escapeHtml(label.subtitle) + '</div>' : '') +
+      ((it.year || ratingSpan) ? '<div class="list-card-mini-poster-year" style="display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%;"><span>' + escapeHtml(it.year ? String(it.year) : '') + '</span>' + ratingSpan + '</div>' : '') +
     '</div>';
   }).join('');
 
@@ -3771,6 +3817,9 @@ function openAiringNextDetailsPage() {
       showId: it.showId,
       seasonNum: it.seasonNum,
       episodeNum: it.episodeNum,
+      year: it.year,
+      rating: it.rating != null ? it.rating : (it.vote_average != null ? it.vote_average : (it.tmdbRating != null ? it.tmdbRating : (it.imdbRating ? parseFloat(it.imdbRating) : undefined))),
+      vote_average: it.vote_average != null ? it.vote_average : undefined,
       isUnaired: true,
       isSeasonPremiere: it.isSeasonPremiere,
       isSeasonFinale: it.isSeasonFinale,
@@ -3838,7 +3887,9 @@ function setListHidden(id, hidden) {
   if (typeof renderMySimklLists === 'function' && window._mySimklLists) renderMySimklLists(window._mySimklLists);
   if (typeof renderMyMdblistLists === 'function' && window._myMdblistLists) renderMyMdblistLists(window._myMdblistLists);
   if (typeof renderMyTraktLists === 'function' && window._myTraktLists) renderMyTraktLists(window._myTraktLists);
+  if (typeof renderMyPrivateTraktLists === 'function' && (window._myPrivateTraktLists || window._myTraktLists)) renderMyPrivateTraktLists(window._myPrivateTraktLists || window._myTraktLists);
   if (typeof renderMyTmdbLists === 'function' && window._myTmdbLists) renderMyTmdbLists(window._myTmdbLists);
+  if (typeof renderMyLists === 'function') renderMyLists();
   if (typeof renderHiddenListsSettingsSection === 'function') renderHiddenListsSettingsSection();
 }
 

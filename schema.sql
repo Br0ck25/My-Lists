@@ -36,6 +36,15 @@ CREATE TABLE creator_lists (
     FOREIGN KEY (username) REFERENCES creators(username) ON DELETE CASCADE
 );
 
+DROP TABLE IF EXISTS creator_key_lookups;
+CREATE TABLE creator_key_lookups (
+    lookup_hash TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (username) REFERENCES creators(username) ON DELETE CASCADE
+);
+CREATE INDEX idx_creator_key_lookups_username ON creator_key_lookups(username);
+
 DROP TABLE IF EXISTS source_groups;
 CREATE TABLE source_groups (
     id TEXT PRIMARY KEY,

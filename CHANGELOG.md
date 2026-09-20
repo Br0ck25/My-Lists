@@ -6,6 +6,255 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 Trakt Continue Watching & Airing Next Live Preview Fixes
+
+- **Trakt Continue Watching Movie vs Series Isolation**:
+  - In `06_source-fetchers-mdblist-trakt.js`, strictly validated `isMovie` (`!isEp && (it.type === "movie" || !!it.movie)`) in `fetchTraktContinueWatching` when `entry.type === "movie"`. Show entities can no longer fall through as movies.
+  - In `23_client-list-management.js`, ensured `getFallbackShelfSample()` respects shelf type (`s.type === 'movie'` filters out all series items; `s.type === 'series'` filters out all movie items). Empty movie catalogs no longer fall back to displaying TV shows from `_myPrivateTraktLists`.
+  - For series shelves, merged all known continue watching series from private Trakt lists so that all in-progress and up-next series display consistently.
+- **Trakt Airing Next 12-Show Live Preview Completeness**:
+  - In `06_source-fetchers-mdblist-trakt.js`, expanded `fetchTraktAiringNext` to query 4 consecutive 33-day calendar segments in parallel (covering 132 days / ~4.5 months) rather than just the immediate 33 days.
+  - In `23_client-list-management.js`, merged server preview samples with the user's client-enriched 12-show cache (`myListAddon:traktAiringNextCache` / `_myPrivateTraktLists`), ensuring all 12 upcoming airing shows display in Live Preview sorted by air date.
+- **Trakt Continue Watching Preview Reliability**:
+  - In `06_source-fetchers-mdblist-trakt.js`, made `/sync/playback` safe against HTTP 404 or empty playback states. Only authentication errors (HTTP 401/403) or rate limits (HTTP 429) raise errors. If no active scrobbles exist, it continues to compute up-next unwatched episodes.
+  - Sliced progress lookup candidate series to 15 (from 40) in `fetchTraktContinueWatching` to stay strictly within Cloudflare Workers' 50 subrequest limit.
+  - Multi-keyed `seenShowIds` across `trakt`, `imdb`, `tmdb`, and `slug` so unwatched series progress properly excludes active playback shows.
+- **Preview Route (`/api/preview`) Subrequest Protection & Error Transparency**:
+  - In `25_api-catalog-routes.js`, capped TMDb rating enrichment on preview samples to the first 12 items (`sampleMetas.slice(0, 12)`), preventing subrequest exhaustion when sample size is up to 100.
+  - Preserved underlying error messages in `/api/preview` catch block (`(err && err.message) || "Couldn't load that list."`).
+
+### ⭐ Simkl Airing Next Removal, MDBList Up Next & Trakt CW Badges, Trakt Attribution & Hidden Lists Scope
+
+- **Simkl Airing Next Removal**:
+  - Mini-poster tiles on **Simkl Airing Next** now render the red circle with the '✕' (`.cw-remove-btn`) matching all other lists.
+  - Sample items in `openSimklAiringNextDetailsPage()` include `removeExternalProvider: 'simkl'`, `removeExternalTarget: 'status'`, and `removeExternalListId: it.status || 'watching'`.
+  - In `25_api-catalog-routes.js`, `/api/external-list/item-mutate` routes Simkl list removals to `https://api.simkl.com/sync/remove-from-list`.
+  - In `23_client-list-management.js`, `removeListItemFromDetails()` purges removed items from memory and `localStorage` cache (`myListAddon:simklAiringNextCache`).
+- **MDBList Up Next & Trakt Continue Watching Badges & Settings**:
+  - Render upcoming air dates, season premiere, and season finale badges on MDBList Up Next and Trakt Continue Watching preview tiles and details modals matching Dashboard Continue Watching.
+  - Added toggle settings under **Settings &rarr; Poster Badges & Labels** (`showBadgesTraktContinueWatching` and `showBadgesMdblistUpNext`).
+  - Added CSS body class hiding rules (`body.hide-trakt-continue-watching-badges` and `body.hide-mdblist-up-next-badges`) in `09_page-shell.js`.
+  - Added badge resolution and `findAiringMatchFor` lookup in `renderMyMdblistLists`, `renderMyPrivateTraktLists`, `openMdblistUpNextDetailsPage`, and `openTraktContinueWatchingDetailsPage`.
+- **Trakt Lists Creator Attribution**:
+  - Trakt lists in "Your Trakt Lists" and Trakt list details modals now attribute `creatorName = 'Trakt'` (or user if `trakt.tv/users/<username>`) rather than defaulting to "My Lists Addon".
+  - Passed `creatorName: 'Trakt'` explicitly in `openTraktContinueWatchingDetailsPage()` and `openTraktAiringNextDetailsPage()`, and attached `data-creator="Trakt"` to Trakt list cards in `renderMyPrivateTraktLists()`.
+- **Hidden Lists Scope**:
+  - Settings &rarr; Hidden Lists now enumerates all lists under "My Lists", including OAuth Trakt private lists (`_myPrivateTraktLists`), local custom lists, and connected provider lists.
+  - `setListHidden()` immediately updates UI in memory and re-renders visible lists across tabs.
+  - Added auto-fetch triggers and updated `renderHiddenListsSettingsSection()` hooks across provider list renderers.
+
+### ✕ Remove Buttons on External Provider Static List Tiles
+
+- Added red ✕ remove buttons to the mini-poster tiles on the **Your MDBList Lists** and **Your Trakt Lists** section cards that previously had no remove buttons.
+  - **Trakt Continue Watching** tiles: button calls `provider=trakt`, `target=history` — removes the show from Trakt watch history.
+  - **Trakt Airing Next** tiles: button calls `provider=trakt`, `target=watchlist` — removes the show from the Trakt watchlist.
+  - **MDBList Up Next** tiles: button calls `provider=mdblist`, `target=watchlist` — removes the show from the MDBList watchlist.
+  - **MDBList Airing Next** tiles: button calls `provider=mdblist`, `target=watchlist` — removes the show from the MDBList watchlist.
+  - All buttons use the existing `cw-remove-btn` class, `data-remove-type="external"`, and `onclick="event.stopPropagation(); removeListItemFromDetails(this)"` pattern, routing through the proven `/api/external-list/item-mutate` endpoint.
+  - Note: TMDB, Simkl (non-AiringNext), and slot-filled Trakt/MDBList cards (History, Watchlist, custom lists) already had remove buttons prior to this change — this only fills the remaining gaps.
+- File changed: `17_client-my-lists-and-trakt-oauth.js` (four targeted insertions in `renderMyMdblistLists` and `renderMyPrivateTraktLists`). Rebuilt `worker_entry_combined.js` (3,927,962 bytes).
+
+### ⭐ Trakt Continue Watching & Airing Next & MDBList Up Next Integration
+
+- **Trakt Continue Watching & Airing Next**:
+  - Integrated both active playback scrobbles (`GET https://api.trakt.tv/sync/playback?limit=50`) and recently watched series progress (`GET https://api.trakt.tv/users/me/watched/shows?extended=noseasons` + `GET https://api.trakt.tv/shows/:id/progress/watched?last_activity=watched&hidden=false&specials=false&count_specials=false`) in `/api/trakt-my-private-lists` (`25_api-catalog-routes.js`) and `fetchTraktContinueWatching` (`06_source-fetchers-mdblist-trakt.js`).
+  - Added exclusion for shows and movies that the user dropped or hid in Trakt by querying `/users/hidden/progress_watched`, `/users/hidden/dropped`, and `/users/hidden/progress_watched_reset` in parallel. Dropped titles are purged from Continue Watching, leaving only active in-progress shows and matching the Trakt.tv dashboard.
+  - Added rate-limit protected concurrency (`mapWithConcurrency` with 5 concurrent requests) across Trakt progress lookups, preventing HTTP 429 rate-limiting from dropping active titles (*The Last of Us*, *Tracker*).
+  - Fixed *FBI* miscalculation: Trakt's default `progress/watched` endpoint calculated `next_episode` against the highest aired episode (`last_activity=aired`), returning unaired season premiere S09E01 *Rendition*. Added `last_activity=watched` query parameter and fallback scanning of `prog.seasons` for the earliest uncompleted aired episode when `completed < aired`, properly returning S01E02 (*Green Birds*).
+  - Preserved **Trakt Airing Next**'s working candidate and client TMDB enrichment pipeline in `17_client-my-lists-and-trakt-oauth.js` and `25_api-catalog-routes.js`, ensuring all candidate shows populate and enrich with upcoming dates and premiere badges via `localStorage` cache and `enrichTraktAiringNextDates()`.
+  - In `04_config-resolution.js`, mapped `trakt:continue-watching`, `trakt:continue-watching:*`, and `trakt:user:continue-watching` to `"trakt-continue-watching"`.
+  - In `05_catalog-core.js`, wired `fetchCatalog` to dispatch `"trakt-continue-watching"` to `fetchTraktContinueWatching()`.
+  - In `06_source-fetchers-mdblist-trakt.js`, implemented `fetchTraktContinueWatching()`, supporting filtering by series/episodes or movies, live playback progress percentages, and Stremio catalog streams.
+  - In `17_client-my-lists-and-trakt-oauth.js`, updated `renderMyPrivateTraktLists` to render preview poster tiles with active playback progress bars, quick count overlay, "+ Add" to Stremio Catalogs (adds both Movies and Shows as mixed catalog), and `openTraktContinueWatchingDetailsPage()` modal.
+- **MDBList Up Next, Watch History Removal & Poster Normalization**:
+  - Added automatic query to MDBList's Up Next API (`GET https://api.mdblist.com/upnext?limit=50&hide_unreleased=true&append_to_response=poster`) in `/api/mdblist-my-lists` (`25_api-catalog-routes.js`). When a user connects their MDBList account, their currently watched shows with next unwatched episodes are returned at the top of "Your MDBList Lists" as **MDBList Up Next**.
+  - Fixed MDBList Watch History removal error (`Could Not Remove From MDBLIST: API Endpoint Not Found`): standardized MDBList Watch History card URL to `mdblist:history` in `/api/mdblist-my-lists` (`25_api-catalog-routes.js`), updated `19_client-search-and-likes.js` and `23_client-list-management.js` to recognize all variations of MDBList history URLs (`mdblist:history` and `https://mdblist.com/history/...`) as `target: 'history'` (preventing them from mistakenly being treated as custom lists and posting to non-existent `/lists/.../items/remove` endpoints), and fortified `/api/external-list/item-mutate` to target MDBList's `/sync/watched/remove`, `/sync/watched`, and `/history/remove` endpoints. Recompiled `worker_entry_combined.js` and verified byte-exact sync.
+  - Fixed broken card preview posters on MDBList Up Next: normalized relative TMDB poster paths (e.g., `/xxx.jpg` -> `https://image.tmdb.org/t/p/w500/xxx.jpg`), added Metahub poster fallback (`https://images.metahub.space/poster/medium/${showId}/img`) across server routes and client list renderers.
+  - Added `resolveListCardItemPoster(it)` and `onerror="handlePosterImgError(this)"` with `data-imdb` and `data-title` to mini-poster tiles in `17_client-my-lists-and-trakt-oauth.js` for both MDBList Up Next and Trakt Continue Watching.
+  - In `04_config-resolution.js`, mapped `mdblist:upnext`, `mdblist:upnext:*`, and `mdblist:user:shows:upnext` to `"mdblist-upnext"`.
+  - In `05_catalog-core.js`, wired `fetchCatalog` to dispatch `"mdblist-upnext"` to `fetchMdblistUpNext()`.
+  - In `06_source-fetchers-mdblist-trakt.js`, updated `extractMdblistItem()` to parse and retain `next_episode` metadata, and implemented `fetchMdblistUpNext()` to serve series catalogs with upcoming/next episode details.
+  - In `17_client-my-lists-and-trakt-oauth.js`, updated `renderMyMdblistLists` to render preview poster tiles with next episode badges, quick count overlay, "+ Add" to Stremio Catalogs (series), and `openMdblistUpNextDetailsPage()` modal.
+  - In `23_client-list-management.js`, added `mdblist:upnext` and `trakt:continue-watching` to `isPersonalSentinel` to prevent invalid like actions on user-specific session shelves.
+
+### ⭐ RapidAPI Streaming Availability Migration & Strict Quota Protection (1,000 req/mo)
+
+- **Complete Transition to RapidAPI Streaming Availability API**:
+  - Rebuilt New on Streaming on top of RapidAPI Streaming Availability API `GET /changes`, sorting strictly by actual streaming service arrival dates (`timestamp`), not original theatrical/broadcast release dates.
+  - New movies and series enter the shelf ordered newest first.
+  - Added automatic episode drop detection: when a new episode is released on a streaming service, the parent show's `last_event_at` is updated, pushing the series back to the top of the list.
+  - Maintained a rolling 30-day window (`NEW_ON_STREAMING_WINDOW_DAYS = 30`), pruning events older than 30 days on each sweep.
+  - Removed all legacy TMDB catalog sweep engine code (`newOnStreamingWalkPath`, `newOnStreamingCombos`, `readNewOnStreamingDepths`, `sweepTmdbNewOnStreaming`, `fetchNewOnStreamingLatestEpisode`, `lookupNewOnStreamingKnown`, etc.) and associated TMDB sweep constants.
+  - Sweeps now strictly require `RAPIDAPI_KEY` (configured via Cloudflare secret) and no longer fall back to TMDB.
+- **Strict Quota Protection & 4-Hour Automated Cadence**:
+  - Designed specifically for the RapidAPI Basic Plan (1,000 requests/month hard limit, 1,000 requests/hour rate limit, 10,240 MB/month bandwidth limit).
+  - Enforced a KV-tracked monthly request counter (`cron:rapidapi:usage`) with a hard safety cutoff at 950 requests (`RAPIDAPI_MONTHLY_SAFETY_CAP = 950`), completely halting automated and manual sweeps before any overage fees can occur.
+  - Automated cron sweeps run on a 4-hour interval cooldown (`NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 14400`), totaling ~6 runs/day (~180 runs/month). With 1-2 pages per run (~180-360 calls/month), usage stays well below the 950 safety cap.
+  - Manual admin sweeps bypass the 4-hour interval cooldown for on-demand testing while still honoring the 950 safety cap.
+  - Added support for clearing all existing items and pulling fresh data from RapidAPI across the full 30-day window (`reset: true` / `clear: true`), accessible via the new **"Clear & pull fresh data"** button on the Admin dashboard.
+  - Admin dashboard New on Streaming tab displays live monthly request consumption (`count / 1,000`, remaining allowance, safety cap status), last sweep timestamps, and next scheduled runs.
+- **MDBList Parity & Sweep Engine Hardening**:
+  - **Service Monetization Suffix Normalization**: Fixed `newOnStreamingProvider` and `normalizeNewOnStreamingServiceKey` to strip `.subscription` and other monetization suffixes. RapidAPI returns `prime.subscription`, `apple.subscription`, `max.subscription`, etc., which previously caused Prime Video and Apple TV+ titles to fail the database query filter and be omitted from the catalog.
+  - **Multi-Type Sweep Coverage (Show, Season, Episode)**: Added `season` changes to the sweep engine alongside `show` and `episode`. When a streaming service drops a new season or a new episode of an existing show, the show's `last_event_at` is updated, pushing the series back to the top of the shelf on that date.
+  - **Proportional Budget Allocation & Quota Rollover**: Replaced greedy page consumption with fair multi-type budget allocation (1 page each for `show`, `season`, and `episode` on 3-page cron ticks; ~50% show, ~15% season, ~35% episode on deep backfills) with automatic rollover of unused quota so episodes and seasons are never starved.
+  - **Deep Reset & Backfill Default**: Increased default sweep pages on resets from 3 to 30 pages (up to 750 items) with a 50-page maximum in Admin, allowing full 30-day historical coverage across all 8 major streaming services.
+  - **Show ID Fallback**: Added `tmdbId` fallback for `imdbId` in `processRapidApiStreamingChanges` to avoid dropping items that only carry TMDB identifiers.
+  - **Digital Store Exclusion (SVOD vs TVOD/Rent/Buy)**: Excluded transactional digital store purchases and rentals (e.g. iTunes Store / Amazon Video buy/rent) by filtering out `streamingOptionType === "rent" || streamingOptionType === "buy"` and removing bare `apple` and `prime` from `NEW_ON_STREAMING_DEFAULT_CATALOGS`. Previously, querying bare `apple` flooded the catalog with dozens of digital purchase releases from iTunes (like Agatha Christie films and iTunes buy drops), which overwrote true streaming subscription premiere dates (e.g. *Golden Axe* premiered on Paramount+ on Sep 16, but an iTunes digital store purchase entry on Sep 18 was mistakenly overwriting it as an Apple TV+ show).
+  - **Unscripted Daily Television Exclusion (Talk Shows, News, Game Shows)**: Filtered out unscripted daily broadcast television (e.g. *The Tonight Show Starring Jimmy Fallon*, *Jimmy Kimmel Live!*, *The Today Show*, *World News Tonight*, *Wheel of Fortune*, *Jeopardy!*, and genres `news`, `talk-show`, `game-show`). Daily broadcast networks (especially Peacock and Hulu) release hundreds of episodes per day that flooded the feed and pushed out actual scripted series and movie releases (such as Netflix drops like *A Parasite's Heart* and *Unlucky Bae*). This matches MDBList's exclusion of daily unscripted TV.
+  - **Increased Manual Backfill Page Capacity (up to 100 Pages)**: Raised the maximum pages for manual sweeps in the Admin Dashboard from 50 to 100 pages and adjusted multi-type budget allocation (45% show, 10% season, 45% episode). This allows deeper historical backfills across the 30-day window without running out of pages during high-activity periods, while remaining strictly protected by the 950-request monthly safety cap.
+  - **Fail-Safe Deferred Table Reset**: Deferred the table purge (`DELETE FROM streaming_events`) during "Clear & pull fresh data" until after the first valid page of new data arrives from RapidAPI, preventing an empty database in the event of upstream API errors.
+  - **Automated TMDB Episode Air-Date Bumping (`bumpNewOnStreamingEpisodes`)**: Restored automated episode air-date detection for active streaming series in `streaming_events` against TMDB's TV API. When an episode airs (such as Episode 5 of *A Parasite's Heart* on Sep 18), the show's `last_event_at`, `season`, and `episode` are updated, pushing the series to the top of the shelf on its exact episode air date to match MDBList's Release Date cataloging.
+  - **Multi-Key Indexing & Clean TMDB ID Normalization**: Fixed `processRapidApiStreamingChanges` to index shows in `showsMap` across all identifiers (`id`, `imdbId`, `tmdbId`, and numeric IDs). If a show lacks an IMDb ID, its TMDB ID is cleaned to a standard integer format (`tmdb:324931`) rather than retaining provider prefixes (`tmdb:series/324931`), ensuring seamless compatibility with Stremio, Metahub posters, and Cinemeta.
+  - **Sweep Budget Rebalancing & 150-Unit Manual Limit**: Shifted the multi-type sweep budget to 70% `show`, 20% `episode`, and 10% `season` so sweeps reach back 7–10 days across all 8 major streaming services instead of exhausting their budget in ~2 days on daily broadcasts. Raised the manual sweep limit from 50 to 150 units in `26_api-creator-and-admin-routes.js`.
+  - **Direct Title Add / Sync Tool (`/admin/api/new-on-streaming/add`)**: Added an admin tool in the New on Streaming tab to add or sync any movie or series directly into `streaming_events` by IMDb ID (e.g. `tt45851964`), TMDB ID (e.g. `324931`), or title name (*A Parasite's Heart*). Automatically retrieves TMDB metadata, posters, and recent episode air dates.
+  - **Admin Preview Search & Pagination**: Added real-time title/ID search filtering and Prev/Next pagination buttons to the Admin New on Streaming preview panel, allowing administrators to search the entire database and page through up to 100 items per page instead of being capped at the top 60 items.
+  - **Admin Auto-Refresh**: Updated the Admin dashboard to automatically reload the live preview table upon completion of any sweep.
+- **Unified Chronological Preview & MDBList Visual Parity**:
+  - Added support for unified chronological viewing across both movies and shows (`type=all` or `type=mixed`) in `fetchNewOnStreaming` (`07_source-fetchers-tmdb-simkl.js`) and `/admin/api/new-on-streaming/preview` (`26_api-creator-and-admin-routes.js`).
+  - Added `<option value="all" selected>All (Movies & Shows)</option>` to the Admin New on Streaming preview dropdown, allowing administrators to view movies and shows interleaved chronologically exactly like [mdblist.com/new-on-streaming/](https://mdblist.com/new-on-streaming/).
+  - Enriched catalog items with streaming service metadata (`service`, `services`), media type (`type`: `movie` vs `series`), and arrival timestamp (`addedAt`).
+  - Enhanced the Admin preview table (`03_admin.js`) with dedicated columns for **Type** (color-coded Show/Movie badges), **Service** (streaming provider badges like Netflix, Hulu, Prime Video), and **Added Date** (`YYYY-MM-DD`).
+
+### ⭐ Self-Service Account Recovery: Set/Update Recovery Answer & Forgot Username
+
+- **Add / Update Recovery Answer for Existing Accounts**:
+  - Added authenticated endpoint `POST /api/creator/recovery-answer` (`26_api-creator-and-admin-routes.js`) allowing existing creators to add or update their recovery answer after signup.
+  - Enforces `RECOVERY_ANSWER_MIN_LENGTH` (8+ characters) and hashes with PBKDF2 (`hashCreatorKey`).
+  - Updates both D1 `creators.recovery_answer_hash` and KV `creator:${username}`.
+  - Added dedicated **Account Recovery** card to Creator Settings in `renderAccountKeySection()` (`22_client-creator-profile.js`), displaying status badge (`✓ Configured` vs `⚠️ Not Set`) with modal `openSetRecoveryAnswerModal()` to set or update.
+  - Updated `POST /api/creator/restore` and `authenticateCreator()` to return `hasRecoveryAnswer` boolean so the frontend immediately reflects status upon login.
+- **Forgot Username Recovery Flow**:
+  - Added self-service endpoint `POST /api/creator/forgot-username` (`26_api-creator-and-admin-routes.js`) allowing users who have their Account Key (`MYL-XXXX-XXXX-XXXX`) and Recovery Answer (if set) to retrieve their username.
+  - Built a fast deterministic SHA-256 blind index (`creatorKeyLookupHash`) mapping `keylookup:<hash>` -> `username` in KV and D1 `creator_key_lookups` (`migrations/0013_add_creator_key_lookups.sql`).
+  - Added fallback scan for pre-migration accounts in D1 to verify key against `key_hash` and automatically backfill the lookup index.
+  - Enforces per-IP rate limiting (`FORGOT_USERNAME_IP_MAX_FAILURES = 5` attempts per 15 minutes) and strict PBKDF2 verification against `key_hash` and `recovery_answer_hash`.
+  - Added **"Forgot username?"** link to the Login dialog (`openRestoreProfileModal()`) in `22_client-creator-profile.js` opening `openForgotUsernameModal()`, which finds the username and offers a one-click "Login with this Username" action.
+  - Updated key rotation (`/api/creator/reset-key` and `/admin/api/reset-creator-key`) and account deletion (`purgeCreatorData`) to keep the key lookup index in sync and prevent orphaned entries.
+  - Updated `D1_SCHEMA_MANIFEST` in `00_constants.js` and `schema.sql` to include migration 0013.
+
+### ⭐ Fix Missing Ratings on Discover Genres & Popular Lists
+
+- **Popular Community Lists (MDBList & Trakt)**:
+  - In `06_source-fetchers-mdblist-trakt.js`, updated `extractMdblistItem(it)` to correctly parse the MDBList ratings array (`it.ratings: [{ source: "tmdb", value: 7.0 }]`), `score`, and `score_average`.
+  - In `mapMdblistItems(data, type)`, fixed item reconstruction by including `vote_average` and `rating` (which were previously omitted from the returned object).
+  - Added `&extended=full` to `fetchTrakt` list queries so Trakt returns item rating information.
+  - In `06_source-fetchers-mdblist-trakt.js`, updated `mapTraktItems` to preserve `tmdbId` and `imdbId` on mapped items, enabling downstream TMDb enrichment for Trakt items.
+  - In `06_source-fetchers-mdblist-trakt.js`, bumped `fetchMdblist` cache keys to `v3` to flush stale list entries cached before `tmdbId` pass-through. Added `&extended=full` to `fetchTraktWatchlist` and `fetchTraktHistory`.
+  - In `07_source-fetchers-tmdb-simkl.js`, added `&extended=full` to `fetchTraktChart` and bumped cache keys to `v2` (`user_cache:trakt:chart:v2:` and `trakt:chart:v2:`), ensuring official Trakt charts (Trending, Popular, Most Played, etc.) receive full rating data from Trakt.
+  - In `07_source-fetchers-tmdb-simkl.js`, added TMDb `/find` resolution for IMDb IDs (`tt...`) in `fetchTmdbDetails`.
+  - In `25_api-catalog-routes.js`, enhanced `/api/preview` TMDb enrichment to resolve ratings via `m.imdbId` / `m.id` (`tt...`) when `tmdbId` is missing, and strengthened `effectiveTmdbKey` resolution.
+  - In `16_client-row-core.js`, added `item.score` parsing fallback to `formatRatingBadgeHtml` and `formatRatingSpanHtml`.
+- **Discover Genres Rating & Popularity Alignment**:
+  - In `07_source-fetchers-tmdb-simkl.js`, updated `fetchTmdbGenre()`: standard genres (family, horror, sci-fi, fantasy, etc.) now sort by `popularity.desc&vote_count.gte=10` (or `vote_count.gte=5` for series) instead of `primary_release_date.desc`, surfacing top, popular, and well-rated titles rather than 0-vote titles releasing today.
+  - Retained `primary_release_date.desc` sorting for `stream-releases`.
+  - In `fetchTmdbGenre`, `fetchTmdbProviderTop10`, `fetchTmdbHiddenGems`, `fetchTmdbKids`, and `fetchTmdbHoliday`, passed full `details` into `mapTmdbItem`, ensuring `vote_average` is populated from detail lookups when omitted in upstream search results.
+- **Client Cache Flushing on Refresh & Settings Toggle**:
+  - In `16_client-row-core.js`, `renderDiscoverChartsList()` clears `_discoverFeedsCache[type]` and `_listPreviewCache` when `forceRefresh` is requested.
+  - In `19_client-search-and-likes.js`, `loadPopularListsFeed(true)` clears cached popular list items and `_listPreviewCache`.
+  - In `23_client-list-management.js`, `toggleTmdbRatingSetting()` invalidates `_discoverFeedsCache` so toggling ratings updates immediately.
+
+### ⭐ TMDb Ratings Across All Pages & Removal of IMDb Ratings
+
+- **Complete Removal of IMDb Ratings**:
+  - Removed IMDb rating option entirely from Settings (`15_tab-settings-html.js`).
+  - Replaced the radio selection group with a single clean checkbox toggle: **TMDb Ratings** (`#badgeTmdbRatingCheckbox`).
+  - Added `toggleTmdbRatingSetting(isChecked)` in `23_client-list-management.js` and updated `setPosterRatingSource(source)` / `getPosterRatingSource()` to support only `'tmdb'` and `'none'`.
+  - Set `hide-badge-imdb-rating` permanently on `<body>` via `applyBadgeBodyClasses()`, while `hide-badge-tmdb-rating` toggles based on the TMDb rating setting.
+- **Universal TMDb Rating Display on All Pages**:
+  - TMDb star ratings (`★ X.X`) display in subtitle rows across:
+    - **Search**: `renderTitlePosterCards()` in `19_client-search-and-likes.js`.
+    - **Discover**: 5-poster list preview cards (`loadPosterSlot`) and curated list preview cards (`buildCuratedListCardHtml`) in `19_client-search-and-likes.js`.
+    - **Lists**: Custom lists (`buildCustomListCardHtml`), local lists / Watchlist / Watch History / Continue Watching (`buildLocalListCardHtml`), Airing Next (`buildAiringNextCardHtml`), and external TMDB user lists (`17_client-my-lists-and-trakt-oauth.js`).
+    - **List Details ("See All" / Full Grids)**: `livePreviewPosterHtml()` in `23_client-list-management.js`.
+  - Upstream data mapping in `07_source-fetchers-tmdb-simkl.js` (`mapTmdbItem`, `mapSimklItems`) and `06_source-fetchers-mdblist-trakt.js` (`extractMdblistItem`, `mapTraktItems`) now extracts and passes `vote_average` and `rating` through all catalog and details endpoints.
+  - **Live Preview Shelves Exception Preserved**: Live Preview shelves on the My Catalogs tab remain strictly exempt from displaying ratings (`isLivePreviewShelf: true`).
+
+### 🏷️ Untied Continue Watching Badges, Subtitle Ratings & Settings Clean-up
+
+- **Untied Continue Watching Badges from Airing Next Removal**:
+  - In `21_client-custom-list-builder.js`, updated `collectAiringNextCandidateShowIds()` to retain candidate show IDs for shows present in Continue Watching even if they are marked in `isAiringNextRemoved(id)`.
+  - In `refreshAiringNext()`, cached all resolved upcoming show schedules in `window._airingNextScheduleMap` and persisted them in `localStorage ('myListAddon:airingScheduleMap')`.
+  - Filtered removed shows strictly from the `airing-next` shelf items while updating `continue-watching` items directly with `airDate`, `seasonFinaleAirDate`, `isSeasonPremiere`, `isSeasonFinale`, and `seasonFinaleEpisodeNumber`.
+  - In `23_client-list-management.js`, updated `getAiringNextIndex()` to include items from the schedule map, ensuring `findAiringMatchFor()` locates upcoming episode and finale dates even for shows removed from the Airing Next shelf.
+  - In `22_client-creator-profile.js`, added fallback to `findAiringMatchFor()` in `buildLocalListCardHtml()` for Continue Watching.
+- **Removed "Removed from Airing Next" Section from Settings**:
+  - Removed the panel and its `#removedAiringNextSettingsSection` container from `15_tab-settings-html.js`.
+  - Converted `renderRemovedAiringNextSettingsSection()` in `22_client-creator-profile.js` into a safe no-op. Shows automatically reappear on the Airing Next shelf when a user watches a newer episode.
+- **Poster Ratings Moved to Subtitle Row with Single Active Toggle**:
+  - Replaced checkboxes with a single-choice radio group (`posterRatingSource`: `None`, `IMDb Ratings`, `TMDb Ratings`) in Settings (`15_tab-settings-html.js`).
+  - Added `getPosterRatingSource()` and `setPosterRatingSource(source)` in `23_client-list-management.js` to enforce mutual exclusivity across `None`, `IMDb`, and `TMDb`.
+  - Implemented `formatRatingSpanHtml(item, options)` in `16_client-row-core.js` to render `<span class="poster-rating">★ X.X</span>` in the subtitle row beside the year (matching the user's screenshot) rather than overlaying chips on the poster artwork.
+  - In `19_client-search-and-likes.js`, wired `renderTitlePosterCards()` to `formatRatingSpanHtml()`, allowing the Settings toggle to directly show or hide ratings in Search.
+  - Removed `.rating-badge` overlay chips from `renderMediaCard()`, `buildAiringNextCardHtml()`, `buildLocalListCardHtml()`, and `livePreviewPosterHtml()`.
+  - Maintained strict suppression of ratings on simulated Stremio shelves in Live Preview & Editor on the My Catalogs tab.
+
+### 📺 Trakt Disconnected State, Channel Publishing, Share Modal Alignment & Builder Layout
+
+- **Disconnected Trakt Prompt**:
+  - Updated `runMyTraktLists()` to check for `token` before fetching. When disconnected (`!token`), it renders the neutral instruction message (`Connect your Trakt account in Settings or click Connect Trakt above...`) and clears `#myPrivateTraktListsResult`, eliminating mock cards and "Couldn't load previews for this list. Retry" errors.
+  - Aligned `disconnectTrakt()` and `renderTraktConnectStatus()` to maintain the neutral prompt on disconnect.
+- **Explore Channels Public Publishing**:
+  - In `saveChannel()`, when a channel is saved with Public toggle ON, it automatically publishes to the Cloudflare Worker explore directory (`/api/channel/share` with `publish: true`), saves `shareCode` and `sharePublished: true`, and updates the Explore Channels directory.
+  - When saved with Public toggle OFF, if the channel was previously published, it unpublishes from the directory via `/api/channel/unpublish`.
+- **Channel Share Modal Alignment**:
+  - Implemented `showSavedChannelModal(name, visibility, url)` in `20_client-channel-builder.js` matching `showSavedCustomListModal` in Custom Lists:
+    - Heading: `✓ Channel Saved`
+    - Subtext: `"{name}" has been saved to your Profile as a {public|private} channel.`
+    - Copy link section: read-only vanity URL input with an inline `Copy Link` button.
+    - Footer buttons: `Open Link ↗` and `Done`.
+  - Replaced generic `showAppAlert` in `saveChannel()` and `shareChannelById()`.
+- **My Channels Delete Button Styling**:
+  - Removed `color:var(--danger);` from the Delete button in `renderMyCreatedChannelsList()` in `20_client-channel-builder.js`, rendering it as a standard secondary (black/dark text) button matching My Lists.
+- **Private Channel Edit Toggle Persistence**:
+  - Added `visibility` and `owner` to `channelShareFields(src)` and `saveLocalChannel(payload)` so private channel visibility is preserved in local storage and never lost on save.
+  - Updated `applyChannelBroadcastSettings()` so editing a private channel keeps `#channelPublicToggle.checked = false`.
+- **Channel Builder & Custom List Form Layout**:
+  - Removed `Shuffle now` from `#channelPlayOrderSelect` in `13_tab-channels.js` and `#customListPlayOrderSelect` in `12_tab-custom-lists.js`.
+  - Added dedicated `Shuffle picks now` button beside `Remove All` in Channel Builder (`13_tab-channels.js`), matching Custom Lists.
+  - Moved `#channelVisibilityRow` (the Public toggle switch) to sit directly beneath `Remove All` and `Shuffle picks now`.
+
+- **Public Channel URLs (`/channels/(username)/(name-of-channel)`)**:
+  - Replaced `/channel/:code` share URLs with personalized vanity links: `https://mylistsadd.com/channels/(username)/(name-of-channel)` (e.g. `${ORIGIN}/channels/${encodeURIComponent(username)}/${slug}`).
+  - Added dedicated `/channels/:username/:slug.json` endpoint to serve the channel payload directly.
+  - Retained full backward compatibility for legacy `/channel/:code` links with automatic 302 redirects to `/configure#channel=<code>`.
+- **Custom List Edit Page Alignment**:
+  - Replaced visibility `<select>` dropdown with the Public/Private `.ui-toggle` switch (`#customListPublicToggle`), matching the New List modal.
+  - Replaced legacy "Randomize order (reshuffles once a day)" checkbox with the Play Order dropdown (including "Shuffle daily", "Aired (oldest first)", "Aired (newest first)", and "Title (A-Z)").
+  - Added collapsible `<details class="channel-advanced-details">` drawer with Play Order and "Hide watched — skip items already in my watch history" checkbox (`#customListHideWatchedCheck`), omitting channel-only broadcast settings.
+- **My Channels Action Buttons & Form Controls**:
+  - Pruned action buttons on My Channels cards to strictly `Edit`, `Delete`, `Share` (rendered only if public/published), and `+ Add` / `Remove`.
+  - Added Public/Private `.ui-toggle` switch (`#channelPublicToggle`) to the Channel Builder create/edit form.
+  - Renamed Hide Watched checkbox label to lowercase: `"Hide watched — skip episodes already in my watch history"`.
+  - Removed "Publish one of your own" panel from Explore Channels.
+  - Removed "On Today" tab/button (`#detailTypeLineupBtn`) from channel details views.
+- **Explore Channels Poster Mosaic**:
+  - Upgraded Explore Channels cards to match other list cards with a 9-poster desktop / 3-poster mobile mosaic (`.list-card-posters.poster-preview-static`), sample items payload, and "See all" preview button.
+- **Removed Quick Channel Wizard**:
+  - Removed the Quick Channel Wizard from Channels Quick Add (`channelsSubQuickAdd`) and the Quick List Wizard from Discover / Catalogs Quick Add (`catalogsSubQuickAdd`).
+- **Simkl Disconnected State**:
+  - Suppressed red error message (`✗ Please connect your Simkl account first.`) when Simkl account is not connected or `!token`, displaying clean neutral instructions instead.
+
+### 🧩 Frontend Architecture & Code-Reuse Consolidation
+
+- **Unified Drag & Drop Engine (`createSortableList`)**: Replaced 4 divergent drag-and-drop systems across lists, channels, custom list draft picks, and creator profile lists with a shared, idempotent pointer and HTML5 drag engine in `16_client-row-core.js` supporting both 1D lists (`axis: 'y'`) and 2D poster grids (`axis: 'xy'`).
+- **Eliminated All Native Browser Dialogs (`alert`, `confirm`, `prompt`)**: Replaced all 18 client-side native `confirm()` prompts and 6 `prompt()` dialogs with styled, accessible modal dialogs (`showAppConfirm`, `confirmDialog`, `showAppPrompt`, `promptDialog`), and routed native `window.alert()` to non-blocking toast notifications (`showToast`) and accessible alerts (`showAppAlert`), eliminating browser UI thread blocks.
+- **Live Preview & Editor Clean Shelf Presentation**: Suppressed `.cw-remove-btn` from Live Preview & Editor shelves (`#lists`), ensuring no configured list or catalog row displays the red circular '✕' button on simulated Stremio shelves.
+- **Explore Channels "+ Add" / "Remove" Button Dynamic Toggle**: Enhanced Explore Channels directory cards so clicking `+ Add` dynamically updates the button to `Remove` (and vice-versa when removed), correctly syncing with `#lists` (Live Preview & Editor) without deleting saved channels from local storage or creating orphaned listings.
+- **Next Up Channel Poster & Artwork Fallbacks**: Derived poster artwork for dynamic Next Up channels from seeded Continue Watching items or `/api/channel-poster` SVG generation, ensuring published Next Up channels and cards always display artwork.
+- **Removed "One line about this channel" Inputs**: Removed redundant description text inputs from the Channel Builder (`13_tab-channels.js`) and the publish list card (`20_client-channel-builder.js`).
+- **WCAG 2.2 AA Contrast Compliance for `--muted`**: Updated `--muted` in `09_page-shell.js` to `#636366` in light theme and `#AEAEB2` in dark theme for full WCAG AA 4.5:1 contrast compliance.
+- **Watchlist Modal Display Label Normalization**: Normalized `Watchlist (Movies)` and `Watchlist (Shows)` to display consistently as `Watchlist` in the "Add / Remove from Lists" modal whether adding a show or a movie.
+- **Toast Theme Alignment**: Redesigned `.app-toast`, `.undo-toast`, and `.action-toast` to adapt cleanly to light and dark themes with no colored left accent border.
+- **"Remove All" Capitalization**: Renamed all instances of "Remove all" to "Remove All" across all tab views and builders.
+- **Removed "Unsaved Changes" Banner**: Removed `#unsavedInstallBanner` and associated background poll/update button that caused confusion regarding whether saved configurations auto-update in Stremio/Nuvio or require re-installation.
+- **Removed Duplicate Provider "+ New List" Buttons**: Retained the single, primary "+ New List" button next to Refresh in the "Your Custom Lists" header of `12_tab-custom-lists.js`, removing 4 competing buttons from individual provider headers.
+- **1-Click Stremio & Nuvio Deep Links**: Added dedicated 1-click install action buttons (`stremio://...`, `nuvio://...`, and Stremio Web) to the install results card in `24_client-backup-restore-presets.js`, alongside the manifest copy button for manual configurations.
+- **Progressive Disclosure for Channels**: Wrapped play orders, broadcast turnover dials, and smart rules inside a collapsible `<details class="channel-advanced-details">` drawer with the default being manual/created order (`as-listed`), keeping custom channel building fast and uncluttered.
+- **Poster Aspect Ratio Standardization**: Enforced strict `aspect-ratio: 2 / 3` with `object-fit: cover` across `.live-preview-poster` and `.media-card-poster` to prevent layout shifts during image loading.
+- **Unified Toast Notification System (`showToast`)**: Consolidated multiple disjoint toast systems (`showAddedToast`, `showUndoToast`, and custom banners) into a single queue-managed toast engine with support for action buttons (e.g. Gmail-style "Undo") and dismiss handlers.
+- **Standardized Poster & Media Cards (`renderMediaCard`)**: Unified disparate poster card HTML generation across Search, Discover, Channels, and Custom Lists into a single standardized component obeying HTML Living Standard specifications.
+- **Shared Input Debounce (`debounce`)**: Added reusable debounce utility with cancellation support for all search and filter bars.
+
 ### 📺 Channels: pairing glue, and channels that keep themselves up to date
 
 - **"Keep multi-part episodes together."** Every ordering step a channel has had until now could split a

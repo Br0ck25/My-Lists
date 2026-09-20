@@ -714,6 +714,8 @@ function saveLocalChannel(payload) {
     sortByAired: !!payload.sortByAired,
     ...channelBroadcastFields(payload),
     ...channelShareFields(payload),
+    visibility: (payload.visibility === 'private' || payload.sharePublished === false) ? 'private' : 'public',
+    owner: String(payload.owner || (existing ? existing.owner : '') || ''),
     // Kept from the existing record when a save does not carry one, so
     // editing a channel never knocks it out of the order someone arranged.
     order: Number(payload.order) || (existing ? Number(existing.order) : 0) || 0,
@@ -968,54 +970,14 @@ function initMyChannelsDrag() {
   if (!container || myChannelsDragBound) return;
   myChannelsDragBound = true;
 
-  container.addEventListener('dragstart', (e) => {
-    const handle = e.target.closest('.channel-drag-handle');
-    if (!handle) { e.preventDefault(); return; }
-    myChannelDragCard = handle.closest('.list-card[data-channel-id]');
-    if (!myChannelDragCard) return;
-    myChannelDragCard.classList.add('dragging');
-    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
-  });
-
-  container.addEventListener('dragover', (e) => {
-    if (!myChannelDragCard) return;
-    e.preventDefault();
-    moveMyChannelDragCard(container, myChannelDragCard, e.clientY);
-  });
-
-  container.addEventListener('dragend', () => {
-    if (!myChannelDragCard) return;
-    myChannelDragCard.classList.remove('dragging');
-    myChannelDragCard = null;
-    beginMyChannelReorder();
-    applyMyChannelOrder(visibleMyChannelIds());
-  });
-
-  const onTouchMove = (e) => {
-    if (!myChannelTouchCard) return;
-    moveMyChannelDragCard(container, myChannelTouchCard, e.clientY);
-  };
-  const onTouchEnd = () => {
-    document.removeEventListener('pointermove', onTouchMove);
-    if (!myChannelTouchCard) return;
-    myChannelTouchCard.classList.remove('dragging');
-    myChannelTouchCard = null;
-    beginMyChannelReorder();
-    applyMyChannelOrder(visibleMyChannelIds());
-  };
-
-  container.addEventListener('pointerdown', (e) => {
-    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
-    const handle = e.target.closest('.channel-drag-handle');
-    if (!handle) return;
-    e.preventDefault();
-    myChannelTouchCard = handle.closest('.list-card[data-channel-id]');
-    if (!myChannelTouchCard) return;
-    myChannelTouchCard.classList.add('dragging');
-    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
-    document.addEventListener('pointermove', onTouchMove);
-    document.addEventListener('pointerup', onTouchEnd, { once: true });
-    document.addEventListener('pointercancel', onTouchEnd, { once: true });
+  createSortableList(container, {
+    itemSelector: '.list-card[data-channel-id]',
+    handleSelector: '.channel-drag-handle',
+    dragClass: 'dragging',
+    onReorder: function() {
+      beginMyChannelReorder();
+      applyMyChannelOrder(visibleMyChannelIds());
+    }
   });
 }
 
@@ -1083,9 +1045,7 @@ function deleteLocalChannel(channelId, fallbackName) {
       true
     );
   } else {
-    if (confirm('Delete channel "' + name + '"? This will permanently remove it from your saved channels.')) {
-      performDelete();
-    }
+    performDelete();
   }
 }
 
@@ -1196,11 +1156,24 @@ function renderChannelDraftList() {
       : '<div style="position:absolute; top:4px; left:4px; z-index:4;">' +
           '<input type="number" class="pos channelPosInput" min="1" max="' + channelDraftItems.length + '" value="' + (i + 1) + '" title="Type position to move" style="width:34px; height:24px; min-height:unset; padding:2px; font-size:0.75rem; text-align:center; border-radius:6px; background:rgba(0,0,0,0.75); color:#fff; border:1px solid rgba(255,255,255,0.3); font-weight:700;">' +
         '</div>';
+    const removeBtn = selecting ? '' : '<button type="button" class="cw-remove-btn channelRemovePickBtn" title="Remove pick" aria-label="Remove pick" style="z-index:4;">\u2715</button>';
+
+    if (typeof renderMediaCard === 'function') {
+      return renderMediaCard({ title: firstLine, poster: it.poster }, {
+        cardClass: 'channel-pick' + (selecting && isChannelDraftSelected(i) ? ' channel-pick-selected' : ''),
+        dataAttrs: { idx: i },
+        style: 'position:relative; cursor:' + (selecting ? 'pointer' : 'grab') + '; user-select:none; touch-action:manipulation;',
+        topLeftHtml: selectBox,
+        topRightHtml: removeBtn,
+        subtitleHtml: '<span title="' + escapeAttr(secondLine) + '">' + escapeHtml(secondLine) + '</span>'
+      });
+    }
+
     return '<div class="live-preview-poster-card channel-pick' + (selecting && isChannelDraftSelected(i) ? ' channel-pick-selected' : '') + '" data-idx="' + i + '" style="position:relative; cursor:' + (selecting ? 'pointer' : 'grab') + '; user-select:none; touch-action:manipulation;">' +
       '<div style="position:relative; width:100%;">' +
         posterEl +
         selectBox +
-        (selecting ? '' : '<button type="button" class="cw-remove-btn channelRemovePickBtn" title="Remove pick" style="z-index:4;">&times;</button>') +
+        removeBtn +
       '</div>' +
       '<div class="live-preview-poster-name" title="' + escapeAttr(firstLine) + '">' + escapeHtml(firstLine) + '</div>' +
       '<div class="live-preview-poster-year" title="' + escapeAttr(secondLine) + '">' + escapeHtml(secondLine) + '</div>' +
@@ -7899,8 +7872,8 @@ function removeAllChannelDraftPicks() {
     renderChannelDraftList();
   };
   const message = 'Remove all ' + channelDraftItems.length + ' picks? This cannot be undone.';
-  if (typeof showAppConfirm === 'function') showAppConfirm('Remove all picks', message, 'Remove all', wipe, true);
-  else if (confirm(message)) wipe();
+  if (typeof showAppConfirm === 'function') showAppConfirm('Remove all picks', message, 'Remove All', wipe, true);
+  else wipe();
 }
 
 document.getElementById('channelDraftList').addEventListener('click', (e) => {
@@ -7960,142 +7933,13 @@ function initChannelHoldDrag() {
   if (!container || channelHoldDragBound) return;
   channelHoldDragBound = true;
 
-  let activeCard = null;
-  let isDragging = false;
-  let holdTimer = null;
-  let startX = 0;
-  let startY = 0;
-
-  const cancelHold = () => {
-    if (holdTimer) {
-      clearTimeout(holdTimer);
-      holdTimer = null;
-    }
-  };
-
-  const stopDrag = () => {
-    cancelHold();
-    if (isDragging && activeCard) {
-      activeCard.classList.remove('dragging');
-      reorderChannelDraftFromDom();
-    }
-    isDragging = false;
-    activeCard = null;
-    document.body.style.userSelect = '';
-  };
-
-  const startDrag = (card) => {
-    isDragging = true;
-    activeCard = card;
-    card.classList.add('dragging');
-    document.body.style.userSelect = 'none';
-    if (typeof navigator !== 'undefined' && navigator.vibrate) {
-      try { navigator.vibrate(30); } catch (err) {}
-    }
-  };
-
-  const handleMove = (clientX, clientY, e) => {
-    if (!activeCard) return;
-
-    if (!isDragging) {
-      const dist = Math.hypot(clientX - startX, clientY - startY);
-      if (dist > 12) {
-        cancelHold();
-        activeCard = null;
-      }
-      return;
-    }
-
-    if (e && e.cancelable) {
-      e.preventDefault();
-    }
-
-    const grid = container.querySelector('.poster-grid-3') || container;
-    const targetCard = getChannelDragAfterElement(grid, clientX, clientY);
-    if (targetCard && targetCard !== activeCard) {
-      const box = targetCard.getBoundingClientRect();
-      const isAfter = (clientY > box.top + box.height / 2) || (clientY >= box.top && clientX > box.left + box.width / 2);
-      if (isAfter) {
-        grid.insertBefore(activeCard, targetCard.nextSibling);
-      } else {
-        grid.insertBefore(activeCard, targetCard);
-      }
-    }
-  };
-
-  container.addEventListener('dragstart', (e) => { e.preventDefault(); });
-
-  // Pointer events for desktop & unified pointer handling
-  container.addEventListener('pointerdown', (e) => {
-    // Bound once and never removed, so Select mode has to be checked here:
-    // a hold-drag and a tap-to-select are the same gesture on a touch
-    // screen, and while selecting, selecting wins.
-    if (channelDraftSelectMode) return;
-    if (e.target.closest('.channelRemovePickBtn, .channelPosInput')) return;
-    const card = e.target.closest('.channel-pick');
-    if (!card) return;
-
-    cancelHold();
-    activeCard = card;
-    isDragging = false;
-    startX = e.clientX;
-    startY = e.clientY;
-
-    const isTouch = e.pointerType === 'touch' || e.pointerType === 'pen';
-    holdTimer = setTimeout(() => {
-      startDrag(card);
-    }, isTouch ? 180 : 120);
-  });
-
-  window.addEventListener('pointermove', (e) => {
-    if (!activeCard) return;
-    handleMove(e.clientX, e.clientY, e);
-  }, { passive: false });
-
-  window.addEventListener('pointerup', () => {
-    if (activeCard) stopDrag();
-  });
-
-  window.addEventListener('pointercancel', (e) => {
-    if (!isDragging) {
-      cancelHold();
-      activeCard = null;
-    } else if (e.pointerType !== 'touch') {
-      stopDrag();
-    }
-  });
-
-  // Dedicated touch listeners for guaranteed mobile gesture prevention
-  container.addEventListener('touchstart', (e) => {
-    if (e.target.closest('.channelRemovePickBtn, .channelPosInput')) return;
-    const card = e.target.closest('.channel-pick');
-    if (!card || e.touches.length !== 1) return;
-
-    cancelHold();
-    activeCard = card;
-    isDragging = false;
-    startX = e.touches[0].clientX;
-    startY = e.touches[0].clientY;
-
-    holdTimer = setTimeout(() => {
-      startDrag(card);
-    }, 180);
-  }, { passive: true });
-
-  window.addEventListener('touchmove', (e) => {
-    if (!activeCard || !e.touches || e.touches.length !== 1) return;
-    if (isDragging && e.cancelable) {
-      e.preventDefault();
-    }
-    handleMove(e.touches[0].clientX, e.touches[0].clientY, e);
-  }, { passive: false });
-
-  window.addEventListener('touchend', () => {
-    if (activeCard) stopDrag();
-  });
-
-  window.addEventListener('touchcancel', () => {
-    if (activeCard) stopDrag();
+  createSortableList(container, {
+    itemSelector: '.channel-pick',
+    handleSelector: '',
+    axis: 'xy',
+    holdDelay: 120,
+    canDrag: () => !channelDraftSelectMode,
+    onReorder: reorderChannelDraftFromDom
   });
 }
 
@@ -8698,6 +8542,10 @@ function readChannelBroadcastSettings() {
 // readChannelBroadcastSettings, called by every path that opens the builder.
 function applyChannelBroadcastSettings(channel) {
   const f = channelBroadcastFields(channel);
+  const publicToggle = document.getElementById('channelPublicToggle');
+  if (publicToggle) {
+    publicToggle.checked = !channel || (channel.visibility !== 'private' && channel.sharePublished !== false);
+  }
   const descInput = document.getElementById('channelDescriptionInput');
   if (descInput) descInput.value = f.description;
   channelDraftStoryLocked = f.storyLocked;
@@ -9041,7 +8889,7 @@ function guardChannelDraftDuplicate(label, existingCount, retry) {
 let editingChannelId = null;
 let editingChannelUrlInput = null;
 
-function saveChannel() {
+async function saveChannel() {
   const nameInput = document.getElementById('channelNameInput');
   const name = nameInput.value.trim();
   if (!name) {
@@ -9076,6 +8924,8 @@ function saveChannel() {
 
   const map = loadLocalChannels();
   const channelId = editingChannelId || generateChannelId();
+  const existingChannel = (editingChannelId && map[editingChannelId]) ? map[editingChannelId] : {};
+  const isPublic = document.getElementById('channelPublicToggle') ? document.getElementById('channelPublicToggle').checked : true;
   
   const payload = Object.assign({
     channelId: channelId,
@@ -9089,6 +8939,10 @@ function saveChannel() {
     // Worker on every request, and its picks have just been sorted for real
     // (see editChannelById) -- so the stored order is now the answer.
     sortByAired: false,
+    visibility: isPublic ? 'public' : 'private',
+    sharePublished: isPublic,
+    shareCode: existingChannel.shareCode || '',
+    owner: existingChannel.owner || (typeof activeCreator !== 'undefined' && activeCreator ? activeCreator.creatorName : ''),
   // The broadcast schedule, Story Lock, Hide watched and Live Cloud Sync,
   // read straight off the panel below the play-order dropdown. The saved
   // channel is no longer consulted for dailyRotate: the panel was populated
@@ -9097,6 +8951,25 @@ function saveChannel() {
   // reading it back is what lets someone turn a network channel's rotation
   // off.
   }, readChannelBroadcastSettings());
+
+  if (isPublic) {
+    try {
+      const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
+      const data = await postChannelShare(payload, { publish: signedIn });
+      if (data && data.ok) {
+        payload.shareCode = data.code;
+        payload.sharePublished = !!data.published;
+        if (data.owner) payload.owner = data.owner;
+        rememberChannelShare(channelId, data.code, !!data.published);
+      }
+    } catch (e) {}
+  } else if (existingChannel.shareCode && (existingChannel.sharePublished || existingChannel.visibility === 'public')) {
+    try {
+      await unpublishChannelByCode(existingChannel.shareCode);
+      payload.sharePublished = false;
+      rememberChannelShare(channelId, existingChannel.shareCode, false);
+    } catch (e) {}
+  }
 
   saveLocalChannel(payload);
 
@@ -9121,7 +8994,11 @@ function saveChannel() {
 
   renderMyCreatedChannelsList();
   renderChannelMergeList();
-  
+  if (typeof loadChannelDirectory === 'function') loadChannelDirectory(true);
+
+  const finalShareUrl = payload.shareCode ? channelShareUrl(payload.shareCode, payload) : '';
+  showSavedChannelModal(name, isPublic ? 'public' : 'private', finalShareUrl);
+
   editingChannelId = null;
   editingChannelUrlInput = null;
   channelDraftItems = [];
@@ -10306,14 +10183,10 @@ function renderMyCreatedChannelsList() {
         '</div>' +
         '<div class="list-card-actions">' +
           '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="editChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)">Edit</button>' +
-          (ch.shareCode
-            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="copyChannelShareLink(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Copy this channel\u2019s share link">Copy link</button>' +
-              '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Push your latest edits to the link people already have">Update link</button>'
-            : '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Create a link that rebuilds this channel anywhere">Share</button>') +
-          (ch.dynamic === 'next-up'
-            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="refreshNextUpChannelSeed(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Pull in whatever you have started watching since">Refresh</button>'
+          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="deleteLocalChannel(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, &quot;' + escapeJsAttr(ch.name) + '&quot;)">Delete</button>' +
+          ((ch.sharePublished || ch.visibility === 'public')
+            ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="shareChannelById(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)" title="Share this channel">Share</button>'
             : '') +
-          '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="deleteLocalChannel(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, &quot;' + escapeJsAttr(ch.name) + '&quot;)">Delete</button>' +
           addBtnHtml +
         '</div>' +
       '</div>' +
@@ -10751,16 +10624,21 @@ function createNextUpChannel(btn) {
   if (btn) btn.disabled = true;
   try {
     const channelId = generateChannelId();
+    const seed = channelNextUpSeedItems();
+    const firstWithArt = seed.find((it) => it && (it.showPoster || it.poster || it.thumbnail));
+    const posterArt = firstWithArt
+      ? (firstWithArt.showPoster || firstWithArt.poster || firstWithArt.thumbnail)
+      : (ORIGIN + '/api/channel-poster?name=' + encodeURIComponent(NEXT_UP_CHANNEL_NAME) + '&v=6');
     const payload = {
       channelId: channelId,
       name: NEXT_UP_CHANNEL_NAME,
-      poster: null,
+      poster: posterArt,
       backdrop: null,
       // A seed, not the answer. The Worker re-derives the lineup on every
       // request and that replaces this -- but only for a config that can
       // prove whose it is, so this is what the channel plays until then and
       // what it falls back to if that proof is ever missing.
-      items: channelNextUpSeedItems(),
+      items: seed,
       shuffle: false,
       autoSort: '',
       sortByAired: false,
@@ -10769,6 +10647,8 @@ function createNextUpChannel(btn) {
     };
     saveLocalChannel(payload);
     addRow(NEXT_UP_CHANNEL_NAME, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+    if (typeof saveState === 'function') saveState();
+    if (typeof renderLivePreview === 'function') renderLivePreview();
     renderMyCreatedChannelsList();
     renderChannelMergeList();
     showAddedToast('"' + NEXT_UP_CHANNEL_NAME + '" added to your Catalogs.');
@@ -11438,11 +11318,30 @@ function channelShareFields(src) {
   return {
     shareCode: String(o.shareCode || ''),
     sharePublished: !!o.sharePublished,
+    visibility: (o.visibility === 'private' || o.sharePublished === false) ? 'private' : 'public',
+    owner: String(o.owner || ''),
   };
 }
 
-function channelShareUrl(code) {
-  return ORIGIN.replace(/\\/+$/, '') + '/channel/' + encodeURIComponent(code);
+function channelShareUrl(code, ch) {
+  let chObj = ch;
+  if (!chObj && typeof loadLocalChannels === 'function') {
+    const map = loadLocalChannels();
+    for (const k in map) {
+      if (map[k] && map[k].shareCode === code) {
+        chObj = map[k];
+        break;
+      }
+    }
+  }
+  const creator = (chObj && chObj.owner) || (typeof activeCreator !== 'undefined' && activeCreator && activeCreator.creatorName);
+  const name = chObj && chObj.name;
+  const base = ORIGIN.endsWith('/') ? ORIGIN.slice(0, -1) : ORIGIN;
+  if (creator && name && (chObj.sharePublished || chObj.visibility === 'public')) {
+    const slug = typeof slugify === 'function' ? slugify(name) : encodeURIComponent(name.toLowerCase().split(' ').join('-'));
+    return base + '/channels/' + encodeURIComponent(creator) + '/' + slug;
+  }
+  return base + '/channel/' + encodeURIComponent(code);
 }
 
 // The code inside whatever got pasted: a full share URL, a "channel:share:"
@@ -11450,8 +11349,17 @@ function channelShareUrl(code) {
 function parseChannelShareCode(raw) {
   const text = String(raw || '').trim();
   if (!text) return '';
-  const fromUrl = text.match(/\\/channel\\/([A-Za-z0-9_-]{1,64})/);
-  if (fromUrl) return fromUrl[1];
+  if (text.includes('/channels/')) {
+    const parts = text.split('/channels/')[1].split('?')[0].split('#')[0].split('/');
+    if (parts.length >= 2 && parts[0] && parts[1]) {
+      const cleanSlug = parts[1].toLowerCase().endsWith('.json') ? parts[1].slice(0, -5) : parts[1];
+      return 'channels:' + parts[0] + ':' + cleanSlug;
+    }
+  }
+  if (text.includes('/channel/')) {
+    const part = text.split('/channel/')[1].split('?')[0].split('#')[0].split('/')[0];
+    if (part && /^[A-Za-z0-9_-]{1,64}$/.test(part)) return part;
+  }
   const fromHash = text.match(/[#&?]channel=([A-Za-z0-9_-]{1,64})/);
   if (fromHash) return fromHash[1];
   const fromScheme = text.match(/^channel:share:([A-Za-z0-9_-]{1,64})$/);
@@ -11463,10 +11371,24 @@ function parseChannelShareCode(raw) {
 // channel carries local bookkeeping (createdAt, the share code itself) that
 // has no meaning on anyone else's device.
 function channelSharePayload(ch) {
+  let poster = ch.poster || null;
+  let backdrop = ch.backdrop || null;
+  if (!poster && !backdrop) {
+    if (ch.dynamic === 'next-up' && typeof channelNextUpSeedItems === 'function') {
+      const seed = channelNextUpSeedItems();
+      const firstWithArt = seed.find((it) => it && (it.showPoster || it.poster || it.thumbnail));
+      if (firstWithArt) {
+        poster = firstWithArt.showPoster || firstWithArt.poster || firstWithArt.thumbnail;
+      }
+    }
+    if (!poster && !backdrop) {
+      poster = ORIGIN + '/api/channel-poster?name=' + encodeURIComponent(ch.name || 'Channel') + '&v=6';
+    }
+  }
   return Object.assign({
     name: ch.name,
-    poster: ch.poster,
-    backdrop: ch.backdrop,
+    poster: poster,
+    backdrop: backdrop,
     items: ch.items || [],
     shuffle: !!ch.shuffle,
     autoSort: ch.autoSort || '',
@@ -11515,6 +11437,35 @@ function rememberChannelShare(channelId, code, published) {
   saveLocalChannelsMap(map);
 }
 
+function showSavedChannelModal(channelName, visibility, url) {
+  const isPrivate = visibility === 'private';
+  showModal(
+    '<div class="modal-body">' +
+      '<button type="button" class="modal-close-x" aria-label="Close" onclick="closeModal()">\u2715</button>' +
+      '<h2 class="panel-title" style="margin-top:0;">\u2713 Channel Saved</h2>' +
+      '<p style="margin:8px 0 16px; font-size:0.9rem; color:var(--text);">' +
+        '<strong>' + escapeHtml(channelName || 'Channel') + '</strong> has been saved to your Profile as a <strong>' + (isPrivate ? 'private' : 'public') + '</strong> channel.' +
+      '</p>' +
+      (isPrivate
+        ? '<div style="padding:12px 14px; background:rgba(0,122,255,0.08); border:1px solid rgba(0,122,255,0.2); border-radius:10px; margin-bottom:16px;">' +
+            '<p style="margin:0; font-size:0.84rem; color:var(--text);">Only you can see this channel from your profile when logged in.</p>' +
+          '</div>'
+        : '<div style="margin-bottom:16px;">' +
+            '<p style="margin:0 0 8px; font-size:0.84rem; color:var(--muted);">Public share link:</p>' +
+            '<div style="display:flex; gap:8px; align-items:center;">' +
+              '<input type="text" id="savedChannelUrlInput" value="' + escapeAttr(url || '') + '" readonly style="flex:1; padding:10px 12px; font-size:0.88rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text);">' +
+              '<button type="button" class="lc-btn primary" id="savedChannelCopyBtn" onclick="copyShareUrlById(&quot;savedChannelUrlInput&quot;, this)" style="white-space:nowrap; padding:10px 14px;">Copy Link</button>' +
+            '</div>' +
+          '</div>'
+      ) +
+      '<div class="actions" style="margin-top:16px; flex-direction:row; justify-content:flex-end; gap:8px;">' +
+        (!isPrivate && url ? '<a href="' + escapeAttr(url) + '" target="_blank" class="button secondary lc-btn" style="text-decoration:none; display:inline-flex; align-items:center;">Open Link &nearr;</a>' : '') +
+        '<button type="button" class="primary lc-btn" onclick="closeModal()">Done</button>' +
+      '</div>' +
+    '</div>'
+  );
+}
+
 // Copies the link a channel already has, without re-uploading it.
 //
 // The modal that appears after sharing or publishing is not a place to keep
@@ -11524,7 +11475,7 @@ async function copyChannelShareLink(channelId, btn) {
   const map = loadLocalChannels();
   const ch = map[channelId];
   if (!ch || !ch.shareCode) return;
-  const link = channelShareUrl(ch.shareCode);
+  const link = channelShareUrl(ch.shareCode, ch);
   let copied = false;
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -11543,9 +11494,7 @@ async function copyChannelShareLink(channelId, btn) {
     showAddedToast('Link to "' + ch.name + '" copied.');
     return;
   }
-  // No clipboard (an insecure origin, or a browser that refuses): the link
-  // still has to be gettable, so it goes on screen to be selected by hand.
-  showAppAlert('Link to "' + ch.name + '"', link, true);
+  showSavedChannelModal(ch.name, ch.visibility || 'public', link);
 }
 
 async function shareChannelById(channelId, btn) {
@@ -11557,6 +11506,7 @@ async function shareChannelById(channelId, btn) {
     btn.disabled = true;
     btn.textContent = 'Sharing…';
   }
+  const isPub = (ch.visibility === 'public' || ch.sharePublished);
   try {
     const data = await postChannelShare(ch, { publish: false });
     if (!data.ok) {
@@ -11564,22 +11514,8 @@ async function shareChannelById(channelId, btn) {
       return;
     }
     rememberChannelShare(channelId, data.code, data.published);
-    const link = data.url || channelShareUrl(data.code);
-    let copied = false;
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(link);
-        copied = true;
-      }
-    } catch (e) {
-      copied = false;
-    }
-    showAppAlert(
-      'Share "' + ch.name + '"',
-      (copied ? 'Link copied to your clipboard:\\n\\n' : 'Copy this link:\\n\\n') + link +
-        '\\n\\nAnyone who opens it gets this exact channel — every pick, its play order and its broadcast schedule.',
-      true
-    );
+    const link = data.url || channelShareUrl(data.code, ch);
+    showSavedChannelModal(ch.name, isPub ? 'public' : 'private', link);
     renderMyCreatedChannelsList();
   } catch (e) {
     showAppAlert('Share Channel', 'Network error while creating that share link.');
@@ -11607,6 +11543,8 @@ function acceptSharedChannel(channel, code) {
   });
   saveLocalChannel(payload);
   addRow(payload.name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+  if (typeof saveState === 'function') saveState();
+  if (typeof renderLivePreview === 'function') renderLivePreview();
   renderMyCreatedChannelsList();
   renderChannelMergeList();
   showAddedToast('Channel "' + payload.name + '" added to your Catalogs.');
@@ -11614,6 +11552,13 @@ function acceptSharedChannel(channel, code) {
 }
 
 async function fetchSharedChannel(code) {
+  if (code && typeof code === 'string' && code.startsWith('channels:')) {
+    const parts = code.split(':');
+    const u = parts[1] || '';
+    const s = parts[2] || '';
+    const res = await fetch(ORIGIN + '/channels/' + encodeURIComponent(u) + '/' + encodeURIComponent(s) + '.json', { cache: 'no-store' });
+    return res.json();
+  }
   const res = await fetch(ORIGIN + '/api/channel/share?code=' + encodeURIComponent(code), { cache: 'no-store' });
   return res.json();
 }
@@ -11754,17 +11699,53 @@ function renderChannelDirectory() {
     feed.innerHTML = '<p style="color:var(--muted); font-size:0.85rem;"><small>No published channel matches that.</small></p>';
     return;
   }
-  feed.innerHTML = shown.map((e) => channelListingCardHtml(
-    e,
-    '<button type="button" class="lc-btn searchLikeExternalBtn' + (_channelDirectoryLiked[e.code] ? ' liked' : '') + '"' +
-      ' aria-label="Like this channel" title="Like this channel"' +
-      ' onclick="toggleChannelDirectoryLike(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">' +
-      (_channelDirectoryLiked[e.code] ? '\u2665' : '\u2661') + (e.likes ? ' ' + e.likes : '') +
-    '</button>' +
-    '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">See all</button>' +
-    '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="addDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">+ Add</button>',
-    ''
-  )).join('');
+  const localChannelsMap = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+  const catalogRows = typeof document !== 'undefined' ? [...document.querySelectorAll('#lists .entry')] : [];
+  function isDirectoryChannelAdded(code) {
+    if (!code) return false;
+    let targetChannelId = null;
+    for (const id in localChannelsMap) {
+      if (localChannelsMap[id] && localChannelsMap[id].shareCode === code) {
+        targetChannelId = id;
+        break;
+      }
+    }
+    for (const row of catalogRows) {
+      if (targetChannelId && row.dataset.channelId === targetChannelId) return true;
+      if (row.dataset.shareCode === code) return true;
+      const urlInputs = [...row.querySelectorAll('.url')];
+      for (const u of urlInputs) {
+        const val = u.value || '';
+        if (!val) continue;
+        if (val.includes(code)) return true;
+        if (targetChannelId && val.includes(targetChannelId)) return true;
+        if (val.startsWith('channel:v1:')) {
+          try {
+            const p = JSON.parse(val.slice('channel:v1:'.length));
+            if (p && (p.shareCode === code || (targetChannelId && p.channelId === targetChannelId))) return true;
+          } catch (_) {}
+        }
+      }
+    }
+    return false;
+  }
+  feed.innerHTML = shown.map((e) => {
+    const isAdded = isDirectoryChannelAdded(e.code);
+    const actionBtn = isAdded
+      ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger); border-color:var(--danger);" onclick="removeDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">Remove</button>'
+      : '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="addDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">+ Add</button>';
+    return channelListingCardHtml(
+      e,
+      '<button type="button" class="lc-btn searchLikeExternalBtn' + (_channelDirectoryLiked[e.code] ? ' liked' : '') + '"' +
+        ' aria-label="Like this channel" title="Like this channel"' +
+        ' onclick="toggleChannelDirectoryLike(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">' +
+        (_channelDirectoryLiked[e.code] ? '\u2665' : '\u2661') + (e.likes ? ' ' + e.likes : '') +
+      '</button>' +
+      '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem;" onclick="previewDirectoryChannel(&quot;' + escapeJsAttr(e.code) + '&quot;, this)">See all</button>' +
+      actionBtn,
+      ''
+    );
+  }).join('');
 }
 
 // Look through a published channel before taking it.
@@ -11836,18 +11817,46 @@ async function toggleChannelDirectoryLike(code, btn) {
 }
 
 async function addDirectoryChannel(code, btn) {
-  const originalLabel = btn ? btn.textContent : '+ Add';
   if (btn) {
     btn.disabled = true;
     btn.textContent = 'Adding…';
   }
   try {
+    const map = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+    let localCh = null;
+    for (const id in map) {
+      if (map[id] && map[id].shareCode === code) {
+        localCh = map[id];
+        break;
+      }
+    }
+    if (localCh) {
+      addRow(localCh.name || 'Channel', 'channel:v1:' + JSON.stringify(localCh), 'series', true, 'Channels', localCh.channelId);
+      if (typeof saveState === 'function') saveState();
+      if (typeof renderLivePreview === 'function') renderLivePreview();
+      fetch(ORIGIN + '/api/channel/added', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: code }),
+      }).catch(() => {});
+      const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
+      if (entry) entry.adds = (Number(entry.adds) || 0) + 1;
+      renderChannelDirectory();
+      if (typeof showAddedToast === 'function') showAddedToast('Channel "' + (localCh.name || 'Channel') + '" added to your Catalogs.');
+      return;
+    }
     const data = await fetchSharedChannel(code);
     if (!data.ok || !data.channel) {
-      showAppAlert('Explore Channels', data.error || 'That channel could not be read.');
+      if (typeof showAppAlert === 'function') showAppAlert('Explore Channels', data.error || 'That channel could not be read.');
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = '+ Add';
+      }
       return;
     }
     acceptSharedChannel(data.channel, code);
+    if (typeof saveState === 'function') saveState();
+    if (typeof renderLivePreview === 'function') renderLivePreview();
     // Taking a channel is the signal "most added" ranks on. Best effort by
     // design: it must never be the reason an add fails.
     fetch(ORIGIN + '/api/channel/added', {
@@ -11857,14 +11866,77 @@ async function addDirectoryChannel(code, btn) {
     }).catch(() => {});
     const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
     if (entry) entry.adds = (Number(entry.adds) || 0) + 1;
-    if (btn) btn.textContent = 'Added ✓';
+    renderChannelDirectory();
   } catch (e) {
-    showAppAlert('Explore Channels', 'Network error while adding that channel.');
-  } finally {
+    if (typeof showAppAlert === 'function') showAppAlert('Explore Channels', 'Network error while adding that channel.');
     if (btn) {
       btn.disabled = false;
-      setTimeout(() => { if (btn) btn.textContent = originalLabel; }, 1500);
+      btn.textContent = '+ Add';
     }
+  }
+}
+
+async function removeDirectoryChannel(code, btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Removing…';
+  }
+  try {
+    const map = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+    let targetChannelId = null;
+    let channelName = '';
+    for (const id in map) {
+      if (map[id] && map[id].shareCode === code) {
+        targetChannelId = id;
+        channelName = map[id].name || '';
+        break;
+      }
+    }
+    const rows = typeof document !== 'undefined' ? [...document.querySelectorAll('#lists .entry')] : [];
+    let removedAnyRow = false;
+    rows.forEach((row) => {
+      let match = false;
+      if (targetChannelId && row.dataset.channelId === targetChannelId) {
+        match = true;
+      } else {
+        const urlInputs = [...row.querySelectorAll('.url')];
+        if (urlInputs.some((u) => {
+          const val = u.value || '';
+          if (targetChannelId && val.includes(targetChannelId)) return true;
+          if (code && val.includes(code)) return true;
+          if (val.startsWith('channel:v1:')) {
+            try {
+              const p = JSON.parse(val.slice('channel:v1:'.length));
+              return p && (p.shareCode === code || (targetChannelId && p.channelId === targetChannelId));
+            } catch (_) {}
+          }
+          return false;
+        })) {
+          match = true;
+        }
+      }
+      if (match) {
+        if (!channelName) {
+          const nameInput = row.querySelector('.name');
+          if (nameInput && nameInput.value) channelName = nameInput.value;
+        }
+        row.remove();
+        removedAnyRow = true;
+      }
+    });
+
+    if (removedAnyRow && typeof saveState === 'function') {
+      saveState();
+    }
+    if (typeof renderLivePreview === 'function') {
+      renderLivePreview();
+    }
+    
+    renderChannelDirectory();
+    if (typeof showAddedToast === 'function') showAddedToast('Removed "' + (channelName || 'Channel') + '" from your Catalogs.');
+  } catch (e) {
+    if (typeof showAppAlert === 'function') showAppAlert('Explore Channels', 'Error while removing that channel.');
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -11877,8 +11949,47 @@ async function addDirectoryChannel(code, btn) {
 // differ only in the buttons on the right. Two card shapes for one object is
 // how a description ends up shown in one place and not the other.
 function channelListingCardHtml(entry, actionsHtml, extraHtml) {
-  const art = entry.backdrop || entry.poster || '';
-  const thumb = art
+  const sampleItems = Array.isArray(entry.sample) ? entry.sample.slice(0, 9) : [];
+  const totalCount = entry.itemCount || sampleItems.length;
+  let postersHtml = '';
+  if (sampleItems.length) {
+    postersHtml = '<div class="list-card-posters poster-preview-static">' +
+      sampleItems.map((it, i) => {
+        const isMobileEnd = (i === 2 && sampleItems.length > 3);
+        const isDesktopEnd = (i === sampleItems.length - 1 && sampleItems.length >= 4);
+        let overlays = '';
+        if (entry.code) {
+          if (isMobileEnd) overlays += '<div class="list-card-count-overlay mobile-only" style="cursor:pointer;" onclick="event.stopPropagation(); previewDirectoryChannel(&quot;' + escapeJsAttr(entry.code) + '&quot;, this)">' + totalCount + ' &rsaquo;</div>';
+          if (isDesktopEnd) overlays += '<div class="list-card-count-overlay desktop-only" style="cursor:pointer;" onclick="event.stopPropagation(); previewDirectoryChannel(&quot;' + escapeJsAttr(entry.code) + '&quot;, this)">' + totalCount + ' &rsaquo;</div>';
+        }
+        const p = it.poster || it.thumbnail || it.showPoster || it.backdrop || entry.poster || entry.backdrop || '';
+        const imgHtml = p
+          ? '<img src="' + escapeAttr(p) + '" alt="" loading="lazy">'
+          : '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:0.65rem;text-align:center;padding:4px;">No poster</div>';
+        const itemId = it.id || it.imdbId || '';
+        const itemType = (it.kind === 'movie' || it.type === 'movie') ? 'movie' : 'series';
+        const posterClickAttr = itemId
+          ? ' style="cursor:pointer;" onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeJsAttr(itemId) + '&quot;, &quot;' + itemType + '&quot;)"'
+          : (entry.code ? ' style="cursor:pointer;" onclick="event.stopPropagation(); previewDirectoryChannel(&quot;' + escapeJsAttr(entry.code) + '&quot;, this)"' : '');
+        const title = it.name || it.title || entry.name || 'Channel';
+        const subtitle = it.subtitle || it.epName || '';
+        return '<div class="list-card-mini-poster-tile">' +
+          '<div class="list-card-mini-poster-img-wrap"' + posterClickAttr + '>' +
+            imgHtml +
+            overlays +
+          '</div>' +
+          '<div class="list-card-mini-poster-name" title="' + escapeAttr(title) + '">' + escapeHtml(title) + '</div>' +
+          (subtitle ? '<div class="list-card-mini-poster-subtitle" title="' + escapeAttr(subtitle) + '">' + escapeHtml(subtitle) + '</div>' : '') +
+        '</div>';
+      }).join('') +
+    '</div>';
+  }
+
+  let art = entry.backdrop || entry.poster || '';
+  if (!art && !postersHtml) {
+    art = ORIGIN + '/api/channel-poster?name=' + encodeURIComponent(entry.name || 'Channel') + '&format=landscape&v=6';
+  }
+  const thumb = (!postersHtml && art)
     ? '<img src="' + escapeAttr(art) + '" alt="" loading="lazy" style="width:88px; height:56px; object-fit:cover; border-radius:6px; border:1px solid var(--border); flex:0 0 auto;">'
     : '';
   const openAttr = entry.code
@@ -11894,6 +12005,7 @@ function channelListingCardHtml(entry, actionsHtml, extraHtml) {
       '</div>' +
       '<div class="list-card-actions">' + actionsHtml + '</div>' +
     '</div>' +
+    postersHtml +
     (extraHtml || '') +
   '</div>';
 }
@@ -11904,12 +12016,26 @@ function channelAsListingEntry(ch) {
   const items = ch.items || [];
   const showKeys = {};
   items.forEach((it) => { const k = channelDraftShowKey(it); if (k) showKeys[k] = true; });
+  let poster = ch.poster || null;
+  let backdrop = ch.backdrop || null;
+  if (!poster && !backdrop) {
+    if (ch.dynamic === 'next-up' && typeof channelNextUpSeedItems === 'function') {
+      const seed = channelNextUpSeedItems();
+      const firstWithArt = seed.find((it) => it && (it.showPoster || it.poster || it.thumbnail));
+      if (firstWithArt) {
+        poster = firstWithArt.showPoster || firstWithArt.poster || firstWithArt.thumbnail;
+      }
+    }
+  }
+  if (!poster && !backdrop) {
+    backdrop = ORIGIN + '/api/channel-poster?name=' + encodeURIComponent(ch.name || 'Channel') + '&format=landscape&v=6';
+  }
   return {
     code: ch.sharePublished ? ch.shareCode : '',
     name: ch.name,
     description: ch.description || '',
-    poster: ch.poster || null,
-    backdrop: ch.backdrop || null,
+    poster: poster,
+    backdrop: backdrop,
     itemCount: items.length,
     showCount: Object.keys(showKeys).length,
     dailyRotate: !!ch.dailyRotate,
@@ -11919,6 +12045,13 @@ function channelAsListingEntry(ch) {
     owner: ch.sharePublished && typeof activeCreator !== 'undefined' && activeCreator ? activeCreator.creatorName : '',
     likes: 0,
     adds: 0,
+    sample: (items || []).slice(0, 9).map((it) => ({
+      name: it.showName || it.title || ch.name || 'Channel',
+      subtitle: it.epName || (it.season != null && it.episode != null ? ('S' + it.season + 'E' + it.episode) : ''),
+      poster: it.thumbnail || it.poster || it.showPoster || it.backdrop || ch.poster || ch.backdrop || '',
+      id: it.imdbId || it.id || '',
+      kind: it.kind || it.type || 'series',
+    })),
   };
 }
 
@@ -11973,8 +12106,6 @@ function renderChannelPublishList() {
       ? '<button type="button" class="lc-btn secondary" style="padding:6px 12px; font-size:0.8rem; color:var(--danger);" onclick="unpublishChannelFromDirectory(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Unpublish</button>'
       : '<button type="button" class="lc-btn primary" style="padding:6px 12px; font-size:0.8rem;" onclick="publishChannelToDirectory(&quot;' + escapeJsAttr(ch.channelId) + '&quot;, this)">Publish</button>';
     const extra =
-      (ch.sharePublished ? '' :
-        '<input type="text" id="channelPublishDesc_' + escapeAttr(ch.channelId) + '" placeholder="One line about this channel (optional)" style="margin-top:8px; font-size:0.82rem;" value="' + escapeAttr(ch.description || '') + '">') +
       // A published channel's link lives here, on screen, rather than only
       // in the modal that announced it -- that modal closes and takes the
       // link with it.
@@ -12017,7 +12148,7 @@ async function publishChannelToDirectory(channelId, btn) {
   try {
     const data = await postChannelShare(ch, {
       publish: true,
-      description: descInput ? descInput.value.trim() : '',
+      description: descInput ? descInput.value.trim() : (ch.description || ''),
     });
     if (!data.ok) {
       showAppAlert('Publish Channel', data.error || 'Could not publish that channel.');
@@ -12185,9 +12316,7 @@ function deleteLocalMergedChannel(mergedId) {
       true
     );
   } else {
-    if (confirm('Delete merged catalog "' + name + '"? This will permanently remove this merged catalog.')) {
-      performDelete();
-    }
+    performDelete();
   }
 }
 
@@ -12416,7 +12545,7 @@ function renderChannelMergeList() {
           if (ch && Array.isArray(ch.items)) totalEpisodes += ch.items.length;
           return '<span class="badge" style="display:inline-flex; align-items:center; gap:5px; padding:3px 8px; font-size:0.8rem; background:var(--panel-strong); border:1px solid var(--border); border-radius:6px; margin:2px 4px 2px 0;">' +
             escapeHtml(chName) +
-            '<button type="button" class="merge-chip-remove-btn" title="Remove ' + escapeAttr(chName) + ' from merge" onclick="removeChannelFromMerge(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;, &quot;' + escapeJsAttr(chId) + '&quot;)">&times;</button>' +
+            '<button type="button" class="merge-chip-remove-btn" title="Remove ' + escapeAttr(chName) + ' from merge" aria-label="Remove ' + escapeAttr(chName) + ' from merge" onclick="removeChannelFromMerge(&quot;' + escapeJsAttr(merged.mergedId) + '&quot;, &quot;' + escapeJsAttr(chId) + '&quot;)">\u2715</button>' +
           '</span>';
         }).join('');
         

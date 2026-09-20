@@ -583,8 +583,58 @@ async function handleFetch(request, env, ctx) {
       return await htmlPageResponse(request, renderBuilderCached(url.origin, {}));
     }
 
-    // Browser navigation for channels (/channels/:slug)
+    // /channels/:username/:channelSlug -- public shareable URL for a creator's published channel
     if (path.startsWith("/channels/")) {
+      const wantsJson = path.endsWith(".json") || (request.headers.get("Accept") || "").includes("application/json");
+      const cleanPath = path.endsWith(".json") ? path.slice(0, -5) : path;
+      const parts = cleanPath.split("/").filter(Boolean);
+      if (parts.length >= 3) {
+        const u = decodeURIComponent(parts[1]).toLowerCase();
+        const s = decodeURIComponent(parts[2]).toLowerCase();
+        let code = "";
+        if (env && env.CONFIGS) {
+          try {
+            code = (await env.CONFIGS.get(`creatorchannel:${u}:${s}`)) || "";
+          } catch {}
+          if (!code) {
+            try {
+              const indexEntries = await readPublicChannelIndex(env);
+              const found = indexEntries.find((e) => e && e.owner && e.owner.toLowerCase() === u && (e.slug === s || (typeof slugifyServer === 'function' ? slugifyServer(e.name) : '') === s));
+              if (found && found.code) code = found.code;
+            } catch {}
+          }
+        }
+        if (code) {
+          if (wantsJson) {
+            try {
+              const raw = await env.CONFIGS.get(`channelshare:${code}`);
+              const record = raw ? JSON.parse(raw) : null;
+              if (record && record.channel) {
+                const ch = sanitizeSharedChannel(record.channel);
+                if (ch) {
+                  return json({
+                    ok: true,
+                    code: code,
+                    channel: ch,
+                    description: record.description || "",
+                    owner: record.owner || "",
+                    published: !!record.published,
+                  }, 200, { "Cache-Control": "public, max-age=60", ...corsHeaders() });
+                }
+              }
+            } catch {}
+          }
+          ctx.waitUntil(bumpStat(env, "pageviews"));
+          return new Response(null, {
+            status: 302,
+            headers: {
+              Location: `${url.origin}/configure#channel=${encodeURIComponent(code)}`,
+              "Cache-Control": "no-store",
+              ...corsHeaders(),
+            },
+          });
+        }
+      }
       ctx.waitUntil(bumpStat(env, "pageviews"));
       return await htmlPageResponse(request, renderBuilderCached(url.origin, {}));
     }
@@ -1043,12 +1093,31 @@ Sitemap: ${url.origin}/sitemap.xml`;
       try {
         const metas = await fetchCatalog({ url: testUrl, type }, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, creatorName, verifiedOwner: previewVerifiedOwner, hideNonDigitalReleases, adultContentFilter, region, env, ctx, origin: url.origin });
         const totalItems = (typeof metas.totalItems === "number") ? metas.totalItems : (metas.length < PAGE_SIZE && skip === 0 ? metas.length : null);
+        // Enrich sample items that lack ratings with TMDb data.
+        // fetchTmdbDetails is cached (7 days) so popular titles are cache hits.
+        const sampleMetas = metas.slice(0, sampleSize);
+        const effectiveTmdbKey = tmdbKey || (env && env.TMDB_API_KEY) || TMDB_API_KEY;
+        if (effectiveTmdbKey) {
+          await mapWithConcurrency(sampleMetas.slice(0, 12), 6, async (m) => {
+            if (m.vote_average != null || m.rating != null || m.score != null) return;
+            const rawTmdbId = m.tmdbId || (m.id && String(m.id).startsWith("tmdb:") ? String(m.id).slice(5) : null) || (m.imdbId && String(m.imdbId).startsWith("tt") ? m.imdbId : (m.id && String(m.id).startsWith("tt") ? m.id : null));
+            if (!rawTmdbId) return;
+            const kind = (m.type === "series" || m.mediatype === "show" || m.mediatype === "series" || m.mediatype === "tv") ? "tv" : "movie";
+            try {
+              const details = await fetchTmdbDetails(rawTmdbId, kind, effectiveTmdbKey, env);
+              if (details && typeof details.vote_average === "number" && details.vote_average > 0) {
+                m.vote_average = details.vote_average;
+                m.rating = details.vote_average;
+              }
+            } catch {}
+          });
+        }
         body = {
           ok: true,
           count: metas.length,
           totalItems: totalItems,
           maybeMore: totalItems != null ? (skip + metas.length < totalItems) : (metas.length >= PAGE_SIZE),
-          sample: metas.slice(0, sampleSize).map((m) => ({
+          sample: sampleMetas.map((m) => ({
             id: m.id,
             showId: m.showId || undefined,
             type: m.type || (m.mediatype === "show" || m.mediatype === "series" || m.mediatype === "tv" ? "series" : (m.mediatype === "episode" ? "episode" : (type === "series" ? "series" : "movie"))),
@@ -1062,18 +1131,28 @@ Sitemap: ${url.origin}/sitemap.xml`;
             seasonNum: m.seasonNum != null ? m.seasonNum : (m.season != null ? m.season : undefined),
             episodeNum: m.episodeNum != null ? m.episodeNum : (m.episode != null ? m.episode : undefined),
             airDate: m.airDate || undefined,
+            airTime: m.airTime || undefined,
             isUnaired: m.isUnaired || undefined,
             isSeasonPremiere: m.isSeasonPremiere || undefined,
             isSeasonFinale: m.isSeasonFinale || undefined,
             seasonFinaleAirDate: m.seasonFinaleAirDate || undefined,
             seasonFinaleEpisodeNumber: m.seasonFinaleEpisodeNumber != null ? m.seasonFinaleEpisodeNumber : undefined,
+            isCompanion: m.isCompanion || undefined,
+            companionType: m.companionType || undefined,
+            companionNote: m.companionNote || undefined,
+            companionStoryline: m.companionStoryline || undefined,
+            precedingShowId: m.precedingShowId || undefined,
+            imdbRating: m.imdbRating || undefined,
+            rating: m.rating != null ? m.rating : (m.vote_average != null ? m.vote_average : (m.imdbRating ? parseFloat(m.imdbRating) : undefined)),
+            vote_average: m.vote_average != null ? m.vote_average : (m.rating != null ? m.rating : undefined),
+            score: m.score != null ? m.score : undefined,
             isAdult: isAdultOrNsfw(m),
             isAdultPosterFiltered: !!m.isAdultPosterFiltered,
           })),
         };
       } catch (err) {
         console.error("preview failed:", err);
-        body = { ok: false, error: "Couldn't load that list." };
+        body = { ok: false, error: (err && err.message) || "Couldn't load that list." };
       }
 
       return new Response(JSON.stringify(body), {
@@ -3231,7 +3310,7 @@ function generateSearchVariations(query) {
         };
 
         const watchlistCard = {
-          name: "Watchlist",
+          name: "Trakt Watch List",
           slug: "watchlist",
           items: watchlistCount,
           likes: 0,
@@ -3241,7 +3320,7 @@ function generateSearchVariations(query) {
         };
 
         const historyCard = {
-          name: "Watch History",
+          name: "Trakt Watch History",
           slug: "history",
           items: 0,
           likes: 0,
@@ -4171,7 +4250,7 @@ function generateSearchVariations(query) {
             };
           }
         } else if (action === "remove") {
-          simklUrl = "https://api.simkl.com/sync/history/remove";
+          simklUrl = "https://api.simkl.com/sync/remove-from-list";
           simklBody = {
             [mediaKey]: [{
               ids: idsObj,
@@ -4365,34 +4444,85 @@ function generateSearchVariations(query) {
           return json({ ok: true, provider: "mdblist", action, target: "watchlist", data: mData });
         }
 
-        if (target === "history") {
-          let mUrl = `https://api.mdblist.com/sync/watched${authParam}`;
-          const payload = isMovie ? { movies: [idsObj] } : { shows: [idsObj] };
+        const isHistoryTarget = target === "history" || (target === "custom" && String(listId || "").toLowerCase().includes("history"));
+        if (isHistoryTarget) {
+          const itemObj = Object.assign({}, idsObj);
+          if (action === "remove") {
+            itemObj.watched_at = null;
+          }
+          if (!isMovie && seasonNum != null && episodeNum != null) {
+            itemObj.seasons = [{
+              number: seasonNum,
+              episodes: [{
+                number: episodeNum,
+                ...(action === "remove" ? { watched_at: null } : {})
+              }]
+            }];
+          }
+          const payload = isMovie ? { movies: [itemObj] } : { shows: [itemObj] };
+          const mdbEndpoints = action === "remove"
+            ? [
+                `https://api.mdblist.com/sync/watched/remove${authParam}`,
+                `https://api.mdblist.com/sync/watched${authParam}`,
+                `https://api.mdblist.com/sync/watched/${authParam}`,
+              ]
+            : [
+                `https://api.mdblist.com/sync/watched${authParam}`,
+                `https://api.mdblist.com/sync/watched/${authParam}`,
+              ];
 
-          try {
-            const mRes = await fetch(mUrl, {
-              method: "POST",
-              headers,
-              body: JSON.stringify(payload),
-            });
-            const mData = await mRes.json().catch(() => ({}));
-            if (!mRes.ok) {
-              let fallbackUrl = `https://api.mdblist.com/history/${action === "add" ? "add" : "remove"}${authParam}`;
-              const fbRes = await fetch(fallbackUrl, {
+          let success = false;
+          let lastErr = null;
+          let mData = {};
+
+          for (const mUrl of mdbEndpoints) {
+            try {
+              const mRes = await fetch(mUrl, {
                 method: "POST",
                 headers,
-                body: JSON.stringify({ id: bestId, mediatype: mdbType }),
+                body: JSON.stringify(payload),
               });
-              const fbData = await fbRes.json().catch(() => ({}));
-              if (!fbRes.ok) {
-                return json({ ok: false, error: mData.error || fbData.error || `MDBList error (HTTP ${mRes.status})` }, mRes.status);
+              mData = await mRes.json().catch(() => ({}));
+              if (mRes.ok) {
+                success = true;
+                break;
+              } else if (mRes.status !== 404 && mRes.status !== 405) {
+                lastErr = mData.error || mData.message || `MDBList error (HTTP ${mRes.status})`;
               }
+            } catch (err) {
+              lastErr = safeErrorMessage(err);
             }
-            invalidatePerUserCache("mdblist", safeUserHash(token));
-            return json({ ok: true, provider: "mdblist", action, target: "history", data: mData });
-          } catch (err) {
-            return json({ ok: false, error: safeErrorMessage(err) }, 500);
           }
+
+          if (!success && action === "remove") {
+            try {
+              const singleUrl = `https://api.mdblist.com/history/remove${authParam}`;
+              const sRes = await fetch(singleUrl, {
+                method: "POST",
+                headers,
+                body: JSON.stringify({
+                  id: bestId,
+                  imdb: cleanImdb,
+                  tmdb: numTmdb,
+                  mediatype: mdbType,
+                }),
+              });
+              const sData = await sRes.json().catch(() => ({}));
+              if (sRes.ok) {
+                success = true;
+                mData = sData;
+              } else if (sRes.status !== 404 && sRes.status !== 405) {
+                lastErr = sData.error || sData.message || lastErr;
+              }
+            } catch {}
+          }
+
+          if (!success) {
+            return json({ ok: false, error: lastErr || "Failed to update MDBList watch history." }, 400);
+          }
+
+          invalidatePerUserCache("mdblist", safeUserHash(token));
+          return json({ ok: true, provider: "mdblist", action, target: "history", data: mData });
         }
 
         if (target === "custom" && listId) {
@@ -5480,7 +5610,7 @@ function generateSearchVariations(query) {
               }
             } catch {}
             const watchlistEntry = {
-              name: "Watchlist",
+              name: "Trakt Watch List",
               slug: "watchlist",
               items: watchlistCount,
               likes: 0,
@@ -5506,13 +5636,260 @@ function generateSearchVariations(query) {
               }
             } catch {}
             const historyEntry = {
-              name: "Watch History",
+              name: "Trakt Watch History",
               slug: "history",
               items: historyCount,
               likes: 0,
               private: true,
               url: "trakt:history",
               contentType: "unknown",
+            };
+
+            let continueWatchingCandidates = [];
+            let wData = [];
+            try {
+              const [playbackRes, wShowsRes, hProgRes, hDroppedRes, hResetRes] = await Promise.all([
+                fetchTraktWithRetry("https://api.trakt.tv/sync/playback?limit=50", {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "trakt-api-version": "2",
+                    "trakt-api-key": TRAKT_CLIENT_ID,
+                    Authorization: `Bearer ${accessToken}`,
+                    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                  },
+                  cf: { cacheTtl: 0, cacheEverything: false },
+                }).catch(() => null),
+                fetchTraktWithRetry("https://api.trakt.tv/users/me/watched/shows?extended=noseasons", {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "trakt-api-version": "2",
+                    "trakt-api-key": TRAKT_CLIENT_ID,
+                    Authorization: `Bearer ${accessToken}`,
+                    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                  },
+                  cf: { cacheTtl: 60, cacheEverything: false },
+                }).catch(() => null),
+                fetchTraktWithRetry("https://api.trakt.tv/users/hidden/progress_watched?type=show&limit=100", {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "trakt-api-version": "2",
+                    "trakt-api-key": TRAKT_CLIENT_ID,
+                    Authorization: `Bearer ${accessToken}`,
+                    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                  },
+                  cf: { cacheTtl: 300, cacheEverything: false },
+                }).catch(() => null),
+                fetchTraktWithRetry("https://api.trakt.tv/users/hidden/dropped?type=show&limit=100", {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "trakt-api-version": "2",
+                    "trakt-api-key": TRAKT_CLIENT_ID,
+                    Authorization: `Bearer ${accessToken}`,
+                    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                  },
+                  cf: { cacheTtl: 300, cacheEverything: false },
+                }).catch(() => null),
+                fetchTraktWithRetry("https://api.trakt.tv/users/hidden/progress_watched_reset?type=show&limit=100", {
+                  headers: {
+                    "Content-Type": "application/json",
+                    "trakt-api-version": "2",
+                    "trakt-api-key": TRAKT_CLIENT_ID,
+                    Authorization: `Bearer ${accessToken}`,
+                    "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                  },
+                  cf: { cacheTtl: 300, cacheEverything: false },
+                }).catch(() => null),
+              ]);
+
+              const hiddenShowKeys = new Set();
+              for (const hRes of [hProgRes, hDroppedRes, hResetRes]) {
+                if (hRes && hRes.ok) {
+                  const hData = await hRes.json().catch(() => []);
+                  if (Array.isArray(hData)) {
+                    for (const item of hData) {
+                      if (!item) continue;
+                      const s = item.show || item.movie || item;
+                      const ids = s.ids || item.ids || {};
+                      if (ids.trakt) hiddenShowKeys.add(String(ids.trakt));
+                      if (ids.imdb) hiddenShowKeys.add(String(ids.imdb).toLowerCase());
+                      if (ids.tmdb) hiddenShowKeys.add(String(ids.tmdb));
+                      if (ids.slug) hiddenShowKeys.add(String(ids.slug).toLowerCase());
+                      if (s.title) hiddenShowKeys.add(String(s.title).toLowerCase().trim());
+                    }
+                  }
+                }
+              }
+
+              function isHiddenShow(sObj, idObj) {
+                if (!sObj && !idObj) return false;
+                const ids = idObj || (sObj && sObj.ids) || {};
+                if (ids.trakt && hiddenShowKeys.has(String(ids.trakt))) return true;
+                if (ids.imdb && hiddenShowKeys.has(String(ids.imdb).toLowerCase())) return true;
+                if (ids.tmdb && hiddenShowKeys.has(String(ids.tmdb))) return true;
+                if (ids.slug && hiddenShowKeys.has(String(ids.slug).toLowerCase())) return true;
+                if (sObj && sObj.title && hiddenShowKeys.has(String(sObj.title).toLowerCase().trim())) return true;
+                return false;
+              }
+
+              const seenShowIds = new Set();
+              if (playbackRes && playbackRes.ok) {
+                const pbData = await playbackRes.json().catch(() => []);
+                if (Array.isArray(pbData)) {
+                  for (const it of pbData) {
+                    if (!it) continue;
+                    const isEp = it.type === "episode" || !!it.episode;
+                    const ep = it.episode || {};
+                    const show = it.show || {};
+                    const mov = it.movie || {};
+                    const inner = isEp ? show : mov;
+                    const ids = (isEp ? (ep.ids || show.ids) : mov.ids) || {};
+                    if (isHiddenShow(inner, ids)) continue;
+                    const imdbId = ids.imdb || show.ids?.imdb || mov.ids?.imdb || "";
+                    const tmdbId = ids.tmdb || show.ids?.tmdb || mov.ids?.tmdb || "";
+                    const traktId = ids.trakt || show.ids?.trakt || mov.ids?.trakt || null;
+                    if (traktId) seenShowIds.add(String(traktId));
+                    if (imdbId) seenShowIds.add(String(imdbId));
+                    if (tmdbId) seenShowIds.add(String(tmdbId));
+                    const bestId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : String(it.id));
+                    const sNum = isEp ? (ep.season != null ? ep.season : 1) : null;
+                    const eNum = isEp ? (ep.number != null ? ep.number : 1) : null;
+                    const epTitle = isEp ? (ep.title || "") : "";
+                    const showTitle = isEp ? (show.title || "") : (mov.title || "");
+                    const fullId = isEp ? (bestId + ":" + sNum + ":" + eNum) : bestId;
+                    continueWatchingCandidates.push({
+                      id: fullId,
+                      showId: bestId,
+                      imdbId: imdbId || null,
+                      tmdbId: tmdbId || null,
+                      name: showTitle,
+                      title: isEp ? (showTitle + (sNum != null && eNum != null ? ` S${String(sNum).padStart(2, "0")}E${String(eNum).padStart(2, "0")}` : "")) : showTitle,
+                      episodeTitle: epTitle,
+                      seasonNum: sNum,
+                      episodeNum: eNum,
+                      year: (isEp ? show.year : mov.year) || "",
+                      poster: imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : (tmdbId ? `https://images.metahub.space/poster/medium/tmdb:${tmdbId}/img` : ""),
+                      type: isEp ? "series" : "movie",
+                      progress: typeof it.progress === "number" ? Math.round(it.progress) : 0,
+                      pausedAt: it.paused_at || null,
+                      lastWatched: it.paused_at || null,
+                    });
+                  }
+                }
+              }
+
+              if (wShowsRes && wShowsRes.ok) {
+                const rawW = await wShowsRes.json().catch(() => []);
+                if (Array.isArray(rawW)) wData = rawW;
+              }
+
+              if (wData && wData.length) {
+                const sorted = wData
+                  .filter((it) => it && it.show && it.show.ids)
+                  .sort((a, b) => new Date(b.last_watched_at || 0) - new Date(a.last_watched_at || 0));
+
+                const candidates = sorted
+                  .filter((it) => {
+                    const ids = it.show.ids;
+                    if (isHiddenShow(it.show, ids)) return false;
+                    const hasPb = (ids.trakt && seenShowIds.has(String(ids.trakt))) ||
+                                  (ids.imdb && seenShowIds.has(String(ids.imdb))) ||
+                                  (ids.tmdb && seenShowIds.has(String(ids.tmdb)));
+                    return !hasPb;
+                  })
+                  .slice(0, 40);
+
+                await mapWithConcurrency(candidates, 5, async (c) => {
+                  const show = c.show;
+                  const showKey = show.ids.trakt || show.ids.imdb || show.ids.slug;
+                  if (!showKey) return;
+                  try {
+                    const pRes = await fetchTraktWithRetry(`https://api.trakt.tv/shows/${encodeURIComponent(showKey)}/progress/watched?last_activity=watched&hidden=false&specials=false&count_specials=false`, {
+                      headers: {
+                        "Content-Type": "application/json",
+                        "trakt-api-version": "2",
+                        "trakt-api-key": TRAKT_CLIENT_ID,
+                        Authorization: `Bearer ${accessToken}`,
+                        "User-Agent": `my-list-addon/${ADDON_VERSION}`,
+                      },
+                      cf: { cacheTtl: 60, cacheEverything: false },
+                    });
+                    if (!pRes.ok) return;
+                    const prog = await pRes.json();
+                    if (!prog) return;
+
+                    const aired = typeof prog.aired === "number" ? prog.aired : 0;
+                    const completed = typeof prog.completed === "number" ? prog.completed : 0;
+                    const now = new Date();
+
+                    let nextEp = prog.next_episode || null;
+                    const isNextEpUnaired = nextEp && nextEp.first_aired && new Date(nextEp.first_aired) > now;
+
+                    // If nextEp points to a future unaired episode or is missing, but user hasn't finished all aired episodes:
+                    // search prog.seasons for the earliest uncompleted aired episode (handles FBI S01E02!)
+                    if ((!nextEp || isNextEpUnaired) && completed < aired && Array.isArray(prog.seasons)) {
+                      for (const s of prog.seasons) {
+                        if (s.number > 0 && s.completed < s.aired && Array.isArray(s.episodes)) {
+                          const unwatched = s.episodes.find((ep) => !ep.completed);
+                          if (unwatched) {
+                            nextEp = {
+                              season: s.number,
+                              number: unwatched.number,
+                              title: unwatched.title || "",
+                              first_aired: unwatched.first_aired || null,
+                            };
+                            break;
+                          }
+                        }
+                      }
+                    }
+
+                    const imdbId = show.ids.imdb || "";
+                    const tmdbId = show.ids.tmdb || "";
+                    const bestId = imdbId || (tmdbId ? `tmdb:${tmdbId}` : String(show.ids.trakt));
+                    const showTitle = show.title || "Show";
+                    const poster = imdbId ? `https://images.metahub.space/poster/medium/${imdbId}/img` : (tmdbId ? `https://images.metahub.space/poster/medium/tmdb:${tmdbId}/img` : "");
+
+                    // An episode belongs in Continue Watching ONLY if it has already aired AND user hasn't completed all aired episodes:
+                    const hasAiredUnwatched = nextEp && (!nextEp.first_aired || new Date(nextEp.first_aired) <= now) && (completed < aired || !prog.aired);
+
+                    if (hasAiredUnwatched) {
+                      const sNum = nextEp.season != null ? nextEp.season : 1;
+                      const eNum = nextEp.number != null ? nextEp.number : 1;
+                      const epTitle = nextEp.title || "";
+                      const fullId = `${bestId}:${sNum}:${eNum}`;
+                      continueWatchingCandidates.push({
+                        id: fullId,
+                        showId: bestId,
+                        imdbId: imdbId || null,
+                        tmdbId: tmdbId || null,
+                        name: showTitle,
+                        title: `${showTitle} S${String(sNum).padStart(2, "0")}E${String(eNum).padStart(2, "0")}`,
+                        episodeTitle: epTitle,
+                        seasonNum: sNum,
+                        episodeNum: eNum,
+                        year: show.year || "",
+                        poster: poster,
+                        type: "series",
+                        progress: 0,
+                        pausedAt: null,
+                        lastWatched: prog.last_watched_at || c.last_watched_at || null,
+                      });
+                    }
+                  } catch {}
+                });
+              }
+            } catch {}
+
+            const continueWatchingEntry = {
+              name: "Trakt Continue Watching",
+              slug: "continue-watching",
+              statusKey: "continue-watching",
+              type: "mixed",
+              contentType: "mixed",
+              itemCount: continueWatchingCandidates.length,
+              items: continueWatchingCandidates,
+              private: true,
+              url: "trakt:continue-watching",
             };
 
             let airingCandidates = [];
@@ -5589,7 +5966,7 @@ function generateSearchVariations(query) {
             const meUsername = (me && me.username) || (meSlug !== "me" ? meSlug : "");
 
             ctx.waitUntil(bumpStatBy(env, "apiuse:trakt", 4));
-            return { lists: [airingNextEntry, watchlistEntry, historyEntry, ...rawLists], username: meUsername };
+            return { lists: [continueWatchingEntry, airingNextEntry, watchlistEntry, historyEntry, ...rawLists], username: meUsername };
           }
         });
 
@@ -6203,9 +6580,10 @@ function generateSearchVariations(query) {
         let mdblistAiringCandidates = [];
         let wlItemCount = 0;
         let wlSampleItems = [];
+        let mdblistUpNextCandidates = [];
         try {
           const authQuery = `?apikey=${encodeURIComponent(token)}`;
-          const [showsRes, epsRes, wlRes, wlItemsRes, wlSyncRes] = await Promise.all([
+          const [showsRes, epsRes, wlRes, wlItemsRes, wlSyncRes, upnextRes] = await Promise.all([
             fetch(`https://api.mdblist.com/sync/watched${authQuery}&mediatype=show&limit=50&append_to_response=poster`, {
               headers,
               cf: { cacheTtl: 60, cacheEverything: false },
@@ -6226,7 +6604,52 @@ function generateSearchVariations(query) {
               headers,
               cf: { cacheTtl: 120, cacheEverything: false },
             }).catch(() => null),
+            fetch(`https://api.mdblist.com/upnext${authQuery}&limit=50&hide_unreleased=true&append_to_response=poster`, {
+              headers,
+              cf: { cacheTtl: 60, cacheEverything: false },
+            }).catch(() => null),
           ]);
+
+          if (upnextRes && upnextRes.ok) {
+            const upData = await upnextRes.json().catch(() => null);
+            const upItems = Array.isArray(upData) ? upData : (upData && Array.isArray(upData.items) ? upData.items : (upData && Array.isArray(upData.results) ? upData.results : []));
+            for (const it of upItems) {
+              if (!it) continue;
+              const extracted = typeof extractMdblistItem === "function" ? extractMdblistItem(it) : null;
+              const nextEp = it.next_episode || (extracted && extracted.nextEpisode) || null;
+              const imdbId = it.imdb_id || (extracted && extracted.imdbId) || (typeof it.id === "string" && it.id.startsWith("tt") ? it.id : null);
+              const tmdbId = it.tmdb_id || (extracted && extracted.tmdbId) || null;
+              const bestId = (extracted && extracted.id) || imdbId || (tmdbId ? `tmdb:${tmdbId}` : String(it.id));
+              const sNum = nextEp ? (nextEp.season != null ? nextEp.season : 1) : (it.season != null ? it.season : null);
+              const eNum = nextEp ? (nextEp.episode != null ? nextEp.episode : (nextEp.number != null ? nextEp.number : 1)) : (it.episode != null ? it.episode : null);
+              const epTitle = nextEp ? (nextEp.title || nextEp.name || "") : (it.episode_title || "");
+              const showTitle = it.title || it.name || (extracted && (extracted.showTitle || extracted.name)) || "Show";
+              const fullId = (sNum != null && eNum != null) ? `${bestId}:${sNum}:${eNum}` : bestId;
+              let posterUrl = it.poster || (extracted && extracted.poster) || "";
+              if (typeof posterUrl === "string" && posterUrl.startsWith("/")) {
+                posterUrl = "https://image.tmdb.org/t/p/w500" + posterUrl;
+              }
+              if (!posterUrl && imdbId && String(imdbId).startsWith("tt")) {
+                posterUrl = `https://images.metahub.space/poster/medium/${imdbId}/img`;
+              }
+              mdblistUpNextCandidates.push({
+                id: fullId,
+                showId: bestId,
+                imdbId: imdbId || null,
+                tmdbId: tmdbId || null,
+                name: showTitle,
+                title: (sNum != null && eNum != null) ? `${showTitle} S${String(sNum).padStart(2, "0")}E${String(eNum).padStart(2, "0")}` : showTitle,
+                episodeTitle: epTitle,
+                seasonNum: sNum,
+                episodeNum: eNum,
+                year: it.year || (extracted && extracted.releaseInfo) || "",
+                poster: posterUrl,
+                type: "series",
+                lastWatched: it.last_watched || it.last_watched_at || null,
+                airDate: nextEp ? (nextEp.air_date || nextEp.air_date_utc || "") : "",
+              });
+            }
+          }
 
           const rawAiringItems = [];
           if (showsRes && showsRes.ok) {
@@ -6317,8 +6740,20 @@ function generateSearchVariations(query) {
           }
         } catch {}
 
+        const upNextCard = {
+          name: "MDBList Up Next",
+          slug: "upnext",
+          statusKey: "upnext",
+          type: "series",
+          contentType: "series",
+          itemCount: mdblistUpNextCandidates.length,
+          items: mdblistUpNextCandidates,
+          private: true,
+          url: "mdblist:user:shows:upnext",
+        };
+
         const watchlistCard = {
-          name: "My Watchlist",
+          name: "MDBList My Watch List",
           slug: "watchlist",
           items: wlItemCount,
           likes: 0,
@@ -6329,12 +6764,12 @@ function generateSearchVariations(query) {
         };
 
         const historyCard = {
-          name: "Watch History",
+          name: "MDBList Watch History",
           slug: "history",
           items: 0,
           likes: 0,
           private: true,
-          url: username ? `https://mdblist.com/history/${encodeURIComponent(username)}` : "mdblist:history",
+          url: "mdblist:history",
           contentType: "unknown",
         };
 
@@ -6350,7 +6785,7 @@ function generateSearchVariations(query) {
           url: "mdblist:user:shows:airing-next",
         };
 
-        return json({ ok: true, lists: [airingNextCard, watchlistCard, historyCard, ...lists], username }, 200, { "Cache-Control": "no-store" }); // no-store: a per-person answer keyed on a credential in the URL (see A12).
+        return json({ ok: true, lists: [upNextCard, airingNextCard, watchlistCard, historyCard, ...lists], username }, 200, { "Cache-Control": "no-store" }); // no-store: a per-person answer keyed on a credential in the URL (see A12).
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }

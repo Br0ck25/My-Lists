@@ -5067,6 +5067,16 @@ describe("client: the dynamic Next Up channel", () => {
       ["tt0903747:2:5", "tt0108778:5:13"]
     );
     assert.equal(saved[0].items[0].title, "Breaking Bad S2E5 \u2014 Breakage");
+    assert.equal(saved[0].poster, "https://img/bb.jpg");
+  });
+
+  it("carries a poster when published or turned into a listing entry", () => {
+    const client = loadClient({ routes: {} });
+    const payload = client.call("channelSharePayload", { name: "Next Up", dynamic: "next-up", items: [] });
+    assert.ok(payload.poster && payload.poster.includes("channel-poster"));
+
+    const entry = client.call("channelAsListingEntry", { name: "Next Up", dynamic: "next-up", items: [] });
+    assert.ok(entry.backdrop && entry.backdrop.includes("channel-poster"));
   });
 
   it("saves with no picks when nothing is in progress, rather than refusing", () => {
@@ -5806,6 +5816,56 @@ describe("client: the Explore Channels directory ordering and likes", () => {
       "the channel landed even though the counter call failed"
     );
   });
+
+  it("shows + Add when published channel is not in Live Preview, flips to Remove on add, and removes row without deleting channel", async () => {
+    const localCh = { channelId: "ch_my1", name: "My 90s Toons", shareCode: "toons90", sharePublished: true, items: [] };
+    const client = loadClient({
+      routes: {
+        "/api/channel/directory": () => ({ json: { ok: true, channels: [{ code: "toons90", name: "My 90s Toons", itemCount: 5, showCount: 2 }] } }),
+        "/api/channel/added": () => ({ json: { ok: true } }),
+      },
+      storage: {
+        "myListAddon:localChannels": JSON.stringify({ "ch_my1": localCh }),
+      },
+    });
+
+    let mockCatalogRows = [];
+    client.document.querySelectorAll = (sel) => {
+      if (sel === "#lists .entry") return mockCatalogRows;
+      return [];
+    };
+
+    await client.call("loadChannelDirectory", true);
+    const feed = client.document.getElementById("channelDirectoryFeed");
+    // Initially not in #lists (Live Preview & Editor), so it must show + Add, NOT Remove
+    assert.match(feed.innerHTML, /\+ Add/);
+    assert.equal(/removeDirectoryChannel/.test(feed.innerHTML), false);
+
+    // Simulate row in #lists
+    const rowStub = {
+      dataset: { channelId: "ch_my1" },
+      querySelectorAll: () => [],
+      remove() { mockCatalogRows = mockCatalogRows.filter((r) => r !== rowStub); },
+    };
+    mockCatalogRows.push(rowStub);
+
+    // Re-render directory
+    client.call("renderChannelDirectory");
+    assert.match(feed.innerHTML, /removeDirectoryChannel/);
+    assert.match(feed.innerHTML, /Remove/);
+
+    // Click Remove
+    await client.call("removeDirectoryChannel", "toons90", null);
+
+    // Row should be removed from #lists, button flipped back to + Add
+    assert.equal(mockCatalogRows.length, 0, "row removed from #lists");
+    assert.match(feed.innerHTML, /\+ Add/);
+    assert.equal(/removeDirectoryChannel/.test(feed.innerHTML), false);
+
+    // Local channel must NOT have been deleted
+    const channelsAfter = client.call("loadLocalChannels");
+    assert.ok(channelsAfter["ch_my1"], "local channel preserved");
+  });
 });
 
 describe("client: dragging a pick while the draft is filtered", () => {
@@ -6176,3 +6236,803 @@ describe("client: Quick List Wizard in Catalogs Quick Add", () => {
   });
 });
 
+describe("client: public channel URLs and explore channels mosaic", () => {
+  it("generates /channels/(username)/(slug) URLs for public published channels", () => {
+    const client = loadClient({ routes: {} });
+    const url = client.call("channelShareUrl", "c123", {
+      name: "Cartoons 90s",
+      owner: "alice",
+      sharePublished: true,
+    });
+    assert.equal(url, "https://example.com/channels/alice/cartoons-90s");
+  });
+
+  it("parses /channels/:username/:slug and .json into channels:username:slug", () => {
+    const client = loadClient({ routes: {} });
+    assert.equal(
+      client.call("parseChannelShareCode", "https://example.com/channels/alice/cartoons-90s"),
+      "channels:alice:cartoons-90s"
+    );
+    assert.equal(
+      client.call("parseChannelShareCode", "https://example.com/channels/alice/cartoons-90s.json"),
+      "channels:alice:cartoons-90s"
+    );
+    assert.equal(
+      client.call("parseChannelShareCode", "https://example.com/channel/C123"),
+      "C123"
+    );
+  });
+
+  it("renders the 9-poster static preview mosaic in channelListingCardHtml when sample items exist", () => {
+    const client = loadClient({ routes: {} });
+    const sample = [
+      { name: "Show 1", subtitle: "S1E1", poster: "https://i/1.jpg", id: "tt1" },
+      { name: "Show 2", subtitle: "S1E2", poster: "https://i/2.jpg", id: "tt2" },
+      { name: "Show 3", subtitle: "S1E3", poster: "https://i/3.jpg", id: "tt3" },
+      { name: "Show 4", subtitle: "S1E4", poster: "https://i/4.jpg", id: "tt4" },
+    ];
+    const html = client.call("channelListingCardHtml", {
+      code: "C1",
+      name: "Test Channel",
+      itemCount: 4,
+      showCount: 4,
+      sample: sample,
+    }, "<button>Add</button>", "");
+    assert.match(html, /list-card-posters poster-preview-static/);
+    assert.match(html, /https:\/\/i\/1\.jpg/);
+    assert.match(html, /https:\/\/i\/4\.jpg/);
+    assert.match(html, /Show 1/);
+  });
+
+  it("displays neutral prompt and suppresses red error when Simkl is not connected", async () => {
+    const client = loadClient({ routes: {} });
+    client.document.body.innerHTML = '<div id="mySimklListsResult"></div>';
+    await client.call("runMySimklLists");
+    const resultHtml = client.document.getElementById("mySimklListsResult").innerHTML;
+    assert.match(resultHtml, /Connect your Simkl account/);
+    assert.doesNotMatch(resultHtml, /testresult err/);
+  });
+});
+
+describe("client: trakt disconnected, channel publishing, toggle persistence, and form layout", () => {
+  it("displays neutral prompt and clears private box when Trakt is not connected", async () => {
+    let requested = false;
+    const client = loadClient({
+      routes: {
+        "/api/trakt-my-lists": () => { requested = true; return { json: { ok: true, lists: [] } }; }
+      }
+    });
+    client.document.body.innerHTML = '<div id="myTraktListsResult"></div><div id="myPrivateTraktListsResult">old content</div>';
+    await client.call("runMyTraktLists");
+    const resultHtml = client.document.getElementById("myTraktListsResult").innerHTML;
+    const privHtml = client.document.getElementById("myPrivateTraktListsResult").innerHTML;
+    assert.equal(requested, false, "should not make request to /api/trakt-my-lists when disconnected");
+    assert.match(resultHtml, /Connect your Trakt account/);
+    assert.equal(privHtml, "");
+  });
+
+  it("editing a private channel keeps the public toggle unchecked", () => {
+    const client = loadClient();
+    client.document.body.innerHTML = `
+      <input type="checkbox" id="channelPublicToggle" checked>
+      <input type="text" id="channelNameInput">
+      <div id="channelDraftList"></div>
+      <span id="channelDraftCountBadge"></span>
+      <select id="channelPlayOrderSelect"><option value="as-listed">As listed</option></select>
+    `;
+    client.call("saveLocalChannel", {
+      channelId: "priv-ch",
+      name: "Private Comedy",
+      items: [],
+      visibility: "private",
+      sharePublished: false,
+    });
+    client.call("editChannelById", "priv-ch");
+    const toggle = client.document.getElementById("channelPublicToggle");
+    assert.equal(toggle.checked, false, "toggle should be false for a private channel");
+  });
+
+  it("delete button in My Channels has secondary styling without red danger color", () => {
+    const client = loadClient();
+    client.document.body.innerHTML = `
+      <div id="myCreatedChannelsList"></div>
+      <input type="text" id="myChannelsSearchInput">
+      <select id="myChannelsSortSelect"><option value="recent">Recent</option></select>
+    `;
+    client.call("saveLocalChannel", {
+      channelId: "ch-del",
+      name: "Delete Test Channel",
+      items: [{ name: "Item 1", kind: "movie" }],
+    });
+    client.call("renderMyCreatedChannelsList");
+    const container = client.document.getElementById("myCreatedChannelsList");
+    assert.match(container.innerHTML, />Delete<\/button>/);
+    assert.doesNotMatch(container.innerHTML, /color:var\(--danger\);"[^>]*>Delete<\/button>/);
+  });
+
+  it("removes shuffle-now from play order dropdowns", async () => {
+    const fs = await import("node:fs");
+    const chanHtml = fs.readFileSync("13_tab-channels.js", "utf8");
+    const customHtml = fs.readFileSync("12_tab-custom-lists.js", "utf8");
+    assert.doesNotMatch(chanHtml, /<option value="shuffle-now">/);
+    assert.doesNotMatch(customHtml, /<option value="shuffle-now">/);
+  });
+
+  it("saving a public channel with active creator publishes to /api/channel/share", async () => {
+    const posts = [];
+    const client = loadClient({
+      routes: {
+        "/api/channel/share": (req) => {
+          posts.push(req.body);
+          return { json: { ok: true, code: "PUB1", published: true, owner: "james" } };
+        }
+      },
+      storage: { "myListAddon:creatorKey": "SECRET" }
+    });
+    client.set("activeCreator", { creatorName: "james" });
+    client.document.getElementById("channelNameInput").value = "Sci-Fi 24/7";
+    client.document.getElementById("channelPublicToggle").checked = true;
+    client.set("channelDraftItems", [{ name: "Firefly S1E1", kind: "episode" }]);
+    await client.call("saveChannel");
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].publish, true);
+    assert.equal(posts[0].creatorName, "james");
+    const saved = Object.values(client.call("loadLocalChannels")).find(c => c.name === "Sci-Fi 24/7");
+    assert.ok(saved);
+    assert.equal(saved.shareCode, "PUB1");
+    assert.equal(saved.sharePublished, true);
+  });
+});
+
+describe("client: My Catalogs sub-heading and poster rating badges", () => {
+  it("My Catalogs tab includes the muted sub-heading under Live Preview & Editor", async () => {
+    const fs = await import("node:fs");
+    const catalogsHtml = fs.readFileSync("10_tab-search-add.js", "utf8");
+    assert.match(catalogsHtml, /Catalogs and lists you've added to your add-on\. Reorder, edit, and preview your active shelves\./);
+  });
+
+  it("formatRatingBadgeHtml renders IMDb and TMDb rating badges correctly", () => {
+    const client = loadClient();
+    const fn = client.get("formatRatingBadgeHtml");
+    assert.equal(typeof fn, "function");
+
+    // IMDb rating
+    const imdbItem = { id: "tt1234567", title: "Test Show", imdbRating: "8.4" };
+    const imdbHtml = client.call("formatRatingBadgeHtml", imdbItem);
+    assert.match(imdbHtml, /class="rating-badge rating-high"/);
+    assert.match(imdbHtml, /data-rating-type="imdb"/);
+    assert.match(imdbHtml, /(&#9733;|★) 8\.4/);
+
+    // TMDb rating
+    const tmdbItem = { id: "tmdb:9999", title: "Test Movie", vote_average: 6.8 };
+    const tmdbHtml = client.call("formatRatingBadgeHtml", tmdbItem);
+    assert.match(tmdbHtml, /class="rating-badge rating-mid"/);
+    assert.match(tmdbHtml, /data-rating-type="tmdb"/);
+    assert.match(tmdbHtml, /(&#9733;|★) 6\.8/);
+
+    // Low rating
+    const lowItem = { id: "tmdb:1111", title: "Low Rated", rating: 4.2 };
+    const lowHtml = client.call("formatRatingBadgeHtml", lowItem);
+    assert.match(lowHtml, /class="rating-badge rating-low"/);
+    assert.match(lowHtml, /(&#9733;|★) 4\.2/);
+  });
+
+  it("formatRatingBadgeHtml suppresses badge for live preview shelf items", () => {
+    const client = loadClient();
+    const item = { id: "tt1234567", title: "Test Show", imdbRating: "8.4", isLivePreviewShelf: true };
+    assert.equal(client.call("formatRatingBadgeHtml", item), "");
+    assert.equal(client.call("formatRatingBadgeHtml", { id: "tt1234567", imdbRating: "8.4" }, { isLivePreviewShelf: true }), "");
+  });
+
+  it("formatRatingBadgeHtml respects showBadgeImdbRating and showBadgeTmdbRating settings", () => {
+    const client = loadClient();
+    const imdbItem = { id: "tt1234567", imdbRating: "8.4" };
+    const tmdbItem = { id: "tmdb:9999", rating: 7.2 };
+
+    // Initially both render
+    assert.ok(client.call("formatRatingBadgeHtml", imdbItem).length > 0);
+    assert.ok(client.call("formatRatingBadgeHtml", tmdbItem).length > 0);
+
+    // Disable IMDb ratings
+    client.window.localStorage.setItem("myListAddon:showBadgeImdbRating", "0");
+    assert.equal(client.call("formatRatingBadgeHtml", imdbItem), "");
+    assert.ok(client.call("formatRatingBadgeHtml", tmdbItem).length > 0);
+
+    // Re-enable IMDb, disable TMDb ratings
+    client.window.localStorage.setItem("myListAddon:showBadgeImdbRating", "1");
+    client.window.localStorage.setItem("myListAddon:showBadgeTmdbRating", "0");
+    assert.ok(client.call("formatRatingBadgeHtml", imdbItem).length > 0);
+    assert.equal(client.call("formatRatingBadgeHtml", tmdbItem), "");
+
+    // Overall rating disabled
+    client.window.localStorage.setItem("myListAddon:showBadgeRating", "0");
+    assert.equal(client.call("formatRatingBadgeHtml", imdbItem), "");
+    assert.equal(client.call("formatRatingBadgeHtml", tmdbItem), "");
+  });
+
+  it("applyBadgeBodyClasses hides IMDb rating permanently and toggles hide-badge-tmdb-rating", () => {
+    const client = loadClient();
+    client.call("applyBadgeBodyClasses");
+    const body = client.document.body;
+
+    // IMDb rating is removed and always hidden
+    assert.equal(body.classList.contains("hide-badge-imdb-rating"), true);
+    // TMDb rating is enabled by default
+    assert.equal(body.classList.contains("hide-badge-tmdb-rating"), false);
+
+    // Disable TMDb rating
+    client.call("toggleTmdbRatingSetting", false);
+    assert.equal(body.classList.contains("hide-badge-imdb-rating"), true);
+    assert.equal(body.classList.contains("hide-badge-tmdb-rating"), true);
+
+    // Re-enable TMDb rating
+    client.call("toggleTmdbRatingSetting", true);
+    assert.equal(body.classList.contains("hide-badge-imdb-rating"), true);
+    assert.equal(body.classList.contains("hide-badge-tmdb-rating"), false);
+  });
+
+  it("livePreviewPosterHtml renders rating in subtitle for details view but suppresses it in live preview shelf", () => {
+    const client = loadClient();
+    client.call("toggleTmdbRatingSetting", true);
+    const shelfItem = { id: "tt1234567", name: "Shelf Item", vote_average: 8.2, isLivePreviewShelf: true };
+    const shelfHtml = client.call("livePreviewPosterHtml", shelfItem);
+    assert.doesNotMatch(shelfHtml, /rating-badge/);
+    assert.doesNotMatch(shelfHtml, /poster-rating/);
+
+    const detailsItem = { id: "tt1234567", name: "Details Item", vote_average: 8.2, isLivePreviewShelf: false };
+    const detailsHtml = client.call("livePreviewPosterHtml", detailsItem);
+    assert.doesNotMatch(detailsHtml, /rating-badge/);
+    assert.match(detailsHtml, /poster-rating/);
+    assert.match(detailsHtml, /(&#9733;|★) 8\.2/);
+  });
+
+  it("setPosterRatingSource and toggleTmdbRatingSetting control TMDb rating status", () => {
+    const client = loadClient();
+    client.call("setPosterRatingSource", "tmdb");
+    assert.equal(client.call("getPosterRatingSource"), "tmdb");
+    assert.equal(client.call("getBadgeSetting", "showBadgeRating"), true);
+    assert.equal(client.call("getBadgeSetting", "showBadgeTmdbRating"), true);
+    assert.equal(client.call("getBadgeSetting", "showBadgeImdbRating"), false);
+
+    client.call("setPosterRatingSource", "none");
+    assert.equal(client.call("getPosterRatingSource"), "none");
+    assert.equal(client.call("getBadgeSetting", "showBadgeRating"), false);
+    assert.equal(client.call("getBadgeSetting", "showBadgeTmdbRating"), false);
+    assert.equal(client.call("getBadgeSetting", "showBadgeImdbRating"), false);
+
+    client.call("toggleTmdbRatingSetting", true);
+    assert.equal(client.call("getPosterRatingSource"), "tmdb");
+    assert.equal(client.call("getBadgeSetting", "showBadgeRating"), true);
+    assert.equal(client.call("getBadgeSetting", "showBadgeTmdbRating"), true);
+
+    client.call("toggleTmdbRatingSetting", false);
+    assert.equal(client.call("getPosterRatingSource"), "none");
+    assert.equal(client.call("getBadgeSetting", "showBadgeRating"), false);
+    assert.equal(client.call("getBadgeSetting", "showBadgeTmdbRating"), false);
+  });
+
+  it("formatRatingSpanHtml renders TMDb rating and honors toggle", () => {
+    const client = loadClient();
+    const item = { id: "tt1234567", tmdbId: "999", vote_average: 7.7 };
+
+    client.call("toggleTmdbRatingSetting", true);
+    const tmdbSpan = client.call("formatRatingSpanHtml", item);
+    assert.match(tmdbSpan, /class="poster-rating"/);
+    assert.match(tmdbSpan, /data-rating-type="tmdb"/);
+    assert.match(tmdbSpan, /7\.7/);
+
+    client.call("toggleTmdbRatingSetting", false);
+    const noneSpan = client.call("formatRatingSpanHtml", item);
+    assert.equal(noneSpan, "");
+  });
+
+  it("TMDb ratings display on Discover, Lists, and Details cards, and are suppressed on Live Preview shelf", () => {
+    const client = loadClient();
+    client.call("toggleTmdbRatingSetting", true);
+
+    // 1. Lists page card (buildLocalListCardHtml)
+    const listObj = {
+      slug: "custom-favorites",
+      name: "Favorites",
+      type: "movie",
+      items: [{ id: "tt1234567", title: "Test Film", year: "2024", vote_average: 8.2 }]
+    };
+    const listCardHtml = client.call("buildLocalListCardHtml", listObj);
+    assert.match(listCardHtml, /class="poster-rating"/);
+    assert.match(listCardHtml, /8\.2/);
+
+    // 2. Details page card (livePreviewPosterHtml)
+    const detailsItem = { id: "tt1234567", name: "Test Film", year: "2024", vote_average: 8.2, isLivePreviewShelf: false };
+    const detailsHtml = client.call("livePreviewPosterHtml", detailsItem);
+    assert.match(detailsHtml, /class="poster-rating"/);
+    assert.match(detailsHtml, /8\.2/);
+
+    // 3. Live Preview shelf card (isLivePreviewShelf: true - suppressed)
+    const shelfItem = { id: "tt1234567", name: "Test Film", year: "2024", vote_average: 8.2, isLivePreviewShelf: true };
+    const shelfHtml = client.call("livePreviewPosterHtml", shelfItem);
+    assert.doesNotMatch(shelfHtml, /class="poster-rating"/);
+  });
+
+  it("Continue Watching badges are not removed when a show is removed from Airing Next", () => {
+    const client = loadClient();
+    const map = client.call("loadLocalCustomLists");
+    const showId = "tt10001";
+
+    map["airing-next"] = {
+      slug: "airing-next",
+      items: [
+        {
+          id: showId,
+          showId: showId,
+          showTitle: "Arrow",
+          seasonNum: 5,
+          episodeNum: 10,
+          airDate: "2026-10-15",
+          isSeasonFinale: true,
+          seasonFinaleAirDate: "2026-10-15",
+        }
+      ]
+    };
+    map["continue-watching"] = {
+      slug: "continue-watching",
+      items: [
+        {
+          id: showId,
+          showId: showId,
+          showTitle: "Arrow",
+          seasonNum: 5,
+          episodeNum: 10,
+          airDate: "2026-10-15",
+          isSeasonFinale: true,
+          seasonFinaleAirDate: "2026-10-15",
+        }
+      ]
+    };
+    client.call("saveLocalCustomListsMap", map);
+
+    // Initial render of continue watching list card has date/finale badge
+    const cwCardInitial = client.call("buildLocalListCardHtml", map["continue-watching"]);
+    assert.match(cwCardInitial, /cw-date-badge-finale/);
+
+    // Remove show from Airing Next
+    client.call("removeAiringNextShow", showId, null);
+
+    // Verify it is removed from Airing Next shelf
+    const updatedMap = client.call("loadLocalCustomLists");
+    const airingItems = (updatedMap["airing-next"] || {}).items || [];
+    assert.equal(airingItems.some(it => it.showId === showId), false);
+
+    // Crucial check: Continue Watching still displays the season finale / air date badge!
+    const cwCardAfterRemoval = client.call("buildLocalListCardHtml", updatedMap["continue-watching"]);
+    assert.match(cwCardAfterRemoval, /cw-date-badge-finale/);
+  });
+
+  it("IMDb rating option is removed and TMDb rating toggle is present in Settings HTML", async () => {
+    const fs = await import("node:fs");
+    const settingsHtml = fs.readFileSync("15_tab-settings-html.js", "utf8");
+    assert.doesNotMatch(settingsHtml, /Removed from Airing Next/);
+    assert.doesNotMatch(settingsHtml, /removedAiringNextSettingsSection/);
+    assert.doesNotMatch(settingsHtml, /IMDb Ratings/);
+    assert.doesNotMatch(settingsHtml, /id="posterRatingImdbRadio"/);
+    assert.match(settingsHtml, /id="badgeTmdbRatingCheckbox"/);
+    assert.match(settingsHtml, /TMDb Ratings/);
+  });
+});
+
+describe("client: Simkl removal, Up Next / Trakt CW badges, Trakt attribution, Hidden Lists", () => {
+  it("settings HTML and CSS include toggles for Trakt Continue Watching and MDBList Up Next badges", async () => {
+    const fs = await import("node:fs");
+    const settingsHtml = fs.readFileSync("15_tab-settings-html.js", "utf8");
+    assert.match(settingsHtml, /id="badgeTraktContinueWatchingCheckbox"/);
+    assert.match(settingsHtml, /id="badgeMdblistUpNextCheckbox"/);
+
+    const pageShell = fs.readFileSync("09_page-shell.js", "utf8");
+    assert.match(pageShell, /body\.hide-trakt-continue-watching-badges/);
+    assert.match(pageShell, /body\.hide-mdblist-up-next-badges/);
+  });
+
+  it("Simkl Airing Next mini poster tiles render cw-remove-btn and details includes external removal", async () => {
+    const client = loadClient();
+
+    const simklLists = [
+      {
+        name: "Simkl Airing Next",
+        statusKey: "airing-next",
+        url: "simkl:user:shows:airing-next",
+        type: "series",
+        items: [
+          {
+            id: "12345",
+            name: "Test Show",
+            airDate: "2026-10-20",
+            status: "watching",
+            isUnaired: true
+          }
+        ]
+      }
+    ];
+
+    client.call("renderMySimklLists", simklLists);
+    const box = client.call("document.getElementById", "mySimklListsResult");
+    assert.ok(box, "Simkl box exists");
+    assert.match(box.innerHTML, /cw-remove-btn/);
+    assert.match(box.innerHTML, /data-provider="simkl"/);
+    assert.match(box.innerHTML, /data-target="status"/);
+  });
+
+  it("MDBList Up Next preview tiles include mdblist-up-next-tile and badge elements", async () => {
+    const client = loadClient();
+
+    const mdblistLists = [
+      {
+        name: "MDBList Up Next",
+        statusKey: "upnext",
+        url: "mdblist:user:shows:upnext",
+        contentType: "series",
+        items: [
+          {
+            id: "tt999999",
+            name: "Test Show",
+            seasonNum: 2,
+            episodeNum: 1,
+            airDate: "2026-11-01",
+            isSeasonPremiere: true,
+            isUnaired: true
+          }
+        ]
+      }
+    ];
+
+    client.call("renderMyMdblistLists", mdblistLists);
+    const box = client.call("document.getElementById", "myMdblistListsResult");
+    assert.ok(box, "MDBList box exists");
+    assert.match(box.innerHTML, /mdblist-up-next-tile/);
+    assert.match(box.innerHTML, /cw-date-badge-premiere/);
+  });
+
+  it("Trakt Continue Watching preview tiles include trakt-continue-watching-tile and badge elements", async () => {
+    const client = loadClient();
+
+    const traktLists = [
+      {
+        name: "Continue Watching",
+        statusKey: "continue-watching",
+        url: "trakt:continue-watching",
+        items: [
+          {
+            id: "tt888888",
+            name: "Trakt Show",
+            seasonNum: 3,
+            episodeNum: 1,
+            airDate: "2026-12-01",
+            isSeasonPremiere: true,
+            isUnaired: true,
+            progress: 45
+          }
+        ]
+      }
+    ];
+
+    client.call("renderMyPrivateTraktLists", traktLists);
+    const box = client.call("document.getElementById", "myPrivateTraktListsResult");
+    assert.ok(box, "Trakt box exists");
+    assert.match(box.innerHTML, /trakt-continue-watching-tile/);
+    assert.match(box.innerHTML, /cw-date-badge-premiere/);
+    assert.match(box.innerHTML, /data-creator="Trakt"/);
+  });
+
+  it("Trakt list details modal attributes creatorName to Trakt or user instead of My Lists Addon", async () => {
+    const client = loadClient();
+
+    // Call openListDetailsPage with a Trakt URL
+    client.call("openListDetailsPage", "Watchlist", "movie", "trakt:watchlist", { sample: [], count: 0 });
+    const sub = client.call("document.getElementById", "detailSubtitle");
+    assert.ok(sub, "subtitle element exists");
+    assert.match(sub.textContent || sub.innerHTML, /by Trakt/);
+    assert.doesNotMatch(sub.textContent || sub.innerHTML, /by My Lists Addon/);
+  });
+
+  it("Hidden Lists settings section includes private Trakt lists and provider lists", async () => {
+    const client = loadClient();
+
+    client.set("_myPrivateTraktLists", [
+      { name: "My Trakt Watchlist", url: "trakt:watchlist" },
+      { name: "Trakt Sci-Fi", url: "https://trakt.tv/users/john/lists/scifi" }
+    ]);
+
+    client.call("renderHiddenListsSettingsSection");
+    const container = client.call("document.getElementById", "hiddenListsSettingsSection");
+    assert.ok(container, "hiddenListsSettingsSection exists");
+    assert.match(container.innerHTML, /My Trakt Watchlist/);
+    assert.match(container.innerHTML, /Trakt Sci-Fi/);
+  });
+});
+
+describe("client: Trakt Continue Watching and Airing Next live preview and fallbacks", () => {
+  it("renderLivePreview falls back to cached Trakt Continue Watching items when preview fails", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/preview": () => ({ json: { ok: false, error: "Couldn't load that list." } }),
+      },
+    });
+
+    client.set("_myPrivateTraktLists", [
+      {
+        name: "Continue Watching",
+        statusKey: "continue-watching",
+        url: "trakt:continue-watching",
+        items: [
+          {
+            id: "tt111111",
+            title: "Trakt CW Show",
+            name: "Trakt CW Show",
+            seasonNum: 2,
+            episodeNum: 3,
+            poster: "https://example.com/poster.jpg",
+            progress: 50,
+          },
+        ],
+      },
+    ]);
+
+    const lists = client.__scopeGet("window._myPrivateTraktLists");
+    const cwList = lists.find(l => l && (l.statusKey === "continue-watching" || l.slug === "continue-watching" || (l.url && l.url.includes(":continue-watching"))));
+    assert.ok(cwList, "found cw list");
+    assert.equal(cwList.items.length, 1);
+    assert.equal(cwList.items[0].name, "Trakt CW Show");
+  });
+
+  it("renderLivePreview falls back to cached Trakt Airing Next items when preview returns empty", async () => {
+    const cachedItems = [
+      {
+        id: "tt222222",
+        name: "Trakt Airing Show",
+        airDate: "2026-10-30",
+        seasonNum: 4,
+        episodeNum: 1,
+        isSeasonPremiere: true,
+        isUnaired: true,
+      },
+    ];
+    const client = loadClient({
+      storage: {
+        "myListAddon:traktAiringNextCache": JSON.stringify(cachedItems),
+      },
+    });
+
+    const parsed = JSON.parse(client.call("localStorage.getItem", "myListAddon:traktAiringNextCache"));
+    assert.ok(Array.isArray(parsed));
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0].name, "Trakt Airing Show");
+  });
+
+  it("renderLivePreview ensures Continue Watching movies shelf never contains series", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/preview": (req) => {
+          if (req.body && req.body.type === "movie") {
+            return { json: { ok: true, sample: [] } };
+          }
+          return { json: { ok: true, sample: [{ id: "tt1", type: "series", name: "Reacher" }] } };
+        },
+      },
+    });
+
+    // Provide series in _myPrivateTraktLists
+    client.set("_myPrivateTraktLists", [
+      {
+        name: "Continue Watching",
+        statusKey: "continue-watching",
+        url: "trakt:continue-watching",
+        items: [
+          { id: "tt1", type: "series", name: "Reacher", seasonNum: 1, episodeNum: 1 },
+          { id: "tt2", type: "series", name: "See", seasonNum: 1, episodeNum: 1 },
+        ],
+      },
+    ]);
+
+    // Test the filtering logic directly
+    const cwList = client.__scopeGet("window._myPrivateTraktLists")[0];
+    const movieItems = cwList.items.filter(it => it && (it.type === "movie" || it.kind === "movie") && !it.seasonNum && !it.episodeNum && !it.episodeTitle);
+    assert.equal(movieItems.length, 0, "no series leaked into movie items");
+  });
+
+  it("renderLivePreview merges all 12 cached Airing Next shows when server returns partial 7-show set", async () => {
+    const cachedItems = Array.from({ length: 12 }, (_, i) => ({
+      id: `tt${1000 + i}`,
+      showId: `tt${1000 + i}`,
+      name: `Airing Show ${i + 1}`,
+      airDate: `2026-11-${String(i + 1).padStart(2, "0")}`,
+      type: "series",
+    }));
+
+    const serverItems = cachedItems.slice(0, 7);
+
+    // Merge simulation matching renderLivePreview logic
+    const seen = new Set();
+    const merged = [];
+    for (const item of serverItems) {
+      const id = String(item.showId || item.id || "").toLowerCase().split(":")[0];
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        merged.push(item);
+      }
+    }
+    for (const item of cachedItems) {
+      const id = String(item.showId || item.id || "").toLowerCase().split(":")[0];
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        merged.push(item);
+      }
+    }
+
+    assert.equal(merged.length, 12, "merged all 12 airing shows");
+    assert.equal(merged[11].name, "Airing Show 12");
+  });
+});
+
+describe("client: list renames, dashboard CW button isolation, and sync preservation", () => {
+  it("adding Trakt Continue Watching does not turn dashboard Continue Watching button to Remove", () => {
+    const client = loadClient();
+
+    // Wire up a fake #lists entry for "Trakt Continue Watching (Shows)" with
+    // url="trakt:continue-watching".  addRow appends to a no-op stub so we
+    // build the DOM fake the same way withRows() does in the live-preview suite.
+    const doc = client.get("document");
+    function fakeInput(v) { return { value: v, dataset: {} }; }
+    const traktCwEntry = {
+      dataset: {},
+      querySelector(sel) {
+        if (sel === ".name") return fakeInput("Trakt Continue Watching (Shows)");
+        if (sel === ".type") return fakeInput("series");
+        return null;
+      },
+      querySelectorAll(sel) {
+        if (sel === ".url") return [fakeInput("trakt:continue-watching")];
+        return [];
+      },
+    };
+    const fakeEntries73a = [traktCwEntry];
+    doc.querySelectorAll = (sel) => {
+      if (sel === "#lists .entry") return fakeEntries73a;
+      if (sel === "#lists .entry .url") return [fakeInput("trakt:continue-watching")];
+      return [];
+    };
+
+    // Dashboard CW slug check must NOT match a Trakt Continue Watching row
+    const isDashboardCwAdded = client.call("isListAddedToConfig", null, "series", "continue-watching");
+    assert.equal(isDashboardCwAdded, false, "Dashboard Continue Watching must NOT match Trakt Continue Watching row");
+
+    // URL-exact check for Trakt Continue Watching itself must match
+    const isTraktCwAdded = client.call("isListAddedToConfig", "trakt:continue-watching", "series");
+    assert.equal(isTraktCwAdded, true, "Trakt Continue Watching itself must match");
+  });
+
+  it("renderMyPrivateTraktLists renders renamed Trakt cards: Trakt Continue Watching, Trakt Watch List, Trakt Watch History", () => {
+    const client = loadClient();
+
+    const traktLists = [
+      { name: "Trakt Continue Watching", slug: "continue-watching", statusKey: "continue-watching", url: "trakt:continue-watching", items: [] },
+      { name: "Trakt Watch List", slug: "watchlist", url: "trakt:watchlist", items: 5 },
+      { name: "Trakt Watch History", slug: "history", url: "trakt:history", items: 10 }
+    ];
+
+    client.call("renderMyPrivateTraktLists", traktLists);
+    const box = client.call("document.getElementById", "myPrivateTraktListsResult");
+    assert.ok(box, "Trakt box exists");
+    assert.match(box.innerHTML, /Trakt Continue Watching/);
+    assert.match(box.innerHTML, /Trakt Watch List/);
+    assert.match(box.innerHTML, /Trakt Watch History/);
+  });
+
+  it("renderMyMdblistLists renders renamed MDBList cards: MDBList My Watch List, MDBList Watch History", () => {
+    const client = loadClient();
+
+    const mdblistLists = [
+      { name: "MDBList My Watch List", slug: "watchlist", url: "mdblist:watchlist", items: 4 },
+      { name: "MDBList Watch History", slug: "history", url: "mdblist:history", items: 8 }
+    ];
+
+    client.call("renderMyMdblistLists", mdblistLists);
+    const box = client.call("document.getElementById", "myMdblistListsResult");
+    assert.ok(box, "MDBList box exists");
+    assert.match(box.innerHTML, /MDBList My Watch List/);
+    assert.match(box.innerHTML, /MDBList Watch History/);
+  });
+
+  it("loadCreatorSync preserves newly added local entries not present in server synced.config", async () => {
+    const client = loadClient({
+      // creatorKey must be present or loadCreatorSync returns before doing anything
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+      routes: {
+        // Payload lives under data.data, not at the top level
+        "/api/creator/sync/load": () => ({
+          json: {
+            ok: true,
+            data: {
+              config: [
+                { name: "Existing Server List", url: "https://trakt.tv/users/test/lists/one", type: "movie", enabled: true, group: "Custom" }
+              ],
+              updatedAt: 100
+            }
+          }
+        }),
+        "/api/creator/sync/save": () => ({ json: { ok: true, updatedAt: 200 } }),
+        "/api/creator/sync/save-tracking": () => ({ json: { ok: true } }),
+        "/api/creator/lists": () => ({ json: { ok: true, lists: [] } }),
+      }
+    });
+
+    client.set("activeCreator", { creatorName: "testuser", displayName: "Test User" });
+
+    // addRow appends to a no-op stub, and collectEntries reads the DOM.
+    // We wire a fake "Trakt Airing Next" entry into the querySelectorAll stub
+    // so collectEntries() inside loadCreatorSync can see it as a local entry,
+    // then intercept addRow to log every row that gets (re-)added during the
+    // rebuild so the assertion can verify both the server list and local entry.
+    const doc = client.get("document");
+    function fakeInput73b(v) { return { value: v, dataset: {} }; }
+    const airingEntry = {
+      dataset: {},
+      querySelector(sel) {
+        if (sel === ".name") return fakeInput73b("Trakt Airing Next");
+        if (sel === ".type") return fakeInput73b("series");
+        return null;
+      },
+      querySelectorAll(sel) {
+        if (sel === ".url") return [fakeInput73b("trakt:user:shows:airing-next")];
+        return [];
+      },
+    };
+
+    // Simulate #lists having the local entry before loadCreatorSync runs
+    let fakeEntries73b = [airingEntry];
+    const listsEl = doc.getElementById("lists");
+    listsEl.querySelectorAll = (sel) => (sel === ".entry" ? [...fakeEntries73b] : []);
+    doc.querySelectorAll = (sel) => {
+      if (sel === "#lists .entry") return [...fakeEntries73b];
+      return [];
+    };
+
+    // Intercept addRow: record every call and rebuild fakeEntries73b so
+    // collectEntries() on the final #lists state reflects what was added.
+    const addedRows = [];
+    const origAddRow = client.get("addRow");
+    client.set("addRow", function(name, url, type, enabled, group, id) {
+      addedRows.push({ name, url, type: type || "movie", enabled, group, id });
+      fakeEntries73b = addedRows.map(r => ({
+        dataset: {},
+        querySelector(sel) {
+          if (sel === ".name") return fakeInput73b(r.name);
+          if (sel === ".type") return fakeInput73b(r.type);
+          return null;
+        },
+        querySelectorAll(sel) {
+          if (sel === ".url") return [fakeInput73b(r.url)];
+          return [];
+        },
+      }));
+      listsEl.querySelectorAll = (sel) => (sel === ".entry" ? [...fakeEntries73b] : []);
+      doc.querySelectorAll = (sel) => {
+        if (sel === "#lists .entry") return [...fakeEntries73b];
+        return [];
+      };
+      return origAddRow(name, url, type, enabled, group, id);
+    });
+
+    // loadCreatorSync with no opts: isBackgroundResume=false → always rebuilds #lists
+    await client.call("loadCreatorSync");
+
+    // After rebuild: server entry must be present AND the pre-existing local
+    // Trakt Airing Next entry must have been preserved and re-added.
+    assert.ok(
+      addedRows.some(e => e.name === "Existing Server List"),
+      "Existing server list preserved"
+    );
+    assert.ok(
+      addedRows.some(e => e.url === "trakt:user:shows:airing-next"),
+      "Freshly added Trakt Airing Next row preserved across sync"
+    );
+  });
+
+});

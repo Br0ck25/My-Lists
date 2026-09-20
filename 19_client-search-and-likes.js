@@ -617,7 +617,9 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
 
     const addedMovie = alreadyAdded.has(item.url + '|movie');
     const addedSeries = alreadyAdded.has(item.url + '|series');
-    const addedDirect = alreadyAdded.has(item.url + '|' + item.type);
+    const addedDirect = typeof isListAddedToConfig === 'function'
+      ? (isListAddedToConfig(item.url, item.type) || isListAddedToConfig(item.url, 'movie') || isListAddedToConfig(item.url, 'series') || isListAddedToConfig(item.url))
+      : (alreadyAdded.has(item.url + '|' + item.type) || addedMovie || addedSeries);
     const alreadyLikedExt = getLikedListsSet().has(item.url);
 
     let usernameSlug = '';
@@ -650,18 +652,6 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
         ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + (item.type || 'movie') + '">' +
         (addedDirect ? 'Remove' : '+ Add') +
         '</button>';
-    } else if (item.source === 'Trakt' && item.contentType === 'unknown') {
-      actionsHtml += '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(item.url) + '">' +
-        (alreadyLikedExt ? '&#9829;' : '&#9825;') +
-        '</button>';
-      actionsHtml += '<button type="button" class="lc-btn ' + (addedMovie ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-        (addedMovie ? 'style="color:var(--danger);"' : '') +
-        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="movie">' +
-        (addedMovie ? 'Remove (Movies)' : '+ Movies') + '</button>' +
-        '<button type="button" class="lc-btn ' + (addedSeries ? 'secondary searchAddBtn is-added' : 'primary searchAddBtn') + '" ' +
-        (addedSeries ? 'style="color:var(--danger);"' : '') +
-        ' data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="series">' +
-        (addedSeries ? 'Remove (Shows)' : '+ Shows') + '</button>';
     } else {
       actionsHtml += '<button type="button" class="lc-btn searchLikeExternalBtn' + (alreadyLikedExt ? ' liked' : '') + '" data-url="' + escapeAttr(item.url) + '">' +
         (alreadyLikedExt ? '&#9829;' : '&#9825;') +
@@ -951,15 +941,17 @@ async function loadPosterSlot(slot) {
               const traktTarget = listUrl === 'trakt:watchlist' ? 'watchlist' : (listUrl === 'trakt:history' ? 'history' : 'custom');
               const slugMatch = listUrl.match(new RegExp('lists/([^/?#]+)'));
               const traktListId = traktTarget === 'custom' ? (slugMatch ? slugMatch[1] : listUrl) : traktTarget;
-              removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt">&times;</button>';
+              removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="trakt" data-target="' + escapeAttr(traktTarget) + '" data-list-id="' + escapeAttr(traktListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Trakt" aria-label="Remove from Trakt">\u2715</button>';
             } else if (isMdblistSlot) {
-              const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (listUrl === 'mdblist:history' ? 'history' : 'custom');
+              const isMdbHist = listUrl === 'mdblist:history' || String(listUrl || '').includes('mdblist.com/history') || (String(listUrl || '').includes('mdblist.com/lists/') && String(listUrl || '').includes('/history'));
+              const mdbTarget = listUrl === 'mdblist:watchlist' ? 'watchlist' : (isMdbHist ? 'history' : 'custom');
               const mdbMatch = listUrl.match(new RegExp('lists/[^/]+/([^/?#]+)'));
               const mdbListId = mdbTarget === 'custom' ? (mdbMatch ? mdbMatch[1] : listUrl) : mdbTarget;
-              removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList">&times;</button>';
+              removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="mdblist" data-target="' + escapeAttr(mdbTarget) + '" data-list-id="' + escapeAttr(mdbListId) + '" data-remove-id="' + escapeAttr(s.id || '') + '" data-media-type="' + escapeAttr(s.type || type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from MDBList" aria-label="Remove from MDBList">\u2715</button>';
             }
 
             const itemPoster = resolveClientPoster(Object.assign({}, s, { listName, listUrl }), s.poster);
+            const ratingSpan = typeof formatRatingSpanHtml === 'function' ? formatRatingSpanHtml(s) : '';
             inner += '<div class="list-card-mini-poster-tile" data-name="' + escapeAttr(listName) + '" data-url="' + escapeAttr(listUrl) + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(cardCreator) + '" data-items="' + escapeAttr(exactCount) + '" data-likes="' + escapeAttr(cardLikes) + '">' +
               '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type || '') + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(itemPoster || '') + '">' +
                 '<img src="' + escapeAttr(itemPoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">' +
@@ -968,7 +960,7 @@ async function loadPosterSlot(slot) {
                 overlays +
               '</div>' +
               '<div class="list-card-mini-poster-name">' + escapeHtml(s.name || '') + '</div>' +
-              (s.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(s.year) + '</div>' : '') +
+              ((s.year || ratingSpan) ? '<div class="list-card-mini-poster-year" style="display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%;"><span>' + escapeHtml(s.year || '') + '</span>' + ratingSpan + '</div>' : '') +
             '</div>';
           });
           slot.className = 'list-card-posters';
@@ -1108,20 +1100,34 @@ document.addEventListener('click', async (e) => {
     const listName = addBtn.dataset.name || 'List';
     const listUrl = addBtn.dataset.url || '';
     const listType = addBtn.dataset.type || 'movie';
-    const isAdded = addBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(listUrl, listType));
+    const isAdded = addBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && (isListAddedToConfig(listUrl, listType) || isListAddedToConfig(listUrl, 'movie') || isListAddedToConfig(listUrl, 'series') || isListAddedToConfig(listUrl)));
     if (isAdded) {
-      if (typeof removeListFromConfig === 'function') removeListFromConfig(listUrl, listType);
+      if (typeof removeListFromConfig === 'function') {
+        removeListFromConfig(listUrl, listType);
+        removeListFromConfig(listUrl, 'movie');
+        removeListFromConfig(listUrl, 'series');
+        removeListFromConfig(listUrl, 'mixed');
+        removeListFromConfig(listUrl);
+        removeListFromConfig(null, listType, listUrl);
+      }
       addBtn.classList.remove('is-added', 'secondary');
       addBtn.classList.add('primary');
       addBtn.textContent = '+ Add';
       addBtn.style.color = '';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Removed "' + listName + '" from your Catalogs.');
     } else {
-      addRow(listName, listUrl, listType, true, 'Custom');
+      if (listType === 'mixed' || listType === 'unknown') {
+        addRow(listName + ' (Movies)', listUrl, 'movie', true, 'Custom');
+        addRow(listName + ' (Shows)', listUrl, 'series', true, 'Custom');
+      } else {
+        addRow(listName, listUrl, listType, true, 'Custom');
+      }
       addBtn.classList.add('is-added', 'secondary');
       addBtn.classList.remove('primary');
       addBtn.textContent = 'Remove';
       addBtn.style.color = 'var(--danger)';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Added "' + listName + '" to your Catalogs.');
     }
     return;
@@ -1141,6 +1147,7 @@ document.addEventListener('click', async (e) => {
       curatedAddBtn.classList.add('primary');
       curatedAddBtn.textContent = '+ Add';
       curatedAddBtn.style.color = '';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Removed "' + listTitle + '" from your Catalogs.');
     } else {
       addRow(listTitle, customUrl, listType, true, 'Curated');
@@ -1148,6 +1155,7 @@ document.addEventListener('click', async (e) => {
       curatedAddBtn.classList.remove('primary');
       curatedAddBtn.textContent = 'Remove';
       curatedAddBtn.style.color = 'var(--danger)';
+      if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Added "' + listTitle + '" to your Catalogs.');
     }
     return;
@@ -1319,6 +1327,12 @@ async function loadPopularListsFeed(forceRefresh) {
   if (popularListsFeedLoaded && !forceRefresh && container.children.length > 0) {
     return;
   }
+  if (forceRefresh) {
+    popularListsFeedLoaded = false;
+    mdblistPopularCache = null;
+    traktPopularCache = null;
+    if (window._listPreviewCache) window._listPreviewCache.clear();
+  }
   container.innerHTML = '<p style="color:var(--muted); font-size:0.88rem;">Loading popular public lists…</p>';
   try {
     const [mdbLists, traktLists] = await Promise.all([
@@ -1353,6 +1367,7 @@ function buildCuratedRecommendationCard(title, type, customUrl, subtitle, items)
     if (isDesktopEnd) {
       overlays += '<div class="list-card-count-overlay desktop-only curatedViewBtn" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     }
+    const ratingSpan = typeof formatRatingSpanHtml === 'function' ? formatRatingSpanHtml(s) : '';
     return '<div class="list-card-mini-poster-tile" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">' +
       '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type) + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
         '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
@@ -1360,7 +1375,7 @@ function buildCuratedRecommendationCard(title, type, customUrl, subtitle, items)
         overlays +
       '</div>' +
       '<div class="list-card-mini-poster-name">' + escapeHtml(s.name) + '</div>' +
-      (s.year ? '<div class="list-card-mini-poster-year">' + escapeHtml(s.year) + '</div>' : '') +
+      ((s.year || ratingSpan) ? '<div class="list-card-mini-poster-year" style="display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%;"><span>' + escapeHtml(s.year || '') + '</span>' + ratingSpan + '</div>' : '') +
     '</div>';
   }).join('');
 
@@ -3357,8 +3372,12 @@ function openSelectListModal(id, type, title, poster) {
           urlInput.value = 'customlist:v1:' + JSON.stringify(payload);
         }
         const nameInput = row.querySelector('.name');
+        let listName = nameInput ? nameInput.value : (payload.listName || 'Unnamed List');
+        if (/^watchlist\s*\((movies|shows|series)\)$/i.test(String(listName).trim())) {
+          listName = 'Watchlist';
+        }
         customLists.push({
-          name: nameInput ? nameInput.value : (payload.listName || 'Unnamed List'),
+          name: listName,
           url: urlInput.value,
           row: row
         });
@@ -3438,11 +3457,16 @@ function openSelectListModal(id, type, title, poster) {
         isChecked = (payload.items || []).some(it => (it.imdbId === id) || (it.id === id) || (it.imdbId === 'tmdb:' + id) || (it.id === 'tmdb:' + id));
       } catch(e) {}
       
+      let displayName = list.name || 'Custom List';
+      if (/^watchlist(\s*\((movies|shows|series)\))?$/i.test(String(displayName).trim())) {
+        displayName = 'Watchlist';
+      }
+      
       html += 
         '<div class="select-list-row" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom: 1px solid var(--border);">' +
           '<label style="display:flex; align-items:center; gap:10px; cursor:pointer; flex:1; color:var(--text); font-size:0.95rem;">' +
             '<input type="checkbox" class="list-select-cb" data-type="custom" data-idx="' + idx + '" data-initially-checked="' + (isChecked ? 'true' : 'false') + '" ' + (isChecked ? 'checked ' : '') + 'style="width:18px; height:18px; cursor:pointer; accent-color:var(--accent);">' +
-            '<span style="font-weight:500;">' + escapeHtml(list.name) + '</span>' +
+            '<span style="font-weight:500;">' + escapeHtml(displayName) + '</span>' +
             (isChecked ? '<span class="in-list-badge" style="font-size:0.75rem; background:rgba(0,230,153,0.15); color:#00b377; padding:2px 6px; border-radius:4px; font-weight:600;">In List</span>' : '') +
           '</label>' +
           (isChecked ? '<button type="button" class="lc-btn secondary" style="padding:3px 8px; font-size:0.75rem; color:var(--danger); border-color:var(--danger); min-width:auto; height:26px; line-height:1;" onclick="removeSingleCustomItemDirect(' + idx + ', &quot;' + escapeJsAttr(id) + '&quot;, &quot;' + escapeJsAttr(type) + '&quot;, this)">Remove</button>' : '') +
@@ -4297,18 +4321,28 @@ function renderTitlePosterCards(items, totalCount, resEl) {
     : ((typeof totalCount === 'number' && totalCount > 20) ? '<div style="margin-bottom:10px; font-size:0.82rem; color:var(--muted);">' + items.length + ' results found</div>' : '');
 
   const postersHtml = items.map(m => {
-    const posterClass = 'live-preview-poster';
     const effectivePoster = resolveClientPoster(m, m.poster);
-    const posterEl = effectivePoster
-      ? '<img class="' + posterClass + '" src="' + escapeAttr(effectivePoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
-      : '<div class="' + posterClass + ' live-preview-poster-placeholder" data-needs-fallback="1"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
-    
-    const title = m.title || '';
     const type = currentCatalogSearchType === 'tv' ? 'series' : 'movie';
     const id = 'tmdb:' + m.tmdbId;
-    const ratingHtml = (typeof m.rating === 'number' && m.rating > 0)
-      ? '<span style="color:#f5c518; font-weight:700; font-size:0.75rem; margin-left:auto;">&#9733; ' + m.rating.toFixed(1) + '</span>'
-      : '';
+    const ratingHtml = typeof formatRatingSpanHtml === 'function' ? formatRatingSpanHtml(m) : '';
+    const subtitleHtml = '<div style="display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%;">' +
+      '<span>' + escapeHtml(m.year || '') + '</span>' +
+      ratingHtml +
+    '</div>';
+
+    if (typeof renderMediaCard === 'function') {
+      return renderMediaCard(Object.assign({}, m, { title: m.title || '', poster: effectivePoster }), {
+        cardClass: 'clickable-poster',
+        dataAttrs: { id: id, type: type, title: m.title || '', poster: effectivePoster || '' },
+        topLeftHtml: '',
+        overlayHtml: '<div class="poster-add-overlay" title="Add to Custom List">+</div>',
+        subtitleHtml: subtitleHtml
+      });
+    }
+
+    const posterEl = effectivePoster
+      ? '<img class="live-preview-poster" src="' + escapeAttr(effectivePoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+      : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
     
     return '<div class="live-preview-poster-card clickable-poster" ' +
       'data-id="' + escapeAttr(id || '') + '" ' +
@@ -4320,11 +4354,8 @@ function renderTitlePosterCards(items, totalCount, resEl) {
         posterEl +
         '<div class="poster-add-overlay" title="Add to Custom List">+</div>' +
       '</div>' +
-      '<div class="live-preview-poster-name">' + escapeHtml(title) + '</div>' +
-      '<div class="live-preview-poster-year" style="display:flex; align-items:center; justify-content:space-between; gap:4px;">' +
-        '<span>' + escapeHtml(m.year || '') + '</span>' +
-        ratingHtml +
-      '</div>' +
+      '<div class="live-preview-poster-name">' + escapeHtml(m.title || '') + '</div>' +
+      '<div class="live-preview-poster-year">' + subtitleHtml + '</div>' +
       '</div>';
   }).join('');
   

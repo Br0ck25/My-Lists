@@ -193,7 +193,7 @@ ${seoHeadHtml}
     --border-strong:rgba(0,0,0,0.13);
     --text:         #1C1C1E;
     --text-2:       #3A3A3C;
-    --muted:        #8E8E93;
+    --muted:        #636366;
     --accent:       #007AFF;
     --brand:        #007AFF;
     --accent-hover: #0062CC;
@@ -235,7 +235,7 @@ ${seoHeadHtml}
     --border-strong:rgba(255,255,255,0.25);
     --text:         #FFFFFF;
     --text-2:       #EBEBF5;
-    --muted:        #8E8E93;
+    --muted:        #AEAEB2;
     --sb-thumb:     rgba(255,255,255,0.15);
     --sb-thumb-hover:rgba(255,255,255,0.25);
   }
@@ -1889,6 +1889,11 @@ ${seoHeadHtml}
   .cw-remove-btn:hover {
     filter: brightness(0.88);
   }
+  #lists .cw-remove-btn,
+  .live-preview-shelf-row .cw-remove-btn,
+  .live-preview-posters .cw-remove-btn {
+    display: none !important;
+  }
   .cw-date-badge {
     position: absolute;
     top: 4px;
@@ -1982,6 +1987,10 @@ ${seoHeadHtml}
   body.hide-badge-season-finale .cw-date-badge-finale { display: none !important; }
   body.hide-badge-season-finale-date .cw-date-badge-finale-date { display: none !important; }
   body.hide-badge-rating .rating-badge, body.hide-badge-rating .poster-rating { display: none !important; }
+  body.hide-badge-imdb-rating .rating-badge[data-rating-type="imdb"], body.hide-badge-imdb-rating .poster-rating[data-rating-type="imdb"] { display: none !important; }
+  body.hide-badge-tmdb-rating .rating-badge[data-rating-type="tmdb"], body.hide-badge-tmdb-rating .poster-rating[data-rating-type="tmdb"] { display: none !important; }
+  .live-preview-posters .rating-badge, .live-preview-shelf-row .rating-badge,
+  .live-preview-posters .poster-rating, .live-preview-shelf-row .poster-rating { display: none !important; }
   body.hide-badge-watched .watched-badge, body.hide-badge-watched .cw-watched-indicator { display: none !important; }
   body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .cw-date-badge,
   body.hide-catalogs-badges .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]) .cw-date-badge,
@@ -1998,7 +2007,11 @@ ${seoHeadHtml}
   body.hide-continue-watching-badges [data-list-key="continue-watching"] .cw-date-badge,
   body.hide-continue-watching-badges .continue-watching-card .cw-date-badge,
   body.hide-continue-watching-badges .live-preview-shelf-row[data-list-slug="continue-watching"] .cw-date-badge,
-  body.hide-continue-watching-badges .live-preview-posters.is-continue-watching-shelf .cw-date-badge { display: none !important; }
+  body.hide-continue-watching-badges .live-preview-posters.is-continue-watching-shelf .cw-date-badge,
+  body.hide-trakt-continue-watching-badges #myPrivateTraktListsResult .trakt-continue-watching-tile .cw-date-badge,
+  body.hide-trakt-continue-watching-badges .detail-page-trakt-continue-watching .cw-date-badge,
+  body.hide-mdblist-up-next-badges #myMdblistListsResult .mdblist-up-next-tile .cw-date-badge,
+  body.hide-mdblist-up-next-badges .detail-page-mdblist-up-next .cw-date-badge { display: none !important; }
   .airing-next-filter-pills {
     display: flex;
     gap: 6px;
@@ -3180,23 +3193,33 @@ ${seoHeadHtml}
     position: fixed; left: 50%;
     bottom: calc(66px + env(safe-area-inset-bottom));
     transform: translateX(-50%);
-    background: var(--text); color: var(--surface);
+    background: rgba(255, 255, 255, 0.96);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
     border-radius: 14px; padding: 12px 18px;
     display: flex; align-items: center; gap: 14px;
-    box-shadow: var(--shadow-md); z-index: 1000;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.12); z-index: 1000;
+  }
+  :root.dark-theme .undo-toast,
+  html.dark-theme .undo-toast {
+    background: #000000;
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.6);
   }
   .action-toast {
     position: fixed;
     left: 50%;
     bottom: calc(72px + env(safe-area-inset-bottom));
     transform: translateX(-50%) translateY(20px);
-    background: rgba(28, 28, 30, 0.95);
-    color: #ffffff;
+    background: rgba(255, 255, 255, 0.96);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
     padding: 10px 18px;
     border-radius: var(--radius-pill);
     font-size: 0.86rem;
     font-weight: 600;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.12);
     z-index: 99999;
     opacity: 0;
     pointer-events: none;
@@ -3211,6 +3234,117 @@ ${seoHeadHtml}
   .action-toast.show {
     opacity: 1;
     transform: translateX(-50%) translateY(0);
+  }
+  :root.dark-theme .action-toast,
+  html.dark-theme .action-toast {
+    background: #000000;
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+  }
+  .app-toast-container {
+    position: fixed;
+    left: 50%;
+    bottom: calc(72px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%);
+    z-index: 99999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    pointer-events: none;
+    max-width: 90vw;
+    width: max-content;
+  }
+  .app-toast {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-radius: var(--radius-pill);
+    background: rgba(255, 255, 255, 0.96);
+    color: var(--text);
+    font-size: 0.88rem;
+    font-weight: 500;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.12);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    opacity: 0;
+    transform: translateY(12px);
+    transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    pointer-events: auto;
+    border: 1px solid var(--border-strong);
+  }
+  .app-toast.show {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  :root.dark-theme .app-toast,
+  html.dark-theme .app-toast {
+    background: #000000;
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+  }
+  .app-toast-msg {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 60vw;
+  }
+  .app-toast-action {
+    background: var(--accent);
+    color: #ffffff;
+    border: none;
+    border-radius: var(--radius-pill);
+    padding: 4px 12px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    line-height: 1.2;
+    transition: background 0.15s ease, transform 0.1s ease;
+  }
+  .app-toast-action:hover {
+    background: var(--accent-hover);
+  }
+  .app-toast-action:active {
+    transform: scale(0.96);
+  }
+  .app-toast-close {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    font-size: 1.1rem;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .app-toast-close:hover {
+    color: var(--text);
+  }
+  :root.dark-theme .app-toast-close,
+  html.dark-theme .app-toast-close {
+    color: rgba(255, 255, 255, 0.6);
+  }
+  :root.dark-theme .app-toast-close:hover,
+  html.dark-theme .app-toast-close:hover {
+    color: #ffffff;
+  }
+  .sortable-item {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .sortable-item.dragging,
+  .entry.dragging,
+  .list-card.dragging,
+  .custom-list-pick.dragging,
+  .creator-list-row.dragging {
+    opacity: 0.45 !important;
+    transform: scale(0.98);
+    transition: transform 0.15s ease, opacity 0.15s ease;
   }
 
   @media (max-width: 640px) {
@@ -3646,7 +3780,6 @@ ${seoHeadHtml}
         <button type="button" class="subnav-pill active generic-type-pill" id="detailTypeAllBtn" onclick="switchListDetailsType('all')">All</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeMovieBtn" onclick="switchListDetailsType('movie')">Movies</button>
         <button type="button" class="subnav-pill generic-type-pill" id="detailTypeSeriesBtn" onclick="switchListDetailsType('series')">Shows</button>
-        <button type="button" class="subnav-pill generic-type-pill" id="detailTypeLineupBtn" onclick="switchListDetailsType('lineup')" style="display:none;">On Today</button>
         <button type="button" class="subnav-pill" id="cwClearHistoryBtn" onclick="clearContinueWatchingAll()" style="display:none; color:var(--danger); border-color:rgba(255,59,48,0.35); margin-left:auto; font-weight:600;">Clear All</button>
       </div>
       <div id="whSortControls" style="display:flex; align-items:center; gap:8px;">

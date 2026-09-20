@@ -1705,7 +1705,9 @@ function sharePreset(name) {
       alert('"' + name + '" copied to your clipboard as JSON -- paste it into the Backup/Restore box above (on this device or another) to import it.');
     }
   }).catch(() => {
-    prompt("Copy this preset's JSON:", jsonStr);
+    if (typeof showAppPrompt === 'function') {
+      showAppPrompt('Preset JSON', 'Copy this preset JSON below:', jsonStr);
+    }
   });
 }
 
@@ -1728,9 +1730,7 @@ function deletePreset(name) {
       true
     );
   } else {
-    if (confirm('Delete preset "' + name + '"?')) {
-      performDelete();
-    }
+    performDelete();
   }
 }
 
@@ -1798,23 +1798,30 @@ function uploadPresetFile(input) {
       return;
     }
     const suggested = (file.name || 'Preset').replace(/\.json$/i, '');
-    const name = (prompt('Save this preset as:', suggested) || '').trim();
-    if (!name) return;
-    const entries = Array.isArray(data) ? data : (data.entries || []);
-    const map = loadPresetsMap();
-    map[name] = {
-      entries: entries,
-      ...(data.customLists ? { customLists: data.customLists } : {}),
-      ...(data.channels ? { channels: data.channels } : {}),
+    const saveWithGivenName = (rawName) => {
+      const name = (rawName || '').trim();
+      if (!name) return;
+      const entries = Array.isArray(data) ? data : (data.entries || []);
+      const map = loadPresetsMap();
+      map[name] = {
+        entries: entries,
+        ...(data.customLists ? { customLists: data.customLists } : {}),
+        ...(data.channels ? { channels: data.channels } : {}),
+      };
+      savePresetsMap(map);
+      renderPresetsList();
+      schedulePresetsSync();
+      const res = rebuildCustomListsFromPreset(name, true);
+      if (res.restoredLists > 0 || res.restoredChannels > 0) {
+        showAddedToast('Uploaded preset "' + name + '" & restored custom lists \u2713');
+      } else {
+        showAddedToast('Uploaded preset "' + name + '" \u2713');
+      }
     };
-    savePresetsMap(map);
-    renderPresetsList();
-    schedulePresetsSync();
-    const res = rebuildCustomListsFromPreset(name, true);
-    if (res.restoredLists > 0 || res.restoredChannels > 0) {
-      showAddedToast('Uploaded preset "' + name + '" & restored custom lists \u2713');
+    if (typeof showAppPrompt === 'function') {
+      showAppPrompt('Save Preset', 'Save this preset as:', suggested, saveWithGivenName);
     } else {
-      showAddedToast('Uploaded preset "' + name + '" \u2713');
+      saveWithGivenName(suggested);
     }
   });
 }
@@ -2036,35 +2043,9 @@ function computeConfigStateHash() {
   }
 }
 
-function checkUnsavedInstallLink() {
-  if (!lastGeneratedConfigHash) return;
-  const currentHash = computeConfigStateHash();
-  const banner = document.getElementById('unsavedInstallBanner');
-  const text = document.getElementById('unsavedInstallText');
-  const btn = document.getElementById('unsavedInstallBtn');
-  if (!banner || !text || !btn) return;
-  
-  if (currentHash !== lastGeneratedConfigHash) {
-    text.textContent = 'Unsaved changes to install link';
-    btn.style.display = 'inline-flex';
-    banner.classList.add('show');
-  } else {
-    banner.classList.remove('show');
-  }
-}
+function checkUnsavedInstallLink() {}
 
-async function updateInstallLinkFromBanner() {
-  const btn = document.getElementById('unsavedInstallBtn');
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = 'Updating\u2026';
-  }
-  await generate();
-  if (btn) {
-    btn.disabled = false;
-    btn.textContent = 'Update Link';
-  }
-}
+function updateInstallLinkFromBanner() {}
 
 function saveState() {
   if (suppressSave) return;
@@ -2198,6 +2179,9 @@ async function generate() {
   }
 
   const installUrl = ORIGIN + '/' + config + '/manifest.json';
+  const stremioInstallUrl = installUrl.replace(/^https?:\\/\\//i, 'stremio://');
+  const stremioWebUrl = 'https://web.stremio.com/#/addons?addon=' + encodeURIComponent(installUrl);
+  const nuvioInstallUrl = installUrl.replace(/^https?:\\/\\//i, 'nuvio://');
   // A group breakdown alongside the plain install-count beacon -- each
   // row's own .group ("MDBList Charts", "Custom Lists", "Channels", etc.)
   // is already a meaningful "what kind of source is this" label, no need
@@ -2229,6 +2213,18 @@ async function generate() {
 
       \${sizeWarning}
 
+      <div class="install-actions-bar" style="display:flex; flex-wrap:wrap; gap:10px;">
+        <a href="\${stremioInstallUrl}" class="btn-stremio" style="flex:1; min-width:140px; padding:10px 16px; font-weight:700; border-radius:var(--radius-pill); text-align:center; text-decoration:none; display:inline-flex; align-items:center; justify-content:center; font-size:0.9rem;">
+          Install in Stremio
+        </a>
+        <a href="\${nuvioInstallUrl}" class="btn-nuvio" style="flex:1; min-width:140px; padding:10px 16px; font-weight:700; border-radius:var(--radius-pill); text-align:center; text-decoration:none; display:inline-flex; align-items:center; justify-content:center; font-size:0.9rem;">
+          Install in Nuvio
+        </a>
+        <a href="\${stremioWebUrl}" target="_blank" rel="noopener noreferrer" class="secondary" style="display:inline-flex; align-items:center; justify-content:center; padding:10px 16px; font-weight:600; border-radius:var(--radius-pill); text-align:center; font-size:0.85rem; text-decoration:none;">
+          Stremio Web
+        </a>
+      </div>
+
       <div class="install-url-container">
         <div class="install-url-header">
           <div class="install-url-label">
@@ -2236,7 +2232,7 @@ async function generate() {
             <span>Manifest Link</span>
           </div>
           <button type="button" class="install-url-copy-btn" id="copyUrlBtn" onclick="copyLink('\${installUrl}')" title="Copy manifest link">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
             <span>Copy Link</span>
           </button>
         </div>
@@ -2246,7 +2242,7 @@ async function generate() {
       <div class="install-hint-box">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0; margin-top:2px;"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
         <div>
-          <span>To install this add-on, copy the manifest link above and paste it into:</span>
+          <span>To install manually, copy the manifest link above and paste it into:</span>
           <div class="install-hint-steps">
             <span>&bull; <strong>Stremio</strong> &rarr; Addons &rarr; Community &rarr; Paste URL</span>
             <span>&bull; <strong>Nuvio</strong> &rarr; Settings &rarr; Content &amp; Discovery &rarr; Addons</span>
@@ -2517,7 +2513,7 @@ tryAutoRestoreCreatorProfile();
     return;
   }
   if (path.toLowerCase() === '/lists/mdblist/watchlist') {
-    openListDetailsPage('MDBList Watchlist', 'movie', 'mdblist:watchlist', null, { skipPushState: true });
+    openListDetailsPage('MDBList My Watch List', 'movie', 'mdblist:watchlist', null, { skipPushState: true });
     return;
   }
   if (path.toLowerCase() === '/lists/mdblist/history') {
@@ -2532,7 +2528,7 @@ tryAutoRestoreCreatorProfile();
     return;
   }
   if (path.toLowerCase() === '/lists/trakt/watchlist') {
-    openListDetailsPage('Trakt Watchlist', 'movie', 'trakt:watchlist', null, { skipPushState: true });
+    openListDetailsPage('Trakt Watch List', 'movie', 'trakt:watchlist', null, { skipPushState: true });
     return;
   }
   if (path.toLowerCase() === '/lists/trakt/history') {
@@ -3499,7 +3495,7 @@ function renderGuidePage(origin) {
       <li>Give it a <strong>Name</strong> and optional <strong>Description</strong>.</li>
       <li>Choose <strong>Content Type</strong>: Movies, Shows, or Mixed, and <strong>Visibility</strong>: Public or Private.</li>
       <li>Click <strong>Create</strong>, then use Search/Discover/Charts to tap <strong>+</strong> on any title to add it to the list.</li>
-      <li>Reorder by dragging or typing a position number; remove with the <strong>&times;</strong> button.</li>
+      <li>Reorder by dragging or typing a position number; remove with the <strong>&#x2715;</strong> button.</li>
       <li>Click <strong>Save</strong>. You can now add this list to your Catalogs like any other.</li>
     </ol>
 

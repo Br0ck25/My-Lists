@@ -24,7 +24,6 @@
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your MDBList Lists</h2>
         <div style="display:flex; gap:8px;">
-          <button type="button" class="primary lc-btn" onclick="openCreateListModal('mdblist')">+ New List</button>
           <button type="button" class="secondary lc-btn" id="listsMdblistConnectBtn" onclick="toggleListsMdblistConnection()">Connect MDBList</button>
         </div>
       </div>
@@ -36,7 +35,6 @@
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your Trakt Lists</h2>
         <div style="display:flex; gap:8px;">
-          <button type="button" class="primary lc-btn" onclick="openCreateListModal('trakt')">+ New List</button>
           <button type="button" class="secondary lc-btn" id="listsTraktConnectBtn" onclick="toggleListsTraktConnection()">Connect Trakt</button>
         </div>
       </div>
@@ -49,7 +47,6 @@
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your TMDB Lists</h2>
         <div style="display:flex; gap:8px;">
-          <button type="button" class="primary lc-btn" onclick="openCreateListModal('tmdb')">+ New List</button>
           <button type="button" class="secondary lc-btn" id="listsTmdbConnectBtn" onclick="toggleListsTmdbConnection()">Connect TMDB</button>
         </div>
       </div>
@@ -61,7 +58,6 @@
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="panel-title" style="margin-bottom:0;">Your Simkl Lists</h2>
         <div style="display:flex; gap:8px;">
-          <button type="button" class="primary lc-btn" onclick="openCreateListModal('simkl')">+ New List</button>
           <button type="button" class="secondary lc-btn" id="listsSimklConnectBtn" onclick="toggleListsSimklConnection()">Connect Simkl</button>
         </div>
       </div>
@@ -92,28 +88,48 @@
       <div class="shelf-header" style="margin-bottom:10px;">
         <h2 class="shelf-title" id="customListEditorTitle">Create a Custom List</h2>
       </div>
-      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Manage items and settings for this custom list. You can reorder items by dragging or typing a position number, remove items with the &times; button, or add new items from Search, Discover, or Charts.</p>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Manage items and settings for this custom list. You can reorder items by dragging or typing a position number, remove items with the &#x2715; button, or add new items from Search, Discover, or Charts.</p>
 
       <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this list:</p>
       <div id="customListDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>No items in this list yet &mdash; tap + on any movie or show across Discover, Search, or Charts to add it.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
         <button type="button" class="secondary lc-btn" onclick="shuffleCustomListDraft()">Shuffle picks now</button>
-        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllCustomListDraftPicks()">Remove all</button>
+        <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllCustomListDraftPicks()">Remove All</button>
       </div>
-      <label style="display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:8px;">
-        <input type="checkbox" id="customListRandomizeCheck">
-        <span style="font-size:0.85rem;">Randomize order (reshuffles once a day)</span>
-      </label>
-
-      <div class="row" id="customListVisibilityRow" style="margin-top:8px; align-items:center; gap:8px;">
-        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
-          <span style="font-size:0.85rem;">Visibility:</span>
-          <select id="customListVisibilitySelect" style="flex:none; width:auto;">
-            <option value="public">Public</option>
-            <option value="private">Private</option>
-          </select>
+      <div id="customListVisibilityRow" style="margin-top:12px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; max-width:280px;">
+        <span style="font-size:0.95rem; font-weight:500; color:var(--text);">Public</span>
+        <label class="ui-toggle">
+          <input type="checkbox" id="customListPublicToggle" checked>
+          <span class="ui-toggle-slider"></span>
         </label>
       </div>
+
+      <!-- Advanced Settings (Progressive Disclosure) -->
+      <details class="channel-advanced-details" style="margin-top:12px; border:1px solid var(--border); border-radius:8px; padding:10px 14px; background:var(--surface);">
+        <summary style="font-weight:600; font-size:0.88rem; cursor:pointer; user-select:none; color:var(--text); display:flex; align-items:center; justify-content:space-between;">
+          <span>Advanced Settings</span>
+          <span style="font-size:0.75rem; color:var(--muted); font-weight:normal;">Play order &amp; watch history rules</span>
+        </summary>
+        <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap;">
+            <label for="customListPlayOrderSelect" style="font-size:0.85rem; font-weight:600; white-space:nowrap;">Play order:</label>
+            <select id="customListPlayOrderSelect" onchange="applyCustomListPlayOrder(this.value)" style="flex:1; min-width:210px; font-size:0.85rem; padding:6px 10px; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:8px;">
+              <option value="as-listed">Creation order (as listed)</option>
+              <option value="aired-asc">Air date &mdash; oldest first</option>
+              <option value="aired-desc">Air date &mdash; newest first</option>
+              <option value="title-az">Title A&ndash;Z</option>
+              <option value="shuffle-daily">Shuffle daily (reshuffles every 24h)</option>
+            </select>
+          </div>
+          <p id="customListPlayOrderHint" style="margin:0 0 14px; color:var(--muted); font-size:0.78rem;">Picks play in the order you created above &mdash; drag one, or type a new position, to change it.</p>
+
+          <label class="channel-rule-row" style="margin-top:10px;">
+            <input type="checkbox" id="customListHideWatchedCheck">
+            <span>Hide watched &mdash; skip items already in my watch history</span>
+          </label>
+          <p style="margin:2px 0 0 24px; color:var(--muted); font-size:0.78rem;">Needs Auto-track playback signed in. Once every pick has been seen, the whole list comes back rather than going dark.</p>
+        </div>
+      </details>
       <div id="customListTypeToggles" style="margin-top:8px; display:flex; gap:16px; flex-wrap:wrap;">
         <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
           <input type="radio" name="customListTypeRadio" value="movie" onchange="setCustomListDraftTypeToggle('movie')" checked>

@@ -1931,6 +1931,9 @@ async function renderAdminDashboard(env) {
   .admin-badge.improvement { background:rgba(0,122,255,0.12); color:var(--accent); }
   .admin-badge.idea { background:rgba(255,149,0,0.12); color:#FF9500; }
   .admin-badge.other { background:rgba(142,142,147,0.15); color:var(--muted); }
+  .admin-badge.series { background:rgba(175,82,222,0.15); color:#af52de; }
+  .admin-badge.movie { background:rgba(0,122,255,0.15); color:var(--accent); }
+  .admin-badge.service { background:var(--panel-strong); color:var(--text); text-transform:none; font-weight:500; margin:1px 4px 1px 0; }
   .feedback-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-top:10px; box-shadow:var(--shadow-sm); }
   .feedback-card.completed { opacity:0.55; }
   .feedback-card-header { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap; }
@@ -2258,32 +2261,55 @@ async function renderAdminDashboard(env) {
 
   <div class="admin-tab-panel" data-admin-panel="newonstreaming">
     <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it just has no Quick Add card and no Discover entry until it is turned on for everyone.</p>
-    <p style="color:#8E8E93; margin:0 0 16px; font-size:0.82rem;">Nothing upstream publishes the date a title landed on a service, so this add-on watches for it: every cron tick walks a slice of each provider&rsquo;s catalog, and a title that was not in the table already is an arrival. That means the list is only as old as the sweep &mdash; the first full pass is <em>seeded</em> (dated by each title&rsquo;s own release, because there was nothing to compare against yet) and every pass after it records real arrivals. Watch the <strong>observed</strong> number below: while it is zero, the ordering is still release dates.</p>
+    <p style="color:#8E8E93; margin:0 0 16px; font-size:0.82rem;">Powered by RapidAPI's <strong>Streaming Availability API</strong> (/changes) to capture the exact date titles and new episodes are added to streaming services (not release dates), with new arrivals first and recent episodes bumping shows to the top within a rolling 30-day window.</p>
 
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Sweep status</div>
       <div id="nosStatus" style="font-size:0.85rem; color:#8E8E93;">Loading&hellip;</div>
       <div style="margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
         <button type="button" class="secondary lc-btn" onclick="loadNewOnStreaming()">Refresh</button>
-        <label style="font-size:0.85rem; color:#8E8E93;">Units
-          <input type="number" id="nosSweepUnits" class="admin-select" style="margin-right:0; width:70px;" value="12" min="1" max="40">
+        <label style="font-size:0.85rem; color:#8E8E93;">Pages
+          <input type="number" id="nosSweepUnits" class="admin-select" style="margin-right:0; width:70px;" value="30" min="1" max="100">
         </label>
-        <label style="font-size:0.85rem; color:#8E8E93; display:inline-flex; align-items:center; gap:6px;">
-          <input type="checkbox" id="nosSweepBump" checked style="width:15px; height:15px;"> also re-bump episodes
-        </label>
-        <button type="button" class="admin-select" style="cursor:pointer;" id="nosSweepBtn" onclick="runNewOnStreamingSweep()">Run a sweep now</button>
+        <button type="button" class="admin-select" style="cursor:pointer;" id="nosSweepBtn" onclick="runNewOnStreamingSweep(false)">Run a sweep now</button>
+        <button type="button" class="secondary lc-btn" style="cursor:pointer; color:#FF9500; border-color:rgba(255,149,0,0.4);" id="nosResetBtn" onclick="runNewOnStreamingSweep(true)">Clear &amp; pull fresh data</button>
         <span id="nosSweepStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
       </div>
-      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">One unit is one provider, one type, one page of 20 &mdash; the same slice the cron takes. A pass reads every catalogue to its end (the depth is measured from TMDB, not configured), and the pass that completes is what lets titles no longer on a service be marked gone. Running a sweep here advances the same cursor the cron uses, so it brings the walk in sooner rather than duplicating it. Capped at 40 units a click because this spends the request&rsquo;s own subrequest allowance, not the cron&rsquo;s.</p>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Each page fetches up to 25 changes from RapidAPI. Automated sweeps run every 4 hours via cron (~180 runs/month) to stay strictly within your 1,000 req/month plan limit. A safety cap halts sweeps at 950 calls to ensure zero overages. Older titles (&gt;30 days) are pruned automatically each sweep.</p>
     </div>
 
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
-      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Rows collected</div>
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Rows in 30-day window</div>
       <div class="table-wrap">
         <table>
-          <tr><th>Service</th><th>Type</th><th>Pages</th><th>Titles</th><th>Seeded</th><th>Observed</th><th>Gone</th><th>Newest</th></tr>
-          <tbody id="nosByServiceBody"><tr><td colspan="8">Loading&hellip;</td></tr></tbody>
+          <tr><th>Service</th><th>Type</th><th>Titles</th><th>Removed</th><th>Newest Arrival</th></tr>
+          <tbody id="nosByServiceBody"><tr><td colspan="5">Loading&hellip;</td></tr></tbody>
         </table>
+      </div>
+    </div>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Add / Sync Title to Catalog</div>
+      <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Directly add or bump any movie or series in New on Streaming by IMDb ID (e.g. <code>tt45851964</code>), TMDB ID (e.g. <code>324931</code>), or title name.</p>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <input type="text" id="nosAddTitleInput" class="admin-select" placeholder="Title, IMDb ID (tt...) or TMDB ID" style="width:240px;">
+        <select class="admin-select" id="nosAddServiceSelect">
+          <option value="netflix">Netflix</option>
+          <option value="primevideo">Prime Video</option>
+          <option value="hulu">Hulu</option>
+          <option value="disney">Disney+</option>
+          <option value="hbomax">HBO Max</option>
+          <option value="appletv">Apple TV+</option>
+          <option value="paramount">Paramount+</option>
+          <option value="peacock">Peacock</option>
+        </select>
+        <select class="admin-select" id="nosAddKindSelect">
+          <option value="series">Show</option>
+          <option value="movie">Movie</option>
+        </select>
+        <input type="date" id="nosAddDateInput" class="admin-select" style="width:130px;" title="Optional arrival date (defaults to episode air date or today)">
+        <button type="button" class="admin-select" style="cursor:pointer;" id="nosAddBtn" onclick="nosAddTitle()">Add / Sync Title</button>
+        <span id="nosAddStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
       </div>
     </div>
 
@@ -2291,14 +2317,19 @@ async function renderAdminDashboard(env) {
       <div style="font-weight:600; font-size:0.9rem; margin-bottom:8px;">Preview the catalog</div>
       <p style="color:#8E8E93; margin:0 0 10px; font-size:0.82rem;">Read through the same code that serves the row to Stremio, so this is the actual shelf and not a second implementation of it. Order is always most recently arrived first.</p>
       <div style="display:flex; gap:8px; align-items:center; margin-bottom:12px; flex-wrap:wrap;">
-        <select class="admin-select" id="nosPreviewType" onchange="loadNewOnStreamingPreview()">
+        <select class="admin-select" id="nosPreviewType" onchange="nosResetAndPreview()">
+          <option value="all" selected>All (Movies &amp; Shows)</option>
           <option value="movie">Movies</option>
           <option value="series">Shows</option>
         </select>
-        <select class="admin-select" id="nosPreviewService" onchange="loadNewOnStreamingPreview()">
+        <select class="admin-select" id="nosPreviewService" onchange="nosResetAndPreview()">
           <option value="">All services</option>
         </select>
-        <button type="button" class="secondary lc-btn" onclick="loadNewOnStreamingPreview()">Load preview</button>
+        <input type="text" id="nosPreviewSearch" class="admin-select" placeholder="Filter by title or ID…" style="width:180px;" oninput="onNosPreviewSearchInput()">
+        <button type="button" class="secondary lc-btn" onclick="nosResetAndPreview()">Load preview</button>
+        <button type="button" class="secondary lc-btn" id="nosPrevBtn" onclick="nosChangePage(-1)" disabled>&larr; Prev</button>
+        <span id="nosPageLabel" style="font-size:0.85rem; color:#8E8E93; font-weight:600;">Page 1</span>
+        <button type="button" class="secondary lc-btn" id="nosNextBtn" onclick="nosChangePage(1)" disabled>Next &rarr;</button>
         <span id="nosPreviewStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
       </div>
       <div style="margin-bottom:12px; font-size:0.82rem; color:#8E8E93;">Catalog URL: <code id="nosPreviewSource">tmdb:new-on-streaming</code> &mdash; paste this into <strong>Catalogs &rarr; + New Catalog</strong> on the main site to install this exact row into Stremio or Nuvio while it is still hidden.</div>
@@ -3503,6 +3534,12 @@ async function renderAdminDashboard(env) {
       }
     }
 
+    function nosProviderLabel(svc) {
+      if (!svc) return '';
+      const p = (nosProviders || []).find(function (x) { return x.key === svc; });
+      return p ? p.name : (svc.charAt(0).toUpperCase() + svc.slice(1));
+    }
+
     async function loadNewOnStreaming() {
       const statusEl = document.getElementById('nosStatus');
       const bodyEl = document.getElementById('nosByServiceBody');
@@ -3526,49 +3563,35 @@ async function renderAdminDashboard(env) {
         if (st.error) {
           bits.push('<div style="color:#FF3B30;">' + escapeHtmlAdmin(st.error) + '</div>');
         }
-        bits.push('<div>Region swept: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong></div>');
+        if (st.engine === 'rapidapi') {
+          bits.push('<div>Engine: <span style="color:#30d158; font-weight:600;">RapidAPI Streaming Availability</span> &mdash; pulling direct streaming arrivals &amp; episode updates (previous 30 days)</div>');
+        }
+        if (!st.rapidKeyConfigured) {
+          bits.push('<div style="color:#FF3B30;"><strong>RAPIDAPI_KEY is not set.</strong> Run <code>npx wrangler secret put RAPIDAPI_KEY</code> to enable sweeps.</div>');
+        }
+        const usage = st.monthlyUsage || { count: 0, limit: 1000, remaining: 1000, safetyCap: 950 };
+        const quotaColor = usage.count >= usage.safetyCap ? '#FF3B30' : (usage.count >= 750 ? '#FF9500' : '#30d158');
+        bits.push('<div>Monthly Quota (' + escapeHtmlAdmin(usage.month || '') + '): <strong style="color:' + quotaColor + ';">' + usage.count + ' / ' + usage.limit + ' requests</strong> (' + usage.remaining + ' remaining; safety cap: ' + usage.safetyCap + ')</div>');
+        bits.push('<div>Automated Schedule: <strong>every 4 hours</strong> (~6 runs/day to stay within 1,000 req/mo quota)</div>');
+        bits.push('<div>Region: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong> &mdash; 30-day rolling window</div>');
         bits.push('<div>Visible to users: ' + (st.inQuickAdd
           ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
           : '<span style="color:#FF9500;">no -- admin only (NEW_ON_STREAMING_IN_QUICK_ADD is false)</span>') + '</div>');
-        const cursor = st.cursor || { page: 1, idx: 0, walk: 0, passErrors: 0 };
-        const perPass = st.passPages || 0;
-        const done = perPass ? Math.min(perPass, ((cursor.page - 1) * st.combos) + cursor.idx) : 0;
-        const pct = perPass ? Math.floor((done / perPass) * 100) : 0;
-        bits.push('<div>Pass size: <strong>' + (perPass || '?') + '</strong> pages ('
-          + st.depthsKnown + ' of ' + st.combos + ' catalogues measured)'
-          + (perPass && st.unitsPerTick ? ' &mdash; about ' + (Math.round((perPass / st.unitsPerTick) * 6 / 6) * 1) + ' ticks, ~' + (Math.round((perPass / st.unitsPerTick) * 6 / 60 * 10) / 10) + ' h a full pass' : '')
-          + '</div>');
-        bits.push('<div>Walk: generation <strong>' + cursor.walk + '</strong>, at page ' + cursor.page + ', catalogue ' + cursor.idx + ' of ' + st.combos + ' (' + pct + '% through this pass), ' + st.unitsPerTick + ' pages a tick</div>');
-        if (cursor.passErrors) {
-          bits.push('<div style="color:#FF9500;">' + cursor.passErrors + ' page(s) failed so far this pass &mdash; removals are skipped for a pass that could not be read.</div>');
-        }
-        bits.push('<div>' + (cursor.walk === 0
-          ? '<span style="color:#FF9500;">Still on the seeding pass</span> -- dates are the titles&rsquo; own release dates until this first pass finishes.'
-          : '<span style="color:#30d158;">Past the seeding pass</span> -- arrivals found from here on are observed, not inferred.') + '</div>');
         const totals = st.totals || {};
-        bits.push('<div>Titles: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows &mdash; ' + (totals.seeded || 0) + ' seeded, <strong>' + (totals.observed || 0) + ' observed</strong>, ' + (totals.removed || 0) + ' marked gone</div>');
+        bits.push('<div>Active titles in 30d window: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows (' + (totals.removed || 0) + ' marked removed)</div>');
         if (st.lastSweep) {
-          bits.push('<div>Last sweep: ' + nosEpochToDay(st.lastSweep.at) + ' &mdash; ' + (st.lastSweep.units || 0) + ' pages, ' + (st.lastSweep.added || 0) + ' new rows, ' + (st.lastSweep.returned || 0) + ' returned, ' + (st.lastSweep.resolved || 0) + ' IMDb lookups, ' + (st.lastSweep.errors || 0) + ' errors' + (st.lastSweep.reason ? ' (' + escapeHtmlAdmin(st.lastSweep.reason) + ')' : '') + '</div>');
-          const rm = st.lastSweep.removal;
-          if (rm) {
-            bits.push('<div>' + (rm.ran
-              ? 'Last completed pass marked <strong>' + rm.marked + '</strong> title(s) gone (of ' + rm.live + ' on record).'
-              : '<span style="color:#FF9500;">Removals held back: ' + escapeHtmlAdmin(rm.reason || 'not yet applicable') + '</span>') + '</div>');
-          }
+          bits.push('<div>Last sweep: ' + nosEpochToDay(st.lastSweep.at) + ' &mdash; ' + (st.lastSweep.units || 0) + ' API calls, ' + (st.lastSweep.seen || 0) + ' changes seen, ' + (st.lastSweep.added || 0) + ' new arrivals, ' + (st.lastSweep.bumped || 0) + ' episodes bumped' + (st.lastSweep.pruned ? ', ' + st.lastSweep.pruned + ' pruned (>30d)' : '') + (st.lastSweep.errors ? ', ' + st.lastSweep.errors + ' errors' + (st.lastSweep.lastError ? ': ' + escapeHtmlAdmin(st.lastSweep.lastError) : '') : '') + (st.lastSweep.reason ? ' (' + escapeHtmlAdmin(st.lastSweep.reason) + ')' : '') + '</div>');
         } else {
           bits.push('<div style="color:#FF9500;">No sweep has completed yet.</div>');
-        }
-        if (st.lastBump) {
-          bits.push('<div>Last episode re-bump: ' + nosEpochToDay(st.lastBump.at) + ' &mdash; ' + (st.lastBump.checked || 0) + ' shows checked, ' + (st.lastBump.bumped || 0) + ' moved to the top</div>');
         }
         statusEl.innerHTML = bits.join('');
 
         const rows = st.byService || [];
         bodyEl.innerHTML = rows.length
           ? rows.map(function (r) {
-              return '<tr><td>' + escapeHtmlAdmin(r.service) + '</td><td>' + escapeHtmlAdmin(r.kind) + '</td><td>' + (r.measured ? r.pages : '?') + '</td><td>' + r.count + '</td><td>' + r.seeded + '</td><td>' + r.observed + '</td><td>' + r.removed + '</td><td>' + nosEpochToDay(r.newest) + '</td></tr>';
+              return '<tr><td>' + escapeHtmlAdmin(r.service) + '</td><td>' + escapeHtmlAdmin(r.kind) + '</td><td>' + r.count + '</td><td>' + r.removed + '</td><td>' + nosEpochToDay(r.newest) + '</td></tr>';
             }).join('')
-          : '<tr><td colspan="8">Nothing collected yet -- run a sweep.</td></tr>';
+          : '<tr><td colspan="5">Nothing collected yet -- run a sweep.</td></tr>';
 
         const sel = document.getElementById('nosPreviewService');
         if (sel && sel.options.length <= 1) {
@@ -3584,39 +3607,114 @@ async function renderAdminDashboard(env) {
       }
     }
 
-    async function runNewOnStreamingSweep() {
+    async function runNewOnStreamingSweep(isReset) {
+      if (isReset) {
+        if (!confirm('This will remove all current items from New on Streaming and pull fresh data from RapidAPI across the 30-day window. Continue?')) {
+          return;
+        }
+      }
       const btn = document.getElementById('nosSweepBtn');
+      const resetBtn = document.getElementById('nosResetBtn');
       const statusEl = document.getElementById('nosSweepStatus');
-      const units = parseInt(document.getElementById('nosSweepUnits').value, 10) || 12;
-      const bump = document.getElementById('nosSweepBump').checked;
-      btn.disabled = true;
-      statusEl.textContent = 'Sweeping… this can take a minute on a first pass.';
+      let units = parseInt(document.getElementById('nosSweepUnits').value, 10) || 30;
+      if (isReset && units < 30) {
+        units = 30;
+      }
+      if (btn) btn.disabled = true;
+      if (resetBtn) resetBtn.disabled = true;
+      statusEl.textContent = isReset ? 'Clearing items & pulling fresh data from RapidAPI…' : 'Sweeping RapidAPI…';
       try {
         const res = await fetch('/admin/api/new-on-streaming/sweep', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ units: units, bump: bump }),
+          body: JSON.stringify({ units: units, manual: true, reset: !!isReset, full: !!isReset }),
         });
         const data = await res.json();
         if (!data.ok) {
           statusEl.textContent = data.error || 'Sweep failed.';
-          btn.disabled = false;
+          if (btn) btn.disabled = false;
+          if (resetBtn) resetBtn.disabled = false;
           return;
         }
         const sw = data.sweep || {};
         if (!sw.ran) {
           statusEl.textContent = sw.reason || 'The sweep did not run.';
         } else {
-          let msg = sw.units + ' pages, ' + sw.seen + ' titles seen, ' + sw.added + ' new rows, ' + sw.returned + ' returned, ' + sw.touched + ' already known';
-          if (sw.wrapped) msg += '; pass complete';
-          if (sw.removal && sw.removal.ran && sw.removal.marked) msg += ', ' + sw.removal.marked + ' marked gone';
-          if (data.bump && data.bump.ran) msg += '; ' + data.bump.bumped + ' shows re-bumped';
-          if (sw.errors) msg += '; ' + sw.errors + ' errors (see the Worker log)';
+          let msg = (sw.cleared ? 'Existing items cleared. ' : '') + sw.units + ' API calls, ' + sw.seen + ' changes seen, ' + sw.added + ' added, ' + sw.bumped + ' episodes bumped';
+          if (sw.pruned) msg += ', ' + sw.pruned + ' pruned (>30d)';
+          if (sw.errors) msg += '; ' + sw.errors + ' errors' + (sw.lastError ? ': ' + sw.lastError : ' (see Worker log)');
           statusEl.textContent = msg;
         }
         await loadNewOnStreaming();
+        if (typeof loadNewOnStreamingPreview === 'function') {
+          await loadNewOnStreamingPreview();
+        }
       } catch (e) {
         statusEl.textContent = 'Could not run -- check your connection.';
+      }
+      if (btn) btn.disabled = false;
+      if (resetBtn) resetBtn.disabled = false;
+    }
+
+    let nosCurrentPage = 0;
+    const nosPageLimit = 100;
+    let nosSearchTimeout = null;
+
+    function nosResetAndPreview() {
+      nosCurrentPage = 0;
+      loadNewOnStreamingPreview();
+    }
+
+    function onNosPreviewSearchInput() {
+      if (nosSearchTimeout) clearTimeout(nosSearchTimeout);
+      nosSearchTimeout = setTimeout(function() {
+        nosCurrentPage = 0;
+        loadNewOnStreamingPreview();
+      }, 350);
+    }
+
+    function nosChangePage(delta) {
+      nosCurrentPage = Math.max(0, nosCurrentPage + delta);
+      loadNewOnStreamingPreview();
+    }
+
+    async function nosAddTitle() {
+      const inputEl = document.getElementById('nosAddTitleInput');
+      const svcEl = document.getElementById('nosAddServiceSelect');
+      const kindEl = document.getElementById('nosAddKindSelect');
+      const dateEl = document.getElementById('nosAddDateInput');
+      const statusEl = document.getElementById('nosAddStatus');
+      const btn = document.getElementById('nosAddBtn');
+      const input = (inputEl.value || '').trim();
+      if (!input) {
+        statusEl.textContent = 'Please enter a title, IMDb ID, or TMDB ID.';
+        return;
+      }
+      btn.disabled = true;
+      statusEl.textContent = 'Searching & syncing title…';
+      try {
+        const res = await fetch('/admin/api/new-on-streaming/add', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            input: input,
+            service: svcEl.value,
+            kind: kindEl.value,
+            date: dateEl.value || null,
+          }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Failed to add title.';
+        } else {
+          const r = data.result || {};
+          statusEl.innerHTML = '<span style="color:#30d158; font-weight:600;">Added: ' + escapeHtmlAdmin(r.name) + ' (' + escapeHtmlAdmin(nosProviderLabel(r.service)) + ', ' + (r.eventKind === 'episode' ? 'Episode ' + r.season + 'x' + r.episode + ', ' : '') + nosEpochToDay(r.eventAt) + ')</span>';
+          inputEl.value = '';
+          await loadNewOnStreaming();
+          nosResetAndPreview();
+        }
+      } catch (e) {
+        statusEl.textContent = 'Could not sync title -- check connection.';
       }
       btn.disabled = false;
     }
@@ -3627,29 +3725,62 @@ async function renderAdminDashboard(env) {
       const sourceEl = document.getElementById('nosPreviewSource');
       const type = document.getElementById('nosPreviewType').value;
       const service = document.getElementById('nosPreviewService').value;
+      const qInput = document.getElementById('nosPreviewSearch');
+      const q = qInput ? (qInput.value || '').trim() : '';
+      const prevBtn = document.getElementById('nosPrevBtn');
+      const nextBtn = document.getElementById('nosNextBtn');
+      const pageLabel = document.getElementById('nosPageLabel');
+
       statusEl.textContent = 'Loading…';
       resultsEl.innerHTML = '';
       try {
-        const res = await fetch('/admin/api/new-on-streaming/preview?type=' + encodeURIComponent(type) + (service ? '&services=' + encodeURIComponent(service) : ''));
+        const skip = nosCurrentPage * nosPageLimit;
+        let url = '/admin/api/new-on-streaming/preview?type=' + encodeURIComponent(type) +
+          (service ? '&services=' + encodeURIComponent(service) : '') +
+          (q ? '&q=' + encodeURIComponent(q) : '') +
+          '&skip=' + skip + '&limit=' + nosPageLimit;
+
+        const res = await fetch(url);
         const data = await res.json();
         if (!data.ok) {
           statusEl.textContent = data.error || 'Could not load preview.';
           return;
         }
         sourceEl.textContent = data.source;
+        const total = data.totalItems != null ? data.totalItems : 0;
         statusEl.textContent = (data.totalItems != null ? data.totalItems + ' titles in this row' : '');
-        if (!data.items.length) {
-          resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">Empty -- the sweep has not collected anything for this service and type yet.</p>';
+
+        if (pageLabel) pageLabel.textContent = 'Page ' + (nosCurrentPage + 1);
+        if (prevBtn) prevBtn.disabled = nosCurrentPage <= 0;
+        if (nextBtn) nextBtn.disabled = (nosCurrentPage + 1) * nosPageLimit >= total;
+
+        if (!data.items || !data.items.length) {
+          resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">Empty -- no matching titles found.</p>';
           return;
         }
         resultsEl.innerHTML =
-          '<div class="table-wrap"><table><tr><th>#</th><th>Poster</th><th>Title</th><th>Year</th><th>Id</th></tr>' +
+          '<div class="table-wrap"><table><tr><th>#</th><th>Poster</th><th>Title</th><th>Type</th><th>Service</th><th>Added Date</th><th>Year</th><th>Id</th></tr>' +
           data.items.map(function (it, i) {
-            return '<tr><td>' + (i + 1) + '</td>' +
-              '<td>' + (it.poster ? '<img src="' + escapeHtmlAdmin(it.poster) + '" alt="" style="width:40px; border-radius:4px;">' : '') + '</td>' +
-              '<td>' + escapeHtmlAdmin(it.name || '') + '</td>' +
+            const isSeries = it.type === 'series';
+            const typeBadge = isSeries
+              ? '<span class="admin-badge series">Show</span>'
+              : '<span class="admin-badge movie">Movie</span>';
+            const svcs = (it.services && it.services.length ? it.services : (it.service ? [it.service] : []));
+            const svcBadges = svcs.length
+              ? svcs.map(function (s) {
+                  return '<span class="admin-badge service">' + escapeHtmlAdmin(nosProviderLabel(s)) + '</span>';
+                }).join('')
+              : '<span style="color:var(--muted);">--</span>';
+            const dateStr = it.addedAt ? nosEpochToDay(it.addedAt) : '--';
+
+            return '<tr><td>' + (skip + i + 1) + '</td>' +
+              '<td>' + (it.poster ? '<img src="' + escapeHtmlAdmin(it.poster) + '" alt="" style="width:38px; height:56px; object-fit:cover; border-radius:4px; display:block;">' : '') + '</td>' +
+              '<td><strong>' + escapeHtmlAdmin(it.name || '') + '</strong></td>' +
+              '<td>' + typeBadge + '</td>' +
+              '<td>' + svcBadges + '</td>' +
+              '<td style="white-space:nowrap;">' + escapeHtmlAdmin(dateStr) + '</td>' +
               '<td>' + escapeHtmlAdmin(it.releaseInfo || '') + '</td>' +
-              '<td style="color:#8E8E93;">' + escapeHtmlAdmin(it.id || '') + '</td></tr>';
+              '<td style="color:var(--muted); font-family:monospace; font-size:0.8rem;">' + escapeHtmlAdmin(it.id || '') + '</td></tr>';
           }).join('') +
           '</table></div>';
       } catch (e) {

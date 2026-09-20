@@ -62,86 +62,18 @@ function movePosTo(input) {
 // Drag-to-reorder, as an addition to (not a replacement for) the ↑/↓
 // buttons above -- those still work and are the only option on touch
 // devices, where native HTML5 drag-and-drop generally isn't supported.
-let dragSrcEntry = null;
-
-document.getElementById('lists').addEventListener('dragstart', (e) => {
-  const handle = e.target.closest('.drag-handle, .shelf-drag-handle');
-  if (!handle) { e.preventDefault(); return; }
-  dragSrcEntry = handle.closest('.entry');
-  dragSrcEntry.classList.add('dragging');
-  e.dataTransfer.effectAllowed = 'move';
-});
-
-document.getElementById('lists').addEventListener('dragend', () => {
-  if (dragSrcEntry) dragSrcEntry.classList.remove('dragging');
-  dragSrcEntry = null;
-  renumber();
-});
-
-document.getElementById('lists').addEventListener('dragover', (e) => {
-  if (!dragSrcEntry) return;
-  e.preventDefault();
-  const container = document.getElementById('lists');
-  const afterEl = getDragAfterElement(container, e.clientY);
-  if (afterEl == null) {
-    container.appendChild(dragSrcEntry);
-  } else if (afterEl !== dragSrcEntry) {
-    container.insertBefore(dragSrcEntry, afterEl);
-  }
-});
-
-function getDragAfterElement(container, y) {
-  const els = [...container.querySelectorAll('.entry:not(.dragging)')];
-  return els.reduce((closest, child) => {
-    const box = child.getBoundingClientRect();
-    const offset = y - box.top - box.height / 2;
-    if (offset < 0 && offset > closest.offset) {
-      return { offset: offset, element: child };
-    }
-    return closest;
-  }, { offset: -Infinity, element: null }).element;
-}
-
-// Touch/pen drag-to-reorder -- native HTML5 drag-and-drop (above) generally
-// doesn't fire on touch devices at all, which left dragging a list of 60
-// rows into place a real chore on mobile (the \u2191/\u2193 buttons and the
-// editable position number both still work there, but neither is as fast
-// as a drag). Pointer Events cover touch/pen here without disturbing the
-// existing mouse path -- gated to pointerType so a mouse drag still goes
-// through the HTML5 dragstart/dragover listeners above untouched. Called
-// once per row (from addRow) since each row gets its own handle.
-let touchDragEntry = null;
-
-function initTouchDrag(handle) {
-  if (!handle) return;
-  handle.addEventListener('pointerdown', (e) => {
-    if (e.pointerType !== 'touch' && e.pointerType !== 'pen') return;
-    e.preventDefault();
-    touchDragEntry = handle.closest('.entry');
-    touchDragEntry.classList.add('dragging');
-    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
-    document.addEventListener('pointermove', onTouchDragMove);
-    document.addEventListener('pointerup', onTouchDragEnd, { once: true });
-    document.addEventListener('pointercancel', onTouchDragEnd, { once: true });
+// Drag-to-reorder for catalog rows, powered by unified createSortableList
+const listsContainer = document.getElementById('lists');
+if (listsContainer) {
+  createSortableList(listsContainer, {
+    itemSelector: '.entry',
+    handleSelector: '.drag-handle, .shelf-drag-handle',
+    onReorder: renumber
   });
 }
 
-function onTouchDragMove(e) {
-  if (!touchDragEntry) return;
-  const container = document.getElementById('lists');
-  const afterEl = getDragAfterElement(container, e.clientY);
-  if (afterEl == null) {
-    container.appendChild(touchDragEntry);
-  } else if (afterEl !== touchDragEntry) {
-    container.insertBefore(touchDragEntry, afterEl);
-  }
-}
-
-function onTouchDragEnd() {
-  document.removeEventListener('pointermove', onTouchDragMove);
-  if (touchDragEntry) touchDragEntry.classList.remove('dragging');
-  touchDragEntry = null;
-  renumber();
+function initTouchDrag(handle) {
+  // Handled transparently by createSortableList on container
 }
 
 // --- undo toast -------------------------------------------------------------
@@ -157,16 +89,38 @@ function captureUndoSnapshot() {
   undoSnapshot = { entries: collectEntries() };
 }
 
+let activeUndoToast = null;
+
 function showUndoToast(message) {
+  if (typeof showToast === 'function') {
+    if (activeUndoToast && typeof activeUndoToast.dismiss === 'function') {
+      activeUndoToast.dismiss();
+    }
+    activeUndoToast = showToast(message, 'undo', {
+      duration: 8000,
+      actionText: 'Undo',
+      onAction: function() {
+        performUndo();
+      }
+    });
+    return;
+  }
   const toast = document.getElementById('undoToast');
-  document.getElementById('undoToastMsg').textContent = message;
-  toast.style.display = 'flex';
-  clearTimeout(undoTimer);
-  undoTimer = setTimeout(hideUndoToast, 8000);
+  if (toast) {
+    document.getElementById('undoToastMsg').textContent = message;
+    toast.style.display = 'flex';
+    clearTimeout(undoTimer);
+    undoTimer = setTimeout(hideUndoToast, 8000);
+  }
 }
 
 function hideUndoToast() {
-  document.getElementById('undoToast').style.display = 'none';
+  if (activeUndoToast && typeof activeUndoToast.dismiss === 'function') {
+    activeUndoToast.dismiss();
+    activeUndoToast = null;
+  }
+  const toast = document.getElementById('undoToast');
+  if (toast) toast.style.display = 'none';
   clearTimeout(undoTimer);
 }
 
@@ -579,6 +533,8 @@ function collectKeys() {
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
     showBadgesAiringNext: getBadgeSetting('showBadgesAiringNext'),
     showBadgesContinueWatching: getBadgeSetting('showBadgesContinueWatching'),
+    showBadgesTraktContinueWatching: getBadgeSetting('showBadgesTraktContinueWatching'),
+    showBadgesMdblistUpNext: getBadgeSetting('showBadgesMdblistUpNext'),
     showBadgesCatalogs: getBadgeSetting('showBadgesCatalogs'),
     showBadgesStremioAiringNext: getBadgeSetting('showBadgesStremioAiringNext'),
     showBadgesStremioContinueWatching: getBadgeSetting('showBadgesStremioContinueWatching'),
@@ -589,6 +545,9 @@ function collectKeys() {
     showBadgeSeasonFinale: getBadgeSetting('showBadgeSeasonFinale'),
     showBadgeSeasonFinaleDate: getBadgeSetting('showBadgeSeasonFinaleDate'),
     showBadgeRating: getBadgeSetting('showBadgeRating'),
+    showBadgeImdbRating: false,
+    showBadgeTmdbRating: getBadgeSetting('showBadgeTmdbRating'),
+    posterRatingSource: typeof getPosterRatingSource === 'function' ? getPosterRatingSource() : 'tmdb',
     showBadgeWatched: getBadgeSetting('showBadgeWatched'),
   };
   if (typeof activeCreator !== 'undefined' && activeCreator) {
@@ -627,6 +586,47 @@ function getBadgeSetting(key) {
 }
 window.getBadgeSetting = getBadgeSetting;
 
+function getPosterRatingSource() {
+  try {
+    const s = localStorage.getItem('myListAddon:posterRatingSource');
+    if (s === 'none') return 'none';
+    if (s === 'tmdb') return 'tmdb';
+    if (localStorage.getItem('myListAddon:showBadgeTmdbRating') === '0') return 'none';
+    if (localStorage.getItem('myListAddon:showBadgeRating') === '0') return 'none';
+    return 'tmdb';
+  } catch (e) {
+    return 'tmdb';
+  }
+}
+window.getPosterRatingSource = getPosterRatingSource;
+
+function toggleTmdbRatingSetting(isChecked) {
+  try {
+    localStorage.setItem('myListAddon:showBadgeTmdbRating', isChecked ? '1' : '0');
+    localStorage.setItem('myListAddon:showBadgeRating', isChecked ? '1' : '0');
+    localStorage.setItem('myListAddon:posterRatingSource', isChecked ? 'tmdb' : 'none');
+    localStorage.setItem('myListAddon:showBadgeImdbRating', '0');
+  } catch (e) {}
+  if (window._discoverFeedsCache) window._discoverFeedsCache = {};
+  applyBadgeBodyClasses();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof saveState === 'function') saveState();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+  if (typeof renderLivePreview === 'function') renderLivePreview();
+  if (typeof applySearchFilters === 'function') applySearchFilters();
+  if (typeof render5PosterListsFeed === 'function') {
+    const activeDiscoverSub = localStorage.getItem('myListAddon:discoverSubmenu') || 'all';
+    if (typeof renderDiscoverChartsList === 'function') renderDiscoverChartsList(activeDiscoverSub, true);
+  }
+}
+window.toggleTmdbRatingSetting = toggleTmdbRatingSetting;
+
+function setPosterRatingSource(source) {
+  const enabled = (source === 'tmdb' || source === true);
+  toggleTmdbRatingSetting(enabled);
+}
+window.setPosterRatingSource = setPosterRatingSource;
+
 function applyBadgeBodyClasses() {
   const b = document.body;
   if (!b) return;
@@ -635,12 +635,18 @@ function applyBadgeBodyClasses() {
   if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
   b.classList.toggle('hide-airing-next-badges', !getBadgeSetting('showBadgesAiringNext'));
   b.classList.toggle('hide-continue-watching-badges', !getBadgeSetting('showBadgesContinueWatching'));
+  b.classList.toggle('hide-trakt-continue-watching-badges', !getBadgeSetting('showBadgesTraktContinueWatching'));
+  b.classList.toggle('hide-mdblist-up-next-badges', !getBadgeSetting('showBadgesMdblistUpNext'));
   b.classList.toggle('hide-catalogs-badges', !getBadgeSetting('showBadgesCatalogs'));
   b.classList.toggle('hide-badge-air-date', !getBadgeSetting('showBadgeAirDate'));
   b.classList.toggle('hide-badge-season-premiere', !getBadgeSetting('showBadgeSeasonPremiere'));
   b.classList.toggle('hide-badge-season-finale', !getBadgeSetting('showBadgeSeasonFinale'));
   b.classList.toggle('hide-badge-season-finale-date', !getBadgeSetting('showBadgeSeasonFinaleDate'));
-  b.classList.toggle('hide-badge-rating', !getBadgeSetting('showBadgeRating'));
+  const ratingSource = getPosterRatingSource();
+  const showTmdb = ratingSource === 'tmdb' && getBadgeSetting('showBadgeRating') && getBadgeSetting('showBadgeTmdbRating');
+  b.classList.toggle('hide-badge-rating', !showTmdb);
+  b.classList.toggle('hide-badge-imdb-rating', true);
+  b.classList.toggle('hide-badge-tmdb-rating', !showTmdb);
   b.classList.toggle('hide-badge-watched', !getBadgeSetting('showBadgeWatched'));
 }
 window.applyBadgeBodyClasses = applyBadgeBodyClasses;
@@ -661,6 +667,8 @@ function initBadgeSettingsUI() {
   const badgeKeys = [
     { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
     { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+    { key: 'showBadgesTraktContinueWatching', id: 'badgeTraktContinueWatchingCheckbox' },
+    { key: 'showBadgesMdblistUpNext', id: 'badgeMdblistUpNextCheckbox' },
     { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
     { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
     { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
@@ -671,6 +679,8 @@ function initBadgeSettingsUI() {
     { key: 'showBadgeSeasonFinale', id: 'badgeSeasonFinaleCheckbox' },
     { key: 'showBadgeSeasonFinaleDate', id: 'badgeSeasonFinaleDateCheckbox' },
     { key: 'showBadgeRating', id: 'badgeRatingCheckbox' },
+    { key: 'showBadgeImdbRating', id: 'badgeImdbRatingCheckbox' },
+    { key: 'showBadgeTmdbRating', id: 'badgeTmdbRatingCheckbox' },
     { key: 'showBadgeWatched', id: 'badgeWatchedCheckbox' },
   ];
   badgeKeys.forEach(({ key, id }) => {
@@ -679,6 +689,18 @@ function initBadgeSettingsUI() {
       el.checked = getBadgeSetting(key);
     }
   });
+  const currentRatingSource = getPosterRatingSource();
+  const tmdbEl = document.getElementById('badgeTmdbRatingCheckbox');
+  if (tmdbEl) {
+    tmdbEl.checked = (currentRatingSource === 'tmdb');
+  }
+  const rNone = document.getElementById('posterRatingNoneRadio');
+  const rImdb = document.getElementById('posterRatingImdbRadio');
+  const rTmdb = document.getElementById('posterRatingTmdbRadio');
+  if (rNone) rNone.checked = (currentRatingSource === 'none');
+  if (rImdb) rImdb.checked = false;
+  if (rTmdb) rTmdb.checked = (currentRatingSource === 'tmdb');
+
   const compEl = document.getElementById('autoRecommendCompanionsCheckbox');
   if (compEl && typeof getCompanionRecommendationSetting === 'function') {
     compEl.checked = getCompanionRecommendationSetting();
@@ -785,6 +807,36 @@ async function renderLivePreview() {
         };
       }
       
+      function getFallbackShelfSample() {
+        if (isCwShelf) {
+          const lists = window._myPrivateTraktLists || window._myTraktLists || [];
+          const cwList = lists.find((l) => l && (l.statusKey === 'continue-watching' || l.slug === 'continue-watching' || (l.url && (l.url === 'trakt:continue-watching' || l.url.includes(':continue-watching')))));
+          if (cwList && Array.isArray(cwList.items) && cwList.items.length) {
+            let items = cwList.items;
+            if (s.type === 'movie') {
+              items = items.filter(it => it && (it.type === 'movie' || it.kind === 'movie'));
+            } else if (s.type === 'series') {
+              items = items.filter(it => it && (it.type === 'series' || it.kind === 'series' || it.episodeTitle || it.seasonNum != null));
+            }
+            return items.length ? items : null;
+          }
+        } else if (isAiringShelf) {
+          let cachedAiring = null;
+          try {
+            cachedAiring = JSON.parse(localStorage.getItem('myListAddon:traktAiringNextCache') || 'null');
+          } catch (e) {}
+          if (Array.isArray(cachedAiring) && cachedAiring.length) {
+            return cachedAiring;
+          }
+          const lists = window._myPrivateTraktLists || window._myTraktLists || [];
+          const aList = lists.find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && (l.url === 'trakt:airing-next' || l.url.includes(':airing-next')))));
+          if (aList && Array.isArray(aList.items) && aList.items.length) {
+            return aList.items;
+          }
+        }
+        return null;
+      }
+      
       try {
         const body = { url: s.url, type: s.type, sample: 100 };
         if (keys.tmdbKey) body.tmdbKey = keys.tmdbKey;
@@ -808,6 +860,124 @@ async function renderLivePreview() {
         const data = await res.json();
         if (statusEl) statusEl.innerHTML = '';
         if (!data.ok) {
+          const fallback = getFallbackShelfSample();
+          if (fallback && fallback.length) {
+            data.ok = true;
+            data.sample = fallback.map(it => ({
+              id: it.id,
+              showId: it.showId || it.id,
+              type: it.type || (it.episodeTitle ? 'series' : (s.type === 'movie' ? 'movie' : 'series')),
+              name: it.name || it.title,
+              poster: it.poster,
+              year: it.year || it.releaseInfo,
+              showTitle: it.showTitle || it.name || it.title,
+              seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
+              episodeNum: it.episodeNum != null ? it.episodeNum : it.episode,
+              airDate: it.airDate,
+              airTime: it.airTime,
+              isUnaired: it.isUnaired,
+              isSeasonPremiere: it.isSeasonPremiere,
+              isSeasonFinale: it.isSeasonFinale,
+              imdbRating: it.imdbRating,
+              rating: it.rating,
+              vote_average: it.vote_average,
+            }));
+            data.totalItems = fallback.length;
+          }
+        }
+        if (data.ok && Array.isArray(data.sample)) {
+          if (isCwShelf) {
+            if (s.type === 'movie') {
+              // Ensure movie shelf only contains movie items, never TV shows
+              data.sample = data.sample.filter(it => it && (it.type === 'movie' || it.kind === 'movie') && !it.seasonNum && !it.episodeNum && !it.episodeTitle);
+            } else if (s.type === 'series') {
+              // Ensure series shelf includes all known continue watching series from private Trakt lists
+              const fallback = getFallbackShelfSample();
+              if (fallback && Array.isArray(fallback) && fallback.length) {
+                const seen = new Set();
+                const merged = [];
+                for (const item of data.sample) {
+                  const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
+                  if (id && !seen.has(id)) {
+                    seen.add(id);
+                    merged.push(item);
+                  }
+                }
+                for (const item of fallback) {
+                  const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
+                  if (id && !seen.has(id)) {
+                    seen.add(id);
+                    merged.push({
+                      id: item.id,
+                      showId: item.showId || item.id,
+                      type: 'series',
+                      name: item.name || item.title,
+                      poster: item.poster,
+                      year: item.year || item.releaseInfo,
+                      showTitle: item.showTitle || item.name || item.title,
+                      seasonNum: item.seasonNum != null ? item.seasonNum : item.season,
+                      episodeNum: item.episodeNum != null ? item.episodeNum : item.episode,
+                      airDate: item.airDate,
+                      airTime: item.airTime,
+                      isUnaired: item.isUnaired,
+                      isSeasonPremiere: item.isSeasonPremiere,
+                      isSeasonFinale: item.isSeasonFinale,
+                      imdbRating: item.imdbRating,
+                      rating: item.rating,
+                      vote_average: item.vote_average,
+                    });
+                  }
+                }
+                data.sample = merged;
+                data.totalItems = merged.length;
+              }
+            }
+          } else if (isAiringShelf) {
+            const fallback = getFallbackShelfSample();
+            if (fallback && Array.isArray(fallback) && fallback.length) {
+              const seen = new Set();
+              const merged = [];
+              for (const item of data.sample) {
+                const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
+                if (id && !seen.has(id)) {
+                  seen.add(id);
+                  merged.push(item);
+                }
+              }
+              for (const item of fallback) {
+                const id = String(item.showId || item.id || '').toLowerCase().split(':')[0];
+                if (id && !seen.has(id)) {
+                  seen.add(id);
+                  merged.push({
+                    id: item.id,
+                    showId: item.showId || item.id,
+                    type: 'series',
+                    name: item.name || item.title,
+                    poster: item.poster,
+                    year: item.year || item.releaseInfo,
+                    showTitle: item.showTitle || item.name || item.title,
+                    seasonNum: item.seasonNum != null ? item.seasonNum : item.season,
+                    episodeNum: item.episodeNum != null ? item.episodeNum : item.episode,
+                    airDate: item.airDate,
+                    airTime: item.airTime,
+                    isUnaired: item.isUnaired,
+                    isSeasonPremiere: item.isSeasonPremiere,
+                    isSeasonFinale: item.isSeasonFinale,
+                    imdbRating: item.imdbRating,
+                    rating: item.rating,
+                    vote_average: item.vote_average,
+                  });
+                }
+              }
+              if (merged.length) {
+                merged.sort((a, b) => (a.airDate || '9999').localeCompare(b.airDate || '9999'));
+                data.sample = merged;
+                data.totalItems = merged.length;
+              }
+            }
+          }
+        }
+        if (!data.ok) {
           postersContainer.innerHTML = '<p class="testresult err">&#x2717; ' + escapeHtml(data.error || 'Could not load this catalog.') + '</p>';
           continue;
         }
@@ -817,12 +987,40 @@ async function renderLivePreview() {
         }
         livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample: data.sample, maybeMore: data.maybeMore, totalItems: data.totalItems };
         const sliced = data.sample.slice(0, visibleCount);
-        sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; });
+        sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; item.isLivePreviewShelf = true; });
         postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
         if (seeAllBtn && data.sample.length > visibleCount) seeAllBtn.disabled = false;
       } catch (e) {
         if (statusEl) statusEl.innerHTML = '';
-        postersContainer.innerHTML = '<p class="testresult err">&#x2717; Network error loading this catalog.</p>';
+        const fallback = getFallbackShelfSample();
+        if (fallback && fallback.length) {
+          const sample = fallback.map(it => ({
+            id: it.id,
+            showId: it.showId || it.id,
+            type: it.type || (it.episodeTitle ? 'series' : (s.type === 'movie' ? 'movie' : 'series')),
+            name: it.name || it.title,
+            poster: it.poster,
+            year: it.year || it.releaseInfo,
+            showTitle: it.showTitle || it.name || it.title,
+            seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
+            episodeNum: it.episodeNum != null ? it.episodeNum : it.episode,
+            airDate: it.airDate,
+            airTime: it.airTime,
+            isUnaired: it.isUnaired,
+            isSeasonPremiere: it.isSeasonPremiere,
+            isSeasonFinale: it.isSeasonFinale,
+            imdbRating: it.imdbRating,
+            rating: it.rating,
+            vote_average: it.vote_average,
+          }));
+          livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample, maybeMore: false, totalItems: sample.length };
+          const sliced = sample.slice(0, visibleCount);
+          sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; item.isLivePreviewShelf = true; });
+          postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
+          if (seeAllBtn && sample.length > visibleCount) seeAllBtn.disabled = false;
+        } else {
+          postersContainer.innerHTML = '<p class="testresult err">&#x2717; Network error loading this catalog.</p>';
+        }
       }
     }
   }
@@ -949,11 +1147,16 @@ function getPosterBadgeSettings() {
   var get = (typeof getBadgeSetting === 'function') ? getBadgeSetting : function() { return true; };
   _posterBadgeCache = {
     continueWatching: get('showBadgesContinueWatching'),
+    traktContinueWatching: get('showBadgesTraktContinueWatching'),
+    mdblistUpNext: get('showBadgesMdblistUpNext'),
     airingNext: get('showBadgesAiringNext'),
     airDate: get('showBadgeAirDate'),
     seasonPremiere: get('showBadgeSeasonPremiere'),
     seasonFinale: get('showBadgeSeasonFinale'),
     seasonFinaleDate: get('showBadgeSeasonFinaleDate'),
+    rating: get('showBadgeRating'),
+    imdbRating: get('showBadgeImdbRating'),
+    tmdbRating: get('showBadgeTmdbRating'),
   };
   _posterBadgeCacheAt = now;
   return _posterBadgeCache;
@@ -1008,8 +1211,55 @@ function getAiringNextIndex() {
     if (a.imdbId) put(byImdb, String(a.imdbId), a, i);
     put(byTitle, String(a.showTitle || a.title || a.name || '').toLowerCase().trim(), a, i);
   }
+  var scheduleItems = [];
+  try {
+    if (window._airingNextScheduleMap && typeof window._airingNextScheduleMap === 'object') {
+      scheduleItems = Object.values(window._airingNextScheduleMap);
+    } else {
+      var raw = localStorage.getItem('myListAddon:airingScheduleMap');
+      if (raw) {
+        var parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') scheduleItems = Object.values(parsed);
+      }
+    }
+  } catch (e) {}
+  for (var j = 0; j < scheduleItems.length; j++) {
+    var sa = scheduleItems[j];
+    if (!sa) continue;
+    put(byShowId, String(sa.showId || ''), sa, list.length + j);
+    put(byBaseId, String(sa.showId || sa.id || '').split(':')[0], sa, list.length + j);
+    if (sa.canonicalTmdbId != null) put(byTmdb, 'c' + String(sa.canonicalTmdbId), sa, list.length + j);
+    if (sa.tmdbId != null) put(byTmdb, 't' + String(sa.tmdbId), sa, list.length + j);
+    if (sa.imdbId) put(byImdb, String(sa.imdbId), sa, list.length + j);
+    put(byTitle, String(sa.showTitle || sa.title || sa.name || '').toLowerCase().trim(), sa, list.length + j);
+  }
+  var providerAiringItems = [];
+  try {
+    const traktLists = window._myPrivateTraktLists || window._myTraktLists || [];
+    const traktAiring = traktLists.find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+    if (traktAiring && Array.isArray(traktAiring.items)) providerAiringItems.push(...traktAiring.items);
+
+    const mdbLists = window._myMdblistLists || [];
+    const mdbAiring = mdbLists.find((l) => l && (l.statusKey === 'airing-next' || l.slug === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+    if (mdbAiring && Array.isArray(mdbAiring.items)) providerAiringItems.push(...mdbAiring.items);
+
+    const simklLists = window._mySimklLists || [];
+    const simklAiring = simklLists.find((l) => l && (l.statusKey === 'airing-next' || (l.url && l.url.includes(':airing-next'))));
+    if (simklAiring && Array.isArray(simklAiring.items)) providerAiringItems.push(...simklAiring.items);
+  } catch (e) {}
+  var baseOffset = list.length + scheduleItems.length;
+  for (var k = 0; k < providerAiringItems.length; k++) {
+    var pa = providerAiringItems[k];
+    if (!pa) continue;
+    put(byShowId, String(pa.showId || pa.id || ''), pa, baseOffset + k);
+    put(byBaseId, String(pa.showId || pa.id || '').split(':')[0], pa, baseOffset + k);
+    if (pa.canonicalTmdbId != null) put(byTmdb, 'c' + String(pa.canonicalTmdbId), pa, baseOffset + k);
+    if (pa.tmdbId != null) put(byTmdb, 't' + String(pa.tmdbId), pa, baseOffset + k);
+    if (pa.imdbId) put(byImdb, String(pa.imdbId), pa, baseOffset + k);
+    put(byTitle, String(pa.showTitle || pa.title || pa.name || '').toLowerCase().trim(), pa, baseOffset + k);
+  }
   _airingIndexCache = {
-    empty: list.length === 0,
+    empty: list.length === 0 && scheduleItems.length === 0 && providerAiringItems.length === 0,
     byShowId: byShowId,
     byBaseId: byBaseId,
     byTmdb: byTmdb,
@@ -1162,30 +1412,40 @@ function livePreviewPosterHtml(m) {
 
   const isCwListContext = parentUrl.includes('continue-watching') || parentUrl.includes('continue_watching') || parentName.includes('continue watching') || decodedSlug === 'continue-watching';
   const isAiringListContext = parentUrl.includes('airing-next') || parentUrl.includes('airing_next') || parentName.includes('airing next') || decodedSlug === 'airing-next';
+  const isTraktCwContext = parentUrl === 'trakt:continue-watching' || (parentUrl.includes('continue-watching') && parentUrl.includes('trakt'));
+  const isMdblistUpNextContext = parentUrl.includes('upnext') || parentUrl.includes('up-next') || parentName.includes('up next');
 
-  const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext);
+  const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext || isTraktCwContext || isMdblistUpNextContext);
   const isAiringItem = !!(m.isAiringNext || m.listSlug === 'airing-next' || isAiringListContext);
 
   let removeBtn = '';
-  const cwRemoveTarget = m.removeShowId || (isCwItem ? (m.showId || m.id || m.imdbId) : null);
-  if (cwRemoveTarget) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="cw" data-remove-id="' + escapeAttr(cwRemoveTarget) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Continue Watching">&times;</button>';
-  } else if (m.removeAiringShowId) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="airing" data-remove-id="' + escapeAttr(m.removeAiringShowId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Airing Next">&times;</button>';
-  } else if (m.removeWatchlistId) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="watchlist" data-remove-id="' + escapeAttr(m.removeWatchlistId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watchlist">&times;</button>';
-  } else if (m.removeHistoryId) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="history" data-remove-id="' + escapeAttr(m.removeHistoryId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watch History">&times;</button>';
-  } else if (m.removeCustomListSlug) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="custom" data-remove-id="' + escapeAttr(m.id) + '" data-remove-slug="' + escapeAttr(m.removeCustomListSlug) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from List">&times;</button>';
-  } else if (m.removeExternalProvider) {
-    removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '">&times;</button>';
+  if (!m.isLivePreviewShelf && !m.hideRemoveBtn) {
+    if (m.removeExternalProvider) {
+      removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="external" data-provider="' + escapeAttr(m.removeExternalProvider) + '" data-target="' + escapeAttr(m.removeExternalTarget || '') + '" data-list-id="' + escapeAttr(m.removeExternalListId || '') + '" data-remove-id="' + escapeAttr(m.id) + '" data-media-type="' + escapeAttr(m.type || 'movie') + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from ' + escapeAttr(m.removeExternalProvider) + '" aria-label="Remove from ' + escapeAttr(m.removeExternalProvider) + '">\u2715</button>';
+    } else {
+      const cwRemoveTarget = m.removeShowId || (isCwItem ? (m.showId || m.id || m.imdbId) : null);
+      if (cwRemoveTarget) {
+        removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="cw" data-remove-id="' + escapeAttr(cwRemoveTarget) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Continue Watching" aria-label="Remove from Continue Watching">\u2715</button>';
+      } else if (m.removeAiringShowId) {
+        removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="airing" data-remove-id="' + escapeAttr(m.removeAiringShowId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Airing Next" aria-label="Remove from Airing Next">\u2715</button>';
+      } else if (m.removeWatchlistId) {
+        removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="watchlist" data-remove-id="' + escapeAttr(m.removeWatchlistId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watchlist" aria-label="Remove from Watchlist">\u2715</button>';
+      } else if (m.removeHistoryId) {
+        removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="history" data-remove-id="' + escapeAttr(m.removeHistoryId) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from Watch History" aria-label="Remove from Watch History">\u2715</button>';
+      } else if (m.removeCustomListSlug) {
+        removeBtn = '<button type="button" class="cw-remove-btn" data-remove-type="custom" data-remove-id="' + escapeAttr(m.id) + '" data-remove-slug="' + escapeAttr(m.removeCustomListSlug) + '" onclick="event.stopPropagation(); removeListItemFromDetails(this)" title="Remove from List" aria-label="Remove from List">\u2715</button>';
+      }
+    }
   }
   
   const badgeSettings = getPosterBadgeSettings();
-  const locationAllowed = isCwItem
-    ? badgeSettings.continueWatching
-    : (isAiringItem ? badgeSettings.airingNext : false);
+  const locationAllowed = isTraktCwContext
+    ? (badgeSettings.traktContinueWatching !== false)
+    : (isMdblistUpNextContext
+        ? (badgeSettings.mdblistUpNext !== false)
+        : (isCwItem
+            ? badgeSettings.continueWatching
+            : (isAiringItem ? badgeSettings.airingNext : false)));
 
   const showAirDate = locationAllowed && badgeSettings.airDate;
   const showPremiere = locationAllowed && badgeSettings.seasonPremiere;
@@ -1219,7 +1479,7 @@ function livePreviewPosterHtml(m) {
     const effectiveAirDate = m.airDate || (isSameEpisode && airingMatch ? airingMatch.airDate : null);
     const currentEpNum = mEpisode != null ? mEpisode : (isSameEpisode && airingMatch ? airingMatch.episodeNum : null);
     const hasLaterAiringEp = !!(isSameSeason && airingMatch && airingMatch.episodeNum != null && currentEpNum != null && currentEpNum < airingMatch.episodeNum);
-    const hasAired = hasLaterAiringEp || (effectiveAirDate && typeof isEpisodeAired === 'function' ? isEpisodeAired(effectiveAirDate) : false);
+    const hasAired = (effectiveAirDate && typeof isEpisodeAired === 'function') ? isEpisodeAired(effectiveAirDate) : hasLaterAiringEp;
     const isUnairedEp = effectiveAirDate ? !hasAired : (!hasLaterAiringEp && !!(m.isUnaired || (isSameEpisode && airingMatch && airingMatch.isUnaired)));
 
     if (showAirDate && !m.hideDateBadge && effectiveAirDate && !hasAired && typeof isEpisodeAired === 'function') {
@@ -1259,7 +1519,18 @@ function livePreviewPosterHtml(m) {
       }
     }
   }
-  return '<div class="live-preview-poster-card clickable-poster" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
+  const ratingSpan = (!m.isLivePreviewShelf && typeof formatRatingSpanHtml === 'function') ? formatRatingSpanHtml(m) : '';
+  let subtitleHtml = '';
+  const subText = m.isLivePreviewShelf ? (m.subtitle || '') : (m.subtitle || (m.year ? String(m.year) : ''));
+  if (subText && ratingSpan) {
+    subtitleHtml = '<div class="live-preview-poster-subtitle" style="display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%;"><span>' + escapeHtml(subText) + '</span>' + ratingSpan + '</div>';
+  } else if (subText) {
+    subtitleHtml = '<div class="live-preview-poster-subtitle">' + escapeHtml(subText) + '</div>';
+  } else if (ratingSpan) {
+    subtitleHtml = '<div class="live-preview-poster-subtitle" style="display:flex; align-items:center; justify-content:flex-end; gap:4px; width:100%;">' + ratingSpan + '</div>';
+  }
+  const extraCardClass = isTraktCwContext ? ' detail-page-trakt-continue-watching' : (isMdblistUpNextContext ? ' detail-page-mdblist-up-next' : '');
+  return '<div class="live-preview-poster-card clickable-poster' + extraCardClass + '" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
       dateBadge +
@@ -1267,7 +1538,7 @@ function livePreviewPosterHtml(m) {
       removeBtn +
     '</div>' +
     '<div class="live-preview-poster-name">' + escapeHtml(m.name || '') + '</div>' +
-    (m.subtitle ? '<div class="live-preview-poster-subtitle">' + escapeHtml(m.subtitle) + '</div>' : '') +
+    subtitleHtml +
   '</div>';
 }
 
@@ -1328,6 +1599,40 @@ function removeListItemFromDetails(btn) {
     if (typeof setExternalListMembership === 'function' && typeof makeExternalKey === 'function') {
       setExternalListMembership(makeExternalKey(provider, target, listId, targetId), false);
       setExternalListMembership(makeExternalKey(provider, target, listId, targetId.replace(/^tmdb:/, '')), false);
+    }
+
+    if (provider === 'simkl') {
+      if (Array.isArray(window._mySimklLists)) {
+        window._mySimklLists.forEach((l) => {
+          if (l && Array.isArray(l.items)) {
+            l.items = l.items.filter((it) => it && String(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : '')) !== targetId);
+          }
+        });
+      }
+      try {
+        const simklCache = JSON.parse(localStorage.getItem('myListAddon:simklAiringNextCache') || '[]');
+        if (Array.isArray(simklCache)) {
+          const updatedCache = simklCache.filter((c) => c && String(c.id || c.imdbId || (c.tmdbId ? 'tmdb:' + c.tmdbId : '')) !== targetId);
+          localStorage.setItem('myListAddon:simklAiringNextCache', JSON.stringify(updatedCache));
+        }
+      } catch (e) {}
+    } else if (provider === 'mdblist') {
+      if (Array.isArray(window._myMdblistLists)) {
+        window._myMdblistLists.forEach((l) => {
+          if (l && Array.isArray(l.items)) {
+            l.items = l.items.filter((it) => it && String(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : '')) !== targetId);
+          }
+        });
+      }
+    } else if (provider === 'trakt') {
+      const tLists = window._myPrivateTraktLists || window._myTraktLists;
+      if (Array.isArray(tLists)) {
+        tLists.forEach((l) => {
+          if (l && Array.isArray(l.items)) {
+            l.items = l.items.filter((it) => it && String(it.id || it.imdbId || (it.tmdbId ? 'tmdb:' + it.tmdbId : '')) !== targetId);
+          }
+        });
+      }
     }
 
     const traktToken = (typeof traktAccessToken !== 'undefined' && traktAccessToken) || localStorage.getItem('myListAddon:traktAccessToken') || '';
@@ -1745,11 +2050,9 @@ window.switchListDetailsType = function(newType) {
   const aBtn = document.getElementById('detailTypeAllBtn');
   const mBtn = document.getElementById('detailTypeMovieBtn');
   const sBtn = document.getElementById('detailTypeSeriesBtn');
-  const lBtn = document.getElementById('detailTypeLineupBtn');
   if (aBtn) aBtn.classList.toggle('active', newType === 'all');
   if (mBtn) mBtn.classList.toggle('active', newType === 'movie');
   if (sBtn) sBtn.classList.toggle('active', newType === 'series');
-  if (lBtn) lBtn.classList.toggle('active', newType === 'lineup');
 
   // "On Today" is not a filter over what is loaded -- it is a different
   // question, answered by the Worker: out of this channel's whole pool,
@@ -2046,6 +2349,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
             subtitle: label.subtitle,
             poster: it.poster || it.showPoster,
             year: it.year,
+            rating: it.rating != null ? it.rating : (it.vote_average != null ? it.vote_average : (it.tmdbRating != null ? it.tmdbRating : (it.imdbRating ? parseFloat(it.imdbRating) : undefined))),
+            vote_average: it.vote_average != null ? it.vote_average : undefined,
             airDate: it.airDate,
             removeHistoryId: it.id || it.imdbId,
           };
@@ -2100,6 +2405,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
               subtitle: label.subtitle || '',
               poster: showPoster,
               year: it.year,
+              rating: it.rating != null ? it.rating : (it.vote_average != null ? it.vote_average : (it.tmdbRating != null ? it.tmdbRating : (it.imdbRating ? parseFloat(it.imdbRating) : undefined))),
+              vote_average: it.vote_average != null ? it.vote_average : undefined,
               airDate: it.airDate,
               isUnaired: it.isUnaired,
               seasonFinaleAirDate: it.seasonFinaleAirDate,
@@ -2148,6 +2455,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
                 subtitle: label.subtitle || '',
                 poster: showPoster,
                 year: it.year,
+                rating: it.rating != null ? it.rating : (it.vote_average != null ? it.vote_average : (it.tmdbRating != null ? it.tmdbRating : (it.imdbRating ? parseFloat(it.imdbRating) : undefined))),
+                vote_average: it.vote_average != null ? it.vote_average : undefined,
                 airDate: it.airDate,
                 isUnaired: it.isUnaired,
                 seasonFinaleAirDate: it.seasonFinaleAirDate,
@@ -2181,6 +2490,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
                 subtitle: label.subtitle || '',
                 poster: isCw ? (it.showPoster || it.poster) : (it.poster || it.showPoster),
                 year: it.year,
+                rating: it.rating != null ? it.rating : (it.vote_average != null ? it.vote_average : (it.tmdbRating != null ? it.tmdbRating : (it.imdbRating ? parseFloat(it.imdbRating) : undefined))),
+                vote_average: it.vote_average != null ? it.vote_average : undefined,
                 airDate: it.airDate,
                 isUnaired: it.isUnaired,
                 removeShowId: isCw ? (it.showId || it.id) : null,
@@ -2242,12 +2553,12 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   }
   else if (urlLower.includes('trakt.tv/users/')) {
     const trakt = urlStr.match(new RegExp('(?:https?:)?(?://(?:www\\.)?trakt\\.tv/users/([^/]+))', 'i'));
-    if (trakt) {
+    if (trakt && trakt[1] && trakt[1].toLowerCase() !== 'me') {
       creatorName = trakt[1];
     } else {
       creatorName = 'Trakt';
     }
-  } else if (urlLower.startsWith('trakt:chart:') || urlLower.startsWith('trakt:watchlist') || urlLower.startsWith('trakt:history')) {
+  } else if (urlLower.startsWith('trakt:') || urlLower.includes('trakt.tv') || nLower.includes('trakt')) {
     creatorName = 'Trakt';
   }
   else if (urlLower.startsWith('simkl:chart:')) {
@@ -2310,7 +2621,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   function formatSubtitle(count) {
     const parts = [];
     if (creatorName) parts.push('by ' + creatorName);
-    parts.push(type === 'series' ? 'Shows' : 'Movies');
+    parts.push(type === 'series' ? 'Shows' : (type === 'mixed' ? 'Mixed' : 'Movies'));
     const loaded = (count === undefined || count === null) ? null : Number(count);
     // A known total is only believable while it is at least what is already
     // on screen. One that the loaded items have overtaken was never the
@@ -2373,7 +2684,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         [...row.querySelectorAll('.url')].some((u) => u.value.includes(chId))
       );
     } else {
-      isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
+      isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl) || isListAddedToConfig(listUrl, 'movie') || isListAddedToConfig(listUrl, 'series') || isListAddedToConfig(listUrl)) : false;
     }
     if (isAdded) {
       addBtn.textContent = 'Remove';
@@ -2476,11 +2787,6 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         const aBtn = document.getElementById('detailTypeAllBtn');
         const mBtn = document.getElementById('detailTypeMovieBtn');
         const sBtn = document.getElementById('detailTypeSeriesBtn');
-        const lBtn = document.getElementById('detailTypeLineupBtn');
-        if (lBtn) {
-          lBtn.style.display = canShowLineup ? '' : 'none';
-          lBtn.classList.remove('active');
-        }
         const isExternalProvider = isExternalHistory || (listUrl && (listUrl.includes('trakt:watchlist') || (listUrl.includes('trakt.tv/users/') && listUrl.includes('/watchlist')) || listUrl.includes('mdblist:watchlist')));
         if (canShowLineup && !channelHasBothTypes) {
           // One kind of thing in this channel, so Movies and Shows would be
@@ -2546,8 +2852,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     // accepts them either, rather than showing a button that can only
     // ever fail.
     const isPersonalSentinel = listUrl && (
-      listUrl.startsWith('mdblist:watchlist') || listUrl.startsWith('mdblist:history') || listUrl.startsWith('mdblist:airing-next') ||
-      listUrl.startsWith('trakt:watchlist') || listUrl.startsWith('trakt:history') || listUrl.startsWith('trakt:airing-next') ||
+      listUrl.startsWith('mdblist:watchlist') || listUrl.startsWith('mdblist:history') || listUrl.startsWith('mdblist:airing-next') || listUrl.startsWith('mdblist:upnext') ||
+      listUrl.startsWith('trakt:watchlist') || listUrl.startsWith('trakt:history') || listUrl.startsWith('trakt:airing-next') || listUrl.startsWith('trakt:continue-watching') ||
       listUrl.startsWith('trakt:user:') || listUrl.startsWith('mdblist:user:')
     );
     if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
@@ -2568,10 +2874,14 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       }
       return;
     }
-    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl)) : false;
+    const isAdded = typeof isListAddedToConfig === 'function' ? (isListAddedToConfig(listUrl, type) || isListAddedToConfig(null, type, listUrl) || isListAddedToConfig(listUrl, 'movie') || isListAddedToConfig(listUrl, 'series') || isListAddedToConfig(listUrl)) : false;
     if (isAdded) {
       if (typeof removeListFromConfig === 'function') {
         removeListFromConfig(listUrl, type);
+        removeListFromConfig(listUrl, 'movie');
+        removeListFromConfig(listUrl, 'series');
+        removeListFromConfig(listUrl, 'mixed');
+        removeListFromConfig(listUrl);
         removeListFromConfig(null, type, listUrl);
       }
       updateDetailAddBtn();
@@ -2643,7 +2953,12 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       } else if (listUrl && (listUrl.startsWith('tmdb:chart:') || listUrl.startsWith('tmdb:') || listUrl.startsWith('autotrack:'))) {
         addRow(name || 'List', listUrl, type, true, 'New Releases');
       } else {
-        addRow(name || 'List', listUrl, type, true, 'Custom');
+        if (type === 'mixed') {
+          addRow((name || 'List') + ' (Movies)', listUrl, 'movie', true, 'Custom');
+          addRow((name || 'List') + ' (Shows)', listUrl, 'series', true, 'Custom');
+        } else {
+          addRow(name || 'List', listUrl, type, true, 'Custom');
+        }
       }
       updateDetailAddBtn();
       if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
@@ -2685,8 +3000,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
   const tmdbListId = isTmdbUserList ? (listUrl.match(new RegExp('list(?:/|:)([0-9]+)', 'i'))?.[1] || '') : '';
 
   const mdbUser = (typeof mdblistUsername !== 'undefined' && mdblistUsername) || localStorage.getItem('myListAddon:mdblistUsername') || '';
-  const isMdbWatchlist = !!(listUrl && mdbUser && (listUrl === 'mdblist:watchlist' || listUrl.toLowerCase().includes('mdblist.com/lists/' + mdbUser.toLowerCase() + '/watchlist')));
-  const isMdbHistory = !!(listUrl && mdbUser && (listUrl === 'mdblist:history' || listUrl.toLowerCase().includes('mdblist.com/lists/' + mdbUser.toLowerCase() + '/history')));
+  const isMdbWatchlist = !!(listUrl && (listUrl === 'mdblist:watchlist' || (mdbUser && listUrl.toLowerCase().includes('mdblist.com/lists/' + mdbUser.toLowerCase() + '/watchlist'))));
+  const isMdbHistory = !!(listUrl && (listUrl === 'mdblist:history' || listUrl.startsWith('mdblist:history') || listUrl.toLowerCase().includes('mdblist.com/history') || (listUrl.toLowerCase().includes('mdblist.com/lists/') && listUrl.toLowerCase().includes('/history'))));
   const isMdbUserList = !!(listUrl && mdbUser && !isMdbWatchlist && !isMdbHistory && !listUrl.toLowerCase().includes('mdblist.com/lists/official/') && (listUrl.toLowerCase().includes('mdblist.com/lists/' + mdbUser.toLowerCase() + '/') || listUrl.startsWith('mdblist:list:')));
   const mdbListId = isMdbUserList ? (listUrl.includes('mdblist.com/lists/') ? (listUrl.split('/lists/')[1] || '').split('/')[1] || (listUrl.split('/lists/')[1] || '').split('/')[0] : (listUrl.split(':')[2] || '')) : '';
 

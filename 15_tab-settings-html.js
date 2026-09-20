@@ -18,12 +18,6 @@
     </div>
 
     <div class="panel" style="margin-top:12px;">
-      <h2 class="panel-title">Removed from Airing Next</h2>
-      <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Shows you've taken off the Airing Next shelf. Nothing about them changed anywhere else -- every episode you marked watched is still watched -- and watching another episode of one puts it back on the shelf by itself. Put one back here at any time.</p>
-      <div id="removedAiringNextSettingsSection"></div>
-    </div>
-
-    <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Region</h2>
       <p style="margin:0 0 10px; color:var(--muted); font-size:0.85rem;">Used for streaming-availability catalogs (Netflix, Disney+, etc.), Stream Releases, and content ratings -- so what shows up actually matches what's available where you are.</p>
       <select id="regionSelect" aria-label="Streaming region" onchange="localStorage.setItem('myListAddon:region', this.value); saveState();" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
@@ -71,6 +65,20 @@
             <div>
               <span style="font-weight:600;">Continue Watching (Dashboard)</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and air date badges on your in-progress Continue Watching series.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeTraktContinueWatchingCheckbox" checked onchange="toggleBadgeSetting('showBadgesTraktContinueWatching', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Continue Watching (Trakt)</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and air date badges on your Trakt Continue Watching series.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeMdblistUpNextCheckbox" checked onchange="toggleBadgeSetting('showBadgesMdblistUpNext', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Up Next (MDBList)</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and air date badges on your MDBList Up Next series.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
@@ -137,10 +145,10 @@
           </div>
         </label>
         <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
-          <input type="checkbox" id="badgeRatingCheckbox" checked onchange="toggleBadgeSetting('showBadgeRating', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <input type="checkbox" id="badgeTmdbRatingCheckbox" checked onchange="toggleTmdbRatingSetting(this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
           <div>
-            <span style="font-weight:600;">Rating Badges</span>
-            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Shows ratings (e.g. <code>★ 8.4</code>) on catalog and search poster cards.</p>
+            <span style="font-weight:600;">TMDb Ratings</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show TMDb star ratings (e.g. <span style="color:#f5c518; font-weight:700;">★ 7.9</span>) beside the year/subtitle across the app (except in Live Preview).</p>
           </div>
         </label>
         <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">

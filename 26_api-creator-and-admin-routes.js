@@ -79,7 +79,12 @@
       // Fire-and-forget, not awaited -- see touchCreatorLastSeen's own
       // comment for why this is throttled and safe to never wait on.
       touchCreatorLastSeen(env, v.normalized);
-      return { ok: true, username: profile.username || v.normalized, displayName: profile.displayName };
+      return {
+        ok: true,
+        username: profile.username || v.normalized,
+        displayName: profile.displayName,
+        hasRecoveryAnswer: Boolean(profile.recoveryAnswerHash),
+      };
     }
 
     // Every failure path above returns the exact same generic message
@@ -1308,6 +1313,7 @@
         }
       }
       await env.CONFIGS.put(`creator:${v.normalized}`, JSON.stringify(profileObj));
+      await storeCreatorKeyLookup(env, creatorKey, v.normalized);
       
       try {
         const countRaw = await env.CONFIGS.get("stats:creator_count");
@@ -1435,6 +1441,7 @@
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
       );
+      await storeCreatorKeyLookup(env, creatorKey, v.normalized);
       return json({ ok: true, creatorName: v.normalized, displayName: profile.displayName, creatorKey }, 200, { "Cache-Control": "no-store" });
     }
 
@@ -1496,7 +1503,153 @@
         `creator:${v.normalized}`,
         JSON.stringify({ ...profile, keyHash })
       );
+      await storeCreatorKeyLookup(env, creatorKey, v.normalized);
       return json({ ok: true, creatorKey }, 200, { "Cache-Control": "no-store" });
+    }
+
+    // /api/creator/recovery-answer  (POST)  { creatorName, creatorKey, recoveryAnswer } -> { ok, hasRecoveryAnswer }
+    // Authenticated self-service. Allows an existing creator to set or update
+    // their recovery answer so they can reset their key or retrieve their
+    // username if ever forgotten.
+    if (path === "/api/creator/recovery-answer" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" }, 500);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const auth = await authenticateCreator(body.creatorName, body.creatorKey);
+      if (!auth.ok) return authFailureResponse(auth);
+
+      const recoveryAnswerRaw = String(body.recoveryAnswer || "").trim();
+      if (!recoveryAnswerRaw || recoveryAnswerRaw.length < RECOVERY_ANSWER_MIN_LENGTH) {
+        return json({
+          ok: false,
+          error: `Recovery Answer must be at least ${RECOVERY_ANSWER_MIN_LENGTH} characters -- it can reset your key, so treat it like a password.`,
+        }, 400);
+      }
+
+      const recoveryAnswerHash = await hashCreatorKey(recoveryAnswerRaw.toLowerCase());
+
+      if (env.DB) {
+        try {
+          await env.DB.prepare(
+            "UPDATE creators SET recovery_answer_hash = ? WHERE username = ?"
+          ).bind(recoveryAnswerHash, auth.username).run();
+        } catch (dbErr) {
+          console.error("D1 write error (update recovery answer):", dbErr);
+          return json({ ok: false, error: "Failed to update recovery answer. Please try again." }, 500);
+        }
+      }
+
+      const raw = await getCreator(env, auth.username);
+      if (raw) {
+        try {
+          const profile = JSON.parse(raw);
+          profile.recoveryAnswerHash = recoveryAnswerHash;
+          await env.CONFIGS.put(`creator:${auth.username}`, JSON.stringify(profile));
+        } catch (kvErr) {
+          console.error("KV write error (update recovery answer):", kvErr);
+        }
+      }
+
+      await storeCreatorKeyLookup(env, body.creatorKey, auth.username);
+
+      return jsonPrivate({ ok: true, hasRecoveryAnswer: true });
+    }
+
+    // /api/creator/forgot-username  (POST)  { creatorKey, recoveryAnswer? } -> { ok, username, displayName }
+    // Self-service recovery for anyone who knows their Account Key (and Recovery Answer if set)
+    // but forgot their username.
+    if (path === "/api/creator/forgot-username" && request.method === "POST") {
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" }, 500);
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+
+      const ip = clientIpKey(request);
+      if (!ip) return json({ ok: false, error: "Could not process this request." }, 400);
+
+      const rateLimitKey = `ratelimit:forgotusername:${ip}`;
+      const attempts = parseInt((await env.CONFIGS.get(rateLimitKey)) || "0", 10);
+      if (attempts >= FORGOT_USERNAME_IP_MAX_FAILURES) {
+        return json({ ok: false, error: "Too many attempts. Please wait 15 minutes and try again." }, 429);
+      }
+      await env.CONFIGS.put(rateLimitKey, String(attempts + 1), { expirationTtl: FORGOT_USERNAME_IP_TTL_SEC });
+
+      const presentedKey = String(body.creatorKey || "").trim().toUpperCase();
+      const presentedAnswer = String(body.recoveryAnswer || "").trim();
+
+      const genericError = "No matching account found. Check your Key and Recovery Answer and try again.";
+      if (!presentedKey || !/^MYL-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(presentedKey)) {
+        return json({ ok: false, error: genericError }, 401);
+      }
+
+      let resolvedUsername = await usernameForCreatorKeyLookup(env, presentedKey);
+
+      // Fallback for pre-migration accounts in D1: scan up to 50 accounts
+      if (!resolvedUsername && env.DB) {
+        try {
+          const rows = await env.DB.prepare(
+            "SELECT username, key_hash, recovery_answer_hash FROM creators LIMIT 50"
+          ).all();
+          if (rows && rows.results) {
+            for (const r of rows.results) {
+              if (r.key_hash && (await verifyCreatorKey(presentedKey, r.key_hash))) {
+                resolvedUsername = r.username;
+                await storeCreatorKeyLookup(env, presentedKey, r.username);
+                break;
+              }
+            }
+          }
+        } catch (scanErr) {
+          console.error("D1 scan error (forgot username fallback):", scanErr);
+        }
+      }
+
+      if (!resolvedUsername) {
+        return json({ ok: false, error: genericError }, 401);
+      }
+
+      const v = validateCreatorUsername(resolvedUsername);
+      if (!v.ok) return json({ ok: false, error: genericError }, 401);
+
+      const raw = await getCreator(env, v.normalized);
+      if (!raw) return json({ ok: false, error: genericError }, 401);
+      let profile;
+      try {
+        profile = JSON.parse(raw);
+      } catch {
+        return json({ ok: false, error: genericError }, 401);
+      }
+
+      const keyMatches = await verifyCreatorKey(presentedKey, profile.keyHash);
+      if (!keyMatches) {
+        return json({ ok: false, error: genericError }, 401);
+      }
+
+      if (profile.recoveryAnswerHash) {
+        if (!presentedAnswer) {
+          return json({ ok: false, error: "A Recovery Answer is required for this account. Please enter your Recovery Answer." }, 401);
+        }
+        const answerMatches = await verifyCreatorKey(presentedAnswer.toLowerCase(), profile.recoveryAnswerHash);
+        if (!answerMatches) {
+          return json({ ok: false, error: genericError }, 401);
+        }
+      }
+
+      await storeCreatorKeyLookup(env, presentedKey, v.normalized);
+
+      return jsonPrivate({
+        ok: true,
+        username: profile.username || v.normalized,
+        displayName: profile.displayName || profile.username || v.normalized,
+        hasRecoveryAnswer: Boolean(profile.recoveryAnswerHash),
+      });
     }
 
     // /api/creator/scrobble-token  (POST)  { creatorName, creatorKey, rotate? }
@@ -1562,7 +1715,17 @@
         if (auth.error !== "no-kv") await noteAuthFailure(env, restoreFailScope, restoreFailDay);
         return authFailureResponse(auth);
       }
-      return jsonPrivate({ ok: true, creatorName: auth.username, displayName: auth.displayName });
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(storeCreatorKeyLookup(env, body.creatorKey, auth.username).catch(() => {}));
+      } else {
+        await storeCreatorKeyLookup(env, body.creatorKey, auth.username).catch(() => {});
+      }
+      return jsonPrivate({
+        ok: true,
+        creatorName: auth.username,
+        displayName: auth.displayName,
+        hasRecoveryAnswer: Boolean(auth.hasRecoveryAnswer),
+      });
     }
 
     // /api/creator/lists  (POST)  { creatorName, creatorKey } -> { ok, displayName, lists }
@@ -2378,6 +2541,12 @@
       } catch {
         return json({ ok: false, error: "Couldn't save that share link. Please try again." }, 500);
       }
+      const channelSlug = typeof slugifyServer === 'function' ? slugifyServer(channel.name || "channel") : "channel";
+      if (record.published && owner) {
+        try {
+          await env.CONFIGS.put(`creatorchannel:${owner.toLowerCase()}:${channelSlug}`, code);
+        } catch {}
+      }
       if (record.published) {
         await upsertPublicChannelIndex(env, code, record).catch(() => {});
       }
@@ -2385,7 +2554,7 @@
       return json({
         ok: true,
         code: code,
-        url: `${url.origin}/channel/${code}`,
+        url: (record.published && owner) ? `${url.origin}/channels/${encodeURIComponent(owner)}/${channelSlug}` : `${url.origin}/channel/${code}`,
         published: record.published,
       });
     }
@@ -2396,7 +2565,19 @@
     // credential for an unlisted channel, and a published one is public.
     if (path === "/api/channel/share" && request.method === "GET") {
       if (!env || !env.CONFIGS) return json({ ok: false, error: "Sharing isn't available on this add-on." }, 503);
-      const code = String(url.searchParams.get("code") || "").trim();
+      let code = String(url.searchParams.get("code") || "").trim();
+      if (code.startsWith("channels:")) {
+        const parts = code.split(":");
+        const u = parts[1] || "";
+        const s = parts[2] || "";
+        const resolved = await env.CONFIGS.get(`creatorchannel:${u.toLowerCase()}:${s.toLowerCase()}`);
+        if (resolved) code = resolved;
+      } else if (!code && url.searchParams.get("username") && url.searchParams.get("slug")) {
+        const u = url.searchParams.get("username").trim();
+        const s = url.searchParams.get("slug").trim();
+        const resolved = await env.CONFIGS.get(`creatorchannel:${u.toLowerCase()}:${s.toLowerCase()}`);
+        if (resolved) code = resolved;
+      }
       if (!code || !/^[A-Za-z0-9_-]{1,64}$/.test(code)) {
         return json({ ok: false, error: "That doesn't look like a channel share link." }, 400);
       }
@@ -6640,47 +6821,86 @@
         body = {};
       }
       const requested = parseInt(body && body.units, 10);
-      const units = Number.isFinite(requested) ? Math.max(1, Math.min(40, requested)) : NEW_ON_STREAMING_PAGES_PER_TICK;
+      const units = Number.isFinite(requested) ? Math.max(1, Math.min(150, requested)) : NEW_ON_STREAMING_PAGES_PER_TICK;
       const withBump = body && body.bump === true;
+      const isReset = body && (body.reset === true || body.clear === true);
+      const isFull = (body && body.full === true) || isReset;
+      const isManual = body && body.manual === false ? false : true;
       try {
-        const sweep = await sweepNewOnStreaming(env, ctx, units * NEW_ON_STREAMING_SWEEP_FETCHES, units);
+        const sweep = await sweepNewOnStreaming(env, ctx, units * NEW_ON_STREAMING_SWEEP_FETCHES, units, {
+          full: isFull,
+          reset: isReset,
+          manual: isManual,
+        });
         let bump = null;
         if (withBump) bump = await bumpNewOnStreamingEpisodes(env, ctx, NEW_ON_STREAMING_SWEEP_FETCHES * 4);
-        // Counted the same way every other shared-key TMDB path is, so a
+        // Counted the same way every other shared-key path is, so a
         // dashboard sweep shows up in the API Usage tab rather than looking
         // like the key spent itself.
         const spent = (sweep && sweep.units ? sweep.units : 0) + (sweep && sweep.resolved ? sweep.resolved : 0);
-        if (spent > 0) ctx.waitUntil(bumpStatBy(env, "apiuse:tmdb", spent));
+        if (spent > 0) {
+          const statKey = sweep && sweep.source === "rapidapi" ? "apiuse:rapidapi" : "apiuse:tmdb";
+          ctx.waitUntil(bumpStatBy(env, statKey, spent));
+        }
         return json({ ok: true, sweep, bump }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }
     }
 
-    // /admin/api/new-on-streaming/preview?type=movie&services=netflix+hulu&skip=0
+    // /admin/api/new-on-streaming/preview?type=movie&services=netflix+hulu&q=...&skip=0&limit=60
     // -> exactly what a Stremio catalog request for this row returns, through
     // fetchNewOnStreaming itself. `source` comes back so the url under test
     // can be copied straight into a catalog row.
     if (path === "/admin/api/new-on-streaming/preview" && request.method === "GET") {
       const authed = await isAdminRequest(request, env);
       if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
-      const type = url.searchParams.get("type") === "series" ? "series" : "movie";
+      const rawType = (url.searchParams.get("type") || "").toLowerCase().trim();
+      const type = rawType === "series" ? "series" : (rawType === "movie" ? "movie" : "all");
       const servicesParam = (url.searchParams.get("services") || "").trim();
+      const q = (url.searchParams.get("q") || "").trim();
       const skipParam = parseInt(url.searchParams.get("skip"), 10);
       const skip = Number.isFinite(skipParam) && skipParam > 0 ? skipParam : 0;
+      const limitParam = parseInt(url.searchParams.get("limit"), 10);
+      const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(100, limitParam) : 60;
       const region = (url.searchParams.get("region") || "US").trim().toUpperCase().slice(0, 2) || "US";
       const source = servicesParam ? `tmdb:new-on-streaming:${servicesParam}` : "tmdb:new-on-streaming";
       try {
-        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming" }, skip, { env, ctx, region });
+        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming", q }, skip, { env, ctx, region, limit, wantTotal: true });
         return json({
           ok: true,
           source,
           type,
           region,
           skip,
+          limit,
           totalItems: items && items.totalItems != null ? items.totalItems : null,
-          items: (items || []).slice(0, 60),
+          items: items || [],
         }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/new-on-streaming/add -> directly add or sync a movie/series into streaming_events
+    if (path === "/admin/api/new-on-streaming/add" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (e) {
+        body = {};
+      }
+      const input = String((body && body.input) || "").trim();
+      const service = String((body && body.service) || "netflix").trim().toLowerCase();
+      const kind = (body && body.kind === "movie") ? "movie" : "series";
+      const customDate = body && body.date ? String(body.date).trim() : "";
+      if (!input) return json({ ok: false, error: "Title, IMDb ID, or TMDB ID is required." }, 400);
+
+      try {
+        const result = await addOrSyncStreamingEvent(env, { input, service, kind, date: customDate });
+        return json({ ok: true, result }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }

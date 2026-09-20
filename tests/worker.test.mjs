@@ -7502,7 +7502,7 @@ describe("the Worker can tell an operator it is ahead of its own database", () =
     // endpoint's report IS the manifest -- and it comes through the same code
     // path an operator would use.
     const db = makeD1();
-    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones", "list_likes", "feedback", "scrobble_tokens", "event_meta", "watch_history", "continue_watching", "airing_next", "creator_user_lists", "creator_show_states", "creator_tracking_meta", "streaming_events"]) {
+    for (const t of ["creators", "creator_lists", "source_groups", "stats", "creator_tombstones", "published_lists", "lists_fts", "list_tombstones", "list_likes", "feedback", "scrobble_tokens", "event_meta", "watch_history", "continue_watching", "airing_next", "creator_user_lists", "creator_show_states", "creator_tracking_meta", "streaming_events", "creator_key_lookups"]) {
       db._db.exec(`DROP TABLE IF EXISTS ${t};`);
     }
     const env = makeEnv({ CONFIGS: makeKv(), DB: db });
@@ -12662,6 +12662,240 @@ describe("worker: Stremio / Nuvio Catalog Search Interface", () => {
     } finally {
       globalThis.fetch = realFetch;
     }
+  });
+});
+
+describe("worker: public channel URLs and redirects", () => {
+  it("redirects /channels/:username/:slug to /configure#channel=<code>", async () => {
+    const env = makeEnv();
+    const code = "CHABC123";
+    const record = {
+      code: code,
+      owner: "alice",
+      published: true,
+      channel: { name: "Comedy Night", items: [{ kind: "movie", imdbId: "tt1234567", season: 1, episode: 1 }] },
+    };
+    await env.CONFIGS.put("channelshare:" + code, JSON.stringify(record));
+    await env.CONFIGS.put("creatorchannel:alice:comedy-night", code);
+
+    const res = await call(env, "/channels/alice/comedy-night");
+    assert.equal(res.status, 302);
+    assert.ok(res.headers.get("location").includes("/configure#channel=" + code));
+  });
+
+  it("serves JSON for /channels/:username/:slug.json", async () => {
+    const env = makeEnv();
+    const code = "CHABC123";
+    const record = {
+      code: code,
+      owner: "alice",
+      published: true,
+      channel: { name: "Comedy Night", items: [{ kind: "movie", imdbId: "tt1234567", season: 1, episode: 1 }] },
+    };
+    await env.CONFIGS.put("channelshare:" + code, JSON.stringify(record));
+    await env.CONFIGS.put("creatorchannel:alice:comedy-night", code);
+
+    const res = await call(env, "/channels/alice/comedy-night.json");
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.channel.name, "Comedy Night");
+  });
+
+  it("redirects /channel/:code for backward compatibility", async () => {
+    const env = makeEnv();
+    const res = await call(env, "/channel/LEGACY123");
+    assert.equal(res.status, 302);
+    assert.ok(res.headers.get("location").includes("/configure#channel=LEGACY123"));
+  });
+});
+
+describe("self-service recovery: set recovery answer & forgot username", () => {
+  for (const [label, makeStores] of [
+    ["KV only", () => ({ CONFIGS: makeKv() })],
+    ["D1 bound", () => ({ CONFIGS: makeKv(), DB: makeD1() })],
+  ]) {
+    it(`allows setting and updating a recovery answer on an existing account (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      // Account created without recovery answer
+      const user = await createUser(env, "norecoveryuser");
+      assert.ok(user.creatorKey);
+
+      // Verify restore returns hasRecoveryAnswer: false
+      const restoreBefore = await call(env, "/api/creator/restore", {
+        method: "POST",
+        json: { creatorName: "norecoveryuser", creatorKey: user.creatorKey },
+      });
+      assert.equal(restoreBefore.status, 200);
+      assert.equal(restoreBefore.body.hasRecoveryAnswer, false);
+
+      // Reject too short
+      const tooShort = await call(env, "/api/creator/recovery-answer", {
+        method: "POST",
+        json: { creatorName: "norecoveryuser", creatorKey: user.creatorKey, recoveryAnswer: "short" },
+      });
+      assert.equal(tooShort.status, 400);
+
+      // Reject unauthenticated
+      const badAuth = await call(env, "/api/creator/recovery-answer", {
+        method: "POST",
+        json: { creatorName: "norecoveryuser", creatorKey: "MYL-WRON-GKEY-XXXX", recoveryAnswer: "valid-recovery-answer" },
+      });
+      assert.equal(badAuth.status, 401);
+
+      // Successfully set recovery answer
+      const setRes = await call(env, "/api/creator/recovery-answer", {
+        method: "POST",
+        json: { creatorName: "norecoveryuser", creatorKey: user.creatorKey, recoveryAnswer: "my-first-pet-rover" },
+      });
+      assert.equal(setRes.status, 200);
+      assert.equal(setRes.body.ok, true);
+      assert.equal(setRes.body.hasRecoveryAnswer, true);
+
+      // Verify restore now returns hasRecoveryAnswer: true
+      const restoreAfter = await call(env, "/api/creator/restore", {
+        method: "POST",
+        json: { creatorName: "norecoveryuser", creatorKey: user.creatorKey },
+      });
+      assert.equal(restoreAfter.status, 200);
+      assert.equal(restoreAfter.body.hasRecoveryAnswer, true);
+
+      // Successfully use newly set recovery answer to reset key
+      const resetRes = await call(env, "/api/creator/reset-key", {
+        method: "POST",
+        json: { username: "norecoveryuser", recoveryAnswer: "my-first-pet-rover" },
+      });
+      assert.equal(resetRes.status, 200);
+      assert.equal(resetRes.body.ok, true);
+      assert.ok(resetRes.body.creatorKey);
+      assert.notEqual(resetRes.body.creatorKey, user.creatorKey);
+    });
+
+    it(`recovers forgotten username via Account Key and Recovery Answer (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      const userWithRecovery = await createUser(env, "alice_findme", { recoveryAnswer: "secret-passphrase-42" });
+      const userNoRecovery = await createUser(env, "bob_findme");
+
+      // 1. User with recovery answer: requires both key and recovery answer
+      const missingAnswer = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        json: { creatorKey: userWithRecovery.creatorKey },
+      });
+      assert.equal(missingAnswer.status, 401);
+
+      const wrongAnswer = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        json: { creatorKey: userWithRecovery.creatorKey, recoveryAnswer: "wrong-passphrase" },
+      });
+      assert.equal(wrongAnswer.status, 401);
+
+      const successWithRecovery = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        json: { creatorKey: userWithRecovery.creatorKey, recoveryAnswer: "secret-passphrase-42" },
+      });
+      assert.equal(successWithRecovery.status, 200);
+      assert.equal(successWithRecovery.body.ok, true);
+      assert.equal(successWithRecovery.body.username, "alice_findme");
+      assert.equal(successWithRecovery.body.hasRecoveryAnswer, true);
+
+      // 2. User without recovery answer: key alone is accepted
+      const successNoRecovery = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        json: { creatorKey: userNoRecovery.creatorKey },
+      });
+      assert.equal(successNoRecovery.status, 200);
+      assert.equal(successNoRecovery.body.ok, true);
+      assert.equal(successNoRecovery.body.username, "bob_findme");
+      assert.equal(successNoRecovery.body.hasRecoveryAnswer, false);
+
+      // 3. Invalid key format or unknown key fails
+      const badKey = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        json: { creatorKey: "MYL-FAKE-KEYY-XXXX" },
+      });
+      assert.equal(badKey.status, 401);
+    });
+
+    it(`updates lookup index when a key is reset (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      const user = await createUser(env, "rotatinguser", { recoveryAnswer: "super-safe-phrase" });
+      const oldKey = user.creatorKey;
+
+      // Reset the key
+      const reset = await call(env, "/api/creator/reset-key", {
+        method: "POST",
+        json: { username: "rotatinguser", recoveryAnswer: "super-safe-phrase" },
+      });
+      assert.equal(reset.status, 200);
+      const newKey = reset.body.creatorKey;
+      assert.notEqual(newKey, oldKey);
+
+      // Old key lookup fails
+      const oldLookup = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        ip: nextIp(),
+        json: { creatorKey: oldKey, recoveryAnswer: "super-safe-phrase" },
+      });
+      assert.equal(oldLookup.status, 401);
+
+      // New key lookup succeeds
+      const newLookup = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        ip: nextIp(),
+        json: { creatorKey: newKey, recoveryAnswer: "super-safe-phrase" },
+      });
+      assert.equal(newLookup.status, 200);
+      assert.equal(newLookup.body.ok, true);
+      assert.equal(newLookup.body.username, "rotatinguser");
+    });
+
+    it(`cleans up key lookup when account is deleted (${label})`, async () => {
+      const env = makeEnv(makeStores());
+      const user = await createUser(env, "deletemeuser");
+      const key = user.creatorKey;
+
+      // Lookup works before delete
+      const before = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        ip: nextIp(),
+        json: { creatorKey: key },
+      });
+      assert.equal(before.status, 200);
+      assert.equal(before.body.username, "deletemeuser");
+
+      // Delete account
+      const del = await call(env, "/api/creator/delete-account", {
+        method: "POST",
+        json: { creatorName: "deletemeuser", creatorKey: key, confirm: "DELETE" },
+      });
+      assert.equal(del.status, 200);
+
+      // Lookup fails after delete
+      const after = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        ip: nextIp(),
+        json: { creatorKey: key },
+      });
+      assert.equal(after.status, 401);
+    });
+  }
+
+  it("rate limits forgot-username after repeated attempts from the same IP", async () => {
+    const env = makeEnv();
+    const testIp = nextIp();
+    for (let i = 0; i < 5; i++) {
+      const res = await call(env, "/api/creator/forgot-username", {
+        method: "POST",
+        ip: testIp,
+        json: { creatorKey: "MYL-WRON-GKEY-XXXX" },
+      });
+      assert.equal(res.status, 401);
+    }
+    const throttled = await call(env, "/api/creator/forgot-username", {
+      method: "POST",
+      ip: testIp,
+      json: { creatorKey: "MYL-WRON-GKEY-XXXX" },
+    });
+    assert.equal(throttled.status, 429);
   });
 });
 

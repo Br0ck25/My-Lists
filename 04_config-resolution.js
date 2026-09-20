@@ -125,6 +125,8 @@ async function resolveConfig(configParam, env) {
           adultContentFilter: !!parsed.adultContentFilter,
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
+          showBadgesTraktContinueWatching: parsed.showBadgesTraktContinueWatching !== false,
+          showBadgesMdblistUpNext: parsed.showBadgesMdblistUpNext !== false,
           showBadgesCatalogs: parsed.showBadgesCatalogs !== false,
           showBadgesStremioAiringNext: parsed.showBadgesStremioAiringNext !== false,
           showBadgesStremioContinueWatching: parsed.showBadgesStremioContinueWatching !== false,
@@ -245,6 +247,7 @@ function detectSource(input) {
   if (s === "mdblist:watchlist" || s.startsWith("mdblist:watchlist:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?watchlist\/?/i.test(s)) return "mdblist-watchlist";
   if (s === "mdblist:history" || s.startsWith("mdblist:history:") || /^https?:\/\/(www\.)?mdblist\.com\/(?:lists\/[^/]+\/)?history\/?/i.test(s)) return "mdblist-history";
   if (s === "mdblist:airing-next" || s.startsWith("mdblist:airing-next:") || s === "mdblist:user:shows:airing-next") return "mdblist-airing-next";
+  if (s === "mdblist:upnext" || s.startsWith("mdblist:upnext:") || s === "mdblist:user:shows:upnext") return "mdblist-upnext";
   // (www.|app.) and a trailing "?query" or "#hash" both tolerated here --
   // matching every other trakt.tv regex in this function -- because a
   // fully $-anchored .../watchlist$ / .../history$ (this used to require
@@ -257,6 +260,7 @@ function detectSource(input) {
   if (s === "trakt:watchlist" || s.startsWith("trakt:watchlist:") || /^https?:\/\/(www\.|app\.)?trakt\.tv\/users\/[^/]+\/watchlist\/?(?:[?#].*)?$/i.test(s)) return "trakt-watchlist";
   if (s === "trakt:history" || s.startsWith("trakt:history:") || /^https?:\/\/(www\.|app\.)?trakt\.tv\/users\/[^/]+\/history\/?(?:[?#].*)?$/i.test(s)) return "trakt-history";
   if (s === "trakt:airing-next" || s.startsWith("trakt:airing-next:") || s === "trakt:user:shows:airing-next") return "trakt-airing-next";
+  if (s === "trakt:continue-watching" || s.startsWith("trakt:continue-watching:") || s === "trakt:user:continue-watching" || /^https?:\/\/(www\.|app\.)?trakt\.tv\/users\/[^/]+\/continue-watching\/?(?:[?#].*)?$/i.test(s)) return "trakt-continue-watching";
   if (s.startsWith("tmdb:chart:") || parseTmdbWebChartUrl(s)) return "tmdb-chart";
   if (s.startsWith("tmdb:top10:")) return "tmdb-top10";
   if (s === "tmdb:hidden-gems") return "tmdb-hidden-gems";
@@ -267,7 +271,11 @@ function detectSource(input) {
   // "tmdb:new-on-streaming", "tmdb:new-on-streaming:netflix+hulu". Matched
   // before nothing else because it shares no prefix with the entries above;
   // it is listed here so the tmdb: family stays in one place.
-  if (s === "tmdb:new-on-streaming" || s.startsWith("tmdb:new-on-streaming:")) return "tmdb-new-on-streaming";
+  if (
+    s === "tmdb:new-on-streaming" || s.startsWith("tmdb:new-on-streaming:") ||
+    s === "rapidapi:new-on-streaming" || s.startsWith("rapidapi:new-on-streaming:") ||
+    s === "streaming:new-on-streaming" || s.startsWith("streaming:new-on-streaming:")
+  ) return "tmdb-new-on-streaming";
   if (s.startsWith("trakt:chart:")) return "trakt-chart";
   if (s.startsWith("simkl:chart:")) return "simkl-chart";
   if (s.startsWith("simkl:user:")) return "simkl-user";
