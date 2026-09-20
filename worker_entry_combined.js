@@ -455,6 +455,28 @@ const CHANNEL_PRESET_NETWORKS = [
 // here without the cached preset ever pointing at a dead host.
 const CHANNEL_PRESET_PREWARM_ORIGIN = "https://prewarm.internal";
 
+// Server-side copy of 20_client-channel-builder.js's own CHANNEL_POOL_MAX_ITEMS
+// -- the two have to agree (this one is the real cap on a Quick Add preset's
+// pool; the client's is the cap on the hand-built/import-from-link path,
+// which still runs client-side). A preset this big is cached in KV
+// (channel:preset:v2:<networkId>, well under KV's 25MB value limit) and
+// NEVER embedded whole into a saved config -- a catalog row only ever
+// carries a tiny `{presetNetworkId, channelId, ...}` pointer at
+// entry.url (channel:v1:), resolved back to the full pool from that KV
+// cache at the moment something actually needs the episode list
+// (channelSourceItems, 05_catalog-core.js). That split is what lets this be
+// 5,000 without reviving the "too large to save" bug several Quick Add
+// channels in one config used to hit when the whole pool rode in the URL.
+const CHANNEL_POOL_MAX_ITEMS = 5000;
+// Discover pages pulled per network before building episodes -- 20 shows a
+// page, so 10 pages is the same up-to-200-show candidate pool
+// /api/quick-channel-shows already offers the client-built path. Building
+// stops the moment CHANNEL_POOL_MAX_ITEMS is reached regardless of how much
+// of this pool was actually walked (see buildNetworkChannelPreset), so a
+// bigger candidate pool costs nothing extra for a popular network that hits
+// the cap early -- it only matters for a network sparse enough to need it.
+const CHANNEL_PRESET_DISCOVER_PAGES = 10;
+
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
 // /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
@@ -12167,11 +12189,11 @@ async function fetchMergedCatalog(urls, type, skip, keys) {
 
 // --- Channels (synthetic series stitched from hand-picked episodes/movies) -
 //
-// A Channel entry stores its whole payload directly in entry.url as
+// A Channel entry stores its payload directly in entry.url as
 // "channel:v1:<JSON>" -- built entirely client-side by the Channel builder
-// panel (search a show, pick episodes; search a movie, add it whole), so
-// once saved it's fully self-contained: no further TMDB lookups needed to
-// serve it. Two things read this payload:
+// panel (search a show, pick episodes; search a movie, add it whole), so a
+// hand-built channel is fully self-contained: no further TMDB lookups
+// needed to serve it. Two things read this payload:
 //  - fetchChannelCatalog (below) -- the catalog-row listing, which is just
 //    ONE tile (the channel itself, poster + name) like any other meta item.
 //  - buildChannelMeta (below) -- the full detail response with the actual
@@ -12185,12 +12207,28 @@ async function fetchMergedCatalog(urls, type, skip, keys) {
 // are always sequential (1, 1..N) regardless of source, purely so the
 // channel displays as one clean ordered list -- same as the reference
 // implementation this feature is modeled on.
+//
+// A Quick Add network channel is the one exception to "fully
+// self-contained": its payload omits `items` and carries `presetNetworkId`
+// instead -- a pointer at the shared, cron-prewarmed pool cached under
+// channel:preset:v2:<presetNetworkId> (buildNetworkChannelPreset,
+// 07_source-fetchers-tmdb-simkl.js), so a catalog row stays a few hundred
+// bytes instead of embedding a pool of up to CHANNEL_POOL_MAX_ITEMS (5,000)
+// episodes. `poster`/`backdrop` still ride in the payload itself (so
+// fetchChannelCatalog's tile never needs to touch that cache), and
+// channelSourceItems is where `items` actually gets filled in from it, for
+// whichever caller needed the real episode list.
 function parseChannelPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
     if (!raw.startsWith("channel:v1:")) return null;
     const data = JSON.parse(raw.slice("channel:v1:".length));
-    return data && Array.isArray(data.items) ? data : null;
+    if (!data) return null;
+    if (Array.isArray(data.items)) return data;
+    // The pointer shape: no items of its own, resolved later from
+    // channel:preset:v2:<presetNetworkId> by whoever actually needs them.
+    if (data.presetNetworkId) return data;
+    return null;
   } catch (e) {
     return null;
   }
@@ -12750,10 +12788,13 @@ function fetchChannelCatalog(entry, origin) {
     const payload = parseChannelPayload(rawUrl);
     // A dynamic channel (Next Up) deliberately stores no picks of its own --
     // its lineup is derived per request in buildChannelMeta -- so "no items"
-    // is not the same as "nothing to show" for one of those. The shelf tile
+    // is not the same as "nothing to show" for one of those. A Quick Add
+    // network channel (presetNetworkId set) is the same story for a
+    // different reason: its items live in the shared preset cache, not on
+    // this payload -- see parseChannelPayload's own comment. The shelf tile
     // here carries no episodes either way, only the channel's name and art.
     if (!payload) continue;
-    if (!payload.dynamic && (!payload.items || !payload.items.length)) continue;
+    if (!payload.dynamic && !payload.presetNetworkId && (!payload.items || !payload.items.length)) continue;
     const channelId = payload.channelId || entry.id;
     const name = payload.name || entry.name;
     
@@ -14818,13 +14859,30 @@ function mergeChannelNewEpisodes(stored, fresh, atTop) {
 
 // The pool a channel draws today's lineup from, before any ordering.
 //
-// Three shapes: a normal channel plays the picks stored on it; a dynamic
+// Four shapes: a normal channel plays the picks stored on it; a dynamic
 // channel (Next Up) has none and is re-derived per request from the
 // account's own tracking; a Live Cloud Sync channel prefers the pool the
-// Worker last rebuilt from the list it was imported from, and keeps its
-// stored picks as the fallback for before that first rebuild lands.
+// Worker last rebuilt from the list it was imported from, keeping its
+// stored picks as the fallback for before that first rebuild lands; and a
+// Quick Add network channel stores no pool of its own at all -- just a
+// presetNetworkId pointer (see parseChannelPayload's own comment) -- so its
+// pool is resolved from the shared, cron-prewarmed cache right here, before
+// any of the other three shapes get a chance to run.
 async function channelSourceItems(payload, opts) {
-  const stored = Array.isArray(payload.items) ? payload.items : [];
+  let stored = Array.isArray(payload.items) ? payload.items : [];
+  if (!stored.length && payload.presetNetworkId && opts && opts.env) {
+    try {
+      const preset = await buildNetworkChannelPreset(
+        String(payload.presetNetworkId),
+        payload.name || "TV Channel",
+        opts.origin || CHANNEL_PRESET_PREWARM_ORIGIN,
+        { env: opts.env, ctx: opts.ctx }
+      );
+      if (preset && preset.ok && preset.channel && Array.isArray(preset.channel.items)) {
+        stored = preset.channel.items;
+      }
+    } catch (e) {}
+  }
   if (payload.dynamic === "next-up") {
     // The live answer when there is one, and the seed the builder stored
     // otherwise.
@@ -14961,6 +15019,11 @@ async function buildChannelMeta(entry, origin, opts = {}) {
   // identity -- see the same note in fetchChannelCatalog above.
   const channelId = payload.channelId || entry.id;
   const name = payload.name || entry.name;
+  // channelSourceItems needs origin (to resolve a Quick Add channel's
+  // presetNetworkId pointer) but only ever sees `opts`, not this function's
+  // own separate `origin` param -- normalized here once rather than trusting
+  // every caller to duplicate it into opts.origin themselves.
+  if (!opts.origin) opts = Object.assign({}, opts, { origin });
   const lineup = await resolveChannelLineup(payload, opts);
   if (!lineup) return null;
   const items = lineup.items;
@@ -18587,14 +18650,29 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
   }
 
   try {
-    const discoverRes = await fetch(
-      `https://api.themoviedb.org/3/discover/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
-        `&with_networks=${encodeURIComponent(networkId)}&sort_by=popularity.desc&page=1&include_adult=false`,
-      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
-    );
-    if (!discoverRes.ok) return { ok: false, error: "TMDB network request failed.", status: 502 };
-    const discoverData = await discoverRes.json();
-    let topShows = (discoverData.results || []).slice(0, 10);
+    // Up to CHANNEL_PRESET_DISCOVER_PAGES pages (20 shows/page) of candidate
+    // shows -- the same up-to-200-show pool /api/quick-channel-shows already
+    // offers the client-built path, needed so a popular network actually has
+    // enough material to approach CHANNEL_POOL_MAX_ITEMS episodes. Safe to
+    // fetch in full: assembleFromShows below stops issuing new show/season
+    // requests the moment the pool is full, so a network that fills up in
+    // its first page or two never pays for the rest of this discovery.
+    const discoverResults = [];
+    for (let page = 1; page <= CHANNEL_PRESET_DISCOVER_PAGES; page++) {
+      const discoverRes = await fetch(
+        `https://api.themoviedb.org/3/discover/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+          `&with_networks=${encodeURIComponent(networkId)}&sort_by=popularity.desc&page=${page}&include_adult=false`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+      );
+      if (!discoverRes.ok) {
+        if (page === 1) return { ok: false, error: "TMDB network request failed.", status: 502 };
+        break;
+      }
+      const discoverData = await discoverRes.json();
+      discoverResults.push(...(discoverData.results || []));
+      if (page >= (discoverData.total_pages || 1)) break;
+    }
+    let topShows = discoverResults;
     const nameLower = String(name || "").toLowerCase();
     // TMDB's own with_networks discover comes back empty for a handful of
     // networks it otherwise carries shows for (a TMDB data gap, not
@@ -18628,7 +18706,7 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
 
     const assembleFromShows = async (showsList) => {
       await mapWithConcurrency(showsList, 4, async (show) => {
-        if (allEpisodes.length >= 200) return;
+        if (allEpisodes.length >= CHANNEL_POOL_MAX_ITEMS) return;
         try {
           const showRes = await fetch(
             `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
@@ -18645,7 +18723,7 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
           const validSeasons = (fullShow.seasons || []).filter((s) => s.season_number > 0).slice(0, 3);
 
           for (const s of validSeasons) {
-            if (allEpisodes.length >= 200) break;
+            if (allEpisodes.length >= CHANNEL_POOL_MAX_ITEMS) break;
             const sRes = await fetch(
               `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}/season/${s.season_number}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
               { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
@@ -18653,7 +18731,7 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
             if (!sRes.ok) continue;
             const sData = await sRes.json();
             for (const ep of (sData.episodes || [])) {
-              if (allEpisodes.length >= 200) break;
+              if (allEpisodes.length >= CHANNEL_POOL_MAX_ITEMS) break;
               const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
               allEpisodes.push({
                 kind: "episode",
@@ -18708,11 +18786,16 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
 // the default 6-minute cron, comfortably inside the 24h TTL those presets
 // are cached under. That keeps /api/channel-preset always serving a warm
 // cache instead of a user's Quick Add click being the one that pays for a
-// live ~40-TMDB-request build. See buildNetworkChannelPreset above for what
-// actually gets fetched, and 20_client-channel-builder.js's quickAddChannel
-// for why a small, capped preset -- not a client-built pool of up to 5,000
-// episodes -- is what keeps a Quick Add channel from blowing the 10 MB
-// SAVED_CONFIG_BYTES_MAX ceiling when several of them end up in one config.
+// live build of up to CHANNEL_POOL_MAX_ITEMS (5,000) episodes.
+//
+// This pool is never embedded whole into a saved config -- a Quick Add
+// catalog row only ever carries a tiny {presetNetworkId, channelId, ...}
+// pointer (see quickAddChannel, 20_client-channel-builder.js), resolved
+// back to this cache by channelSourceItems (05_catalog-core.js) at the
+// moment a channel's actual episode list is needed. That split is what lets
+// the pool be this big without reviving the "too large to save" bug several
+// Quick Add channels in one config used to hit when the whole pool rode in
+// the install URL.
 async function prewarmChannelPresets(env, ctx) {
   const summary = { ran: false, refreshed: "", error: "" };
   if (!env || !env.CONFIGS) return summary;
@@ -48860,9 +48943,29 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
         const data = await res.json();
         if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_PRESET_MIN_ITEMS) {
           const channelId = generateChannelId();
+          // The full pool (up to CHANNEL_POOL_MAX_ITEMS episodes) is kept
+          // locally for the My Channels editor -- saveLocalChannel gets it
+          // in full, exactly as before. The saved CATALOG ROW is different:
+          // it carries a slim pointer (name/poster/art + presetNetworkId),
+          // never the pool itself, so this channel's real weight lives in
+          // the shared channel:preset:v2:<networkId> cache instead of in
+          // every install link that adds it -- see parseChannelPayload and
+          // channelSourceItems (05_catalog-core.js) for how that pointer
+          // resolves back to the full pool at serve time.
           const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '' });
           saveLocalChannel(payload);
-          addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+          const pointerPayload = {
+            channelId: channelId,
+            name: name,
+            poster: data.channel.poster,
+            backdrop: data.channel.backdrop,
+            presetNetworkId: networkId,
+            shuffle: false,
+            dailyRotate: true,
+            liveSync: false,
+            sourceUrl: '',
+          };
+          addRow(name, 'channel:v1:' + JSON.stringify(pointerPayload), 'series', true, 'Channels', channelId);
           renderMyCreatedChannelsList();
           renderChannelMergeList();
           showAddedToast('Channel "' + name + '" added to your Catalogs.');
@@ -70468,12 +70571,15 @@ function generateSearchVariations(query) {
       const name = url.searchParams.get("name") || "TV Channel";
       if (!networkId) return json({ ok: false, error: "Missing networkId." }, 400);
 
-      // The build itself (TMDB discover -> top 10 shows -> up to 3 seasons
-      // each, capped at 200 episodes, cached 24h under
-      // channel:preset:v2:<networkId>) is shared with the daily cron prewarm
-      // (prewarmChannelPresets, 07_source-fetchers-tmdb-simkl.js) so a Quick
-      // Add click almost always hits that warm cache rather than paying for
-      // a live build.
+      // The build itself (TMDB discover -> up to ~200 candidate shows -> up
+      // to 3 seasons each, capped at CHANNEL_POOL_MAX_ITEMS (5,000) episodes,
+      // cached 24h under channel:preset:v2:<networkId>) is shared with the
+      // daily cron prewarm (prewarmChannelPresets,
+      // 07_source-fetchers-tmdb-simkl.js) so a Quick Add click almost always
+      // hits that warm cache rather than paying for a live build. What comes
+      // back here is the FULL pool -- the client only embeds a small pointer
+      // to it in the saved catalog row (see quickAddChannel,
+      // 20_client-channel-builder.js), not this whole response.
       const result = await buildNetworkChannelPreset(networkId, name, url.origin, { env, ctx });
       if (!result.ok) return json({ ok: false, error: result.error }, result.status || 200);
       return json({ ok: true, channel: result.channel }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });

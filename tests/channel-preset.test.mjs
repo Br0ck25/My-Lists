@@ -2,11 +2,46 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 import { makeEnv, makeKv, call, runScheduledTick } from "./harness.mjs";
 
 const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+// Same technique as worker.test.mjs's own loadSourceFunctions: the files
+// share one sandbox so a function in 05_ that calls one declared in 07_ (as
+// channelSourceItems now calls buildNetworkChannelPreset) can see it, the
+// same way it does once all sources are concatenated into the real Worker.
+// No `fetch` in this sandbox on purpose -- these tests pre-seed the KV cache
+// so a correct resolution never needs one, and an accidental live TMDB call
+// fails loudly (ReferenceError) instead of silently reaching the network.
+function loadSourceFunctions(...relFiles) {
+  const sandbox = {
+    console, URL, URLSearchParams, atob, btoa, Uint8Array, TextDecoder, TextEncoder,
+    crypto: globalThis.crypto,
+  };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  for (const relFile of relFiles) {
+    const src = fs.readFileSync(path.join(REPO_ROOT, relFile), "utf8");
+    vm.runInContext(src, sandbox, { filename: relFile });
+  }
+  return sandbox;
+}
+
+function makeFakeConfigs(initial = {}) {
+  const store = new Map(Object.entries(initial));
+  return {
+    async get(key) { return store.has(key) ? store.get(key) : null; },
+    async put(key, val) { store.set(key, typeof val === "string" ? val : JSON.stringify(val)); },
+    _store: store,
+  };
+}
+
+// The real network ids don't matter for the size-regression test below --
+// only that there are ten distinct pointer rows and none of them carry a pool.
+const CHANNEL_PRESET_NETWORK_IDS_FOR_TEST = ["129", "2", "80", "174", "4", "56", "16", "47", "64", "54"];
 
 // A Quick Add network channel used to have no real cap: quickAddChannel's
 // preset check compared the server's (capped-at-200) preset against
@@ -131,6 +166,62 @@ describe("/api/channel-preset", () => {
     }
   });
 
+  it("pulls from multiple discover pages and is no longer capped at 200 episodes", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, TMDB_API_KEY: "test-tmdb-key" });
+    const discoverPages = new Set();
+    // 3 discover pages x 20 shows x 1 season x 10 episodes = 600 possible
+    // episodes -- well past the old 200 cap, but under CHANNEL_POOL_MAX_ITEMS
+    // (5,000), so a correct build pulls every last one of them rather than
+    // stopping early at either boundary.
+    const stub = stubTmdb((u) => {
+      if (u.includes("/discover/tv")) {
+        const pageMatch = u.match(/[?&]page=(\d+)/);
+        const page = pageMatch ? Number(pageMatch[1]) : 1;
+        discoverPages.add(page);
+        if (page > 3) return { results: [], total_pages: 3 };
+        const results = Array.from({ length: 20 }, (_, i) => ({ id: (page - 1) * 20 + i + 1 }));
+        return { results, total_pages: 3 };
+      }
+      if (u.includes("/network/")) return { logo_path: "/logo.png" };
+      const showMatch = u.match(/\/tv\/(\d+)\?/);
+      if (showMatch && !u.includes("/season/")) {
+        const id = showMatch[1];
+        return {
+          id: Number(id),
+          name: "Show " + id,
+          poster_path: "/p" + id + ".jpg",
+          backdrop_path: "/b" + id + ".jpg",
+          external_ids: { imdb_id: "tt" + id },
+          seasons: [{ season_number: 1 }],
+        };
+      }
+      const seasonMatch = u.match(/\/tv\/(\d+)\/season\/(\d+)\?/);
+      if (seasonMatch) {
+        const id = seasonMatch[1];
+        return {
+          episodes: Array.from({ length: 10 }, (_, i) => ({
+            episode_number: i + 1,
+            name: "Ep " + (i + 1),
+            air_date: "2024-01-01",
+            still_path: "/s" + id + "e" + (i + 1) + ".jpg",
+          })),
+        };
+      }
+      return { results: [] };
+    });
+
+    try {
+      const res = await call(env, "/api/channel-preset?networkId=6&name=" + encodeURIComponent("NBC"));
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true, res.body.error);
+      assert.equal(res.body.channel.items.length, 600, "must pull the full pool, not stop at the old 200-item cap");
+      assert.ok(discoverPages.has(2) && discoverPages.has(3), "must walk more than a single discover page");
+    } finally {
+      stub.restore();
+    }
+  });
+
   it("keeps building instead of failing when TMDB's own network discover comes back empty for a known fallback network", async () => {
     const kv = makeKv();
     const env = makeEnv({ CONFIGS: kv, TMDB_API_KEY: "test-tmdb-key" });
@@ -216,24 +307,116 @@ describe("daily channel preset prewarm (cron)", () => {
 describe("quickAddChannel's cached-preset gate (client)", () => {
   // The bug itself, guarded directly against the source: quickAddChannel
   // used to require the server's preset to have >= CHANNEL_POOL_MAX_ITEMS
-  // (5000) items before using it, which a preset (capped at 200 on the
-  // server, on purpose) could never satisfy -- so this comparison was
-  // always false and every Quick Add click fell through to building a
-  // channel live in the browser with no cap of its own. A regression here
-  // would silently reopen the exact "10 quick-add channels -> config too
-  // large to save" bug this whole file is about, without the cron/route
-  // tests above ever seeing it, since they exercise the server side only.
-  it("no longer requires an impossible 5000 items before using the cached preset", () => {
+  // (5000) items before using it. Back when the server capped a preset at
+  // 200 that comparison could never be satisfied; now that the server's own
+  // pool can genuinely reach 5000, the two numbers could coincidentally
+  // match again by accident -- so this still has to compare against a real,
+  // reachable bar (CHANNEL_PRESET_MIN_ITEMS), not the pool ceiling itself.
+  it("still gates on a real bar, not the (now reachable) 5000-item pool ceiling", () => {
     const src = fs.readFileSync(path.join(REPO_ROOT, "20_client-channel-builder.js"), "utf8");
     assert.match(
       src,
       /data\.channel\.items\.length >= CHANNEL_PRESET_MIN_ITEMS/,
-      "quickAddChannel must gate on CHANNEL_PRESET_MIN_ITEMS, not the old unreachable threshold"
+      "quickAddChannel must gate on CHANNEL_PRESET_MIN_ITEMS, not the pool ceiling"
     );
     assert.doesNotMatch(
       src,
       /data\.channel\.items\.length >= CHANNEL_POOL_MAX_ITEMS/,
-      "the old unreachable gate (>= CHANNEL_POOL_MAX_ITEMS, 5000) must not come back"
+      "the old unreachable gate (>= CHANNEL_POOL_MAX_ITEMS) must not come back"
     );
+  });
+
+  // The other half of the fix: a Quick Add network channel's saved catalog
+  // row must be a small pointer, not the pool itself -- otherwise raising
+  // the pool to 5,000 would silently reopen the "too large to save" bug
+  // rather than actually fix it as the smaller 200-item pool happened to.
+  it("saves a small presetNetworkId pointer for the catalog row, not the pool", () => {
+    const src = fs.readFileSync(path.join(REPO_ROOT, "20_client-channel-builder.js"), "utf8");
+    assert.match(
+      src,
+      /presetNetworkId:\s*networkId/,
+      "quickAddChannel's saved row must point at the shared preset by networkId"
+    );
+  });
+});
+
+describe("Quick Add network channels stay resolvable and small end to end", () => {
+  it("channelSourceItems resolves a presetNetworkId pointer to the full cached pool", async () => {
+    const sb = loadSourceFunctions("00_constants.js", "05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+    const items600 = Array.from({ length: 600 }, (_, i) => ({
+      kind: "episode", imdbId: "tt" + (i % 30), season: 1, episode: i, showName: "Show " + (i % 30), epName: "Ep " + i, title: "t", released: "2024-01-01",
+    }));
+    const cachedPreset = { name: "CBS", poster: "https://x/api/channel-logo?path=/x.png", backdrop: null, items: items600, shuffle: false, dailyRotate: true };
+    const env = { CONFIGS: makeFakeConfigs({ "channel:preset:v2:16": JSON.stringify(cachedPreset) }) };
+
+    // The exact slim shape quickAddChannel now saves into the catalog row --
+    // no `items` at all, just enough to find the shared preset and this
+    // user's own identity/settings for it.
+    const pointerPayload = { channelId: "user-ch-1", name: "CBS", presetNetworkId: "16", shuffle: false, dailyRotate: true };
+
+    const resolved = await sb.channelSourceItems(pointerPayload, { env, origin: "https://example.com" });
+    assert.equal(resolved.length, 600, "must resolve to the full cached pool, not an empty/partial one");
+    assert.equal(resolved[0].showName, "Show 0");
+  });
+
+  it("buildChannelMeta serves a real episode list for a presetNetworkId channel with zero TMDB calls", async () => {
+    const sb = loadSourceFunctions("00_constants.js", "05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+    const items = Array.from({ length: 50 }, (_, i) => ({
+      kind: "episode", imdbId: "tt900" + (i % 5), season: 1, episode: (i % 10) + 1, showName: "Show " + (i % 5), epName: "Ep " + i, title: "t", released: "2024-01-01",
+    }));
+    const cachedPreset = { name: "ABC", poster: "https://x/api/channel-logo?path=/x.png", backdrop: null, items, shuffle: false, dailyRotate: true };
+    const env = { CONFIGS: makeFakeConfigs({ "channel:preset:v2:2": JSON.stringify(cachedPreset) }) };
+
+    const pointerPayload = { channelId: "user-ch-2", name: "ABC", presetNetworkId: "2", shuffle: false, dailyRotate: true };
+    const entry = { id: "user-ch-2", type: "series", name: "ABC", url: "channel:v1:" + JSON.stringify(pointerPayload) };
+
+    // No `fetch` exists in this sandbox at all (see loadSourceFunctions) --
+    // if resolution fell through to a live TMDB build instead of the cache,
+    // this would throw ReferenceError rather than silently going out.
+    const meta = await sb.buildChannelMeta(entry, "https://example.com", { env });
+    assert.ok(meta, "a warm-cache pointer channel must resolve to real meta");
+    assert.ok(meta.videos.length > 0, "must actually carry playable episodes");
+  });
+
+  it("fetchChannelCatalog renders a pointer channel's tile with no env/KV at all", () => {
+    const sb = loadSourceFunctions("00_constants.js", "05_catalog-core.js", "07_source-fetchers-tmdb-simkl.js");
+    const pointerPayload = {
+      channelId: "user-ch-3", name: "NBC", presetNetworkId: "6", shuffle: false, dailyRotate: true,
+      poster: "https://example.com/api/channel-logo?path=/nbc.png", backdrop: "https://example.com/api/channel-logo?path=/nbc.png",
+    };
+    const entry = { id: "user-ch-3", type: "series", name: "NBC", url: "channel:v1:" + JSON.stringify(pointerPayload) };
+
+    // fetchChannelCatalog is not async and takes no env -- the tile must
+    // render from the pointer's own poster/backdrop alone, never touching
+    // the shared preset cache.
+    const metas = sb.fetchChannelCatalog(entry, "https://example.com");
+    assert.equal(metas.length, 1);
+    assert.equal(metas[0].id, "channel_user-ch-3");
+    assert.equal(metas[0].name, "NBC");
+    assert.match(metas[0].poster, /\/api\/channel-logo\?path=/);
+  });
+
+  // The actual regression test for the reported bug, now that the pool is
+  // back to 5,000: ten Quick Add channels' worth of pointer rows must stay
+  // tiny, because none of them carry a pool of their own.
+  it("ten Quick Add channels' worth of pointer rows stay far under the config size limit", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const entries = CHANNEL_PRESET_NETWORK_IDS_FOR_TEST.map((id, i) => {
+      const pointerPayload = {
+        channelId: "ch-" + i,
+        name: "Network " + i,
+        presetNetworkId: id,
+        poster: "https://example.com/api/channel-logo?path=/n" + i + ".png",
+        backdrop: "https://example.com/api/channel-logo?path=/n" + i + ".png",
+        shuffle: false,
+        dailyRotate: true,
+      };
+      return { name: "Network " + i, url: "channel:v1:" + JSON.stringify(pointerPayload), type: "series", group: "Channels" };
+    });
+
+    const res = await call(env, "/api/save", { method: "POST", json: { entries } });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true, res.body.error);
+    assert.ok(res.body.id, "must save under a short id, not fall back to a giant URL");
   });
 });

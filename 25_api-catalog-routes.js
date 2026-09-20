@@ -1983,12 +1983,15 @@ function generateSearchVariations(query) {
       const name = url.searchParams.get("name") || "TV Channel";
       if (!networkId) return json({ ok: false, error: "Missing networkId." }, 400);
 
-      // The build itself (TMDB discover -> top 10 shows -> up to 3 seasons
-      // each, capped at 200 episodes, cached 24h under
-      // channel:preset:v2:<networkId>) is shared with the daily cron prewarm
-      // (prewarmChannelPresets, 07_source-fetchers-tmdb-simkl.js) so a Quick
-      // Add click almost always hits that warm cache rather than paying for
-      // a live build.
+      // The build itself (TMDB discover -> up to ~200 candidate shows -> up
+      // to 3 seasons each, capped at CHANNEL_POOL_MAX_ITEMS (5,000) episodes,
+      // cached 24h under channel:preset:v2:<networkId>) is shared with the
+      // daily cron prewarm (prewarmChannelPresets,
+      // 07_source-fetchers-tmdb-simkl.js) so a Quick Add click almost always
+      // hits that warm cache rather than paying for a live build. What comes
+      // back here is the FULL pool -- the client only embeds a small pointer
+      // to it in the saved catalog row (see quickAddChannel,
+      // 20_client-channel-builder.js), not this whole response.
       const result = await buildNetworkChannelPreset(networkId, name, url.origin, { env, ctx });
       if (!result.ok) return json({ ok: false, error: result.error }, result.status || 200);
       return json({ ok: true, channel: result.channel }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });

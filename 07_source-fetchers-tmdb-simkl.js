@@ -2091,14 +2091,29 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
   }
 
   try {
-    const discoverRes = await fetch(
-      `https://api.themoviedb.org/3/discover/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
-        `&with_networks=${encodeURIComponent(networkId)}&sort_by=popularity.desc&page=1&include_adult=false`,
-      { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
-    );
-    if (!discoverRes.ok) return { ok: false, error: "TMDB network request failed.", status: 502 };
-    const discoverData = await discoverRes.json();
-    let topShows = (discoverData.results || []).slice(0, 10);
+    // Up to CHANNEL_PRESET_DISCOVER_PAGES pages (20 shows/page) of candidate
+    // shows -- the same up-to-200-show pool /api/quick-channel-shows already
+    // offers the client-built path, needed so a popular network actually has
+    // enough material to approach CHANNEL_POOL_MAX_ITEMS episodes. Safe to
+    // fetch in full: assembleFromShows below stops issuing new show/season
+    // requests the moment the pool is full, so a network that fills up in
+    // its first page or two never pays for the rest of this discovery.
+    const discoverResults = [];
+    for (let page = 1; page <= CHANNEL_PRESET_DISCOVER_PAGES; page++) {
+      const discoverRes = await fetch(
+        `https://api.themoviedb.org/3/discover/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+          `&with_networks=${encodeURIComponent(networkId)}&sort_by=popularity.desc&page=${page}&include_adult=false`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+      );
+      if (!discoverRes.ok) {
+        if (page === 1) return { ok: false, error: "TMDB network request failed.", status: 502 };
+        break;
+      }
+      const discoverData = await discoverRes.json();
+      discoverResults.push(...(discoverData.results || []));
+      if (page >= (discoverData.total_pages || 1)) break;
+    }
+    let topShows = discoverResults;
     const nameLower = String(name || "").toLowerCase();
     // TMDB's own with_networks discover comes back empty for a handful of
     // networks it otherwise carries shows for (a TMDB data gap, not
@@ -2132,7 +2147,7 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
 
     const assembleFromShows = async (showsList) => {
       await mapWithConcurrency(showsList, 4, async (show) => {
-        if (allEpisodes.length >= 200) return;
+        if (allEpisodes.length >= CHANNEL_POOL_MAX_ITEMS) return;
         try {
           const showRes = await fetch(
             `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
@@ -2149,7 +2164,7 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
           const validSeasons = (fullShow.seasons || []).filter((s) => s.season_number > 0).slice(0, 3);
 
           for (const s of validSeasons) {
-            if (allEpisodes.length >= 200) break;
+            if (allEpisodes.length >= CHANNEL_POOL_MAX_ITEMS) break;
             const sRes = await fetch(
               `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}/season/${s.season_number}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
               { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
@@ -2157,7 +2172,7 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
             if (!sRes.ok) continue;
             const sData = await sRes.json();
             for (const ep of (sData.episodes || [])) {
-              if (allEpisodes.length >= 200) break;
+              if (allEpisodes.length >= CHANNEL_POOL_MAX_ITEMS) break;
               const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
               allEpisodes.push({
                 kind: "episode",
@@ -2212,11 +2227,16 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
 // the default 6-minute cron, comfortably inside the 24h TTL those presets
 // are cached under. That keeps /api/channel-preset always serving a warm
 // cache instead of a user's Quick Add click being the one that pays for a
-// live ~40-TMDB-request build. See buildNetworkChannelPreset above for what
-// actually gets fetched, and 20_client-channel-builder.js's quickAddChannel
-// for why a small, capped preset -- not a client-built pool of up to 5,000
-// episodes -- is what keeps a Quick Add channel from blowing the 10 MB
-// SAVED_CONFIG_BYTES_MAX ceiling when several of them end up in one config.
+// live build of up to CHANNEL_POOL_MAX_ITEMS (5,000) episodes.
+//
+// This pool is never embedded whole into a saved config -- a Quick Add
+// catalog row only ever carries a tiny {presetNetworkId, channelId, ...}
+// pointer (see quickAddChannel, 20_client-channel-builder.js), resolved
+// back to this cache by channelSourceItems (05_catalog-core.js) at the
+// moment a channel's actual episode list is needed. That split is what lets
+// the pool be this big without reviving the "too large to save" bug several
+// Quick Add channels in one config used to hit when the whole pool rode in
+// the install URL.
 async function prewarmChannelPresets(env, ctx) {
   const summary = { ran: false, refreshed: "", error: "" };
   if (!env || !env.CONFIGS) return summary;

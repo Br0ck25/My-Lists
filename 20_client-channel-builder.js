@@ -10391,9 +10391,29 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
         const data = await res.json();
         if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_PRESET_MIN_ITEMS) {
           const channelId = generateChannelId();
+          // The full pool (up to CHANNEL_POOL_MAX_ITEMS episodes) is kept
+          // locally for the My Channels editor -- saveLocalChannel gets it
+          // in full, exactly as before. The saved CATALOG ROW is different:
+          // it carries a slim pointer (name/poster/art + presetNetworkId),
+          // never the pool itself, so this channel's real weight lives in
+          // the shared channel:preset:v2:<networkId> cache instead of in
+          // every install link that adds it -- see parseChannelPayload and
+          // channelSourceItems (05_catalog-core.js) for how that pointer
+          // resolves back to the full pool at serve time.
           const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '' });
           saveLocalChannel(payload);
-          addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+          const pointerPayload = {
+            channelId: channelId,
+            name: name,
+            poster: data.channel.poster,
+            backdrop: data.channel.backdrop,
+            presetNetworkId: networkId,
+            shuffle: false,
+            dailyRotate: true,
+            liveSync: false,
+            sourceUrl: '',
+          };
+          addRow(name, 'channel:v1:' + JSON.stringify(pointerPayload), 'series', true, 'Channels', channelId);
           renderMyCreatedChannelsList();
           renderChannelMergeList();
           showAddedToast('Channel "' + name + '" added to your Catalogs.');

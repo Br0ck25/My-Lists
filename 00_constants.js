@@ -405,6 +405,28 @@ const CHANNEL_PRESET_NETWORKS = [
 // here without the cached preset ever pointing at a dead host.
 const CHANNEL_PRESET_PREWARM_ORIGIN = "https://prewarm.internal";
 
+// Server-side copy of 20_client-channel-builder.js's own CHANNEL_POOL_MAX_ITEMS
+// -- the two have to agree (this one is the real cap on a Quick Add preset's
+// pool; the client's is the cap on the hand-built/import-from-link path,
+// which still runs client-side). A preset this big is cached in KV
+// (channel:preset:v2:<networkId>, well under KV's 25MB value limit) and
+// NEVER embedded whole into a saved config -- a catalog row only ever
+// carries a tiny `{presetNetworkId, channelId, ...}` pointer at
+// entry.url (channel:v1:), resolved back to the full pool from that KV
+// cache at the moment something actually needs the episode list
+// (channelSourceItems, 05_catalog-core.js). That split is what lets this be
+// 5,000 without reviving the "too large to save" bug several Quick Add
+// channels in one config used to hit when the whole pool rode in the URL.
+const CHANNEL_POOL_MAX_ITEMS = 5000;
+// Discover pages pulled per network before building episodes -- 20 shows a
+// page, so 10 pages is the same up-to-200-show candidate pool
+// /api/quick-channel-shows already offers the client-built path. Building
+// stops the moment CHANNEL_POOL_MAX_ITEMS is reached regardless of how much
+// of this pool was actually walked (see buildNetworkChannelPreset), so a
+// bigger candidate pool costs nothing extra for a popular network that hits
+// the cap early -- it only matters for a network sparse enough to need it.
+const CHANNEL_PRESET_DISCOVER_PAGES = 10;
+
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
 // /admin/api/migrate-d1 walks five KV prefixes (creator:, creatorlist:,
