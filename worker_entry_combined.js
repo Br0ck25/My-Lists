@@ -9186,6 +9186,7 @@ async function renderAdminDashboard(env) {
     <button type="button" class="subnav-pill" data-sub-tab="feedback" onclick="switchAdminSubTab('feedback')">Feedback</button>
     <button type="button" class="subnav-pill" data-sub-tab="netflixpreview" onclick="switchAdminSubTab('netflixpreview')">Provider Preview</button>
     <button type="button" class="subnav-pill" data-sub-tab="newonstreaming" onclick="switchAdminSubTab('newonstreaming')">New on Streaming</button>
+    <button type="button" class="subnav-pill" data-sub-tab="channelpresets" onclick="switchAdminSubTab('channelpresets')">Channel Presets</button>
     <button type="button" class="subnav-pill" data-sub-tab="maintenance" onclick="switchAdminSubTab('maintenance')">Maintenance</button>
   </div>
 
@@ -9490,6 +9491,28 @@ async function renderAdminDashboard(env) {
     </div>
   </div>
 
+  <div class="admin-tab-panel" data-admin-panel="channelpresets">
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The shared pool behind every <strong>Quick Add Popular Networks</strong> channel (up to 5,000 episodes per network, cached 24h under <code>channel:preset:v2:&lt;networkId&gt;</code>) &mdash; every visitor who Quick Adds the same network reads this same cache. A daily cron rotation keeps it warm automatically, but a cache built under an older version of the build code keeps serving its old shape until that rotation reaches it again, which can take a few hours. Clear or rebuild a network here to skip the wait.</p>
+
+    <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button type="button" class="secondary lc-btn" onclick="loadChannelPresets()">Refresh</button>
+        <button type="button" class="secondary lc-btn" style="cursor:pointer; color:#FF3B30; border-color:rgba(255,59,48,0.4);" id="cpClearAllBtn" onclick="clearAllChannelPresets()">Clear all caches</button>
+        <span id="cpStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
+      </div>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Clearing never touches anyone's already-saved channels -- each saved row carries its own small item sample as a fallback, so a cleared cache just means the next Quick Add click (or the cron rotation) rebuilds it fresh instead of serving what was cached before.</p>
+    </div>
+
+    <div class="panel" style="margin:0; padding:14px 16px;">
+      <div class="table-wrap">
+        <table>
+          <tr><th>Network</th><th>Cached</th><th>Episodes</th><th>Built</th><th></th></tr>
+          <tbody id="cpTableBody"><tr><td colspan="5">Loading&hellip;</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <div class="admin-tab-panel" data-admin-panel="maintenance">
     <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">One-off, click-to-run maintenance actions -- everything here is also reachable as a raw <code>POST</code> request for anyone using <code>wrangler</code>/curl, but these buttons are the point-and-click way to run the same thing entirely from this dashboard, no terminal required.</p>
 
@@ -9602,6 +9625,7 @@ async function renderAdminDashboard(env) {
       feedback: 'management',
       netflixpreview: 'management',
       newonstreaming: 'management',
+      channelpresets: 'management',
       maintenance: 'management',
     };
 
@@ -9651,6 +9675,7 @@ async function renderAdminDashboard(env) {
       if (tabId === 'apiusage' && !window._apiUsageLoadedOnce) { window._apiUsageLoadedOnce = true; loadApiUsage(); }
       if (tabId === 'netflixpreview' && !window._netflixPreviewLoadedOnce) { window._netflixPreviewLoadedOnce = true; loadNetflixPreview(); }
       if (tabId === 'newonstreaming' && !window._newOnStreamingLoadedOnce) { window._newOnStreamingLoadedOnce = true; loadNewOnStreaming(); }
+      if (tabId === 'channelpresets' && !window._channelPresetsLoadedOnce) { window._channelPresetsLoadedOnce = true; loadChannelPresets(); }
     }
 
     function restoreAdminActiveTab() {
@@ -10939,6 +10964,114 @@ async function renderAdminDashboard(env) {
       } catch (e) {
         statusEl.textContent = 'Could not load -- check your connection.';
       }
+    }
+
+    // --- Channel Presets -----------------------------------------------------
+    //
+    // Status of the shared channel:preset:v2:<networkId> cache behind every
+    // Quick Add network channel, and one-click clear/rebuild for when it is
+    // still serving what an older version of buildNetworkChannelPreset built.
+
+    function cpAgoText(ms) {
+      if (!ms) return '--';
+      const secs = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+      if (secs < 60) return secs + 's ago';
+      const mins = Math.floor(secs / 60);
+      if (mins < 60) return mins + 'm ago';
+      const hrs = Math.floor(mins / 60);
+      if (hrs < 24) return hrs + 'h ago';
+      return Math.floor(hrs / 24) + 'd ago';
+    }
+
+    async function loadChannelPresets() {
+      const statusEl = document.getElementById('cpStatus');
+      const body = document.getElementById('cpTableBody');
+      statusEl.textContent = 'Loading…';
+      try {
+        const res = await fetch('/admin/api/channel-presets');
+        const data = await res.json();
+        if (!data.ok) {
+          statusEl.textContent = data.error || 'Could not load.';
+          return;
+        }
+        statusEl.textContent = data.networks.length + ' networks';
+        body.innerHTML = data.networks.map((net) => {
+          const cachedBadge = net.cached
+            ? '<span class="admin-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">cached</span>'
+            : '<span style="color:var(--muted);">not cached</span>';
+          return '<tr>' +
+            '<td><strong>' + escapeHtmlAdmin(net.name) + '</strong> <span style="color:var(--muted); font-family:monospace; font-size:0.78rem;">(' + escapeHtmlAdmin(net.id) + ')</span></td>' +
+            '<td>' + cachedBadge + '</td>' +
+            '<td>' + (net.cached ? net.itemCount : '--') + '</td>' +
+            '<td style="white-space:nowrap;">' + cpAgoText(net.builtAt) + '</td>' +
+            '<td style="white-space:nowrap;">' +
+              '<button type="button" class="secondary lc-btn" style="padding:4px 10px; font-size:0.8rem;" onclick="rebuildOneChannelPreset(' + "'" + net.id + "'" + ', this)">Rebuild</button> ' +
+              '<button type="button" class="secondary lc-btn" style="padding:4px 10px; font-size:0.8rem; color:#FF3B30;" onclick="clearOneChannelPreset(' + "'" + net.id + "'" + ', this)"' + (net.cached ? '' : ' disabled') + '>Clear</button>' +
+            '</td>' +
+          '</tr>';
+        }).join('');
+      } catch (e) {
+        statusEl.textContent = 'Could not load -- check your connection.';
+      }
+    }
+
+    async function clearOneChannelPreset(networkId, btn) {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch('/admin/api/channel-presets/clear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ networkId: networkId }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert(data.error || 'Could not clear.');
+        }
+      } catch (e) {
+        alert('Could not clear -- check your connection.');
+      }
+      loadChannelPresets();
+    }
+
+    async function rebuildOneChannelPreset(networkId, btn) {
+      const originalLabel = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = 'Building…'; }
+      try {
+        const res = await fetch('/admin/api/channel-presets/rebuild', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ networkId: networkId }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert(data.error || 'Could not rebuild.');
+        }
+      } catch (e) {
+        alert('Could not rebuild -- check your connection.');
+      }
+      if (btn) btn.textContent = originalLabel;
+      loadChannelPresets();
+    }
+
+    async function clearAllChannelPresets() {
+      if (!confirm('Clear every network’s cached preset? Each one rebuilds fresh the next time it is Quick Added or the cron rotation reaches it.')) return;
+      const btn = document.getElementById('cpClearAllBtn');
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch('/admin/api/channel-presets/clear', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ all: true }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          alert(data.error || 'Could not clear.');
+        }
+      } catch (e) {
+        alert('Could not clear -- check your connection.');
+      }
+      if (btn) btn.disabled = false;
+      loadChannelPresets();
     }
 
     // feedbackEntries is the client's local copy of the list, kept in sync
@@ -18776,6 +18909,13 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
       items: allEpisodes,
       shuffle: false,
       dailyRotate: true,
+      // When this build actually ran, not when a cache hit last served it --
+      // read by the admin dashboard's Channel Presets tab so "is this the
+      // old 200-item cache or the new one" is a real answer instead of a
+      // guess. Every consumer of this payload (channelSourceItems,
+      // fetchChannelCatalog, ...) reads only the fields above; this one
+      // rides along unused by any of them.
+      builtAt: Date.now(),
     };
 
     if (env && env.CONFIGS) {
@@ -82904,6 +83044,104 @@ function generateSearchVariations(query) {
       try {
         const result = await addOrSyncStreamingEvent(env, { input, service, kind, date: customDate });
         return json({ ok: true, result }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // --- Channel presets: the shared, cron-prewarmed pool behind every Quick
+    // Add network channel (channel:preset:v2:<networkId>, buildNetworkChannelPreset
+    // in 07_source-fetchers-tmdb-simkl.js) -- 24h-TTL'd, so a cache built under
+    // an older version of that function keeps serving its old shape (item
+    // count, fields) until the daily cron rotation reaches it again, which can
+    // take a few hours. These three routes are the point-and-click way to see
+    // that state and force it fresh right now, without waiting.
+
+    // /admin/api/channel-presets -> status of all CHANNEL_PRESET_NETWORKS.
+    if (path === "/admin/api/channel-presets" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      try {
+        const networks = await Promise.all(CHANNEL_PRESET_NETWORKS.map(async (net) => {
+          let cached = false;
+          let itemCount = 0;
+          let builtAt = null;
+          try {
+            const raw = await env.CONFIGS.get(`channel:preset:v2:${net.id}`);
+            if (raw) {
+              const parsed = JSON.parse(raw);
+              if (parsed && Array.isArray(parsed.items)) {
+                cached = true;
+                itemCount = parsed.items.length;
+                builtAt = Number.isFinite(parsed.builtAt) ? parsed.builtAt : null;
+              }
+            }
+          } catch (e) {}
+          return { id: net.id, name: net.name, cached, itemCount, builtAt };
+        }));
+        return json({ ok: true, networks }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/channel-presets/clear  { networkId }  or  { all: true }
+    // -> deletes the cached preset(s). The very next Quick Add click (or the
+    // next time the cron rotation reaches that network) rebuilds it fresh --
+    // this never touches anyone's already-saved catalog rows, which carry
+    // their own small item sample as a fallback (see CHANNEL_POINTER_SAMPLE_ITEMS,
+    // 20_client-channel-builder.js) and keep working regardless.
+    if (path === "/admin/api/channel-presets/clear" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (e) {
+        body = {};
+      }
+      const clearAll = body && body.all === true;
+      const targets = clearAll
+        ? CHANNEL_PRESET_NETWORKS
+        : CHANNEL_PRESET_NETWORKS.filter((net) => net.id === String((body && body.networkId) || "").trim());
+      if (!targets.length) return json({ ok: false, error: "Unknown network." }, 400);
+      try {
+        await Promise.all(targets.map((net) => env.CONFIGS.delete(`channel:preset:v2:${net.id}`)));
+        return json({ ok: true, cleared: targets.map((net) => net.id) }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/channel-presets/rebuild  { networkId }
+    // -> forces one network's cache fresh right now, same build
+    // buildNetworkChannelPreset always does on a cold cache -- this just
+    // skips waiting for the cron rotation or the next real Quick Add click.
+    // One network at a time (not "rebuild all"): a single network can mean
+    // dozens of TMDB requests (up to CHANNEL_PRESET_DISCOVER_PAGES pages of
+    // shows, then seasons for each), and doing that for all 28 in one HTTP
+    // request risks the request itself timing out.
+    if (path === "/admin/api/channel-presets/rebuild" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (e) {
+        body = {};
+      }
+      const net = CHANNEL_PRESET_NETWORKS.find((n) => n.id === String((body && body.networkId) || "").trim());
+      if (!net) return json({ ok: false, error: "Unknown network." }, 400);
+      try {
+        const result = await buildNetworkChannelPreset(net.id, net.name, url.origin, { env, ctx, forceRebuild: true });
+        if (!result.ok) return json({ ok: false, error: result.error }, result.status || 200);
+        return json({
+          ok: true,
+          network: { id: net.id, name: net.name, itemCount: result.channel.items.length, builtAt: result.channel.builtAt || null },
+        }, 200, { "Cache-Control": "no-store" });
       } catch (err) {
         return json({ ok: false, error: safeErrorMessage(err) });
       }

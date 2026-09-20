@@ -420,3 +420,131 @@ describe("Quick Add network channels stay resolvable and small end to end", () =
     assert.ok(res.body.id, "must save under a short id, not fall back to a giant URL");
   });
 });
+
+// --- Admin: /admin/api/channel-presets (status, clear, rebuild) -------------
+//
+// The point-and-click way to see whether a network's shared preset cache is
+// still what an older build produced, and to force it fresh without waiting
+// for the cron rotation to come back around to it.
+
+async function adminCookie(env) {
+  const r = await call(env, "/admin/login", { method: "POST", form: { key: env.ADMIN_KEY } });
+  const m = (r.headers.get("set-cookie") || "").match(/^([^=]+=[^;]+)/);
+  return m ? m[1] : "";
+}
+
+describe("admin: Channel Presets tab", () => {
+  it("requires admin auth on all three routes", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const statusRes = await call(env, "/admin/api/channel-presets");
+    assert.equal(statusRes.status, 401);
+    const clearRes = await call(env, "/admin/api/channel-presets/clear", { method: "POST", json: { all: true } });
+    assert.equal(clearRes.status, 401);
+    const rebuildRes = await call(env, "/admin/api/channel-presets/rebuild", { method: "POST", json: { networkId: "129" } });
+    assert.equal(rebuildRes.status, 401);
+  });
+
+  it("reports cached state, item count and build time for every network", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const cookie = await adminCookie(env);
+    const builtAt = Date.now() - 60000;
+    await kv.put("channel:preset:v2:16", JSON.stringify({
+      name: "CBS", items: Array.from({ length: 250 }, () => ({ kind: "episode" })), builtAt,
+    }));
+
+    const res = await call(env, "/admin/api/channel-presets", { headers: { cookie } });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true, res.body.error);
+    assert.equal(res.body.networks.length, 28, "must list every CHANNEL_PRESET_NETWORKS entry");
+
+    const cbs = res.body.networks.find((n) => n.id === "16");
+    assert.equal(cbs.name, "CBS");
+    assert.equal(cbs.cached, true);
+    assert.equal(cbs.itemCount, 250);
+    assert.equal(cbs.builtAt, builtAt);
+
+    const notCached = res.body.networks.find((n) => n.id === "2"); // ABC
+    assert.equal(notCached.cached, false);
+    assert.equal(notCached.itemCount, 0);
+    assert.equal(notCached.builtAt, null);
+  });
+
+  it("clears one network's cache without touching any other", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const cookie = await adminCookie(env);
+    await kv.put("channel:preset:v2:16", JSON.stringify({ name: "CBS", items: [{ kind: "episode" }] }));
+    await kv.put("channel:preset:v2:2", JSON.stringify({ name: "ABC", items: [{ kind: "episode" }] }));
+
+    const res = await call(env, "/admin/api/channel-presets/clear", {
+      method: "POST", headers: { cookie }, json: { networkId: "16" },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true, res.body.error);
+    assert.deepEqual(res.body.cleared, ["16"]);
+
+    assert.equal(await kv.get("channel:preset:v2:16"), null);
+    assert.ok(await kv.get("channel:preset:v2:2"), "an unrelated network's cache must survive");
+  });
+
+  it("clears every network's cache when all: true", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv });
+    const cookie = await adminCookie(env);
+    await kv.put("channel:preset:v2:16", JSON.stringify({ name: "CBS", items: [{ kind: "episode" }] }));
+    await kv.put("channel:preset:v2:2", JSON.stringify({ name: "ABC", items: [{ kind: "episode" }] }));
+
+    const res = await call(env, "/admin/api/channel-presets/clear", {
+      method: "POST", headers: { cookie }, json: { all: true },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.ok, true, res.body.error);
+    assert.equal(res.body.cleared.length, 28);
+
+    assert.equal(await kv.get("channel:preset:v2:16"), null);
+    assert.equal(await kv.get("channel:preset:v2:2"), null);
+  });
+
+  it("rebuilds one network right now, bypassing whatever was cached before", async () => {
+    const kv = makeKv();
+    const env = makeEnv({ CONFIGS: kv, TMDB_API_KEY: "test-tmdb-key" });
+    const cookie = await adminCookie(env);
+    // A stale cache shaped like the OLD 200-item build (no builtAt at all) --
+    // exactly what an admin would be looking at after deploying this fix.
+    await kv.put("channel:preset:v2:16", JSON.stringify({
+      name: "CBS", items: Array.from({ length: 200 }, () => ({ kind: "episode" })),
+    }));
+
+    const stub = stubTmdb(smallNetworkHandler);
+    try {
+      const res = await call(env, "/admin/api/channel-presets/rebuild", {
+        method: "POST", headers: { cookie }, json: { networkId: "16" },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true, res.body.error);
+      assert.equal(res.body.network.id, "16");
+      // smallNetworkHandler produces 4 episodes (2 shows x 1 season x 2 episodes).
+      assert.equal(res.body.network.itemCount, 4);
+      assert.ok(res.body.network.builtAt > Date.now() - 5000, "builtAt must be from this rebuild, not the stale cache");
+    } finally {
+      stub.restore();
+    }
+
+    const cached = JSON.parse(await kv.get("channel:preset:v2:16"));
+    assert.equal(cached.items.length, 4, "the cache itself must now hold the rebuilt pool, not the stale 200-item one");
+  });
+
+  it("rejects an unknown networkId on both clear and rebuild", async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const cookie = await adminCookie(env);
+    const clearRes = await call(env, "/admin/api/channel-presets/clear", {
+      method: "POST", headers: { cookie }, json: { networkId: "not-a-real-network" },
+    });
+    assert.equal(clearRes.body.ok, false);
+    const rebuildRes = await call(env, "/admin/api/channel-presets/rebuild", {
+      method: "POST", headers: { cookie }, json: { networkId: "not-a-real-network" },
+    });
+    assert.equal(rebuildRes.body.ok, false);
+  });
+});

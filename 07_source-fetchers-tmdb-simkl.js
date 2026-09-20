@@ -2209,6 +2209,13 @@ async function buildNetworkChannelPreset(networkId, name, origin, options = {}) 
       items: allEpisodes,
       shuffle: false,
       dailyRotate: true,
+      // When this build actually ran, not when a cache hit last served it --
+      // read by the admin dashboard's Channel Presets tab so "is this the
+      // old 200-item cache or the new one" is a real answer instead of a
+      // guess. Every consumer of this payload (channelSourceItems,
+      // fetchChannelCatalog, ...) reads only the fields above; this one
+      // rides along unused by any of them.
+      builtAt: Date.now(),
     };
 
     if (env && env.CONFIGS) {
