@@ -6,6 +6,11 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ⭐ Rating badges on Storylines, Sagas & Universes
+
+- Both places this feature name appears now show a TMDB rating badge on each poster: the Channel Builder's own **Storylines, Sagas & Universes** browse grid (`renderStorylinesUniverseList`, `20_client-channel-builder.js`) gets the usual poster-corner badge, and the item details modal's **Storylines, Sagas & Universes** section (`renderItemStorylinesWatchOrder`, `19_client-search-and-likes.js`) gets an inline star-and-number next to each card's subtitle, since its posters are already busy with a part-number badge, a watched checkmark and a "Current" pill. The title already open in that modal is skipped -- its rating is already shown higher up on the same page.
+- TV_CROSSOVER_EVENTS is a static, hand-curated registry (poster, title, year -- no rating baked in), so both surfaces resolve ratings live from `/api/details/batch`, deduplicated and cached at module scope (`resolveStorylineRatings`/`applyStorylineRatingBadges`, `20_client-channel-builder.js`) so the two pages, a title appearing in more than one saga, and switching category tabs, all share one lookup per id for the whole session rather than re-asking.
+
 ### ⭐ Specials, alongside a show's regular seasons
 
 - **Channel Builder**: browsing a show's seasons to add episodes to a channel (`/api/show-seasons`, `25_api-catalog-routes.js`) now lists that show's Specials (TMDB season 0) as its own season button, after every numbered season, instead of dropping it silently. "Add every season" picks it up too. The three automated bulk builders that also start from a show list — Quick Add network channels, the Quick Channel Wizard, and a Spotlight actor's whole filmography (`buildChannelItemsFromShows`, `20_client-channel-builder.js`) — still leave Specials out on their own, since an unattended channel full of recaps and clip shows plays badly; a person who wants them can still add them by hand from the season picker.

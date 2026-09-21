@@ -9248,6 +9248,10 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
   }
 
   const channelsMap = (typeof loadLocalChannels === 'function') ? (loadLocalChannels() || {}) : {};
+  // Collected alongside the poster markup below, rather than re-discovered
+  // by querying the rendered DOM afterward -- these ids are plain data this
+  // loop already has in hand.
+  const ratingIdsOnPage = new Set();
 
   const cardsHtml = filtered.map((event) => {
     const isMovieSaga = event.category === 'moviesagas' || event.episodes.every((e) => e.type === 'movie');
@@ -9296,9 +9300,23 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
         overlays += '<div class="list-card-count-overlay desktop-only" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
       }
 
+      // The registry hands each entry a poster but never a rating -- these are
+      // static, hand-curated saga/universe listings, not a live catalog fetch.
+      // resolveStorylineRatings (below) fills this slot in after render, from
+      // /api/details/batch, keyed on the same id a channel pick for this entry
+      // would use. Placed in the DOM before the count overlay below so the
+      // "+N (rsaquo)" tile -- which covers the whole poster -- paints over
+      // the badge rather than beside it, on whichever tile actually shows it.
+      const ratingId = ep.imdbId || (ep.tmdbId ? ('tmdb:' + ep.tmdbId) : '');
+      if (ratingId) ratingIdsOnPage.add(ratingId);
+      const ratingSlot = ratingId
+        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(ratingId) + '" data-rating-style="overlay"></span>'
+        : '';
+
       return '<div class="list-card-mini-poster-tile">' +
         '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)">' +
           '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
+          ratingSlot +
           overlays +
         '</div>' +
         '<div class="list-card-mini-poster-name" title="' + escapeAttr(itemTitle) + '">' + escapeHtml(itemTitle) + '</div>' +
@@ -9330,6 +9348,118 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
   }).join('');
 
   container.innerHTML = cardsHtml;
+  resolveStorylineRatings([...ratingIdsOnPage]);
+}
+
+// --- Storyline poster ratings ---------------------------------------------
+//
+// TV_CROSSOVER_EVENTS is a static, hand-curated registry -- poster, title,
+// year -- with no rating baked in, so the badge shown here has to be resolved
+// live. Cached at module scope (by imdb/tmdb id, not by event) so switching
+// category tabs, or a title turning up in more than one saga, never re-asks
+// for something already known this session -- and shared with the "Storylines,
+// Sagas & Universes" section of the item details modal
+// (renderItemStorylinesWatchOrder, 19_client-search-and-likes.js), the other
+// place this same registry's posters are browsed, so the two never duplicate
+// a lookup for the same title either.
+window._storylineRatingsCache = window._storylineRatingsCache || {};
+window._storylineRatingsInFlight = window._storylineRatingsInFlight || new Set();
+
+// /api/details/batch caps a single request at 60 ids and is metered per id,
+// not per request -- see 25_api-catalog-routes.js -- so a full "All" grid's
+// worth of unique posters (a few hundred, in practice) is chunked here and
+// each chunk resolved independently. Most of these ids are for mainstream
+// franchise titles other parts of the add-on already resolve for other
+// reasons, so in practice this mainly warms whatever is not already sitting
+// in the shared server-side cache.
+const STORYLINE_RATINGS_CHUNK_SIZE = 60;
+const STORYLINE_RATINGS_MAX_ROUNDS = 8;
+
+function resolveStorylineRatings(idsOnPage) {
+  const allIds = Array.isArray(idsOnPage) ? idsOnPage.filter(Boolean) : [];
+  if (!allIds.length) return;
+  // Whatever this render already has a cached answer for (from an earlier
+  // render this session -- switching category tabs, most often, or the same
+  // title turning up in more than one saga) still needs painting onto these
+  // fresh DOM nodes, even though nothing needs to be fetched for it again.
+  const alreadyCached = allIds.filter((id) => id in window._storylineRatingsCache);
+  if (alreadyCached.length) applyStorylineRatingBadges(alreadyCached);
+
+  const idsNeeded = [...new Set(
+    allIds.filter((id) => !(id in window._storylineRatingsCache) && !window._storylineRatingsInFlight.has(id))
+  )];
+  if (!idsNeeded.length) return;
+  idsNeeded.forEach((id) => window._storylineRatingsInFlight.add(id));
+
+  const chunks = [];
+  for (let i = 0; i < idsNeeded.length; i += STORYLINE_RATINGS_CHUNK_SIZE) {
+    chunks.push(idsNeeded.slice(i, i + STORYLINE_RATINGS_CHUNK_SIZE));
+  }
+
+  chunks.forEach(async (chunk) => {
+    let pending = chunk;
+    for (let round = 0; round < STORYLINE_RATINGS_MAX_ROUNDS && pending.length; round++) {
+      let data = null;
+      try {
+        const res = await fetch(ORIGIN + '/api/details/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: pending }),
+        });
+        data = await res.json();
+      } catch (e) {
+        break;
+      }
+      if (!data || !data.ok || !data.results) break;
+      const resolvedThisRound = pending;
+      resolvedThisRound.forEach((id) => {
+        const d = data.results[id];
+        const p = d && d.rating != null ? parseFloat(d.rating) : NaN;
+        window._storylineRatingsCache[id] = (!isNaN(p) && p > 0) ? p : null;
+      });
+      applyStorylineRatingBadges(resolvedThisRound);
+      if (data.done !== false && (!Array.isArray(data.remainingIds) || !data.remainingIds.length)) {
+        pending = [];
+        break;
+      }
+      pending = Array.isArray(data.remainingIds) ? data.remainingIds : [];
+    }
+    // Whatever never got a result after the last round (a network error, or
+    // the budget genuinely never catching up) is left uncached rather than
+    // pinned "in flight" forever -- the next render of this grid gets to
+    // try it again instead of the slot staying blank for the rest of the
+    // session. Cleared for the whole chunk at once: an id resolved earlier
+    // in the loop is already cached and safe to re-mark not-in-flight, and
+    // one that never resolved just goes back to being fetchable.
+    chunk.forEach((id) => window._storylineRatingsInFlight.delete(id));
+  });
+}
+
+// Not scoped to one container: the same id can need patching in the Channel
+// Builder's own grid, the item details modal's storyline section, or (rarely)
+// both, and by the time a chunk resolves there is no reliable way to know
+// which one is even still open. A poster-corner overlay (formatRatingBadgeHtml)
+// on the Channel Builder grid's tiles; a plain inline star+number
+// (formatRatingSpanHtml) beside the subtitle line on the modal's cards, which
+// are too busy with their own corner badges (part number, watched checkmark,
+// "Current" pill) for a fourth overlay to land cleanly. Each slot says which
+// it wants via data-rating-style.
+function applyStorylineRatingBadges(ids) {
+  if (typeof document === 'undefined') return;
+  ids.forEach((id) => {
+    const rating = window._storylineRatingsCache[id];
+    if (!rating) return;
+    document.querySelectorAll('.storyline-rating-slot[data-rating-id="' + id + '"]').forEach((slot) => {
+      const wantsInline = slot.dataset && slot.dataset.ratingStyle === 'inline';
+      let html = '';
+      if (wantsInline && typeof formatRatingSpanHtml === 'function') {
+        html = formatRatingSpanHtml({ id: id, rating: rating });
+      } else if (typeof formatRatingBadgeHtml === 'function') {
+        html = formatRatingBadgeHtml({ id: id, rating: rating });
+      }
+      if (html) slot.innerHTML = html;
+    });
+  });
 }
 
 async function fetchStorylineOrderedItems(eventId) {

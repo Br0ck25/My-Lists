@@ -3017,6 +3017,98 @@ describe("client: crossover and companion events detection in channel builder", 
   });
 });
 
+// TV_CROSSOVER_EVENTS carries poster, title and year for every entry but no
+// rating -- it is a static, hand-curated registry, not a live catalog fetch --
+// so the Storylines, Sagas & Universes grid resolves ratings itself, from
+// /api/details/batch, after rendering. These pin the id-collection, dedup and
+// caching logic (resolveStorylineRatings), not the DOM patch itself
+// (applyStorylineRatingBadges): the harness's element stubs always answer
+// querySelectorAll with [], the same limitation resolveMissingPostersInDom's
+// DOM-patching has always had here (see client-harness.mjs).
+describe("client: Storylines, Sagas & Universes rating badges", () => {
+  const BATCH = "/api/details/batch";
+
+  // KonoSuba's own event: three tiles, two of which (Seasons 1-2 and Season
+  // 3) are the same show and so share one imdb id -- a real, already-in-the-
+  // registry case of the exact id collision the grid's dedup has to handle.
+  const KONOSUBA_SHOW_ID = "tt5312384";
+  const KONOSUBA_MOVIE_ID = "tt8600494";
+
+  function batchRoute(ratingsById) {
+    return {
+      [BATCH]: (req) => {
+        const ids = req.body.ids;
+        const results = {};
+        ids.forEach((id) => {
+          const r = Object.prototype.hasOwnProperty.call(ratingsById, id) ? ratingsById[id] : null;
+          results[id] = (r == null) ? null : { rating: String(r) };
+        });
+        return { json: { ok: true, results: results, remainingIds: [], done: true } };
+      },
+    };
+  }
+
+  it("renders a rating slot for every poster tile, deduping the same show across two entries", () => {
+    const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6, [KONOSUBA_MOVIE_ID]: 7.1 }) });
+    client.call("renderStorylinesUniverseList", "all");
+    const html = client.get("document").getElementById("storylinesUniverseList").innerHTML;
+    const slotIds = [...html.matchAll(/storyline-rating-slot" data-rating-id="([^"]+)"/g)].map((m) => m[1]);
+    assert.ok(slotIds.includes(KONOSUBA_SHOW_ID), "the show's tiles carry a rating slot for its id");
+    assert.ok(slotIds.includes(KONOSUBA_MOVIE_ID), "the movie tile carries a rating slot for its own id");
+  });
+
+  it("asks /api/details/batch for every unique poster id on the grid exactly once", async () => {
+    const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6, [KONOSUBA_MOVIE_ID]: 7.1 }) });
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+
+    // The "all" grid is chunked into up to 60 ids per request, so this may be
+    // more than one request -- what matters is that the repeated show id
+    // (two tiles in the same card) was only ever asked for once combined.
+    const sent = requestsTo(client, BATCH);
+    assert.ok(sent.length >= 1, "at least one batch request went out");
+    const allIdsSent = sent.flatMap((r) => r.body.ids);
+    assert.equal(allIdsSent.filter((id) => id === KONOSUBA_SHOW_ID).length, 1,
+      "the id shared by two tiles is requested only once, not once per tile");
+    assert.equal(allIdsSent.filter((id) => id === KONOSUBA_MOVIE_ID).length, 1);
+
+    const cache = client.get("_storylineRatingsCache");
+    assert.equal(cache[KONOSUBA_SHOW_ID], 7.6);
+    assert.equal(cache[KONOSUBA_MOVIE_ID], 7.1);
+  });
+
+  it("does not re-fetch a rating this session already resolved", async () => {
+    const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6, [KONOSUBA_MOVIE_ID]: 7.1 }) });
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+    const firstRoundCount = requestsTo(client, BATCH).length;
+    assert.ok(firstRoundCount >= 1);
+
+    // Re-rendering the same category (switching tabs back, in the real UI)
+    // finds every id already cached, so this should add no new requests.
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+    assert.equal(requestsTo(client, BATCH).length, firstRoundCount,
+      "a second render of the same grid asks for nothing already known");
+  });
+
+  it("caches a title with no TMDB rating as null instead of retrying it forever", async () => {
+    const client = loadClient({ routes: batchRoute({}) });
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+
+    const cache = client.get("_storylineRatingsCache");
+    assert.equal(cache[KONOSUBA_SHOW_ID], null);
+    assert.equal(cache[KONOSUBA_MOVIE_ID], null);
+
+    const firstRoundCount = requestsTo(client, BATCH).length;
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+    assert.equal(requestsTo(client, BATCH).length, firstRoundCount,
+      "an id already known to have no rating is not asked for again");
+  });
+});
+
 describe("client: livePreviewPosterHtml Continue Watching older season badge suppression", () => {
   it("suppresses season finale badge on Continue Watching when user is watching an older season", () => {
     const client = loadClient();
@@ -3798,6 +3890,60 @@ describe("client: Item Details Storylines, Sagas & Universes watch order", () =>
     // 2. Open Standalone Movie details
     await client.call("openItemDetailsModal", "tt9999999", "movie");
     assert.equal(body.innerHTML.includes("item-storylines-section"), false, "Standalone movie modal does not contain storylines section");
+  });
+
+  // Same static registry, same missing rating, as the Channel Builder's own
+  // grid (see "client: Storylines, Sagas & Universes rating badges" above) --
+  // these cover the one thing specific to this surface: the title already
+  // open in the modal is skipped, since its rating is already shown higher
+  // up on the same page.
+  it("renders a rating slot for each companion title, but not for the one already open", () => {
+    const client = loadClient();
+    const bb = {
+      id: "tt0903747",
+      imdbId: "tt0903747",
+      tmdbId: 1396,
+      title: "Breaking Bad",
+      seasonsData: [{ season_number: 1, episode_count: 7 }]
+    };
+    const html = client.__scopeCall("renderItemStorylinesWatchOrder", [bb, "series"]);
+    assert.match(html, /storyline-rating-slot" data-rating-id="tt9243946" data-rating-style="inline"/,
+      "El Camino (a companion) gets a rating slot");
+    assert.match(html, /storyline-rating-slot" data-rating-id="tt3032476" data-rating-style="inline"/,
+      "Better Call Saul (a companion) gets a rating slot");
+    assert.equal(html.includes('data-rating-id="tt0903747"'), false,
+      "Breaking Bad itself -- the title already open in this modal -- gets no slot");
+  });
+
+  it("asks /api/details/batch for the companion titles once the modal body is actually updated", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/details": () => ({
+          json: {
+            ok: true,
+            details: {
+              id: "tt0903747", imdbId: "tt0903747", tmdbId: 1396, title: "Breaking Bad",
+              seasonsData: [{ season_number: 1, episode_count: 7 }],
+            },
+          },
+        }),
+        "/api/details/batch": (req) => {
+          const results = {};
+          req.body.ids.forEach((id) => { results[id] = { rating: "8.9" }; });
+          return { json: { ok: true, results: results, remainingIds: [], done: true } };
+        },
+      },
+    });
+    await client.call("openItemDetailsModal", "tt0903747", "series");
+    await settle();
+
+    const sent = requestsTo(client, "/api/details/batch").flatMap((r) => r.body.ids);
+    assert.ok(sent.includes("tt9243946"), "El Camino is resolved");
+    assert.ok(sent.includes("tt3032476"), "Better Call Saul is resolved");
+    assert.equal(sent.includes("tt0903747"), false, "the currently open title is never asked for");
+
+    const cache = client.get("_storylineRatingsCache");
+    assert.equal(cache.tt9243946, 8.9);
   });
 });
 

@@ -1,5 +1,58 @@
 # Changes Log
 
+## 2026-09-21 - Rating badges on Storylines, Sagas & Universes
+
+### Files Changed
+`19_client-search-and-likes.js`, `20_client-channel-builder.js`, `worker_entry_combined.js`,
+`CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/client.test.mjs`
+
+### The problem
+
+TV_CROSSOVER_EVENTS (the static saga/universe registry both features below read from) carries a
+poster, a title and a year for every entry, but never a rating -- it's hand-curated, not a live catalog
+fetch. Two different places show this same registry's posters, and neither one had a rating badge:
+the Channel Builder's own **Storylines, Sagas & Universes** browse grid (`renderStorylinesUniverseList`),
+and the identically-named section of the item details modal (`renderItemStorylinesWatchOrder`) that shows
+a title's saga when you're already looking at one of its parts.
+
+### The fix
+
+Added `resolveStorylineRatings`/`applyStorylineRatingBadges` (`20_client-channel-builder.js`): after a
+poster grid renders, it collects the unique imdb/tmdb ids on the page, skips whatever is already cached
+or already in flight, and resolves the rest from `/api/details/batch` in chunks of 60 (that route's own
+per-request cap), with its existing round-continuation loop for whatever a single invocation's fetch
+budget didn't finish. Results land in a module-scoped cache keyed by id, shared by both surfaces, so a
+title in more than one saga, or shown on both pages, is only ever looked up once per session.
+
+Each surface renders the badge to fit what's already on its own poster tile. The Channel Builder's grid
+tiles are otherwise bare, so they get the standard poster-corner badge (`formatRatingBadgeHtml`, which
+had been sitting fully wired -- CSS, settings toggles -- with no caller anywhere in the app until now).
+The item details modal's storyline cards are already carrying a part-number badge, a watched checkmark
+and (on the current part) a full-width "Current" pill, so a fourth overlay would only collide; those get
+a plain inline star-and-number instead (`formatRatingSpanHtml`), next to the subtitle text. The card for
+the title already open in that modal is skipped entirely -- its rating is already shown higher up on the
+same page, and skipping it also sidesteps the one tile whose "Current" pill spans the full width where an
+overlay badge would have gone.
+
+Both call sites hand the resolver a plain list of ids collected while building the HTML, rather than
+re-discovering them by querying the rendered DOM afterward: the ids were already in hand from the same
+loop that built the poster markup, and it kept the fetch-and-cache logic testable independent of DOM
+queries. The item details modal's call is deferred by one microtask (`Promise.resolve().then(...)`),
+since `renderItemStorylinesWatchOrder` only returns an html *string* -- its one caller doesn't assign that
+into the modal body until after it returns, so resolving synchronously would query a DOM that doesn't
+have these slots in it yet.
+
+### Tests
+
+`tests/client.test.mjs`: a new "Storylines, Sagas & Universes rating badges" suite (4) covers the
+Channel Builder grid -- a rating slot renders for every poster tile (deduping a show that appears twice
+in the same card), `/api/details/batch` is asked for each unique id exactly once, a second render of the
+same grid asks for nothing already cached, and a title with no TMDB rating is cached as `null` rather
+than retried forever. Two more in the existing "Item Details Storylines, Sagas & Universes watch order"
+suite cover the modal-specific behaviour: a rating slot renders for each companion title but not for the
+one already open, and `openItemDetailsModal` end to end resolves the companions' ratings once the modal
+body is actually updated, never the currently-open title's own id.
+
 ## 2026-09-21 - Specials, listed instead of dropped
 
 ### Files Changed
