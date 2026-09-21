@@ -3159,6 +3159,134 @@ describe("client: Storylines, Sagas & Universes rating badges", () => {
     assert.equal(requestsTo(client, BATCH).length, firstRoundCount,
       "an id already known to have no rating is not asked for again");
   });
+
+  // Regression test for a live-site report right after the placement fix
+  // above: the grid itself looked fine, but a saga's own "See All" page
+  // (openStorylineDetails -> openListDetailsPage) showed no ratings on any of
+  // its posters. Cause: the grid's card preview only ever resolves the first
+  // 9 posters it actually renders (previewPosters = episodes.slice(0, 9)), so
+  // a longer saga's remaining items were never asked about at all, and the
+  // shared "See All" grid has no slot-patching of its own to backfill one
+  // later -- it only ever renders whatever rating an item already carries.
+  it("resolves ratings for every item on the See All page, not just the grid's own 9-poster preview", async () => {
+    const MCU_EVENT_ID = "movie_mcu_infinity_saga";
+    const CAP_AMERICA_ID = "tt0458339"; // part 1, inside the grid's own preview
+    const CIVIL_WAR_ID = "tt3498820"; // part 10, past the grid's 9-poster preview
+    const ENDGAME_ID = "tt4154796"; // part 12, past the grid's 9-poster preview
+
+    const client = loadClient({ routes: batchRoute({ [CAP_AMERICA_ID]: 7.0, [CIVIL_WAR_ID]: 7.8, [ENDGAME_ID]: 8.4 }) });
+
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+    const cacheAfterGrid = client.get("_storylineRatingsCache");
+    assert.equal(cacheAfterGrid[CAP_AMERICA_ID], 7.0, "sanity check: the grid resolved part 1's rating");
+    assert.equal(CIVIL_WAR_ID in cacheAfterGrid, false, "sanity check: the grid never even asked about part 10");
+
+    let openedPreloaded = null;
+    client.set("openListDetailsPage", (name, type, url, preloaded) => { openedPreloaded = preloaded; });
+    await client.call("openStorylineDetails", MCU_EVENT_ID);
+
+    assert.ok(openedPreloaded, "openListDetailsPage was called");
+    assert.equal(openedPreloaded.sample.length, 12);
+    const byId = Object.fromEntries(openedPreloaded.sample.map((it) => [it.id, it]));
+    assert.equal(byId[CAP_AMERICA_ID].vote_average, 7.0, "a rating the grid already resolved carries straight through");
+    assert.equal(byId[CIVIL_WAR_ID].vote_average, 7.8, "resolved fresh before the See All page opens, despite being outside the grid's preview");
+    assert.equal(byId[ENDGAME_ID].vote_average, 8.4);
+  });
+});
+
+// The Storylines & Universes grid's own "Customize" button (loadStorylineToDraft,
+// 20_client-channel-builder.js) loads a saga's items into an editable draft
+// before adding it. Every list on Discover and in Search gets the same idea,
+// pointed at the Custom List Builder instead (loadListToCustomListDraft,
+// 21_client-custom-list-builder.js), since these lists are plain movie/show
+// catalogs rather than episode-level channel programming.
+describe("client: Customize button on Discover and Search lists", () => {
+  it("render5PosterListsFeed (Discover shelves, Popular Lists, Liked Lists) gives every card a Customize button", () => {
+    const client = loadClient();
+    const doc = client.window.document;
+    const container = doc.createElement("div");
+    client.call("render5PosterListsFeed", container, [
+      { name: "Trending Now", url: "https://mdblist.com/lists/a/trending", type: "movie", user: "MDBList", likes: 3 },
+    ]);
+    assert.match(container.innerHTML, /customizeListBtn/, "card has a Customize button");
+    assert.match(container.innerHTML,
+      /customizeListBtn" data-name="Trending Now" data-url="https:\/\/mdblist\.com\/lists\/a\/trending" data-type="movie"/,
+      "Customize button carries the same name\\/url\\/type as the Add button");
+  });
+
+  it("buildCuratedRecommendationCard (Discover's Curated tab) gives its card a Customize button", () => {
+    const client = loadClient();
+    const html = client.call("buildCuratedRecommendationCard", "Recommended Movies", "movie", "custom:curated:recommended-movies", "Based on your watch history", []);
+    assert.match(html, /customizeListBtn" data-name="Recommended Movies" data-url="custom:curated:recommended-movies" data-type="movie"/);
+  });
+
+  it("renderListSearchResults (the Search tab's list search) gives every result a Customize button", () => {
+    const client = loadClient();
+    const doc = client.window.document;
+    const box = doc.createElement("div");
+    client.call("renderListSearchResults", [{ url: "https://mdblist.com/lists/a/b", name: "Some List", type: "movie", items: 12, likes: 1 }], [], null, [], [], box, "");
+    assert.match(box.innerHTML, /customizeListBtn" data-name="Some List" data-url="https:\/\/mdblist\.com\/lists\/a\/b" data-type="movie"/);
+  });
+
+  const PREVIEW = "/api/preview";
+  function previewRoute(moviesByType) {
+    return {
+      [PREVIEW]: (req) => {
+        const t = req.body.type;
+        const sample = moviesByType[t] || [];
+        return { json: { ok: true, count: sample.length, totalItems: sample.length, sample: sample } };
+      },
+    };
+  }
+
+  it("loadListToCustomListDraft loads a movie list's preview into an editable draft, not an immediate save", async () => {
+    const client = loadClient({
+      routes: previewRoute({
+        movie: [
+          { id: "tt1000001", type: "movie", name: "Movie One", poster: "https://img.example/1.jpg", year: "2020" },
+          { id: "tt1000002", type: "movie", name: "Movie Two", poster: "https://img.example/2.jpg", year: "2021" },
+        ],
+      }),
+    });
+    await client.call("loadListToCustomListDraft", "My Copied List", "https://mdblist.com/lists/a/movies", "movie", null);
+
+    const items = client.get("customListDraftItems");
+    assert.equal(items.length, 2);
+    assert.equal(items[0].imdbId, "tt1000001");
+    assert.equal(items[0].title, "Movie One");
+    assert.equal(items[0].year, "2020");
+    assert.equal(client.get("customListDraftType"), "movie");
+    assert.equal(client.get("customListDraftListId"), null, "a fresh draft, not tied to any existing saved list");
+    assert.equal(client.document.getElementById("customListNameInput").value, "My Copied List");
+  });
+
+  it("loadListToCustomListDraft marks the draft mixed when a list has both movies and shows", async () => {
+    const client = loadClient({
+      routes: previewRoute({
+        movie: [{ id: "tt2000001", type: "movie", name: "A Movie", poster: "p", year: "2019" }],
+        series: [{ id: "tt2000002", type: "series", name: "A Show", poster: "p", year: "2018" }],
+      }),
+    });
+    await client.call("loadListToCustomListDraft", "Mixed List", "https://mdblist.com/lists/a/mixed", "mixed", null);
+
+    const items = client.get("customListDraftItems");
+    assert.equal(items.length, 2);
+    assert.equal(client.get("customListDraftType"), "mixed");
+  });
+
+  it("loadListToCustomListDraft does not touch an existing saved list's identity", async () => {
+    const client = loadClient({
+      routes: previewRoute({ movie: [{ id: "tt3000001", type: "movie", name: "Solo", poster: "p", year: "2022" }] }),
+    });
+    client.set("customListDraftListId", "some-existing-id");
+    client.set("editingCustomListUrlInput", {});
+    await client.call("loadListToCustomListDraft", "Fresh Copy", "https://mdblist.com/lists/a/solo", "movie", null);
+
+    assert.equal(client.get("customListDraftListId"), null,
+      "loading a Discover/Search list starts a brand new draft, never overwrites the list being edited");
+    assert.equal(client.get("editingCustomListUrlInput"), null);
+  });
 });
 
 describe("client: livePreviewPosterHtml Continue Watching older season badge suppression", () => {

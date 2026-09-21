@@ -6,6 +6,17 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ⭐ Customize button on Discover and Search lists
+
+- Every list card on Discover (all sub-tabs -- All, Movies, Shows, Popular Lists, Curated, Hidden Gems, Kids, Holidays, Genres) and in the Search tab's list search now has a **Customize** button alongside its **+ Add**, the same idea as the Storylines & Universes grid's own Customize button. Since these lists are plain movie/show catalogs rather than a saga's episode-level programming, it loads the list's items into the **Custom List Builder**'s editable draft instead of the Channel Builder -- add, remove, or reorder titles, then Save -- rather than immediately copying the list as-is the way **+ Add** or the existing "Copy to Custom List" buttons do (`loadListToCustomListDraft`, `21_client-custom-list-builder.js`).
+- Uses the same bounded preview fetch already filling each card's own poster strip (up to ~100 items per type), not an exhaustive full-list fetch -- a hand-edited draft is for curating a short list, and a shelf like TMDB Trending can run into the thousands.
+
+### 🐛 A saga's "See All" page showed no ratings past its first 9 posters
+
+- The Storylines & Universes grid's own card only ever resolves ratings for the first 9 posters it actually shows (`previewPosters = event.episodes.slice(0, 9)`); a longer saga's remaining items (Marvel's 12-movie Infinity Saga, past part 9) were never asked about at all. That was invisible on the grid itself, but the saga's "See All" page (`openStorylineDetails` -> `openListDetailsPage`) has no slot-patching of its own -- it only ever renders whatever rating an item already carries -- so every poster past the ninth showed no rating there either.
+- `openStorylineDetails` (`20_client-channel-builder.js`) now awaits every item's rating (reusing the grid's own cache, and resolving whatever isn't cached yet) before opening the "See All" page, so every poster carries its rating up front. `resolveStorylineRatings` now returns a Promise a caller can await, and tracks in-flight ids by their actual fetch Promise (not just a Set) so a caller needing every id waits on one someone else already started fetching instead of skipping it.
+- New test covers a 12-item saga specifically: the grid resolves parts 1-9, and opening its "See All" page resolves parts 10-12 fresh before the page opens.
+
 ### 🐛 Storylines & Universes rating badges were in the wrong place
 
 - **After the fix below made the badges visible, they showed up as a colored top-left overlay on the poster** -- inconsistent with every other poster tile in the app, which shows its rating as a plain inline star+number beside the year instead (Discover's own `loadPosterSlot`, `19_client-search-and-likes.js`, sharing the identical `list-card-mini-poster-tile` markup). The Channel Builder grid's rating slot (`renderStorylinesUniverseList`, `20_client-channel-builder.js`) moved out of the poster image wrapper and into the year line, and `applyStorylineRatingBadges` was simplified to always use `formatRatingSpanHtml` -- the same formatter, same placement, both Storylines surfaces and Discover now share.

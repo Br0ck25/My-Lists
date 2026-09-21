@@ -29,6 +29,99 @@ async function importCustomListFromLink(btn) {
   nameInput.value = '';
 }
 
+// The "Customize" button on a Discover/Search list card -- the same idea as
+// the Storylines & Universes grid's own Customize button (loadStorylineToDraft,
+// 20_client-channel-builder.js), which loads a saga's items into an editable
+// draft instead of adding it as-is. Every list in the app is really just
+// movies or shows (unlike a saga, which is built episode by episode for the
+// Channel Builder), so this loads straight into the Custom List draft instead
+// -- add, remove, reorder, then Save -- rather than copyListToCustomList's
+// immediate "fetch everything and save now" (used by the plain "+ Add"
+// button and the My Lists/Search Lists "Copy to Custom List" buttons).
+//
+// Uses the bounded preview fetch (fetchPreviewForSlot, up to ~100 items per
+// type -- the same one already filling this card's own poster strip), not
+// copyListToCustomList's exhaustive fetchAllItemsForList: a hand-edited draft
+// is for curating a short list, and a shelf like TMDB Trending can run into
+// the thousands.
+async function loadListToCustomListDraft(name, listUrl, contentType, btn) {
+  const originalText = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Loading items…';
+  }
+  try {
+    const isSingle = contentType === 'movie' || contentType === 'series';
+    const typesToFetch = isSingle ? [contentType] : ['movie', 'series'];
+    const allItems = [];
+    let hasMovies = false;
+    let hasShows = false;
+
+    for (const type of typesToFetch) {
+      let result = null;
+      try {
+        result = await fetchPreviewForSlot(listUrl, type);
+      } catch (e) {
+        continue;
+      }
+      const sample = (result && result.ok && Array.isArray(result.sample)) ? result.sample : [];
+      if (!sample.length) continue;
+      if (type === 'movie') hasMovies = true;
+      if (type === 'series') hasShows = true;
+      sample.forEach((it) => {
+        allItems.push({
+          id: it.id || undefined,
+          imdbId: it.imdbId || (String(it.id || '').startsWith('tt') ? it.id : ''),
+          tmdbId: it.tmdbId || '',
+          title: it.name || it.title || '',
+          year: it.year || '',
+          poster: it.poster || null,
+          type: type,
+        });
+      });
+    }
+
+    if (!allItems.length) {
+      if (typeof showAppAlert === 'function') {
+        showAppAlert('Customize List', 'Could not load items for this list.');
+      } else {
+        alert('Could not load items for this list.');
+      }
+      return;
+    }
+
+    editingCustomListUrlInput = null;
+    editingCreatorListSlug = null;
+    editingLocalCustomListSlug = null;
+    customListDraftListId = null;
+    customListDraftItems = allItems;
+    customListDraftType = (hasMovies && hasShows) ? 'mixed' : (hasShows ? 'series' : 'movie');
+    updateCustomListTypeRadio(customListDraftType);
+    setCustomListDraftVisibility('private');
+
+    const nameInput = document.getElementById('customListNameInput');
+    if (nameInput) nameInput.value = name || '';
+
+    renderCustomListDraftList();
+    updateCustomListSaveButtonLabel();
+
+    switchTab('lists');
+    if (typeof switchListsSubmenu === 'function') switchListsSubmenu('create-list');
+    const panel = document.getElementById('listsSubCreateList');
+    if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (err) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Customize List', 'Error loading list: ' + (err.message || err));
+    } else {
+      alert('Error loading list: ' + (err.message || err));
+    }
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+}
+
 const customListSearchBox = document.getElementById('customListSearchResult');
 if (customListSearchBox) {
   customListSearchBox.addEventListener('click', (e) => {
