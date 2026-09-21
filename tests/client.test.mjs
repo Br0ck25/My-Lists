@@ -4855,6 +4855,394 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
   });
 });
 
+// --- Quick Add network channels: the saved row must stay usable on its own -
+//
+// quickAddChannel saves a Quick Add channel's real weight (up to
+// CHANNEL_POOL_MAX_ITEMS episodes) only in the shared server cache, and
+// writes a small presetNetworkId POINTER into the catalog row -- see that
+// constant's own comment (20_client-channel-builder.js) for the full design.
+// The first version of that pointer carried NO items of its own at all, on
+// the theory that channelSourceItems (05_catalog-core.js) would always
+// resolve the real pool server-side. That missed something: a long list of
+// OTHER places in this codebase read a channel row's own `.items` directly,
+// as a local shortcut, entirely independent of that server resolution --
+// ensureAllChannelsSyncedFromRows/renderMyCreatedChannelsList (the "My
+// Channels" list) and openListDetailsPage's local-preview path ("See All")
+// among them. An empty-items pointer left every one of those rendering a
+// broken 0-episode channel the moment this browser's own copy of the full
+// pool was not available (a different device, cleared storage, or -- the
+// case that actually surfaces this from real use -- saveLocalChannelsMap's
+// own quota fallback losing the write entirely once several 5,000-item
+// channels together exceed what this browser's localStorage will hold).
+// These tests hold the fix to that: the row always carries a real, small
+// sample alongside its pointer, so every one of those local-only readers
+// keeps working even when this browser has never seen the full pool at all.
+describe("client: a Quick Add channel row stays usable without its local copy", () => {
+  function fakeInput(value) {
+    return { value, dataset: {} };
+  }
+  function fakeEntry(name, url, type) {
+    return {
+      dataset: {}, style: {},
+      querySelector(sel) {
+        if (sel === ".name") return fakeInput(name);
+        if (sel === ".type") return fakeInput(type);
+        if (sel === ".url") return fakeInput(url);
+        return null;
+      },
+      querySelectorAll(sel) { return sel === ".url" ? [fakeInput(url)] : []; },
+    };
+  }
+  function withRows(client, rows) {
+    const entries = rows.map((r) => fakeEntry(r.name, r.url, r.type));
+    const doc = client.get("document");
+    const lists = doc.getElementById("lists");
+    lists.querySelectorAll = (sel) => (sel === ".entry" ? entries : []);
+    doc.querySelectorAll = (sel) => (sel === "#lists .entry" ? entries : []);
+    return entries;
+  }
+  function presetItems(n, tag) {
+    return Array.from({ length: n }, (_, i) => ({
+      kind: "episode", imdbId: "tt" + tag + i, season: 1, episode: i + 1,
+      showName: tag + " Show", epName: "Ep " + i, title: "t", released: "2024-01-01",
+    }));
+  }
+
+  it("quickAddChannel's saved row carries a real, non-empty items sample -- not just the pointer", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel-preset": () => ({
+          json: { ok: true, channel: { name: "TNT", poster: "p", backdrop: "b", items: presetItems(4000, "TNT"), shuffle: false, dailyRotate: true } },
+        }),
+      },
+    });
+    const addedRows = [];
+    client.set("addRow", (name, url) => { addedRows.push({ name, url }); });
+
+    await client.call("quickAddChannel", "TNT", null, "41", null, null);
+
+    assert.equal(addedRows.length, 1, "must save exactly one catalog row");
+    const payload = JSON.parse(addedRows[0].url.slice("channel:v1:".length));
+    assert.equal(payload.presetNetworkId, "41");
+    assert.ok(Array.isArray(payload.items) && payload.items.length > 0,
+      "the saved row must not be an empty pointer -- every local-only reader depends on this");
+    assert.ok(payload.items.length < 4000,
+      "the saved row's sample must stay small -- the full 4000-item pool belongs in the server cache, not the row");
+
+    // The LOCAL copy (My Channels editor) is unaffected -- it still gets the
+    // real, full pool, exactly as before this whole pointer design existed.
+    const local = client.call("loadLocalChannels");
+    const localChannel = Object.values(local).find((c) => c.name === "TNT");
+    assert.equal(localChannel.items.length, 4000);
+    // presetNetworkId rides along on the local copy too, not just the row's
+    // pointer -- channelsForCloudSync (22_client-creator-profile.js) needs it
+    // there to recognize this channel's pool already lives in the shared
+    // server cache and skip re-uploading it whole to this account's cloud
+    // channels blob.
+    assert.equal(localChannel.presetNetworkId, "41");
+  });
+
+  it("a channel row reconstructed from scratch (this browser never had a local copy) still shows real episodes, not zero", () => {
+    const client = loadClient({});
+    // Simulates exactly what quickAddChannel now saves: a pointer plus its
+    // own small sample -- and simulates a browser that never got (or lost)
+    // this channel's full local copy, so ensureAllChannelsSyncedFromRows has
+    // to build the local record from the row alone.
+    const pointerPayload = {
+      channelId: "ch-tnt", name: "TNT", poster: "p", backdrop: "b",
+      items: presetItems(50, "TNT"), presetNetworkId: "41",
+      shuffle: false, dailyRotate: true, liveSync: false, sourceUrl: "",
+    };
+    withRows(client, [{ name: "TNT", url: "channel:v1:" + JSON.stringify(pointerPayload), type: "series" }]);
+
+    const synced = client.call("ensureAllChannelsSyncedFromRows", client.call("loadLocalChannels"));
+    assert.equal(synced["ch-tnt"].items.length, 50,
+      "must reconstruct a real sample from the row, not an empty channel");
+    assert.equal(synced["ch-tnt"].name, "TNT");
+  });
+
+  it("backfills presetNetworkId onto a local record an older reconstruction already created without it -- otherwise it can never self-heal", () => {
+    const client = loadClient({});
+    // A record shaped exactly like what ensureAllChannelsSyncedFromRows used
+    // to save before presetNetworkId existed on its reconstruction branch --
+    // stuck at the pointer's sample size, with no network id to resolve
+    // against. This function only ever fills in a MISSING record; an
+    // existing one (like this) previously kept winning forever, which left
+    // resolveThinPresetChannels with nothing to find and repair it with.
+    const poisoned = {
+      channelId: "ch-old", name: "TNT", poster: "p", backdrop: "b",
+      items: presetItems(50, "TNT"), shuffle: false, dailyRotate: true,
+      order: 0, createdAt: 1, updatedAt: 1,
+      // no presetNetworkId
+    };
+    client.call("saveLocalChannelsMap", { "ch-old": poisoned });
+
+    const pointerPayload = {
+      channelId: "ch-old", name: "TNT", poster: "p", backdrop: "b",
+      items: presetItems(50, "TNT"), presetNetworkId: "41",
+      shuffle: false, dailyRotate: true, liveSync: false, sourceUrl: "",
+    };
+    withRows(client, [{ name: "TNT", url: "channel:v1:" + JSON.stringify(pointerPayload), type: "series" }]);
+
+    const synced = client.call("ensureAllChannelsSyncedFromRows", client.call("loadLocalChannels"));
+    assert.equal(synced["ch-old"].presetNetworkId, "41",
+      "the row still carries presetNetworkId -- an existing local record missing it must get it backfilled");
+  });
+});
+
+// Quick Add channels' full pools (up to 5,000 items) are kept in full in
+// this browser's own copy for the My Channels editor -- but that same full
+// copy used to also ride whole into this account's cloud channels sync
+// blob (pushChannelsSync), which has its own, much smaller cap (24MB,
+// /api/creator/sync/save-channels). A handful of these pools crosses it
+// easily, and the save then fails silently: this account's channels stop
+// syncing across devices, and worse, the very next pull down
+// (loadCreatorSync, on a background poll, a tab switch, a reload) used to
+// unconditionally overwrite this device's richer local state with whatever
+// stale, smaller copy the server was still holding -- reported live as "a
+// deleted channel comes right back" and "some channels only show 50
+// items". This suite covers the three pieces of the fix: the cloud push no
+// longer carries a preset-backed channel's full pool, a stale pull can no
+// longer clobber local state newer than what the server actually has, and
+// a channel left thin by either of those quietly resolves itself back to
+// the real pool without losing whatever the user customized on it.
+describe("client: Quick Add channel cloud sync stays small, and never shrinks what's on screen", () => {
+  function presetItems(n, tag) {
+    return Array.from({ length: n }, (_, i) => ({
+      kind: "episode", imdbId: "tt" + tag + i, season: 1, episode: i + 1,
+      showName: tag + " Show", epName: "Ep " + i, title: "t", released: "2024-01-01",
+    }));
+  }
+
+  it("channelsForCloudSync slims a preset-backed channel's pool for the cloud, and leaves a hand-built channel untouched", () => {
+    const client = loadClient({});
+    const sampleSize = client.get("CHANNEL_POINTER_SAMPLE_ITEMS");
+    const map = {
+      "ch-preset": { channelId: "ch-preset", name: "TNT", presetNetworkId: "41", items: presetItems(4000, "TNT") },
+      "ch-handbuilt": { channelId: "ch-handbuilt", name: "My Mix", presetNetworkId: "", items: presetItems(800, "MIX") },
+    };
+    const slimmed = client.call("channelsForCloudSync", map);
+    assert.equal(slimmed["ch-preset"].items.length, sampleSize,
+      "a preset-backed channel's full pool already lives in the shared server cache -- the cloud blob only needs a sample");
+    assert.equal(slimmed["ch-handbuilt"].items.length, 800,
+      "a hand-built channel has no other durable copy anywhere -- it must stay full");
+    // The local map itself must not be mutated by building the cloud payload.
+    assert.equal(map["ch-preset"].items.length, 4000);
+  });
+
+  it("loadCreatorSync does not let a same-or-older channels stamp overwrite this device's local channels", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+      routes: {
+        "/api/creator/sync/load": () => ({
+          json: {
+            ok: true,
+            data: {
+              config: [],
+              updatedAt: 100,
+              channelsUpdatedAt: 500,
+              channels: { "ch-server": { channelId: "ch-server", name: "Stale Copy", items: presetItems(50, "STALE") } },
+            },
+          },
+        }),
+        "/api/creator/sync/save": () => ({ json: { ok: true, updatedAt: 200 } }),
+        "/api/creator/sync/save-tracking": () => ({ json: { ok: true } }),
+        "/api/creator/lists": () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "testuser", displayName: "Test User" });
+    // This device already knows this exact stamp -- its own last channels
+    // push (e.g. deleting a channel, or adding one) never landed, most
+    // likely because the full local pool it tried to send crossed the
+    // cloud blob's 24MB cap.
+    client.set("_serverChannelsUpdatedAt", 500);
+
+    client.call("saveLocalChannelsMap", { "ch-local": { channelId: "ch-local", name: "Fresh Local", items: presetItems(4000, "FRESH") } });
+
+    await client.call("loadCreatorSync");
+
+    const after = client.call("loadLocalChannels");
+    assert.ok(after["ch-local"], "a local-only channel must survive a load that brought nothing actually newer");
+    assert.equal(after["ch-local"].items.length, 4000);
+    assert.ok(!after["ch-server"], "the stale server copy must not have been adopted");
+  });
+
+  it("loadCreatorSync DOES adopt synced.channels once the server's stamp is genuinely newer", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+      routes: {
+        "/api/creator/sync/load": () => ({
+          json: {
+            ok: true,
+            data: {
+              config: [],
+              updatedAt: 100,
+              channelsUpdatedAt: 700,
+              channels: { "ch-server": { channelId: "ch-server", name: "Newer From Server", items: presetItems(50, "NEW") } },
+            },
+          },
+        }),
+        "/api/creator/sync/save": () => ({ json: { ok: true, updatedAt: 200 } }),
+        "/api/creator/sync/save-tracking": () => ({ json: { ok: true } }),
+        "/api/creator/lists": () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "testuser", displayName: "Test User" });
+    client.set("_serverChannelsUpdatedAt", 500);
+    client.call("saveLocalChannelsMap", { "ch-local": { channelId: "ch-local", name: "Old Local", items: presetItems(4000, "OLD") } });
+
+    await client.call("loadCreatorSync");
+
+    const after = client.call("loadLocalChannels");
+    assert.ok(after["ch-server"], "a genuinely newer server state must still be adopted -- this isn't a one-way lock");
+    assert.equal(after["ch-server"].name, "Newer From Server");
+  });
+
+  it("a thin preset-backed channel (a cloud-synced sample, not the real pool) quietly resolves back to full without losing its customization", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel-preset": () => ({
+          json: { ok: true, channel: { name: "TNT", poster: "p2", backdrop: "b2", items: presetItems(4000, "TNT"), shuffle: false, dailyRotate: true } },
+        }),
+      },
+    });
+    const sampleSize = client.get("CHANNEL_POINTER_SAMPLE_ITEMS");
+    const thin = {
+      channelId: "ch-tnt", name: "TNT", poster: "p", backdrop: "b",
+      presetNetworkId: "41", items: presetItems(sampleSize, "TNT"),
+      dailyRotate: true, hideWatched: true, rotateShows: 24, rotateEpisodes: 3,
+    };
+    client.call("saveLocalChannelsMap", { "ch-tnt": thin });
+
+    client.call("renderMyCreatedChannelsList");
+    // resolveThinPresetChannels fires its fetch in the background rather
+    // than blocking the render -- give its .then() chain a couple of real
+    // ticks to land before checking the result.
+    await new Promise((r) => setTimeout(r, 20));
+
+    const after = client.call("loadLocalChannels");
+    assert.equal(after["ch-tnt"].items.length, 4000,
+      "resolves the real pool instead of staying stuck at the sample size forever");
+    assert.equal(after["ch-tnt"].hideWatched, true,
+      "a customization the generic network preset knows nothing about must survive the upgrade");
+  });
+
+  it("editing and saving a preset-backed channel clears presetNetworkId, so a curated trim can never be overwritten back to the full preset", () => {
+    // channelSourceItems (05_catalog-core.js) always prefers presetNetworkId's
+    // generic network lineup over a channel's own items -- the saved
+    // catalog row already drops this field the moment a channel goes
+    // through saveChannel (nothing in that payload writes it back), so a
+    // user's edit already took effect for real playback even before this
+    // fix. What was missing was the LOCAL copy agreeing: without this,
+    // trimming a Quick Add channel down to a small curated set left the
+    // local record still presetNetworkId-tagged, and resolveThinPresetChannels
+    // would silently blow the trim away the next time "My Channels" rendered.
+    const client = loadClient({});
+    client.call("saveLocalChannel", {
+      channelId: "ch-tnt", name: "TNT", presetNetworkId: "41", items: presetItems(4000, "TNT"),
+    });
+    client.call("editChannelById", "ch-tnt");
+    client.get("document").getElementById("channelNameInput").value = "TNT";
+    // Simulates the user having trimmed the draft down to a small, deliberately curated set.
+    client.set("channelDraftItems", presetItems(12, "CURATED"));
+    client.call("saveChannel");
+
+    const saved = client.call("loadLocalChannels")["ch-tnt"];
+    assert.equal(saved.presetNetworkId, "", "must no longer be treated as the generic network channel");
+    assert.equal(saved.items.length, 12, "the curated trim, not the original pool, must be what's saved");
+
+    // And now that it's untagged, resolveThinPresetChannels must leave it alone
+    // even though it is well under the sample-size threshold.
+    client.call("renderMyCreatedChannelsList");
+    const stillCurated = client.call("loadLocalChannels")["ch-tnt"];
+    assert.equal(stillCurated.items.length, 12, "an untagged channel must never be resolved back to a network preset");
+  });
+
+  it("the catalog row's own Edit button never downgrades a richer local copy to the row's thin pointer sample", () => {
+    // A Quick Add channel's saved catalog row carries only a small pointer
+    // sample (quickAddChannel, this file) -- editChannel (the Edit button
+    // rendered inline on the catalog row itself, a different surface than
+    // editChannelById's My Channels card) used to read that row and save it
+    // straight into the local channels map unconditionally, which meant
+    // opening the editor from THIS button silently downgraded a Quick Add
+    // channel's real multi-thousand-item pool down to the row's sample --
+    // and saving from there made that loss permanent.
+    const client = loadClient({});
+    client.call("saveLocalChannel", {
+      channelId: "ch-tnt", name: "TNT", presetNetworkId: "41", items: presetItems(4000, "TNT"),
+    });
+    const sampleSize = client.get("CHANNEL_POINTER_SAMPLE_ITEMS");
+    const pointerPayload = {
+      channelId: "ch-tnt", name: "TNT", presetNetworkId: "41",
+      items: presetItems(sampleSize, "TNT"), dailyRotate: true,
+    };
+    const row = {
+      closest(sel) { return sel === ".source-row" ? this : null; },
+      querySelector(sel) { return sel === ".url" ? { value: "channel:v1:" + JSON.stringify(pointerPayload) } : null; },
+    };
+
+    client.call("editChannel", row);
+
+    const after = client.call("loadLocalChannels")["ch-tnt"];
+    assert.equal(after.items.length, 4000, "must keep the real pool, not fall back to the row's small sample");
+  });
+
+  it("channelRowUrl slims a preset-backed channel's row, and leaves a hand-built one's alone", () => {
+    const client = loadClient({});
+    const sampleSize = client.get("CHANNEL_POINTER_SAMPLE_ITEMS");
+    const preset = { channelId: "ch-preset", name: "TNT", presetNetworkId: "41", items: presetItems(4000, "TNT") };
+    const handBuilt = { channelId: "ch-mix", name: "My Mix", presetNetworkId: "", items: presetItems(800, "MIX") };
+
+    const presetPayload = JSON.parse(client.call("channelRowUrl", preset).slice("channel:v1:".length));
+    assert.equal(presetPayload.items.length, sampleSize);
+    assert.equal(presetPayload.presetNetworkId, "41");
+
+    const handBuiltPayload = JSON.parse(client.call("channelRowUrl", handBuilt).slice("channel:v1:".length));
+    assert.equal(handBuiltPayload.items.length, 800, "a hand-built channel has no other durable copy -- must stay full");
+  });
+
+  it("merging several full-pool Quick Add channels stays small, instead of reopening the too-large-to-save ceiling", () => {
+    // The exact scenario reported live: merging 9+ Quick Add network
+    // channels (each up to CHANNEL_POOL_MAX_ITEMS) into one combined
+    // catalog. mergeChannelsIntoRow and its siblings (toggleMergedChannelInCatalog,
+    // addChannelToMerge, removeChannelFromMerge, pruneChannelFromAllMerges)
+    // used to embed each member's FULL local copy -- quickAddChannel's own
+    // pointer discipline only ever protected that channel's OWN row, not
+    // what merging did with it afterward.
+    const client = loadClient({});
+    const addedRows = [];
+    client.set("addRow", (name, url) => { addedRows.push({ name, url }); });
+
+    const channelIds = [];
+    for (let i = 0; i < 9; i++) {
+      const id = "ch-net" + i;
+      channelIds.push(id);
+      client.call("saveLocalChannel", {
+        channelId: id, name: "Network " + i, presetNetworkId: "net" + i, items: presetItems(5000, "N" + i),
+      });
+    }
+
+    const doc = client.get("document");
+    const checkboxes = channelIds.map((id) => ({ dataset: { channelid: id } }));
+    doc.querySelectorAll = (sel) => (sel === "#channelMergeList .channelMergeCheck:checked" ? checkboxes : []);
+    doc.getElementById("channelMergeNameInput").value = "Combined";
+
+    client.call("mergeChannelsIntoRow");
+
+    assert.equal(addedRows.length, 1, "must add exactly one combined catalog row");
+    const totalBytes = Buffer.byteLength(addedRows[0].url, "utf8");
+    assert.ok(totalBytes < 200 * 1024,
+      "nine merged 5,000-item channels must stay well under the 10MB config ceiling -- got " + totalBytes + " bytes");
+    const lines = addedRows[0].url.split("\n");
+    assert.equal(lines.length, 9, "one line per merged channel");
+    lines.forEach((line) => {
+      const payload = JSON.parse(line.slice("channel:v1:".length));
+      assert.ok(payload.items.length <= client.get("CHANNEL_POINTER_SAMPLE_ITEMS"),
+        "each merged member must carry only its pointer sample, not its full pool");
+    });
+  });
+});
+
 describe("client: the Channel builder's interleaved play order", () => {
   function withDraft(items) {
     const client = loadClient({ routes: {} });

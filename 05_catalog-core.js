@@ -251,11 +251,11 @@ async function fetchMergedCatalog(urls, type, skip, keys) {
 
 // --- Channels (synthetic series stitched from hand-picked episodes/movies) -
 //
-// A Channel entry stores its whole payload directly in entry.url as
+// A Channel entry stores its payload directly in entry.url as
 // "channel:v1:<JSON>" -- built entirely client-side by the Channel builder
-// panel (search a show, pick episodes; search a movie, add it whole), so
-// once saved it's fully self-contained: no further TMDB lookups needed to
-// serve it. Two things read this payload:
+// panel (search a show, pick episodes; search a movie, add it whole), so a
+// hand-built channel is fully self-contained: no further TMDB lookups
+// needed to serve it. Two things read this payload:
 //  - fetchChannelCatalog (below) -- the catalog-row listing, which is just
 //    ONE tile (the channel itself, poster + name) like any other meta item.
 //  - buildChannelMeta (below) -- the full detail response with the actual
@@ -269,12 +269,33 @@ async function fetchMergedCatalog(urls, type, skip, keys) {
 // are always sequential (1, 1..N) regardless of source, purely so the
 // channel displays as one clean ordered list -- same as the reference
 // implementation this feature is modeled on.
+//
+// A Quick Add network channel is the one exception to "fully
+// self-contained": its payload carries `presetNetworkId` -- a pointer at
+// the shared, cron-prewarmed pool cached under
+// channel:preset:v2:<presetNetworkId> (buildNetworkChannelPreset,
+// 07_source-fetchers-tmdb-simkl.js) -- alongside a small
+// CHANNEL_POINTER_SAMPLE_ITEMS-item `items` sample of its own rather than
+// the full pool (up to CHANNEL_POOL_MAX_ITEMS, 5,000). That sample is not
+// an optimization to skip: a long list of places across this codebase read
+// a channel row's own `.items` directly as a local shortcut (the "My
+// Channels" list, "See All"'s local-preview path, and others), and a
+// pointer shipped with NO items at all left every one of those rendering a
+// broken 0-episode channel instead of falling back to something real.
+// channelSourceItems always prefers the full pool when it can reach the
+// cache, and falls back to this sample only if that lookup itself fails.
 function parseChannelPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
     if (!raw.startsWith("channel:v1:")) return null;
     const data = JSON.parse(raw.slice("channel:v1:".length));
-    return data && Array.isArray(data.items) ? data : null;
+    if (!data) return null;
+    if (Array.isArray(data.items)) return data;
+    // Defensive only: a well-formed pointer always carries its own sample
+    // (see quickAddChannel, 20_client-channel-builder.js) -- this covers a
+    // hand-edited or older-shaped row that has presetNetworkId but no items.
+    if (data.presetNetworkId) return data;
+    return null;
   } catch (e) {
     return null;
   }
@@ -834,10 +855,13 @@ function fetchChannelCatalog(entry, origin) {
     const payload = parseChannelPayload(rawUrl);
     // A dynamic channel (Next Up) deliberately stores no picks of its own --
     // its lineup is derived per request in buildChannelMeta -- so "no items"
-    // is not the same as "nothing to show" for one of those. The shelf tile
+    // is not the same as "nothing to show" for one of those. A Quick Add
+    // network channel (presetNetworkId set) is the same story for a
+    // different reason: its items live in the shared preset cache, not on
+    // this payload -- see parseChannelPayload's own comment. The shelf tile
     // here carries no episodes either way, only the channel's name and art.
     if (!payload) continue;
-    if (!payload.dynamic && (!payload.items || !payload.items.length)) continue;
+    if (!payload.dynamic && !payload.presetNetworkId && (!payload.items || !payload.items.length)) continue;
     const channelId = payload.channelId || entry.id;
     const name = payload.name || entry.name;
     
@@ -2902,13 +2926,33 @@ function mergeChannelNewEpisodes(stored, fresh, atTop) {
 
 // The pool a channel draws today's lineup from, before any ordering.
 //
-// Three shapes: a normal channel plays the picks stored on it; a dynamic
+// Four shapes: a normal channel plays the picks stored on it; a dynamic
 // channel (Next Up) has none and is re-derived per request from the
 // account's own tracking; a Live Cloud Sync channel prefers the pool the
-// Worker last rebuilt from the list it was imported from, and keeps its
-// stored picks as the fallback for before that first rebuild lands.
+// Worker last rebuilt from the list it was imported from, keeping its
+// stored picks as the fallback for before that first rebuild lands; and a
+// Quick Add network channel carries a presetNetworkId pointer alongside a
+// small (CHANNEL_POINTER_SAMPLE_ITEMS) sample of its own -- see
+// parseChannelPayload's own comment for why that sample exists at all. The
+// real pool always wins when it is reachable: resolved from the shared,
+// cron-prewarmed cache right here, before any of the other three shapes get
+// a chance to run, with the small sample as the fallback for the rare case
+// the cache lookup itself fails (env not wired through, or a genuine outage).
 async function channelSourceItems(payload, opts) {
-  const stored = Array.isArray(payload.items) ? payload.items : [];
+  let stored = Array.isArray(payload.items) ? payload.items : [];
+  if (payload.presetNetworkId && opts && opts.env) {
+    try {
+      const preset = await buildNetworkChannelPreset(
+        String(payload.presetNetworkId),
+        payload.name || "TV Channel",
+        opts.origin || CHANNEL_PRESET_PREWARM_ORIGIN,
+        { env: opts.env, ctx: opts.ctx }
+      );
+      if (preset && preset.ok && preset.channel && Array.isArray(preset.channel.items) && preset.channel.items.length) {
+        stored = preset.channel.items;
+      }
+    } catch (e) {}
+  }
   if (payload.dynamic === "next-up") {
     // The live answer when there is one, and the seed the builder stored
     // otherwise.
@@ -3045,6 +3089,11 @@ async function buildChannelMeta(entry, origin, opts = {}) {
   // identity -- see the same note in fetchChannelCatalog above.
   const channelId = payload.channelId || entry.id;
   const name = payload.name || entry.name;
+  // channelSourceItems needs origin (to resolve a Quick Add channel's
+  // presetNetworkId pointer) but only ever sees `opts`, not this function's
+  // own separate `origin` param -- normalized here once rather than trusting
+  // every caller to duplicate it into opts.origin themselves.
+  if (!opts.origin) opts = Object.assign({}, opts, { origin });
   const lineup = await resolveChannelLineup(payload, opts);
   if (!lineup) return null;
   const items = lineup.items;

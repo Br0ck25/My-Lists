@@ -1983,136 +1983,27 @@ function generateSearchVariations(query) {
       const name = url.searchParams.get("name") || "TV Channel";
       if (!networkId) return json({ ok: false, error: "Missing networkId." }, 400);
 
-      const cacheKey = `channel:preset:v2:${networkId}`;
-      try {
-        if (env && env.CONFIGS) {
-          const cached = await env.CONFIGS.get(cacheKey);
-          if (cached) {
-            const parsed = JSON.parse(cached);
-            if (parsed && Array.isArray(parsed.items) && parsed.items.length) {
-              return json({ ok: true, channel: parsed }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
-            }
-          }
-        }
-      } catch (e) {}
-
-      try {
-        const discoverRes = await fetch(
-          `https://api.themoviedb.org/3/discover/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
-            `&with_networks=${encodeURIComponent(networkId)}&sort_by=popularity.desc&page=1&include_adult=false`,
-          { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
-        );
-        if (!discoverRes.ok) return json({ ok: false, error: "TMDB network request failed." }, 502);
-        const discoverData = await discoverRes.json();
-        let topShows = (discoverData.results || []).slice(0, 10);
-        const nameLower = name.toLowerCase();
-        if (!topShows.length) {
-          if (nameLower.includes("metv")) {
-            topShows = [{ id: 4607 }, { id: 735 }, { id: 1403 }, { id: 2098 }, { id: 2287 }, { id: 873 }, { id: 253 }, { id: 914 }, { id: 2101 }, { id: 2289 }, { id: 2099 }, { id: 2100 }, { id: 2344 }, { id: 2103 }];
-          } else if (nameLower.includes("food")) {
-            topShows = [{ id: 2382 }, { id: 17855 }, { id: 62326 }, { id: 2383 }, { id: 63278 }, { id: 44006 }, { id: 11822 }, { id: 67070 }];
-          } else if (nameLower.includes("ion")) {
-            topShows = [{ id: 62741 }, { id: 1408 }, { id: 1418 }, { id: 4614 }, { id: 62688 }, { id: 2734 }];
-          }
-        }
-        if (!topShows.length) return json({ ok: false, error: "No shows found for that network." });
-
-        let networkLogo = null;
-        try {
-          const networkRes = await fetch(
-            `https://api.themoviedb.org/3/network/${encodeURIComponent(networkId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
-            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
-          );
-          if (networkRes.ok) {
-            const networkData = await networkRes.json();
-            if (networkData.logo_path) networkLogo = `${url.origin}/api/channel-logo?path=${encodeURIComponent(networkData.logo_path)}`;
-          }
-        } catch (e) {}
-
-        const allEpisodes = [];
-        let poster = networkLogo;
-        let backdrop = null;
-
-        const assembleFromShows = async (showsList) => {
-          await mapWithConcurrency(showsList, 4, async (show) => {
-            if (allEpisodes.length >= 200) return;
-            try {
-              const showRes = await fetch(
-                `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
-                { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
-              );
-              if (!showRes.ok) return;
-              const fullShow = await showRes.json();
-              const imdbId = (fullShow.external_ids && fullShow.external_ids.imdb_id) || fullShow.imdb_id || (`tmdb:${show.id}`);
-
-              if (!poster && fullShow.poster_path) poster = `https://image.tmdb.org/t/p/w500${fullShow.poster_path}`;
-              if (!backdrop && fullShow.backdrop_path) backdrop = `https://image.tmdb.org/t/p/w780${fullShow.backdrop_path}`;
-
-              const showPosterUrl = fullShow.poster_path ? `https://image.tmdb.org/t/p/w500${fullShow.poster_path}` : "";
-              const validSeasons = (fullShow.seasons || []).filter((s) => s.season_number > 0).slice(0, 3);
-
-              for (const s of validSeasons) {
-                if (allEpisodes.length >= 200) break;
-                const sRes = await fetch(
-                  `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}/season/${s.season_number}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
-                  { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
-                );
-                if (!sRes.ok) continue;
-                const sData = await sRes.json();
-                for (const ep of (sData.episodes || [])) {
-                  if (allEpisodes.length >= 200) break;
-                  const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
-                  allEpisodes.push({
-                    kind: "episode",
-                    imdbId: imdbId,
-                    season: s.season_number,
-                    episode: ep.episode_number,
-                    showName: fullShow.name || show.name || "",
-                    epName: ep.name || (`Episode ${ep.episode_number}`),
-                    title: `${fullShow.name || show.name} S${s.season_number}E${ep.episode_number} \u2014 ${ep.name || (`Episode ${ep.episode_number}`)}`,
-                    released: ep.air_date || "",
-                    thumbnail: stillUrl || showPosterUrl,
-                    poster: showPosterUrl || stillUrl,
-                    showPoster: showPosterUrl,
-                  });
-                }
-              }
-            } catch (e) {}
-          });
-        };
-
-        await assembleFromShows(topShows);
-
-        if (!allEpisodes.length && (nameLower.includes("metv") || nameLower.includes("food") || nameLower.includes("ion"))) {
-          let fallbackShows = [];
-          if (nameLower.includes("metv")) {
-            fallbackShows = [{ id: 4607 }, { id: 735 }, { id: 1403 }, { id: 2098 }, { id: 2287 }, { id: 873 }, { id: 253 }, { id: 914 }, { id: 2101 }, { id: 2289 }, { id: 2099 }, { id: 2100 }, { id: 2344 }, { id: 2103 }];
-          } else if (nameLower.includes("food")) {
-            fallbackShows = [{ id: 2382 }, { id: 17855 }, { id: 62326 }, { id: 2383 }, { id: 63278 }, { id: 44006 }, { id: 11822 }, { id: 67070 }];
-          } else if (nameLower.includes("ion")) {
-            fallbackShows = [{ id: 62741 }, { id: 1408 }, { id: 1418 }, { id: 4614 }, { id: 62688 }, { id: 2734 }];
-          }
-          await assembleFromShows(fallbackShows);
-        }
-
-        if (!allEpisodes.length) return json({ ok: false, error: "Could not assemble episodes for this network." });
-
-        const channelPayload = {
-          name: name,
-          poster: poster || (url.origin + "/icon.png"),
-          backdrop: backdrop || poster || (url.origin + "/icon.png"),
-          items: allEpisodes,
-          shuffle: false,
-          dailyRotate: true,
-        };
-
-        if (env && env.CONFIGS && ctx && typeof ctx.waitUntil === "function") {
-          ctx.waitUntil(env.CONFIGS.put(cacheKey, JSON.stringify(channelPayload), { expirationTtl: 86400 }));
-        }
-        return json({ ok: true, channel: channelPayload }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
-      } catch (err) {
-        return json({ ok: false, error: err.message || "Failed to build network channel preset." }, 500);
-      }
+      // The build itself (TMDB discover -> up to ~200 candidate shows -> up
+      // to 3 seasons each, capped at CHANNEL_POOL_MAX_ITEMS (5,000) episodes,
+      // cached 24h under channel:preset:v2:<networkId>) is shared with the
+      // daily cron prewarm (prewarmChannelPresets,
+      // 07_source-fetchers-tmdb-simkl.js) so a Quick Add click almost always
+      // hits that warm cache rather than paying for a live build. What comes
+      // back here is the FULL pool -- the client only embeds a small pointer
+      // to it in the saved catalog row (see quickAddChannel,
+      // 20_client-channel-builder.js), not this whole response.
+      const result = await buildNetworkChannelPreset(networkId, name, url.origin, { env, ctx });
+      if (!result.ok) return json({ ok: false, error: result.error }, result.status || 200);
+      // no-store, not the usual max-age=3600 default: the KV cache this
+      // reads from (channel:preset:v2:<networkId>, 24h TTL) is already the
+      // caching layer, invalidated instantly by the admin Channel Presets
+      // tab's Clear/Rebuild buttons. A public, 24h Cache-Control on top of
+      // that used to let a browser (or a shared/CDN cache, from "public")
+      // keep replaying a stale response -- including a pre-fix 200-episode
+      // build from long before this endpoint's pool cap was raised to
+      // CHANNEL_POOL_MAX_ITEMS -- for up to a full day after an admin
+      // rebuild, no matter how fresh the KV entry actually was.
+      return json({ ok: true, channel: result.channel }, 200, { "Cache-Control": "no-store" });
     }
 
     // /api/channel-lineup  (POST)  { url, watchHistory?, continueWatching? }

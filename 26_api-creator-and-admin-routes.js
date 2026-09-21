@@ -6906,6 +6906,104 @@
       }
     }
 
+    // --- Channel presets: the shared, cron-prewarmed pool behind every Quick
+    // Add network channel (channel:preset:v2:<networkId>, buildNetworkChannelPreset
+    // in 07_source-fetchers-tmdb-simkl.js) -- 24h-TTL'd, so a cache built under
+    // an older version of that function keeps serving its old shape (item
+    // count, fields) until the daily cron rotation reaches it again, which can
+    // take a few hours. These three routes are the point-and-click way to see
+    // that state and force it fresh right now, without waiting.
+
+    // /admin/api/channel-presets -> status of all CHANNEL_PRESET_NETWORKS.
+    if (path === "/admin/api/channel-presets" && request.method === "GET") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      try {
+        const networks = await Promise.all(CHANNEL_PRESET_NETWORKS.map(async (net) => {
+          let cached = false;
+          let itemCount = 0;
+          let builtAt = null;
+          try {
+            const raw = await env.CONFIGS.get(`channel:preset:v2:${net.id}`);
+            if (raw) {
+              const parsed = JSON.parse(raw);
+              if (parsed && Array.isArray(parsed.items)) {
+                cached = true;
+                itemCount = parsed.items.length;
+                builtAt = Number.isFinite(parsed.builtAt) ? parsed.builtAt : null;
+              }
+            }
+          } catch (e) {}
+          return { id: net.id, name: net.name, cached, itemCount, builtAt };
+        }));
+        return json({ ok: true, networks }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/channel-presets/clear  { networkId }  or  { all: true }
+    // -> deletes the cached preset(s). The very next Quick Add click (or the
+    // next time the cron rotation reaches that network) rebuilds it fresh --
+    // this never touches anyone's already-saved catalog rows, which carry
+    // their own small item sample as a fallback (see CHANNEL_POINTER_SAMPLE_ITEMS,
+    // 20_client-channel-builder.js) and keep working regardless.
+    if (path === "/admin/api/channel-presets/clear" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (e) {
+        body = {};
+      }
+      const clearAll = body && body.all === true;
+      const targets = clearAll
+        ? CHANNEL_PRESET_NETWORKS
+        : CHANNEL_PRESET_NETWORKS.filter((net) => net.id === String((body && body.networkId) || "").trim());
+      if (!targets.length) return json({ ok: false, error: "Unknown network." }, 400);
+      try {
+        await Promise.all(targets.map((net) => env.CONFIGS.delete(`channel:preset:v2:${net.id}`)));
+        return json({ ok: true, cleared: targets.map((net) => net.id) }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
+    // /admin/api/channel-presets/rebuild  { networkId }
+    // -> forces one network's cache fresh right now, same build
+    // buildNetworkChannelPreset always does on a cold cache -- this just
+    // skips waiting for the cron rotation or the next real Quick Add click.
+    // One network at a time (not "rebuild all"): a single network can mean
+    // dozens of TMDB requests (up to CHANNEL_PRESET_DISCOVER_PAGES pages of
+    // shows, then seasons for each), and doing that for all 28 in one HTTP
+    // request risks the request itself timing out.
+    if (path === "/admin/api/channel-presets/rebuild" && request.method === "POST") {
+      const authed = await isAdminRequest(request, env);
+      if (!authed) return json({ ok: false, error: "Not authorized." }, 401);
+      if (!env || !env.CONFIGS) return json({ ok: false, error: "no-kv" });
+      let body = {};
+      try {
+        body = await request.json();
+      } catch (e) {
+        body = {};
+      }
+      const net = CHANNEL_PRESET_NETWORKS.find((n) => n.id === String((body && body.networkId) || "").trim());
+      if (!net) return json({ ok: false, error: "Unknown network." }, 400);
+      try {
+        const result = await buildNetworkChannelPreset(net.id, net.name, url.origin, { env, ctx, forceRebuild: true });
+        if (!result.ok) return json({ ok: false, error: result.error }, result.status || 200);
+        return json({
+          ok: true,
+          network: { id: net.id, name: net.name, itemCount: result.channel.items.length, builtAt: result.channel.builtAt || null },
+        }, 200, { "Cache-Control": "no-store" });
+      } catch (err) {
+        return json({ ok: false, error: safeErrorMessage(err) });
+      }
+    }
+
     if (path === "/admin/login" && request.method === "POST") {
       if (!env || !env.ADMIN_KEY) {
         return new Response(
@@ -7277,6 +7375,11 @@ export default {
         streamingSweep,
         guard("bumpNewOnStreamingEpisodes", streamingSweep.then(() => bumpNewOnStreamingEpisodes(env, ctx, newOnStreamingBudget))),
         guard("prewarmSharedCatalogs", streamingSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
+        // One Quick Add network per tick (see prewarmChannelPresets,
+        // 07_source-fetchers-tmdb-simkl.js) -- independent of the streaming
+        // sweep chain above since it spends TMDB requests, not RapidAPI's
+        // capped quota, and has nothing to wait on.
+        guard("prewarmChannelPresets", prewarmChannelPresets(env, ctx)),
         // Cheap (one sqlite_master read per tick) and the only thing that puts
         // "you have not run migration N" somewhere an operator will see it
         // without going looking. The admin panel shows the same thing on

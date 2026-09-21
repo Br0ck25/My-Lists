@@ -728,6 +728,57 @@ describe("RapidAPI Streaming Availability sweep", () => {
     }
   });
 
+  // Regular ticks are not reconstructing history -- they are catching
+  // *today's* real-time episode/season drops, so they weight the 4-page
+  // budget toward `episode` (a second page there = 50 items/tick instead of
+  // 25, RapidAPI's own page size) rather than spreading it 70/20/10 the way
+  // a backfill does. A backfill (reset: true) must keep the old weighting,
+  // since it is reconstructing which titles exist at all.
+  it("weights a regular tick's page budget toward episode changes, and keeps a backfill's show-heavy weighting", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+
+    // hasMore: true on every page (up to a generous cap) so the sweep only
+    // ever stops because it hit ITS OWN computed per-type budget, not
+    // because a no-data stub ran dry after page 1 -- that would make every
+    // type look identically page-starved regardless of the allocation math.
+    const countByType = () => {
+      const counts = {};
+      const net = stubRapidApi((url) => {
+        const u = new URL(url);
+        const itemType = u.searchParams.get("item_type");
+        if (!itemType) return { changes: [], shows: {}, hasMore: false };
+        counts[itemType] = (counts[itemType] || 0) + 1;
+        const more = counts[itemType] < 20;
+        return { changes: [], shows: {}, hasMore: more, nextCursor: more ? `cursor-${counts[itemType]}` : undefined };
+      });
+      return { net, counts };
+    };
+
+    const cookie = await adminCookie(env);
+
+    let { net, counts } = countByType();
+    try {
+      const regular = await sweep(env, cookie, 4, { reset: false, full: false });
+      assert.equal(regular.ran, true);
+      assert.equal(counts.episode, 2, "a regular tick must give episode a second page");
+      assert.equal(counts.show, 1);
+      assert.equal(counts.season, 1);
+    } finally {
+      net.restore();
+    }
+
+    ({ net, counts } = countByType());
+    try {
+      const backfill = await sweep(env, cookie, 10, { reset: true, full: true });
+      assert.equal(backfill.ran, true);
+      assert.ok(counts.show >= counts.episode, "a backfill must stay show-heavy, not episode-heavy");
+      assert.ok(counts.show >= counts.season, "a backfill must stay show-heavy, not episode-heavy");
+    } finally {
+      net.restore();
+    }
+  });
+
   it("filters out digital store buy/rent releases and preserves true subscription premiere date", async () => {
     const db = makeD1();
     const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
@@ -1009,6 +1060,81 @@ describe("RapidAPI Streaming Availability sweep", () => {
       assert.equal(row.event_kind, "episode");
       assert.equal(row.season, 1);
       assert.equal(row.episode, 5);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  // Regression test for the "A Love Other Than Yours" report: a show that
+  // fell behind 50 other, more-recently-active series must still get its
+  // episode bump. Under the old `ORDER BY last_event_at DESC LIMIT 50`
+  // selection, the 50 fresher fillers below would occupy every slot forever
+  // and the target would never once be selected for a TMDB check, however
+  // many ticks ran -- it would sit at its original arrival date permanently
+  // while MDBList (which does not have this ceiling) correctly showed it
+  // bumped to the new episode's air date.
+  it("still checks and bumps a series buried past the old top-50-by-recency window", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key" });
+    const cookie = await adminCookie(env);
+    const now = Math.floor(Date.now() / 1000);
+
+    for (let i = 1; i <= 50; i++) {
+      seedStreamingEvent(db, {
+        service: "netflix",
+        imdbId: `tt1000${String(i).padStart(3, "0")}`,
+        kind: "series",
+        at: now - i,
+        name: `Filler ${i}`,
+      });
+    }
+
+    const staleAt = now - 20 * 86400; // 20 days ago: stale, but inside the 30-day prune window
+    seedStreamingEvent(db, {
+      service: "primevideo",
+      imdbId: "tt9999999",
+      tmdbId: 500001,
+      kind: "series",
+      at: staleAt,
+      name: "A Love Other Than Yours",
+    });
+
+    const newEpisodeIso = new Date((now - 86400) * 1000).toISOString().slice(0, 10); // aired yesterday
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const urlStr = String(url);
+      if (urlStr.includes("/3/tv/500001")) {
+        return new Response(JSON.stringify({
+          id: 500001,
+          name: "A Love Other Than Yours",
+          last_episode_to_air: { air_date: newEpisodeIso, season_number: 1, episode_number: 6 },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return origFetch(url, opts);
+    };
+
+    // Simulate the rotating cursor having already walked past the 50 fresher
+    // shows on earlier ticks, exactly as it would after enough real
+    // 6-minute cron ticks -- this is the state the fix is meant to reach.
+    await env.CONFIGS.put("cron:newonstreaming:bumpcursor:US", "50");
+
+    try {
+      const res = await call(env, "/admin/api/new-on-streaming/sweep", {
+        method: "POST",
+        headers: { cookie },
+        json: { units: 1, manual: true, bump: true },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.ok, true, res.body.error);
+      assert.ok(res.body.bump);
+      assert.equal(res.body.bump.bumped, 1, "the buried show must still get checked and bumped");
+
+      const row = db._db.prepare("SELECT * FROM streaming_events WHERE imdb_id = 'tt9999999'").get();
+      assert.ok(row.last_event_at > staleAt, "last_event_at must move forward to the new episode");
+      assert.equal(row.event_kind, "episode");
+      assert.equal(row.season, 1);
+      assert.equal(row.episode, 6);
     } finally {
       globalThis.fetch = origFetch;
     }

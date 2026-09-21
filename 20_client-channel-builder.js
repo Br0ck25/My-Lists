@@ -682,11 +682,30 @@ function ensureAllChannelsSyncedFromRows(map) {
                   order: Number(payload.order) || 0,
                   createdAt: Date.now(),
                   updatedAt: Date.now(),
+                  presetNetworkId: payload.presetNetworkId || '',
                 };
                 modified = true;
-              } else if ((!map[chId].name || map[chId].name === 'Channel') && chName !== 'Channel') {
-                map[chId].name = chName;
-                modified = true;
+              } else {
+                if ((!map[chId].name || map[chId].name === 'Channel') && chName !== 'Channel') {
+                  map[chId].name = chName;
+                  modified = true;
+                }
+                // A local record built by an OLDER version of the branch
+                // above (before presetNetworkId existed here) is otherwise
+                // stuck this way forever: this function only ever fills in
+                // a MISSING record, never revisits one that already exists,
+                // so that old, incomplete record keeps winning every time.
+                // Without presetNetworkId, resolveThinPresetChannels has no
+                // network to re-fetch from and silently skips it on every
+                // render -- a channel stuck at its old pointer sample with
+                // no way back to its real pool. Backfilling it here, from
+                // the same row payload that already has it, is what lets
+                // the next render's resolveThinPresetChannels actually see
+                // and repair it.
+                if (!map[chId].presetNetworkId && payload.presetNetworkId) {
+                  map[chId].presetNetworkId = payload.presetNetworkId;
+                  modified = true;
+                }
               }
             }
           } catch (e) {}
@@ -721,6 +740,29 @@ function saveLocalChannel(payload) {
     order: Number(payload.order) || (existing ? Number(existing.order) : 0) || 0,
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now,
+    // Not read by anything that renders or plays this channel -- kept so
+    // pushChannelsSync (22_client-creator-profile.js) and
+    // resolveThinPresetChannels can tell this channel's full pool already
+    // lives durably in the shared channel:preset:v2:<networkId> cache and
+    // skip re-uploading it whole, or quietly refresh it from there.
+    //
+    // hasOwnProperty, not a plain payload.presetNetworkId || existing... --
+    // that fallback could never tell "the caller didn't mention this field"
+    // (resolveThinPresetChannels' own re-save, which should keep whatever
+    // this record already had) apart from "the caller explicitly cleared
+    // it" (saveChannel, the full editor's Save button, which never writes
+    // presetNetworkId at all once a channel has been through it -- the
+    // saved catalog row already drops it the same way, since editing a
+    // channel's picks is what makes it no longer "the generic network
+    // lineup"). Falling back to the old value in the second case is exactly
+    // how a deliberately trimmed-down edit -- say, curated to under 50
+    // picks -- got silently overwritten back to the full, unedited preset
+    // the next time this local copy looked thin: the row had already
+    // forgotten this was ever a preset channel, but this record's fallback
+    // kept insisting it still was.
+    presetNetworkId: Object.prototype.hasOwnProperty.call(payload, 'presetNetworkId')
+      ? (payload.presetNetworkId || '')
+      : (existing ? existing.presetNetworkId : '') || '',
   };
   saveLocalChannelsMap(map);
   return map[channelId];
@@ -751,7 +793,7 @@ function pruneChannelFromAllMerges(channelId) {
         if (row.dataset.mergedId === mergedId || (row.id && row.id === mergedId)) {
           const urls = merged.channelIds.map((id) => {
             const ch = channelsMap[id];
-            return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+            return ch ? channelRowUrl(ch) : null;
           }).filter(Boolean);
           const urlInput = row.querySelector('.url');
           if (urlInput) urlInput.value = urls.join('\\n');
@@ -862,8 +904,7 @@ function undoChannelDelete() {
   if (_pendingChannelUndoTimer) clearTimeout(_pendingChannelUndoTimer);
   saveLocalChannel(channel);
   if (inCatalogs) {
-    const payload = Object.assign({}, channel);
-    addRow(channel.name || 'Channel', 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channel.channelId);
+    addRow(channel.name || 'Channel', channelRowUrl(channel), 'series', true, 'Channels', channel.channelId);
     saveState();
   }
   renderChannelUndoBar();
@@ -1071,8 +1112,7 @@ function toggleChannelInCatalog(channelId) {
     renderChannelMergeList();
     showAddedToast('Removed "' + channel.name + '" from your Catalogs.');
   } else {
-    const url = 'channel:v1:' + JSON.stringify(channel);
-    addRow(channel.name, url, 'series', true, 'Channels', channelId);
+    addRow(channel.name, channelRowUrl(channel), 'series', true, 'Channels', channelId);
     renderMyCreatedChannelsList();
     renderChannelMergeList();
     showAddedToast('Added "' + channel.name + '" to your Catalogs.');
@@ -8939,6 +8979,17 @@ async function saveChannel() {
     // Worker on every request, and its picks have just been sorted for real
     // (see editChannelById) -- so the stored order is now the answer.
     sortByAired: false,
+    // Explicitly cleared (not just left out): channelSourceItems
+    // (05_catalog-core.js) always prefers presetNetworkId's generic network
+    // lineup over whatever items a channel's own row carries, so a Quick
+    // Add channel that still had this set after being edited here would
+    // have its picks silently ignored for actual playback -- the edit would
+    // look saved but never play. The saved row already forgot this field
+    // the moment it started going through this function (nothing above
+    // rebuilds it), so this just makes the local copy agree with what the
+    // row has always done -- see saveLocalChannel's own comment on why an
+    // explicit '' here, not an absence, is what keeps that copy in sync.
+    presetNetworkId: '',
     visibility: isPublic ? 'public' : 'private',
     sharePublished: isPublic,
     shareCode: existingChannel.shareCode || '',
@@ -9771,7 +9822,22 @@ function editChannel(btnOrRow) {
     return;
   }
   if (payload.channelId) {
-    saveLocalChannel(payload);
+    // The row's own payload is often just a pointer -- Quick Add's small
+    // CHANNEL_POINTER_SAMPLE_ITEMS sample, never the full pool (see
+    // quickAddChannel) -- so this must only create a local record when this
+    // browser doesn't have one yet, never overwrite a richer one that
+    // already exists. Unconditionally saving it here used to open the
+    // editor onto 50 episodes instead of a Quick Add channel's real
+    // thousands every time this specific Edit button (the one on the
+    // catalog row itself, not the one on the My Channels card -- see
+    // editChannelById for that one) was clicked, and hitting Save from
+    // there made the loss permanent. Same guard ensureAllChannelsSyncedFromRows
+    // already uses for the same reason.
+    const map = loadLocalChannels();
+    const existing = map[payload.channelId];
+    if (!existing || (payload.items || []).length > (existing.items || []).length) {
+      saveLocalChannel(payload);
+    }
     editChannelById(payload.channelId);
   } else {
     const channelId = generateChannelId();
@@ -10194,6 +10260,50 @@ function renderMyCreatedChannelsList() {
     '</div>';
   }).join('');
   initMyChannelsDrag();
+  resolveThinPresetChannels(shown);
+}
+
+// A Quick Add network channel's local copy can end up carrying only its
+// small CHANNEL_POINTER_SAMPLE_ITEMS sample instead of its real pool --
+// most often after this browser's own cloud sync pulls one down (see
+// channelsForCloudSync, 22_client-creator-profile.js: the sample is all
+// that ever goes up, since the full pool already lives durably in the
+// shared channel:preset:v2:<networkId> cache and doesn't need a second
+// copy per account). That keeps the cloud sync payload small, but it also
+// means a card can show 50 episodes for a channel that is actually a few
+// thousand. Since the real pool is one warm-cache request away, quietly
+// re-resolves it in the background and re-renders once it lands -- the
+// same self-healing pattern resolveMissingPostersInDom already uses for
+// posters missed at render time.
+let _thinPresetChannelsInFlight = null;
+function resolveThinPresetChannels(channels) {
+  if (!_thinPresetChannelsInFlight) _thinPresetChannelsInFlight = new Set();
+  (channels || []).forEach((ch) => {
+    if (!ch || !ch.presetNetworkId || !ch.channelId) return;
+    if ((ch.items || []).length > CHANNEL_POINTER_SAMPLE_ITEMS) return;
+    if (_thinPresetChannelsInFlight.has(ch.channelId)) return;
+    _thinPresetChannelsInFlight.add(ch.channelId);
+    fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(ch.presetNetworkId) + '&name=' + encodeURIComponent(ch.name || ''), { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((data) => {
+        _thinPresetChannelsInFlight.delete(ch.channelId);
+        if (!data || !data.ok || !data.channel || !Array.isArray(data.channel.items)) return;
+        if (data.channel.items.length <= (ch.items || []).length) return;
+        // Starts from ch (this channel's existing record), not data.channel --
+        // any customization the user made (hidden-watched, story locks,
+        // publish/share state, rotation settings, ...) belongs to ch and has
+        // no counterpart in the server's generic network preset, which would
+        // otherwise reset every one of them back to default the moment this
+        // resolves.
+        saveLocalChannel(Object.assign({}, ch, {
+          items: data.channel.items,
+          poster: data.channel.poster || ch.poster,
+          backdrop: data.channel.backdrop || ch.backdrop,
+        }));
+        renderMyCreatedChannelsList();
+      })
+      .catch(() => { _thinPresetChannelsInFlight.delete(ch.channelId); });
+  });
 }
 
 function cancelEditChannel() {
@@ -10283,6 +10393,66 @@ const CHANNEL_MAX_TOTAL_ITEMS = 5000;
 // cap that applies to the manual "Add every season" button, which has no
 // pool/rotation concept).
 const CHANNEL_POOL_MAX_ITEMS = 5000;
+// The bar quickAddChannel uses to decide the server's cached network preset
+// (up to 200 episodes -- see buildNetworkChannelPreset,
+// 07_source-fetchers-tmdb-simkl.js) is "good enough to use" rather than
+// falling through to building a channel live, show by show, in the browser.
+// This used to compare against CHANNEL_POOL_MAX_ITEMS (5000) -- a preset can
+// never reach that, since the server caps it at 200 on purpose, so that
+// check was always false and Quick Add always took the slow client-built
+// path, which has no cap of its own and could pull in thousands of items
+// per network. Ten networks' worth of that easily blew past
+// SAVED_CONFIG_BYTES_MAX (10 MB) when saving the install link.
+const CHANNEL_PRESET_MIN_ITEMS = 20;
+// A Quick Add network channel's saved catalog row carries this many items
+// alongside its presetNetworkId pointer -- never the full pool (see
+// quickAddChannel below for why), but never zero either. A long list of
+// places across this codebase treat a channel:v1: row as self-contained and
+// read its own items directly rather than going back to the server: the
+// "My Channels" list/card counts and posters (ensureAllChannelsSyncedFromRows,
+// renderMyCreatedChannelsList), the "See All" details page's local-preview
+// shortcut (openListDetailsPage, 23_client-list-management.js), and others.
+// Shipping a pointer with NO items at all satisfied the server-side resolver
+// (channelSourceItems, 05_catalog-core.js) but broke every one of those --
+// each one independently discovered a channel with 0 episodes and either
+// rendered that or fell through to a network call /api/preview was never
+// built to serve for a channel (it returns the channel's own single tile,
+// not its episode list), which is what actually produced "That URL isn't a
+// supported list source." A 50-item sample costs about 20KB per channel
+// even at a generous per-item size -- ten of them together add about 200KB
+// to a saved config, nowhere near SAVED_CONFIG_BYTES_MAX (10MB) -- and keeps
+// every one of those existing call sites working exactly as it already
+// assumed. The real, full pool (up to CHANNEL_POOL_MAX_ITEMS) is still what
+// actually plays: channelSourceItems always prefers the live cache over
+// this sample, which exists purely as what a local shortcut or a cold
+// cache falls back to.
+const CHANNEL_POINTER_SAMPLE_ITEMS = 50;
+
+// The URL string one catalog row stores for a channel -- quickAddChannel's
+// own pointer sample (see above) if presetNetworkId still marks it as
+// resolvable from the shared channel:preset:v2:<networkId> cache, or the
+// channel exactly as given otherwise. Every place that (re-)builds a
+// channel's row -- adding or removing it from Catalogs, merging several
+// together, rebuilding a merge after a member is added or removed, restoring
+// one from the undo bar, accepting a shared or directory channel -- must
+// route through this rather than JSON.stringifying the channel directly.
+// quickAddChannel is the only place that ever built its OWN pointer by
+// hand; every other one of those call sites used to just embed whatever
+// loadLocalChannels() had for that channel, full pool included, which is
+// exactly the size ceiling this pointer design exists to avoid -- a channel
+// added via Quick Add and still preset-backed reopened it the moment it was
+// merged with others, removed and re-added, or restored from an undo,
+// regardless of how carefully quickAddChannel's own first save behaved.
+function channelRowUrl(channel) {
+  if (!channel) return '';
+  if (channel.presetNetworkId && (channel.items || []).length > CHANNEL_POINTER_SAMPLE_ITEMS) {
+    return 'channel:v1:' + JSON.stringify(Object.assign({}, channel, {
+      items: channel.items.slice(0, CHANNEL_POINTER_SAMPLE_ITEMS),
+    }));
+  }
+  return 'channel:v1:' + JSON.stringify(channel);
+}
+
 // What a rotating day's lineup actually looks like -- must match
 // CHANNEL_ROTATION_SHOWS_PER_DAY / CHANNEL_ROTATION_EPISODES_PER_SHOW
 // server-side. Used here only for display text (the real selection logic
@@ -10376,13 +10546,44 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
   try {
     if (networkId) {
       try {
-        const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name));
+        const res = await fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(networkId) + '&name=' + encodeURIComponent(name), { cache: 'no-store' });
         const data = await res.json();
-        if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_POOL_MAX_ITEMS) {
+        if (data.ok && data.channel && Array.isArray(data.channel.items) && data.channel.items.length >= CHANNEL_PRESET_MIN_ITEMS) {
           const channelId = generateChannelId();
-          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '' });
+          // The full pool (up to CHANNEL_POOL_MAX_ITEMS episodes) is kept
+          // locally for the My Channels editor -- saveLocalChannel gets it
+          // in full, exactly as before. The saved CATALOG ROW is different:
+          // it carries a slim pointer (name/poster/art + presetNetworkId)
+          // plus a small CHANNEL_POINTER_SAMPLE_ITEMS-item sample (see that
+          // constant's own comment for why this is not empty), never the
+          // full pool, so this channel's real weight lives in the shared
+          // channel:preset:v2:<networkId> cache instead of in every install
+          // link that adds it -- see parseChannelPayload and
+          // channelSourceItems (05_catalog-core.js) for how that pointer
+          // resolves back to the full pool at serve time.
+          // presetNetworkId rides along on the full local copy too, not
+          // just the pointer -- it's how pushChannelsSync (
+          // 22_client-creator-profile.js) recognizes this channel's full
+          // pool already lives durably in the shared channel:preset:v2:
+          // cache and doesn't need its own copy re-uploaded to this
+          // account's cloud channels blob (which has its own, much smaller
+          // 24MB cap -- easy to blow past once a few of these 5,000-item
+          // pools are all kept in full).
+          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '', presetNetworkId: networkId });
           saveLocalChannel(payload);
-          addRow(name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+          const pointerPayload = {
+            channelId: channelId,
+            name: name,
+            poster: data.channel.poster,
+            backdrop: data.channel.backdrop,
+            items: data.channel.items.slice(0, CHANNEL_POINTER_SAMPLE_ITEMS),
+            presetNetworkId: networkId,
+            shuffle: false,
+            dailyRotate: true,
+            liveSync: false,
+            sourceUrl: '',
+          };
+          addRow(name, 'channel:v1:' + JSON.stringify(pointerPayload), 'series', true, 'Channels', channelId);
           renderMyCreatedChannelsList();
           renderChannelMergeList();
           showAddedToast('Channel "' + name + '" added to your Catalogs.');
@@ -11542,7 +11743,7 @@ function acceptSharedChannel(channel, code) {
     sharePublished: false,
   });
   saveLocalChannel(payload);
-  addRow(payload.name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+  addRow(payload.name, channelRowUrl(payload), 'series', true, 'Channels', channelId);
   if (typeof saveState === 'function') saveState();
   if (typeof renderLivePreview === 'function') renderLivePreview();
   renderMyCreatedChannelsList();
@@ -11831,7 +12032,7 @@ async function addDirectoryChannel(code, btn) {
       }
     }
     if (localCh) {
-      addRow(localCh.name || 'Channel', 'channel:v1:' + JSON.stringify(localCh), 'series', true, 'Channels', localCh.channelId);
+      addRow(localCh.name || 'Channel', channelRowUrl(localCh), 'series', true, 'Channels', localCh.channelId);
       if (typeof saveState === 'function') saveState();
       if (typeof renderLivePreview === 'function') renderLivePreview();
       fetch(ORIGIN + '/api/channel/added', {
@@ -12344,7 +12545,7 @@ function removeChannelFromMerge(mergedId, channelIdToRemove) {
       } else {
         const urls = merged.channelIds.map((id) => {
           const ch = channelsMap[id];
-          return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+          return ch ? channelRowUrl(ch) : null;
         }).filter(Boolean);
         const urlInput = row.querySelector('.url');
         if (urlInput) urlInput.value = urls.join('\\n');
@@ -12378,7 +12579,7 @@ function addChannelToMerge(mergedId, channelIdToAdd) {
       if (row.dataset.mergedId === mergedId || (row.id && row.id === mergedId)) {
         const urls = merged.channelIds.map((id) => {
           const c = channelsMap[id];
-          return c ? ('channel:v1:' + JSON.stringify(c)) : null;
+          return c ? channelRowUrl(c) : null;
         }).filter(Boolean);
         const urlInput = row.querySelector('.url');
         if (urlInput) urlInput.value = urls.join('\\n');
@@ -12421,9 +12622,9 @@ function toggleMergedChannelInCatalog(mergedId) {
   } else {
     const urls = (merged.channelIds || []).map((id) => {
       const ch = channelsMap[id];
-      return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+      return ch ? channelRowUrl(ch) : null;
     }).filter(Boolean);
-    
+
     if (!urls.length) {
       if (typeof showAppAlert === 'function') {
         showAppAlert('Merge Channels', 'Could not find the channels for this merged catalog.');
@@ -12464,7 +12665,7 @@ function mergeChannelsIntoRow() {
   const channelIds = [...checks].map((cb) => cb.dataset.channelid).filter(Boolean);
   const urls = channelIds.map((id) => {
     const ch = channelsMap[id];
-    return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+    return ch ? channelRowUrl(ch) : null;
   }).filter(Boolean);
 
   if (urls.length < 2) {

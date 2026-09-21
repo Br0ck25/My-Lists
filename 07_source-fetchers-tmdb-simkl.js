@@ -1717,11 +1717,29 @@ async function sweepRapidApiNewOnStreaming(env, ctx, fetchBudget, maxUnits, opti
   const maxPages = Math.min(effectiveBudget, limitUnits, remainingInQuota);
 
   const writes = [];
-  const itemTypeConfigs = [
-    { type: "show", share: 0.70 },
-    { type: "episode", share: 0.20 },
-    { type: "season", share: 0.10 },
-  ];
+  // A regular tick and a backfill (isFull/isReset) want different splits.
+  // A backfill is reconstructing history across up to 30-150 pages, where
+  // `show` (a title's very first sighting) dominates and this split already
+  // reaches back 7-10 days across all 8 services (see CHANGELOG). A regular
+  // 4-page tick has a completely different job: it is not discovering new
+  // history, it is catching *today's* real-time drops -- and per-tick, that
+  // is almost entirely episode changes on shows already known to the
+  // catalog, not brand-new titles. With RapidAPI's /changes page capped at
+  // 25 items and no cursor continuation once a tick's page budget runs out,
+  // giving `episode` a second page (1 -> 2, so 25 -> 50 items/tick) is what
+  // actually moves the real ceiling on this path -- see
+  // NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP in 00_constants.js.
+  const itemTypeConfigs = (isFull || isReset)
+    ? [
+        { type: "show", share: 0.70 },
+        { type: "episode", share: 0.20 },
+        { type: "season", share: 0.10 },
+      ]
+    : [
+        { type: "show", share: 0.25 },
+        { type: "episode", share: 0.50 },
+        { type: "season", share: 0.25 },
+      ];
 
   let remainingBudget = maxPages;
 
@@ -1884,7 +1902,20 @@ async function d1BatchInChunks(env, statements, label) {
   }
 }
 
-// Episode bumps check active streaming series against TMDB for recent air dates
+// Episode bumps check active streaming series against TMDB for recent air dates.
+//
+// Which 50 shows get checked on a given tick used to be `ORDER BY
+// last_event_at DESC LIMIT 50` -- the shows that were bumped most recently.
+// That is self-reinforcing: a show that has not had an event lately is, by
+// definition, never in that top 50, so it can never be checked, so it can
+// never be bumped, so it never re-enters the top 50 -- permanently frozen
+// the moment more than 50 other series are more recently active than it.
+// With cron ticking every 6 minutes (wrangler.toml), that ceiling is
+// crossed almost immediately, which is why a real new episode (e.g. a show
+// dozens of spots back) never got picked up here at all. A rotating OFFSET
+// cursor, persisted in KV like the sweep's own `cron:newonstreaming:lastsweep`,
+// walks the whole active-series table a batch at a time instead, so every
+// series gets checked in turn.
 async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
   const summary = { ran: false, reason: "", checked: 0, bumped: 0, errors: 0 };
   if (!env || !env.DB) {
@@ -1900,6 +1931,36 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
   const nowSec = Math.floor(Date.now() / 1000);
   const sevenDaysAgo = nowSec - (7 * 86400);
   const region = NEW_ON_STREAMING_REGIONS[0];
+  const batchSize = 50;
+
+  let totalActive = 0;
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT COUNT(DISTINCT imdb_id) AS n FROM streaming_events
+        WHERE region = ? AND kind = 'series' AND removed_at IS NULL`
+    ).bind(region).all();
+    totalActive = Number((results && results[0] && results[0].n) || 0);
+  } catch (e) {
+    summary.reason = `Database query failed: ${e && e.message ? e.message : e}`;
+    return summary;
+  }
+
+  if (!totalActive) {
+    summary.ran = true;
+    summary.reason = "No active series in database to bump";
+    return summary;
+  }
+
+  const cursorKey = `cron:newonstreaming:bumpcursor:${region}`;
+  let cursor = 0;
+  if (env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(cursorKey);
+      const n = parseInt(raw, 10);
+      if (Number.isFinite(n) && n >= 0) cursor = n;
+    } catch (e) {}
+  }
+  const offset = cursor % totalActive;
 
   let shows = [];
   try {
@@ -1907,9 +1968,9 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
       `SELECT DISTINCT imdb_id, tmdb_id, name, last_event_at
          FROM streaming_events
         WHERE region = ? AND kind = 'series' AND removed_at IS NULL
-        ORDER BY last_event_at DESC
-        LIMIT 50`
-    ).bind(region).all();
+        ORDER BY imdb_id
+        LIMIT ? OFFSET ?`
+    ).bind(region, batchSize, offset).all();
     shows = results || [];
   } catch (e) {
     summary.reason = `Database query failed: ${e && e.message ? e.message : e}`;
@@ -1922,7 +1983,18 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
     return summary;
   }
 
+  // Advance the cursor by exactly how many rows this tick actually spends a
+  // TMDB fetch on (maxChecks), never by the wider fetched batch -- a small
+  // fetchBudget (the admin dashboard's manual "sweep now" passes just 4)
+  // must not walk the cursor past rows it never checked, or those rows are
+  // silently skipped every rotation rather than merely deferred to the next one.
   const maxChecks = Math.min(shows.length, Number.isFinite(fetchBudget) ? Math.max(5, fetchBudget) : 25);
+  if (env.CONFIGS) {
+    try {
+      await env.CONFIGS.put(cursorKey, String(offset + maxChecks), { expirationTtl: 2592000 });
+    } catch (e) {}
+  }
+
   const writes = [];
 
   for (let i = 0; i < maxChecks; i++) {
@@ -1983,6 +2055,218 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
   }
 
   summary.ran = true;
+  return summary;
+}
+
+// --- Quick Add network channel presets ---------------------------------------
+//
+// Builds the episode pool for one "Quick Add Popular Networks" channel (up
+// to CHANNEL_PRESET_DISCOVER_PAGES pages of candidate shows on that TMDB
+// network, up to 3 seasons each, capped at CHANNEL_POOL_MAX_ITEMS episodes
+// total) and caches it in KV under channel:preset:v2:<networkId>
+// for 24h. Shared by the /api/channel-preset route (25_api-catalog-routes.js,
+// which a Quick Add click reads on the way to adding the channel) and
+// prewarmChannelPresets below (the cron sweep that keeps that cache from
+// ever being cold when a click reads it) -- one implementation, so the two
+// can never build a different lineup for the same network.
+//
+// options.env/ctx: env is required for caching; ctx, when given, lets a KV
+// write ride ctx.waitUntil instead of blocking the caller (used by the live
+// route; the cron sweep has nothing waiting on it, so it just awaits).
+// options.forceRebuild skips the cache read (the cron sweep always rebuilds,
+// since its entire job is refreshing that cache before it goes stale).
+async function buildNetworkChannelPreset(networkId, name, origin, options = {}) {
+  const { env, ctx, forceRebuild } = options;
+  const cacheKey = `channel:preset:v2:${networkId}`;
+
+  if (!forceRebuild && env && env.CONFIGS) {
+    try {
+      const cached = await env.CONFIGS.get(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed && Array.isArray(parsed.items) && parsed.items.length) {
+          return { ok: true, channel: parsed };
+        }
+      }
+    } catch (e) {}
+  }
+
+  try {
+    // Up to CHANNEL_PRESET_DISCOVER_PAGES pages (20 shows/page) of candidate
+    // shows -- the same up-to-200-show pool /api/quick-channel-shows already
+    // offers the client-built path, needed so a popular network actually has
+    // enough material to approach CHANNEL_POOL_MAX_ITEMS episodes. Safe to
+    // fetch in full: assembleFromShows below stops issuing new show/season
+    // requests the moment the pool is full, so a network that fills up in
+    // its first page or two never pays for the rest of this discovery.
+    const discoverResults = [];
+    for (let page = 1; page <= CHANNEL_PRESET_DISCOVER_PAGES; page++) {
+      const discoverRes = await fetch(
+        `https://api.themoviedb.org/3/discover/tv?api_key=${encodeURIComponent(TMDB_API_KEY)}` +
+          `&with_networks=${encodeURIComponent(networkId)}&sort_by=popularity.desc&page=${page}&include_adult=false`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+      );
+      if (!discoverRes.ok) {
+        if (page === 1) return { ok: false, error: "TMDB network request failed.", status: 502 };
+        break;
+      }
+      const discoverData = await discoverRes.json();
+      discoverResults.push(...(discoverData.results || []));
+      if (page >= (discoverData.total_pages || 1)) break;
+    }
+    let topShows = discoverResults;
+    const nameLower = String(name || "").toLowerCase();
+    // TMDB's own with_networks discover comes back empty for a handful of
+    // networks it otherwise carries shows for (a TMDB data gap, not
+    // something this add-on can fix) -- these hand-picked lineups are the
+    // fallback for exactly those, tried again below if the discover-sourced
+    // shows also failed to yield a single episode.
+    const namedFallbackShows = () => {
+      if (nameLower.includes("metv")) return [{ id: 4607 }, { id: 735 }, { id: 1403 }, { id: 2098 }, { id: 2287 }, { id: 873 }, { id: 253 }, { id: 914 }, { id: 2101 }, { id: 2289 }, { id: 2099 }, { id: 2100 }, { id: 2344 }, { id: 2103 }];
+      if (nameLower.includes("food")) return [{ id: 2382 }, { id: 17855 }, { id: 62326 }, { id: 2383 }, { id: 63278 }, { id: 44006 }, { id: 11822 }, { id: 67070 }];
+      if (nameLower.includes("ion")) return [{ id: 62741 }, { id: 1408 }, { id: 1418 }, { id: 4614 }, { id: 62688 }, { id: 2734 }];
+      return [];
+    };
+    if (!topShows.length) topShows = namedFallbackShows();
+    if (!topShows.length) return { ok: false, error: "No shows found for that network." };
+
+    let networkLogo = null;
+    try {
+      const networkRes = await fetch(
+        `https://api.themoviedb.org/3/network/${encodeURIComponent(networkId)}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+        { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+      );
+      if (networkRes.ok) {
+        const networkData = await networkRes.json();
+        if (networkData.logo_path) networkLogo = `${origin}/api/channel-logo?path=${encodeURIComponent(networkData.logo_path)}`;
+      }
+    } catch (e) {}
+
+    const allEpisodes = [];
+    let poster = networkLogo;
+    let backdrop = null;
+
+    const assembleFromShows = async (showsList) => {
+      await mapWithConcurrency(showsList, 4, async (show) => {
+        if (allEpisodes.length >= CHANNEL_POOL_MAX_ITEMS) return;
+        try {
+          const showRes = await fetch(
+            `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}?api_key=${encodeURIComponent(TMDB_API_KEY)}&append_to_response=external_ids`,
+            { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+          );
+          if (!showRes.ok) return;
+          const fullShow = await showRes.json();
+          const imdbId = (fullShow.external_ids && fullShow.external_ids.imdb_id) || fullShow.imdb_id || (`tmdb:${show.id}`);
+
+          if (!poster && fullShow.poster_path) poster = `https://image.tmdb.org/t/p/w500${fullShow.poster_path}`;
+          if (!backdrop && fullShow.backdrop_path) backdrop = `https://image.tmdb.org/t/p/w780${fullShow.backdrop_path}`;
+
+          const showPosterUrl = fullShow.poster_path ? `https://image.tmdb.org/t/p/w500${fullShow.poster_path}` : "";
+          const validSeasons = (fullShow.seasons || []).filter((s) => s.season_number > 0).slice(0, 3);
+
+          for (const s of validSeasons) {
+            if (allEpisodes.length >= CHANNEL_POOL_MAX_ITEMS) break;
+            const sRes = await fetch(
+              `https://api.themoviedb.org/3/tv/${encodeURIComponent(show.id)}/season/${s.season_number}?api_key=${encodeURIComponent(TMDB_API_KEY)}`,
+              { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 86400, cacheEverything: true } }
+            );
+            if (!sRes.ok) continue;
+            const sData = await sRes.json();
+            for (const ep of (sData.episodes || [])) {
+              if (allEpisodes.length >= CHANNEL_POOL_MAX_ITEMS) break;
+              const stillUrl = ep.still_path ? `https://image.tmdb.org/t/p/w500${ep.still_path}` : "";
+              allEpisodes.push({
+                kind: "episode",
+                imdbId: imdbId,
+                season: s.season_number,
+                episode: ep.episode_number,
+                showName: fullShow.name || show.name || "",
+                epName: ep.name || (`Episode ${ep.episode_number}`),
+                title: `${fullShow.name || show.name} S${s.season_number}E${ep.episode_number} — ${ep.name || (`Episode ${ep.episode_number}`)}`,
+                released: ep.air_date || "",
+                thumbnail: stillUrl || showPosterUrl,
+                poster: showPosterUrl || stillUrl,
+                showPoster: showPosterUrl,
+              });
+            }
+          }
+        } catch (e) {}
+      });
+    };
+
+    await assembleFromShows(topShows);
+
+    if (!allEpisodes.length) {
+      const fallbackShows = namedFallbackShows();
+      if (fallbackShows.length) await assembleFromShows(fallbackShows);
+    }
+
+    if (!allEpisodes.length) return { ok: false, error: "Could not assemble episodes for this network." };
+
+    const channelPayload = {
+      name: name,
+      poster: poster || (origin + "/icon.png"),
+      backdrop: backdrop || poster || (origin + "/icon.png"),
+      items: allEpisodes,
+      shuffle: false,
+      dailyRotate: true,
+      // When this build actually ran, not when a cache hit last served it --
+      // read by the admin dashboard's Channel Presets tab so "is this the
+      // old 200-item cache or the new one" is a real answer instead of a
+      // guess. Every consumer of this payload (channelSourceItems,
+      // fetchChannelCatalog, ...) reads only the fields above; this one
+      // rides along unused by any of them.
+      builtAt: Date.now(),
+    };
+
+    if (env && env.CONFIGS) {
+      const put = env.CONFIGS.put(cacheKey, JSON.stringify(channelPayload), { expirationTtl: 86400 }).catch(() => {});
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(put); else await put;
+    }
+    return { ok: true, channel: channelPayload };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || "Failed to build network channel preset.", status: 500 };
+  }
+}
+
+// A rotating cursor (KV, one entry advanced per cron tick) refreshes one
+// Quick Add network's channel preset per tick -- all ~28 networks
+// (CHANNEL_PRESET_NETWORKS, 00_constants.js) cycle through in a few hours at
+// the default 6-minute cron, comfortably inside the 24h TTL those presets
+// are cached under. That keeps /api/channel-preset always serving a warm
+// cache instead of a user's Quick Add click being the one that pays for a
+// live build of up to CHANNEL_POOL_MAX_ITEMS (5,000) episodes.
+//
+// This pool is never embedded whole into a saved config -- a Quick Add
+// catalog row only ever carries a tiny {presetNetworkId, channelId, ...}
+// pointer (see quickAddChannel, 20_client-channel-builder.js), resolved
+// back to this cache by channelSourceItems (05_catalog-core.js) at the
+// moment a channel's actual episode list is needed. That split is what lets
+// the pool be this big without reviving the "too large to save" bug several
+// Quick Add channels in one config used to hit when the whole pool rode in
+// the install URL.
+async function prewarmChannelPresets(env, ctx) {
+  const summary = { ran: false, refreshed: "", error: "" };
+  if (!env || !env.CONFIGS) return summary;
+  const networks = CHANNEL_PRESET_NETWORKS;
+  if (!networks.length) return summary;
+
+  let cursor = 0;
+  try {
+    const raw = await env.CONFIGS.get("cron:channelpresets:cursor");
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n >= 0) cursor = n;
+  } catch (e) {}
+
+  const net = networks[cursor % networks.length];
+  try {
+    await env.CONFIGS.put("cron:channelpresets:cursor", String(cursor + 1), { expirationTtl: 2592000 });
+  } catch (e) {}
+
+  const result = await buildNetworkChannelPreset(net.id, net.name, CHANNEL_PRESET_PREWARM_ORIGIN, { env, forceRebuild: true });
+  summary.ran = true;
+  summary.refreshed = net.name;
+  if (!result.ok) summary.error = result.error || "";
   return summary;
 }
 

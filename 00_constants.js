@@ -328,12 +328,24 @@ const NEW_ON_STREAMING_REGIONS = ["US"];
 const RAPIDAPI_MONTHLY_LIMIT = 1000;
 const RAPIDAPI_MONTHLY_SAFETY_CAP = 950;
 
-// Runs every 4 hours via cron (~180 runs/month). With 1-2 pages per incremental
-// run, this uses ~180-360 requests/month, staying safely within the 1,000 limit.
+// Runs every 4 hours via cron (~180 runs/month). With 4 pages + 1 removed-check
+// per incremental run, this uses ~900 requests/month (180 * 5), staying under
+// the 950 safety cap with a small margin.
 const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 14400;
 
-// Maximum pages fetched per sweep
-const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 3;
+// Maximum pages fetched per sweep.
+//
+// RapidAPI's /changes endpoint returns only 25 changes per page (see its
+// openapi.yaml), and a regular sweep never pages past what this budget
+// allows -- there is no cursor continuation once a type's page budget for
+// the tick runs out. 8 major streaming services can easily produce more
+// than 25 real episode-arrival events in a single 4-5 hour sweep window, so
+// this is the actual ceiling on how much of the catalog's real-time bump
+// coverage comes from RapidAPI directly (the rest falls to the slower,
+// TMDB-based bumpNewOnStreamingEpisodes safety net). Raised from 3 to 4 so a
+// regular tick can give `episode` a second page (see itemTypeShares below)
+// instead of the single page every type got before.
+const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 4;
 const NEW_ON_STREAMING_PAGES_PER_TICK = NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP;
 const NEW_ON_STREAMING_SWEEP_FETCHES = 1;
 const CRON_NEW_ON_STREAMING_SHARE = 0.25;
@@ -346,6 +358,74 @@ const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 // this to true is the entire "move it to the live site" step; nothing else
 // about the feature changes.
 const NEW_ON_STREAMING_IN_QUICK_ADD = false;
+
+// --- Quick Add network channel presets --------------------------------------
+//
+// Same id/name pairs as the "Quick Add Popular Networks" buttons in
+// 13_tab-channels.js -- kept as a second, server-side list rather than
+// scraped from that HTML, since the cron sweep below needs to walk them with
+// no page loaded. Adding a network button there is not "live" for this sweep
+// until its id/name pair is added here too.
+const CHANNEL_PRESET_NETWORKS = [
+  { id: "129", name: "A&E" },
+  { id: "2", name: "ABC" },
+  { id: "80", name: "Adult Swim" },
+  { id: "174", name: "AMC" },
+  { id: "4", name: "BBC One" },
+  { id: "56", name: "Cartoon Network" },
+  { id: "16", name: "CBS" },
+  { id: "47", name: "Comedy Central" },
+  { id: "64", name: "Discovery" },
+  { id: "54", name: "Disney Channel" },
+  { id: "143", name: "Food Network" },
+  { id: "19", name: "FOX" },
+  { id: "88", name: "FX" },
+  { id: "384", name: "Hallmark Channel" },
+  { id: "49", name: "HBO" },
+  { id: "209", name: "HGTV" },
+  { id: "65", name: "History" },
+  { id: "436", name: "Ion Television" },
+  { id: "738", name: "MeTV" },
+  { id: "33", name: "MTV" },
+  { id: "6", name: "NBC" },
+  { id: "13", name: "Nickelodeon" },
+  { id: "149", name: "Syfy" },
+  { id: "68", name: "TBS" },
+  { id: "71", name: "The CW" },
+  { id: "84", name: "TLC" },
+  { id: "41", name: "TNT" },
+  { id: "30", name: "USA Network" },
+];
+// buildNetworkChannelPreset (07_source-fetchers-tmdb-simkl.js) only uses this
+// to build a `/api/channel-logo?path=...` URL, and that URL is never read as
+// a live link -- every consumer (getPremadeChannelLogo/extractLogoPath,
+// 05_catalog-core.js) re-extracts just the `path=` query param and rebuilds
+// the link against the real request's origin at serve time. So the cron
+// sweep, which has no request to take an origin from, can use any placeholder
+// here without the cached preset ever pointing at a dead host.
+const CHANNEL_PRESET_PREWARM_ORIGIN = "https://prewarm.internal";
+
+// Server-side copy of 20_client-channel-builder.js's own CHANNEL_POOL_MAX_ITEMS
+// -- the two have to agree (this one is the real cap on a Quick Add preset's
+// pool; the client's is the cap on the hand-built/import-from-link path,
+// which still runs client-side). A preset this big is cached in KV
+// (channel:preset:v2:<networkId>, well under KV's 25MB value limit) and
+// NEVER embedded whole into a saved config -- a catalog row only ever
+// carries a tiny `{presetNetworkId, channelId, ...}` pointer at
+// entry.url (channel:v1:), resolved back to the full pool from that KV
+// cache at the moment something actually needs the episode list
+// (channelSourceItems, 05_catalog-core.js). That split is what lets this be
+// 5,000 without reviving the "too large to save" bug several Quick Add
+// channels in one config used to hit when the whole pool rode in the URL.
+const CHANNEL_POOL_MAX_ITEMS = 5000;
+// Discover pages pulled per network before building episodes -- 20 shows a
+// page, so 10 pages is the same up-to-200-show candidate pool
+// /api/quick-channel-shows already offers the client-built path. Building
+// stops the moment CHANNEL_POOL_MAX_ITEMS is reached regardless of how much
+// of this pool was actually walked (see buildNetworkChannelPreset), so a
+// bigger candidate pool costs nothing extra for a popular network that hits
+// the cap early -- it only matters for a network sparse enough to need it.
+const CHANNEL_PRESET_DISCOVER_PAGES = 10;
 
 // --- Bounds on the KV -> D1 backfill sweep ----------------------------------
 //
