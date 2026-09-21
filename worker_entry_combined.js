@@ -36690,8 +36690,11 @@ async function openItemDetailsModal(id, type, opts) {
     if (d.seasonsData && d.seasonsData.length > 0) {
       seasonsHtml += '<h3 style="margin: 32px 0 16px; font-family:serif; font-size:1.5rem;">Seasons</h3>';
       seasonsHtml += '<div style="display:flex; flex-direction:column; gap:16px;">';
-      d.seasonsData.forEach(season => {
-        if (season.season_number === 0) return; // Skip specials usually
+      // Specials (season 0) are real seasons too -- just listed last, below
+      // every numbered season, since TMDB itself orders them first.
+      const regularSeasons = d.seasonsData.filter(season => season.season_number !== 0);
+      const specialSeasons = d.seasonsData.filter(season => season.season_number === 0);
+      regularSeasons.concat(specialSeasons).forEach(season => {
         // TMDB doesn't always have a dedicated season poster (common for
         // long-running / reality shows) -- fall back to the show's own
         // poster rather than leaving a blank placeholder box.
@@ -48474,7 +48477,13 @@ async function buildChannelItemsFromShows(shows, opts) {
       const seasonsRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(show.tmdbId), { cache: 'no-store' });
       const seasonsData = await seasonsRes.json();
       if (!seasonsData.ok) continue;
-      const seasonResults = await Promise.all(seasonsData.seasons.map((s) =>
+      // Specials (season 0) are excluded here -- they're recaps, gag reels
+      // and clip shows as often as they are episodes, and an automatically
+      // built network/wizard channel plays badly with them mixed in. A
+      // person who wants them can still add a show's Specials by hand from
+      // the manual season picker, which does list them.
+      const regularSeasons = seasonsData.seasons.filter((s) => s.season > 0);
+      const seasonResults = await Promise.all(regularSeasons.map((s) =>
         fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(show.tmdbId) + '&season=' + encodeURIComponent(s.season), { cache: 'no-store' })
           .then((r) => r.json())
           .then((d) => ({ season: s.season, episodes: d.ok ? d.episodes : [] }))
@@ -70034,8 +70043,15 @@ function generateSearchVariations(query) {
         }
         if (!showRes.ok) return json({ ok: false, error: `TMDB show lookup failed (HTTP ${showRes.status}).` });
         const data = await showRes.json();
+        // Specials (season 0) are kept, but out of the way of the "is this
+        // show actually one giant unpacked season" heuristic below, which
+        // only makes sense against the regular seasons -- so they're split
+        // off here and tacked back on at the end, after the real seasons.
+        const specials = (data.seasons || [])
+          .filter((s) => s.season_number === 0)
+          .map((s) => ({ season: s.season_number, name: s.name || "Specials", episodeCount: s.episode_count }));
         let seasons = (data.seasons || [])
-          .filter((s) => s.season_number > 0) // skip "Specials" (season 0)
+          .filter((s) => s.season_number > 0)
           .map((s) => ({ season: s.season_number, name: s.name, episodeCount: s.episode_count }));
         const standardEpisodeCount = seasons.reduce((sum, s) => sum + (s.episodeCount || 0), 0);
         if (seasons.length === 1 && standardEpisodeCount > 1) {
@@ -70049,6 +70065,7 @@ function generateSearchVariations(query) {
             }));
           }
         }
+        seasons = seasons.concat(specials);
         return json({
           ok: true,
           imdbId: details.imdbId,

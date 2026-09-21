@@ -6,6 +6,11 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ⭐ Specials, alongside a show's regular seasons
+
+- **Channel Builder**: browsing a show's seasons to add episodes to a channel (`/api/show-seasons`, `25_api-catalog-routes.js`) now lists that show's Specials (TMDB season 0) as its own season button, after every numbered season, instead of dropping it silently. "Add every season" picks it up too. The three automated bulk builders that also start from a show list — Quick Add network channels, the Quick Channel Wizard, and a Spotlight actor's whole filmography (`buildChannelItemsFromShows`, `20_client-channel-builder.js`) — still leave Specials out on their own, since an unattended channel full of recaps and clip shows plays badly; a person who wants them can still add them by hand from the season picker.
+- **Item details modal**: clicking a poster to view a show's page (`openItemDetailsModal`, `19_client-search-and-likes.js`) now shows a Specials season card below all of the show's regular seasons, rather than skipping it.
+
 ## [1.5.5] - 2026-09-20
 
 ### 🐛 Trakt Airing Next: item counts, badges and slow search

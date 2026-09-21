@@ -10162,11 +10162,14 @@ describe("Anime Unpacking: restoring multi-season division for compressed anime 
       assert.equal(data.ok, true);
       assert.equal(data.name, "MASHLE: MAGIC AND MUSCLES");
       assert.equal(data.imdbId, "tt21209804");
-      assert.equal(data.seasons.length, 2, "must be unpacked into 2 seasons");
+      assert.equal(data.seasons.length, 3, "unpacked into 2 seasons, plus Specials kept at the end");
       assert.equal(data.seasons[0].season, 1);
       assert.equal(data.seasons[0].episodeCount, 12);
       assert.equal(data.seasons[1].season, 2);
       assert.equal(data.seasons[1].episodeCount, 12);
+      assert.equal(data.seasons[2].season, 0, "Specials is listed last, not dropped");
+      assert.equal(data.seasons[2].name, "Specials");
+      assert.equal(data.seasons[2].episodeCount, 2);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -10310,6 +10313,42 @@ describe("Anime Unpacking: restoring multi-season division for compressed anime 
       assert.equal(data.seasons.length, 5);
       assert.equal(data.seasons[0].season, 1);
       assert.equal(data.seasons[4].season, 5);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("/api/show-seasons lists a show's Specials after every regular season, not dropped", async () => {
+    const env = makeEnv({ TMDB_API_KEY: "test-tmdb-key" });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.includes("/tv/2316?") || u.includes("/tv/2316/external_ids")) {
+        return new Response(JSON.stringify({
+          id: 2316,
+          name: "The Office",
+          external_ids: { imdb_id: "tt0386676" },
+          seasons: [
+            { season_number: 0, name: "Specials", episode_count: 7 },
+            { season_number: 1, name: "Season 1", episode_count: 6 },
+            { season_number: 2, name: "Season 2", episode_count: 22 },
+          ],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return originalFetch(url, opts);
+    };
+
+    try {
+      const res = await call(env, "/api/show-seasons?tmdbId=2316");
+      assert.equal(res.status, 200);
+      const data = res.body;
+      assert.equal(data.ok, true);
+      assert.equal(data.seasons.length, 3, "Specials is included alongside the regular seasons");
+      assert.equal(data.seasons[0].season, 1, "regular seasons still come first, in order");
+      assert.equal(data.seasons[1].season, 2);
+      assert.equal(data.seasons[2].season, 0, "Specials is listed last");
+      assert.equal(data.seasons[2].name, "Specials");
+      assert.equal(data.seasons[2].episodeCount, 7);
     } finally {
       globalThis.fetch = originalFetch;
     }

@@ -3014,8 +3014,11 @@ async function openItemDetailsModal(id, type, opts) {
     if (d.seasonsData && d.seasonsData.length > 0) {
       seasonsHtml += '<h3 style="margin: 32px 0 16px; font-family:serif; font-size:1.5rem;">Seasons</h3>';
       seasonsHtml += '<div style="display:flex; flex-direction:column; gap:16px;">';
-      d.seasonsData.forEach(season => {
-        if (season.season_number === 0) return; // Skip specials usually
+      // Specials (season 0) are real seasons too -- just listed last, below
+      // every numbered season, since TMDB itself orders them first.
+      const regularSeasons = d.seasonsData.filter(season => season.season_number !== 0);
+      const specialSeasons = d.seasonsData.filter(season => season.season_number === 0);
+      regularSeasons.concat(specialSeasons).forEach(season => {
         // TMDB doesn't always have a dedicated season poster (common for
         // long-running / reality shows) -- fall back to the show's own
         // poster rather than leaving a blank placeholder box.
