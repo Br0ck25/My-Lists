@@ -237,6 +237,110 @@ function getSafePosterUrl(item) {
     (safeCert ? '&cert=' + encodeURIComponent(safeCert) : '');
 }
 
+// --- Better Posters (btttr.cc), website side -------------------------------
+//
+// The add-on already rewrites posters server-side for Stremio/Nuvio
+// (applyBetterPostersToMetas, 05_catalog-core.js). This is that same rewrite
+// for the website's own surfaces -- Live Preview, Search, Discover, My Lists,
+// creator profiles, the builders -- so what you browse here matches what your
+// apps get served. The two are pinned to the same expected URLs by
+// tests/better-posters.test.mjs.
+//
+// Deliberately no regex in here: this file's text passes through
+// 09_page-shell.js's outer template literal, which eats one round of
+// backslash escapes, so every \\d would have to be written doubled (see
+// parseListSearchIntent's own comment below). Plain string scanning sidesteps
+// that trap entirely.
+
+const BETTER_POSTERS_ORIGIN_WEB = 'https://btttr.cc';
+
+function betterPostersOnWeb() {
+  return typeof getBetterPostersSetting === 'function' && getBetterPostersSetting('betterPosters', false);
+}
+window.betterPostersOnWeb = betterPostersOnWeb;
+
+// The same id fields the Worker's betterPostersImdbId reads, plus showId /
+// showImdbId: the website carries an episode's parent show as its own field,
+// where a catalog meta has already been flattened down to one id.
+function betterPostersWebImdbId(it) {
+  if (!it || typeof it !== 'object') return '';
+  const candidates = [it.imdb_id, it.imdbId, it.imdb, it.showImdbId, it.showId, it.id];
+  for (let i = 0; i < candidates.length; i++) {
+    const raw = candidates[i];
+    if (typeof raw !== 'string') continue;
+    const s = raw.trim().toLowerCase();
+    if (s.charAt(0) !== 't' || s.charAt(1) !== 't') continue;
+    let digits = '';
+    for (let j = 2; j < s.length; j++) {
+      const c = s.charCodeAt(j);
+      if (c < 48 || c > 57) break;  // stops at the ':' of a 'tt123:1:2' episode id
+      digits += s.charAt(j);
+    }
+    if (digits.length < 5 || digits.length > 12) continue;
+    const id = 'tt' + digits;
+    if (id === 'tt0000000') continue;  // the 'list unavailable' placeholder
+    return id;
+  }
+  return '';
+}
+
+function betterPostersWebUrl(imdbId) {
+  const get = (typeof getBetterPostersSetting === 'function') ? getBetterPostersSetting : function(k, d) { return !!d; };
+  const pick = (typeof getBetterPostersChoice === 'function') ? getBetterPostersChoice : function(k, d) { return d; };
+  const genre = get('betterPostersGenre', true);
+  const rating = get('betterPostersRating', true);
+  let base;
+  if (genre && rating) base = 'poster';
+  else if (genre) base = 'poster-g';
+  else if (rating) base = 'poster-r';
+  else base = 'poster-n';
+  const suffix = (get('betterPostersQuality', false) ? 'q' : '') + (get('betterPostersAge', false) ? 'a' : '');
+  if (suffix) base += (base.indexOf('-') >= 0 ? suffix : '-' + suffix);
+  const params = [];
+  if (!get('betterPostersTrendTags', true)) params.push('tag=none');
+  const lang = pick('betterPostersLang', 'en');
+  if (lang && lang !== 'en') params.push('lang=' + encodeURIComponent(lang));
+  const rs = pick('betterPostersRatingSource', 'avg');
+  if (rs && rs !== 'avg') params.push('rs=' + encodeURIComponent(rs));
+  return BETTER_POSTERS_ORIGIN_WEB + '/' + base + '/imdb/poster-default/' + imdbId + '.jpg' +
+    (params.length ? '?' + params.join('&') : '');
+}
+
+// Artwork this add-on renders itself. None of it is a title's poster, so none
+// of it is BetterPosters' to replace: a TV Channel's generated logo/banner, a
+// badge overlay, and the Adult Content Filter's safe-poster stand-in.
+function isGeneratedPosterUrl(p) {
+  if (!p || typeof p !== 'string') return false;
+  return p.indexOf('/api/channel-poster') >= 0
+    || p.indexOf('/api/channel-logo') >= 0
+    || p.indexOf('/api/poster-badge') >= 0
+    || p.indexOf('/api/safe-poster') >= 0;
+}
+
+function applyBetterPosterWeb(it, poster) {
+  if (!betterPostersOnWeb()) return poster;
+  const alreadyBetter = typeof poster === 'string' && poster.indexOf(BETTER_POSTERS_ORIGIN_WEB) === 0;
+  if (!alreadyBetter) {
+    if (isGeneratedPosterUrl(poster)) return poster;
+    if (it && it.posterShape === 'landscape') return poster;
+    // An episode still is a screenshot of that episode. The show's poster is
+    // not a substitute for it, so a tile showing a still keeps it.
+    if (it && it.thumbnail && poster === it.thumbnail) return poster;
+  }
+  const imdbId = betterPostersWebImdbId(it);
+  if (!imdbId) return poster;
+  // Rebuilt from the current settings every time rather than kept, so
+  // changing a style option re-renders with the new one instead of keeping
+  // whatever URL happened to be produced first.
+  return betterPostersWebUrl(imdbId);
+}
+window.applyBetterPosterWeb = applyBetterPosterWeb;
+
+// The one funnel every poster on the website passes through -- directly, or
+// via resolveListCardItemPoster (17), resolveItemPoster (22),
+// livePreviewPosterHtml (23), renderMediaCard (16) and loadPosterSlot below.
+// The Adult Content Filter is checked FIRST and returns early, so it still
+// overrides BetterPosters exactly as it does server-side.
 function resolveClientPoster(it, fallbackPoster) {
   if (!it) return fallbackPoster || '';
   const p = fallbackPoster !== undefined ? fallbackPoster : (it.poster || it.showPoster || '');
@@ -244,7 +348,7 @@ function resolveClientPoster(it, fallbackPoster) {
   if (isAdultContentFilterEnabled() && (it.isAdult || it.isAdultPosterFiltered || isAdultOrNsfw(it))) {
     return getSafePosterUrl(it);
   }
-  return p;
+  return applyBetterPosterWeb(it, p);
 }
 
 function parseListSearchIntent(rawQuery) {
@@ -1380,9 +1484,10 @@ function buildCuratedRecommendationCard(title, type, customUrl, subtitle, items)
       overlays += '<div class="list-card-count-overlay desktop-only curatedViewBtn" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     }
     const ratingSpan = typeof formatRatingSpanHtml === 'function' ? formatRatingSpanHtml(s) : '';
+    const tilePoster = resolveClientPoster(s, s.poster || '');
     return '<div class="list-card-mini-poster-tile" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">' +
-      '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type) + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
-        '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
+      '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type) + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(tilePoster || '') + '">' +
+        '<img src="' + escapeAttr(tilePoster) + '" alt="" loading="lazy">' +
         '<div class="poster-add-overlay">+</div>' +
         overlays +
       '</div>' +
@@ -2857,7 +2962,7 @@ function renderItemStorylinesWatchOrder(d, type) {
       return '<div class="item-storyline-card' + (isCurrent ? ' is-current' : '') + '"' + clickHandler + ' title="' + escapeAttr(displayTitle + (isCurrent ? ' (Currently Viewing)' : '')) + '">' +
         '<div class="item-storyline-poster-wrap">' +
           (posterUrl ?
-            '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(displayTitle) + '" onerror="handleStorylinePosterError(this)">' :
+            '<img src="' + escapeAttr(resolveClientPoster(ep, posterUrl)) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(displayTitle) + '" onerror="handleStorylinePosterError(this)">' :
             '<div class="season-header-poster-placeholder"></div>') +
           '<span class="item-storyline-part-badge">Part ' + (ep.part != null ? ep.part : (i + 1)) + '</span>' +
           (isCurrent ? '<span class="item-storyline-current-pill">Current</span>' : '') +
@@ -3106,7 +3211,7 @@ async function openItemDetailsModal(id, type, opts) {
     body.innerHTML = 
       '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap;">' +
         '<div style="flex: 0 0 300px; max-width: 100%;">' +
-          (d.poster ? '<img src="' + escapeAttr(d.poster) + '" style="width:100%; border-radius:8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">' : '') +
+          (d.poster ? '<img src="' + escapeAttr(resolveClientPoster(d, d.poster)) + '" style="width:100%; border-radius:8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">' : '') +
         '</div>' +
         '<div style="flex: 1; min-width: 300px;">' +
           '<h1 style="margin:0 0 16px; font-size:2.5rem; font-family: serif;">' + escapeHtml(d.title) + '</h1>' +
@@ -4377,18 +4482,21 @@ function renderTitlePosterCards(items, totalCount, resEl) {
       ratingHtml +
     '</div>';
 
+    // Resolved up front so the rendered <img> and the data-poster the poster
+    // modal reads back are the same URL.
+    const resolvedCardPoster = resolveClientPoster(m, effectivePoster || '');
     if (typeof renderMediaCard === 'function') {
-      return renderMediaCard(Object.assign({}, m, { title: m.title || '', poster: effectivePoster }), {
+      return renderMediaCard(Object.assign({}, m, { title: m.title || '', poster: resolvedCardPoster }), {
         cardClass: 'clickable-poster',
-        dataAttrs: { id: id, type: type, title: m.title || '', poster: effectivePoster || '' },
+        dataAttrs: { id: id, type: type, title: m.title || '', poster: resolvedCardPoster || '' },
         topLeftHtml: '',
         overlayHtml: '<div class="poster-add-overlay" title="Add to Custom List">+</div>',
         subtitleHtml: subtitleHtml
       });
     }
 
-    const posterEl = effectivePoster
-      ? '<img class="live-preview-poster" src="' + escapeAttr(effectivePoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+    const posterEl = resolvedCardPoster
+      ? '<img class="live-preview-poster" src="' + escapeAttr(resolvedCardPoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
       : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
     
     return '<div class="live-preview-poster-card clickable-poster" ' +

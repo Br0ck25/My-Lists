@@ -89,7 +89,8 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
 - Swap the artwork your catalogs serve to Stremio/Nuvio for [BetterPosters](https://btttr.cc/) — posters with the genre, rating and tags rendered into the image itself. **Off by default**; turn it on under **Settings → Account & Sync → Better Posters**.
 - No API key and no account: BetterPosters keys off the IMDb id alone, so the whole feature is a URL swap on artwork the add-on already resolved.
 - Style controls mirror btttr.cc's own configurator — genre, rating (IMDb / TMDB / Rotten Tomatoes / Metacritic / Trakt / Letterboxd / Roger Ebert), trend tags, quality tags (4K/DV/Atmos), age rating, and poster language.
-- Applies to catalog rows, the search catalog, and title pages (`/meta/`). Titles without an IMDb id, TV Channels, and landscape tiles keep their existing artwork. Poster badges are drawn *over* BetterPosters art rather than replacing it, and the Adult Content Filter still overrides it.
+- **Applies everywhere**, not just in your apps: Live Preview, Search, Discover, My Lists, creator profiles and the builders on the website, plus the catalog rows, search catalog and title pages (`/meta/`) served to Stremio/Nuvio. The website updates the moment you tick the box; an existing install link needs a Save/Update.
+- Titles without an IMDb id, TV Channel artwork, episode stills and landscape tiles keep their existing artwork. Poster badges are drawn *over* BetterPosters art rather than replacing it, and the Adult Content Filter still overrides it.
 
 ### Creator Profiles & Cloud Sync
 - Free, passwordless account system secured by salted PBKDF2-SHA256 Creator Keys (`MYL-XXXX-XXXX-XXXX`).

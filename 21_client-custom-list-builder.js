@@ -195,7 +195,7 @@ function renderCustomListDraftList() {
     const removeBtn = '<button type="button" class="cw-remove-btn customListRemovePickBtn" title="Remove from list" aria-label="Remove from list" style="z-index:4;">\u2715</button>';
 
     if (typeof renderMediaCard === 'function') {
-      return renderMediaCard({ title: label, poster: it.poster }, {
+      return renderMediaCard(Object.assign({}, it, { title: label, poster: it.poster }), {
         cardClass: 'custom-list-pick',
         dataAttrs: { idx: i },
         style: 'position:relative; cursor:grab; user-select:none; touch-action:manipulation;',
@@ -205,8 +205,9 @@ function renderCustomListDraftList() {
       });
     }
 
-    const posterEl = it.poster
-      ? '<img class="live-preview-poster" src="' + escapeAttr(it.poster) + '" alt="" loading="lazy">'
+    const pickPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster || '') : it.poster;
+    const posterEl = pickPoster
+      ? '<img class="live-preview-poster" src="' + escapeAttr(pickPoster) + '" alt="" loading="lazy">'
       : '<div class="live-preview-poster live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
     
     return '<div class="live-preview-poster-card custom-list-pick" data-idx="' + i + '" style="position:relative; cursor:grab; user-select:none; touch-action:manipulation;">' +

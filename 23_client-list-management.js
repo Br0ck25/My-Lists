@@ -275,7 +275,7 @@ async function testSourceRow(btn) {
       const more = data.maybeMore ? '+' : '';
       resultEl.className = 'testresult ok';
       const thumbs = (data.sample || []).filter((s) => s.poster).slice(0, 5).map((s) =>
-        '<img class="preview-thumb" src="' + escapeAttr(s.poster) + '" alt="' + escapeAttr(s.name) + '" title="' + escapeAttr(s.name) + '" loading="lazy">'
+        '<img class="preview-thumb" src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(s, s.poster) : s.poster) + '" alt="' + escapeAttr(s.name) + '" title="' + escapeAttr(s.name) + '" loading="lazy">'
       ).join('');
       const label = data.count === 0
         ? '\u2713 Reachable, but 0 items matched (check the movie/series toggle).'
@@ -720,10 +720,24 @@ function toggleBetterPostersSetting(key, value) {
     localStorage.setItem('myListAddon:' + key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
   } catch (e) {}
   if (key === 'betterPosters') applyBetterPostersOptionsVisibility();
+  refreshBetterPostersSurfaces();
   if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
   if (typeof saveState === 'function') saveState();
 }
 window.toggleBetterPostersSetting = toggleBetterPostersSetting;
+
+// No refetch needed. Every website surface resolves its poster at render time
+// through resolveClientPoster (19), and nothing writes the resolved URL back
+// onto the item, so the original poster is always still there to fall back to
+// when the setting goes off again -- re-rendering is the whole job. Surfaces
+// not currently on screen pick the change up when they next render, the same
+// way the badge settings behave.
+function refreshBetterPostersSurfaces() {
+  if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+  if (typeof renderLivePreview === 'function') renderLivePreview();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+}
+window.refreshBetterPostersSurfaces = refreshBetterPostersSurfaces;
 
 // The style controls are meaningless while the master switch is off, so they
 // collapse rather than sitting there inert.
@@ -1519,13 +1533,18 @@ function appendPosterGridItems(gridEl, items) {
 window.appendPosterGridItems = appendPosterGridItems;
 
 function livePreviewPosterHtml(m) {
-  if (typeof resolveClientPoster === 'function') {
-    m.poster = resolveClientPoster(m, m.poster);
-  }
+  // Resolved into a local, never written back onto m. It used to assign
+  // "m.poster = ..." to it, which meant a re-render of the same cached item saw the
+  // already-resolved URL as its own original -- harmless while the result was
+  // stable, but it would make a Better Posters URL stick after the setting was
+  // switched back off, with no original left to restore.
+  const resolvedPoster = (typeof resolveClientPoster === 'function')
+    ? resolveClientPoster(m, m.poster)
+    : m.poster;
   const landscape = m.posterShape === 'landscape';
   const posterClass = 'live-preview-poster' + (landscape ? ' landscape' : '');
-  const posterEl = m.poster
-    ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)" data-imdb="' + escapeAttr(m.id || '') + '"><div class="' + posterClass + ' live-preview-poster-placeholder" style="display:none;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>'
+  const posterEl = resolvedPoster
+    ? '<img class="' + posterClass + '" src="' + escapeAttr(resolvedPoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)" data-imdb="' + escapeAttr(m.id || '') + '"><div class="' + posterClass + ' live-preview-poster-placeholder" style="display:none;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>'
     : '<div class="' + posterClass + ' live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
   
   const parentUrl = (m.listUrl || (window._currentListDetailsParams ? window._currentListDetailsParams.listUrl : '') || '').toLowerCase();
@@ -1659,7 +1678,12 @@ function livePreviewPosterHtml(m) {
     subtitleHtml = '<div class="live-preview-poster-subtitle" style="display:flex; align-items:center; justify-content:flex-end; gap:4px; width:100%;">' + ratingSpan + '</div>';
   }
   const extraCardClass = isTraktCwContext ? ' detail-page-trakt-continue-watching' : (isMdblistUpNextContext ? ' detail-page-mdblist-up-next' : '');
-  return '<div class="live-preview-poster-card clickable-poster' + extraCardClass + '" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
+  // resolvedPoster, not m.poster: this attribute is what the poster modal
+  // reads back, so it has to carry the same URL the tile is showing -- the
+  // safe-poster stand-in for a filtered adult item, and the Better Posters
+  // URL when that is on. It used to match only because the poster was
+  // assigned onto m above.
+  return '<div class="live-preview-poster-card clickable-poster' + extraCardClass + '" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(resolvedPoster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
       dateBadge +

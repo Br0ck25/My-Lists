@@ -105,8 +105,9 @@ function renderChannelTitleResults(results, searchType = 'tv') {
   }
   const isMovie = searchType === 'movie';
   const cardsHtml = results.map((r) => {
-    const posterImg = r.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+    const rPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(r, r.poster || '') : (r.poster);
+    const posterImg = rPoster
+      ? '<img class="preview-thumb" src="' + escapeAttr(rPoster) + '" alt="" loading="lazy" style="cursor:pointer;">'
       : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No poster</div>';
     const btnLabel = isMovie ? '+ Add Movie' : '+ Browse';
     const cardClass = isMovie ? 'channelMovieCard' : 'channelTitleCard';
@@ -9336,7 +9337,7 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
 
       return '<div class="list-card-mini-poster-tile">' +
         '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)">' +
-          '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
+          '<img src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(ep, posterUrl) : (posterUrl)) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
           overlays +
         '</div>' +
         '<div class="list-card-mini-poster-name" title="' + escapeAttr(itemTitle) + '">' + escapeHtml(itemTitle) + '</div>' +
@@ -11333,8 +11334,9 @@ function renderChannelPersonResults(results) {
     return;
   }
   const cards = results.map((p) => {
-    const img = p.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(p.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+    const pPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(p, p.poster || '') : (p.poster);
+    const img = pPoster
+      ? '<img class="preview-thumb" src="' + escapeAttr(pPoster) + '" alt="" loading="lazy" style="cursor:pointer;">'
       : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No photo</div>';
     const data = ' data-personid="' + escapeAttr(String(p.personId)) + '" data-personname="' + escapeAttr(p.name) + '"';
     return '<div class="custom-list-search-item channelPersonCard" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
@@ -11398,7 +11400,7 @@ function setChannelSpotlightSortAndReload(value) {
 }
 
 function channelPersonCreditCardHtml(credit, isShow) {
-  const poster = credit.poster || '';
+  const poster = typeof resolveClientPoster === 'function' ? resolveClientPoster(credit, credit.poster || '') : (credit.poster || '');
   const img = poster
     ? '<img class="preview-thumb" src="' + escapeAttr(poster) + '" alt="" loading="lazy">'
     : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';

@@ -1051,7 +1051,12 @@ window.formatRatingSpanHtml = formatRatingSpanHtml;
 function renderMediaCard(item, options = {}) {
   if (!item) return '';
   const title = item.title || item.name || '';
-  const poster = item.poster || (typeof resolveClientPoster === 'function' ? resolveClientPoster(item, item.poster) : '');
+  // Was an "item.poster ||" short-circuit, which meant a
+  // card that already had a poster never reached the funnel at all, so
+  // neither the Adult Content Filter nor Better Posters could touch it.
+  const poster = (typeof resolveClientPoster === 'function')
+    ? resolveClientPoster(item, item.poster || '')
+    : (item.poster || '');
   const year = item.year || '';
   
   const cardClass = 'live-preview-poster-card' + (options.cardClass ? ' ' + options.cardClass : '');

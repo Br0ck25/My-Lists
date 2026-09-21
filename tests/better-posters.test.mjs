@@ -321,3 +321,115 @@ describe("BetterPosters end-to-end via the catalog route", () => {
     );
   });
 });
+
+// --- the website's own surfaces -------------------------------------------
+// The Worker rewrites posters for Stremio/Nuvio; resolveClientPoster (19) does
+// the same for every poster the website itself renders. These run the real
+// client bundle -- see tests/client-harness.mjs.
+
+const { loadClient } = await import("./client-harness.mjs");
+
+const ON = { "myListAddon:betterPosters": "1" };
+const movie = (extra = {}) => ({ id: "tt0111161", type: "movie", name: "Shawshank", poster: "orig.jpg", ...extra });
+
+describe("Better Posters on the website", () => {
+  it("leaves posters alone while the setting is off", () => {
+    const c = loadClient();
+    assert.equal(c.call("resolveClientPoster", movie(), "orig.jpg"), "orig.jpg");
+  });
+
+  it("swaps an IMDb-backed poster once the setting is on", () => {
+    const c = loadClient({ storage: ON });
+    assert.equal(
+      c.call("resolveClientPoster", movie(), "orig.jpg"),
+      "https://btttr.cc/poster/imdb/poster-default/tt0111161.jpg"
+    );
+  });
+
+  it("builds the same URL the Worker does, including the style options", () => {
+    const c = loadClient({ storage: {
+      ...ON,
+      "myListAddon:betterPostersGenre": "0",
+      "myListAddon:betterPostersQuality": "1",
+      "myListAddon:betterPostersTrendTags": "0",
+      "myListAddon:betterPostersRatingSource": "IM",
+    } });
+    assert.equal(
+      c.call("resolveClientPoster", movie(), "orig.jpg"),
+      "https://btttr.cc/poster-rq/imdb/poster-default/tt0111161.jpg?tag=none&rs=IM"
+    );
+  });
+
+  it("resolves a show from an episode id, and skips a TMDB-only item", () => {
+    const c = loadClient({ storage: ON });
+    assert.equal(
+      c.call("resolveClientPoster", { id: "tt0903747:5:16", poster: "still.jpg" }, "still.jpg"),
+      "https://btttr.cc/poster/imdb/poster-default/tt0903747.jpg"
+    );
+    assert.equal(c.call("resolveClientPoster", { id: "tmdb:550", poster: "keep.jpg" }, "keep.jpg"), "keep.jpg");
+  });
+
+  // Precedence has to match the Worker's: the filter runs first and returns.
+  it("lets the Adult Content Filter override it", () => {
+    const c = loadClient({ storage: { ...ON, "myListAddon:adultContentFilter": "1" } });
+    const out = c.call("resolveClientPoster", movie({ isAdult: true }), "orig.jpg");
+    assert.ok(out.includes("/api/safe-poster"), out);
+    assert.ok(!out.includes("btttr.cc"), out);
+  });
+
+  it("never touches artwork the add-on generates itself", () => {
+    const c = loadClient({ storage: ON });
+    const keep = [
+      "https://example.com/api/channel-poster?name=X",
+      "https://example.com/api/channel-logo?path=/a.png",
+      "https://example.com/api/poster-badge?poster=y&id=tt0111161",
+    ];
+    for (const p of keep) {
+      assert.equal(c.call("resolveClientPoster", movie({ poster: p }), p), p);
+    }
+  });
+
+  it("leaves a landscape tile and an episode still alone", () => {
+    const c = loadClient({ storage: ON });
+    assert.equal(
+      c.call("resolveClientPoster", movie({ posterShape: "landscape" }), "wide.jpg"),
+      "wide.jpg"
+    );
+    assert.equal(
+      c.call("resolveClientPoster", { id: "tt0903747:1:2", thumbnail: "still.jpg" }, "still.jpg"),
+      "still.jpg"
+    );
+  });
+
+  it("rebuilds rather than stacking when handed its own URL back", () => {
+    const c = loadClient({ storage: { ...ON, "myListAddon:betterPostersRating": "0" } });
+    const once = c.call("resolveClientPoster", movie(), "orig.jpg");
+    const twice = c.call("resolveClientPoster", movie(), once);
+    assert.equal(once, "https://btttr.cc/poster-g/imdb/poster-default/tt0111161.jpg");
+    assert.equal(twice, once);
+  });
+});
+
+describe("Better Posters reaches the shared renderers", () => {
+  it("renders through the Live Preview grid without mutating the item", () => {
+    const c = loadClient({ storage: ON });
+    const m = movie();
+    const html = c.call("livePreviewPosterHtml", m);
+    assert.ok(html.includes("https://btttr.cc/poster/imdb/poster-default/tt0111161.jpg"), html.slice(0, 300));
+    // The original has to survive, or switching the setting back off would
+    // have nothing to restore.
+    assert.equal(m.poster, "orig.jpg");
+  });
+
+  it("renders through renderMediaCard, which used to short-circuit", () => {
+    const c = loadClient({ storage: ON });
+    const html = c.call("renderMediaCard", movie(), {});
+    assert.ok(html.includes("https://btttr.cc/poster/imdb/poster-default/tt0111161.jpg"), html.slice(0, 300));
+  });
+
+  it("renderMediaCard still honours the Adult Content Filter", () => {
+    const c = loadClient({ storage: { "myListAddon:adultContentFilter": "1" } });
+    const html = c.call("renderMediaCard", movie({ isAdult: true }), {});
+    assert.ok(html.includes("/api/safe-poster"), html.slice(0, 300));
+  });
+});
