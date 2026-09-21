@@ -37,6 +37,17 @@
     </div>
 
     <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Duplicate Items Across Lists</h2>
+      <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.92rem; user-select:none;">
+        <input type="checkbox" id="dedupeAcrossListsCheckbox" ${initialDedupeAcrossLists ? 'checked' : ''} onchange="localStorage.setItem('myListAddon:dedupeAcrossLists', this.checked ? '1' : '0'); saveState()" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+        <div>
+          <span style="font-weight:600;">Remove duplicate items across lists</span>
+          <p style="margin:4px 0 0; color:var(--muted); font-size:0.82rem;">Keeps your top list exactly as it is; every list below it has anything already shown in an earlier list removed. Order is whatever order your lists are in here -- drag a list to change which one keeps a shared title. Applies to Live Preview &amp; Editor and to the real catalogs Stremio/Nuvio see once you Save/Update. Requires Save/Update to take effect on an existing install link.</p>
+        </div>
+      </label>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Adult Content &amp; Poster Safety</h2>
       <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.92rem; user-select:none;">
         <input type="checkbox" id="adultContentFilterCheckbox" ${initialAdultContentFilter ? 'checked' : ''} onchange="localStorage.setItem('myListAddon:adultContentFilter', this.checked ? '1' : '0'); if (window._listPreviewCache) window._listPreviewCache.clear(); saveState()" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">

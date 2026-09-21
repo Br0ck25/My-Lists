@@ -2789,6 +2789,14 @@ function renderItemStorylinesWatchOrder(d, type) {
   const matchingEvents = events.filter((ev) => Array.isArray(ev.episodes) && ev.episodes.some(isPartMatch));
   if (!matchingEvents.length) return '';
 
+  // Same static registry, same missing rating, as the Channel Builder's own
+  // Storylines, Sagas & Universes grid (20_client-channel-builder.js) --
+  // collected here and handed to that page's resolveStorylineRatings once
+  // this html is actually in the DOM (see the microtask below), so the two
+  // surfaces share one cache and neither re-asks for what the other already
+  // resolved this session.
+  const itemStorylineRatingIds = new Set();
+
   const storylineBlocksHtml = matchingEvents.map((event, eventIdx) => {
     const isSingle = (matchingEvents.length === 1);
     const displayStyle = (isSingle || eventIdx === 0) ? 'display:block;' : 'display:none;';
@@ -2824,6 +2832,14 @@ function renderItemStorylinesWatchOrder(d, type) {
         ' onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeJsAttr(partId) + '&quot;, &quot;' + partType + '&quot;)"' :
         (isCurrent ? ' onclick="event.stopPropagation(); window.scrollTo({ top: 0, behavior: &quot;smooth&quot; });"' : '');
 
+      // Skipped on the card for the title already open in this modal -- its
+      // rating is already shown up in the main info block, so repeating it
+      // here would just be noise on the one tile that needs it least.
+      if (!isCurrent && partId) itemStorylineRatingIds.add(partId);
+      const ratingSlot = (!isCurrent && partId)
+        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(partId) + '" data-rating-style="inline"></span>'
+        : '';
+
       return '<div class="item-storyline-card' + (isCurrent ? ' is-current' : '') + '"' + clickHandler + ' title="' + escapeAttr(displayTitle + (isCurrent ? ' (Currently Viewing)' : '')) + '">' +
         '<div class="item-storyline-poster-wrap">' +
           (posterUrl ?
@@ -2834,7 +2850,10 @@ function renderItemStorylinesWatchOrder(d, type) {
           (isWatched && !isCurrent ? '<span class="item-storyline-watched-badge" title="Watched">&#x2713;</span>' : '') +
         '</div>' +
         '<div class="item-storyline-title">' + escapeHtml(displayTitle) + '</div>' +
-        '<div class="item-storyline-meta">' + escapeHtml(formatSubtitle) + '</div>' +
+        '<div class="item-storyline-meta" style="display:flex; align-items:center; justify-content:space-between; gap:6px;">' +
+          '<span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + escapeHtml(formatSubtitle) + '</span>' +
+          ratingSlot +
+        '</div>' +
       '</div>';
     }).join('');
 
@@ -2867,6 +2886,17 @@ function renderItemStorylinesWatchOrder(d, type) {
         '</button>'
       ).join('') +
     '</div>' : '';
+
+  // Deferred a tick rather than called right here: this function only
+  // returns an html STRING, and openItemDetailsModal (its one caller) does
+  // not assign that string into the modal body until after this returns --
+  // resolving now would query a DOM that does not have these slots in it
+  // yet. A microtask runs after that synchronous assignment either way,
+  // real timers or not, which is what keeps this reachable from a test.
+  if (itemStorylineRatingIds.size && typeof resolveStorylineRatings === 'function') {
+    const idsToResolve = [...itemStorylineRatingIds];
+    Promise.resolve().then(() => resolveStorylineRatings(idsToResolve));
+  }
 
   return '<div class="item-storylines-section">' +
     '<div class="shelf-header" style="margin-bottom:12px;">' +

@@ -3017,6 +3017,98 @@ describe("client: crossover and companion events detection in channel builder", 
   });
 });
 
+// TV_CROSSOVER_EVENTS carries poster, title and year for every entry but no
+// rating -- it is a static, hand-curated registry, not a live catalog fetch --
+// so the Storylines, Sagas & Universes grid resolves ratings itself, from
+// /api/details/batch, after rendering. These pin the id-collection, dedup and
+// caching logic (resolveStorylineRatings), not the DOM patch itself
+// (applyStorylineRatingBadges): the harness's element stubs always answer
+// querySelectorAll with [], the same limitation resolveMissingPostersInDom's
+// DOM-patching has always had here (see client-harness.mjs).
+describe("client: Storylines, Sagas & Universes rating badges", () => {
+  const BATCH = "/api/details/batch";
+
+  // KonoSuba's own event: three tiles, two of which (Seasons 1-2 and Season
+  // 3) are the same show and so share one imdb id -- a real, already-in-the-
+  // registry case of the exact id collision the grid's dedup has to handle.
+  const KONOSUBA_SHOW_ID = "tt5312384";
+  const KONOSUBA_MOVIE_ID = "tt8600494";
+
+  function batchRoute(ratingsById) {
+    return {
+      [BATCH]: (req) => {
+        const ids = req.body.ids;
+        const results = {};
+        ids.forEach((id) => {
+          const r = Object.prototype.hasOwnProperty.call(ratingsById, id) ? ratingsById[id] : null;
+          results[id] = (r == null) ? null : { rating: String(r) };
+        });
+        return { json: { ok: true, results: results, remainingIds: [], done: true } };
+      },
+    };
+  }
+
+  it("renders a rating slot for every poster tile, deduping the same show across two entries", () => {
+    const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6, [KONOSUBA_MOVIE_ID]: 7.1 }) });
+    client.call("renderStorylinesUniverseList", "all");
+    const html = client.get("document").getElementById("storylinesUniverseList").innerHTML;
+    const slotIds = [...html.matchAll(/storyline-rating-slot" data-rating-id="([^"]+)"/g)].map((m) => m[1]);
+    assert.ok(slotIds.includes(KONOSUBA_SHOW_ID), "the show's tiles carry a rating slot for its id");
+    assert.ok(slotIds.includes(KONOSUBA_MOVIE_ID), "the movie tile carries a rating slot for its own id");
+  });
+
+  it("asks /api/details/batch for every unique poster id on the grid exactly once", async () => {
+    const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6, [KONOSUBA_MOVIE_ID]: 7.1 }) });
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+
+    // The "all" grid is chunked into up to 60 ids per request, so this may be
+    // more than one request -- what matters is that the repeated show id
+    // (two tiles in the same card) was only ever asked for once combined.
+    const sent = requestsTo(client, BATCH);
+    assert.ok(sent.length >= 1, "at least one batch request went out");
+    const allIdsSent = sent.flatMap((r) => r.body.ids);
+    assert.equal(allIdsSent.filter((id) => id === KONOSUBA_SHOW_ID).length, 1,
+      "the id shared by two tiles is requested only once, not once per tile");
+    assert.equal(allIdsSent.filter((id) => id === KONOSUBA_MOVIE_ID).length, 1);
+
+    const cache = client.get("_storylineRatingsCache");
+    assert.equal(cache[KONOSUBA_SHOW_ID], 7.6);
+    assert.equal(cache[KONOSUBA_MOVIE_ID], 7.1);
+  });
+
+  it("does not re-fetch a rating this session already resolved", async () => {
+    const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6, [KONOSUBA_MOVIE_ID]: 7.1 }) });
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+    const firstRoundCount = requestsTo(client, BATCH).length;
+    assert.ok(firstRoundCount >= 1);
+
+    // Re-rendering the same category (switching tabs back, in the real UI)
+    // finds every id already cached, so this should add no new requests.
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+    assert.equal(requestsTo(client, BATCH).length, firstRoundCount,
+      "a second render of the same grid asks for nothing already known");
+  });
+
+  it("caches a title with no TMDB rating as null instead of retrying it forever", async () => {
+    const client = loadClient({ routes: batchRoute({}) });
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+
+    const cache = client.get("_storylineRatingsCache");
+    assert.equal(cache[KONOSUBA_SHOW_ID], null);
+    assert.equal(cache[KONOSUBA_MOVIE_ID], null);
+
+    const firstRoundCount = requestsTo(client, BATCH).length;
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+    assert.equal(requestsTo(client, BATCH).length, firstRoundCount,
+      "an id already known to have no rating is not asked for again");
+  });
+});
+
 describe("client: livePreviewPosterHtml Continue Watching older season badge suppression", () => {
   it("suppresses season finale badge on Continue Watching when user is watching an older season", () => {
     const client = loadClient();
@@ -3316,6 +3408,33 @@ describe("client: adult content filter & safe poster replacement", () => {
     const collect = client.get("collectKeys");
     const keys = collect();
     assert.equal(keys.adultContentFilter, true);
+  });
+});
+
+describe("client: dedupeAcrossLists setting round-trips through collectKeys and buildConfig", () => {
+  it("collectKeys returns dedupeAcrossLists: true once the checkbox is checked", () => {
+    const client = loadClient();
+    client.get("document").getElementById("dedupeAcrossListsCheckbox").checked = true;
+    const keys = client.get("collectKeys")();
+    assert.equal(keys.dedupeAcrossLists, true);
+  });
+
+  it("collectKeys returns dedupeAcrossLists: false by default", () => {
+    const client = loadClient();
+    const keys = client.get("collectKeys")();
+    assert.equal(keys.dedupeAcrossLists, false);
+  });
+
+  it("buildConfig carries dedupeAcrossLists into the saved payload only when enabled", () => {
+    const client = loadClient();
+    const buildConfig = client.get("buildConfig");
+    const decodeOne = (b64) => JSON.parse(client.get("atob")(b64.replace(/-/g, "+").replace(/_/g, "/")));
+
+    const withOn = buildConfig([], { dedupeAcrossLists: true });
+    assert.equal(decodeOne(withOn).dedupeAcrossLists, true);
+
+    const withOff = buildConfig([], { dedupeAcrossLists: false });
+    assert.equal(decodeOne(withOff).dedupeAcrossLists, undefined, "omitted entirely, same as every other off-by-default flag here");
   });
 });
 
@@ -3799,6 +3918,60 @@ describe("client: Item Details Storylines, Sagas & Universes watch order", () =>
     await client.call("openItemDetailsModal", "tt9999999", "movie");
     assert.equal(body.innerHTML.includes("item-storylines-section"), false, "Standalone movie modal does not contain storylines section");
   });
+
+  // Same static registry, same missing rating, as the Channel Builder's own
+  // grid (see "client: Storylines, Sagas & Universes rating badges" above) --
+  // these cover the one thing specific to this surface: the title already
+  // open in the modal is skipped, since its rating is already shown higher
+  // up on the same page.
+  it("renders a rating slot for each companion title, but not for the one already open", () => {
+    const client = loadClient();
+    const bb = {
+      id: "tt0903747",
+      imdbId: "tt0903747",
+      tmdbId: 1396,
+      title: "Breaking Bad",
+      seasonsData: [{ season_number: 1, episode_count: 7 }]
+    };
+    const html = client.__scopeCall("renderItemStorylinesWatchOrder", [bb, "series"]);
+    assert.match(html, /storyline-rating-slot" data-rating-id="tt9243946" data-rating-style="inline"/,
+      "El Camino (a companion) gets a rating slot");
+    assert.match(html, /storyline-rating-slot" data-rating-id="tt3032476" data-rating-style="inline"/,
+      "Better Call Saul (a companion) gets a rating slot");
+    assert.equal(html.includes('data-rating-id="tt0903747"'), false,
+      "Breaking Bad itself -- the title already open in this modal -- gets no slot");
+  });
+
+  it("asks /api/details/batch for the companion titles once the modal body is actually updated", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/details": () => ({
+          json: {
+            ok: true,
+            details: {
+              id: "tt0903747", imdbId: "tt0903747", tmdbId: 1396, title: "Breaking Bad",
+              seasonsData: [{ season_number: 1, episode_count: 7 }],
+            },
+          },
+        }),
+        "/api/details/batch": (req) => {
+          const results = {};
+          req.body.ids.forEach((id) => { results[id] = { rating: "8.9" }; });
+          return { json: { ok: true, results: results, remainingIds: [], done: true } };
+        },
+      },
+    });
+    await client.call("openItemDetailsModal", "tt0903747", "series");
+    await settle();
+
+    const sent = requestsTo(client, "/api/details/batch").flatMap((r) => r.body.ids);
+    assert.ok(sent.includes("tt9243946"), "El Camino is resolved");
+    assert.ok(sent.includes("tt3032476"), "Better Call Saul is resolved");
+    assert.equal(sent.includes("tt0903747"), false, "the currently open title is never asked for");
+
+    const cache = client.get("_storylineRatingsCache");
+    assert.equal(cache.tt9243946, 8.9);
+  });
 });
 
 
@@ -4081,6 +4254,135 @@ describe("client: Live Preview proves who is asking before reading a personal sh
     assert.equal(sent.length, 1);
     assert.equal(sent[0].body.creatorKey, undefined,
       "a signed-out browser has no ownership to claim over someone else's shelf");
+  });
+});
+
+// "Remove duplicate items across lists" (Settings -> dedupeAcrossListsCheckbox).
+// Server-side coverage (the real Stremio/Nuvio catalogs) lives in
+// tests/worker.test.mjs under "worker: remove duplicate items across lists" --
+// this is the client-only half: the same rule applied to Live Preview's
+// already-fetched shelves, purely in the browser, no extra request.
+describe("client: Live Preview removes duplicate items across lists", () => {
+  function fakeInput(value) {
+    return { value, dataset: {} };
+  }
+
+  function fakeEntry(name, url, type) {
+    const posters = { innerHTML: "", classList: { add() {}, remove() {}, toggle() {} } };
+    const status = { innerHTML: "" };
+    const entry = {
+      dataset: {},
+      style: {},
+      posters,
+      status,
+      querySelector(sel) {
+        if (sel === ".name") return fakeInput(name);
+        if (sel === ".type") return fakeInput(type);
+        if (sel === ".url") return fakeInput(url);
+        if (sel === ".live-preview-posters") return posters;
+        if (sel === ".live-preview-shelf-status") return status;
+        return null;
+      },
+      querySelectorAll(sel) {
+        if (sel === ".url") return [fakeInput(url)];
+        return [];
+      },
+    };
+    return entry;
+  }
+
+  function withRows(client, rows) {
+    const entries = rows.map((r) => fakeEntry(r.name, r.url, r.type));
+    const doc = client.get("document");
+    const lists = doc.getElementById("lists");
+    lists.querySelectorAll = (sel) => (sel === ".entry" ? entries : []);
+    doc.querySelectorAll = (sel) => {
+      if (sel === "#lists .entry") return entries;
+      if (sel === "#lists .entry .url") return rows.map((r) => fakeInput(r.url));
+      return [];
+    };
+    return entries;
+  }
+
+  const sampleRoute = (byUrl) => (req) => ({
+    json: { ok: true, totalItems: byUrl[req.body.url].length, maybeMore: false, sample: byUrl[req.body.url] },
+  });
+
+  it("keeps the top list's items and strips whatever a later list of the same type already has", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:dedupeAcrossLists": "1" },
+      routes: {
+        "/api/preview": sampleRoute({
+          "customlist:v1:listone": [
+            { id: "ttA", type: "movie", name: "Movie A", poster: "" },
+            { id: "ttB", type: "movie", name: "Movie B", poster: "" },
+          ],
+          "customlist:v1:listtwo": [
+            { id: "ttA", type: "movie", name: "Movie A", poster: "" },
+            { id: "ttC", type: "movie", name: "Movie C", poster: "" },
+          ],
+        }),
+      },
+    });
+    const rows = withRows(client, [
+      { name: "List 1", url: "customlist:v1:listone", type: "movie" },
+      { name: "List 2", url: "customlist:v1:listtwo", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+
+    assert.match(rows[0].posters.innerHTML, /ttA/, "list 1 keeps A");
+    assert.match(rows[0].posters.innerHTML, /ttB/, "list 1 keeps B");
+    assert.equal(rows[1].posters.innerHTML.includes("ttA"), false, "list 2 loses A -- already shown by list 1");
+    assert.match(rows[1].posters.innerHTML, /ttC/, "list 2 keeps C -- not shown anywhere earlier");
+
+    const shelfData = client.get("livePreviewShelfData");
+    assert.deepEqual(shelfData[0].sample.map((it) => it.id), ["ttA", "ttB"]);
+    assert.deepEqual(shelfData[1].sample.map((it) => it.id), ["ttC"]);
+    assert.equal(shelfData[1].totalItems, 1, "the shown total drops by however many were removed");
+  });
+
+  it("does nothing when the setting is off, even with the exact same overlapping lists", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/preview": sampleRoute({
+          "customlist:v1:listone": [{ id: "ttA", type: "movie", name: "Movie A", poster: "" }],
+          "customlist:v1:listtwo": [
+            { id: "ttA", type: "movie", name: "Movie A", poster: "" },
+            { id: "ttB", type: "movie", name: "Movie B", poster: "" },
+          ],
+        }),
+      },
+    });
+    withRows(client, [
+      { name: "List 1", url: "customlist:v1:listone", type: "movie" },
+      { name: "List 2", url: "customlist:v1:listtwo", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+
+    const shelfData = client.get("livePreviewShelfData");
+    assert.deepEqual(shelfData[1].sample.map((it) => it.id), ["ttA", "ttB"], "no dedup applied");
+  });
+
+  it("shows a message instead of an empty shelf when every item in a list was a duplicate", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:dedupeAcrossLists": "1" },
+      routes: {
+        "/api/preview": sampleRoute({
+          "customlist:v1:listone": [{ id: "ttA", type: "movie", name: "Movie A", poster: "" }],
+          "customlist:v1:listtwo": [{ id: "ttA", type: "movie", name: "Movie A", poster: "" }],
+        }),
+      },
+    });
+    const rows = withRows(client, [
+      { name: "List 1", url: "customlist:v1:listone", type: "movie" },
+      { name: "List 2", url: "customlist:v1:listtwo", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+
+    assert.match(rows[1].posters.innerHTML, /duplicate/i);
   });
 });
 

@@ -1,5 +1,118 @@
 # Changes Log
 
+## 2026-09-21 - Remove duplicate items across lists
+
+### Files Changed
+`02_http-and-creator-utils.js`, `04_config-resolution.js`, `05_catalog-core.js`, `09_page-shell.js`,
+`15_tab-settings-html.js`, `22_client-creator-profile.js`, `23_client-list-management.js`,
+`24_client-backup-restore-presets.js`, `25_api-catalog-routes.js`, `worker_entry_combined.js`,
+`CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/client.test.mjs`, `tests/worker.test.mjs`
+
+### The request
+
+Someone with several overlapping lists (the same handful of popular titles turning up near the top of
+list after list) wanted the later lists to stop repeating what an earlier one already showed -- both in
+the builder's own Live Preview and in the real catalogs Stremio/Nuvio end up with once the install link
+is generated. Their own example: three lists that each start with the same three movies; with the setting
+on, the top list keeps everything, and each list after it keeps only what nothing above it already has.
+
+### The fix
+
+New setting, off by default: **Remove duplicate items across lists**. "Order" is whichever order a
+person's lists are in, in Catalogs/Live Preview & Editor -- the same order a list is already
+drag-to-reordered in today, so changing which list keeps a shared title is just dragging it above the
+other one.
+
+Two places apply the identical rule, since a person can look at either one:
+
+- **Live Preview & Editor** -- `renderLivePreview` (`23_client-list-management.js`) already fetches every
+  enabled shelf's sample in parallel before this runs; once every shelf has its final answer, a single
+  pass walks them in order, removing (per type -- movie vs series never collide anyway) whatever id an
+  earlier shelf already showed, then re-renders just the shelves that actually lost something.
+- **The real Stremio/Nuvio catalogs** -- new `dedupeAcrossListEntries` (`05_catalog-core.js`), called from
+  the `/catalog/:type/:id.json` route (`25_api-catalog-routes.js`) whenever the setting is on. Finds the
+  entry being served, re-fetches every enabled earlier same-type entry at the identical `skip`, and
+  strips anything already in one of those pages. Deliberately mirrors `fetchMergedCatalog`'s own existing
+  tradeoff for a merged row's sources -- same skip/page window only, not the whole earlier list -- since
+  getting it exact deeper into pagination would mean holding every earlier list in full, which this
+  add-on's stateless, one-request-per-page design was never built for.
+
+Getting the flag itself from a checkbox to both of those meant threading it through every place a
+settings flag like this already has to reach: `collectKeys`/`buildConfig` and the client's own `/api/save`
+call, the server's field allowlist on `/api/save`, both `resolveConfig` decode paths (the KV short-link
+branch and `decodeConfig`'s base64 branch), the `/:config/configure` page's `initialKeys`, JSON backup
+export/restore, the config-changed-since-last-save hash, and cross-device Creator Profile sync. Used
+`hideNonDigitalReleases` as the template throughout, since it already touches every one of those exact
+spots.
+
+### Tests
+
+`tests/worker.test.mjs` ("worker: remove duplicate items across lists", 4 tests, plus a decode/resolve
+test alongside the existing `adultContentFilter` one): built from `customlist:v1:` entries specifically,
+since that source embeds its items directly in the url and needs no network mock at all. Covers the top
+list staying untouched, a later list losing only what an earlier one already has, the setting doing
+nothing at all when off, movie/series lists never deduping against each other even with a deliberately
+shared id, and a disabled earlier list being skipped while a later enabled one still counts.
+
+`tests/client.test.mjs`: a new "Live Preview removes duplicate items across lists" suite (3 tests) covers
+the client-side pass -- the top shelf keeps its items, a later shelf loses what's shared, the setting does
+nothing when off, and a shelf that loses every item shows a message instead of going blank. A separate
+"dedupeAcrossLists setting round-trips through collectKeys and buildConfig" suite (3 tests) covers the
+settings plumbing directly.
+
+## 2026-09-21 - Rating badges on Storylines, Sagas & Universes
+
+### Files Changed
+`19_client-search-and-likes.js`, `20_client-channel-builder.js`, `worker_entry_combined.js`,
+`CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/client.test.mjs`
+
+### The problem
+
+TV_CROSSOVER_EVENTS (the static saga/universe registry both features below read from) carries a
+poster, a title and a year for every entry, but never a rating -- it's hand-curated, not a live catalog
+fetch. Two different places show this same registry's posters, and neither one had a rating badge:
+the Channel Builder's own **Storylines, Sagas & Universes** browse grid (`renderStorylinesUniverseList`),
+and the identically-named section of the item details modal (`renderItemStorylinesWatchOrder`) that shows
+a title's saga when you're already looking at one of its parts.
+
+### The fix
+
+Added `resolveStorylineRatings`/`applyStorylineRatingBadges` (`20_client-channel-builder.js`): after a
+poster grid renders, it collects the unique imdb/tmdb ids on the page, skips whatever is already cached
+or already in flight, and resolves the rest from `/api/details/batch` in chunks of 60 (that route's own
+per-request cap), with its existing round-continuation loop for whatever a single invocation's fetch
+budget didn't finish. Results land in a module-scoped cache keyed by id, shared by both surfaces, so a
+title in more than one saga, or shown on both pages, is only ever looked up once per session.
+
+Each surface renders the badge to fit what's already on its own poster tile. The Channel Builder's grid
+tiles are otherwise bare, so they get the standard poster-corner badge (`formatRatingBadgeHtml`, which
+had been sitting fully wired -- CSS, settings toggles -- with no caller anywhere in the app until now).
+The item details modal's storyline cards are already carrying a part-number badge, a watched checkmark
+and (on the current part) a full-width "Current" pill, so a fourth overlay would only collide; those get
+a plain inline star-and-number instead (`formatRatingSpanHtml`), next to the subtitle text. The card for
+the title already open in that modal is skipped entirely -- its rating is already shown higher up on the
+same page, and skipping it also sidesteps the one tile whose "Current" pill spans the full width where an
+overlay badge would have gone.
+
+Both call sites hand the resolver a plain list of ids collected while building the HTML, rather than
+re-discovering them by querying the rendered DOM afterward: the ids were already in hand from the same
+loop that built the poster markup, and it kept the fetch-and-cache logic testable independent of DOM
+queries. The item details modal's call is deferred by one microtask (`Promise.resolve().then(...)`),
+since `renderItemStorylinesWatchOrder` only returns an html *string* -- its one caller doesn't assign that
+into the modal body until after it returns, so resolving synchronously would query a DOM that doesn't
+have these slots in it yet.
+
+### Tests
+
+`tests/client.test.mjs`: a new "Storylines, Sagas & Universes rating badges" suite (4) covers the
+Channel Builder grid -- a rating slot renders for every poster tile (deduping a show that appears twice
+in the same card), `/api/details/batch` is asked for each unique id exactly once, a second render of the
+same grid asks for nothing already cached, and a title with no TMDB rating is cached as `null` rather
+than retried forever. Two more in the existing "Item Details Storylines, Sagas & Universes watch order"
+suite cover the modal-specific behaviour: a rating slot renders for each companion title but not for the
+one already open, and `openItemDetailsModal` end to end resolves the companions' ratings once the modal
+body is actually updated, never the currently-open title's own id.
+
 ## 2026-09-21 - Specials, listed instead of dropped
 
 ### Files Changed

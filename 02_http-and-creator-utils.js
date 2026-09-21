@@ -359,7 +359,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // with no CONFIGS KV binding, and without KV there are no Creator Profiles for
 // a personal shelf to belong to.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false, dedupeAcrossLists: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -406,6 +406,12 @@ function decodeConfig(config) {
       // as region's own default above.
       hideNonDigitalReleases: !!(!Array.isArray(parsed) && parsed.hideNonDigitalReleases),
       adultContentFilter: !!(!Array.isArray(parsed) && parsed.adultContentFilter),
+      // Keeps the first list of a given type in a config untouched and
+      // strips whatever a later list of the same type shares with an
+      // earlier one -- see dedupeAcrossListEntries (05_catalog-core.js) for
+      // where this is actually applied. Defaults to false, same reasoning
+      // as region/hideNonDigitalReleases above.
+      dedupeAcrossLists: !!(!Array.isArray(parsed) && parsed.dedupeAcrossLists),
     };
   } catch {
     return empty;

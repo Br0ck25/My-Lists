@@ -314,6 +314,7 @@ function buildConfig(entries, keys) {
   if (keys && keys.region && keys.region !== 'US') payload.region = keys.region;
   if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
   if (keys && keys.adultContentFilter) payload.adultContentFilter = true;
+  if (keys && keys.dedupeAcrossLists) payload.dedupeAcrossLists = true;
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -528,6 +529,7 @@ function collectKeys() {
     })(),
     hideNonDigitalReleases: document.getElementById('hideNonDigitalReleasesCheckbox') ? document.getElementById('hideNonDigitalReleasesCheckbox').checked : false,
     adultContentFilter: typeof isAdultContentFilterEnabled === 'function' ? isAdultContentFilterEnabled() : (localStorage.getItem('myListAddon:adultContentFilter') === '1'),
+    dedupeAcrossLists: document.getElementById('dedupeAcrossListsCheckbox') ? document.getElementById('dedupeAcrossListsCheckbox').checked : (localStorage.getItem('myListAddon:dedupeAcrossLists') === '1'),
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
@@ -1022,6 +1024,46 @@ async function renderLivePreview() {
 
   const workers = Array(Math.min(CONCURRENCY, shelves.length)).fill(0).map(worker);
   await Promise.all(workers);
+
+  // "Remove duplicate items across lists" (Settings -> dedupeAcrossListsCheckbox).
+  // Runs once every shelf above has actually resolved, not per-shelf as each
+  // one finishes -- the whole point is comparing a later shelf against
+  // earlier ones, which only means something once "earlier" has a final
+  // answer. Mirrors dedupeAcrossListEntries (05_catalog-core.js) exactly:
+  // the config's first list of a type is untouched, everything after it
+  // (in this same top-to-bottom order) loses whatever id an earlier
+  // same-type shelf already has, so what's shown here matches what the
+  // real Stremio/Nuvio catalogs will once this config is saved.
+  let dedupeAcrossLists = false;
+  try { dedupeAcrossLists = localStorage.getItem('myListAddon:dedupeAcrossLists') === '1'; } catch (e) {}
+  if (dedupeAcrossLists) {
+    const seenByType = {};
+    livePreviewShelfData.forEach((shelf, i) => {
+      if (!shelf || !Array.isArray(shelf.sample) || !shelf.sample.length) return;
+      const seen = seenByType[shelf.type] || (seenByType[shelf.type] = new Set());
+      const before = shelf.sample.length;
+      shelf.sample = shelf.sample.filter((item) => item && item.id && !seen.has(item.id));
+      shelf.sample.forEach((item) => seen.add(item.id));
+      const removed = before - shelf.sample.length;
+      if (!removed) return;
+      if (typeof shelf.totalItems === 'number') {
+        shelf.totalItems = Math.max(shelf.sample.length, shelf.totalItems - removed);
+      }
+      const entryDOM = enabledEntries[i];
+      const postersContainer = entryDOM && entryDOM.querySelector('.live-preview-posters');
+      const seeAllBtn = entryDOM && entryDOM.querySelector('.live-preview-shelf-title button');
+      if (!postersContainer) return;
+      if (!shelf.sample.length) {
+        postersContainer.innerHTML = '<p><small>No items left after removing duplicates of an earlier list.</small></p>';
+        if (seeAllBtn) seeAllBtn.disabled = true;
+        return;
+      }
+      const sliced = shelf.sample.slice(0, visibleCount);
+      sliced.forEach((item) => { item.listUrl = shelf.url; item.listName = shelf.name; item.isLivePreviewShelf = true; });
+      postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
+      if (seeAllBtn) seeAllBtn.disabled = !(shelf.sample.length > visibleCount);
+    });
+  }
 }
 
 // Hides a poster that could not be loaded and shows a "No poster" tile in

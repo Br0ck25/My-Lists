@@ -158,6 +158,7 @@ function buildFullBackupPayload() {
       scrobbleBlockAnonymous: localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1',
       hideNonDigitalReleases: localStorage.getItem('myListAddon:hideNonDigitalReleases') === '1',
       adultContentFilter: localStorage.getItem('myListAddon:adultContentFilter') === '1',
+      dedupeAcrossLists: localStorage.getItem('myListAddon:dedupeAcrossLists') === '1',
       region: localStorage.getItem('myListAddon:region') || '',
       dashboardListOrder: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]'); } catch(e) { return []; } })(),
       hiddenLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch(e) { return []; } })(),
@@ -631,6 +632,11 @@ function applyImportedConfig(data) {
     const cb = document.getElementById('adultContentFilterCheckbox');
     if (cb) cb.checked = s.adultContentFilter;
     try { localStorage.setItem('myListAddon:adultContentFilter', s.adultContentFilter ? '1' : '0'); } catch (e) {}
+  }
+  if (typeof s.dedupeAcrossLists === 'boolean') {
+    const cb = document.getElementById('dedupeAcrossListsCheckbox');
+    if (cb) cb.checked = s.dedupeAcrossLists;
+    try { localStorage.setItem('myListAddon:dedupeAcrossLists', s.dedupeAcrossLists ? '1' : '0'); } catch (e) {}
   }
   if (typeof s.region === 'string' && s.region) {
     const el = document.getElementById('regionSelect');
@@ -2033,6 +2039,7 @@ function computeConfigStateHash() {
         region: keys.region,
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
         adultContentFilter: keys.adultContentFilter,
+        dedupeAcrossLists: keys.dedupeAcrossLists,
         shuffleShelves: keys.shuffleShelves,
         shuffleItems: keys.shuffleItems,
         track: !!keys.track,
@@ -2149,6 +2156,7 @@ async function generate() {
         region: keys.region,
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
         adultContentFilter: keys.adultContentFilter,
+        dedupeAcrossLists: keys.dedupeAcrossLists,
       }),
     });
     const data = await res.json();
@@ -2321,6 +2329,13 @@ if (serverEntries.length && !serverEntriesAreDefaults) {
     const cb = document.getElementById('adultContentFilterCheckbox');
     if (cb) cb.checked = savedAdultFilter === '1';
   }
+  const savedDedupeAcrossLists = (function() {
+    try { return localStorage.getItem('myListAddon:dedupeAcrossLists'); } catch (e) { return null; }
+  })();
+  if (savedDedupeAcrossLists !== null) {
+    const cb = document.getElementById('dedupeAcrossListsCheckbox');
+    if (cb) cb.checked = savedDedupeAcrossLists === '1';
+  }
 } else {
   // Fresh visit to the plain builder page — restore whatever was left off
   // last time, if anything was saved. Falls through to the server's
@@ -2350,6 +2365,14 @@ if (serverEntries.length && !serverEntriesAreDefaults) {
     document.getElementById('adultContentFilterCheckbox').checked = savedAdultFilterDirect === '1';
   } else if (saved && saved.keys && document.getElementById('adultContentFilterCheckbox')) {
     document.getElementById('adultContentFilterCheckbox').checked = !!saved.keys.adultContentFilter;
+  }
+  const savedDedupeAcrossListsDirect = (function() {
+    try { return localStorage.getItem('myListAddon:dedupeAcrossLists'); } catch (e) { return null; }
+  })();
+  if (savedDedupeAcrossListsDirect !== null && document.getElementById('dedupeAcrossListsCheckbox')) {
+    document.getElementById('dedupeAcrossListsCheckbox').checked = savedDedupeAcrossListsDirect === '1';
+  } else if (saved && saved.keys && document.getElementById('dedupeAcrossListsCheckbox')) {
+    document.getElementById('dedupeAcrossListsCheckbox').checked = !!saved.keys.dedupeAcrossLists;
   }
   const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
   const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';

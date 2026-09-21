@@ -3020,6 +3020,11 @@ async function loadCreatorSync(opts) {
         if (cb) cb.checked = synced.keys.adultContentFilter;
         try { localStorage.setItem('myListAddon:adultContentFilter', synced.keys.adultContentFilter ? '1' : '0'); } catch (e) {}
       }
+      if (typeof synced.keys.dedupeAcrossLists === 'boolean') {
+        const cb = document.getElementById('dedupeAcrossListsCheckbox');
+        if (cb) cb.checked = synced.keys.dedupeAcrossLists;
+        try { localStorage.setItem('myListAddon:dedupeAcrossLists', synced.keys.dedupeAcrossLists ? '1' : '0'); } catch (e) {}
+      }
       if (typeof synced.keys.shuffleShelves === 'boolean') {
         const el = document.getElementById('shuffleShelvesCheckbox');
         if (el) el.checked = synced.keys.shuffleShelves;

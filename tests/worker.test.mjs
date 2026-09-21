@@ -10632,6 +10632,111 @@ describe("worker: adult content filter & safe poster generator", () => {
     assert.ok(resolvedFromKv.body.includes('id="adultContentFilterCheckbox" checked'));
   });
 
+  it("decodes and resolves dedupeAcrossLists in config", async () => {
+    const b64True = btoa(JSON.stringify({ dedupeAcrossLists: true }));
+    const decodedTrue = httpUtils.decodeConfig(b64True);
+    assert.equal(decodedTrue.dedupeAcrossLists, true);
+
+    const b64False = btoa(JSON.stringify({ dedupeAcrossLists: false }));
+    const decodedFalse = httpUtils.decodeConfig(b64False);
+    assert.equal(decodedFalse.dedupeAcrossLists, false);
+
+    const b64Missing = btoa(JSON.stringify({}));
+    const decodedMissing = httpUtils.decodeConfig(b64Missing);
+    assert.equal(decodedMissing.dedupeAcrossLists, false, "defaults to off, same as every install predating this setting");
+
+    // resolveConfig through the KV short-id config path
+    const env = makeEnv();
+    await env.CONFIGS.put("testdedupe", JSON.stringify({ dedupeAcrossLists: true, entries: [] }));
+    const resolvedFromKv = await call(env, "/testdedupe/configure");
+    assert.equal(resolvedFromKv.status, 200);
+    assert.ok(resolvedFromKv.body.includes('id="dedupeAcrossListsCheckbox" checked'));
+  });
+
+  // "Remove duplicate items across lists" -- the real Stremio/Nuvio catalog
+  // route, not just the decode. A config's first list of a type is served
+  // untouched; every list after it loses whatever id an earlier same-type
+  // list already has (dedupeAcrossListEntries, 05_catalog-core.js). Built
+  // from customlist:v1: entries specifically: that source embeds its items
+  // directly in the url and needs no network fetch at all, so what each
+  // route call returns is exactly and only what this test put there.
+  describe("worker: remove duplicate items across lists", () => {
+    const movieList = (items) => "customlist:v1:" + JSON.stringify({ items });
+    const item = (id, title) => ({ id, imdbId: id, title, kind: "movie" });
+
+    it("keeps the first list untouched and strips items from later lists that it already has", async () => {
+      const env = makeEnv();
+      const cfg = "deduplists1";
+      await env.CONFIGS.put(cfg, JSON.stringify({
+        dedupeAcrossLists: true,
+        entries: [
+          { id: "list1", type: "movie", name: "List 1", url: movieList([item("ttA", "Movie A"), item("ttB", "Movie B"), item("ttC", "Movie C"), item("ttD", "Movie D")]) },
+          { id: "list2", type: "movie", name: "List 2", url: movieList([item("ttA", "Movie A"), item("ttB", "Movie B"), item("ttC", "Movie C"), item("ttE", "Movie E")]) },
+          { id: "list3", type: "movie", name: "List 3", url: movieList([item("ttA", "Movie A"), item("ttB", "Movie B"), item("ttC", "Movie C"), item("ttF", "Movie F")]) },
+        ],
+      }));
+
+      const res1 = await call(env, `/${cfg}/catalog/movie/list1.json`);
+      assert.deepEqual(res1.body.metas.map((m) => m.id), ["ttA", "ttB", "ttC", "ttD"], "the top list keeps every item");
+
+      const res2 = await call(env, `/${cfg}/catalog/movie/list2.json`);
+      assert.deepEqual(res2.body.metas.map((m) => m.id), ["ttE"], "list 2 loses A/B/C, already shown by list 1");
+
+      const res3 = await call(env, `/${cfg}/catalog/movie/list3.json`);
+      assert.deepEqual(res3.body.metas.map((m) => m.id), ["ttF"], "list 3 loses A/B/C too, from the same earlier list");
+    });
+
+    it("does nothing when the setting is off, even with the exact same lists", async () => {
+      const env = makeEnv();
+      const cfg = "deduplists2";
+      await env.CONFIGS.put(cfg, JSON.stringify({
+        // dedupeAcrossLists omitted entirely -- defaults to off.
+        entries: [
+          { id: "list1", type: "movie", name: "List 1", url: movieList([item("ttA", "Movie A"), item("ttB", "Movie B")]) },
+          { id: "list2", type: "movie", name: "List 2", url: movieList([item("ttA", "Movie A"), item("ttC", "Movie C")]) },
+        ],
+      }));
+
+      const res2 = await call(env, `/${cfg}/catalog/movie/list2.json`);
+      assert.deepEqual(res2.body.metas.map((m) => m.id), ["ttA", "ttC"], "no dedup applied -- ttA stays duplicated");
+    });
+
+    it("only dedupes within the same type -- a movie list never strips items from a series list", async () => {
+      const env = makeEnv();
+      const cfg = "deduplists3";
+      const seriesList = (items) => "customlist:v1:" + JSON.stringify({ items: items.map((it) => ({ ...it, kind: "series" })) });
+      await env.CONFIGS.put(cfg, JSON.stringify({
+        dedupeAcrossLists: true,
+        entries: [
+          { id: "movies1", type: "movie", name: "Movies 1", url: movieList([item("tt001", "Shared Id")]) },
+          { id: "shows1", type: "series", name: "Shows 1", url: seriesList([{ id: "tt001", imdbId: "tt001", title: "Shared Id" }]) },
+        ],
+      }));
+
+      const resShows = await call(env, `/${cfg}/catalog/series/shows1.json`);
+      assert.deepEqual(resShows.body.metas.map((m) => m.id), ["tt001"], "a series list is never deduped against an earlier movie list");
+    });
+
+    it("skips a disabled earlier list, but still counts a later one that comes before it", async () => {
+      const env = makeEnv();
+      const cfg = "deduplists4";
+      await env.CONFIGS.put(cfg, JSON.stringify({
+        dedupeAcrossLists: true,
+        entries: [
+          { id: "list1", type: "movie", name: "List 1", enabled: false, url: movieList([item("ttA", "Movie A")]) },
+          { id: "list2", type: "movie", name: "List 2", url: movieList([item("ttA", "Movie A"), item("ttB", "Movie B")]) },
+          { id: "list3", type: "movie", name: "List 3", url: movieList([item("ttB", "Movie B"), item("ttC", "Movie C")]) },
+        ],
+      }));
+
+      const res2 = await call(env, `/${cfg}/catalog/movie/list2.json`);
+      assert.deepEqual(res2.body.metas.map((m) => m.id), ["ttA", "ttB"], "a disabled earlier list is not consulted at all");
+
+      const res3 = await call(env, `/${cfg}/catalog/movie/list3.json`);
+      assert.deepEqual(res3.body.metas.map((m) => m.id), ["ttC"], "list 3 still loses ttB, already shown by the enabled list 2");
+    });
+  });
+
   it("isAdultOrNsfw accurately identifies adult, explicit certifications, and NSFW genres", () => {
     const isAdult = catalogFns.isAdultOrNsfw;
 

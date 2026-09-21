@@ -370,7 +370,7 @@ async function handleFetch(request, env, ctx) {
     let m = path.match(/^\/([^/]+)\/configure$/);
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter } = await resolveConfig(m[1], env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists } = await resolveConfig(m[1], env);
       // The one page that still sends no-store (it renders the person's own
       // API keys -- see the note on the headers below), but it should not
       // also be re-sending the 1.3MB client bundle every time. The split
@@ -380,7 +380,7 @@ async function handleFetch(request, env, ctx) {
       return new Response(
         await pageWithExternalBundle(renderBuilder(url.origin, {
           initialEntries: entries,
-          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter },
+          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists },
           isConfigureMode: true,
         })),
         // The one builder page that deliberately keeps no-store rather than
@@ -875,8 +875,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       if (!config) return jsonPublic({ metas: [] });
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
-      const entry = entries.find((e) => e.id === id && e.type === type);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
+      const entryIndex = entries.findIndex((e) => e.id === id && e.type === type);
+      const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
       const source = detectSource(entry.url);
@@ -898,6 +899,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
         let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        if (dedupeAcrossLists) {
+          metas = await dedupeAcrossListEntries(entries, entryIndex, skip, metas, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, env, ctx });
+        }
         if (searchQuery && Array.isArray(metas) && metas.length > 0) {
           const sq = searchQuery.toLowerCase();
           metas = metas.filter((it) => (it.name && it.name.toLowerCase().includes(sq)) || (it.title && it.title.toLowerCase().includes(sq)));
@@ -7026,6 +7030,7 @@ function generateSearchVariations(query) {
       if (body.region && body.region !== "US") payload.region = body.region;
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
       if (body.adultContentFilter) payload.adultContentFilter = true;
+      if (body.dedupeAcrossLists) payload.dedupeAcrossLists = true;
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a

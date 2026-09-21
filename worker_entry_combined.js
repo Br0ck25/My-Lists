@@ -2744,7 +2744,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // with no CONFIGS KV binding, and without KV there are no Creator Profiles for
 // a personal shelf to belong to.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false, dedupeAcrossLists: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -2791,6 +2791,12 @@ function decodeConfig(config) {
       // as region's own default above.
       hideNonDigitalReleases: !!(!Array.isArray(parsed) && parsed.hideNonDigitalReleases),
       adultContentFilter: !!(!Array.isArray(parsed) && parsed.adultContentFilter),
+      // Keeps the first list of a given type in a config untouched and
+      // strips whatever a later list of the same type shares with an
+      // earlier one -- see dedupeAcrossListEntries (05_catalog-core.js) for
+      // where this is actually applied. Defaults to false, same reasoning
+      // as region/hideNonDigitalReleases above.
+      dedupeAcrossLists: !!(!Array.isArray(parsed) && parsed.dedupeAcrossLists),
     };
   } catch {
     return empty;
@@ -11674,6 +11680,7 @@ async function resolveConfig(configParam, env) {
           region: parsed.region || "US",
           hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
           adultContentFilter: !!parsed.adultContentFilter,
+          dedupeAcrossLists: !!parsed.dedupeAcrossLists,
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
           showBadgesTraktContinueWatching: parsed.showBadgesTraktContinueWatching !== false,
@@ -12318,6 +12325,58 @@ async function fetchMergedCatalog(urls, type, skip, keys) {
   const sliced = merged.slice(0, PAGE_SIZE);
   sliced.totalItems = totalSum > 0 ? totalSum : null;
   return sliced;
+}
+
+// Cross-LIST duplicate removal for Stremio/Nuvio catalogs -- "Remove
+// duplicate items across lists" in Settings (dedupeAcrossListsCheckbox).
+// Keeps a config's FIRST list of a given type exactly as fetchCatalog
+// already built it, and for every list after it (in the same order the
+// builder's Catalogs/Live Preview shows them, i.e. entries' own order)
+// strips whatever id already showed up in an earlier same-type list.
+// renderLivePreview (23_client-list-management.js) applies the identical
+// rule client-side over its already-fetched shelves, so what the builder
+// shows is what this ends up serving.
+//
+// Same "same skip/page window" limitation fetchMergedCatalog above already
+// accepts for a merged row's own sources: an earlier entry is re-fetched at
+// the SAME skip as the one being served rather than pulled in full, so this
+// is exact for the common case (the home screen's first page of every row)
+// and only approximate once someone pages deep into more than one row at
+// once. Getting it exact deeper would mean holding every earlier list in
+// full, which does not fit this add-on's stateless, one-request-per-page
+// design -- see fetchMergedCatalog's own comment for the same tradeoff.
+//
+// keys deliberately omits isStremioCatalog/showBadgesStremio*/
+// adultContentFilter/origin: those only ever change a poster URL or add a
+// field, never which ids come back (applyBadgedPostersToMetas and
+// applyAdultContentFilterToMetas are both 1:1 maps), so skipping them here
+// just saves the work rather than changing the answer.
+async function dedupeAcrossListEntries(entries, entryIndex, skip, metas, keys) {
+  if (!Array.isArray(metas) || !metas.length) return metas;
+  const entry = entries[entryIndex];
+  if (!entry) return metas;
+  const priorEntries = entries.slice(0, entryIndex).filter((e) => e && e.enabled !== false && e.type === entry.type);
+  if (!priorEntries.length) return metas;
+
+  const priorResults = await Promise.all(
+    priorEntries.map((e) => fetchCatalog(e, skip, keys).catch(() => []))
+  );
+  const seen = new Set();
+  for (const list of priorResults) {
+    for (const m of list) {
+      if (m && m.id) seen.add(m.id);
+    }
+  }
+  if (!seen.size) return metas;
+  const tot = metas.totalItems;
+  const before = metas.length;
+  const filtered = metas.filter((m) => !m || !seen.has(m.id));
+  // Approximate, same reasoning as the page-window limitation above: this
+  // page lost `before - filtered.length` items to dedup, so the running
+  // total is adjusted by the same amount rather than left claiming a count
+  // this page can no longer back up.
+  if (typeof tot === 'number') filtered.totalItems = Math.max(filtered.length, tot - (before - filtered.length));
+  return filtered;
 }
 
 // --- Channels (synthetic series stitched from hand-picked episodes/movies) -
@@ -21593,6 +21652,7 @@ function renderBuilder(
   const initialRegion = initialKeys.region || "US";
   const initialHideNonDigitalReleases = !!initialKeys.hideNonDigitalReleases;
   const initialAdultContentFilter = !!initialKeys.adultContentFilter;
+  const initialDedupeAcrossLists = !!initialKeys.dedupeAcrossLists;
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();
@@ -26516,6 +26576,17 @@ if ('serviceWorker' in navigator) {
         <div>
           <span style="font-weight:600;">Hide items with no digital release</span>
           <p style="margin:4px 0 0; color:var(--muted); font-size:0.82rem;">Removes movies with no known digital or physical release from TMDB Trending Movies and Popular Movies catalogs -- useful for skipping still-in-theaters titles you can't stream or buy yet. Shows aren't affected (no equivalent release-type data exists for TV). Requires Save/Update to take effect on an existing install link.</p>
+        </div>
+      </label>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Duplicate Items Across Lists</h2>
+      <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.92rem; user-select:none;">
+        <input type="checkbox" id="dedupeAcrossListsCheckbox" ${initialDedupeAcrossLists ? 'checked' : ''} onchange="localStorage.setItem('myListAddon:dedupeAcrossLists', this.checked ? '1' : '0'); saveState()" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+        <div>
+          <span style="font-weight:600;">Remove duplicate items across lists</span>
+          <p style="margin:4px 0 0; color:var(--muted); font-size:0.82rem;">Keeps your top list exactly as it is; every list below it has anything already shown in an earlier list removed. Order is whatever order your lists are in here -- drag a list to change which one keeps a shared title. Applies to Live Preview &amp; Editor and to the real catalogs Stremio/Nuvio see once you Save/Update. Requires Save/Update to take effect on an existing install link.</p>
         </div>
       </label>
     </div>
@@ -37011,6 +37082,14 @@ function renderItemStorylinesWatchOrder(d, type) {
   const matchingEvents = events.filter((ev) => Array.isArray(ev.episodes) && ev.episodes.some(isPartMatch));
   if (!matchingEvents.length) return '';
 
+  // Same static registry, same missing rating, as the Channel Builder's own
+  // Storylines, Sagas & Universes grid (20_client-channel-builder.js) --
+  // collected here and handed to that page's resolveStorylineRatings once
+  // this html is actually in the DOM (see the microtask below), so the two
+  // surfaces share one cache and neither re-asks for what the other already
+  // resolved this session.
+  const itemStorylineRatingIds = new Set();
+
   const storylineBlocksHtml = matchingEvents.map((event, eventIdx) => {
     const isSingle = (matchingEvents.length === 1);
     const displayStyle = (isSingle || eventIdx === 0) ? 'display:block;' : 'display:none;';
@@ -37046,6 +37125,14 @@ function renderItemStorylinesWatchOrder(d, type) {
         ' onclick="event.stopPropagation(); openItemDetailsModal(&quot;' + escapeJsAttr(partId) + '&quot;, &quot;' + partType + '&quot;)"' :
         (isCurrent ? ' onclick="event.stopPropagation(); window.scrollTo({ top: 0, behavior: &quot;smooth&quot; });"' : '');
 
+      // Skipped on the card for the title already open in this modal -- its
+      // rating is already shown up in the main info block, so repeating it
+      // here would just be noise on the one tile that needs it least.
+      if (!isCurrent && partId) itemStorylineRatingIds.add(partId);
+      const ratingSlot = (!isCurrent && partId)
+        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(partId) + '" data-rating-style="inline"></span>'
+        : '';
+
       return '<div class="item-storyline-card' + (isCurrent ? ' is-current' : '') + '"' + clickHandler + ' title="' + escapeAttr(displayTitle + (isCurrent ? ' (Currently Viewing)' : '')) + '">' +
         '<div class="item-storyline-poster-wrap">' +
           (posterUrl ?
@@ -37056,7 +37143,10 @@ function renderItemStorylinesWatchOrder(d, type) {
           (isWatched && !isCurrent ? '<span class="item-storyline-watched-badge" title="Watched">&#x2713;</span>' : '') +
         '</div>' +
         '<div class="item-storyline-title">' + escapeHtml(displayTitle) + '</div>' +
-        '<div class="item-storyline-meta">' + escapeHtml(formatSubtitle) + '</div>' +
+        '<div class="item-storyline-meta" style="display:flex; align-items:center; justify-content:space-between; gap:6px;">' +
+          '<span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + escapeHtml(formatSubtitle) + '</span>' +
+          ratingSlot +
+        '</div>' +
       '</div>';
     }).join('');
 
@@ -37089,6 +37179,17 @@ function renderItemStorylinesWatchOrder(d, type) {
         '</button>'
       ).join('') +
     '</div>' : '';
+
+  // Deferred a tick rather than called right here: this function only
+  // returns an html STRING, and openItemDetailsModal (its one caller) does
+  // not assign that string into the modal body until after this returns --
+  // resolving now would query a DOM that does not have these slots in it
+  // yet. A microtask runs after that synchronous assignment either way,
+  // real timers or not, which is what keeps this reachable from a test.
+  if (itemStorylineRatingIds.size && typeof resolveStorylineRatings === 'function') {
+    const idsToResolve = [...itemStorylineRatingIds];
+    Promise.resolve().then(() => resolveStorylineRatings(idsToResolve));
+  }
 
   return '<div class="item-storylines-section">' +
     '<div class="shelf-header" style="margin-bottom:12px;">' +
@@ -47952,6 +48053,10 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
   }
 
   const channelsMap = (typeof loadLocalChannels === 'function') ? (loadLocalChannels() || {}) : {};
+  // Collected alongside the poster markup below, rather than re-discovered
+  // by querying the rendered DOM afterward -- these ids are plain data this
+  // loop already has in hand.
+  const ratingIdsOnPage = new Set();
 
   const cardsHtml = filtered.map((event) => {
     const isMovieSaga = event.category === 'moviesagas' || event.episodes.every((e) => e.type === 'movie');
@@ -48000,9 +48105,23 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
         overlays += '<div class="list-card-count-overlay desktop-only" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
       }
 
+      // The registry hands each entry a poster but never a rating -- these are
+      // static, hand-curated saga/universe listings, not a live catalog fetch.
+      // resolveStorylineRatings (below) fills this slot in after render, from
+      // /api/details/batch, keyed on the same id a channel pick for this entry
+      // would use. Placed in the DOM before the count overlay below so the
+      // "+N (rsaquo)" tile -- which covers the whole poster -- paints over
+      // the badge rather than beside it, on whichever tile actually shows it.
+      const ratingId = ep.imdbId || (ep.tmdbId ? ('tmdb:' + ep.tmdbId) : '');
+      if (ratingId) ratingIdsOnPage.add(ratingId);
+      const ratingSlot = ratingId
+        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(ratingId) + '" data-rating-style="overlay"></span>'
+        : '';
+
       return '<div class="list-card-mini-poster-tile">' +
         '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)">' +
           '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
+          ratingSlot +
           overlays +
         '</div>' +
         '<div class="list-card-mini-poster-name" title="' + escapeAttr(itemTitle) + '">' + escapeHtml(itemTitle) + '</div>' +
@@ -48034,6 +48153,118 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
   }).join('');
 
   container.innerHTML = cardsHtml;
+  resolveStorylineRatings([...ratingIdsOnPage]);
+}
+
+// --- Storyline poster ratings ---------------------------------------------
+//
+// TV_CROSSOVER_EVENTS is a static, hand-curated registry -- poster, title,
+// year -- with no rating baked in, so the badge shown here has to be resolved
+// live. Cached at module scope (by imdb/tmdb id, not by event) so switching
+// category tabs, or a title turning up in more than one saga, never re-asks
+// for something already known this session -- and shared with the "Storylines,
+// Sagas & Universes" section of the item details modal
+// (renderItemStorylinesWatchOrder, 19_client-search-and-likes.js), the other
+// place this same registry's posters are browsed, so the two never duplicate
+// a lookup for the same title either.
+window._storylineRatingsCache = window._storylineRatingsCache || {};
+window._storylineRatingsInFlight = window._storylineRatingsInFlight || new Set();
+
+// /api/details/batch caps a single request at 60 ids and is metered per id,
+// not per request -- see 25_api-catalog-routes.js -- so a full "All" grid's
+// worth of unique posters (a few hundred, in practice) is chunked here and
+// each chunk resolved independently. Most of these ids are for mainstream
+// franchise titles other parts of the add-on already resolve for other
+// reasons, so in practice this mainly warms whatever is not already sitting
+// in the shared server-side cache.
+const STORYLINE_RATINGS_CHUNK_SIZE = 60;
+const STORYLINE_RATINGS_MAX_ROUNDS = 8;
+
+function resolveStorylineRatings(idsOnPage) {
+  const allIds = Array.isArray(idsOnPage) ? idsOnPage.filter(Boolean) : [];
+  if (!allIds.length) return;
+  // Whatever this render already has a cached answer for (from an earlier
+  // render this session -- switching category tabs, most often, or the same
+  // title turning up in more than one saga) still needs painting onto these
+  // fresh DOM nodes, even though nothing needs to be fetched for it again.
+  const alreadyCached = allIds.filter((id) => id in window._storylineRatingsCache);
+  if (alreadyCached.length) applyStorylineRatingBadges(alreadyCached);
+
+  const idsNeeded = [...new Set(
+    allIds.filter((id) => !(id in window._storylineRatingsCache) && !window._storylineRatingsInFlight.has(id))
+  )];
+  if (!idsNeeded.length) return;
+  idsNeeded.forEach((id) => window._storylineRatingsInFlight.add(id));
+
+  const chunks = [];
+  for (let i = 0; i < idsNeeded.length; i += STORYLINE_RATINGS_CHUNK_SIZE) {
+    chunks.push(idsNeeded.slice(i, i + STORYLINE_RATINGS_CHUNK_SIZE));
+  }
+
+  chunks.forEach(async (chunk) => {
+    let pending = chunk;
+    for (let round = 0; round < STORYLINE_RATINGS_MAX_ROUNDS && pending.length; round++) {
+      let data = null;
+      try {
+        const res = await fetch(ORIGIN + '/api/details/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: pending }),
+        });
+        data = await res.json();
+      } catch (e) {
+        break;
+      }
+      if (!data || !data.ok || !data.results) break;
+      const resolvedThisRound = pending;
+      resolvedThisRound.forEach((id) => {
+        const d = data.results[id];
+        const p = d && d.rating != null ? parseFloat(d.rating) : NaN;
+        window._storylineRatingsCache[id] = (!isNaN(p) && p > 0) ? p : null;
+      });
+      applyStorylineRatingBadges(resolvedThisRound);
+      if (data.done !== false && (!Array.isArray(data.remainingIds) || !data.remainingIds.length)) {
+        pending = [];
+        break;
+      }
+      pending = Array.isArray(data.remainingIds) ? data.remainingIds : [];
+    }
+    // Whatever never got a result after the last round (a network error, or
+    // the budget genuinely never catching up) is left uncached rather than
+    // pinned "in flight" forever -- the next render of this grid gets to
+    // try it again instead of the slot staying blank for the rest of the
+    // session. Cleared for the whole chunk at once: an id resolved earlier
+    // in the loop is already cached and safe to re-mark not-in-flight, and
+    // one that never resolved just goes back to being fetchable.
+    chunk.forEach((id) => window._storylineRatingsInFlight.delete(id));
+  });
+}
+
+// Not scoped to one container: the same id can need patching in the Channel
+// Builder's own grid, the item details modal's storyline section, or (rarely)
+// both, and by the time a chunk resolves there is no reliable way to know
+// which one is even still open. A poster-corner overlay (formatRatingBadgeHtml)
+// on the Channel Builder grid's tiles; a plain inline star+number
+// (formatRatingSpanHtml) beside the subtitle line on the modal's cards, which
+// are too busy with their own corner badges (part number, watched checkmark,
+// "Current" pill) for a fourth overlay to land cleanly. Each slot says which
+// it wants via data-rating-style.
+function applyStorylineRatingBadges(ids) {
+  if (typeof document === 'undefined') return;
+  ids.forEach((id) => {
+    const rating = window._storylineRatingsCache[id];
+    if (!rating) return;
+    document.querySelectorAll('.storyline-rating-slot[data-rating-id="' + id + '"]').forEach((slot) => {
+      const wantsInline = slot.dataset && slot.dataset.ratingStyle === 'inline';
+      let html = '';
+      if (wantsInline && typeof formatRatingSpanHtml === 'function') {
+        html = formatRatingSpanHtml({ id: id, rating: rating });
+      } else if (typeof formatRatingBadgeHtml === 'function') {
+        html = formatRatingBadgeHtml({ id: id, rating: rating });
+      }
+      if (html) slot.innerHTML = html;
+    });
+  });
 }
 
 async function fetchStorylineOrderedItems(eventId) {
@@ -58517,6 +58748,11 @@ async function loadCreatorSync(opts) {
         if (cb) cb.checked = synced.keys.adultContentFilter;
         try { localStorage.setItem('myListAddon:adultContentFilter', synced.keys.adultContentFilter ? '1' : '0'); } catch (e) {}
       }
+      if (typeof synced.keys.dedupeAcrossLists === 'boolean') {
+        const cb = document.getElementById('dedupeAcrossListsCheckbox');
+        if (cb) cb.checked = synced.keys.dedupeAcrossLists;
+        try { localStorage.setItem('myListAddon:dedupeAcrossLists', synced.keys.dedupeAcrossLists ? '1' : '0'); } catch (e) {}
+      }
       if (typeof synced.keys.shuffleShelves === 'boolean') {
         const el = document.getElementById('shuffleShelvesCheckbox');
         if (el) el.checked = synced.keys.shuffleShelves;
@@ -62245,6 +62481,7 @@ function buildConfig(entries, keys) {
   if (keys && keys.region && keys.region !== 'US') payload.region = keys.region;
   if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
   if (keys && keys.adultContentFilter) payload.adultContentFilter = true;
+  if (keys && keys.dedupeAcrossLists) payload.dedupeAcrossLists = true;
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -62459,6 +62696,7 @@ function collectKeys() {
     })(),
     hideNonDigitalReleases: document.getElementById('hideNonDigitalReleasesCheckbox') ? document.getElementById('hideNonDigitalReleasesCheckbox').checked : false,
     adultContentFilter: typeof isAdultContentFilterEnabled === 'function' ? isAdultContentFilterEnabled() : (localStorage.getItem('myListAddon:adultContentFilter') === '1'),
+    dedupeAcrossLists: document.getElementById('dedupeAcrossListsCheckbox') ? document.getElementById('dedupeAcrossListsCheckbox').checked : (localStorage.getItem('myListAddon:dedupeAcrossLists') === '1'),
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
@@ -62953,6 +63191,46 @@ async function renderLivePreview() {
 
   const workers = Array(Math.min(CONCURRENCY, shelves.length)).fill(0).map(worker);
   await Promise.all(workers);
+
+  // "Remove duplicate items across lists" (Settings -> dedupeAcrossListsCheckbox).
+  // Runs once every shelf above has actually resolved, not per-shelf as each
+  // one finishes -- the whole point is comparing a later shelf against
+  // earlier ones, which only means something once "earlier" has a final
+  // answer. Mirrors dedupeAcrossListEntries (05_catalog-core.js) exactly:
+  // the config's first list of a type is untouched, everything after it
+  // (in this same top-to-bottom order) loses whatever id an earlier
+  // same-type shelf already has, so what's shown here matches what the
+  // real Stremio/Nuvio catalogs will once this config is saved.
+  let dedupeAcrossLists = false;
+  try { dedupeAcrossLists = localStorage.getItem('myListAddon:dedupeAcrossLists') === '1'; } catch (e) {}
+  if (dedupeAcrossLists) {
+    const seenByType = {};
+    livePreviewShelfData.forEach((shelf, i) => {
+      if (!shelf || !Array.isArray(shelf.sample) || !shelf.sample.length) return;
+      const seen = seenByType[shelf.type] || (seenByType[shelf.type] = new Set());
+      const before = shelf.sample.length;
+      shelf.sample = shelf.sample.filter((item) => item && item.id && !seen.has(item.id));
+      shelf.sample.forEach((item) => seen.add(item.id));
+      const removed = before - shelf.sample.length;
+      if (!removed) return;
+      if (typeof shelf.totalItems === 'number') {
+        shelf.totalItems = Math.max(shelf.sample.length, shelf.totalItems - removed);
+      }
+      const entryDOM = enabledEntries[i];
+      const postersContainer = entryDOM && entryDOM.querySelector('.live-preview-posters');
+      const seeAllBtn = entryDOM && entryDOM.querySelector('.live-preview-shelf-title button');
+      if (!postersContainer) return;
+      if (!shelf.sample.length) {
+        postersContainer.innerHTML = '<p><small>No items left after removing duplicates of an earlier list.</small></p>';
+        if (seeAllBtn) seeAllBtn.disabled = true;
+        return;
+      }
+      const sliced = shelf.sample.slice(0, visibleCount);
+      sliced.forEach((item) => { item.listUrl = shelf.url; item.listName = shelf.name; item.isLivePreviewShelf = true; });
+      postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
+      if (seeAllBtn) seeAllBtn.disabled = !(shelf.sample.length > visibleCount);
+    });
+  }
 }
 
 // Hides a poster that could not be loaded and shows a "No poster" tile in
@@ -65339,6 +65617,7 @@ function buildFullBackupPayload() {
       scrobbleBlockAnonymous: localStorage.getItem('myListAddon:scrobbleBlockAnonymous') === '1',
       hideNonDigitalReleases: localStorage.getItem('myListAddon:hideNonDigitalReleases') === '1',
       adultContentFilter: localStorage.getItem('myListAddon:adultContentFilter') === '1',
+      dedupeAcrossLists: localStorage.getItem('myListAddon:dedupeAcrossLists') === '1',
       region: localStorage.getItem('myListAddon:region') || '',
       dashboardListOrder: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:dashboardListOrder') || '[]'); } catch(e) { return []; } })(),
       hiddenLists: (function() { try { return JSON.parse(localStorage.getItem('myListAddon:hiddenLists') || '[]'); } catch(e) { return []; } })(),
@@ -65812,6 +66091,11 @@ function applyImportedConfig(data) {
     const cb = document.getElementById('adultContentFilterCheckbox');
     if (cb) cb.checked = s.adultContentFilter;
     try { localStorage.setItem('myListAddon:adultContentFilter', s.adultContentFilter ? '1' : '0'); } catch (e) {}
+  }
+  if (typeof s.dedupeAcrossLists === 'boolean') {
+    const cb = document.getElementById('dedupeAcrossListsCheckbox');
+    if (cb) cb.checked = s.dedupeAcrossLists;
+    try { localStorage.setItem('myListAddon:dedupeAcrossLists', s.dedupeAcrossLists ? '1' : '0'); } catch (e) {}
   }
   if (typeof s.region === 'string' && s.region) {
     const el = document.getElementById('regionSelect');
@@ -67214,6 +67498,7 @@ function computeConfigStateHash() {
         region: keys.region,
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
         adultContentFilter: keys.adultContentFilter,
+        dedupeAcrossLists: keys.dedupeAcrossLists,
         shuffleShelves: keys.shuffleShelves,
         shuffleItems: keys.shuffleItems,
         track: !!keys.track,
@@ -67330,6 +67615,7 @@ async function generate() {
         region: keys.region,
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
         adultContentFilter: keys.adultContentFilter,
+        dedupeAcrossLists: keys.dedupeAcrossLists,
       }),
     });
     const data = await res.json();
@@ -67502,6 +67788,13 @@ if (serverEntries.length && !serverEntriesAreDefaults) {
     const cb = document.getElementById('adultContentFilterCheckbox');
     if (cb) cb.checked = savedAdultFilter === '1';
   }
+  const savedDedupeAcrossLists = (function() {
+    try { return localStorage.getItem('myListAddon:dedupeAcrossLists'); } catch (e) { return null; }
+  })();
+  if (savedDedupeAcrossLists !== null) {
+    const cb = document.getElementById('dedupeAcrossListsCheckbox');
+    if (cb) cb.checked = savedDedupeAcrossLists === '1';
+  }
 } else {
   // Fresh visit to the plain builder page — restore whatever was left off
   // last time, if anything was saved. Falls through to the server's
@@ -67531,6 +67824,14 @@ if (serverEntries.length && !serverEntriesAreDefaults) {
     document.getElementById('adultContentFilterCheckbox').checked = savedAdultFilterDirect === '1';
   } else if (saved && saved.keys && document.getElementById('adultContentFilterCheckbox')) {
     document.getElementById('adultContentFilterCheckbox').checked = !!saved.keys.adultContentFilter;
+  }
+  const savedDedupeAcrossListsDirect = (function() {
+    try { return localStorage.getItem('myListAddon:dedupeAcrossLists'); } catch (e) { return null; }
+  })();
+  if (savedDedupeAcrossListsDirect !== null && document.getElementById('dedupeAcrossListsCheckbox')) {
+    document.getElementById('dedupeAcrossListsCheckbox').checked = savedDedupeAcrossListsDirect === '1';
+  } else if (saved && saved.keys && document.getElementById('dedupeAcrossListsCheckbox')) {
+    document.getElementById('dedupeAcrossListsCheckbox').checked = !!saved.keys.dedupeAcrossLists;
   }
   const tmdbDisc = localStorage.getItem('myListAddon:tmdbDisconnected') === 'true';
   const mdblistDisc = localStorage.getItem('myListAddon:mdblistDisconnected') === 'true';
@@ -69331,7 +69632,7 @@ async function handleFetch(request, env, ctx) {
     let m = path.match(/^\/([^/]+)\/configure$/);
     if (m) {
       ctx.waitUntil(bumpStat(env, "pageviews"));
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter } = await resolveConfig(m[1], env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists } = await resolveConfig(m[1], env);
       // The one page that still sends no-store (it renders the person's own
       // API keys -- see the note on the headers below), but it should not
       // also be re-sending the 1.3MB client bundle every time. The split
@@ -69341,7 +69642,7 @@ async function handleFetch(request, env, ctx) {
       return new Response(
         await pageWithExternalBundle(renderBuilder(url.origin, {
           initialEntries: entries,
-          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter },
+          initialKeys: { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktUsername, traktAccessToken, shuffleShelves, shuffleItems, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists },
           isConfigureMode: true,
         })),
         // The one builder page that deliberately keeps no-store rather than
@@ -69836,8 +70137,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
 
       if (!config) return jsonPublic({ metas: [] });
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
-      const entry = entries.find((e) => e.id === id && e.type === type);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
+      const entryIndex = entries.findIndex((e) => e.id === id && e.type === type);
+      const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
       const source = detectSource(entry.url);
@@ -69859,6 +70161,9 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
         let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        if (dedupeAcrossLists) {
+          metas = await dedupeAcrossListEntries(entries, entryIndex, skip, metas, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, env, ctx });
+        }
         if (searchQuery && Array.isArray(metas) && metas.length > 0) {
           const sq = searchQuery.toLowerCase();
           metas = metas.filter((it) => (it.name && it.name.toLowerCase().includes(sq)) || (it.title && it.title.toLowerCase().includes(sq)));
@@ -75987,6 +76292,7 @@ function generateSearchVariations(query) {
       if (body.region && body.region !== "US") payload.region = body.region;
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
       if (body.adultContentFilter) payload.adultContentFilter = true;
+      if (body.dedupeAcrossLists) payload.dedupeAcrossLists = true;
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a

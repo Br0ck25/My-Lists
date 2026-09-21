@@ -16,6 +16,7 @@ function renderBuilder(
   const initialRegion = initialKeys.region || "US";
   const initialHideNonDigitalReleases = !!initialKeys.hideNonDigitalReleases;
   const initialAdultContentFilter = !!initialKeys.adultContentFilter;
+  const initialDedupeAcrossLists = !!initialKeys.dedupeAcrossLists;
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();
