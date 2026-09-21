@@ -10489,7 +10489,13 @@ async function buildChannelItemsFromShows(shows, opts) {
       const seasonsRes = await fetch(ORIGIN + '/api/show-seasons?tmdbId=' + encodeURIComponent(show.tmdbId), { cache: 'no-store' });
       const seasonsData = await seasonsRes.json();
       if (!seasonsData.ok) continue;
-      const seasonResults = await Promise.all(seasonsData.seasons.map((s) =>
+      // Specials (season 0) are excluded here -- they're recaps, gag reels
+      // and clip shows as often as they are episodes, and an automatically
+      // built network/wizard channel plays badly with them mixed in. A
+      // person who wants them can still add a show's Specials by hand from
+      // the manual season picker, which does list them.
+      const regularSeasons = seasonsData.seasons.filter((s) => s.season > 0);
+      const seasonResults = await Promise.all(regularSeasons.map((s) =>
         fetch(ORIGIN + '/api/show-episodes?tmdbId=' + encodeURIComponent(show.tmdbId) + '&season=' + encodeURIComponent(s.season), { cache: 'no-store' })
           .then((r) => r.json())
           .then((d) => ({ season: s.season, episodes: d.ok ? d.episodes : [] }))

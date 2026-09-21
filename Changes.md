@@ -1,5 +1,42 @@
 # Changes Log
 
+## 2026-09-21 - Specials, listed instead of dropped
+
+### Files Changed
+`19_client-search-and-likes.js`, `20_client-channel-builder.js`, `25_api-catalog-routes.js`,
+`worker_entry_combined.js`, `CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/client.test.mjs`,
+`tests/worker.test.mjs`
+
+### The problem
+
+Two places in the add-on quietly threw away a show's Specials (TMDB season 0): `/api/show-seasons`
+filtered them out of the season list `browseChannelShow` (Channel Builder) fetches, so there was no way to
+add a special to a channel by hand; and the item details modal (`openItemDetailsModal`) skipped season 0
+entirely while looping over `d.seasonsData`, so a show's Specials never appeared on its own page at all.
+
+### The fix
+
+`/api/show-seasons` now keeps Specials, appended after the regular seasons -- kept out of the "is this
+single season actually several TMDB seasons packed together" unpacking heuristic (which only makes sense
+against real seasons), then tacked back on at the end. `browseChannelShow` and `addAllSeasonsToChannel`
+needed no changes: they already just render/act on whatever `/api/show-seasons` returns, so Specials now
+shows up as its own season button after every numbered one, and "Add every season" includes it.
+
+`buildChannelItemsFromShows` -- the shared helper behind Quick Add's network channels, the Quick Channel
+Wizard, and a Spotlight actor's whole filmography, none of which a person reviews episode-by-episode before
+it is built -- now filters Specials back out for itself, so those three automated builders keep their prior
+behavior instead of picking up recap/clip-show episodes nobody chose.
+
+`openItemDetailsModal`'s season list now renders every regular season first, then Specials at the end,
+instead of skipping it.
+
+### Tests
+
+`tests/worker.test.mjs` (2) -- `/api/show-seasons` appends Specials after the regular seasons for a normal
+show, and still appends it after unpacking a compressed anime season into several real ones.
+`tests/client.test.mjs` (2) -- `openItemDetailsModal` renders a show's Specials card last, after every
+numbered season; `browseChannelShow` renders Specials as its own season button, after the numbered ones.
+
 ## 2026-09-16 - Air times that did not appear, and a date that read a day early
 
 ### Files Changed

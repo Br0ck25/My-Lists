@@ -2826,6 +2826,53 @@ describe("client: a show's page, rendered", () => {
     assert.match(html, /data-season="3">0\/10 episodes</);
     assert.match(html, />Mark Show Watched</);
   });
+
+  it("lists Specials below every numbered season, not skipped", async () => {
+    const withSpecials = {
+      ...DETAILS,
+      seasonsData: [
+        { season_number: 0, name: "Specials", episode_count: 3, air_date: "2020-06-01" },
+        ...DETAILS.seasonsData,
+      ],
+    };
+    const client = loadClient({ routes: { "/api/details": () => ({ json: { ok: true, details: withSpecials } }) } });
+    client.set("_fullyWatchedShowIds", new Set());
+    client.call("saveLocalCustomListsMap", { "watch-history": { slug: "watch-history", items: [] } });
+    await client.call("openItemDetailsModal", "tt_rendered", "series");
+    const html = client.get("document").getElementById("itemDetailsBody").innerHTML;
+    const seasonOrder = [...html.matchAll(/data-season="(\d+)"/g)].map((m) => m[1]);
+    assert.deepEqual(seasonOrder.filter((v, i, a) => a.indexOf(v) === i), ["1", "2", "3", "0"],
+      "Specials (season 0) renders last, after every numbered season");
+    assert.match(html, /Specials/, "the Specials season card itself is rendered");
+  });
+});
+
+describe("client: browsing a show's seasons in the Channel Builder", () => {
+  function seasonsClient(seasons) {
+    return loadClient({
+      routes: {
+        "/api/show-seasons": () => ({
+          json: { ok: true, imdbId: "tt0386676", name: "The Office", poster: "", backdrop: "", seasons },
+        }),
+      },
+    });
+  }
+
+  it("lists a show's Specials as a season button, alongside all its regular seasons", async () => {
+    // /api/show-seasons now hands Specials back appended after the regular
+    // seasons (see 25_api-catalog-routes.js), so the season grid just
+    // renders whatever it is given -- this pins that it does, in order.
+    const client = seasonsClient([
+      { season: 1, name: "Season 1", episodeCount: 6 },
+      { season: 2, name: "Season 2", episodeCount: 22 },
+      { season: 0, name: "Specials", episodeCount: 7 },
+    ]);
+    await client.call("browseChannelShow", "2316", "The Office", "", "");
+    const html = el(client, "channelEpisodePicker").innerHTML;
+    const seasonBtnNames = [...html.matchAll(/data-season="(\d+)">([^<]*)</g)].map((m) => m[1] + ":" + m[2]);
+    assert.deepEqual(seasonBtnNames, ["1:Season 1 (6)", "2:Season 2 (22)", "0:Specials (7)"],
+      "Specials shows up as its own button, after the numbered seasons");
+  });
 });
 
 describe("client: crossover and companion events detection in channel builder", () => {

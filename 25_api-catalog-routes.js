@@ -1874,8 +1874,15 @@ function generateSearchVariations(query) {
         }
         if (!showRes.ok) return json({ ok: false, error: `TMDB show lookup failed (HTTP ${showRes.status}).` });
         const data = await showRes.json();
+        // Specials (season 0) are kept, but out of the way of the "is this
+        // show actually one giant unpacked season" heuristic below, which
+        // only makes sense against the regular seasons -- so they're split
+        // off here and tacked back on at the end, after the real seasons.
+        const specials = (data.seasons || [])
+          .filter((s) => s.season_number === 0)
+          .map((s) => ({ season: s.season_number, name: s.name || "Specials", episodeCount: s.episode_count }));
         let seasons = (data.seasons || [])
-          .filter((s) => s.season_number > 0) // skip "Specials" (season 0)
+          .filter((s) => s.season_number > 0)
           .map((s) => ({ season: s.season_number, name: s.name, episodeCount: s.episode_count }));
         const standardEpisodeCount = seasons.reduce((sum, s) => sum + (s.episodeCount || 0), 0);
         if (seasons.length === 1 && standardEpisodeCount > 1) {
@@ -1889,6 +1896,7 @@ function generateSearchVariations(query) {
             }));
           }
         }
+        seasons = seasons.concat(specials);
         return json({
           ok: true,
           imdbId: details.imdbId,
