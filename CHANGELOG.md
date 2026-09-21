@@ -6,6 +6,27 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ⭐ Customize button on Discover and Search lists
+
+- Every list card on Discover (all sub-tabs -- All, Movies, Shows, Popular Lists, Curated, Hidden Gems, Kids, Holidays, Genres) and in the Search tab's list search now has a **Customize** button alongside its **+ Add**, the same idea as the Storylines & Universes grid's own Customize button. Since these lists are plain movie/show catalogs rather than a saga's episode-level programming, it loads the list's items into the **Custom List Builder**'s editable draft instead of the Channel Builder -- add, remove, or reorder titles, then Save -- rather than immediately copying the list as-is the way **+ Add** or the existing "Copy to Custom List" buttons do (`loadListToCustomListDraft`, `21_client-custom-list-builder.js`).
+- Uses the same bounded preview fetch already filling each card's own poster strip (up to ~100 items per type), not an exhaustive full-list fetch -- a hand-edited draft is for curating a short list, and a shelf like TMDB Trending can run into the thousands.
+
+### 🐛 A saga's "See All" page showed no ratings past its first 9 posters
+
+- The Storylines & Universes grid's own card only ever resolves ratings for the first 9 posters it actually shows (`previewPosters = event.episodes.slice(0, 9)`); a longer saga's remaining items (Marvel's 12-movie Infinity Saga, past part 9) were never asked about at all. That was invisible on the grid itself, but the saga's "See All" page (`openStorylineDetails` -> `openListDetailsPage`) has no slot-patching of its own -- it only ever renders whatever rating an item already carries -- so every poster past the ninth showed no rating there either.
+- `openStorylineDetails` (`20_client-channel-builder.js`) now awaits every item's rating (reusing the grid's own cache, and resolving whatever isn't cached yet) before opening the "See All" page, so every poster carries its rating up front. `resolveStorylineRatings` now returns a Promise a caller can await, and tracks in-flight ids by their actual fetch Promise (not just a Set) so a caller needing every id waits on one someone else already started fetching instead of skipping it.
+- New test covers a 12-item saga specifically: the grid resolves parts 1-9, and opening its "See All" page resolves parts 10-12 fresh before the page opens.
+
+### 🐛 Storylines & Universes rating badges were in the wrong place
+
+- **After the fix below made the badges visible, they showed up as a colored top-left overlay on the poster** -- inconsistent with every other poster tile in the app, which shows its rating as a plain inline star+number beside the year instead (Discover's own `loadPosterSlot`, `19_client-search-and-likes.js`, sharing the identical `list-card-mini-poster-tile` markup). The Channel Builder grid's rating slot (`renderStorylinesUniverseList`, `20_client-channel-builder.js`) moved out of the poster image wrapper and into the year line, and `applyStorylineRatingBadges` was simplified to always use `formatRatingSpanHtml` -- the same formatter, same placement, both Storylines surfaces and Discover now share.
+- New test confirms the rating slot renders inside the year line rather than the poster image wrapper.
+
+### 🐛 Storylines & Universes rating badges were invisible
+
+- **The rating badges shipped on the Storylines, Sagas & Universes grid were in the DOM but never visible**: `applyStorylineRatingBadges` (`20_client-channel-builder.js`) handed the resolved number to `formatRatingBadgeHtml`/`formatRatingSpanHtml` as `rating`, and that field's own logic guesses imdb-vs-tmdb from the id's shape -- every id on this grid is an imdb `tt...` id, so every badge came back `data-rating-type="imdb"`. This site forces IMDb-typed rating badges hidden unconditionally (`hide-badge-imdb-rating`, `23_client-list-management.js` -- only a TMDB-vs-none choice is a real setting here, IMDb ratings were never a feature), so the badge existed, had the right number, and rendered completely invisible. Confirmed live with an automated browser check against the deployed site before and after: 190 of 321 posters had a `.rating-badge` element with zero visible pixels. Fixed by handing the value over as `vote_average` instead, which both formatters treat as TMDB unconditionally, sidestepping the id-shape guess entirely.
+- New regression test pins the exact call shape (`vote_average`, not `rating`) and separately confirms the buggy shape really does mislabel it -- the earlier tests for this feature only checked the fetch/cache logic and could not have caught this, since the DOM patch itself isn't observable in this repo's client test harness.
+
 ### ⭐ Remove duplicate items across lists
 
 - New setting (Settings -> Duplicate Items Across Lists -> **Remove duplicate items across lists**): the config's top list (in the same top-to-bottom order shown in Catalogs/Live Preview & Editor, drag-to-reorder included) is left exactly as it is, and every list after it has whatever id an earlier same-type list already carries removed. A movie list is never deduped against a series list, since they never share an id in practice anyway.
@@ -15,7 +36,7 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ### ⭐ Rating badges on Storylines, Sagas & Universes
 
-- Both places this feature name appears now show a TMDB rating badge on each poster: the Channel Builder's own **Storylines, Sagas & Universes** browse grid (`renderStorylinesUniverseList`, `20_client-channel-builder.js`) gets the usual poster-corner badge, and the item details modal's **Storylines, Sagas & Universes** section (`renderItemStorylinesWatchOrder`, `19_client-search-and-likes.js`) gets an inline star-and-number next to each card's subtitle, since its posters are already busy with a part-number badge, a watched checkmark and a "Current" pill. The title already open in that modal is skipped -- its rating is already shown higher up on the same page.
+- Both places this feature name appears now show a TMDB rating next to each poster's year, the same plain inline star-and-number every other poster tile in the app already uses (Discover's `loadPosterSlot`, `19_client-search-and-likes.js`): the Channel Builder's own **Storylines, Sagas & Universes** browse grid (`renderStorylinesUniverseList`, `20_client-channel-builder.js`) and the item details modal's **Storylines, Sagas & Universes** section (`renderItemStorylinesWatchOrder`, `19_client-search-and-likes.js`, next to each card's subtitle). The title already open in that modal is skipped -- its rating is already shown higher up on the same page.
 - TV_CROSSOVER_EVENTS is a static, hand-curated registry (poster, title, year -- no rating baked in), so both surfaces resolve ratings live from `/api/details/batch`, deduplicated and cached at module scope (`resolveStorylineRatings`/`applyStorylineRatingBadges`, `20_client-channel-builder.js`) so the two pages, a title appearing in more than one saga, and switching category tabs, all share one lookup per id for the whole session rather than re-asking.
 
 ### ⭐ Specials, alongside a show's regular seasons

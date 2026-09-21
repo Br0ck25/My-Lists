@@ -662,6 +662,7 @@ function renderListSearchResults(mdblistMatches, traktMatches, traktError, myLis
         (addedDirect ? 'Remove' : '+ Add') +
         '</button>';
     }
+    actionsHtml += '<button type="button" class="lc-btn secondary customizeListBtn" data-name="' + escapeAttr(item.name) + '" data-url="' + escapeAttr(item.url) + '" data-type="' + escapeAttr(item.type || 'movie') + '" title="Load into the Custom List Builder to add, remove, or reorder before saving">Customize</button>';
 
     const creatorLabel = item.user ? (item.user.includes('Official') || item.user.includes('Franchise') ? escapeHtml(item.user) : 'by ' + escapeHtml(item.user)) : '';
     const itemCountLabel = typeof item.items === 'number' ? (item.items + ' items') : (item.items ? escapeHtml(String(item.items)) : '');
@@ -1132,6 +1133,17 @@ document.addEventListener('click', async (e) => {
     }
     return;
   }
+  const customizeBtn = e.target.closest('.customizeListBtn');
+  if (customizeBtn) {
+    e.stopPropagation();
+    const listName = customizeBtn.dataset.name || 'List';
+    const listUrl = customizeBtn.dataset.url || '';
+    const listType = customizeBtn.dataset.type || 'movie';
+    if (typeof loadListToCustomListDraft === 'function') {
+      loadListToCustomListDraft(listName, listUrl, listType, customizeBtn);
+    }
+    return;
+  }
   const curatedAddBtn = e.target.closest('.curatedAddBtn');
   if (curatedAddBtn) {
     const listTitle = curatedAddBtn.dataset.title || 'Curated List';
@@ -1387,7 +1399,8 @@ function buildCuratedRecommendationCard(title, type, customUrl, subtitle, items)
     (isAdded ? 'style="color:var(--danger);"' : '') +
     ' data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">' +
     (isAdded ? 'Remove' : '+ Add') +
-  '</button>';
+  '</button>' +
+  '<button type="button" class="lc-btn secondary customizeListBtn" data-name="' + escapeAttr(title) + '" data-url="' + escapeAttr(customUrl) + '" data-type="' + escapeAttr(type) + '" title="Load into the Custom List Builder to add, remove, or reorder before saving">Customize</button>';
 
   return '<div class="list-card" data-name="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">' +
     '<div class="list-card-header">' +
@@ -1912,6 +1925,7 @@ function render5PosterListsFeed(container, lists) {
             ' data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url || '') + '" data-type="' + escapeAttr(type) + '">' +
             (added ? 'Remove' : '+ Add') +
           '</button>' +
+          '<button type="button" class="lc-btn secondary customizeListBtn" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url || '') + '" data-type="' + escapeAttr(type) + '" title="Load into the Custom List Builder to add, remove, or reorder before saving">Customize</button>' +
         '</div>' +
       '</div>' +
       '<div class="list-card-posters poster-preview-slot" data-name="' + escapeAttr(l.name) + '" data-url="' + escapeAttr(l.url || '') + '" data-type="' + escapeAttr(type) + '" data-creator="' + escapeAttr(author) + '" data-items="' + escapeAttr(itemCount || '') + '" data-likes="' + escapeAttr(l.likes || 0) + '"></div>' +
@@ -2837,7 +2851,7 @@ function renderItemStorylinesWatchOrder(d, type) {
       // here would just be noise on the one tile that needs it least.
       if (!isCurrent && partId) itemStorylineRatingIds.add(partId);
       const ratingSlot = (!isCurrent && partId)
-        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(partId) + '" data-rating-style="inline"></span>'
+        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(partId) + '"></span>'
         : '';
 
       return '<div class="item-storyline-card' + (isCurrent ? ' is-current' : '') + '"' + clickHandler + ' title="' + escapeAttr(displayTitle + (isCurrent ? ' (Currently Viewing)' : '')) + '">' +

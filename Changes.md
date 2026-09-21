@@ -1,5 +1,149 @@
 # Changes Log
 
+## 2026-09-21 - Customize button on Discover and Search lists
+
+### Files Changed
+`19_client-search-and-likes.js`, `21_client-custom-list-builder.js`, `worker_entry_combined.js`,
+`tests/client.test.mjs`, `CHANGELOG.md`, `Changes.md`
+
+### The request
+
+After seeing the Storylines & Universes grid's own **Customize** button (which loads a saga's items into
+the Channel Builder's editable draft before adding it), the ask was to give every list on Discover --
+every sub-tab, not just one -- and every list Search turns up the same button.
+
+### The fix
+
+A saga is built episode by episode for a 24/7 channel; a Discover or Search list is just a plain catalog
+of movies or shows. So rather than reusing the Channel Builder, **Customize** on these lists loads the
+list's items into the **Custom List Builder**'s draft instead (`loadListToCustomListDraft`,
+`21_client-custom-list-builder.js`) -- add, remove, reorder, then Save -- which is what these lists
+actually are. This is deliberately different from the existing **+ Add** button and the My Lists panel's
+"Copy to Custom List" buttons (`copyListToCustomList`, `18_client-copy-and-trakt-export.js`), both of
+which copy a list in as-is with no chance to edit first.
+
+Uses the same bounded preview fetch (`fetchPreviewForSlot`, up to ~100 items per type) already filling
+each card's own poster strip, not `copyListToCustomList`'s exhaustive full-list fetch -- a hand-edited
+draft is for curating a short list, and a shelf like TMDB Trending can run into the thousands of items.
+
+Every Discover sub-tab (All, Movies, Shows, Popular Lists, Hidden Gems, Kids, Holidays, Genres) renders
+through one shared function, `render5PosterListsFeed` (`19_client-search-and-likes.js`), so adding the
+button there covers all of them at once; Curated (`buildCuratedRecommendationCard`) and the Search tab's
+own list search (`renderListSearchResults`) each needed their own copy of the button, since they build
+their card markup separately.
+
+### Tests
+
+`tests/client.test.mjs`: new "Customize button on Discover and Search lists" suite -- a Customize button
+renders on cards from all three surfaces (`render5PosterListsFeed`, `buildCuratedRecommendationCard`,
+`renderListSearchResults`) with the same name/url/type as the card's own Add button, `loadListToCustomListDraft`
+correctly populates the draft from a movie-only list, marks the draft "mixed" when a list has both movies
+and shows, and never overwrites the identity of a list already being edited (starts a fresh, unsaved draft
+every time).
+
+## 2026-09-21 - A saga's "See All" page showed no ratings past its first 9 posters
+
+### Files Changed
+`20_client-channel-builder.js`, `worker_entry_combined.js`, `tests/client.test.mjs`, `CHANGELOG.md`,
+`Changes.md`
+
+### The bug
+
+The Storylines & Universes grid itself looked correct after the placement fix below, but a saga's own
+"See All" page showed no ratings on any poster past the ninth. The grid's card preview only ever resolves
+ratings for the first 9 posters it actually shows (`previewPosters = event.episodes.slice(0, 9)`, in
+`renderStorylinesUniverseList`) -- a 12-movie saga's remaining 3 items were never asked about at all. The
+shared "See All" page (`openStorylineDetails` -> `openListDetailsPage`) has no slot-patching machinery of
+its own, unlike the grid and the item details modal -- it only ever renders whatever rating an item
+already carries when the page is built, so a gap in the grid's own cache became a gap on this page too.
+
+### The fix
+
+`openStorylineDetails` now awaits every episode's rating before opening the "See All" page: whatever the
+grid already resolved comes straight from the shared cache, and whatever it didn't (parts past the
+preview window) gets resolved fresh, right there. This meant `resolveStorylineRatings` needed to become
+awaitable -- it now returns a Promise that resolves once every id passed in has an answer cached -- and
+its in-flight tracking moved from a Set of ids to a Map of id -> the actual fetch Promise resolving it, so
+a caller that needs an answer for every id (this one has no fallback render for one that never shows up)
+can await an id someone else already started fetching instead of silently skipping it.
+
+### Tests
+
+`tests/client.test.mjs`: new regression test using Marvel's 12-movie Infinity Saga specifically -- browses
+the grid first (resolving only parts 1-9, confirmed via the cache), then opens the saga's "See All" page
+and confirms parts 10-12 arrive with correct ratings too, resolved fresh before the page opens.
+
+## 2026-09-21 - Storylines & Universes rating badges were in the wrong place
+
+### Files Changed
+`19_client-search-and-likes.js`, `20_client-channel-builder.js`, `worker_entry_combined.js`,
+`tests/client.test.mjs`, `CHANGELOG.md`, `Changes.md`
+
+### The bug
+
+The previous entry below made the Storylines, Sagas & Universes badges visible, but on the Channel
+Builder's own browse grid they came back as a colored badge overlaid on the poster's top-left corner --
+not how a rating shows up anywhere else on the site. Discover, list previews, and every other place that
+uses this same `list-card-mini-poster-tile` poster markup (`loadPosterSlot`, `19_client-search-and-likes.js`)
+shows its rating as a plain star-and-number sitting in the text line below the poster, next to the year --
+never a colored overlay on the image itself. The item details modal's own Storylines section already
+matched that pattern; only the Channel Builder grid didn't.
+
+### The fix
+
+Moved the grid's rating slot out of the poster image wrapper and into the year line
+(`renderStorylinesUniverseList`, `20_client-channel-builder.js`), styled identically to Discover's own
+year/rating row. `applyStorylineRatingBadges` no longer branches between a poster-corner badge
+(`formatRatingBadgeHtml`) and an inline one (`formatRatingSpanHtml`) -- both Storylines surfaces only
+ever want the inline star now, so it always uses that formatter, and the now-unused `data-rating-style`
+attribute was dropped from both surfaces' markup.
+
+### Tests
+
+`tests/client.test.mjs`: new test confirms the rating slot renders inside the year line rather than the
+poster image wrapper; the existing regression test for the invisible-badge bug was reworded since it no
+longer needs to distinguish an "overlay badge" case that doesn't exist anymore, while still pinning down
+`formatRatingBadgeHtml`'s id-shape guess as the actual mechanism behind that earlier bug.
+
+## 2026-09-21 - Storylines & Universes rating badges were invisible
+
+### Files Changed
+`20_client-channel-builder.js`, `worker_entry_combined.js`, `tests/client.test.mjs`, `CHANGELOG.md`,
+`Changes.md`
+
+### The bug
+
+The previous entry below added a rating badge to both Storylines, Sagas & Universes surfaces, and it
+shipped and deployed correctly -- but nothing ever became visible on either one. The badges were there in
+the DOM the whole time, just permanently invisible.
+
+`applyStorylineRatingBadges` handed each resolved rating to `formatRatingBadgeHtml`/`formatRatingSpanHtml`
+as `{ id, rating }`. Both formatters have always supported two input shapes -- a raw `rating` field, or a
+`vote_average` field -- and for the `rating` field specifically, `formatRatingBadgeHtml` guesses whether
+the number is an IMDb or a TMDB rating from the shape of `id` alone: an id starting with `tt` reads as
+IMDb. Every id on these two pages is an imdb-style `tt...` id, even though the value itself always comes
+from `/api/details/batch`'s own TMDB `vote_average`. So every badge got labelled `data-rating-type="imdb"`
+-- and this site hides IMDb-type badges unconditionally, everywhere, by design (`hide-badge-imdb-rating` is
+forced on in `23_client-list-management.js`; only a TMDB-vs-none choice has ever been a real setting here).
+Correct data, correct markup, zero visible pixels.
+
+### The fix
+
+Both call sites in `applyStorylineRatingBadges` now pass the value as `vote_average` instead of `rating`,
+which both formatters treat as unambiguously TMDB regardless of what the id looks like -- sidestepping the
+guess entirely rather than trying to special-case it.
+
+Found by reproducing the report directly against the live site with Playwright rather than re-reading the
+diff, since the diff alone looked correct -- the deployed build genuinely did have the feature, it just
+had this one mislabeled field.
+
+### Tests
+
+`tests/client.test.mjs`: new regression test in the existing "Storylines, Sagas & Universes rating badges"
+suite asserts both formatters label a `tt...` id's badge as `data-rating-type="tmdb"` when given
+`vote_average`, and separately confirms `formatRatingBadgeHtml` really does mislabel that same id as
+`imdb` when given `rating` instead -- pinning down the exact mechanism, not just the symptom.
+
 ## 2026-09-21 - Remove duplicate items across lists
 
 ### Files Changed

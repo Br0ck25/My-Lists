@@ -3057,6 +3057,58 @@ describe("client: Storylines, Sagas & Universes rating badges", () => {
     assert.ok(slotIds.includes(KONOSUBA_MOVIE_ID), "the movie tile carries a rating slot for its own id");
   });
 
+  // Regression test for a real bug caught on the live site, not by this
+  // suite: applyStorylineRatingBadges used to hand the resolved number to
+  // the formatters as `rating`, and formatRatingBadgeHtml's own `rating`
+  // field guesses imdb-vs-tmdb from the id's shape -- every id here is an
+  // imdb "tt..." id, so every badge came out data-rating-type="imdb". This
+  // site forces IMDb-typed badges hidden unconditionally (hide-badge-imdb-
+  // rating, 23_client-list-management.js -- only a TMDB-vs-none choice is a
+  // real setting here), so every badge existed in the DOM and rendered
+  // completely invisible. The harness cannot exercise the DOM patch itself
+  // (see the top of this describe block), but it can pin the exact call
+  // applyStorylineRatingBadges now makes: vote_average, not rating, which
+  // both formatters treat as TMDB unconditionally, sidestepping the guess.
+  it("labels a resolved rating as TMDB, not IMDb, even though every id here is a tt... id", () => {
+    const client = loadClient();
+    const inlineBadge = client.call("formatRatingSpanHtml", { id: "tt0458339", vote_average: 7.0 });
+    assert.match(inlineBadge, /data-rating-type="tmdb"/,
+      "the inline badge both Storylines surfaces render must not be labelled imdb");
+
+    // The bug's actual mechanism, pinned directly on the sibling formatter
+    // kept elsewhere in the app for a poster-corner badge: the same value
+    // sent as `rating` -- what applyStorylineRatingBadges used to send --
+    // mislabels a "tt..." id as imdb, confirming this (and not something
+    // else) is what made every badge invisible.
+    const buggyShape = client.call("formatRatingBadgeHtml", { id: "tt0458339", rating: 7.0 });
+    assert.match(buggyShape, /data-rating-type="imdb"/,
+      "confirms formatRatingBadgeHtml's own id-shape guess is what caused this -- not something else");
+  });
+
+  // Regression test for a second live-site report, right after the above fix
+  // shipped: the badge became visible, but as a colored top-left overlay on
+  // the poster -- inconsistent with every other poster tile in the app,
+  // which shows its rating as a plain inline star+number in the year line
+  // (Discover's loadPosterSlot, 19_client-search-and-likes.js). The grid's
+  // rating slot must live in the year line, not inside the poster image
+  // wrapper, and applyStorylineRatingBadges must only ever fill it with
+  // formatRatingSpanHtml's plain star+number, never a colored rating-badge div.
+  it("places the rating in the year line like every other poster tile, not as a poster-corner overlay", () => {
+    const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6 }) });
+    client.call("renderStorylinesUniverseList", "all");
+    const html = client.get("document").getElementById("storylinesUniverseList").innerHTML;
+    const yearLineWithSlot = /list-card-mini-poster-year"[^>]*><span>[^<]*<\/span><span class="storyline-rating-slot" data-rating-id="tt5312384">/;
+    assert.match(html, yearLineWithSlot,
+      "the rating slot sits inside the year line, beside the year, not overlaid on the poster image");
+
+    const imgWrapBlocks = [...html.matchAll(/list-card-mini-poster-img-wrap"[\s\S]*?(?=<div class="list-card-mini-poster-name")/g)];
+    assert.ok(imgWrapBlocks.length > 0, "sanity check: the grid rendered at least one poster tile");
+    imgWrapBlocks.forEach((m) => {
+      assert.equal(m[0].includes("storyline-rating-slot"), false,
+        "no rating slot is left inside the poster image wrapper");
+    });
+  });
+
   it("asks /api/details/batch for every unique poster id on the grid exactly once", async () => {
     const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6, [KONOSUBA_MOVIE_ID]: 7.1 }) });
     client.call("renderStorylinesUniverseList", "all");
@@ -3106,6 +3158,134 @@ describe("client: Storylines, Sagas & Universes rating badges", () => {
     await settle();
     assert.equal(requestsTo(client, BATCH).length, firstRoundCount,
       "an id already known to have no rating is not asked for again");
+  });
+
+  // Regression test for a live-site report right after the placement fix
+  // above: the grid itself looked fine, but a saga's own "See All" page
+  // (openStorylineDetails -> openListDetailsPage) showed no ratings on any of
+  // its posters. Cause: the grid's card preview only ever resolves the first
+  // 9 posters it actually renders (previewPosters = episodes.slice(0, 9)), so
+  // a longer saga's remaining items were never asked about at all, and the
+  // shared "See All" grid has no slot-patching of its own to backfill one
+  // later -- it only ever renders whatever rating an item already carries.
+  it("resolves ratings for every item on the See All page, not just the grid's own 9-poster preview", async () => {
+    const MCU_EVENT_ID = "movie_mcu_infinity_saga";
+    const CAP_AMERICA_ID = "tt0458339"; // part 1, inside the grid's own preview
+    const CIVIL_WAR_ID = "tt3498820"; // part 10, past the grid's 9-poster preview
+    const ENDGAME_ID = "tt4154796"; // part 12, past the grid's 9-poster preview
+
+    const client = loadClient({ routes: batchRoute({ [CAP_AMERICA_ID]: 7.0, [CIVIL_WAR_ID]: 7.8, [ENDGAME_ID]: 8.4 }) });
+
+    client.call("renderStorylinesUniverseList", "all");
+    await settle();
+    const cacheAfterGrid = client.get("_storylineRatingsCache");
+    assert.equal(cacheAfterGrid[CAP_AMERICA_ID], 7.0, "sanity check: the grid resolved part 1's rating");
+    assert.equal(CIVIL_WAR_ID in cacheAfterGrid, false, "sanity check: the grid never even asked about part 10");
+
+    let openedPreloaded = null;
+    client.set("openListDetailsPage", (name, type, url, preloaded) => { openedPreloaded = preloaded; });
+    await client.call("openStorylineDetails", MCU_EVENT_ID);
+
+    assert.ok(openedPreloaded, "openListDetailsPage was called");
+    assert.equal(openedPreloaded.sample.length, 12);
+    const byId = Object.fromEntries(openedPreloaded.sample.map((it) => [it.id, it]));
+    assert.equal(byId[CAP_AMERICA_ID].vote_average, 7.0, "a rating the grid already resolved carries straight through");
+    assert.equal(byId[CIVIL_WAR_ID].vote_average, 7.8, "resolved fresh before the See All page opens, despite being outside the grid's preview");
+    assert.equal(byId[ENDGAME_ID].vote_average, 8.4);
+  });
+});
+
+// The Storylines & Universes grid's own "Customize" button (loadStorylineToDraft,
+// 20_client-channel-builder.js) loads a saga's items into an editable draft
+// before adding it. Every list on Discover and in Search gets the same idea,
+// pointed at the Custom List Builder instead (loadListToCustomListDraft,
+// 21_client-custom-list-builder.js), since these lists are plain movie/show
+// catalogs rather than episode-level channel programming.
+describe("client: Customize button on Discover and Search lists", () => {
+  it("render5PosterListsFeed (Discover shelves, Popular Lists, Liked Lists) gives every card a Customize button", () => {
+    const client = loadClient();
+    const doc = client.window.document;
+    const container = doc.createElement("div");
+    client.call("render5PosterListsFeed", container, [
+      { name: "Trending Now", url: "https://mdblist.com/lists/a/trending", type: "movie", user: "MDBList", likes: 3 },
+    ]);
+    assert.match(container.innerHTML, /customizeListBtn/, "card has a Customize button");
+    assert.match(container.innerHTML,
+      /customizeListBtn" data-name="Trending Now" data-url="https:\/\/mdblist\.com\/lists\/a\/trending" data-type="movie"/,
+      "Customize button carries the same name\\/url\\/type as the Add button");
+  });
+
+  it("buildCuratedRecommendationCard (Discover's Curated tab) gives its card a Customize button", () => {
+    const client = loadClient();
+    const html = client.call("buildCuratedRecommendationCard", "Recommended Movies", "movie", "custom:curated:recommended-movies", "Based on your watch history", []);
+    assert.match(html, /customizeListBtn" data-name="Recommended Movies" data-url="custom:curated:recommended-movies" data-type="movie"/);
+  });
+
+  it("renderListSearchResults (the Search tab's list search) gives every result a Customize button", () => {
+    const client = loadClient();
+    const doc = client.window.document;
+    const box = doc.createElement("div");
+    client.call("renderListSearchResults", [{ url: "https://mdblist.com/lists/a/b", name: "Some List", type: "movie", items: 12, likes: 1 }], [], null, [], [], box, "");
+    assert.match(box.innerHTML, /customizeListBtn" data-name="Some List" data-url="https:\/\/mdblist\.com\/lists\/a\/b" data-type="movie"/);
+  });
+
+  const PREVIEW = "/api/preview";
+  function previewRoute(moviesByType) {
+    return {
+      [PREVIEW]: (req) => {
+        const t = req.body.type;
+        const sample = moviesByType[t] || [];
+        return { json: { ok: true, count: sample.length, totalItems: sample.length, sample: sample } };
+      },
+    };
+  }
+
+  it("loadListToCustomListDraft loads a movie list's preview into an editable draft, not an immediate save", async () => {
+    const client = loadClient({
+      routes: previewRoute({
+        movie: [
+          { id: "tt1000001", type: "movie", name: "Movie One", poster: "https://img.example/1.jpg", year: "2020" },
+          { id: "tt1000002", type: "movie", name: "Movie Two", poster: "https://img.example/2.jpg", year: "2021" },
+        ],
+      }),
+    });
+    await client.call("loadListToCustomListDraft", "My Copied List", "https://mdblist.com/lists/a/movies", "movie", null);
+
+    const items = client.get("customListDraftItems");
+    assert.equal(items.length, 2);
+    assert.equal(items[0].imdbId, "tt1000001");
+    assert.equal(items[0].title, "Movie One");
+    assert.equal(items[0].year, "2020");
+    assert.equal(client.get("customListDraftType"), "movie");
+    assert.equal(client.get("customListDraftListId"), null, "a fresh draft, not tied to any existing saved list");
+    assert.equal(client.document.getElementById("customListNameInput").value, "My Copied List");
+  });
+
+  it("loadListToCustomListDraft marks the draft mixed when a list has both movies and shows", async () => {
+    const client = loadClient({
+      routes: previewRoute({
+        movie: [{ id: "tt2000001", type: "movie", name: "A Movie", poster: "p", year: "2019" }],
+        series: [{ id: "tt2000002", type: "series", name: "A Show", poster: "p", year: "2018" }],
+      }),
+    });
+    await client.call("loadListToCustomListDraft", "Mixed List", "https://mdblist.com/lists/a/mixed", "mixed", null);
+
+    const items = client.get("customListDraftItems");
+    assert.equal(items.length, 2);
+    assert.equal(client.get("customListDraftType"), "mixed");
+  });
+
+  it("loadListToCustomListDraft does not touch an existing saved list's identity", async () => {
+    const client = loadClient({
+      routes: previewRoute({ movie: [{ id: "tt3000001", type: "movie", name: "Solo", poster: "p", year: "2022" }] }),
+    });
+    client.set("customListDraftListId", "some-existing-id");
+    client.set("editingCustomListUrlInput", {});
+    await client.call("loadListToCustomListDraft", "Fresh Copy", "https://mdblist.com/lists/a/solo", "movie", null);
+
+    assert.equal(client.get("customListDraftListId"), null,
+      "loading a Discover/Search list starts a brand new draft, never overwrites the list being edited");
+    assert.equal(client.get("editingCustomListUrlInput"), null);
   });
 });
 
@@ -3934,9 +4114,9 @@ describe("client: Item Details Storylines, Sagas & Universes watch order", () =>
       seasonsData: [{ season_number: 1, episode_count: 7 }]
     };
     const html = client.__scopeCall("renderItemStorylinesWatchOrder", [bb, "series"]);
-    assert.match(html, /storyline-rating-slot" data-rating-id="tt9243946" data-rating-style="inline"/,
+    assert.match(html, /storyline-rating-slot" data-rating-id="tt9243946"/,
       "El Camino (a companion) gets a rating slot");
-    assert.match(html, /storyline-rating-slot" data-rating-id="tt3032476" data-rating-style="inline"/,
+    assert.match(html, /storyline-rating-slot" data-rating-id="tt3032476"/,
       "Better Call Saul (a companion) gets a rating slot");
     assert.equal(html.includes('data-rating-id="tt0903747"'), false,
       "Breaking Bad itself -- the title already open in this modal -- gets no slot");
