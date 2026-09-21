@@ -5186,6 +5186,61 @@ describe("client: Quick Add channel cloud sync stays small, and never shrinks wh
     const after = client.call("loadLocalChannels")["ch-tnt"];
     assert.equal(after.items.length, 4000, "must keep the real pool, not fall back to the row's small sample");
   });
+
+  it("channelRowUrl slims a preset-backed channel's row, and leaves a hand-built one's alone", () => {
+    const client = loadClient({});
+    const sampleSize = client.get("CHANNEL_POINTER_SAMPLE_ITEMS");
+    const preset = { channelId: "ch-preset", name: "TNT", presetNetworkId: "41", items: presetItems(4000, "TNT") };
+    const handBuilt = { channelId: "ch-mix", name: "My Mix", presetNetworkId: "", items: presetItems(800, "MIX") };
+
+    const presetPayload = JSON.parse(client.call("channelRowUrl", preset).slice("channel:v1:".length));
+    assert.equal(presetPayload.items.length, sampleSize);
+    assert.equal(presetPayload.presetNetworkId, "41");
+
+    const handBuiltPayload = JSON.parse(client.call("channelRowUrl", handBuilt).slice("channel:v1:".length));
+    assert.equal(handBuiltPayload.items.length, 800, "a hand-built channel has no other durable copy -- must stay full");
+  });
+
+  it("merging several full-pool Quick Add channels stays small, instead of reopening the too-large-to-save ceiling", () => {
+    // The exact scenario reported live: merging 9+ Quick Add network
+    // channels (each up to CHANNEL_POOL_MAX_ITEMS) into one combined
+    // catalog. mergeChannelsIntoRow and its siblings (toggleMergedChannelInCatalog,
+    // addChannelToMerge, removeChannelFromMerge, pruneChannelFromAllMerges)
+    // used to embed each member's FULL local copy -- quickAddChannel's own
+    // pointer discipline only ever protected that channel's OWN row, not
+    // what merging did with it afterward.
+    const client = loadClient({});
+    const addedRows = [];
+    client.set("addRow", (name, url) => { addedRows.push({ name, url }); });
+
+    const channelIds = [];
+    for (let i = 0; i < 9; i++) {
+      const id = "ch-net" + i;
+      channelIds.push(id);
+      client.call("saveLocalChannel", {
+        channelId: id, name: "Network " + i, presetNetworkId: "net" + i, items: presetItems(5000, "N" + i),
+      });
+    }
+
+    const doc = client.get("document");
+    const checkboxes = channelIds.map((id) => ({ dataset: { channelid: id } }));
+    doc.querySelectorAll = (sel) => (sel === "#channelMergeList .channelMergeCheck:checked" ? checkboxes : []);
+    doc.getElementById("channelMergeNameInput").value = "Combined";
+
+    client.call("mergeChannelsIntoRow");
+
+    assert.equal(addedRows.length, 1, "must add exactly one combined catalog row");
+    const totalBytes = Buffer.byteLength(addedRows[0].url, "utf8");
+    assert.ok(totalBytes < 200 * 1024,
+      "nine merged 5,000-item channels must stay well under the 10MB config ceiling -- got " + totalBytes + " bytes");
+    const lines = addedRows[0].url.split("\n");
+    assert.equal(lines.length, 9, "one line per merged channel");
+    lines.forEach((line) => {
+      const payload = JSON.parse(line.slice("channel:v1:".length));
+      assert.ok(payload.items.length <= client.get("CHANNEL_POINTER_SAMPLE_ITEMS"),
+        "each merged member must carry only its pointer sample, not its full pool");
+    });
+  });
 });
 
 describe("client: the Channel builder's interleaved play order", () => {

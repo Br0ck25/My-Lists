@@ -793,7 +793,7 @@ function pruneChannelFromAllMerges(channelId) {
         if (row.dataset.mergedId === mergedId || (row.id && row.id === mergedId)) {
           const urls = merged.channelIds.map((id) => {
             const ch = channelsMap[id];
-            return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+            return ch ? channelRowUrl(ch) : null;
           }).filter(Boolean);
           const urlInput = row.querySelector('.url');
           if (urlInput) urlInput.value = urls.join('\\n');
@@ -904,8 +904,7 @@ function undoChannelDelete() {
   if (_pendingChannelUndoTimer) clearTimeout(_pendingChannelUndoTimer);
   saveLocalChannel(channel);
   if (inCatalogs) {
-    const payload = Object.assign({}, channel);
-    addRow(channel.name || 'Channel', 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channel.channelId);
+    addRow(channel.name || 'Channel', channelRowUrl(channel), 'series', true, 'Channels', channel.channelId);
     saveState();
   }
   renderChannelUndoBar();
@@ -1113,8 +1112,7 @@ function toggleChannelInCatalog(channelId) {
     renderChannelMergeList();
     showAddedToast('Removed "' + channel.name + '" from your Catalogs.');
   } else {
-    const url = 'channel:v1:' + JSON.stringify(channel);
-    addRow(channel.name, url, 'series', true, 'Channels', channelId);
+    addRow(channel.name, channelRowUrl(channel), 'series', true, 'Channels', channelId);
     renderMyCreatedChannelsList();
     renderChannelMergeList();
     showAddedToast('Added "' + channel.name + '" to your Catalogs.');
@@ -10429,6 +10427,32 @@ const CHANNEL_PRESET_MIN_ITEMS = 20;
 // this sample, which exists purely as what a local shortcut or a cold
 // cache falls back to.
 const CHANNEL_POINTER_SAMPLE_ITEMS = 50;
+
+// The URL string one catalog row stores for a channel -- quickAddChannel's
+// own pointer sample (see above) if presetNetworkId still marks it as
+// resolvable from the shared channel:preset:v2:<networkId> cache, or the
+// channel exactly as given otherwise. Every place that (re-)builds a
+// channel's row -- adding or removing it from Catalogs, merging several
+// together, rebuilding a merge after a member is added or removed, restoring
+// one from the undo bar, accepting a shared or directory channel -- must
+// route through this rather than JSON.stringifying the channel directly.
+// quickAddChannel is the only place that ever built its OWN pointer by
+// hand; every other one of those call sites used to just embed whatever
+// loadLocalChannels() had for that channel, full pool included, which is
+// exactly the size ceiling this pointer design exists to avoid -- a channel
+// added via Quick Add and still preset-backed reopened it the moment it was
+// merged with others, removed and re-added, or restored from an undo,
+// regardless of how carefully quickAddChannel's own first save behaved.
+function channelRowUrl(channel) {
+  if (!channel) return '';
+  if (channel.presetNetworkId && (channel.items || []).length > CHANNEL_POINTER_SAMPLE_ITEMS) {
+    return 'channel:v1:' + JSON.stringify(Object.assign({}, channel, {
+      items: channel.items.slice(0, CHANNEL_POINTER_SAMPLE_ITEMS),
+    }));
+  }
+  return 'channel:v1:' + JSON.stringify(channel);
+}
+
 // What a rotating day's lineup actually looks like -- must match
 // CHANNEL_ROTATION_SHOWS_PER_DAY / CHANNEL_ROTATION_EPISODES_PER_SHOW
 // server-side. Used here only for display text (the real selection logic
@@ -11719,7 +11743,7 @@ function acceptSharedChannel(channel, code) {
     sharePublished: false,
   });
   saveLocalChannel(payload);
-  addRow(payload.name, 'channel:v1:' + JSON.stringify(payload), 'series', true, 'Channels', channelId);
+  addRow(payload.name, channelRowUrl(payload), 'series', true, 'Channels', channelId);
   if (typeof saveState === 'function') saveState();
   if (typeof renderLivePreview === 'function') renderLivePreview();
   renderMyCreatedChannelsList();
@@ -12008,7 +12032,7 @@ async function addDirectoryChannel(code, btn) {
       }
     }
     if (localCh) {
-      addRow(localCh.name || 'Channel', 'channel:v1:' + JSON.stringify(localCh), 'series', true, 'Channels', localCh.channelId);
+      addRow(localCh.name || 'Channel', channelRowUrl(localCh), 'series', true, 'Channels', localCh.channelId);
       if (typeof saveState === 'function') saveState();
       if (typeof renderLivePreview === 'function') renderLivePreview();
       fetch(ORIGIN + '/api/channel/added', {
@@ -12521,7 +12545,7 @@ function removeChannelFromMerge(mergedId, channelIdToRemove) {
       } else {
         const urls = merged.channelIds.map((id) => {
           const ch = channelsMap[id];
-          return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+          return ch ? channelRowUrl(ch) : null;
         }).filter(Boolean);
         const urlInput = row.querySelector('.url');
         if (urlInput) urlInput.value = urls.join('\\n');
@@ -12555,7 +12579,7 @@ function addChannelToMerge(mergedId, channelIdToAdd) {
       if (row.dataset.mergedId === mergedId || (row.id && row.id === mergedId)) {
         const urls = merged.channelIds.map((id) => {
           const c = channelsMap[id];
-          return c ? ('channel:v1:' + JSON.stringify(c)) : null;
+          return c ? channelRowUrl(c) : null;
         }).filter(Boolean);
         const urlInput = row.querySelector('.url');
         if (urlInput) urlInput.value = urls.join('\\n');
@@ -12598,9 +12622,9 @@ function toggleMergedChannelInCatalog(mergedId) {
   } else {
     const urls = (merged.channelIds || []).map((id) => {
       const ch = channelsMap[id];
-      return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+      return ch ? channelRowUrl(ch) : null;
     }).filter(Boolean);
-    
+
     if (!urls.length) {
       if (typeof showAppAlert === 'function') {
         showAppAlert('Merge Channels', 'Could not find the channels for this merged catalog.');
@@ -12641,7 +12665,7 @@ function mergeChannelsIntoRow() {
   const channelIds = [...checks].map((cb) => cb.dataset.channelid).filter(Boolean);
   const urls = channelIds.map((id) => {
     const ch = channelsMap[id];
-    return ch ? ('channel:v1:' + JSON.stringify(ch)) : null;
+    return ch ? channelRowUrl(ch) : null;
   }).filter(Boolean);
 
   if (urls.length < 2) {
