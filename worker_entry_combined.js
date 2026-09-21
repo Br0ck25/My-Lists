@@ -990,6 +990,80 @@ const D1_SCHEMA_MANIFEST = [
   },
 ];
 
+
+// ---------------------------------------------------------------------------
+// BetterPosters (https://btttr.cc) -- optional replacement artwork.
+//
+// BetterPosters renders a title's poster with the text baked in: genre, star
+// rating, a trend tag ("Trending"/"New"), quality flags (4K/DV/Atmos) and an
+// age rating. It keys off the IMDB id alone -- no API key, no account, nothing
+// to register -- so the whole integration is a URL rewrite over metas this
+// add-on already built. Off by default; "Better Posters" in Settings ->
+// Artwork & Badges turns it on.
+//
+// The URL contract is the one btttr.cc's own configurator emits for external
+// add-ons (its "AIOMetadata / Other Addon" mode):
+//
+//   https://btttr.cc/{base}/imdb/poster-default/{imdb_id}.jpg[?tag=none][&lang=..][&rs=..]
+//
+// {base} is what selects the artwork -- NOT the literal "poster-default"
+// segment after it. That segment is fixed: the service ignores whatever is put
+// there (every value, including a nonsense one, returns byte-identical bytes),
+// which is why the nuvio-better-posters-addon project's single hard-coded
+// "/poster/imdb/poster-default/{id}.jpg" only ever yields the default style.
+// buildBetterPosterUrl (05_catalog-core.js) assembles the base properly.
+const BETTER_POSTERS_ORIGIN = "https://btttr.cc";
+
+// Rating sources btttr.cc accepts for "rs", straight off its configurator's
+// own dropdown. "avg" is its default and is sent as no parameter at all.
+const BETTER_POSTERS_RATING_SOURCES = [
+  { value: "avg", label: "Average" },
+  { value: "IM", label: "IMDb (/10)" },
+  { value: "TM", label: "TMDB (/10)" },
+  { value: "RT", label: "Rotten Tomatoes (%)" },
+  { value: "MC", label: "Metacritic (/100)" },
+  { value: "TR", label: "Trakt (/10)" },
+  { value: "LB", label: "Letterboxd (/5)" },
+  { value: "RE", label: "Roger Ebert (/4)" },
+];
+
+// Languages btttr.cc's configurator offers for "lang". Anything not on this
+// list is treated as English (again: sent as no parameter).
+const BETTER_POSTERS_LANGS = [
+  { value: "en", label: "English" },
+  { value: "es-ES", label: "Espa\u00f1ol (Espa\u00f1a)" },
+  { value: "es-MX", label: "Espa\u00f1ol (Latinoam\u00e9rica)" },
+  { value: "fr", label: "Fran\u00e7ais" },
+  { value: "de", label: "Deutsch" },
+  { value: "pt-BR", label: "Portugu\u00eas (Brasil)" },
+  { value: "pt-PT", label: "Portugu\u00eas (Portugal)" },
+  { value: "it", label: "Italiano" },
+  { value: "nl", label: "Nederlands" },
+  { value: "pl", label: "Polski" },
+  { value: "ru", label: "\u0420\u0443\u0441\u0441\u043a\u0438\u0439" },
+  { value: "tr", label: "T\u00fcrk\u00e7e" },
+  { value: "ar", label: "\u0627\u0644\u0639\u0631\u0628\u064a\u0629" },
+  { value: "ja", label: "\u65e5\u672c\u8a9e" },
+  { value: "ko", label: "\ud55c\uad6d\uc5b4" },
+  { value: "zh", label: "\u4e2d\u6587" },
+  { value: "hi", label: "\u0939\u093f\u0928\u094d\u0926\u0940" },
+  { value: "sv", label: "Svenska" },
+  { value: "cs", label: "\u010ce\u0161tina" },
+];
+
+function buildBetterPostersLangOptionsHtml(selected) {
+  const sel = BETTER_POSTERS_LANGS.some((l) => l.value === selected) ? selected : "en";
+  return BETTER_POSTERS_LANGS.map(
+    ({ value, label }) => `<option value="${value}"${value === sel ? " selected" : ""}>${label}</option>`
+  ).join("");
+}
+
+function buildBetterPostersRatingSourceOptionsHtml(selected) {
+  const sel = BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === selected) ? selected : "avg";
+  return BETTER_POSTERS_RATING_SOURCES.map(
+    ({ value, label }) => `<option value="${value}"${value === sel ? " selected" : ""}>${label}</option>`
+  ).join("");
+}
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -2744,7 +2818,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // with no CONFIGS KV binding, and without KV there are no Creator Profiles for
 // a personal shelf to belong to.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false, dedupeAcrossLists: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false, dedupeAcrossLists: false, betterPosters: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -2797,6 +2871,19 @@ function decodeConfig(config) {
       // where this is actually applied. Defaults to false, same reasoning
       // as region/hideNonDigitalReleases above.
       dedupeAcrossLists: !!(!Array.isArray(parsed) && parsed.dedupeAcrossLists),
+      // BetterPosters (btttr.cc) replacement artwork -- see
+      // applyBetterPostersToMetas (05_catalog-core.js). Opt-in, so it
+      // defaults to false and every install predating it is untouched. The
+      // style keys below only matter when betterPosters itself is on, and
+      // each one defaults to btttr.cc's own default for that option.
+      betterPosters: !!(!Array.isArray(parsed) && parsed.betterPosters),
+      betterPostersGenre: Array.isArray(parsed) || parsed.betterPostersGenre !== false,
+      betterPostersRating: Array.isArray(parsed) || parsed.betterPostersRating !== false,
+      betterPostersQuality: !!(!Array.isArray(parsed) && parsed.betterPostersQuality),
+      betterPostersAge: !!(!Array.isArray(parsed) && parsed.betterPostersAge),
+      betterPostersTrendTags: Array.isArray(parsed) || parsed.betterPostersTrendTags !== false,
+      betterPostersLang: (!Array.isArray(parsed) && parsed.betterPostersLang) || "en",
+      betterPostersRatingSource: (!Array.isArray(parsed) && parsed.betterPostersRatingSource) || "avg",
     };
   } catch {
     return empty;
@@ -11681,6 +11768,17 @@ async function resolveConfig(configParam, env) {
           hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
           adultContentFilter: !!parsed.adultContentFilter,
           dedupeAcrossLists: !!parsed.dedupeAcrossLists,
+          // See decodeConfig (02_http-and-creator-utils.js) for why
+          // betterPosters itself defaults off while its style keys default
+          // to btttr.cc's own defaults.
+          betterPosters: !!parsed.betterPosters,
+          betterPostersGenre: parsed.betterPostersGenre !== false,
+          betterPostersRating: parsed.betterPostersRating !== false,
+          betterPostersQuality: !!parsed.betterPostersQuality,
+          betterPostersAge: !!parsed.betterPostersAge,
+          betterPostersTrendTags: parsed.betterPostersTrendTags !== false,
+          betterPostersLang: parsed.betterPostersLang || "en",
+          betterPostersRatingSource: parsed.betterPostersRatingSource || "avg",
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
           showBadgesTraktContinueWatching: parsed.showBadgesTraktContinueWatching !== false,
@@ -12264,6 +12362,15 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     const tot = result.totalItems;
     result = deterministicDailyShuffle(result, `items:${entry.id || entry.name}:${keys.configParam || ''}`);
     result.totalItems = tot;
+  }
+
+  // Before the badge pass below, never after: a badge wraps whatever poster
+  // URL it finds into /api/poster-badge?poster=..., so running this second
+  // would throw the badged poster away. Running it first means a badged
+  // poster is a badge drawn over BetterPosters artwork, which is the point.
+  // The adult-content filter still runs after both and still wins.
+  if (keys.betterPosters && Array.isArray(result) && result.length > 0) {
+    result = applyBetterPostersToMetas(result, keys.betterPostersOptions || {});
   }
 
   if (keys.isStremioCatalog === true && keys.origin && Array.isArray(result) && result.length > 0) {
@@ -12934,6 +13041,110 @@ function applyAdultContentFilterToMetas(metas, origin, parentEntry) {
       poster: safeUrl,
       isAdultPosterFiltered: true,
     };
+  });
+  mapped.totalItems = tot;
+  return mapped;
+}
+
+// --- BetterPosters (https://btttr.cc) -------------------------------------
+// Replacement artwork with the metadata burned into the image itself. See the
+// contract note on BETTER_POSTERS_ORIGIN (00_constants.js) for the URL shape
+// and why the "poster-default" segment is a fixed literal rather than a style.
+
+const BETTER_POSTERS_IMDB_RE = /(?:^|[^a-z0-9])(tt\d{5,12})(?=$|[^0-9])/i;
+
+// tt0000000 is this add-on's own "temporarily unavailable" placeholder (see
+// the catalog route's catch in 25), not a title BetterPosters could render.
+const BETTER_POSTERS_PLACEHOLDER_ID = "tt0000000";
+
+// Deliberately reads the id fields only, never meta.poster. Several posters
+// this add-on builds itself carry an id in their query string
+// (/api/poster-badge?...&id=tt123...), so scraping the poster URL -- which is
+// what the nuvio-better-posters-addon project does -- would make an
+// already-processed poster look like a plain IMDB title and send it back
+// through BetterPosters a second time.
+function betterPostersImdbId(meta) {
+  if (!meta || typeof meta !== "object") return null;
+  for (const candidate of [meta.imdb_id, meta.imdbId, meta.imdb, meta.id]) {
+    if (typeof candidate !== "string") continue;
+    const hit = candidate.match(BETTER_POSTERS_IMDB_RE);
+    if (!hit) continue;
+    const id = hit[1].toLowerCase();
+    if (id !== BETTER_POSTERS_PLACEHOLDER_ID) return id;
+  }
+  return null;
+}
+
+// Mirrors updateAioUrl() in btttr.cc's own configurator: the bottom-row choice
+// picks the stem, then the quality/age flags are appended to it -- with a "-"
+// only when the stem does not already carry one. So genre+rating+quality is
+// "poster-q", genre-only+quality is "poster-gq".
+function betterPostersBase(opts) {
+  const genre = opts.genre !== false;
+  const rating = opts.rating !== false;
+  let base;
+  if (genre && rating) base = "poster";
+  else if (genre) base = "poster-g";
+  else if (rating) base = "poster-r";
+  else base = "poster-n";
+  const suffix = (opts.quality ? "q" : "") + (opts.age ? "a" : "");
+  if (suffix) base += base.includes("-") ? suffix : "-" + suffix;
+  return base;
+}
+
+function buildBetterPosterUrl(imdbId, opts) {
+  const o = opts || {};
+  const params = [];
+  // Every one of these is omitted at its btttr.cc default, so a default
+  // config produces the exact URL its configurator would hand out.
+  if (o.trendTags === false) params.push("tag=none");
+  if (o.lang && o.lang !== "en" && BETTER_POSTERS_LANGS.some((l) => l.value === o.lang)) {
+    params.push("lang=" + encodeURIComponent(o.lang));
+  }
+  if (o.ratingSource && o.ratingSource !== "avg" && BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === o.ratingSource)) {
+    params.push("rs=" + encodeURIComponent(o.ratingSource));
+  }
+  const qs = params.length ? "?" + params.join("&") : "";
+  return `${BETTER_POSTERS_ORIGIN}/${betterPostersBase(o)}/imdb/poster-default/${imdbId}.jpg${qs}`;
+}
+
+// Packs a resolved config's betterPosters* keys into the shape
+// buildBetterPosterUrl reads. Each default matches btttr.cc's own default for
+// that option, so an install that never touched the style controls gets the
+// same artwork its configurator hands out.
+function betterPostersOptionsFrom(cfg) {
+  const c = cfg || {};
+  return {
+    genre: c.betterPostersGenre !== false,
+    rating: c.betterPostersRating !== false,
+    quality: !!c.betterPostersQuality,
+    age: !!c.betterPostersAge,
+    trendTags: c.betterPostersTrendTags !== false,
+    lang: c.betterPostersLang || "en",
+    ratingSource: c.betterPostersRatingSource || "avg",
+  };
+}
+
+// Single-meta form, for the /meta/ detail route.
+function applyBetterPosterToMeta(meta, opts) {
+  if (!meta || typeof meta !== "object") return meta;
+  return applyBetterPostersToMetas([meta], opts)[0];
+}
+
+// 1:1 map, same shape as applyBadgedPostersToMetas/applyAdultContentFilterToMetas
+// below -- it only ever swaps a poster URL, never which ids come back.
+function applyBetterPostersToMetas(metas, opts) {
+  if (!Array.isArray(metas) || !metas.length) return metas;
+  const tot = metas.totalItems;
+  const mapped = metas.map((m) => {
+    if (!m) return m;
+    // BetterPosters only renders 2:3 artwork, so a landscape shelf (a TV
+    // channel's 16:9 banner) keeps whatever it already had rather than
+    // getting a portrait poster squeezed into a widescreen tile.
+    if (m.posterShape === "landscape") return m;
+    const imdbId = betterPostersImdbId(m);
+    if (!imdbId) return m;
+    return { ...m, poster: buildBetterPosterUrl(imdbId, opts) };
   });
   mapped.totalItems = tot;
   return mapped;
@@ -21653,6 +21864,17 @@ function renderBuilder(
   const initialHideNonDigitalReleases = !!initialKeys.hideNonDigitalReleases;
   const initialAdultContentFilter = !!initialKeys.adultContentFilter;
   const initialDedupeAcrossLists = !!initialKeys.dedupeAcrossLists;
+  // BetterPosters (btttr.cc). Opt-in, so the master switch defaults off while
+  // each style control defaults to btttr.cc's own default for that option --
+  // see decodeConfig (02_http-and-creator-utils.js).
+  const initialBetterPosters = !!initialKeys.betterPosters;
+  const initialBetterPostersGenre = initialKeys.betterPostersGenre !== false;
+  const initialBetterPostersRating = initialKeys.betterPostersRating !== false;
+  const initialBetterPostersQuality = !!initialKeys.betterPostersQuality;
+  const initialBetterPostersAge = !!initialKeys.betterPostersAge;
+  const initialBetterPostersTrendTags = initialKeys.betterPostersTrendTags !== false;
+  const betterPostersLangOptionsHtml = buildBetterPostersLangOptionsHtml(initialKeys.betterPostersLang || "en");
+  const betterPostersRatingSourceOptionsHtml = buildBetterPostersRatingSourceOptionsHtml(initialKeys.betterPostersRatingSource || "avg");
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();
@@ -26600,6 +26822,70 @@ if ('serviceWorker' in navigator) {
           <p style="margin:4px 0 0; color:var(--muted); font-size:0.82rem;">Filter NSFW posters and replace default unfiltered posters with safe, age-appropriate ones across your catalogs, search, continue watching, and Stremio/Nuvio.</p>
         </div>
       </label>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Better Posters</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Swap the plain artwork your catalogs serve to Stremio and Nuvio for <a href="https://btttr.cc/" target="_blank" rel="noopener noreferrer" style="color:var(--accent);">BetterPosters</a> &mdash; posters with the genre, rating and tags drawn into the image itself. No API key or account needed. Only titles with an IMDb id are affected; anything else keeps the poster it already had. Requires Save/Update to take effect on an existing install link.</p>
+      <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+        <input type="checkbox" id="betterPostersCheckbox" ${initialBetterPosters ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPosters', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+        <div>
+          <span style="font-weight:600;">Use Better Posters artwork</span>
+          <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Applies to the catalog rows and title pages Stremio/Nuvio request from this add-on. Your dashboard here on the website is not changed. Poster badges, if you have them on, are drawn over this artwork rather than replacing it, and the Adult Content Filter still overrides it.</p>
+        </div>
+      </label>
+      <div id="betterPostersOptions" style="display:${initialBetterPosters ? 'flex' : 'none'}; flex-direction:column; gap:10px; margin-top:12px; padding-top:12px; border-top:1px solid var(--border);">
+        <div style="font-size:0.85rem; font-weight:700; color:var(--text);">What to draw on the poster</div>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersGenreCheckbox" ${initialBetterPostersGenre ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersGenre', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Genre</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Genre label along the bottom of the poster.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersRatingCheckbox" ${initialBetterPostersRating ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersRating', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Rating</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Star rating along the bottom of the poster.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersTrendTagsCheckbox" ${initialBetterPostersTrendTags ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersTrendTags', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Trend tags</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">A corner tag on titles that are currently trending or newly released.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersQualityCheckbox" ${initialBetterPostersQuality ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersQuality', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Quality tags</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">4K, Dolby Vision and Atmos badges, where BetterPosters knows them.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersAgeCheckbox" ${initialBetterPostersAge ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersAge', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Age rating</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Certification chip (PG-13, TV-MA, and so on).</p>
+          </div>
+        </label>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">
+          <label for="betterPostersRatingSourceSelect" style="font-size:0.85rem; font-weight:600; color:var(--text);">Rating source</label>
+          <select id="betterPostersRatingSourceSelect" onchange="toggleBetterPostersSetting('betterPostersRatingSource', this.value)" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            ${betterPostersRatingSourceOptionsHtml}
+          </select>
+          <p style="margin:0; color:var(--muted); font-size:0.8rem;">Which score the rating is taken from. Only used when Rating is on above.</p>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">
+          <label for="betterPostersLangSelect" style="font-size:0.85rem; font-weight:600; color:var(--text);">Poster language</label>
+          <select id="betterPostersLangSelect" onchange="toggleBetterPostersSetting('betterPostersLang', this.value)" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            ${betterPostersLangOptionsHtml}
+          </select>
+          <p style="margin:0; color:var(--muted); font-size:0.8rem;">Language BetterPosters draws the title and labels in, where it has artwork for it.</p>
+        </div>
+      </div>
     </div>
 
     <div class="panel" style="margin-top:12px;">
@@ -58938,6 +59224,35 @@ async function loadCreatorSync(opts) {
           if (el) el.checked = synced.keys[key];
         }
       });
+      // Better Posters rides the same sync as the badge settings, so turning
+      // it on in one browser turns it on in the next. Handled separately
+      // because two of its keys are dropdown values rather than booleans,
+      // and because the master switch's default is off rather than on.
+      [
+        { key: 'betterPosters', id: 'betterPostersCheckbox' },
+        { key: 'betterPostersGenre', id: 'betterPostersGenreCheckbox' },
+        { key: 'betterPostersRating', id: 'betterPostersRatingCheckbox' },
+        { key: 'betterPostersTrendTags', id: 'betterPostersTrendTagsCheckbox' },
+        { key: 'betterPostersQuality', id: 'betterPostersQualityCheckbox' },
+        { key: 'betterPostersAge', id: 'betterPostersAgeCheckbox' },
+      ].forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'boolean') {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key] ? '1' : '0'); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.checked = synced.keys[key];
+        }
+      });
+      [
+        { key: 'betterPostersLang', id: 'betterPostersLangSelect' },
+        { key: 'betterPostersRatingSource', id: 'betterPostersRatingSourceSelect' },
+      ].forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'string' && synced.keys[key]) {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key]); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.value = synced.keys[key];
+        }
+      });
+      if (typeof applyBetterPostersOptionsVisibility === 'function') applyBetterPostersOptionsVisibility();
       if (typeof synced.keys.posterRatingSource === 'string' || typeof synced.keys.showBadgeTmdbRating !== 'undefined') {
         const isTmdb = synced.keys.posterRatingSource === 'tmdb' || (synced.keys.posterRatingSource !== 'none' && synced.keys.showBadgeTmdbRating !== false);
         try {
@@ -62628,6 +62943,20 @@ function buildConfig(entries, keys) {
   if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
   if (keys && keys.adultContentFilter) payload.adultContentFilter = true;
   if (keys && keys.dedupeAcrossLists) payload.dedupeAcrossLists = true;
+  // BetterPosters. Only written when it is actually on, and each style key
+  // only when it differs from btttr.cc's default for that option -- an
+  // install link should not grow by eight keys for a feature left off, and a
+  // default style round-trips to the same URL either way.
+  if (keys && keys.betterPosters) {
+    payload.betterPosters = true;
+    if (keys.betterPostersGenre === false) payload.betterPostersGenre = false;
+    if (keys.betterPostersRating === false) payload.betterPostersRating = false;
+    if (keys.betterPostersTrendTags === false) payload.betterPostersTrendTags = false;
+    if (keys.betterPostersQuality) payload.betterPostersQuality = true;
+    if (keys.betterPostersAge) payload.betterPostersAge = true;
+    if (keys.betterPostersLang && keys.betterPostersLang !== 'en') payload.betterPostersLang = keys.betterPostersLang;
+    if (keys.betterPostersRatingSource && keys.betterPostersRatingSource !== 'avg') payload.betterPostersRatingSource = keys.betterPostersRatingSource;
+  }
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -62846,6 +63175,14 @@ function collectKeys() {
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
+    betterPosters: getBetterPostersSetting('betterPosters', false),
+    betterPostersGenre: getBetterPostersSetting('betterPostersGenre', true),
+    betterPostersRating: getBetterPostersSetting('betterPostersRating', true),
+    betterPostersTrendTags: getBetterPostersSetting('betterPostersTrendTags', true),
+    betterPostersQuality: getBetterPostersSetting('betterPostersQuality', false),
+    betterPostersAge: getBetterPostersSetting('betterPostersAge', false),
+    betterPostersLang: getBetterPostersChoice('betterPostersLang', 'en'),
+    betterPostersRatingSource: getBetterPostersChoice('betterPostersRatingSource', 'avg'),
     showBadgesAiringNext: getBadgeSetting('showBadgesAiringNext'),
     showBadgesContinueWatching: getBadgeSetting('showBadgesContinueWatching'),
     showBadgesTraktContinueWatching: getBadgeSetting('showBadgesTraktContinueWatching'),
@@ -62978,6 +63315,75 @@ function toggleBadgeSetting(key, isChecked) {
 }
 window.toggleBadgeSetting = toggleBadgeSetting;
 
+// --- Better Posters (btttr.cc) ---------------------------------------------
+//
+// Deliberately NOT getBadgeSetting: that one treats "absent" as on, which is
+// right for badges (they predate the stored setting) and wrong here -- the
+// master switch has to stay off until someone asks for it. So each key
+// carries its own default instead.
+function getBetterPostersSetting(key, defaultOn) {
+  try {
+    const v = localStorage.getItem('myListAddon:' + key);
+    if (v === null) return !!defaultOn;
+    return v === '1';
+  } catch (e) {
+    return !!defaultOn;
+  }
+}
+window.getBetterPostersSetting = getBetterPostersSetting;
+
+function getBetterPostersChoice(key, fallback) {
+  try {
+    return localStorage.getItem('myListAddon:' + key) || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+window.getBetterPostersChoice = getBetterPostersChoice;
+
+// One handler for both the checkboxes and the two dropdowns -- a boolean is
+// stored as 1/0, a dropdown value as itself.
+function toggleBetterPostersSetting(key, value) {
+  try {
+    localStorage.setItem('myListAddon:' + key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
+  } catch (e) {}
+  if (key === 'betterPosters') applyBetterPostersOptionsVisibility();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof saveState === 'function') saveState();
+}
+window.toggleBetterPostersSetting = toggleBetterPostersSetting;
+
+// The style controls are meaningless while the master switch is off, so they
+// collapse rather than sitting there inert.
+function applyBetterPostersOptionsVisibility() {
+  const wrap = document.getElementById('betterPostersOptions');
+  if (!wrap) return;
+  wrap.style.display = getBetterPostersSetting('betterPosters', false) ? 'flex' : 'none';
+}
+window.applyBetterPostersOptionsVisibility = applyBetterPostersOptionsVisibility;
+
+const BETTER_POSTERS_TOGGLES = [
+  { key: 'betterPosters', id: 'betterPostersCheckbox', on: false },
+  { key: 'betterPostersGenre', id: 'betterPostersGenreCheckbox', on: true },
+  { key: 'betterPostersRating', id: 'betterPostersRatingCheckbox', on: true },
+  { key: 'betterPostersTrendTags', id: 'betterPostersTrendTagsCheckbox', on: true },
+  { key: 'betterPostersQuality', id: 'betterPostersQualityCheckbox', on: false },
+  { key: 'betterPostersAge', id: 'betterPostersAgeCheckbox', on: false },
+];
+
+function initBetterPostersSettingsUI() {
+  BETTER_POSTERS_TOGGLES.forEach(({ key, id, on }) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = getBetterPostersSetting(key, on);
+  });
+  const langEl = document.getElementById('betterPostersLangSelect');
+  if (langEl) langEl.value = getBetterPostersChoice('betterPostersLang', 'en');
+  const rsEl = document.getElementById('betterPostersRatingSourceSelect');
+  if (rsEl) rsEl.value = getBetterPostersChoice('betterPostersRatingSource', 'avg');
+  applyBetterPostersOptionsVisibility();
+}
+window.initBetterPostersSettingsUI = initBetterPostersSettingsUI;
+
 function initBadgeSettingsUI() {
   const badgeKeys = [
     { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
@@ -63025,6 +63431,7 @@ function initBadgeSettingsUI() {
 window.initBadgeSettingsUI = initBadgeSettingsUI;
 document.addEventListener('DOMContentLoaded', () => {
   initBadgeSettingsUI();
+  initBetterPostersSettingsUI();
 });
 
 // --- Live Preview -----------------------------------------------------------
@@ -70275,15 +70682,24 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const isSearchCatalog = id === "search_movies" || id === "search_series" || id === "search" || id === "search_movie" || (id === "top" && searchQuery);
       if (isSearchCatalog) {
         if (!searchQuery) return jsonPublic({ metas: [] });
-        const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
-        const effectiveTmdbKey = tmdbKey || TMDB_API_KEY;
-        const metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        const searchConfig = config ? await resolveConfig(config, env) : {};
+        const effectiveTmdbKey = searchConfig.tmdbKey || TMDB_API_KEY;
+        let metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        // This route builds its metas directly rather than through
+        // fetchCatalog, so it needs its own call -- otherwise search results
+        // would be the one row in Stremio still showing the old artwork.
+        if (searchConfig.betterPosters) {
+          metas = applyBetterPostersToMetas(metas, betterPostersOptionsFrom(searchConfig));
+        }
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400" });
       }
 
       if (!config) return jsonPublic({ metas: [] });
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
+      // Kept as a whole object as well as destructured: the betterPosters*
+      // style keys are passed through wholesale rather than one at a time.
+      const resolvedConfig = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, betterPosters, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = resolvedConfig;
       const entryIndex = entries.findIndex((e) => e.id === id && e.type === type);
       const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
@@ -70306,7 +70722,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // to a config that PROVED it belongs to that account. See resolveConfig
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
-        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
         if (dedupeAcrossLists) {
           metas = await dedupeAcrossListEntries(entries, entryIndex, skip, metas, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, env, ctx });
         }
@@ -70660,10 +71076,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // 2. Standard title metadata for IMDb ids ("tt...") or TMDB ids ("tmdb:...")
       if (id.startsWith("tt") || id.startsWith("tmdb:")) {
         try {
-          const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
-          const effectiveKey = tmdbKey || TMDB_API_KEY;
-          const meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
+          const metaConfig = config ? await resolveConfig(config, env) : {};
+          const effectiveKey = metaConfig.tmdbKey || TMDB_API_KEY;
+          let meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
           if (!meta) return jsonPublic({ meta: null });
+          // Same opt-in artwork the catalog rows get, so a title's detail
+          // page does not fall back to the plain poster the moment it is
+          // opened. Only the poster is touched -- background, logo, cast and
+          // the episode list all stay exactly as fetchStandardItemMeta built
+          // them, and a non-IMDB id (tmdb:...) is left alone.
+          if (metaConfig.betterPosters) {
+            meta = applyBetterPosterToMeta(meta, betterPostersOptionsFrom(metaConfig));
+          }
           return jsonPublic(
             { meta },
             200,

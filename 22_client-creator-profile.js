@@ -3064,6 +3064,35 @@ async function loadCreatorSync(opts) {
           if (el) el.checked = synced.keys[key];
         }
       });
+      // Better Posters rides the same sync as the badge settings, so turning
+      // it on in one browser turns it on in the next. Handled separately
+      // because two of its keys are dropdown values rather than booleans,
+      // and because the master switch's default is off rather than on.
+      [
+        { key: 'betterPosters', id: 'betterPostersCheckbox' },
+        { key: 'betterPostersGenre', id: 'betterPostersGenreCheckbox' },
+        { key: 'betterPostersRating', id: 'betterPostersRatingCheckbox' },
+        { key: 'betterPostersTrendTags', id: 'betterPostersTrendTagsCheckbox' },
+        { key: 'betterPostersQuality', id: 'betterPostersQualityCheckbox' },
+        { key: 'betterPostersAge', id: 'betterPostersAgeCheckbox' },
+      ].forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'boolean') {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key] ? '1' : '0'); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.checked = synced.keys[key];
+        }
+      });
+      [
+        { key: 'betterPostersLang', id: 'betterPostersLangSelect' },
+        { key: 'betterPostersRatingSource', id: 'betterPostersRatingSourceSelect' },
+      ].forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'string' && synced.keys[key]) {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key]); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.value = synced.keys[key];
+        }
+      });
+      if (typeof applyBetterPostersOptionsVisibility === 'function') applyBetterPostersOptionsVisibility();
       if (typeof synced.keys.posterRatingSource === 'string' || typeof synced.keys.showBadgeTmdbRating !== 'undefined') {
         const isTmdb = synced.keys.posterRatingSource === 'tmdb' || (synced.keys.posterRatingSource !== 'none' && synced.keys.showBadgeTmdbRating !== false);
         try {

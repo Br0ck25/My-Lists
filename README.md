@@ -85,6 +85,12 @@ it. [**What the free plan can and cannot run**](#which-cloudflare-plan-do-i-need
   devices; without it everything else still syncs and a removal holds only in the browser that made it.
 - **Scheduled Cron Worker**: Automatically queries TMDB every 6 minutes via Cloudflare Cron Triggers (`*/6 * * * *`, cursor-paginated so it does not re-sweep every account on every tick) to find newly-aired episodes for caught-up shows and push them to Continue Watching, to record what has arrived on each streaming service for [New on Streaming](#new-on-streaming), and to keep the shared provider charts pre-warmed in KV.
 
+### Better Posters Artwork (Optional)
+- Swap the artwork your catalogs serve to Stremio/Nuvio for [BetterPosters](https://btttr.cc/) — posters with the genre, rating and tags rendered into the image itself. **Off by default**; turn it on under **Settings → Account & Sync → Better Posters**.
+- No API key and no account: BetterPosters keys off the IMDb id alone, so the whole feature is a URL swap on artwork the add-on already resolved.
+- Style controls mirror btttr.cc's own configurator — genre, rating (IMDb / TMDB / Rotten Tomatoes / Metacritic / Trakt / Letterboxd / Roger Ebert), trend tags, quality tags (4K/DV/Atmos), age rating, and poster language.
+- Applies to catalog rows, the search catalog, and title pages (`/meta/`). Titles without an IMDb id, TV Channels, and landscape tiles keep their existing artwork. Poster badges are drawn *over* BetterPosters art rather than replacing it, and the Adult Content Filter still overrides it.
+
 ### Creator Profiles & Cloud Sync
 - Free, passwordless account system secured by salted PBKDF2-SHA256 Creator Keys (`MYL-XXXX-XXXX-XXXX`).
 - Synchronize your catalogs, custom lists, channels, presets, likes, and watch history across all your browsers and devices.

@@ -6,6 +6,18 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ⭐ Better Posters (btttr.cc)
+
+- **Settings -> Account & Sync -> Better Posters** swaps the artwork your catalogs serve to Stremio and Nuvio for [BetterPosters](https://btttr.cc/) -- posters with the genre, rating and tags drawn into the image itself rather than laid over it. **Off by default**, needs no API key or account, and takes effect on an existing install link after Save/Update.
+- Applies to catalog rows, the search catalog, and the title pages Stremio/Nuvio request (`/meta/`). Only titles with an IMDb id are touched; a TMDB-only item, a TV Channel, and any landscape tile keep the poster they already had (BetterPosters only renders 2:3 artwork).
+- Style controls mirror btttr.cc's own configurator: **Genre**, **Rating** (with a source picker -- IMDb, TMDB, Rotten Tomatoes, Metacritic, Trakt, Letterboxd, Roger Ebert), **Trend tags**, **Quality tags** (4K/DV/Atmos), **Age rating**, and a **poster language**. Each defaults to btttr.cc's own default, so leaving them alone produces exactly the URL its configurator hands out.
+- **Poster badges still work on top of it.** The BetterPosters swap runs *before* the badge pass, so a premiere/finale/air-date chip is drawn over the BetterPosters artwork instead of replacing it. The Adult Content Filter still overrides both.
+- The settings ride the same Creator Profile sync as the badge settings, so enabling it in one browser enables it in the next.
+- Only the add-on's own responses are rewritten -- your dashboard here on the website is unchanged.
+
+**A note on the reference project.** [`StrayBer/nuvio-better-posters-addon`](https://github.com/StrayBer/nuvio-better-posters-addon) solves a different problem: it is a *wrapper* add-on that proxies somebody else's manifest and rewrites the posters in the responses flowing through it. This add-on builds its own catalogs, so none of that proxy machinery (upstream fetching, manifest merging, config tokens for wrapped URLs) is needed here -- the useful part was the poster-URL contract, about forty lines. Two things were corrected in the process: that project pins the single path `/poster/imdb/poster-default/{id}.jpg`, which is the **default style only** -- the style actually lives in the *first* path segment, and the `poster-default` segment it varies is ignored by the service (every value returns byte-identical artwork). It also scrapes `meta.poster` for an IMDb id, which here would match this add-on's own badge URLs (`/api/poster-badge?...&id=tt...`) and round-trip an already-badged poster back through BetterPosters; only the id fields are read.
+
+
 ### ⭐ Customize button on Discover and Search lists
 
 - Every list card on Discover (all sub-tabs -- All, Movies, Shows, Popular Lists, Curated, Hidden Gems, Kids, Holidays, Genres) and in the Search tab's list search now has a **Customize** button alongside its **+ Add**, the same idea as the Storylines & Universes grid's own Customize button. Since these lists are plain movie/show catalogs rather than a saga's episode-level programming, it loads the list's items into the **Custom List Builder**'s editable draft instead of the Channel Builder -- add, remove, or reorder titles, then Save -- rather than immediately copying the list as-is the way **+ Add** or the existing "Copy to Custom List" buttons do (`loadListToCustomListDraft`, `21_client-custom-list-builder.js`).

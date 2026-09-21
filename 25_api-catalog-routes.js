@@ -867,15 +867,24 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const isSearchCatalog = id === "search_movies" || id === "search_series" || id === "search" || id === "search_movie" || (id === "top" && searchQuery);
       if (isSearchCatalog) {
         if (!searchQuery) return jsonPublic({ metas: [] });
-        const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
-        const effectiveTmdbKey = tmdbKey || TMDB_API_KEY;
-        const metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        const searchConfig = config ? await resolveConfig(config, env) : {};
+        const effectiveTmdbKey = searchConfig.tmdbKey || TMDB_API_KEY;
+        let metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        // This route builds its metas directly rather than through
+        // fetchCatalog, so it needs its own call -- otherwise search results
+        // would be the one row in Stremio still showing the old artwork.
+        if (searchConfig.betterPosters) {
+          metas = applyBetterPostersToMetas(metas, betterPostersOptionsFrom(searchConfig));
+        }
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400" });
       }
 
       if (!config) return jsonPublic({ metas: [] });
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
+      // Kept as a whole object as well as destructured: the betterPosters*
+      // style keys are passed through wholesale rather than one at a time.
+      const resolvedConfig = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, betterPosters, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = resolvedConfig;
       const entryIndex = entries.findIndex((e) => e.id === id && e.type === type);
       const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
@@ -898,7 +907,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // to a config that PROVED it belongs to that account. See resolveConfig
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
-        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
         if (dedupeAcrossLists) {
           metas = await dedupeAcrossListEntries(entries, entryIndex, skip, metas, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, env, ctx });
         }
@@ -1252,10 +1261,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // 2. Standard title metadata for IMDb ids ("tt...") or TMDB ids ("tmdb:...")
       if (id.startsWith("tt") || id.startsWith("tmdb:")) {
         try {
-          const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
-          const effectiveKey = tmdbKey || TMDB_API_KEY;
-          const meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
+          const metaConfig = config ? await resolveConfig(config, env) : {};
+          const effectiveKey = metaConfig.tmdbKey || TMDB_API_KEY;
+          let meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
           if (!meta) return jsonPublic({ meta: null });
+          // Same opt-in artwork the catalog rows get, so a title's detail
+          // page does not fall back to the plain poster the moment it is
+          // opened. Only the poster is touched -- background, logo, cast and
+          // the episode list all stay exactly as fetchStandardItemMeta built
+          // them, and a non-IMDB id (tmdb:...) is left alone.
+          if (metaConfig.betterPosters) {
+            meta = applyBetterPosterToMeta(meta, betterPostersOptionsFrom(metaConfig));
+          }
           return jsonPublic(
             { meta },
             200,

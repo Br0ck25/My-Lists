@@ -315,6 +315,20 @@ function buildConfig(entries, keys) {
   if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
   if (keys && keys.adultContentFilter) payload.adultContentFilter = true;
   if (keys && keys.dedupeAcrossLists) payload.dedupeAcrossLists = true;
+  // BetterPosters. Only written when it is actually on, and each style key
+  // only when it differs from btttr.cc's default for that option -- an
+  // install link should not grow by eight keys for a feature left off, and a
+  // default style round-trips to the same URL either way.
+  if (keys && keys.betterPosters) {
+    payload.betterPosters = true;
+    if (keys.betterPostersGenre === false) payload.betterPostersGenre = false;
+    if (keys.betterPostersRating === false) payload.betterPostersRating = false;
+    if (keys.betterPostersTrendTags === false) payload.betterPostersTrendTags = false;
+    if (keys.betterPostersQuality) payload.betterPostersQuality = true;
+    if (keys.betterPostersAge) payload.betterPostersAge = true;
+    if (keys.betterPostersLang && keys.betterPostersLang !== 'en') payload.betterPostersLang = keys.betterPostersLang;
+    if (keys.betterPostersRatingSource && keys.betterPostersRatingSource !== 'avg') payload.betterPostersRatingSource = keys.betterPostersRatingSource;
+  }
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -533,6 +547,14 @@ function collectKeys() {
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
+    betterPosters: getBetterPostersSetting('betterPosters', false),
+    betterPostersGenre: getBetterPostersSetting('betterPostersGenre', true),
+    betterPostersRating: getBetterPostersSetting('betterPostersRating', true),
+    betterPostersTrendTags: getBetterPostersSetting('betterPostersTrendTags', true),
+    betterPostersQuality: getBetterPostersSetting('betterPostersQuality', false),
+    betterPostersAge: getBetterPostersSetting('betterPostersAge', false),
+    betterPostersLang: getBetterPostersChoice('betterPostersLang', 'en'),
+    betterPostersRatingSource: getBetterPostersChoice('betterPostersRatingSource', 'avg'),
     showBadgesAiringNext: getBadgeSetting('showBadgesAiringNext'),
     showBadgesContinueWatching: getBadgeSetting('showBadgesContinueWatching'),
     showBadgesTraktContinueWatching: getBadgeSetting('showBadgesTraktContinueWatching'),
@@ -665,6 +687,75 @@ function toggleBadgeSetting(key, isChecked) {
 }
 window.toggleBadgeSetting = toggleBadgeSetting;
 
+// --- Better Posters (btttr.cc) ---------------------------------------------
+//
+// Deliberately NOT getBadgeSetting: that one treats "absent" as on, which is
+// right for badges (they predate the stored setting) and wrong here -- the
+// master switch has to stay off until someone asks for it. So each key
+// carries its own default instead.
+function getBetterPostersSetting(key, defaultOn) {
+  try {
+    const v = localStorage.getItem('myListAddon:' + key);
+    if (v === null) return !!defaultOn;
+    return v === '1';
+  } catch (e) {
+    return !!defaultOn;
+  }
+}
+window.getBetterPostersSetting = getBetterPostersSetting;
+
+function getBetterPostersChoice(key, fallback) {
+  try {
+    return localStorage.getItem('myListAddon:' + key) || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+window.getBetterPostersChoice = getBetterPostersChoice;
+
+// One handler for both the checkboxes and the two dropdowns -- a boolean is
+// stored as 1/0, a dropdown value as itself.
+function toggleBetterPostersSetting(key, value) {
+  try {
+    localStorage.setItem('myListAddon:' + key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
+  } catch (e) {}
+  if (key === 'betterPosters') applyBetterPostersOptionsVisibility();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof saveState === 'function') saveState();
+}
+window.toggleBetterPostersSetting = toggleBetterPostersSetting;
+
+// The style controls are meaningless while the master switch is off, so they
+// collapse rather than sitting there inert.
+function applyBetterPostersOptionsVisibility() {
+  const wrap = document.getElementById('betterPostersOptions');
+  if (!wrap) return;
+  wrap.style.display = getBetterPostersSetting('betterPosters', false) ? 'flex' : 'none';
+}
+window.applyBetterPostersOptionsVisibility = applyBetterPostersOptionsVisibility;
+
+const BETTER_POSTERS_TOGGLES = [
+  { key: 'betterPosters', id: 'betterPostersCheckbox', on: false },
+  { key: 'betterPostersGenre', id: 'betterPostersGenreCheckbox', on: true },
+  { key: 'betterPostersRating', id: 'betterPostersRatingCheckbox', on: true },
+  { key: 'betterPostersTrendTags', id: 'betterPostersTrendTagsCheckbox', on: true },
+  { key: 'betterPostersQuality', id: 'betterPostersQualityCheckbox', on: false },
+  { key: 'betterPostersAge', id: 'betterPostersAgeCheckbox', on: false },
+];
+
+function initBetterPostersSettingsUI() {
+  BETTER_POSTERS_TOGGLES.forEach(({ key, id, on }) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = getBetterPostersSetting(key, on);
+  });
+  const langEl = document.getElementById('betterPostersLangSelect');
+  if (langEl) langEl.value = getBetterPostersChoice('betterPostersLang', 'en');
+  const rsEl = document.getElementById('betterPostersRatingSourceSelect');
+  if (rsEl) rsEl.value = getBetterPostersChoice('betterPostersRatingSource', 'avg');
+  applyBetterPostersOptionsVisibility();
+}
+window.initBetterPostersSettingsUI = initBetterPostersSettingsUI;
+
 function initBadgeSettingsUI() {
   const badgeKeys = [
     { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
@@ -712,6 +803,7 @@ function initBadgeSettingsUI() {
 window.initBadgeSettingsUI = initBadgeSettingsUI;
 document.addEventListener('DOMContentLoaded', () => {
   initBadgeSettingsUI();
+  initBetterPostersSettingsUI();
 });
 
 // --- Live Preview -----------------------------------------------------------
