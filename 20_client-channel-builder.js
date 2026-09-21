@@ -682,6 +682,7 @@ function ensureAllChannelsSyncedFromRows(map) {
                   order: Number(payload.order) || 0,
                   createdAt: Date.now(),
                   updatedAt: Date.now(),
+                  presetNetworkId: payload.presetNetworkId || '',
                 };
                 modified = true;
               } else if ((!map[chId].name || map[chId].name === 'Channel') && chName !== 'Channel') {
@@ -721,6 +722,11 @@ function saveLocalChannel(payload) {
     order: Number(payload.order) || (existing ? Number(existing.order) : 0) || 0,
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now,
+    // Not read by anything that renders or plays this channel -- kept so
+    // pushChannelsSync (22_client-creator-profile.js) can tell this
+    // channel's full pool already lives durably in the shared
+    // channel:preset:v2:<networkId> cache and skip re-uploading it whole.
+    presetNetworkId: payload.presetNetworkId || (existing ? existing.presetNetworkId : '') || '',
   };
   saveLocalChannelsMap(map);
   return map[channelId];
@@ -10194,6 +10200,50 @@ function renderMyCreatedChannelsList() {
     '</div>';
   }).join('');
   initMyChannelsDrag();
+  resolveThinPresetChannels(shown);
+}
+
+// A Quick Add network channel's local copy can end up carrying only its
+// small CHANNEL_POINTER_SAMPLE_ITEMS sample instead of its real pool --
+// most often after this browser's own cloud sync pulls one down (see
+// channelsForCloudSync, 22_client-creator-profile.js: the sample is all
+// that ever goes up, since the full pool already lives durably in the
+// shared channel:preset:v2:<networkId> cache and doesn't need a second
+// copy per account). That keeps the cloud sync payload small, but it also
+// means a card can show 50 episodes for a channel that is actually a few
+// thousand. Since the real pool is one warm-cache request away, quietly
+// re-resolves it in the background and re-renders once it lands -- the
+// same self-healing pattern resolveMissingPostersInDom already uses for
+// posters missed at render time.
+let _thinPresetChannelsInFlight = null;
+function resolveThinPresetChannels(channels) {
+  if (!_thinPresetChannelsInFlight) _thinPresetChannelsInFlight = new Set();
+  (channels || []).forEach((ch) => {
+    if (!ch || !ch.presetNetworkId || !ch.channelId) return;
+    if ((ch.items || []).length > CHANNEL_POINTER_SAMPLE_ITEMS) return;
+    if (_thinPresetChannelsInFlight.has(ch.channelId)) return;
+    _thinPresetChannelsInFlight.add(ch.channelId);
+    fetch(ORIGIN + '/api/channel-preset?networkId=' + encodeURIComponent(ch.presetNetworkId) + '&name=' + encodeURIComponent(ch.name || ''), { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((data) => {
+        _thinPresetChannelsInFlight.delete(ch.channelId);
+        if (!data || !data.ok || !data.channel || !Array.isArray(data.channel.items)) return;
+        if (data.channel.items.length <= (ch.items || []).length) return;
+        // Starts from ch (this channel's existing record), not data.channel --
+        // any customization the user made (hidden-watched, story locks,
+        // publish/share state, rotation settings, ...) belongs to ch and has
+        // no counterpart in the server's generic network preset, which would
+        // otherwise reset every one of them back to default the moment this
+        // resolves.
+        saveLocalChannel(Object.assign({}, ch, {
+          items: data.channel.items,
+          poster: data.channel.poster || ch.poster,
+          backdrop: data.channel.backdrop || ch.backdrop,
+        }));
+        renderMyCreatedChannelsList();
+      })
+      .catch(() => { _thinPresetChannelsInFlight.delete(ch.channelId); });
+  });
 }
 
 function cancelEditChannel() {
@@ -10425,7 +10475,15 @@ async function quickAddChannel(name, listUrl, networkId, btn, options) {
           // link that adds it -- see parseChannelPayload and
           // channelSourceItems (05_catalog-core.js) for how that pointer
           // resolves back to the full pool at serve time.
-          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '' });
+          // presetNetworkId rides along on the full local copy too, not
+          // just the pointer -- it's how pushChannelsSync (
+          // 22_client-creator-profile.js) recognizes this channel's full
+          // pool already lives durably in the shared channel:preset:v2:
+          // cache and doesn't need its own copy re-uploaded to this
+          // account's cloud channels blob (which has its own, much smaller
+          // 24MB cap -- easy to blow past once a few of these 5,000-item
+          // pools are all kept in full).
+          const payload = Object.assign({}, data.channel, { channelId: channelId, name: name, liveSync: false, sourceUrl: '', presetNetworkId: networkId });
           saveLocalChannel(payload);
           const pointerPayload = {
             channelId: channelId,

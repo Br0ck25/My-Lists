@@ -4934,6 +4934,12 @@ describe("client: a Quick Add channel row stays usable without its local copy", 
     const local = client.call("loadLocalChannels");
     const localChannel = Object.values(local).find((c) => c.name === "TNT");
     assert.equal(localChannel.items.length, 4000);
+    // presetNetworkId rides along on the local copy too, not just the row's
+    // pointer -- channelsForCloudSync (22_client-creator-profile.js) needs it
+    // there to recognize this channel's pool already lives in the shared
+    // server cache and skip re-uploading it whole to this account's cloud
+    // channels blob.
+    assert.equal(localChannel.presetNetworkId, "41");
   });
 
   it("a channel row reconstructed from scratch (this browser never had a local copy) still shows real episodes, not zero", () => {
@@ -4953,6 +4959,144 @@ describe("client: a Quick Add channel row stays usable without its local copy", 
     assert.equal(synced["ch-tnt"].items.length, 50,
       "must reconstruct a real sample from the row, not an empty channel");
     assert.equal(synced["ch-tnt"].name, "TNT");
+  });
+});
+
+// Quick Add channels' full pools (up to 5,000 items) are kept in full in
+// this browser's own copy for the My Channels editor -- but that same full
+// copy used to also ride whole into this account's cloud channels sync
+// blob (pushChannelsSync), which has its own, much smaller cap (24MB,
+// /api/creator/sync/save-channels). A handful of these pools crosses it
+// easily, and the save then fails silently: this account's channels stop
+// syncing across devices, and worse, the very next pull down
+// (loadCreatorSync, on a background poll, a tab switch, a reload) used to
+// unconditionally overwrite this device's richer local state with whatever
+// stale, smaller copy the server was still holding -- reported live as "a
+// deleted channel comes right back" and "some channels only show 50
+// items". This suite covers the three pieces of the fix: the cloud push no
+// longer carries a preset-backed channel's full pool, a stale pull can no
+// longer clobber local state newer than what the server actually has, and
+// a channel left thin by either of those quietly resolves itself back to
+// the real pool without losing whatever the user customized on it.
+describe("client: Quick Add channel cloud sync stays small, and never shrinks what's on screen", () => {
+  function presetItems(n, tag) {
+    return Array.from({ length: n }, (_, i) => ({
+      kind: "episode", imdbId: "tt" + tag + i, season: 1, episode: i + 1,
+      showName: tag + " Show", epName: "Ep " + i, title: "t", released: "2024-01-01",
+    }));
+  }
+
+  it("channelsForCloudSync slims a preset-backed channel's pool for the cloud, and leaves a hand-built channel untouched", () => {
+    const client = loadClient({});
+    const sampleSize = client.get("CHANNEL_POINTER_SAMPLE_ITEMS");
+    const map = {
+      "ch-preset": { channelId: "ch-preset", name: "TNT", presetNetworkId: "41", items: presetItems(4000, "TNT") },
+      "ch-handbuilt": { channelId: "ch-handbuilt", name: "My Mix", presetNetworkId: "", items: presetItems(800, "MIX") },
+    };
+    const slimmed = client.call("channelsForCloudSync", map);
+    assert.equal(slimmed["ch-preset"].items.length, sampleSize,
+      "a preset-backed channel's full pool already lives in the shared server cache -- the cloud blob only needs a sample");
+    assert.equal(slimmed["ch-handbuilt"].items.length, 800,
+      "a hand-built channel has no other durable copy anywhere -- it must stay full");
+    // The local map itself must not be mutated by building the cloud payload.
+    assert.equal(map["ch-preset"].items.length, 4000);
+  });
+
+  it("loadCreatorSync does not let a same-or-older channels stamp overwrite this device's local channels", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+      routes: {
+        "/api/creator/sync/load": () => ({
+          json: {
+            ok: true,
+            data: {
+              config: [],
+              updatedAt: 100,
+              channelsUpdatedAt: 500,
+              channels: { "ch-server": { channelId: "ch-server", name: "Stale Copy", items: presetItems(50, "STALE") } },
+            },
+          },
+        }),
+        "/api/creator/sync/save": () => ({ json: { ok: true, updatedAt: 200 } }),
+        "/api/creator/sync/save-tracking": () => ({ json: { ok: true } }),
+        "/api/creator/lists": () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "testuser", displayName: "Test User" });
+    // This device already knows this exact stamp -- its own last channels
+    // push (e.g. deleting a channel, or adding one) never landed, most
+    // likely because the full local pool it tried to send crossed the
+    // cloud blob's 24MB cap.
+    client.set("_serverChannelsUpdatedAt", 500);
+
+    client.call("saveLocalChannelsMap", { "ch-local": { channelId: "ch-local", name: "Fresh Local", items: presetItems(4000, "FRESH") } });
+
+    await client.call("loadCreatorSync");
+
+    const after = client.call("loadLocalChannels");
+    assert.ok(after["ch-local"], "a local-only channel must survive a load that brought nothing actually newer");
+    assert.equal(after["ch-local"].items.length, 4000);
+    assert.ok(!after["ch-server"], "the stale server copy must not have been adopted");
+  });
+
+  it("loadCreatorSync DOES adopt synced.channels once the server's stamp is genuinely newer", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:creatorKey": "KEY-1" },
+      routes: {
+        "/api/creator/sync/load": () => ({
+          json: {
+            ok: true,
+            data: {
+              config: [],
+              updatedAt: 100,
+              channelsUpdatedAt: 700,
+              channels: { "ch-server": { channelId: "ch-server", name: "Newer From Server", items: presetItems(50, "NEW") } },
+            },
+          },
+        }),
+        "/api/creator/sync/save": () => ({ json: { ok: true, updatedAt: 200 } }),
+        "/api/creator/sync/save-tracking": () => ({ json: { ok: true } }),
+        "/api/creator/lists": () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set("activeCreator", { creatorName: "testuser", displayName: "Test User" });
+    client.set("_serverChannelsUpdatedAt", 500);
+    client.call("saveLocalChannelsMap", { "ch-local": { channelId: "ch-local", name: "Old Local", items: presetItems(4000, "OLD") } });
+
+    await client.call("loadCreatorSync");
+
+    const after = client.call("loadLocalChannels");
+    assert.ok(after["ch-server"], "a genuinely newer server state must still be adopted -- this isn't a one-way lock");
+    assert.equal(after["ch-server"].name, "Newer From Server");
+  });
+
+  it("a thin preset-backed channel (a cloud-synced sample, not the real pool) quietly resolves back to full without losing its customization", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/channel-preset": () => ({
+          json: { ok: true, channel: { name: "TNT", poster: "p2", backdrop: "b2", items: presetItems(4000, "TNT"), shuffle: false, dailyRotate: true } },
+        }),
+      },
+    });
+    const sampleSize = client.get("CHANNEL_POINTER_SAMPLE_ITEMS");
+    const thin = {
+      channelId: "ch-tnt", name: "TNT", poster: "p", backdrop: "b",
+      presetNetworkId: "41", items: presetItems(sampleSize, "TNT"),
+      dailyRotate: true, hideWatched: true, rotateShows: 24, rotateEpisodes: 3,
+    };
+    client.call("saveLocalChannelsMap", { "ch-tnt": thin });
+
+    client.call("renderMyCreatedChannelsList");
+    // resolveThinPresetChannels fires its fetch in the background rather
+    // than blocking the render -- give its .then() chain a couple of real
+    // ticks to land before checking the result.
+    await new Promise((r) => setTimeout(r, 20));
+
+    const after = client.call("loadLocalChannels");
+    assert.equal(after["ch-tnt"].items.length, 4000,
+      "resolves the real pool instead of staying stuck at the sample size forever");
+    assert.equal(after["ch-tnt"].hideWatched, true,
+      "a customization the generic network preset knows nothing about must survive the upgrade");
   });
 });
 

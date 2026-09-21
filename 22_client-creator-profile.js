@@ -2098,6 +2098,32 @@ function scheduleChannelsSync() {
   channelsSyncTimer = setTimeout(pushChannelsSync, 1200);
 }
 
+// A Quick Add network channel's full pool (up to CHANNEL_POOL_MAX_ITEMS,
+// kept in full in this browser's own copy for the My Channels editor) is
+// already durably cached server-side under channel:preset:v2:<networkId>,
+// shared across every account -- it doesn't also need a per-account copy
+// riding in this account's cloud channels blob. That blob has its own,
+// much smaller cap (24MB, /api/creator/sync/save-channels), which a
+// handful of 5,000-item pools crosses easily; the save then fails
+// silently and this account's channels stop syncing across devices at
+// all. Slims any presetNetworkId-carrying channel down to the same small
+// sample its catalog row pointer already carries (see quickAddChannel,
+// 20_client-channel-builder.js) before it goes up -- a hand-built channel
+// with no preset backing it (no other durable copy anywhere) is left
+// exactly as it is.
+function channelsForCloudSync(map) {
+  const out = {};
+  for (const [id, ch] of Object.entries(map || {})) {
+    if (!ch) continue;
+    if (ch.presetNetworkId && Array.isArray(ch.items) && ch.items.length > CHANNEL_POINTER_SAMPLE_ITEMS) {
+      out[id] = Object.assign({}, ch, { items: ch.items.slice(0, CHANNEL_POINTER_SAMPLE_ITEMS) });
+    } else {
+      out[id] = ch;
+    }
+  }
+  return out;
+}
+
 async function pushChannelsSync() {
   // A reset has just cleared this browser on purpose; an autosave or
   // scrobble landing now would push the old state straight back up to
@@ -2110,7 +2136,7 @@ async function pushChannelsSync() {
   // creatorSyncGateOpen.
   if (!creatorSyncGateOpen()) { deferSyncPush('channels'); return; }
   try {
-    const localChannels = (typeof loadLocalChannels === 'function') ? loadLocalChannels() : {};
+    const localChannels = channelsForCloudSync((typeof loadLocalChannels === 'function') ? loadLocalChannels() : {});
     const localMerged = (typeof loadLocalMergedChannels === 'function') ? loadLocalMergedChannels() : {};
     const res = await fetch(ORIGIN + '/api/creator/sync/save-channels', {
       method: 'POST',
@@ -2636,7 +2662,16 @@ async function loadCreatorSync(opts) {
     // the same load that adopts their data -- see pushPresetsDirectly and
     // pushChannelsSync.
     if (synced.presetsUpdatedAt !== undefined) window._serverPresetsUpdatedAt = Number(synced.presetsUpdatedAt) || 0;
+    // Captured ahead of the reassignment below, same reasoning as
+    // priorServerTrackingUpdatedAt just below: tells the channels merge
+    // further down whether this load actually brought anything newer than
+    // what this device already knew, or is just replaying a stamp it has
+    // already seen (or an older one, if a channels push that would have
+    // advanced it never landed -- see pushChannelsSync's 24MB size guard).
+    const priorServerChannelsUpdatedAt = window._serverChannelsUpdatedAt;
     if (synced.channelsUpdatedAt !== undefined) window._serverChannelsUpdatedAt = Number(synced.channelsUpdatedAt) || 0;
+    const channelsChanged = typeof priorServerChannelsUpdatedAt === 'undefined' ||
+      (Number(synced.channelsUpdatedAt) || 0) > priorServerChannelsUpdatedAt;
     
     const currentConfigStr = JSON.stringify(synced.config || []);
     const configDataChanged = currentConfigStr !== window._lastConfigStr;
@@ -2690,12 +2725,22 @@ async function loadCreatorSync(opts) {
       if (typeof applyHiddenMyListsSections === 'function') applyHiddenMyListsSections();
     }
 
-    if (synced.channels && typeof synced.channels === 'object') {
+    // channelsChanged, not a bare presence check: a channels push that
+    // failed to land (over the 24MB cap -- see pushChannelsSync) leaves the
+    // server's stamp exactly where this device already had it, and without
+    // this guard the very next load (a background poll, a tab switch, a
+    // reload) would overwrite this device's richer local state -- a
+    // just-added channel's real pool, or a delete that hasn't synced yet --
+    // with the stale copy the server is still holding. A channel this
+    // device never touched keeps rolling forward normally; only a race
+    // against this device's own unlanded edit is what this blocks.
+    if (channelsChanged && synced.channels && typeof synced.channels === 'object') {
       if (typeof saveLocalChannelsMap === 'function') {
         saveLocalChannelsMap(synced.channels);
       }
     }
-    if (synced.mergedChannels && typeof synced.mergedChannels === 'object') {
+    // Same blob, same stamp, same guard as synced.channels just above.
+    if (channelsChanged && synced.mergedChannels && typeof synced.mergedChannels === 'object') {
       if (typeof saveLocalMergedChannelsMap === 'function') {
         saveLocalMergedChannelsMap(synced.mergedChannels);
       }
