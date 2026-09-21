@@ -39386,9 +39386,27 @@ function ensureAllChannelsSyncedFromRows(map) {
                   presetNetworkId: payload.presetNetworkId || '',
                 };
                 modified = true;
-              } else if ((!map[chId].name || map[chId].name === 'Channel') && chName !== 'Channel') {
-                map[chId].name = chName;
-                modified = true;
+              } else {
+                if ((!map[chId].name || map[chId].name === 'Channel') && chName !== 'Channel') {
+                  map[chId].name = chName;
+                  modified = true;
+                }
+                // A local record built by an OLDER version of the branch
+                // above (before presetNetworkId existed here) is otherwise
+                // stuck this way forever: this function only ever fills in
+                // a MISSING record, never revisits one that already exists,
+                // so that old, incomplete record keeps winning every time.
+                // Without presetNetworkId, resolveThinPresetChannels has no
+                // network to re-fetch from and silently skips it on every
+                // render -- a channel stuck at its old pointer sample with
+                // no way back to its real pool. Backfilling it here, from
+                // the same row payload that already has it, is what lets
+                // the next render's resolveThinPresetChannels actually see
+                // and repair it.
+                if (!map[chId].presetNetworkId && payload.presetNetworkId) {
+                  map[chId].presetNetworkId = payload.presetNetworkId;
+                  modified = true;
+                }
               }
             }
           } catch (e) {}

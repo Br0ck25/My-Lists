@@ -4960,6 +4960,34 @@ describe("client: a Quick Add channel row stays usable without its local copy", 
       "must reconstruct a real sample from the row, not an empty channel");
     assert.equal(synced["ch-tnt"].name, "TNT");
   });
+
+  it("backfills presetNetworkId onto a local record an older reconstruction already created without it -- otherwise it can never self-heal", () => {
+    const client = loadClient({});
+    // A record shaped exactly like what ensureAllChannelsSyncedFromRows used
+    // to save before presetNetworkId existed on its reconstruction branch --
+    // stuck at the pointer's sample size, with no network id to resolve
+    // against. This function only ever fills in a MISSING record; an
+    // existing one (like this) previously kept winning forever, which left
+    // resolveThinPresetChannels with nothing to find and repair it with.
+    const poisoned = {
+      channelId: "ch-old", name: "TNT", poster: "p", backdrop: "b",
+      items: presetItems(50, "TNT"), shuffle: false, dailyRotate: true,
+      order: 0, createdAt: 1, updatedAt: 1,
+      // no presetNetworkId
+    };
+    client.call("saveLocalChannelsMap", { "ch-old": poisoned });
+
+    const pointerPayload = {
+      channelId: "ch-old", name: "TNT", poster: "p", backdrop: "b",
+      items: presetItems(50, "TNT"), presetNetworkId: "41",
+      shuffle: false, dailyRotate: true, liveSync: false, sourceUrl: "",
+    };
+    withRows(client, [{ name: "TNT", url: "channel:v1:" + JSON.stringify(pointerPayload), type: "series" }]);
+
+    const synced = client.call("ensureAllChannelsSyncedFromRows", client.call("loadLocalChannels"));
+    assert.equal(synced["ch-old"].presetNetworkId, "41",
+      "the row still carries presetNetworkId -- an existing local record missing it must get it backfilled");
+  });
 });
 
 // Quick Add channels' full pools (up to 5,000 items) are kept in full in
