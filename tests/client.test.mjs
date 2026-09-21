@@ -5126,6 +5126,66 @@ describe("client: Quick Add channel cloud sync stays small, and never shrinks wh
     assert.equal(after["ch-tnt"].hideWatched, true,
       "a customization the generic network preset knows nothing about must survive the upgrade");
   });
+
+  it("editing and saving a preset-backed channel clears presetNetworkId, so a curated trim can never be overwritten back to the full preset", () => {
+    // channelSourceItems (05_catalog-core.js) always prefers presetNetworkId's
+    // generic network lineup over a channel's own items -- the saved
+    // catalog row already drops this field the moment a channel goes
+    // through saveChannel (nothing in that payload writes it back), so a
+    // user's edit already took effect for real playback even before this
+    // fix. What was missing was the LOCAL copy agreeing: without this,
+    // trimming a Quick Add channel down to a small curated set left the
+    // local record still presetNetworkId-tagged, and resolveThinPresetChannels
+    // would silently blow the trim away the next time "My Channels" rendered.
+    const client = loadClient({});
+    client.call("saveLocalChannel", {
+      channelId: "ch-tnt", name: "TNT", presetNetworkId: "41", items: presetItems(4000, "TNT"),
+    });
+    client.call("editChannelById", "ch-tnt");
+    client.get("document").getElementById("channelNameInput").value = "TNT";
+    // Simulates the user having trimmed the draft down to a small, deliberately curated set.
+    client.set("channelDraftItems", presetItems(12, "CURATED"));
+    client.call("saveChannel");
+
+    const saved = client.call("loadLocalChannels")["ch-tnt"];
+    assert.equal(saved.presetNetworkId, "", "must no longer be treated as the generic network channel");
+    assert.equal(saved.items.length, 12, "the curated trim, not the original pool, must be what's saved");
+
+    // And now that it's untagged, resolveThinPresetChannels must leave it alone
+    // even though it is well under the sample-size threshold.
+    client.call("renderMyCreatedChannelsList");
+    const stillCurated = client.call("loadLocalChannels")["ch-tnt"];
+    assert.equal(stillCurated.items.length, 12, "an untagged channel must never be resolved back to a network preset");
+  });
+
+  it("the catalog row's own Edit button never downgrades a richer local copy to the row's thin pointer sample", () => {
+    // A Quick Add channel's saved catalog row carries only a small pointer
+    // sample (quickAddChannel, this file) -- editChannel (the Edit button
+    // rendered inline on the catalog row itself, a different surface than
+    // editChannelById's My Channels card) used to read that row and save it
+    // straight into the local channels map unconditionally, which meant
+    // opening the editor from THIS button silently downgraded a Quick Add
+    // channel's real multi-thousand-item pool down to the row's sample --
+    // and saving from there made that loss permanent.
+    const client = loadClient({});
+    client.call("saveLocalChannel", {
+      channelId: "ch-tnt", name: "TNT", presetNetworkId: "41", items: presetItems(4000, "TNT"),
+    });
+    const sampleSize = client.get("CHANNEL_POINTER_SAMPLE_ITEMS");
+    const pointerPayload = {
+      channelId: "ch-tnt", name: "TNT", presetNetworkId: "41",
+      items: presetItems(sampleSize, "TNT"), dailyRotate: true,
+    };
+    const row = {
+      closest(sel) { return sel === ".source-row" ? this : null; },
+      querySelector(sel) { return sel === ".url" ? { value: "channel:v1:" + JSON.stringify(pointerPayload) } : null; },
+    };
+
+    client.call("editChannel", row);
+
+    const after = client.call("loadLocalChannels")["ch-tnt"];
+    assert.equal(after.items.length, 4000, "must keep the real pool, not fall back to the row's small sample");
+  });
 });
 
 describe("client: the Channel builder's interleaved play order", () => {

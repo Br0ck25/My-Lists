@@ -39442,10 +39442,28 @@ function saveLocalChannel(payload) {
     createdAt: existing ? existing.createdAt : now,
     updatedAt: now,
     // Not read by anything that renders or plays this channel -- kept so
-    // pushChannelsSync (22_client-creator-profile.js) can tell this
-    // channel's full pool already lives durably in the shared
-    // channel:preset:v2:<networkId> cache and skip re-uploading it whole.
-    presetNetworkId: payload.presetNetworkId || (existing ? existing.presetNetworkId : '') || '',
+    // pushChannelsSync (22_client-creator-profile.js) and
+    // resolveThinPresetChannels can tell this channel's full pool already
+    // lives durably in the shared channel:preset:v2:<networkId> cache and
+    // skip re-uploading it whole, or quietly refresh it from there.
+    //
+    // hasOwnProperty, not a plain payload.presetNetworkId || existing... --
+    // that fallback could never tell "the caller didn't mention this field"
+    // (resolveThinPresetChannels' own re-save, which should keep whatever
+    // this record already had) apart from "the caller explicitly cleared
+    // it" (saveChannel, the full editor's Save button, which never writes
+    // presetNetworkId at all once a channel has been through it -- the
+    // saved catalog row already drops it the same way, since editing a
+    // channel's picks is what makes it no longer "the generic network
+    // lineup"). Falling back to the old value in the second case is exactly
+    // how a deliberately trimmed-down edit -- say, curated to under 50
+    // picks -- got silently overwritten back to the full, unedited preset
+    // the next time this local copy looked thin: the row had already
+    // forgotten this was ever a preset channel, but this record's fallback
+    // kept insisting it still was.
+    presetNetworkId: Object.prototype.hasOwnProperty.call(payload, 'presetNetworkId')
+      ? (payload.presetNetworkId || '')
+      : (existing ? existing.presetNetworkId : '') || '',
   };
   saveLocalChannelsMap(map);
   return map[channelId];
@@ -47664,6 +47682,17 @@ async function saveChannel() {
     // Worker on every request, and its picks have just been sorted for real
     // (see editChannelById) -- so the stored order is now the answer.
     sortByAired: false,
+    // Explicitly cleared (not just left out): channelSourceItems
+    // (05_catalog-core.js) always prefers presetNetworkId's generic network
+    // lineup over whatever items a channel's own row carries, so a Quick
+    // Add channel that still had this set after being edited here would
+    // have its picks silently ignored for actual playback -- the edit would
+    // look saved but never play. The saved row already forgot this field
+    // the moment it started going through this function (nothing above
+    // rebuilds it), so this just makes the local copy agree with what the
+    // row has always done -- see saveLocalChannel's own comment on why an
+    // explicit '' here, not an absence, is what keeps that copy in sync.
+    presetNetworkId: '',
     visibility: isPublic ? 'public' : 'private',
     sharePublished: isPublic,
     shareCode: existingChannel.shareCode || '',
@@ -48496,7 +48525,22 @@ function editChannel(btnOrRow) {
     return;
   }
   if (payload.channelId) {
-    saveLocalChannel(payload);
+    // The row's own payload is often just a pointer -- Quick Add's small
+    // CHANNEL_POINTER_SAMPLE_ITEMS sample, never the full pool (see
+    // quickAddChannel) -- so this must only create a local record when this
+    // browser doesn't have one yet, never overwrite a richer one that
+    // already exists. Unconditionally saving it here used to open the
+    // editor onto 50 episodes instead of a Quick Add channel's real
+    // thousands every time this specific Edit button (the one on the
+    // catalog row itself, not the one on the My Channels card -- see
+    // editChannelById for that one) was clicked, and hitting Save from
+    // there made the loss permanent. Same guard ensureAllChannelsSyncedFromRows
+    // already uses for the same reason.
+    const map = loadLocalChannels();
+    const existing = map[payload.channelId];
+    if (!existing || (payload.items || []).length > (existing.items || []).length) {
+      saveLocalChannel(payload);
+    }
     editChannelById(payload.channelId);
   } else {
     const channelId = generateChannelId();
