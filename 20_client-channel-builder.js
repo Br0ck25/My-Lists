@@ -9304,23 +9304,22 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
       // static, hand-curated saga/universe listings, not a live catalog fetch.
       // resolveStorylineRatings (below) fills this slot in after render, from
       // /api/details/batch, keyed on the same id a channel pick for this entry
-      // would use. Placed in the DOM before the count overlay below so the
-      // "+N (rsaquo)" tile -- which covers the whole poster -- paints over
-      // the badge rather than beside it, on whichever tile actually shows it.
+      // would use. Placed in the year line rather than overlaid on the poster,
+      // matching every other poster tile sharing this same list-card-mini-poster-tile
+      // markup elsewhere in the app (Discover's loadPosterSlot, 19_client-search-and-likes.js).
       const ratingId = ep.imdbId || (ep.tmdbId ? ('tmdb:' + ep.tmdbId) : '');
       if (ratingId) ratingIdsOnPage.add(ratingId);
       const ratingSlot = ratingId
-        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(ratingId) + '" data-rating-style="overlay"></span>'
+        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(ratingId) + '"></span>'
         : '';
 
       return '<div class="list-card-mini-poster-tile">' +
         '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)">' +
           '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
-          ratingSlot +
           overlays +
         '</div>' +
         '<div class="list-card-mini-poster-name" title="' + escapeAttr(itemTitle) + '">' + escapeHtml(itemTitle) + '</div>' +
-        '<div class="list-card-mini-poster-year">' + escapeHtml(yearOrSeason) + '</div>' +
+        '<div class="list-card-mini-poster-year" style="display:flex; align-items:center; justify-content:space-between; gap:4px; width:100%;"><span>' + escapeHtml(yearOrSeason) + '</span>' + ratingSlot + '</div>' +
       '</div>';
     }).join('');
 
@@ -9438,35 +9437,28 @@ function resolveStorylineRatings(idsOnPage) {
 // Not scoped to one container: the same id can need patching in the Channel
 // Builder's own grid, the item details modal's storyline section, or (rarely)
 // both, and by the time a chunk resolves there is no reliable way to know
-// which one is even still open. A poster-corner overlay (formatRatingBadgeHtml)
-// on the Channel Builder grid's tiles; a plain inline star+number
-// (formatRatingSpanHtml) beside the subtitle line on the modal's cards, which
-// are too busy with their own corner badges (part number, watched checkmark,
-// "Current" pill) for a fourth overlay to land cleanly. Each slot says which
-// it wants via data-rating-style.
+// which one is even still open. Both places render the identical plain
+// inline star+number (formatRatingSpanHtml) that every other poster tile in
+// the app uses beside its year -- Discover's own list-card-mini-poster-tile
+// (loadPosterSlot, 19_client-search-and-likes.js) included -- rather than a
+// poster-corner overlay, which is both visually inconsistent with the rest
+// of the site and, on the modal's cards, would land on top of their own
+// corner badges (part number, watched checkmark, "Current" pill).
 function applyStorylineRatingBadges(ids) {
-  if (typeof document === 'undefined') return;
+  if (typeof document === 'undefined' || typeof formatRatingSpanHtml !== 'function') return;
   ids.forEach((id) => {
     const rating = window._storylineRatingsCache[id];
     if (!rating) return;
+    // vote_average, not rating: this value is /api/details/batch's own TMDB
+    // vote_average, but every id here is an imdb "tt..." id, and
+    // formatRatingBadgeHtml's sibling formatter -- kept elsewhere in the app
+    // for a poster-corner badge -- guesses imdb-vs-tmdb from the id's own
+    // shape for a plain "rating" field. Passing it as vote_average sidesteps
+    // that guess entirely: it's always read as TMDB, full stop.
+    const html = formatRatingSpanHtml({ id: id, vote_average: rating });
+    if (!html) return;
     document.querySelectorAll('.storyline-rating-slot[data-rating-id="' + id + '"]').forEach((slot) => {
-      const wantsInline = slot.dataset && slot.dataset.ratingStyle === 'inline';
-      let html = '';
-      // vote_average, not rating: this value is /api/details/batch's own
-      // TMDB vote_average, but every id here is an imdb "tt..." id, and
-      // formatRatingBadgeHtml's own rating field guesses imdb-vs-tmdb from
-      // the id's own shape -- "tt" reads as imdb. That mislabelled the badge
-      // data-rating-type="imdb", which this site hides unconditionally
-      // (hide-badge-imdb-rating is always forced on, 23_client-list-management.js
-      // -- IMDb ratings are not a feature here, only TMDB-vs-none is). Passing
-      // it as vote_average sidesteps the guess entirely: both formatters treat
-      // that field as TMDB, full stop.
-      if (wantsInline && typeof formatRatingSpanHtml === 'function') {
-        html = formatRatingSpanHtml({ id: id, vote_average: rating });
-      } else if (typeof formatRatingBadgeHtml === 'function') {
-        html = formatRatingBadgeHtml({ id: id, vote_average: rating });
-      }
-      if (html) slot.innerHTML = html;
+      slot.innerHTML = html;
     });
   });
 }

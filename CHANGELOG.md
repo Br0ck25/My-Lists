@@ -6,6 +6,11 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 Storylines & Universes rating badges were in the wrong place
+
+- **After the fix below made the badges visible, they showed up as a colored top-left overlay on the poster** -- inconsistent with every other poster tile in the app, which shows its rating as a plain inline star+number beside the year instead (Discover's own `loadPosterSlot`, `19_client-search-and-likes.js`, sharing the identical `list-card-mini-poster-tile` markup). The Channel Builder grid's rating slot (`renderStorylinesUniverseList`, `20_client-channel-builder.js`) moved out of the poster image wrapper and into the year line, and `applyStorylineRatingBadges` was simplified to always use `formatRatingSpanHtml` -- the same formatter, same placement, both Storylines surfaces and Discover now share.
+- New test confirms the rating slot renders inside the year line rather than the poster image wrapper.
+
 ### 🐛 Storylines & Universes rating badges were invisible
 
 - **The rating badges shipped on the Storylines, Sagas & Universes grid were in the DOM but never visible**: `applyStorylineRatingBadges` (`20_client-channel-builder.js`) handed the resolved number to `formatRatingBadgeHtml`/`formatRatingSpanHtml` as `rating`, and that field's own logic guesses imdb-vs-tmdb from the id's shape -- every id on this grid is an imdb `tt...` id, so every badge came back `data-rating-type="imdb"`. This site forces IMDb-typed rating badges hidden unconditionally (`hide-badge-imdb-rating`, `23_client-list-management.js` -- only a TMDB-vs-none choice is a real setting here, IMDb ratings were never a feature), so the badge existed, had the right number, and rendered completely invisible. Confirmed live with an automated browser check against the deployed site before and after: 190 of 321 posters had a `.rating-badge` element with zero visible pixels. Fixed by handing the value over as `vote_average` instead, which both formatters treat as TMDB unconditionally, sidestepping the id-shape guess entirely.
@@ -20,7 +25,7 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ### ⭐ Rating badges on Storylines, Sagas & Universes
 
-- Both places this feature name appears now show a TMDB rating badge on each poster: the Channel Builder's own **Storylines, Sagas & Universes** browse grid (`renderStorylinesUniverseList`, `20_client-channel-builder.js`) gets the usual poster-corner badge, and the item details modal's **Storylines, Sagas & Universes** section (`renderItemStorylinesWatchOrder`, `19_client-search-and-likes.js`) gets an inline star-and-number next to each card's subtitle, since its posters are already busy with a part-number badge, a watched checkmark and a "Current" pill. The title already open in that modal is skipped -- its rating is already shown higher up on the same page.
+- Both places this feature name appears now show a TMDB rating next to each poster's year, the same plain inline star-and-number every other poster tile in the app already uses (Discover's `loadPosterSlot`, `19_client-search-and-likes.js`): the Channel Builder's own **Storylines, Sagas & Universes** browse grid (`renderStorylinesUniverseList`, `20_client-channel-builder.js`) and the item details modal's **Storylines, Sagas & Universes** section (`renderItemStorylinesWatchOrder`, `19_client-search-and-likes.js`, next to each card's subtitle). The title already open in that modal is skipped -- its rating is already shown higher up on the same page.
 - TV_CROSSOVER_EVENTS is a static, hand-curated registry (poster, title, year -- no rating baked in), so both surfaces resolve ratings live from `/api/details/batch`, deduplicated and cached at module scope (`resolveStorylineRatings`/`applyStorylineRatingBadges`, `20_client-channel-builder.js`) so the two pages, a title appearing in more than one saga, and switching category tabs, all share one lookup per id for the whole session rather than re-asking.
 
 ### ⭐ Specials, alongside a show's regular seasons

@@ -3071,20 +3071,42 @@ describe("client: Storylines, Sagas & Universes rating badges", () => {
   // both formatters treat as TMDB unconditionally, sidestepping the guess.
   it("labels a resolved rating as TMDB, not IMDb, even though every id here is a tt... id", () => {
     const client = loadClient();
-    const overlayBadge = client.call("formatRatingBadgeHtml", { id: "tt0458339", vote_average: 7.0 });
-    assert.match(overlayBadge, /data-rating-type="tmdb"/,
-      "the overlay badge (Channel Builder grid) must not be labelled imdb");
-    assert.equal(overlayBadge.includes('data-rating-type="imdb"'), false);
-
     const inlineBadge = client.call("formatRatingSpanHtml", { id: "tt0458339", vote_average: 7.0 });
     assert.match(inlineBadge, /data-rating-type="tmdb"/,
-      "the inline badge (item details modal) must not be labelled imdb either");
+      "the inline badge both Storylines surfaces render must not be labelled imdb");
 
-    // The bug itself, pinned directly: the same call with `rating` instead
-    // of `vote_average` -- what the code used to send -- mislabels it.
+    // The bug's actual mechanism, pinned directly on the sibling formatter
+    // kept elsewhere in the app for a poster-corner badge: the same value
+    // sent as `rating` -- what applyStorylineRatingBadges used to send --
+    // mislabels a "tt..." id as imdb, confirming this (and not something
+    // else) is what made every badge invisible.
     const buggyShape = client.call("formatRatingBadgeHtml", { id: "tt0458339", rating: 7.0 });
     assert.match(buggyShape, /data-rating-type="imdb"/,
       "confirms formatRatingBadgeHtml's own id-shape guess is what caused this -- not something else");
+  });
+
+  // Regression test for a second live-site report, right after the above fix
+  // shipped: the badge became visible, but as a colored top-left overlay on
+  // the poster -- inconsistent with every other poster tile in the app,
+  // which shows its rating as a plain inline star+number in the year line
+  // (Discover's loadPosterSlot, 19_client-search-and-likes.js). The grid's
+  // rating slot must live in the year line, not inside the poster image
+  // wrapper, and applyStorylineRatingBadges must only ever fill it with
+  // formatRatingSpanHtml's plain star+number, never a colored rating-badge div.
+  it("places the rating in the year line like every other poster tile, not as a poster-corner overlay", () => {
+    const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6 }) });
+    client.call("renderStorylinesUniverseList", "all");
+    const html = client.get("document").getElementById("storylinesUniverseList").innerHTML;
+    const yearLineWithSlot = /list-card-mini-poster-year"[^>]*><span>[^<]*<\/span><span class="storyline-rating-slot" data-rating-id="tt5312384">/;
+    assert.match(html, yearLineWithSlot,
+      "the rating slot sits inside the year line, beside the year, not overlaid on the poster image");
+
+    const imgWrapBlocks = [...html.matchAll(/list-card-mini-poster-img-wrap"[\s\S]*?(?=<div class="list-card-mini-poster-name")/g)];
+    assert.ok(imgWrapBlocks.length > 0, "sanity check: the grid rendered at least one poster tile");
+    imgWrapBlocks.forEach((m) => {
+      assert.equal(m[0].includes("storyline-rating-slot"), false,
+        "no rating slot is left inside the poster image wrapper");
+    });
   });
 
   it("asks /api/details/batch for every unique poster id on the grid exactly once", async () => {
@@ -3964,9 +3986,9 @@ describe("client: Item Details Storylines, Sagas & Universes watch order", () =>
       seasonsData: [{ season_number: 1, episode_count: 7 }]
     };
     const html = client.__scopeCall("renderItemStorylinesWatchOrder", [bb, "series"]);
-    assert.match(html, /storyline-rating-slot" data-rating-id="tt9243946" data-rating-style="inline"/,
+    assert.match(html, /storyline-rating-slot" data-rating-id="tt9243946"/,
       "El Camino (a companion) gets a rating slot");
-    assert.match(html, /storyline-rating-slot" data-rating-id="tt3032476" data-rating-style="inline"/,
+    assert.match(html, /storyline-rating-slot" data-rating-id="tt3032476"/,
       "Better Call Saul (a companion) gets a rating slot");
     assert.equal(html.includes('data-rating-id="tt0903747"'), false,
       "Breaking Bad itself -- the title already open in this modal -- gets no slot");

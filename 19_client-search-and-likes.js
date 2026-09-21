@@ -2837,7 +2837,7 @@ function renderItemStorylinesWatchOrder(d, type) {
       // here would just be noise on the one tile that needs it least.
       if (!isCurrent && partId) itemStorylineRatingIds.add(partId);
       const ratingSlot = (!isCurrent && partId)
-        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(partId) + '" data-rating-style="inline"></span>'
+        ? '<span class="storyline-rating-slot" data-rating-id="' + escapeAttr(partId) + '"></span>'
         : '';
 
       return '<div class="item-storyline-card' + (isCurrent ? ' is-current' : '') + '"' + clickHandler + ' title="' + escapeAttr(displayTitle + (isCurrent ? ' (Currently Viewing)' : '')) + '">' +

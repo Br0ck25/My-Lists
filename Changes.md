@@ -1,5 +1,37 @@
 # Changes Log
 
+## 2026-09-21 - Storylines & Universes rating badges were in the wrong place
+
+### Files Changed
+`19_client-search-and-likes.js`, `20_client-channel-builder.js`, `worker_entry_combined.js`,
+`tests/client.test.mjs`, `CHANGELOG.md`, `Changes.md`
+
+### The bug
+
+The previous entry below made the Storylines, Sagas & Universes badges visible, but on the Channel
+Builder's own browse grid they came back as a colored badge overlaid on the poster's top-left corner --
+not how a rating shows up anywhere else on the site. Discover, list previews, and every other place that
+uses this same `list-card-mini-poster-tile` poster markup (`loadPosterSlot`, `19_client-search-and-likes.js`)
+shows its rating as a plain star-and-number sitting in the text line below the poster, next to the year --
+never a colored overlay on the image itself. The item details modal's own Storylines section already
+matched that pattern; only the Channel Builder grid didn't.
+
+### The fix
+
+Moved the grid's rating slot out of the poster image wrapper and into the year line
+(`renderStorylinesUniverseList`, `20_client-channel-builder.js`), styled identically to Discover's own
+year/rating row. `applyStorylineRatingBadges` no longer branches between a poster-corner badge
+(`formatRatingBadgeHtml`) and an inline one (`formatRatingSpanHtml`) -- both Storylines surfaces only
+ever want the inline star now, so it always uses that formatter, and the now-unused `data-rating-style`
+attribute was dropped from both surfaces' markup.
+
+### Tests
+
+`tests/client.test.mjs`: new test confirms the rating slot renders inside the year line rather than the
+poster image wrapper; the existing regression test for the invisible-badge bug was reworded since it no
+longer needs to distinguish an "overlay badge" case that doesn't exist anymore, while still pinning down
+`formatRatingBadgeHtml`'s id-shape guess as the actual mechanism behind that earlier bug.
+
 ## 2026-09-21 - Storylines & Universes rating badges were invisible
 
 ### Files Changed
