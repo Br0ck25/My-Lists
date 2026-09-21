@@ -3411,6 +3411,33 @@ describe("client: adult content filter & safe poster replacement", () => {
   });
 });
 
+describe("client: dedupeAcrossLists setting round-trips through collectKeys and buildConfig", () => {
+  it("collectKeys returns dedupeAcrossLists: true once the checkbox is checked", () => {
+    const client = loadClient();
+    client.get("document").getElementById("dedupeAcrossListsCheckbox").checked = true;
+    const keys = client.get("collectKeys")();
+    assert.equal(keys.dedupeAcrossLists, true);
+  });
+
+  it("collectKeys returns dedupeAcrossLists: false by default", () => {
+    const client = loadClient();
+    const keys = client.get("collectKeys")();
+    assert.equal(keys.dedupeAcrossLists, false);
+  });
+
+  it("buildConfig carries dedupeAcrossLists into the saved payload only when enabled", () => {
+    const client = loadClient();
+    const buildConfig = client.get("buildConfig");
+    const decodeOne = (b64) => JSON.parse(client.get("atob")(b64.replace(/-/g, "+").replace(/_/g, "/")));
+
+    const withOn = buildConfig([], { dedupeAcrossLists: true });
+    assert.equal(decodeOne(withOn).dedupeAcrossLists, true);
+
+    const withOff = buildConfig([], { dedupeAcrossLists: false });
+    assert.equal(decodeOne(withOff).dedupeAcrossLists, undefined, "omitted entirely, same as every other off-by-default flag here");
+  });
+});
+
 describe("client: continue watching storyline & companion recommendations", () => {
   it("settings toggle: defaults to enabled and persists toggling", () => {
     const client = loadClient();
@@ -4227,6 +4254,135 @@ describe("client: Live Preview proves who is asking before reading a personal sh
     assert.equal(sent.length, 1);
     assert.equal(sent[0].body.creatorKey, undefined,
       "a signed-out browser has no ownership to claim over someone else's shelf");
+  });
+});
+
+// "Remove duplicate items across lists" (Settings -> dedupeAcrossListsCheckbox).
+// Server-side coverage (the real Stremio/Nuvio catalogs) lives in
+// tests/worker.test.mjs under "worker: remove duplicate items across lists" --
+// this is the client-only half: the same rule applied to Live Preview's
+// already-fetched shelves, purely in the browser, no extra request.
+describe("client: Live Preview removes duplicate items across lists", () => {
+  function fakeInput(value) {
+    return { value, dataset: {} };
+  }
+
+  function fakeEntry(name, url, type) {
+    const posters = { innerHTML: "", classList: { add() {}, remove() {}, toggle() {} } };
+    const status = { innerHTML: "" };
+    const entry = {
+      dataset: {},
+      style: {},
+      posters,
+      status,
+      querySelector(sel) {
+        if (sel === ".name") return fakeInput(name);
+        if (sel === ".type") return fakeInput(type);
+        if (sel === ".url") return fakeInput(url);
+        if (sel === ".live-preview-posters") return posters;
+        if (sel === ".live-preview-shelf-status") return status;
+        return null;
+      },
+      querySelectorAll(sel) {
+        if (sel === ".url") return [fakeInput(url)];
+        return [];
+      },
+    };
+    return entry;
+  }
+
+  function withRows(client, rows) {
+    const entries = rows.map((r) => fakeEntry(r.name, r.url, r.type));
+    const doc = client.get("document");
+    const lists = doc.getElementById("lists");
+    lists.querySelectorAll = (sel) => (sel === ".entry" ? entries : []);
+    doc.querySelectorAll = (sel) => {
+      if (sel === "#lists .entry") return entries;
+      if (sel === "#lists .entry .url") return rows.map((r) => fakeInput(r.url));
+      return [];
+    };
+    return entries;
+  }
+
+  const sampleRoute = (byUrl) => (req) => ({
+    json: { ok: true, totalItems: byUrl[req.body.url].length, maybeMore: false, sample: byUrl[req.body.url] },
+  });
+
+  it("keeps the top list's items and strips whatever a later list of the same type already has", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:dedupeAcrossLists": "1" },
+      routes: {
+        "/api/preview": sampleRoute({
+          "customlist:v1:listone": [
+            { id: "ttA", type: "movie", name: "Movie A", poster: "" },
+            { id: "ttB", type: "movie", name: "Movie B", poster: "" },
+          ],
+          "customlist:v1:listtwo": [
+            { id: "ttA", type: "movie", name: "Movie A", poster: "" },
+            { id: "ttC", type: "movie", name: "Movie C", poster: "" },
+          ],
+        }),
+      },
+    });
+    const rows = withRows(client, [
+      { name: "List 1", url: "customlist:v1:listone", type: "movie" },
+      { name: "List 2", url: "customlist:v1:listtwo", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+
+    assert.match(rows[0].posters.innerHTML, /ttA/, "list 1 keeps A");
+    assert.match(rows[0].posters.innerHTML, /ttB/, "list 1 keeps B");
+    assert.equal(rows[1].posters.innerHTML.includes("ttA"), false, "list 2 loses A -- already shown by list 1");
+    assert.match(rows[1].posters.innerHTML, /ttC/, "list 2 keeps C -- not shown anywhere earlier");
+
+    const shelfData = client.get("livePreviewShelfData");
+    assert.deepEqual(shelfData[0].sample.map((it) => it.id), ["ttA", "ttB"]);
+    assert.deepEqual(shelfData[1].sample.map((it) => it.id), ["ttC"]);
+    assert.equal(shelfData[1].totalItems, 1, "the shown total drops by however many were removed");
+  });
+
+  it("does nothing when the setting is off, even with the exact same overlapping lists", async () => {
+    const client = loadClient({
+      routes: {
+        "/api/preview": sampleRoute({
+          "customlist:v1:listone": [{ id: "ttA", type: "movie", name: "Movie A", poster: "" }],
+          "customlist:v1:listtwo": [
+            { id: "ttA", type: "movie", name: "Movie A", poster: "" },
+            { id: "ttB", type: "movie", name: "Movie B", poster: "" },
+          ],
+        }),
+      },
+    });
+    withRows(client, [
+      { name: "List 1", url: "customlist:v1:listone", type: "movie" },
+      { name: "List 2", url: "customlist:v1:listtwo", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+
+    const shelfData = client.get("livePreviewShelfData");
+    assert.deepEqual(shelfData[1].sample.map((it) => it.id), ["ttA", "ttB"], "no dedup applied");
+  });
+
+  it("shows a message instead of an empty shelf when every item in a list was a duplicate", async () => {
+    const client = loadClient({
+      storage: { "myListAddon:dedupeAcrossLists": "1" },
+      routes: {
+        "/api/preview": sampleRoute({
+          "customlist:v1:listone": [{ id: "ttA", type: "movie", name: "Movie A", poster: "" }],
+          "customlist:v1:listtwo": [{ id: "ttA", type: "movie", name: "Movie A", poster: "" }],
+        }),
+      },
+    });
+    const rows = withRows(client, [
+      { name: "List 1", url: "customlist:v1:listone", type: "movie" },
+      { name: "List 2", url: "customlist:v1:listtwo", type: "movie" },
+    ]);
+
+    await client.call("renderLivePreview");
+
+    assert.match(rows[1].posters.innerHTML, /duplicate/i);
   });
 });
 

@@ -249,6 +249,58 @@ async function fetchMergedCatalog(urls, type, skip, keys) {
   return sliced;
 }
 
+// Cross-LIST duplicate removal for Stremio/Nuvio catalogs -- "Remove
+// duplicate items across lists" in Settings (dedupeAcrossListsCheckbox).
+// Keeps a config's FIRST list of a given type exactly as fetchCatalog
+// already built it, and for every list after it (in the same order the
+// builder's Catalogs/Live Preview shows them, i.e. entries' own order)
+// strips whatever id already showed up in an earlier same-type list.
+// renderLivePreview (23_client-list-management.js) applies the identical
+// rule client-side over its already-fetched shelves, so what the builder
+// shows is what this ends up serving.
+//
+// Same "same skip/page window" limitation fetchMergedCatalog above already
+// accepts for a merged row's own sources: an earlier entry is re-fetched at
+// the SAME skip as the one being served rather than pulled in full, so this
+// is exact for the common case (the home screen's first page of every row)
+// and only approximate once someone pages deep into more than one row at
+// once. Getting it exact deeper would mean holding every earlier list in
+// full, which does not fit this add-on's stateless, one-request-per-page
+// design -- see fetchMergedCatalog's own comment for the same tradeoff.
+//
+// keys deliberately omits isStremioCatalog/showBadgesStremio*/
+// adultContentFilter/origin: those only ever change a poster URL or add a
+// field, never which ids come back (applyBadgedPostersToMetas and
+// applyAdultContentFilterToMetas are both 1:1 maps), so skipping them here
+// just saves the work rather than changing the answer.
+async function dedupeAcrossListEntries(entries, entryIndex, skip, metas, keys) {
+  if (!Array.isArray(metas) || !metas.length) return metas;
+  const entry = entries[entryIndex];
+  if (!entry) return metas;
+  const priorEntries = entries.slice(0, entryIndex).filter((e) => e && e.enabled !== false && e.type === entry.type);
+  if (!priorEntries.length) return metas;
+
+  const priorResults = await Promise.all(
+    priorEntries.map((e) => fetchCatalog(e, skip, keys).catch(() => []))
+  );
+  const seen = new Set();
+  for (const list of priorResults) {
+    for (const m of list) {
+      if (m && m.id) seen.add(m.id);
+    }
+  }
+  if (!seen.size) return metas;
+  const tot = metas.totalItems;
+  const before = metas.length;
+  const filtered = metas.filter((m) => !m || !seen.has(m.id));
+  // Approximate, same reasoning as the page-window limitation above: this
+  // page lost `before - filtered.length` items to dedup, so the running
+  // total is adjusted by the same amount rather than left claiming a count
+  // this page can no longer back up.
+  if (typeof tot === 'number') filtered.totalItems = Math.max(filtered.length, tot - (before - filtered.length));
+  return filtered;
+}
+
 // --- Channels (synthetic series stitched from hand-picked episodes/movies) -
 //
 // A Channel entry stores its payload directly in entry.url as

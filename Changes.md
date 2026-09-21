@@ -1,5 +1,65 @@
 # Changes Log
 
+## 2026-09-21 - Remove duplicate items across lists
+
+### Files Changed
+`02_http-and-creator-utils.js`, `04_config-resolution.js`, `05_catalog-core.js`, `09_page-shell.js`,
+`15_tab-settings-html.js`, `22_client-creator-profile.js`, `23_client-list-management.js`,
+`24_client-backup-restore-presets.js`, `25_api-catalog-routes.js`, `worker_entry_combined.js`,
+`CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`, `tests/client.test.mjs`, `tests/worker.test.mjs`
+
+### The request
+
+Someone with several overlapping lists (the same handful of popular titles turning up near the top of
+list after list) wanted the later lists to stop repeating what an earlier one already showed -- both in
+the builder's own Live Preview and in the real catalogs Stremio/Nuvio end up with once the install link
+is generated. Their own example: three lists that each start with the same three movies; with the setting
+on, the top list keeps everything, and each list after it keeps only what nothing above it already has.
+
+### The fix
+
+New setting, off by default: **Remove duplicate items across lists**. "Order" is whichever order a
+person's lists are in, in Catalogs/Live Preview & Editor -- the same order a list is already
+drag-to-reordered in today, so changing which list keeps a shared title is just dragging it above the
+other one.
+
+Two places apply the identical rule, since a person can look at either one:
+
+- **Live Preview & Editor** -- `renderLivePreview` (`23_client-list-management.js`) already fetches every
+  enabled shelf's sample in parallel before this runs; once every shelf has its final answer, a single
+  pass walks them in order, removing (per type -- movie vs series never collide anyway) whatever id an
+  earlier shelf already showed, then re-renders just the shelves that actually lost something.
+- **The real Stremio/Nuvio catalogs** -- new `dedupeAcrossListEntries` (`05_catalog-core.js`), called from
+  the `/catalog/:type/:id.json` route (`25_api-catalog-routes.js`) whenever the setting is on. Finds the
+  entry being served, re-fetches every enabled earlier same-type entry at the identical `skip`, and
+  strips anything already in one of those pages. Deliberately mirrors `fetchMergedCatalog`'s own existing
+  tradeoff for a merged row's sources -- same skip/page window only, not the whole earlier list -- since
+  getting it exact deeper into pagination would mean holding every earlier list in full, which this
+  add-on's stateless, one-request-per-page design was never built for.
+
+Getting the flag itself from a checkbox to both of those meant threading it through every place a
+settings flag like this already has to reach: `collectKeys`/`buildConfig` and the client's own `/api/save`
+call, the server's field allowlist on `/api/save`, both `resolveConfig` decode paths (the KV short-link
+branch and `decodeConfig`'s base64 branch), the `/:config/configure` page's `initialKeys`, JSON backup
+export/restore, the config-changed-since-last-save hash, and cross-device Creator Profile sync. Used
+`hideNonDigitalReleases` as the template throughout, since it already touches every one of those exact
+spots.
+
+### Tests
+
+`tests/worker.test.mjs` ("worker: remove duplicate items across lists", 4 tests, plus a decode/resolve
+test alongside the existing `adultContentFilter` one): built from `customlist:v1:` entries specifically,
+since that source embeds its items directly in the url and needs no network mock at all. Covers the top
+list staying untouched, a later list losing only what an earlier one already has, the setting doing
+nothing at all when off, movie/series lists never deduping against each other even with a deliberately
+shared id, and a disabled earlier list being skipped while a later enabled one still counts.
+
+`tests/client.test.mjs`: a new "Live Preview removes duplicate items across lists" suite (3 tests) covers
+the client-side pass -- the top shelf keeps its items, a later shelf loses what's shared, the setting does
+nothing when off, and a shelf that loses every item shows a message instead of going blank. A separate
+"dedupeAcrossLists setting round-trips through collectKeys and buildConfig" suite (3 tests) covers the
+settings plumbing directly.
+
 ## 2026-09-21 - Rating badges on Storylines, Sagas & Universes
 
 ### Files Changed

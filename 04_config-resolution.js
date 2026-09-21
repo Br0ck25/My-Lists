@@ -123,6 +123,7 @@ async function resolveConfig(configParam, env) {
           region: parsed.region || "US",
           hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
           adultContentFilter: !!parsed.adultContentFilter,
+          dedupeAcrossLists: !!parsed.dedupeAcrossLists,
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
           showBadgesTraktContinueWatching: parsed.showBadgesTraktContinueWatching !== false,
