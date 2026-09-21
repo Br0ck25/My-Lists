@@ -48257,10 +48257,19 @@ function applyStorylineRatingBadges(ids) {
     document.querySelectorAll('.storyline-rating-slot[data-rating-id="' + id + '"]').forEach((slot) => {
       const wantsInline = slot.dataset && slot.dataset.ratingStyle === 'inline';
       let html = '';
+      // vote_average, not rating: this value is /api/details/batch's own
+      // TMDB vote_average, but every id here is an imdb "tt..." id, and
+      // formatRatingBadgeHtml's own rating field guesses imdb-vs-tmdb from
+      // the id's own shape -- "tt" reads as imdb. That mislabelled the badge
+      // data-rating-type="imdb", which this site hides unconditionally
+      // (hide-badge-imdb-rating is always forced on, 23_client-list-management.js
+      // -- IMDb ratings are not a feature here, only TMDB-vs-none is). Passing
+      // it as vote_average sidesteps the guess entirely: both formatters treat
+      // that field as TMDB, full stop.
       if (wantsInline && typeof formatRatingSpanHtml === 'function') {
-        html = formatRatingSpanHtml({ id: id, rating: rating });
+        html = formatRatingSpanHtml({ id: id, vote_average: rating });
       } else if (typeof formatRatingBadgeHtml === 'function') {
-        html = formatRatingBadgeHtml({ id: id, rating: rating });
+        html = formatRatingBadgeHtml({ id: id, vote_average: rating });
       }
       if (html) slot.innerHTML = html;
     });

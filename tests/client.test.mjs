@@ -3057,6 +3057,36 @@ describe("client: Storylines, Sagas & Universes rating badges", () => {
     assert.ok(slotIds.includes(KONOSUBA_MOVIE_ID), "the movie tile carries a rating slot for its own id");
   });
 
+  // Regression test for a real bug caught on the live site, not by this
+  // suite: applyStorylineRatingBadges used to hand the resolved number to
+  // the formatters as `rating`, and formatRatingBadgeHtml's own `rating`
+  // field guesses imdb-vs-tmdb from the id's shape -- every id here is an
+  // imdb "tt..." id, so every badge came out data-rating-type="imdb". This
+  // site forces IMDb-typed badges hidden unconditionally (hide-badge-imdb-
+  // rating, 23_client-list-management.js -- only a TMDB-vs-none choice is a
+  // real setting here), so every badge existed in the DOM and rendered
+  // completely invisible. The harness cannot exercise the DOM patch itself
+  // (see the top of this describe block), but it can pin the exact call
+  // applyStorylineRatingBadges now makes: vote_average, not rating, which
+  // both formatters treat as TMDB unconditionally, sidestepping the guess.
+  it("labels a resolved rating as TMDB, not IMDb, even though every id here is a tt... id", () => {
+    const client = loadClient();
+    const overlayBadge = client.call("formatRatingBadgeHtml", { id: "tt0458339", vote_average: 7.0 });
+    assert.match(overlayBadge, /data-rating-type="tmdb"/,
+      "the overlay badge (Channel Builder grid) must not be labelled imdb");
+    assert.equal(overlayBadge.includes('data-rating-type="imdb"'), false);
+
+    const inlineBadge = client.call("formatRatingSpanHtml", { id: "tt0458339", vote_average: 7.0 });
+    assert.match(inlineBadge, /data-rating-type="tmdb"/,
+      "the inline badge (item details modal) must not be labelled imdb either");
+
+    // The bug itself, pinned directly: the same call with `rating` instead
+    // of `vote_average` -- what the code used to send -- mislabels it.
+    const buggyShape = client.call("formatRatingBadgeHtml", { id: "tt0458339", rating: 7.0 });
+    assert.match(buggyShape, /data-rating-type="imdb"/,
+      "confirms formatRatingBadgeHtml's own id-shape guess is what caused this -- not something else");
+  });
+
   it("asks /api/details/batch for every unique poster id on the grid exactly once", async () => {
     const client = loadClient({ routes: batchRoute({ [KONOSUBA_SHOW_ID]: 7.6, [KONOSUBA_MOVIE_ID]: 7.1 }) });
     client.call("renderStorylinesUniverseList", "all");

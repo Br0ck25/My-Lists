@@ -6,6 +6,11 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 Storylines & Universes rating badges were invisible
+
+- **The rating badges shipped on the Storylines, Sagas & Universes grid were in the DOM but never visible**: `applyStorylineRatingBadges` (`20_client-channel-builder.js`) handed the resolved number to `formatRatingBadgeHtml`/`formatRatingSpanHtml` as `rating`, and that field's own logic guesses imdb-vs-tmdb from the id's shape -- every id on this grid is an imdb `tt...` id, so every badge came back `data-rating-type="imdb"`. This site forces IMDb-typed rating badges hidden unconditionally (`hide-badge-imdb-rating`, `23_client-list-management.js` -- only a TMDB-vs-none choice is a real setting here, IMDb ratings were never a feature), so the badge existed, had the right number, and rendered completely invisible. Confirmed live with an automated browser check against the deployed site before and after: 190 of 321 posters had a `.rating-badge` element with zero visible pixels. Fixed by handing the value over as `vote_average` instead, which both formatters treat as TMDB unconditionally, sidestepping the id-shape guess entirely.
+- New regression test pins the exact call shape (`vote_average`, not `rating`) and separately confirms the buggy shape really does mislabel it -- the earlier tests for this feature only checked the fetch/cache logic and could not have caught this, since the DOM patch itself isn't observable in this repo's client test harness.
+
 ### ⭐ Remove duplicate items across lists
 
 - New setting (Settings -> Duplicate Items Across Lists -> **Remove duplicate items across lists**): the config's top list (in the same top-to-bottom order shown in Catalogs/Live Preview & Editor, drag-to-reorder included) is left exactly as it is, and every list after it has whatever id an earlier same-type list already carries removed. A movie list is never deduped against a series list, since they never share an id in practice anyway.

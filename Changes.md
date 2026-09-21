@@ -1,5 +1,44 @@
 # Changes Log
 
+## 2026-09-21 - Storylines & Universes rating badges were invisible
+
+### Files Changed
+`20_client-channel-builder.js`, `worker_entry_combined.js`, `tests/client.test.mjs`, `CHANGELOG.md`,
+`Changes.md`
+
+### The bug
+
+The previous entry below added a rating badge to both Storylines, Sagas & Universes surfaces, and it
+shipped and deployed correctly -- but nothing ever became visible on either one. The badges were there in
+the DOM the whole time, just permanently invisible.
+
+`applyStorylineRatingBadges` handed each resolved rating to `formatRatingBadgeHtml`/`formatRatingSpanHtml`
+as `{ id, rating }`. Both formatters have always supported two input shapes -- a raw `rating` field, or a
+`vote_average` field -- and for the `rating` field specifically, `formatRatingBadgeHtml` guesses whether
+the number is an IMDb or a TMDB rating from the shape of `id` alone: an id starting with `tt` reads as
+IMDb. Every id on these two pages is an imdb-style `tt...` id, even though the value itself always comes
+from `/api/details/batch`'s own TMDB `vote_average`. So every badge got labelled `data-rating-type="imdb"`
+-- and this site hides IMDb-type badges unconditionally, everywhere, by design (`hide-badge-imdb-rating` is
+forced on in `23_client-list-management.js`; only a TMDB-vs-none choice has ever been a real setting here).
+Correct data, correct markup, zero visible pixels.
+
+### The fix
+
+Both call sites in `applyStorylineRatingBadges` now pass the value as `vote_average` instead of `rating`,
+which both formatters treat as unambiguously TMDB regardless of what the id looks like -- sidestepping the
+guess entirely rather than trying to special-case it.
+
+Found by reproducing the report directly against the live site with Playwright rather than re-reading the
+diff, since the diff alone looked correct -- the deployed build genuinely did have the feature, it just
+had this one mislabeled field.
+
+### Tests
+
+`tests/client.test.mjs`: new regression test in the existing "Storylines, Sagas & Universes rating badges"
+suite asserts both formatters label a `tt...` id's badge as `data-rating-type="tmdb"` when given
+`vote_average`, and separately confirms `formatRatingBadgeHtml` really does mislabel that same id as
+`imdb` when given `rating` instead -- pinning down the exact mechanism, not just the symptom.
+
 ## 2026-09-21 - Remove duplicate items across lists
 
 ### Files Changed
