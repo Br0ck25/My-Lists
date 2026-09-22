@@ -339,7 +339,8 @@ const JUSTWATCH_GRAPHQL_URL = "https://apis.justwatch.com/graphql";
 // on every sweep. Older days are read once and kept.
 const NEW_ON_STREAMING_JW_REFRESH_DAYS = 3;
 const NEW_ON_STREAMING_JW_PAGE_SIZE = 100;
-const NEW_ON_STREAMING_JW_MAX_PAGES_PER_SWEEP = 20;
+const NEW_ON_STREAMING_JW_MAX_PAGES_PER_SWEEP = 30;
+const JUSTWATCH_NEW_TITLES_CAP = 600;
 const NEW_ON_STREAMING_JW_INTERVAL_SECONDS = 7200;
 
 const RAPIDAPI_CHANGES_URL = "https://streaming-availability.p.rapidapi.com/changes";

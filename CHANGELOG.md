@@ -6,6 +6,12 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 New on Streaming: days over JustWatch's 600-entry cap were cut short
+
+Compared the whole Sep 5–21 range against a saved copy of mdblist.com/new-on-streaming. The biggest gap was **Sep 12**: mdblist had 864 titles, and we had 600 entries. JustWatch's `newTitles` stops every query at 600 (`JUSTWATCH_NEW_TITLES_CAP`), and that day Prime Video alone added more than 600 movies. Now a query that reports a capped `totalCount` is split into narrower queries that together cover the same results: by service, then movies vs. seasons, then by halving the release-year range (`splitJustWatchSlice`). The split pieces are saved with each day's progress, so a big day can finish over several sweeps. Up to 30 pages per sweep.
+
+Result of the comparison: of 2,189 mdblist titles, 1,934 match ours on the same day. About 160 more are probably the same title named differently (JustWatch sometimes gives the original-language title, e.g. *W jak morderstwo* for *In for a Murder*). 30 are titles we already moved to Sep 22, a day mdblist had not finished loading. That leaves about 55 unexplained titles on each side.
+
 ### 🔁 New on Streaming now reads JustWatch, the same feed mdblist uses
 
 The fixes below made RapidAPI collect its data properly, but the list still didn't match mdblist. The rest of the gap was the **data itself**. RapidAPI's crawler lists titles mdblist never has, like the 2024 *Road House* "on Hulu", Peacock's *Velvet* and *seaQuest DSV*, or *Jimmy Kimmel Live!* dated four days after its last episode. The sweep now reads **JustWatch's `newTitles` GraphQL feed**, which is what mdblist's New on Streaming is built on:

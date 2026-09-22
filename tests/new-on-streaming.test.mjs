@@ -1471,6 +1471,50 @@ describe("JustWatch New on Streaming sweep", () => {
     }
   });
 
+  // JustWatch stops a query at 600 entries (Sep 12 2026: 600+ Prime movies
+  // in one day). A capped query is split until every slice fits.
+  it("splits a day that hits JustWatch's 600-entry cap by service, then type, then release year", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const realFetch = globalThis.fetch;
+    const seen = [];
+    globalThis.fetch = async (url, opts) => {
+      if (!String(url).includes("apis.justwatch.com")) return realFetch(url, opts);
+      const v = JSON.parse(opts.body).variables;
+      const f = v.filter;
+      seen.push(f);
+      const today = v.date === day(0);
+      let total = 0;
+      let edges = [];
+      if (today) {
+        const onlyAmp = f.packages.length === 1 && f.packages[0] === "amp";
+        if (f.packages.length > 1) total = 600;
+        else if (onlyAmp && !f.objectTypes) total = 600;
+        else if (onlyAmp && f.objectTypes[0] === "MOVIE" && !f.releaseYear) total = 600;
+        else if (onlyAmp && f.objectTypes[0] === "MOVIE") {
+          const y = f.releaseYear.min <= 1990 && f.releaseYear.max >= 1990 ? 1990 : null;
+          edges = y ? [jwEdge({ title: `Old Movie ${f.releaseYear.min}`, imdbId: "tt7000001", pkg: "amp", year: y })] : [];
+          total = edges.length;
+        } else if (f.packages[0] === "nfx") {
+          edges = [jwEdge({ title: "Netflix Movie", imdbId: "tt7000002", pkg: "nfx" })];
+          total = 1;
+        }
+      }
+      return new Response(JSON.stringify({ data: { newTitles: { totalCount: total, edges: total >= 600 ? [] : edges, pageInfo: { hasNextPage: false, endCursor: null } } } }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    };
+    try {
+      const cookie = await adminCookie(env);
+      const res = await sweep(env, cookie, 40);
+      assert.ok(res.split >= 3);
+      assert.deepEqual(liveTitles(db).map((r) => r.imdb_id), ["tt7000001", "tt7000002"]);
+      assert.ok(seen.some((f) => f.releaseYear), "must fall back to release-year slices");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
   it("does not run the TMDB episode bump (the feed already carries episodes)", async () => {
     const db = makeD1();
     const env = makeEnv({ DB: db, TMDB_API_KEY: "k" });

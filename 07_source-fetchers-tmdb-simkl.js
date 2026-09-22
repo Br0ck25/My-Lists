@@ -2009,7 +2009,10 @@ const JUSTWATCH_NEW_TITLES_QUERY = `query NewTitles($country: Country!, $date: D
   }
 }`;
 
-async function fetchJustWatchNewTitles({ country, date, packages, after }) {
+async function fetchJustWatchNewTitles({ country, date, packages, after, slice }) {
+  const filter = { packages: slice && slice.p ? slice.p : packages, monetizationTypes: ["FLATRATE"] };
+  if (slice && slice.o) filter.objectTypes = [slice.o];
+  if (slice && slice.y) filter.releaseYear = { min: slice.y[0], max: slice.y[1] };
   const res = await fetch(JUSTWATCH_GRAPHQL_URL, {
     method: "POST",
     headers: { "content-type": "application/json", "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
@@ -2021,7 +2024,7 @@ async function fetchJustWatchNewTitles({ country, date, packages, after }) {
         date,
         after: after || "",
         first: NEW_ON_STREAMING_JW_PAGE_SIZE,
-        filter: { packages, monetizationTypes: ["FLATRATE"] },
+        filter,
       },
     }),
   });
@@ -2106,6 +2109,22 @@ function processJustWatchNewTitles(edges, { env, region, dayEpoch, startPosition
   return position;
 }
 
+// JustWatch stops a newTitles query at 600 entries (JUSTWATCH_NEW_TITLES_CAP):
+// the 1st of a month, or a day Prime Video dumps a catalogue (Sep 12 2026:
+// 600+ Prime movies alone), silently loses the rest. A query that reports a
+// capped totalCount is split into narrower ones that partition it -- by
+// service, then movies vs seasons, then by halving the release-year range --
+// until each fits. (A title with no release year cannot be reached once the
+// year split starts; on a capped day that is the trade.)
+function splitJustWatchSlice(slice, packages) {
+  if (!slice.p) return packages.map((pkg) => ({ p: [pkg] }));
+  if (!slice.o) return [{ ...slice, o: "MOVIE" }, { ...slice, o: "SHOW_SEASON" }];
+  const [min, max] = slice.y || [1870, new Date().getUTCFullYear() + 2];
+  if (min >= max) return null;
+  const mid = Math.floor((min + max) / 2);
+  return [{ ...slice, y: [min, mid] }, { ...slice, y: [mid + 1, max] }];
+}
+
 function newOnStreamingJwDaysKey(region) {
   return `cron:newonstreaming:jwdays:${region}`;
 }
@@ -2183,15 +2202,20 @@ async function sweepJustWatchNewOnStreaming(env, ctx, fetchBudget, maxUnits, opt
     const refresh = offset < NEW_ON_STREAMING_JW_REFRESH_DAYS;
     const st = days[date] || {};
     if (!refresh && st.done) continue;
-    let after = refresh ? "" : (st.after || "");
-    let position = refresh ? 0 : (Number(st.position) || 0);
+    // A day's work is a queue of query slices (see splitJustWatchSlice);
+    // an unfinished day resumes from its queue and cursor. A finished recent
+    // day starts over so late additions are picked up.
+    const resume = !st.done && Array.isArray(st.queue) && st.queue.length;
+    let queue = resume ? st.queue.slice() : [{}];
+    let after = resume ? (st.after || "") : "";
+    let position = resume ? (Number(st.position) || 0) : 0;
     const dayEpoch = Math.floor(Date.UTC(Number(date.slice(0, 4)), Number(date.slice(5, 7)) - 1, Number(date.slice(8, 10))) / 1000);
-    let done = false;
     let failed = false;
-    while (budget > 0) {
+    while (budget > 0 && queue.length) {
+      const slice = queue[0];
       let page;
       try {
-        page = await fetchJustWatchNewTitles({ country, date, packages, after });
+        page = await fetchJustWatchNewTitles({ country, date, packages, after, slice });
       } catch (err) {
         summary.errors++;
         summary.lastError = err && err.message ? err.message : String(err);
@@ -2204,6 +2228,14 @@ async function sweepJustWatchNewOnStreaming(env, ctx, fetchBudget, maxUnits, opt
       budget--;
       summary.units++;
       await clearOnce();
+      if (!after && Number(page.totalCount) >= JUSTWATCH_NEW_TITLES_CAP) {
+        const parts = splitJustWatchSlice(slice, packages);
+        if (parts) {
+          queue = parts.concat(queue.slice(1));
+          summary.split = (summary.split || 0) + 1;
+          continue;
+        }
+      }
       position = processJustWatchNewTitles(page.edges, { env, region, dayEpoch, startPosition: position, nowSec, writes, summary });
       if (writes.length >= 40) {
         await d1BatchInChunks(env, writes, "New on Streaming JustWatch sweep");
@@ -2211,12 +2243,14 @@ async function sweepJustWatchNewOnStreaming(env, ctx, fetchBudget, maxUnits, opt
       }
       const info = page.pageInfo || {};
       if (!info.hasNextPage || !info.endCursor) {
-        done = true;
-        break;
+        queue = queue.slice(1);
+        after = "";
+      } else {
+        after = info.endCursor;
       }
-      after = info.endCursor;
     }
-    days[date] = done ? { done: true, at: nowSec } : { done: false, after: failed ? (st.after || "") : after, position, at: nowSec };
+    const done = !failed && queue.length === 0;
+    days[date] = done ? { done: true, at: nowSec } : { done: false, queue, after, position, at: nowSec };
     summary.days.push({ date, done, entries: position });
     if (failed) break;
   }
