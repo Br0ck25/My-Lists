@@ -137,6 +137,7 @@ async function resolveConfig(configParam, env) {
           betterPostersRatingSource: parsed.betterPostersRatingSource || "avg",
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
+          showBadgesWatchlist: parsed.showBadgesWatchlist !== false,
           showBadgesTraktContinueWatching: parsed.showBadgesTraktContinueWatching !== false,
           showBadgesMdblistUpNext: parsed.showBadgesMdblistUpNext !== false,
           showBadgesCatalogs: parsed.showBadgesCatalogs !== false,
