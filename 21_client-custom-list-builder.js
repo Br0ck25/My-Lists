@@ -3874,6 +3874,10 @@ function buildAiringNextCardHtml() {
       '</div>' +
       '<div class="list-card-actions">' +
         '<span style="font-size:0.78rem; color:var(--muted); white-space:nowrap;">Auto-tracked</span>' +
+        // Airing Next is the one tracked shelf with its own card renderer
+        // (every other one goes through buildLocalListCardHtml), so it was
+        // the one that did not get a Rebuild button when the others did.
+        '<button type="button" class="lc-btn secondary trackedShelfRebuildBtn" data-slug="airing-next" data-name="Airing Next" title="Replace this shelf on your account with what this device has">Rebuild</button>' +
         addBtnHtml +
       '</div>' +
     '</div>' +

@@ -238,13 +238,25 @@ describe("loading a preset never touches a tracked shelf", () => {
 });
 
 describe("Rebuild button on a tracked shelf", () => {
-  it("renders on each tracked shelf", () => {
+  it("renders on each shelf that goes through the shared card renderer", () => {
     const c = loadClient();
-    for (const slug of ["continue-watching", "airing-next", "watch-history", "watchlist"]) {
+    for (const slug of ["continue-watching", "watch-history", "watchlist"]) {
       const html = c.call("buildLocalListCardHtml", { slug, name: slug, type: "series", items: [] });
       assert.ok(html.includes("trackedShelfRebuildBtn"), slug + " should offer Rebuild");
       assert.ok(html.includes('data-slug="' + slug + '"'), slug);
     }
+  });
+
+  // Airing Next is the one tracked shelf with its OWN card renderer -- the
+  // dashboard calls buildAiringNextCardHtml for it and buildLocalListCardHtml
+  // for everything else. Asserting the shared renderer for all four passed
+  // while the real Airing Next card had no button at all, so this exercises
+  // the renderer the app actually uses.
+  it("renders on Airing Next, which has its own card renderer", () => {
+    const c = loadClient();
+    const html = c.call("buildAiringNextCardHtml");
+    assert.ok(html.includes("trackedShelfRebuildBtn"), "Airing Next should offer Rebuild");
+    assert.ok(html.includes('data-slug="airing-next"'));
   });
 
   it("does not render on an ordinary list", () => {

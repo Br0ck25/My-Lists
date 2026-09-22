@@ -16,6 +16,11 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - The settings ride the same Creator Profile sync as the badge settings, so enabling it in one browser enables it in the next.
 - Every poster on the website resolves through one funnel (`resolveClientPoster`, `19_client-search-and-likes.js`), which the surfaces above already reached via `resolveListCardItemPoster` (17), `resolveItemPoster` (22), `livePreviewPosterHtml` (23), `renderMediaCard` (16) and `loadPosterSlot` (19). The client mirror of the Worker's URL builder lives next to it, and the two are pinned to the same expected URLs by the same test file.
 
+### 🐛 Airing Next was the one tracked shelf with no Rebuild button
+
+- Every other shelf renders through `buildLocalListCardHtml`; Airing Next has its own renderer (`buildAiringNextCardHtml`, `21_client-custom-list-builder.js`), which the Rebuild change missed. Its card now carries the same button.
+- The test for this passed the whole time, because it called the *shared* renderer for all four slugs -- including the one slug that never reaches it. It now exercises `buildAiringNextCardHtml` directly, which is the renderer the dashboard actually calls for that card.
+
 ### 🐛 Drag-to-reorder stopped dead at the bottom of the screen
 
 - Nothing scrolled the page while a drag was in progress. `moveItem` places the dragged row among the rows **currently on screen**, so on any list taller than the window -- which is most of them once Live Preview shelves carry posters and each row is ~200px -- dragging past the last visible row did nothing: the row stopped at the edge and sat there. That is what "the drag freezes and won't move the list" was, and it applied to every list `createSortableList` drives (Catalogs, Live Preview, Your Custom Lists, the builders) on desktop and touch alike.
