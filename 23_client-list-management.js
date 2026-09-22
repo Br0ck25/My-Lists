@@ -275,7 +275,7 @@ async function testSourceRow(btn) {
       const more = data.maybeMore ? '+' : '';
       resultEl.className = 'testresult ok';
       const thumbs = (data.sample || []).filter((s) => s.poster).slice(0, 5).map((s) =>
-        '<img class="preview-thumb" src="' + escapeAttr(s.poster) + '" alt="' + escapeAttr(s.name) + '" title="' + escapeAttr(s.name) + '" loading="lazy">'
+        '<img class="preview-thumb" src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(s, s.poster) : s.poster) + '" alt="' + escapeAttr(s.name) + '" title="' + escapeAttr(s.name) + '" loading="lazy">'
       ).join('');
       const label = data.count === 0
         ? '\u2713 Reachable, but 0 items matched (check the movie/series toggle).'
@@ -315,6 +315,20 @@ function buildConfig(entries, keys) {
   if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
   if (keys && keys.adultContentFilter) payload.adultContentFilter = true;
   if (keys && keys.dedupeAcrossLists) payload.dedupeAcrossLists = true;
+  // BetterPosters. Only written when it is actually on, and each style key
+  // only when it differs from btttr.cc's default for that option -- an
+  // install link should not grow by eight keys for a feature left off, and a
+  // default style round-trips to the same URL either way.
+  if (keys && keys.betterPosters) {
+    payload.betterPosters = true;
+    if (keys.betterPostersGenre === false) payload.betterPostersGenre = false;
+    if (keys.betterPostersRating === false) payload.betterPostersRating = false;
+    if (keys.betterPostersTrendTags === false) payload.betterPostersTrendTags = false;
+    if (keys.betterPostersQuality) payload.betterPostersQuality = true;
+    if (keys.betterPostersAge) payload.betterPostersAge = true;
+    if (keys.betterPostersLang && keys.betterPostersLang !== 'en') payload.betterPostersLang = keys.betterPostersLang;
+    if (keys.betterPostersRatingSource && keys.betterPostersRatingSource !== 'avg') payload.betterPostersRatingSource = keys.betterPostersRatingSource;
+  }
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -533,6 +547,14 @@ function collectKeys() {
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
+    betterPosters: getBetterPostersSetting('betterPosters', false),
+    betterPostersGenre: getBetterPostersSetting('betterPostersGenre', true),
+    betterPostersRating: getBetterPostersSetting('betterPostersRating', true),
+    betterPostersTrendTags: getBetterPostersSetting('betterPostersTrendTags', true),
+    betterPostersQuality: getBetterPostersSetting('betterPostersQuality', false),
+    betterPostersAge: getBetterPostersSetting('betterPostersAge', false),
+    betterPostersLang: getBetterPostersChoice('betterPostersLang', 'en'),
+    betterPostersRatingSource: getBetterPostersChoice('betterPostersRatingSource', 'avg'),
     showBadgesAiringNext: getBadgeSetting('showBadgesAiringNext'),
     showBadgesContinueWatching: getBadgeSetting('showBadgesContinueWatching'),
     showBadgesTraktContinueWatching: getBadgeSetting('showBadgesTraktContinueWatching'),
@@ -540,6 +562,7 @@ function collectKeys() {
     showBadgesCatalogs: getBadgeSetting('showBadgesCatalogs'),
     showBadgesStremioAiringNext: getBadgeSetting('showBadgesStremioAiringNext'),
     showBadgesStremioContinueWatching: getBadgeSetting('showBadgesStremioContinueWatching'),
+    showBadgesStremioWatchlist: getBadgeSetting('showBadgesStremioWatchlist'),
     showBadgesStremioCatalogs: getBadgeSetting('showBadgesStremioCatalogs'),
     showBadgesStremio: getBadgeSetting('showBadgesStremio'),
     showBadgeAirDate: getBadgeSetting('showBadgeAirDate'),
@@ -665,6 +688,95 @@ function toggleBadgeSetting(key, isChecked) {
 }
 window.toggleBadgeSetting = toggleBadgeSetting;
 
+// --- Better Posters (btttr.cc) ---------------------------------------------
+//
+// Deliberately NOT getBadgeSetting: that one treats "absent" as on, which is
+// right for badges (they predate the stored setting) and wrong here -- the
+// master switch has to stay off until someone asks for it. So each key
+// carries its own default instead.
+function getBetterPostersSetting(key, defaultOn) {
+  try {
+    const v = localStorage.getItem('myListAddon:' + key);
+    if (v === null) return !!defaultOn;
+    return v === '1';
+  } catch (e) {
+    return !!defaultOn;
+  }
+}
+window.getBetterPostersSetting = getBetterPostersSetting;
+
+function getBetterPostersChoice(key, fallback) {
+  try {
+    return localStorage.getItem('myListAddon:' + key) || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+window.getBetterPostersChoice = getBetterPostersChoice;
+
+// One handler for both the checkboxes and the two dropdowns -- a boolean is
+// stored as 1/0, a dropdown value as itself.
+function toggleBetterPostersSetting(key, value) {
+  try {
+    localStorage.setItem('myListAddon:' + key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
+  } catch (e) {}
+  if (key === 'betterPosters') applyBetterPostersOptionsVisibility();
+  refreshBetterPostersSurfaces();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof saveState === 'function') saveState();
+}
+window.toggleBetterPostersSetting = toggleBetterPostersSetting;
+
+// No refetch needed. Every website surface resolves its poster at render time
+// through resolveClientPoster (19), and nothing writes the resolved URL back
+// onto the item, so the original poster is always still there to fall back to
+// when the setting goes off again -- re-rendering is the whole job. Surfaces
+// not currently on screen pick the change up when they next render, the same
+// way the badge settings behave.
+function refreshBetterPostersSurfaces() {
+  if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+  // Tiles already patched carry a done-marker; clear it so they are
+  // reconsidered under the new setting.
+  try {
+    document.querySelectorAll('[data-better-poster-done]').forEach((el) => { delete el.dataset.betterPosterDone; });
+  } catch (e) {}
+  if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(document);
+  if (typeof renderLivePreview === 'function') renderLivePreview();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+}
+window.refreshBetterPostersSurfaces = refreshBetterPostersSurfaces;
+
+// The style controls are meaningless while the master switch is off, so they
+// collapse rather than sitting there inert.
+function applyBetterPostersOptionsVisibility() {
+  const wrap = document.getElementById('betterPostersOptions');
+  if (!wrap) return;
+  wrap.style.display = getBetterPostersSetting('betterPosters', false) ? 'flex' : 'none';
+}
+window.applyBetterPostersOptionsVisibility = applyBetterPostersOptionsVisibility;
+
+const BETTER_POSTERS_TOGGLES = [
+  { key: 'betterPosters', id: 'betterPostersCheckbox', on: false },
+  { key: 'betterPostersGenre', id: 'betterPostersGenreCheckbox', on: true },
+  { key: 'betterPostersRating', id: 'betterPostersRatingCheckbox', on: true },
+  { key: 'betterPostersTrendTags', id: 'betterPostersTrendTagsCheckbox', on: true },
+  { key: 'betterPostersQuality', id: 'betterPostersQualityCheckbox', on: false },
+  { key: 'betterPostersAge', id: 'betterPostersAgeCheckbox', on: false },
+];
+
+function initBetterPostersSettingsUI() {
+  BETTER_POSTERS_TOGGLES.forEach(({ key, id, on }) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = getBetterPostersSetting(key, on);
+  });
+  const langEl = document.getElementById('betterPostersLangSelect');
+  if (langEl) langEl.value = getBetterPostersChoice('betterPostersLang', 'en');
+  const rsEl = document.getElementById('betterPostersRatingSourceSelect');
+  if (rsEl) rsEl.value = getBetterPostersChoice('betterPostersRatingSource', 'avg');
+  applyBetterPostersOptionsVisibility();
+}
+window.initBetterPostersSettingsUI = initBetterPostersSettingsUI;
+
 function initBadgeSettingsUI() {
   const badgeKeys = [
     { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
@@ -674,6 +786,7 @@ function initBadgeSettingsUI() {
     { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
     { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
     { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+    { key: 'showBadgesStremioWatchlist', id: 'badgeStremioWatchlistCheckbox' },
     { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
     { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
     { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
@@ -712,6 +825,7 @@ function initBadgeSettingsUI() {
 window.initBadgeSettingsUI = initBadgeSettingsUI;
 document.addEventListener('DOMContentLoaded', () => {
   initBadgeSettingsUI();
+  initBetterPostersSettingsUI();
 });
 
 // --- Live Preview -----------------------------------------------------------
@@ -763,7 +877,17 @@ function _liveFallbackMeta(it, defaultType) {
     showId: it.showId || it.id,
     type: it.type || defaultType || (it.episodeTitle ? 'series' : 'series'),
     name: it.name || it.title,
-    poster: it.poster,
+    // Resolved the same way the Lists tab resolves it. Reading it.poster
+    // alone left every Airing Next tile as "No poster": those items carry no
+    // poster of their own, and My Lists only ever showed one because
+    // resolveListCardItemPoster falls back to showPoster and then to a
+    // metahub poster built from the show's IMDb id. Live Preview had no such
+    // fallback, so the two surfaces disagreed about the same item -- and
+    // turning Better Posters on masked it, since that builds a URL from the
+    // id and never needs a poster field at all.
+    poster: (typeof resolveListCardItemPoster === 'function')
+      ? resolveListCardItemPoster(it)
+      : (it.poster || it.showPoster || ''),
     year: it.year || it.releaseInfo,
     showTitle: it.showTitle || it.name || it.title,
     seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
@@ -846,13 +970,7 @@ async function renderLivePreview() {
       // so only these get hidden rather than shown empty; the row's config
       // is untouched, so the moment the account has something in it again,
       // the same row picks it back up as it normally would.
-      const isPersonalTrackedShelf = (s.url || '').split('\\n').some((line) => {
-        const u = line.trim().toLowerCase();
-        return u.startsWith('autotrack:') ||
-          u.startsWith('trakt:watchlist') || u.startsWith('trakt:history') || u.startsWith('trakt:airing-next') || u.startsWith('trakt:continue-watching') || u.startsWith('trakt:user:') ||
-          u.startsWith('mdblist:watchlist') || u.startsWith('mdblist:history') || u.startsWith('mdblist:airing-next') || u.startsWith('mdblist:upnext') || u.startsWith('mdblist:user:') ||
-          u.startsWith('simkl:watchlist') || u.startsWith('simkl:history') || u.startsWith('simkl:airing-next') || u.startsWith('simkl:user:');
-      });
+      const isPersonalTrackedShelf = isPersonalShelfUrlClient(s.url);
 
       if (s.name && s.name.toLowerCase().includes('watch history')) {
         postersContainer.classList.add('is-watch-history-shelf');
@@ -872,7 +990,18 @@ async function renderLivePreview() {
         };
       }
       
-      function getFallbackShelfSample() {
+      // The sample to show INSTEAD of what /api/preview returned, for the two
+      // shelves that have a locally-known copy.
+      //
+      // It has to come from the account that actually backs THIS shelf. It
+      // used to try Trakt first for any Continue Watching / Airing Next row
+      // whatever its URL, so a row tracked by this add-on
+      // (autotrack:continue-watching:...) was shown the connected TRAKT
+      // account's shelf instead of its own. Two different accounts, two
+      // different sets of shows -- which is why the Lists tab and Live Preview
+      // could disagree about the same row, and why syncing the add-on's own
+      // shelf to the account changed nothing: this path never read it.
+      function traktShelfSample(stillUpcoming) {
         if (isCwShelf) {
           const lists = window._myPrivateTraktLists || window._myTraktLists || [];
           const cwList = lists.find((l) => l && (l.statusKey === 'continue-watching' || l.slug === 'continue-watching' || (l.url && (l.url === 'trakt:continue-watching' || l.url.includes(':continue-watching')))));
@@ -893,7 +1022,6 @@ async function renderLivePreview() {
           // episode (or whose episode has since aired) get merged in as if
           // they were real Airing Next entries, inflating the shelf beyond
           // what Trakt actually has scheduled.
-          const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
           let cachedAiring = null;
           try {
             cachedAiring = JSON.parse(localStorage.getItem('myListAddon:traktAiringNextCache') || 'null');
@@ -910,6 +1038,36 @@ async function renderLivePreview() {
           }
         }
         return null;
+      }
+
+      // This add-on's own auto-tracked shelf -- the exact list the Lists tab
+      // renders, and the only copy guaranteed current on this device.
+      function addonShelfSample(stillUpcoming) {
+        const localSlug = isCwShelf ? 'continue-watching' : (isAiringShelf ? 'airing-next' : '');
+        if (!localSlug || typeof loadLocalCustomLists !== 'function') return null;
+        const localList = loadLocalCustomLists()[localSlug];
+        let items = (localList && Array.isArray(localList.items)) ? localList.items : [];
+        if (!items.length) return null;
+        if (isAiringShelf) {
+          items = stillUpcoming(items);
+        } else if (s.type === 'movie') {
+          items = items.filter((it) => it && (it.type === 'movie' || it.kind === 'movie'));
+        } else if (s.type === 'series') {
+          items = items.filter((it) => it && (it.type === 'series' || it.kind === 'series' || it.episodeTitle || it.seasonNum != null || it.episodeNum != null || it.season != null));
+        }
+        return items.length ? items : null;
+      }
+
+      function getFallbackShelfSample() {
+        const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+        // An "autotrack:" row is this add-on's own shelf, so its own list is
+        // the only right answer -- never a connected Trakt account's.
+        if ((s.url || '').toLowerCase().indexOf('autotrack:') !== -1) {
+          return addonShelfSample(stillUpcoming);
+        }
+        // Everything else keeps the behaviour it had: Trakt's copy where there
+        // is one, and the add-on's own list only as a last resort.
+        return traktShelfSample(stillUpcoming) || addonShelfSample(stillUpcoming);
       }
       
       try {
@@ -1040,6 +1198,11 @@ async function renderLivePreview() {
     const seenByType = {};
     livePreviewShelfData.forEach((shelf, i) => {
       if (!shelf || !Array.isArray(shelf.sample) || !shelf.sample.length) return;
+      // Same exclusion the Worker applies in dedupeAcrossListEntries
+      // (05_catalog-core.js): a personal shelf is neither stripped nor a
+      // source of strips. Preview has to agree with what gets served, or the
+      // editor shows a shelf the install does not.
+      if (isPersonalShelfUrlClient(shelf.url)) return;
       const seen = seenByType[shelf.type] || (seenByType[shelf.type] = new Set());
       const before = shelf.sample.length;
       shelf.sample = shelf.sample.filter((item) => item && item.id && !seen.has(item.id));
@@ -1187,6 +1350,7 @@ function getPosterBadgeSettings() {
     traktContinueWatching: get('showBadgesTraktContinueWatching'),
     mdblistUpNext: get('showBadgesMdblistUpNext'),
     airingNext: get('showBadgesAiringNext'),
+    catalogs: get('showBadgesCatalogs'),
     airDate: get('showBadgeAirDate'),
     seasonPremiere: get('showBadgeSeasonPremiere'),
     seasonFinale: get('showBadgeSeasonFinale'),
@@ -1363,6 +1527,9 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
 
   var first = items.slice(0, POSTER_GRID_FIRST_CHUNK);
   gridEl.insertAdjacentHTML('beforeend', first.map(livePreviewPosterHtml).join(''));
+  // A TMDB-id-only item cannot get a BetterPosters URL at render time, so
+  // the ids for what just landed on screen are translated and patched in.
+  if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
 
   if (items.length <= POSTER_GRID_FIRST_CHUNK) {
     if (typeof onComplete === 'function') onComplete(items.length);
@@ -1385,6 +1552,7 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
       return;
     }
     gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
     cursor += slice.length;
     if (cursor < items.length) {
       schedule(step);
@@ -1419,6 +1587,7 @@ function appendPosterGridItems(gridEl, items) {
     var slice = items.slice(cursor, cursor + POSTER_GRID_BATCH);
     if (!slice.length) return;
     gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
     cursor += slice.length;
     if (cursor < items.length) schedule(step);
   }
@@ -1426,14 +1595,36 @@ function appendPosterGridItems(gridEl, items) {
 }
 window.appendPosterGridItems = appendPosterGridItems;
 
+// Client mirror of isPersonalShelfUrl (00_constants.js) -- Continue Watching,
+// Airing Next, Watch History and Watchlist, from any provider. Kept in step
+// with it by tests/personal-shelves.test.mjs, which asserts both sides answer
+// the same for the same URLs.
+function isPersonalShelfUrlClient(url) {
+  if (!url) return false;
+  return String(url).split(/[\\r\\n]+/).some((line) => {
+    const u = line.trim().toLowerCase();
+    if (!u) return false;
+    return u.indexOf('autotrack:') === 0 ||
+      u.indexOf('trakt:watchlist') === 0 || u.indexOf('trakt:history') === 0 || u.indexOf('trakt:airing-next') === 0 || u.indexOf('trakt:continue-watching') === 0 || u.indexOf('trakt:user:') === 0 ||
+      u.indexOf('mdblist:watchlist') === 0 || u.indexOf('mdblist:history') === 0 || u.indexOf('mdblist:airing-next') === 0 || u.indexOf('mdblist:upnext') === 0 || u.indexOf('mdblist:user:') === 0 ||
+      u.indexOf('simkl:watchlist') === 0 || u.indexOf('simkl:history') === 0 || u.indexOf('simkl:airing-next') === 0 || u.indexOf('simkl:user:') === 0;
+  });
+}
+window.isPersonalShelfUrlClient = isPersonalShelfUrlClient;
+
 function livePreviewPosterHtml(m) {
-  if (typeof resolveClientPoster === 'function') {
-    m.poster = resolveClientPoster(m, m.poster);
-  }
+  // Resolved into a local, never written back onto m. It used to assign
+  // "m.poster = ..." to it, which meant a re-render of the same cached item saw the
+  // already-resolved URL as its own original -- harmless while the result was
+  // stable, but it would make a Better Posters URL stick after the setting was
+  // switched back off, with no original left to restore.
+  const resolvedPoster = (typeof resolveClientPoster === 'function')
+    ? resolveClientPoster(m, m.poster)
+    : m.poster;
   const landscape = m.posterShape === 'landscape';
   const posterClass = 'live-preview-poster' + (landscape ? ' landscape' : '');
-  const posterEl = m.poster
-    ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)" data-imdb="' + escapeAttr(m.id || '') + '"><div class="' + posterClass + ' live-preview-poster-placeholder" style="display:none;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>'
+  const posterEl = resolvedPoster
+    ? '<img class="' + posterClass + '" src="' + escapeAttr(resolvedPoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)" data-imdb="' + escapeAttr(m.id || '') + '"><div class="' + posterClass + ' live-preview-poster-placeholder" style="display:none;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>'
     : '<div class="' + posterClass + ' live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
   
   const parentUrl = (m.listUrl || (window._currentListDetailsParams ? window._currentListDetailsParams.listUrl : '') || '').toLowerCase();
@@ -1454,6 +1645,12 @@ function livePreviewPosterHtml(m) {
 
   const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext || isTraktCwContext || isMdblistUpNextContext);
   const isAiringItem = !!(m.isAiringNext || m.listSlug === 'airing-next' || isAiringListContext);
+  // A Watchlist shelf carries the same premiere / finale / air-date chips now
+  // that fetchAutoTrackedCatalog enriches it from the same Airing Next data
+  // (05_catalog-core.js). Checked AFTER the two above so a shelf that is both
+  // keeps its more specific meaning.
+  const isWatchlistListContext = parentUrl.includes('watchlist') || parentName.includes('watchlist') || decodedSlug === 'watchlist';
+  const isWatchlistItem = !isCwItem && !isAiringItem && !!(m.listSlug === 'watchlist' || isWatchlistListContext);
 
   let removeBtn = '';
   if (!m.isLivePreviewShelf && !m.hideRemoveBtn) {
@@ -1482,7 +1679,9 @@ function livePreviewPosterHtml(m) {
         ? (badgeSettings.mdblistUpNext !== false)
         : (isCwItem
             ? badgeSettings.continueWatching
-            : (isAiringItem ? badgeSettings.airingNext : false)));
+            : (isAiringItem
+                ? badgeSettings.airingNext
+                : (isWatchlistItem ? badgeSettings.catalogs !== false : false))));
 
   const showAirDate = locationAllowed && badgeSettings.airDate;
   const showPremiere = locationAllowed && badgeSettings.seasonPremiere;
@@ -1567,7 +1766,12 @@ function livePreviewPosterHtml(m) {
     subtitleHtml = '<div class="live-preview-poster-subtitle" style="display:flex; align-items:center; justify-content:flex-end; gap:4px; width:100%;">' + ratingSpan + '</div>';
   }
   const extraCardClass = isTraktCwContext ? ' detail-page-trakt-continue-watching' : (isMdblistUpNextContext ? ' detail-page-mdblist-up-next' : '');
-  return '<div class="live-preview-poster-card clickable-poster' + extraCardClass + '" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
+  // resolvedPoster, not m.poster: this attribute is what the poster modal
+  // reads back, so it has to carry the same URL the tile is showing -- the
+  // safe-poster stand-in for a filtered adult item, and the Better Posters
+  // URL when that is on. It used to match only because the poster was
+  // assigned onto m above.
+  return '<div class="live-preview-poster-card clickable-poster' + extraCardClass + '" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(resolvedPoster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
       dateBadge +
@@ -2893,14 +3097,44 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       listUrl.startsWith('trakt:watchlist') || listUrl.startsWith('trakt:history') || listUrl.startsWith('trakt:airing-next') || listUrl.startsWith('trakt:continue-watching') ||
       listUrl.startsWith('trakt:user:') || listUrl.startsWith('mdblist:user:')
     );
-    if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
+    // A channel published to Explore Channels IS likeable -- the directory's
+    // own cards have had a heart all along -- but by its published code
+    // against /api/channel/like, not by a list URL against the list ledger.
+    // That is why the channel: exclusion below is right and the button was
+    // still missing here: there was no channel-flavoured branch to fall into.
+    // Only a channel opened FROM the directory has a code; one of your own
+    // saved channels has nothing published to like.
+    const channelLikeCode = (opts && opts.channelLikeCode) || '';
+    if (channelLikeCode) {
+      const chLiked = typeof _channelDirectoryLiked !== 'undefined' && !!_channelDirectoryLiked[channelLikeCode];
+      likeBtn.style.display = '';
+      // Cleared, not left stale: the delegated .searchLikeExternalBtn handler
+      // (19_client-search-and-likes.js) acts on dataset.url and returns early
+      // without one, so this button reaches only the channel path below --
+      // the same arrangement the directory's own hearts already use.
+      delete likeBtn.dataset.url;
+      likeBtn.dataset.channelLikeCode = channelLikeCode;
+      likeBtn.setAttribute('aria-label', 'Like this channel');
+      likeBtn.title = 'Like this channel';
+      likeBtn.classList.toggle('liked', chLiked);
+      likeBtn.innerHTML = chLiked ? '&#9829;' : '&#9825;';
+      likeBtn.onclick = function() {
+        if (typeof toggleChannelDirectoryLike === 'function') toggleChannelDirectoryLike(channelLikeCode, likeBtn);
+      };
+    } else if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;
+      delete likeBtn.dataset.channelLikeCode;
+      likeBtn.onclick = null;
+      likeBtn.setAttribute('aria-label', 'Like this list');
+      likeBtn.title = 'Like this list';
       likeBtn.classList.toggle('liked', isLiked);
       likeBtn.innerHTML = isLiked ? '&#9829;' : '&#9825;';
     } else {
       likeBtn.style.display = 'none';
+      delete likeBtn.dataset.channelLikeCode;
+      likeBtn.onclick = null;
     }
   }
 

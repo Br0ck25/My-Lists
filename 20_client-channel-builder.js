@@ -105,8 +105,9 @@ function renderChannelTitleResults(results, searchType = 'tv') {
   }
   const isMovie = searchType === 'movie';
   const cardsHtml = results.map((r) => {
-    const posterImg = r.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+    const rPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(r, r.poster || '') : (r.poster);
+    const posterImg = rPoster
+      ? '<img class="preview-thumb" src="' + escapeAttr(rPoster) + '" alt="" loading="lazy" style="cursor:pointer;">'
       : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No poster</div>';
     const btnLabel = isMovie ? '+ Add Movie' : '+ Browse';
     const cardClass = isMovie ? 'channelMovieCard' : 'channelTitleCard';
@@ -9336,7 +9337,7 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
 
       return '<div class="list-card-mini-poster-tile">' +
         '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)">' +
-          '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
+          '<img src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(ep, posterUrl) : (posterUrl)) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
           overlays +
         '</div>' +
         '<div class="list-card-mini-poster-name" title="' + escapeAttr(itemTitle) + '">' + escapeHtml(itemTitle) + '</div>' +
@@ -10056,7 +10057,10 @@ function channelItemsInPlayOrder(items, channel) {
 // lookup below is about finding a channel that IS saved here, and none of
 // them can find one that is not, so a caller holding the channel already
 // hands it straight over.
-function openChannelDetailsPage(channelIdOrDivId, channelOverride) {
+// directoryCode is set only when this was opened from Explore Channels, and
+// it is what the Like button on the details page acts on -- a channel is
+// liked by its published code, not by a list URL the way a list is.
+function openChannelDetailsPage(channelIdOrDivId, channelOverride, directoryCode) {
   const map = loadLocalChannels();
   let channel = channelOverride || map[channelIdOrDivId];
   if (!channel) {
@@ -10257,7 +10261,11 @@ function channelItemId(it, idx) {
 
   const channelUrl = channel.channelId ? ('channel:id:' + channel.channelId) : ('channel:v1:' + (channel.name || 'channel'));
   if (typeof openListDetailsPage === 'function') {
-    openListDetailsPage(channel.name || 'TV Channel', 'series', channelUrl, { sample: sample, count: sample.length, maybeMore: false });
+    openListDetailsPage(
+      channel.name || 'TV Channel', 'series', channelUrl,
+      { sample: sample, count: sample.length, maybeMore: false },
+      directoryCode ? { channelLikeCode: directoryCode } : undefined
+    );
   }
 }
 
@@ -11333,8 +11341,9 @@ function renderChannelPersonResults(results) {
     return;
   }
   const cards = results.map((p) => {
-    const img = p.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(p.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+    const pPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(p, p.poster || '') : (p.poster);
+    const img = pPoster
+      ? '<img class="preview-thumb" src="' + escapeAttr(pPoster) + '" alt="" loading="lazy" style="cursor:pointer;">'
       : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No photo</div>';
     const data = ' data-personid="' + escapeAttr(String(p.personId)) + '" data-personname="' + escapeAttr(p.name) + '"';
     return '<div class="custom-list-search-item channelPersonCard" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
@@ -11398,7 +11407,7 @@ function setChannelSpotlightSortAndReload(value) {
 }
 
 function channelPersonCreditCardHtml(credit, isShow) {
-  const poster = credit.poster || '';
+  const poster = typeof resolveClientPoster === 'function' ? resolveClientPoster(credit, credit.poster || '') : (credit.poster || '');
   const img = poster
     ? '<img class="preview-thumb" src="' + escapeAttr(poster) + '" alt="" loading="lazy">'
     : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
@@ -12147,7 +12156,7 @@ async function previewDirectoryChannel(code, btn) {
     // could collide with a saved channel's would make "+ Add" on the details
     // page act on the wrong one.
     const preview = Object.assign({}, data.channel, { channelId: 'directory:' + code });
-    openChannelDetailsPage(preview.channelId, preview);
+    openChannelDetailsPage(preview.channelId, preview, code);
   } catch (e) {
     showAppAlert('Explore Channels', 'Network error while opening that channel.');
   } finally {
@@ -12158,12 +12167,27 @@ async function previewDirectoryChannel(code, btn) {
   }
 }
 
+// Repaints a Like button that is NOT part of the directory feed -- the one on
+// a channel's "See All" page. renderChannelDirectory() redraws the feed's own
+// hearts, but that feed is not on screen while the details page is, so this
+// button has to be updated by hand.
+function syncChannelLikeButton(code) {
+  const sel = (window.CSS && CSS.escape) ? CSS.escape(String(code)) : String(code);
+  const el = document.querySelector('[data-channel-like-code="' + sel + '"]');
+  if (!el) return;
+  const liked = !!_channelDirectoryLiked[code];
+  el.classList.toggle('liked', liked);
+  el.innerHTML = liked ? '&#9829;' : '&#9825;';
+}
+window.syncChannelLikeButton = syncChannelLikeButton;
+
 async function toggleChannelDirectoryLike(code, btn) {
   const wasLiked = !!_channelDirectoryLiked[code];
   // Filled in before the round trip so the heart answers the tap, and put
   // back if the server disagrees -- it holds the ledger, this does not.
   _channelDirectoryLiked[code] = !wasLiked;
   renderChannelDirectory();
+  syncChannelLikeButton(code);
   try {
     const body = { code: code, action: wasLiked ? 'unlike' : 'like' };
     const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
@@ -12180,15 +12204,18 @@ async function toggleChannelDirectoryLike(code, btn) {
     if (!data.ok) {
       _channelDirectoryLiked[code] = wasLiked;
       renderChannelDirectory();
+      syncChannelLikeButton(code);
       return;
     }
     _channelDirectoryLiked[code] = !!data.liked;
     const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
     if (entry) entry.likes = data.likes;
     renderChannelDirectory();
+    syncChannelLikeButton(code);
   } catch (e) {
     _channelDirectoryLiked[code] = wasLiked;
     renderChannelDirectory();
+    syncChannelLikeButton(code);
   }
 }
 

@@ -17,6 +17,17 @@ function renderBuilder(
   const initialHideNonDigitalReleases = !!initialKeys.hideNonDigitalReleases;
   const initialAdultContentFilter = !!initialKeys.adultContentFilter;
   const initialDedupeAcrossLists = !!initialKeys.dedupeAcrossLists;
+  // BetterPosters (btttr.cc). Opt-in, so the master switch defaults off while
+  // each style control defaults to btttr.cc's own default for that option --
+  // see decodeConfig (02_http-and-creator-utils.js).
+  const initialBetterPosters = !!initialKeys.betterPosters;
+  const initialBetterPostersGenre = initialKeys.betterPostersGenre !== false;
+  const initialBetterPostersRating = initialKeys.betterPostersRating !== false;
+  const initialBetterPostersQuality = !!initialKeys.betterPostersQuality;
+  const initialBetterPostersAge = !!initialKeys.betterPostersAge;
+  const initialBetterPostersTrendTags = initialKeys.betterPostersTrendTags !== false;
+  const betterPostersLangOptionsHtml = buildBetterPostersLangOptionsHtml(initialKeys.betterPostersLang || "en");
+  const betterPostersRatingSourceOptionsHtml = buildBetterPostersRatingSourceOptionsHtml(initialKeys.betterPostersRatingSource || "avg");
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();

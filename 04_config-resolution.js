@@ -124,6 +124,17 @@ async function resolveConfig(configParam, env) {
           hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
           adultContentFilter: !!parsed.adultContentFilter,
           dedupeAcrossLists: !!parsed.dedupeAcrossLists,
+          // See decodeConfig (02_http-and-creator-utils.js) for why
+          // betterPosters itself defaults off while its style keys default
+          // to btttr.cc's own defaults.
+          betterPosters: !!parsed.betterPosters,
+          betterPostersGenre: parsed.betterPostersGenre !== false,
+          betterPostersRating: parsed.betterPostersRating !== false,
+          betterPostersQuality: !!parsed.betterPostersQuality,
+          betterPostersAge: !!parsed.betterPostersAge,
+          betterPostersTrendTags: parsed.betterPostersTrendTags !== false,
+          betterPostersLang: parsed.betterPostersLang || "en",
+          betterPostersRatingSource: parsed.betterPostersRatingSource || "avg",
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
           showBadgesTraktContinueWatching: parsed.showBadgesTraktContinueWatching !== false,
@@ -132,6 +143,7 @@ async function resolveConfig(configParam, env) {
           showBadgesStremioAiringNext: parsed.showBadgesStremioAiringNext !== false,
           showBadgesStremioContinueWatching: parsed.showBadgesStremioContinueWatching !== false,
           showBadgesStremioCatalogs: parsed.showBadgesStremioCatalogs !== false,
+          showBadgesStremioWatchlist: parsed.showBadgesStremioWatchlist !== false,
           showBadgesStremio: parsed.showBadgesStremio !== false,
         };
       } catch {

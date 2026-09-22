@@ -359,7 +359,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // with no CONFIGS KV binding, and without KV there are no Creator Profiles for
 // a personal shelf to belong to.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false, dedupeAcrossLists: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false, dedupeAcrossLists: false, betterPosters: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -412,6 +412,22 @@ function decodeConfig(config) {
       // where this is actually applied. Defaults to false, same reasoning
       // as region/hideNonDigitalReleases above.
       dedupeAcrossLists: !!(!Array.isArray(parsed) && parsed.dedupeAcrossLists),
+      // Badge toggles default ON when absent, the way the others here do, so
+      // an install predating this one keeps showing them.
+      showBadgesStremioWatchlist: Array.isArray(parsed) || parsed.showBadgesStremioWatchlist !== false,
+      // BetterPosters (btttr.cc) replacement artwork -- see
+      // applyBetterPostersToMetas (05_catalog-core.js). Opt-in, so it
+      // defaults to false and every install predating it is untouched. The
+      // style keys below only matter when betterPosters itself is on, and
+      // each one defaults to btttr.cc's own default for that option.
+      betterPosters: !!(!Array.isArray(parsed) && parsed.betterPosters),
+      betterPostersGenre: Array.isArray(parsed) || parsed.betterPostersGenre !== false,
+      betterPostersRating: Array.isArray(parsed) || parsed.betterPostersRating !== false,
+      betterPostersQuality: !!(!Array.isArray(parsed) && parsed.betterPostersQuality),
+      betterPostersAge: !!(!Array.isArray(parsed) && parsed.betterPostersAge),
+      betterPostersTrendTags: Array.isArray(parsed) || parsed.betterPostersTrendTags !== false,
+      betterPostersLang: (!Array.isArray(parsed) && parsed.betterPostersLang) || "en",
+      betterPostersRatingSource: (!Array.isArray(parsed) && parsed.betterPostersRatingSource) || "avg",
     };
   } catch {
     return empty;

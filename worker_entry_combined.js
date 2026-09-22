@@ -990,6 +990,128 @@ const D1_SCHEMA_MANIFEST = [
   },
 ];
 
+
+// ---------------------------------------------------------------------------
+// BetterPosters (https://btttr.cc) -- optional replacement artwork.
+//
+// BetterPosters renders a title's poster with the text baked in: genre, star
+// rating, a trend tag ("Trending"/"New"), quality flags (4K/DV/Atmos) and an
+// age rating. It keys off the IMDB id alone -- no API key, no account, nothing
+// to register -- so the whole integration is a URL rewrite over metas this
+// add-on already built. Off by default; "Better Posters" in Settings ->
+// Artwork & Badges turns it on.
+//
+// The URL contract is the one btttr.cc's own configurator emits for external
+// add-ons (its "AIOMetadata / Other Addon" mode):
+//
+//   https://btttr.cc/{base}/imdb/poster-default/{imdb_id}.jpg[?tag=none][&lang=..][&rs=..]
+//
+// {base} is what selects the artwork -- NOT the literal "poster-default"
+// segment after it. That segment is fixed: the service ignores whatever is put
+// there (every value, including a nonsense one, returns byte-identical bytes),
+// which is why the nuvio-better-posters-addon project's single hard-coded
+// "/poster/imdb/poster-default/{id}.jpg" only ever yields the default style.
+// buildBetterPosterUrl (05_catalog-core.js) assembles the base properly.
+const BETTER_POSTERS_ORIGIN = "https://btttr.cc";
+
+// Rating sources btttr.cc accepts for "rs", straight off its configurator's
+// own dropdown. "avg" is its default and is sent as no parameter at all.
+const BETTER_POSTERS_RATING_SOURCES = [
+  { value: "avg", label: "Average" },
+  { value: "IM", label: "IMDb (/10)" },
+  { value: "TM", label: "TMDB (/10)" },
+  { value: "RT", label: "Rotten Tomatoes (%)" },
+  { value: "MC", label: "Metacritic (/100)" },
+  { value: "TR", label: "Trakt (/10)" },
+  { value: "LB", label: "Letterboxd (/5)" },
+  { value: "RE", label: "Roger Ebert (/4)" },
+];
+
+// Languages btttr.cc's configurator offers for "lang". Anything not on this
+// list is treated as English (again: sent as no parameter).
+const BETTER_POSTERS_LANGS = [
+  { value: "en", label: "English" },
+  { value: "es-ES", label: "Espa\u00f1ol (Espa\u00f1a)" },
+  { value: "es-MX", label: "Espa\u00f1ol (Latinoam\u00e9rica)" },
+  { value: "fr", label: "Fran\u00e7ais" },
+  { value: "de", label: "Deutsch" },
+  { value: "pt-BR", label: "Portugu\u00eas (Brasil)" },
+  { value: "pt-PT", label: "Portugu\u00eas (Portugal)" },
+  { value: "it", label: "Italiano" },
+  { value: "nl", label: "Nederlands" },
+  { value: "pl", label: "Polski" },
+  { value: "ru", label: "\u0420\u0443\u0441\u0441\u043a\u0438\u0439" },
+  { value: "tr", label: "T\u00fcrk\u00e7e" },
+  { value: "ar", label: "\u0627\u0644\u0639\u0631\u0628\u064a\u0629" },
+  { value: "ja", label: "\u65e5\u672c\u8a9e" },
+  { value: "ko", label: "\ud55c\uad6d\uc5b4" },
+  { value: "zh", label: "\u4e2d\u6587" },
+  { value: "hi", label: "\u0939\u093f\u0928\u094d\u0926\u0940" },
+  { value: "sv", label: "Svenska" },
+  { value: "cs", label: "\u010ce\u0161tina" },
+];
+
+function buildBetterPostersLangOptionsHtml(selected) {
+  const sel = BETTER_POSTERS_LANGS.some((l) => l.value === selected) ? selected : "en";
+  return BETTER_POSTERS_LANGS.map(
+    ({ value, label }) => `<option value="${value}"${value === sel ? " selected" : ""}>${label}</option>`
+  ).join("");
+}
+
+function buildBetterPostersRatingSourceOptionsHtml(selected) {
+  const sel = BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === selected) ? selected : "avg";
+  return BETTER_POSTERS_RATING_SOURCES.map(
+    ({ value, label }) => `<option value="${value}"${value === sel ? " selected" : ""}>${label}</option>`
+  ).join("");
+}
+
+// --- personal, auto-tracked shelves --------------------------------------
+//
+// Continue Watching, Airing Next, Watch History and Watchlist, across every
+// provider that can supply one. These are not lists in the ordinary sense:
+// each is a live view OF ONE ACCOUNT, derived per request, and its whole job
+// is to answer "what am I in the middle of / what is next for me".
+//
+// That makes them the wrong input and the wrong target for anything that
+// treats lists as interchangeable collections -- "Remove duplicate items
+// across lists" most of all, which would otherwise strip the show you are
+// three episodes into out of Continue Watching purely because it also turned
+// up in Trending higher on the page.
+const PERSONAL_SHELF_URL_PREFIXES = [
+  "autotrack:",
+  "trakt:watchlist", "trakt:history", "trakt:airing-next", "trakt:continue-watching", "trakt:user:",
+  "mdblist:watchlist", "mdblist:history", "mdblist:airing-next", "mdblist:upnext", "mdblist:user:",
+  "simkl:watchlist", "simkl:history", "simkl:airing-next", "simkl:user:",
+];
+
+// True when ANY source line of a (possibly merged) row names a personal
+// shelf -- a merged row carrying one is still reading somebody's account.
+function isPersonalShelfUrl(url) {
+  if (!url) return false;
+  return String(url).split(/[\r\n]+/).some((line) => {
+    const u = line.trim().toLowerCase();
+    return !!u && PERSONAL_SHELF_URL_PREFIXES.some((p) => u.startsWith(p));
+  });
+}
+
+// How many TMDB->IMDB translations one /api/imdb-ids call will do. Each is a
+// separate outbound request, so this is the per-request subrequest ceiling for
+// that endpoint -- sized to cover a Curated card's poster strip plus headroom,
+// and to stay well inside the 50 a free Workers plan allows per request.
+const IMDB_ID_LOOKUP_MAX = 24;
+
+// The Stremio/Nuvio artwork-overlay toggles, as stored in an install config.
+// Named in one place because they have to agree across four: the builder
+// page's save request, /api/save's stored payload, resolveConfig's read, and
+// the badge gate in fetchCatalog. Each reads as ON when absent, so only a
+// switched-off one is ever written.
+const STREMIO_BADGE_KEYS = [
+  "showBadgesStremio",
+  "showBadgesStremioAiringNext",
+  "showBadgesStremioContinueWatching",
+  "showBadgesStremioWatchlist",
+  "showBadgesStremioCatalogs",
+];
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -2744,7 +2866,7 @@ function deterministicDailyShuffle(array, salt = "") {
 // with no CONFIGS KV binding, and without KV there are no Creator Profiles for
 // a personal shelf to belong to.
 function decodeConfig(config) {
-  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false, dedupeAcrossLists: false };
+  const empty = { entries: [], tmdbKey: "", mdblistKey: "", mdblistAccessToken: "", traktKey: "", traktUsername: "", traktAccessToken: "", simklKey: "", simklAccessToken: "", track: false, trackCreatorName: "", trackCreatorKey: "", trackOwner: "", shuffleShelves: false, shuffleItems: false, region: "US", hideNonDigitalReleases: false, adultContentFilter: false, dedupeAcrossLists: false, betterPosters: false };
   try {
     const b64 = config.replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64 + "===".slice((b64.length + 3) % 4);
@@ -2797,6 +2919,22 @@ function decodeConfig(config) {
       // where this is actually applied. Defaults to false, same reasoning
       // as region/hideNonDigitalReleases above.
       dedupeAcrossLists: !!(!Array.isArray(parsed) && parsed.dedupeAcrossLists),
+      // Badge toggles default ON when absent, the way the others here do, so
+      // an install predating this one keeps showing them.
+      showBadgesStremioWatchlist: Array.isArray(parsed) || parsed.showBadgesStremioWatchlist !== false,
+      // BetterPosters (btttr.cc) replacement artwork -- see
+      // applyBetterPostersToMetas (05_catalog-core.js). Opt-in, so it
+      // defaults to false and every install predating it is untouched. The
+      // style keys below only matter when betterPosters itself is on, and
+      // each one defaults to btttr.cc's own default for that option.
+      betterPosters: !!(!Array.isArray(parsed) && parsed.betterPosters),
+      betterPostersGenre: Array.isArray(parsed) || parsed.betterPostersGenre !== false,
+      betterPostersRating: Array.isArray(parsed) || parsed.betterPostersRating !== false,
+      betterPostersQuality: !!(!Array.isArray(parsed) && parsed.betterPostersQuality),
+      betterPostersAge: !!(!Array.isArray(parsed) && parsed.betterPostersAge),
+      betterPostersTrendTags: Array.isArray(parsed) || parsed.betterPostersTrendTags !== false,
+      betterPostersLang: (!Array.isArray(parsed) && parsed.betterPostersLang) || "en",
+      betterPostersRatingSource: (!Array.isArray(parsed) && parsed.betterPostersRatingSource) || "avg",
     };
   } catch {
     return empty;
@@ -11681,6 +11819,17 @@ async function resolveConfig(configParam, env) {
           hideNonDigitalReleases: !!parsed.hideNonDigitalReleases,
           adultContentFilter: !!parsed.adultContentFilter,
           dedupeAcrossLists: !!parsed.dedupeAcrossLists,
+          // See decodeConfig (02_http-and-creator-utils.js) for why
+          // betterPosters itself defaults off while its style keys default
+          // to btttr.cc's own defaults.
+          betterPosters: !!parsed.betterPosters,
+          betterPostersGenre: parsed.betterPostersGenre !== false,
+          betterPostersRating: parsed.betterPostersRating !== false,
+          betterPostersQuality: !!parsed.betterPostersQuality,
+          betterPostersAge: !!parsed.betterPostersAge,
+          betterPostersTrendTags: parsed.betterPostersTrendTags !== false,
+          betterPostersLang: parsed.betterPostersLang || "en",
+          betterPostersRatingSource: parsed.betterPostersRatingSource || "avg",
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
           showBadgesTraktContinueWatching: parsed.showBadgesTraktContinueWatching !== false,
@@ -11689,6 +11838,7 @@ async function resolveConfig(configParam, env) {
           showBadgesStremioAiringNext: parsed.showBadgesStremioAiringNext !== false,
           showBadgesStremioContinueWatching: parsed.showBadgesStremioContinueWatching !== false,
           showBadgesStremioCatalogs: parsed.showBadgesStremioCatalogs !== false,
+          showBadgesStremioWatchlist: parsed.showBadgesStremioWatchlist !== false,
           showBadgesStremio: parsed.showBadgesStremio !== false,
         };
       } catch {
@@ -12266,17 +12416,32 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     result.totalItems = tot;
   }
 
+  // Before the badge pass below, never after: a badge wraps whatever poster
+  // URL it finds into /api/poster-badge?poster=..., so running this second
+  // would throw the badged poster away. Running it first means a badged
+  // poster is a badge drawn over BetterPosters artwork, which is the point.
+  // The adult-content filter still runs after both and still wins.
+  if (keys.betterPosters && Array.isArray(result) && result.length > 0) {
+    result = applyBetterPostersToMetas(result, keys.betterPostersOptions || {});
+  }
+
   if (keys.isStremioCatalog === true && keys.origin && Array.isArray(result) && result.length > 0) {
     const entryUrl = String(entry.url || '');
     const entryName = String(entry.name || '').toLowerCase();
     const isAiringNext = entryUrl.includes('airing-next') || entryUrl.includes('airing_next') || entry.statusKey === 'airing-next' || entry.slug === 'airing-next' || entry.id === 'airing-next' || entryName.includes('airing next');
     const isContinueWatching = entryUrl.includes('continue-watching') || entryUrl.includes('continue_watching') || entry.statusKey === 'continue-watching' || entry.slug === 'continue-watching' || entry.id === 'continue-watching' || entryName.includes('continue watching');
+    // Matched the same way as the two above. "upnext" is deliberately absent:
+    // that is MDBList's own Up Next shelf, which is a progress list rather
+    // than a watchlist and already lands on the catalogs toggle.
+    const isWatchlist = entryUrl.includes('watchlist') || entry.statusKey === 'watchlist' || entry.slug === 'watchlist' || entry.id === 'watchlist' || entryName.includes('watchlist');
 
     let allowBadges = false;
     if (isAiringNext) {
       allowBadges = keys.showBadgesStremioAiringNext !== false && keys.showBadgesStremio !== false;
     } else if (isContinueWatching) {
       allowBadges = keys.showBadgesStremioContinueWatching !== false && keys.showBadgesStremio !== false;
+    } else if (isWatchlist) {
+      allowBadges = keys.showBadgesStremioWatchlist !== false && keys.showBadgesStremio !== false;
     } else {
       allowBadges = keys.showBadgesStremioCatalogs !== false && keys.showBadgesStremio !== false;
     }
@@ -12355,7 +12520,16 @@ async function dedupeAcrossListEntries(entries, entryIndex, skip, metas, keys) {
   if (!Array.isArray(metas) || !metas.length) return metas;
   const entry = entries[entryIndex];
   if (!entry) return metas;
-  const priorEntries = entries.slice(0, entryIndex).filter((e) => e && e.enabled !== false && e.type === entry.type);
+  // A personal shelf sits outside this feature entirely, in both directions:
+  // it is never stripped, and it never strips anything else. Continue
+  // Watching exists to show what you are part-way through -- losing a show
+  // from it because Trending happened to list the same title higher up is
+  // not de-duplication, it is the shelf failing at its one job. And the
+  // reverse would be just as surprising: a title vanishing from Trending
+  // because it is in your Watchlist. See isPersonalShelfUrl (00_constants.js).
+  if (isPersonalShelfUrl(entry.url)) return metas;
+  const priorEntries = entries.slice(0, entryIndex).filter((e) =>
+    e && e.enabled !== false && e.type === entry.type && !isPersonalShelfUrl(e.url));
   if (!priorEntries.length) return metas;
 
   const priorResults = await Promise.all(
@@ -12934,6 +13108,110 @@ function applyAdultContentFilterToMetas(metas, origin, parentEntry) {
       poster: safeUrl,
       isAdultPosterFiltered: true,
     };
+  });
+  mapped.totalItems = tot;
+  return mapped;
+}
+
+// --- BetterPosters (https://btttr.cc) -------------------------------------
+// Replacement artwork with the metadata burned into the image itself. See the
+// contract note on BETTER_POSTERS_ORIGIN (00_constants.js) for the URL shape
+// and why the "poster-default" segment is a fixed literal rather than a style.
+
+const BETTER_POSTERS_IMDB_RE = /(?:^|[^a-z0-9])(tt\d{5,12})(?=$|[^0-9])/i;
+
+// tt0000000 is this add-on's own "temporarily unavailable" placeholder (see
+// the catalog route's catch in 25), not a title BetterPosters could render.
+const BETTER_POSTERS_PLACEHOLDER_ID = "tt0000000";
+
+// Deliberately reads the id fields only, never meta.poster. Several posters
+// this add-on builds itself carry an id in their query string
+// (/api/poster-badge?...&id=tt123...), so scraping the poster URL -- which is
+// what the nuvio-better-posters-addon project does -- would make an
+// already-processed poster look like a plain IMDB title and send it back
+// through BetterPosters a second time.
+function betterPostersImdbId(meta) {
+  if (!meta || typeof meta !== "object") return null;
+  for (const candidate of [meta.imdb_id, meta.imdbId, meta.imdb, meta.id]) {
+    if (typeof candidate !== "string") continue;
+    const hit = candidate.match(BETTER_POSTERS_IMDB_RE);
+    if (!hit) continue;
+    const id = hit[1].toLowerCase();
+    if (id !== BETTER_POSTERS_PLACEHOLDER_ID) return id;
+  }
+  return null;
+}
+
+// Mirrors updateAioUrl() in btttr.cc's own configurator: the bottom-row choice
+// picks the stem, then the quality/age flags are appended to it -- with a "-"
+// only when the stem does not already carry one. So genre+rating+quality is
+// "poster-q", genre-only+quality is "poster-gq".
+function betterPostersBase(opts) {
+  const genre = opts.genre !== false;
+  const rating = opts.rating !== false;
+  let base;
+  if (genre && rating) base = "poster";
+  else if (genre) base = "poster-g";
+  else if (rating) base = "poster-r";
+  else base = "poster-n";
+  const suffix = (opts.quality ? "q" : "") + (opts.age ? "a" : "");
+  if (suffix) base += base.includes("-") ? suffix : "-" + suffix;
+  return base;
+}
+
+function buildBetterPosterUrl(imdbId, opts) {
+  const o = opts || {};
+  const params = [];
+  // Every one of these is omitted at its btttr.cc default, so a default
+  // config produces the exact URL its configurator would hand out.
+  if (o.trendTags === false) params.push("tag=none");
+  if (o.lang && o.lang !== "en" && BETTER_POSTERS_LANGS.some((l) => l.value === o.lang)) {
+    params.push("lang=" + encodeURIComponent(o.lang));
+  }
+  if (o.ratingSource && o.ratingSource !== "avg" && BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === o.ratingSource)) {
+    params.push("rs=" + encodeURIComponent(o.ratingSource));
+  }
+  const qs = params.length ? "?" + params.join("&") : "";
+  return `${BETTER_POSTERS_ORIGIN}/${betterPostersBase(o)}/imdb/poster-default/${imdbId}.jpg${qs}`;
+}
+
+// Packs a resolved config's betterPosters* keys into the shape
+// buildBetterPosterUrl reads. Each default matches btttr.cc's own default for
+// that option, so an install that never touched the style controls gets the
+// same artwork its configurator hands out.
+function betterPostersOptionsFrom(cfg) {
+  const c = cfg || {};
+  return {
+    genre: c.betterPostersGenre !== false,
+    rating: c.betterPostersRating !== false,
+    quality: !!c.betterPostersQuality,
+    age: !!c.betterPostersAge,
+    trendTags: c.betterPostersTrendTags !== false,
+    lang: c.betterPostersLang || "en",
+    ratingSource: c.betterPostersRatingSource || "avg",
+  };
+}
+
+// Single-meta form, for the /meta/ detail route.
+function applyBetterPosterToMeta(meta, opts) {
+  if (!meta || typeof meta !== "object") return meta;
+  return applyBetterPostersToMetas([meta], opts)[0];
+}
+
+// 1:1 map, same shape as applyBadgedPostersToMetas/applyAdultContentFilterToMetas
+// below -- it only ever swaps a poster URL, never which ids come back.
+function applyBetterPostersToMetas(metas, opts) {
+  if (!Array.isArray(metas) || !metas.length) return metas;
+  const tot = metas.totalItems;
+  const mapped = metas.map((m) => {
+    if (!m) return m;
+    // BetterPosters only renders 2:3 artwork, so a landscape shelf (a TV
+    // channel's 16:9 banner) keeps whatever it already had rather than
+    // getting a portrait poster squeezed into a widescreen tile.
+    if (m.posterShape === "landscape") return m;
+    const imdbId = betterPostersImdbId(m);
+    if (!imdbId) return m;
+    return { ...m, poster: buildBetterPosterUrl(imdbId, opts) };
   });
   mapped.totalItems = tot;
   return mapped;
@@ -13601,8 +13879,16 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       if (trackingRaw) {
         const trackingBlob = JSON.parse(trackingRaw);
         items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
-        if (slug === 'continue-watching') {
+        // Loaded for the watchlist as well as continue-watching: it is the
+        // only source of "this show has an episode coming", and a watchlist
+        // entry wants that chip exactly as much as an in-progress one does.
+        // The fully-watched filtering below stays continue-watching only --
+        // a watchlist is what you mean to watch, not a progress shelf, so
+        // dropping finished shows from it would be wrong.
+        if (slug === 'continue-watching' || slug === 'watchlist') {
           airingItems = trackingBlob.airingNext || [];
+        }
+        if (slug === 'continue-watching') {
           const fwList = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
@@ -13624,8 +13910,16 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         if (!blobStr) return [];
         const blob = JSON.parse(blobStr);
         items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
-        if (slug === 'continue-watching') {
+        // Loaded for the watchlist as well as continue-watching: it is the
+        // only source of "this show has an episode coming", and a watchlist
+        // entry wants that chip exactly as much as an in-progress one does.
+        // The fully-watched filtering below stays continue-watching only --
+        // a watchlist is what you mean to watch, not a progress shelf, so
+        // dropping finished shows from it would be wrong.
+        if (slug === 'continue-watching' || slug === 'watchlist') {
           airingItems = blob.airingNext || [];
+        }
+        if (slug === 'continue-watching') {
           const fwList = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
@@ -13649,7 +13943,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
     const airingByShowId = new Map();
     const airingByBaseId = new Map();
     const airingByTitle = new Map();
-    if (slug === 'continue-watching' && Array.isArray(airingItems) && airingItems.length) {
+    if ((slug === 'continue-watching' || slug === 'watchlist') && Array.isArray(airingItems) && airingItems.length) {
       airingItems.forEach(an => {
         if (!an) return;
         const sid = String(an.showId || an.id || '');
@@ -13701,7 +13995,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       let seasonFinaleEpisodeNumber = it.seasonFinaleEpisodeNumber != null ? it.seasonFinaleEpisodeNumber : undefined;
       let airingMatch = null;
 
-      if (slug === 'continue-watching' && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
+      if ((slug === 'continue-watching' || slug === 'watchlist') && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
         if (it.showId && airingByShowId.has(String(it.showId))) airingMatch = airingByShowId.get(String(it.showId));
         else if (it.id && airingByShowId.has(String(it.id))) airingMatch = airingByShowId.get(String(it.id));
         else {
@@ -21653,6 +21947,17 @@ function renderBuilder(
   const initialHideNonDigitalReleases = !!initialKeys.hideNonDigitalReleases;
   const initialAdultContentFilter = !!initialKeys.adultContentFilter;
   const initialDedupeAcrossLists = !!initialKeys.dedupeAcrossLists;
+  // BetterPosters (btttr.cc). Opt-in, so the master switch defaults off while
+  // each style control defaults to btttr.cc's own default for that option --
+  // see decodeConfig (02_http-and-creator-utils.js).
+  const initialBetterPosters = !!initialKeys.betterPosters;
+  const initialBetterPostersGenre = initialKeys.betterPostersGenre !== false;
+  const initialBetterPostersRating = initialKeys.betterPostersRating !== false;
+  const initialBetterPostersQuality = !!initialKeys.betterPostersQuality;
+  const initialBetterPostersAge = !!initialKeys.betterPostersAge;
+  const initialBetterPostersTrendTags = initialKeys.betterPostersTrendTags !== false;
+  const betterPostersLangOptionsHtml = buildBetterPostersLangOptionsHtml(initialKeys.betterPostersLang || "en");
+  const betterPostersRatingSourceOptionsHtml = buildBetterPostersRatingSourceOptionsHtml(initialKeys.betterPostersRatingSource || "avg");
   const streamingTop10Html = buildStreamingTop10Html();
   const streamingHtml = buildStreamingHtml();
   const mdblistChartsHtml = buildMdblistChartsHtml();
@@ -26603,6 +26908,70 @@ if ('serviceWorker' in navigator) {
     </div>
 
     <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Better Posters</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Swap plain poster artwork for <a href="https://btttr.cc/" target="_blank" rel="noopener noreferrer" style="color:var(--accent);">BetterPosters</a> &mdash; posters with the genre, rating and tags drawn into the image itself. No API key or account needed. Only movies and shows with an IMDb id are affected; anything else keeps the poster it already had.</p>
+      <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+        <input type="checkbox" id="betterPostersCheckbox" ${initialBetterPosters ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPosters', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+        <div>
+          <span style="font-weight:600;">Use Better Posters artwork</span>
+          <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Applies everywhere: Live Preview, Search, Discover, My Lists, creator profiles and the builders here on the website, and the catalog rows and title pages Stremio and Nuvio request from the add-on. The website updates as soon as you tick this; Stremio/Nuvio need a Save/Update on an existing install link. Poster badges, if you have them on, are drawn over this artwork rather than replacing it, and the Adult Content Filter still overrides it. TV Channel artwork and episode stills are left as they are.</p>
+        </div>
+      </label>
+      <div id="betterPostersOptions" style="display:${initialBetterPosters ? 'flex' : 'none'}; flex-direction:column; gap:10px; margin-top:12px; padding-top:12px; border-top:1px solid var(--border);">
+        <div style="font-size:0.85rem; font-weight:700; color:var(--text);">What to draw on the poster</div>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersGenreCheckbox" ${initialBetterPostersGenre ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersGenre', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Genre</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Genre label along the bottom of the poster.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersRatingCheckbox" ${initialBetterPostersRating ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersRating', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Rating</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Star rating along the bottom of the poster.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersTrendTagsCheckbox" ${initialBetterPostersTrendTags ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersTrendTags', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Trend tags</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">A corner tag on titles that are currently trending or newly released.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersQualityCheckbox" ${initialBetterPostersQuality ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersQuality', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Quality tags</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">4K, Dolby Vision and Atmos badges, where BetterPosters knows them.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersAgeCheckbox" ${initialBetterPostersAge ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersAge', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Age rating</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Certification chip (PG-13, TV-MA, and so on).</p>
+          </div>
+        </label>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">
+          <label for="betterPostersRatingSourceSelect" style="font-size:0.85rem; font-weight:600; color:var(--text);">Rating source</label>
+          <select id="betterPostersRatingSourceSelect" onchange="toggleBetterPostersSetting('betterPostersRatingSource', this.value)" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            ${betterPostersRatingSourceOptionsHtml}
+          </select>
+          <p style="margin:0; color:var(--muted); font-size:0.8rem;">Which score the rating is taken from. Only used when Rating is on above.</p>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">
+          <label for="betterPostersLangSelect" style="font-size:0.85rem; font-weight:600; color:var(--text);">Poster language</label>
+          <select id="betterPostersLangSelect" onchange="toggleBetterPostersSetting('betterPostersLang', this.value)" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            ${betterPostersLangOptionsHtml}
+          </select>
+          <p style="margin:0; color:var(--muted); font-size:0.8rem;">Language BetterPosters draws the title and labels in, where it has artwork for it.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Poster Badges &amp; Labels</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Customize which badges and indicators are displayed on posters across your website dashboard, catalogs, and Stremio/Nuvio.</p>
       <div style="display:flex; flex-direction:column; gap:12px;">
@@ -26659,6 +27028,13 @@ if ('serviceWorker' in navigator) {
             <div>
               <span style="font-weight:600;">Continue Watching Catalogs in Stremio</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Continue Watching poster artwork in Stremio and Nuvio.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeStremioWatchlistCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioWatchlist', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Watchlist Catalogs in Stremio</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Watchlist poster artwork in Stremio and Nuvio.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
@@ -28039,7 +28415,12 @@ window.formatRatingSpanHtml = formatRatingSpanHtml;
 function renderMediaCard(item, options = {}) {
   if (!item) return '';
   const title = item.title || item.name || '';
-  const poster = item.poster || (typeof resolveClientPoster === 'function' ? resolveClientPoster(item, item.poster) : '');
+  // Was an "item.poster ||" short-circuit, which meant a
+  // card that already had a poster never reached the funnel at all, so
+  // neither the Adult Content Filter nor Better Posters could touch it.
+  const poster = (typeof resolveClientPoster === 'function')
+    ? resolveClientPoster(item, item.poster || '')
+    : (item.poster || '');
   const year = item.year || '';
   
   const cardClass = 'live-preview-poster-card' + (options.cardClass ? ' ' + options.cardClass : '');
@@ -28151,6 +28532,68 @@ function createSortableList(container, options = {}) {
     }
   }
 
+  // --- auto-scroll while dragging ------------------------------------------
+  //
+  // moveItem works in viewport coordinates, so a row can only ever be placed
+  // among the rows currently on screen. Nothing scrolled while a drag was in
+  // progress, so on any list taller than the window -- which is most of them
+  // once Live Preview shelves carry posters and each row is ~200px -- dragging
+  // past the last visible row did nothing at all: the row stopped at the edge
+  // and sat there. That is what "the drag freezes and won't move the list"
+  // was. It applied to every list this function drives, on desktop and touch
+  // alike.
+  const AUTO_SCROLL_EDGE = 90;   // distance from an edge where scrolling starts
+  const AUTO_SCROLL_MAX = 20;    // px per frame at the very edge
+  let autoScrollRaf = null;
+  let lastClientX = 0;
+  let lastClientY = 0;
+
+  // The page itself scrolls for the catalog and My Lists surfaces, but this
+  // same function also drives lists inside scrollable panels, so scroll
+  // whichever actually can.
+  function scrollHostFor(el) {
+    let n = el && el.parentElement;
+    while (n && n !== document.body && n !== document.documentElement) {
+      const oy = getComputedStyle(n).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 1) return n;
+      n = n.parentElement;
+    }
+    return null;
+  }
+
+  function autoScrollStep() {
+    autoScrollRaf = null;
+    if (!activeItem) return;
+    const host = scrollHostFor(activeItem);
+    const top = host ? host.getBoundingClientRect().top : 0;
+    const bottom = host ? host.getBoundingClientRect().bottom : (window.innerHeight || document.documentElement.clientHeight);
+    let delta = 0;
+    if (lastClientY < top + AUTO_SCROLL_EDGE) {
+      delta = -Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (top + AUTO_SCROLL_EDGE - lastClientY) / AUTO_SCROLL_EDGE));
+    } else if (lastClientY > bottom - AUTO_SCROLL_EDGE) {
+      delta = Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (lastClientY - (bottom - AUTO_SCROLL_EDGE)) / AUTO_SCROLL_EDGE));
+    }
+    if (delta) {
+      if (host) host.scrollTop += delta;
+      else window.scrollBy(0, delta);
+      // Re-place the row against the rows that just came into view, or the
+      // page would scroll underneath a row that never moves.
+      moveItem(lastClientY, lastClientX);
+    }
+    queueAutoScroll();
+  }
+
+  function queueAutoScroll() {
+    if (autoScrollRaf != null || !activeItem) return;
+    if (typeof requestAnimationFrame !== 'function') return;
+    autoScrollRaf = requestAnimationFrame(autoScrollStep);
+  }
+
+  function stopAutoScroll() {
+    if (autoScrollRaf != null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(autoScrollRaf);
+    autoScrollRaf = null;
+  }
+
   function startDragging(item) {
     isDragging = true;
     activeItem = item;
@@ -28163,6 +28606,7 @@ function createSortableList(container, options = {}) {
 
   function stopDragging() {
     cancelHold();
+    stopAutoScroll();
     if (isDragging && activeItem) {
       activeItem.classList.remove(dragClass);
       onReorder();
@@ -28191,10 +28635,17 @@ function createSortableList(container, options = {}) {
     container.addEventListener('dragover', (e) => {
       if (!activeItem) return;
       e.preventDefault();
+      lastClientX = e.clientX;
+      lastClientY = e.clientY;
       moveItem(e.clientY, e.clientX);
+      // dragover stops firing once the pointer is held still at the edge, so
+      // the scrolling has to be driven by its own frame loop rather than by
+      // the event.
+      queueAutoScroll();
     });
 
     container.addEventListener('dragend', () => {
+      stopAutoScroll();
       if (!activeItem) return;
       activeItem.classList.remove(dragClass);
       activeItem = null;
@@ -28243,7 +28694,10 @@ function createSortableList(container, options = {}) {
         return;
       }
       if (ev.cancelable) ev.preventDefault();
+      lastClientX = ev.clientX;
+      lastClientY = ev.clientY;
       moveItem(ev.clientY, ev.clientX);
+      queueAutoScroll();
     };
 
     const onPointerEnd = () => {
@@ -34530,6 +34984,175 @@ function getSafePosterUrl(item) {
     (safeCert ? '&cert=' + encodeURIComponent(safeCert) : '');
 }
 
+// --- Better Posters (btttr.cc), website side -------------------------------
+//
+// The add-on already rewrites posters server-side for Stremio/Nuvio
+// (applyBetterPostersToMetas, 05_catalog-core.js). This is that same rewrite
+// for the website's own surfaces -- Live Preview, Search, Discover, My Lists,
+// creator profiles, the builders -- so what you browse here matches what your
+// apps get served. The two are pinned to the same expected URLs by
+// tests/better-posters.test.mjs.
+//
+// Deliberately no regex in here: this file's text passes through
+// 09_page-shell.js's outer template literal, which eats one round of
+// backslash escapes, so every \\d would have to be written doubled (see
+// parseListSearchIntent's own comment below). Plain string scanning sidesteps
+// that trap entirely.
+
+const BETTER_POSTERS_ORIGIN_WEB = 'https://btttr.cc';
+
+function betterPostersOnWeb() {
+  return typeof getBetterPostersSetting === 'function' && getBetterPostersSetting('betterPosters', false);
+}
+window.betterPostersOnWeb = betterPostersOnWeb;
+
+// The same id fields the Worker's betterPostersImdbId reads, plus showId /
+// showImdbId: the website carries an episode's parent show as its own field,
+// where a catalog meta has already been flattened down to one id.
+function betterPostersWebImdbId(it) {
+  if (!it || typeof it !== 'object') return '';
+  const candidates = [it.imdb_id, it.imdbId, it.imdb, it.showImdbId, it.showId, it.id];
+  for (let i = 0; i < candidates.length; i++) {
+    const raw = candidates[i];
+    if (typeof raw !== 'string') continue;
+    const s = raw.trim().toLowerCase();
+    if (s.charAt(0) !== 't' || s.charAt(1) !== 't') continue;
+    let digits = '';
+    for (let j = 2; j < s.length; j++) {
+      const c = s.charCodeAt(j);
+      if (c < 48 || c > 57) break;  // stops at the ':' of a 'tt123:1:2' episode id
+      digits += s.charAt(j);
+    }
+    if (digits.length < 5 || digits.length > 12) continue;
+    const id = 'tt' + digits;
+    if (id === 'tt0000000') continue;  // the 'list unavailable' placeholder
+    return id;
+  }
+  return '';
+}
+
+function betterPostersWebUrl(imdbId) {
+  const get = (typeof getBetterPostersSetting === 'function') ? getBetterPostersSetting : function(k, d) { return !!d; };
+  const pick = (typeof getBetterPostersChoice === 'function') ? getBetterPostersChoice : function(k, d) { return d; };
+  const genre = get('betterPostersGenre', true);
+  const rating = get('betterPostersRating', true);
+  let base;
+  if (genre && rating) base = 'poster';
+  else if (genre) base = 'poster-g';
+  else if (rating) base = 'poster-r';
+  else base = 'poster-n';
+  const suffix = (get('betterPostersQuality', false) ? 'q' : '') + (get('betterPostersAge', false) ? 'a' : '');
+  if (suffix) base += (base.indexOf('-') >= 0 ? suffix : '-' + suffix);
+  const params = [];
+  if (!get('betterPostersTrendTags', true)) params.push('tag=none');
+  const lang = pick('betterPostersLang', 'en');
+  if (lang && lang !== 'en') params.push('lang=' + encodeURIComponent(lang));
+  const rs = pick('betterPostersRatingSource', 'avg');
+  if (rs && rs !== 'avg') params.push('rs=' + encodeURIComponent(rs));
+  return BETTER_POSTERS_ORIGIN_WEB + '/' + base + '/imdb/poster-default/' + imdbId + '.jpg' +
+    (params.length ? '?' + params.join('&') : '');
+}
+
+// Artwork this add-on renders itself. None of it is a title's poster, so none
+// of it is BetterPosters' to replace: a TV Channel's generated logo/banner, a
+// badge overlay, and the Adult Content Filter's safe-poster stand-in.
+function isGeneratedPosterUrl(p) {
+  if (!p || typeof p !== 'string') return false;
+  return p.indexOf('/api/channel-poster') >= 0
+    || p.indexOf('/api/channel-logo') >= 0
+    || p.indexOf('/api/poster-badge') >= 0
+    || p.indexOf('/api/safe-poster') >= 0;
+}
+
+function applyBetterPosterWeb(it, poster) {
+  if (!betterPostersOnWeb()) return poster;
+  const alreadyBetter = typeof poster === 'string' && poster.indexOf(BETTER_POSTERS_ORIGIN_WEB) === 0;
+  if (!alreadyBetter) {
+    if (isGeneratedPosterUrl(poster)) return poster;
+    if (it && it.posterShape === 'landscape') return poster;
+    // An episode still is a screenshot of that episode. The show's poster is
+    // not a substitute for it, so a tile showing a still keeps it.
+    if (it && it.thumbnail && poster === it.thumbnail) return poster;
+  }
+  const imdbId = betterPostersWebImdbId(it);
+  if (!imdbId) return poster;
+  // Rebuilt from the current settings every time rather than kept, so
+  // changing a style option re-renders with the new one instead of keeping
+  // whatever URL happened to be produced first.
+  return betterPostersWebUrl(imdbId);
+}
+window.applyBetterPosterWeb = applyBetterPosterWeb;
+
+// Gives BetterPosters artwork to tiles whose item has only a TMDB id.
+//
+// BetterPosters is keyed by IMDB id and nothing else, so applyBetterPosterWeb
+// leaves a "tmdb:..." item alone -- correctly, because there is nothing to
+// build a URL from. The Curated For You / Recommended cards are entirely such
+// items (/api/recommendations answers with TMDB ids), which is why those two
+// cards kept their plain artwork while the identical rows in Live Preview and
+// in Stremio/Nuvio did not: the catalog path translates the ids on the way
+// through and the dashboard card never did.
+//
+// So the translation happens here instead, after render and only for the tiles
+// actually on screen -- see /api/imdb-ids (25_api-catalog-routes.js) for why it
+// is not done for the whole list up front.
+const _betterPostersIdCache = {};
+
+async function applyBetterPostersToTmdbTiles(rootEl) {
+  if (typeof betterPostersOnWeb !== 'function' || !betterPostersOnWeb()) return;
+  const root = rootEl || document;
+  const wraps = [...root.querySelectorAll('[data-id^="tmdb:"]')].filter((el) => {
+    if (el.dataset.betterPosterDone) return false;
+    return !!el.querySelector('img');
+  });
+  if (!wraps.length) return;
+
+  // Marked before the request, not after: a re-render while one is in flight
+  // would otherwise queue the same ids again.
+  const needed = [];
+  wraps.forEach((el) => {
+    el.dataset.betterPosterDone = '1';
+    const id = el.dataset.id;
+    if (!(id in _betterPostersIdCache)) {
+      needed.push({ id: id, type: el.dataset.type === 'series' ? 'series' : 'movie' });
+    }
+  });
+
+  if (needed.length) {
+    // One in-flight batch at a time, capped to what the endpoint accepts.
+    const batch = needed.slice(0, 24);
+    try {
+      const res = await fetch(ORIGIN + '/api/imdb-ids', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: batch }),
+      });
+      const data = await res.json();
+      // A miss is cached as '' too, so a title TMDB has no IMDB id for is not
+      // asked about again on every re-render.
+      batch.forEach((it) => { _betterPostersIdCache[it.id] = (data && data.ok && data.map && data.map[it.id]) || ''; });
+    } catch (e) {
+      batch.forEach((it) => { _betterPostersIdCache[it.id] = ''; });
+    }
+  }
+
+  wraps.forEach((el) => {
+    const imdbId = _betterPostersIdCache[el.dataset.id];
+    if (!imdbId) return;
+    const url = betterPostersWebUrl(imdbId);
+    const img = el.querySelector('img');
+    if (img) img.src = url;
+    // The poster modal reads this back, so it has to match what is shown.
+    if (el.dataset.poster) el.dataset.poster = url;
+  });
+}
+window.applyBetterPostersToTmdbTiles = applyBetterPostersToTmdbTiles;
+
+// The one funnel every poster on the website passes through -- directly, or
+// via resolveListCardItemPoster (17), resolveItemPoster (22),
+// livePreviewPosterHtml (23), renderMediaCard (16) and loadPosterSlot below.
+// The Adult Content Filter is checked FIRST and returns early, so it still
+// overrides BetterPosters exactly as it does server-side.
 function resolveClientPoster(it, fallbackPoster) {
   if (!it) return fallbackPoster || '';
   const p = fallbackPoster !== undefined ? fallbackPoster : (it.poster || it.showPoster || '');
@@ -34537,7 +35160,7 @@ function resolveClientPoster(it, fallbackPoster) {
   if (isAdultContentFilterEnabled() && (it.isAdult || it.isAdultPosterFiltered || isAdultOrNsfw(it))) {
     return getSafePosterUrl(it);
   }
-  return p;
+  return applyBetterPosterWeb(it, p);
 }
 
 function parseListSearchIntent(rawQuery) {
@@ -35673,9 +36296,10 @@ function buildCuratedRecommendationCard(title, type, customUrl, subtitle, items)
       overlays += '<div class="list-card-count-overlay desktop-only curatedViewBtn" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '" style="cursor:pointer;">' + totalCount + ' &rsaquo;</div>';
     }
     const ratingSpan = typeof formatRatingSpanHtml === 'function' ? formatRatingSpanHtml(s) : '';
+    const tilePoster = resolveClientPoster(s, s.poster || '');
     return '<div class="list-card-mini-poster-tile" data-title="' + escapeAttr(title) + '" data-type="' + escapeAttr(type) + '" data-url="' + escapeAttr(customUrl) + '">' +
-      '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type) + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(s.poster || '') + '">' +
-        '<img src="' + escapeAttr(s.poster) + '" alt="" loading="lazy">' +
+      '<div class="list-card-mini-poster-img-wrap clickable-poster" data-id="' + escapeAttr(s.id || '') + '" data-type="' + escapeAttr(s.type || type) + '" data-title="' + escapeAttr(s.name || '') + '" data-poster="' + escapeAttr(tilePoster || '') + '">' +
+        '<img src="' + escapeAttr(tilePoster) + '" alt="" loading="lazy">' +
         '<div class="poster-add-overlay">+</div>' +
         overlays +
       '</div>' +
@@ -36061,6 +36685,9 @@ async function loadCuratedListsFeed(forceRefresh) {
 
     container.innerHTML = sectionsHtml;
     populateSearchResultPosters();
+    // These cards are built from TMDB-id-only items, so BetterPosters cannot
+    // be applied at render time -- see applyBetterPostersToTmdbTiles.
+    applyBetterPostersToTmdbTiles(container);
     lastCuratedWatchCount = currentCount;
     curatedListsFeedLoaded = true;
   } catch (err) {
@@ -37150,7 +37777,7 @@ function renderItemStorylinesWatchOrder(d, type) {
       return '<div class="item-storyline-card' + (isCurrent ? ' is-current' : '') + '"' + clickHandler + ' title="' + escapeAttr(displayTitle + (isCurrent ? ' (Currently Viewing)' : '')) + '">' +
         '<div class="item-storyline-poster-wrap">' +
           (posterUrl ?
-            '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(displayTitle) + '" onerror="handleStorylinePosterError(this)">' :
+            '<img src="' + escapeAttr(resolveClientPoster(ep, posterUrl)) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(displayTitle) + '" onerror="handleStorylinePosterError(this)">' :
             '<div class="season-header-poster-placeholder"></div>') +
           '<span class="item-storyline-part-badge">Part ' + (ep.part != null ? ep.part : (i + 1)) + '</span>' +
           (isCurrent ? '<span class="item-storyline-current-pill">Current</span>' : '') +
@@ -37399,7 +38026,7 @@ async function openItemDetailsModal(id, type, opts) {
     body.innerHTML = 
       '<div style="display:flex; flex-direction:row; gap:32px; flex-wrap:wrap;">' +
         '<div style="flex: 0 0 300px; max-width: 100%;">' +
-          (d.poster ? '<img src="' + escapeAttr(d.poster) + '" style="width:100%; border-radius:8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">' : '') +
+          (d.poster ? '<img src="' + escapeAttr(resolveClientPoster(d, d.poster)) + '" style="width:100%; border-radius:8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">' : '') +
         '</div>' +
         '<div style="flex: 1; min-width: 300px;">' +
           '<h1 style="margin:0 0 16px; font-size:2.5rem; font-family: serif;">' + escapeHtml(d.title) + '</h1>' +
@@ -38670,18 +39297,21 @@ function renderTitlePosterCards(items, totalCount, resEl) {
       ratingHtml +
     '</div>';
 
+    // Resolved up front so the rendered <img> and the data-poster the poster
+    // modal reads back are the same URL.
+    const resolvedCardPoster = resolveClientPoster(m, effectivePoster || '');
     if (typeof renderMediaCard === 'function') {
-      return renderMediaCard(Object.assign({}, m, { title: m.title || '', poster: effectivePoster }), {
+      return renderMediaCard(Object.assign({}, m, { title: m.title || '', poster: resolvedCardPoster }), {
         cardClass: 'clickable-poster',
-        dataAttrs: { id: id, type: type, title: m.title || '', poster: effectivePoster || '' },
+        dataAttrs: { id: id, type: type, title: m.title || '', poster: resolvedCardPoster || '' },
         topLeftHtml: '',
         overlayHtml: '<div class="poster-add-overlay" title="Add to Custom List">+</div>',
         subtitleHtml: subtitleHtml
       });
     }
 
-    const posterEl = effectivePoster
-      ? '<img class="live-preview-poster" src="' + escapeAttr(effectivePoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
+    const posterEl = resolvedCardPoster
+      ? '<img class="live-preview-poster" src="' + escapeAttr(resolvedCardPoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)">'
       : '<div class="live-preview-poster live-preview-poster-placeholder" data-needs-fallback="1"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
     
     return '<div class="live-preview-poster-card clickable-poster" ' +
@@ -38924,8 +39554,9 @@ function renderChannelTitleResults(results, searchType = 'tv') {
   }
   const isMovie = searchType === 'movie';
   const cardsHtml = results.map((r) => {
-    const posterImg = r.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(r.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+    const rPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(r, r.poster || '') : (r.poster);
+    const posterImg = rPoster
+      ? '<img class="preview-thumb" src="' + escapeAttr(rPoster) + '" alt="" loading="lazy" style="cursor:pointer;">'
       : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No poster</div>';
     const btnLabel = isMovie ? '+ Add Movie' : '+ Browse';
     const cardClass = isMovie ? 'channelMovieCard' : 'channelTitleCard';
@@ -48155,7 +48786,7 @@ function renderStorylinesUniverseList(category = activeStorylineCategory) {
 
       return '<div class="list-card-mini-poster-tile">' +
         '<div class="list-card-mini-poster-img-wrap" style="position:relative; cursor:pointer;" onclick="openStorylineDetails(&quot;' + escapeJsAttr(event.id) + '&quot;)">' +
-          '<img src="' + escapeAttr(posterUrl) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
+          '<img src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(ep, posterUrl) : (posterUrl)) + '" alt="" loading="lazy" data-tmdb-id="' + escapeAttr(String(ep.tmdbId || '')) + '" data-poster-kind="' + (isMovie ? 'movie' : 'show') + '" data-poster-title="' + escapeAttr(itemTitle) + '" onerror="handleStorylinePosterError(this)">' +
           overlays +
         '</div>' +
         '<div class="list-card-mini-poster-name" title="' + escapeAttr(itemTitle) + '">' + escapeHtml(itemTitle) + '</div>' +
@@ -48875,7 +49506,10 @@ function channelItemsInPlayOrder(items, channel) {
 // lookup below is about finding a channel that IS saved here, and none of
 // them can find one that is not, so a caller holding the channel already
 // hands it straight over.
-function openChannelDetailsPage(channelIdOrDivId, channelOverride) {
+// directoryCode is set only when this was opened from Explore Channels, and
+// it is what the Like button on the details page acts on -- a channel is
+// liked by its published code, not by a list URL the way a list is.
+function openChannelDetailsPage(channelIdOrDivId, channelOverride, directoryCode) {
   const map = loadLocalChannels();
   let channel = channelOverride || map[channelIdOrDivId];
   if (!channel) {
@@ -49076,7 +49710,11 @@ function channelItemId(it, idx) {
 
   const channelUrl = channel.channelId ? ('channel:id:' + channel.channelId) : ('channel:v1:' + (channel.name || 'channel'));
   if (typeof openListDetailsPage === 'function') {
-    openListDetailsPage(channel.name || 'TV Channel', 'series', channelUrl, { sample: sample, count: sample.length, maybeMore: false });
+    openListDetailsPage(
+      channel.name || 'TV Channel', 'series', channelUrl,
+      { sample: sample, count: sample.length, maybeMore: false },
+      directoryCode ? { channelLikeCode: directoryCode } : undefined
+    );
   }
 }
 
@@ -50152,8 +50790,9 @@ function renderChannelPersonResults(results) {
     return;
   }
   const cards = results.map((p) => {
-    const img = p.poster
-      ? '<img class="preview-thumb" src="' + escapeAttr(p.poster) + '" alt="" loading="lazy" style="cursor:pointer;">'
+    const pPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(p, p.poster || '') : (p.poster);
+    const img = pPoster
+      ? '<img class="preview-thumb" src="' + escapeAttr(pPoster) + '" alt="" loading="lazy" style="cursor:pointer;">'
       : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;cursor:pointer;">No photo</div>';
     const data = ' data-personid="' + escapeAttr(String(p.personId)) + '" data-personname="' + escapeAttr(p.name) + '"';
     return '<div class="custom-list-search-item channelPersonCard" style="display:flex; flex-direction:column; align-items:center; width:100%; min-width:0; cursor:pointer;"' + data + '>' +
@@ -50217,7 +50856,7 @@ function setChannelSpotlightSortAndReload(value) {
 }
 
 function channelPersonCreditCardHtml(credit, isShow) {
-  const poster = credit.poster || '';
+  const poster = typeof resolveClientPoster === 'function' ? resolveClientPoster(credit, credit.poster || '') : (credit.poster || '');
   const img = poster
     ? '<img class="preview-thumb" src="' + escapeAttr(poster) + '" alt="" loading="lazy">'
     : '<div class="preview-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;text-align:center;padding:4px;">No poster</div>';
@@ -50966,7 +51605,7 @@ async function previewDirectoryChannel(code, btn) {
     // could collide with a saved channel's would make "+ Add" on the details
     // page act on the wrong one.
     const preview = Object.assign({}, data.channel, { channelId: 'directory:' + code });
-    openChannelDetailsPage(preview.channelId, preview);
+    openChannelDetailsPage(preview.channelId, preview, code);
   } catch (e) {
     showAppAlert('Explore Channels', 'Network error while opening that channel.');
   } finally {
@@ -50977,12 +51616,27 @@ async function previewDirectoryChannel(code, btn) {
   }
 }
 
+// Repaints a Like button that is NOT part of the directory feed -- the one on
+// a channel's "See All" page. renderChannelDirectory() redraws the feed's own
+// hearts, but that feed is not on screen while the details page is, so this
+// button has to be updated by hand.
+function syncChannelLikeButton(code) {
+  const sel = (window.CSS && CSS.escape) ? CSS.escape(String(code)) : String(code);
+  const el = document.querySelector('[data-channel-like-code="' + sel + '"]');
+  if (!el) return;
+  const liked = !!_channelDirectoryLiked[code];
+  el.classList.toggle('liked', liked);
+  el.innerHTML = liked ? '&#9829;' : '&#9825;';
+}
+window.syncChannelLikeButton = syncChannelLikeButton;
+
 async function toggleChannelDirectoryLike(code, btn) {
   const wasLiked = !!_channelDirectoryLiked[code];
   // Filled in before the round trip so the heart answers the tap, and put
   // back if the server disagrees -- it holds the ledger, this does not.
   _channelDirectoryLiked[code] = !wasLiked;
   renderChannelDirectory();
+  syncChannelLikeButton(code);
   try {
     const body = { code: code, action: wasLiked ? 'unlike' : 'like' };
     const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
@@ -50999,15 +51653,18 @@ async function toggleChannelDirectoryLike(code, btn) {
     if (!data.ok) {
       _channelDirectoryLiked[code] = wasLiked;
       renderChannelDirectory();
+      syncChannelLikeButton(code);
       return;
     }
     _channelDirectoryLiked[code] = !!data.liked;
     const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
     if (entry) entry.likes = data.likes;
     renderChannelDirectory();
+    syncChannelLikeButton(code);
   } catch (e) {
     _channelDirectoryLiked[code] = wasLiked;
     renderChannelDirectory();
+    syncChannelLikeButton(code);
   }
 }
 
@@ -52012,7 +52669,7 @@ function renderCustomListDraftList() {
     const removeBtn = '<button type="button" class="cw-remove-btn customListRemovePickBtn" title="Remove from list" aria-label="Remove from list" style="z-index:4;">\u2715</button>';
 
     if (typeof renderMediaCard === 'function') {
-      return renderMediaCard({ title: label, poster: it.poster }, {
+      return renderMediaCard(Object.assign({}, it, { title: label, poster: it.poster }), {
         cardClass: 'custom-list-pick',
         dataAttrs: { idx: i },
         style: 'position:relative; cursor:grab; user-select:none; touch-action:manipulation;',
@@ -52022,8 +52679,9 @@ function renderCustomListDraftList() {
       });
     }
 
-    const posterEl = it.poster
-      ? '<img class="live-preview-poster" src="' + escapeAttr(it.poster) + '" alt="" loading="lazy">'
+    const pickPoster = typeof resolveClientPoster === 'function' ? resolveClientPoster(it, it.poster || '') : it.poster;
+    const posterEl = pickPoster
+      ? '<img class="live-preview-poster" src="' + escapeAttr(pickPoster) + '" alt="" loading="lazy">'
       : '<div class="live-preview-poster live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
     
     return '<div class="live-preview-poster-card custom-list-pick" data-idx="' + i + '" style="position:relative; cursor:grab; user-select:none; touch-action:manipulation;">' +
@@ -57237,6 +57895,15 @@ function clearLocalAccountData() {
   if (typeof customListDraftItems !== 'undefined') customListDraftItems = [];
   _memoryCustomListsString = null;
   _memoryCustomListsObj = null;
+  // Channels keep the same kind of in-memory copy as custom lists do, and
+  // loadLocalChannels returns it BEFORE looking at storage (see
+  // 20_client-channel-builder.js). Clearing only the custom-list pair left
+  // every created channel sitting in memory, so Reset Account Data wiped the
+  // storage and the very next read handed them straight back -- and the next
+  // save wrote them to storage again and synced them up. Exactly the bug the
+  // sessionStorage sweep below was added to fix for lists, one cache over.
+  if (typeof _memoryChannelsMap !== 'undefined') _memoryChannelsMap = null;
+  if (typeof _memoryChannelsString !== 'undefined') _memoryChannelsString = null;
 
   // Clear all localStorage keys for account data, credentials, and custom lists
   try {
@@ -58920,6 +59587,7 @@ async function loadCreatorSync(opts) {
         { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
         { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
         { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+        { key: 'showBadgesStremioWatchlist', id: 'badgeStremioWatchlistCheckbox' },
         { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
         { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
         { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
@@ -58938,6 +59606,35 @@ async function loadCreatorSync(opts) {
           if (el) el.checked = synced.keys[key];
         }
       });
+      // Better Posters rides the same sync as the badge settings, so turning
+      // it on in one browser turns it on in the next. Handled separately
+      // because two of its keys are dropdown values rather than booleans,
+      // and because the master switch's default is off rather than on.
+      [
+        { key: 'betterPosters', id: 'betterPostersCheckbox' },
+        { key: 'betterPostersGenre', id: 'betterPostersGenreCheckbox' },
+        { key: 'betterPostersRating', id: 'betterPostersRatingCheckbox' },
+        { key: 'betterPostersTrendTags', id: 'betterPostersTrendTagsCheckbox' },
+        { key: 'betterPostersQuality', id: 'betterPostersQualityCheckbox' },
+        { key: 'betterPostersAge', id: 'betterPostersAgeCheckbox' },
+      ].forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'boolean') {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key] ? '1' : '0'); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.checked = synced.keys[key];
+        }
+      });
+      [
+        { key: 'betterPostersLang', id: 'betterPostersLangSelect' },
+        { key: 'betterPostersRatingSource', id: 'betterPostersRatingSourceSelect' },
+      ].forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'string' && synced.keys[key]) {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key]); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.value = synced.keys[key];
+        }
+      });
+      if (typeof applyBetterPostersOptionsVisibility === 'function') applyBetterPostersOptionsVisibility();
       if (typeof synced.keys.posterRatingSource === 'string' || typeof synced.keys.showBadgeTmdbRating !== 'undefined') {
         const isTmdb = synced.keys.posterRatingSource === 'tmdb' || (synced.keys.posterRatingSource !== 'none' && synced.keys.showBadgeTmdbRating !== false);
         try {
@@ -62588,7 +63285,7 @@ async function testSourceRow(btn) {
       const more = data.maybeMore ? '+' : '';
       resultEl.className = 'testresult ok';
       const thumbs = (data.sample || []).filter((s) => s.poster).slice(0, 5).map((s) =>
-        '<img class="preview-thumb" src="' + escapeAttr(s.poster) + '" alt="' + escapeAttr(s.name) + '" title="' + escapeAttr(s.name) + '" loading="lazy">'
+        '<img class="preview-thumb" src="' + escapeAttr(typeof resolveClientPoster === 'function' ? resolveClientPoster(s, s.poster) : s.poster) + '" alt="' + escapeAttr(s.name) + '" title="' + escapeAttr(s.name) + '" loading="lazy">'
       ).join('');
       const label = data.count === 0
         ? '\u2713 Reachable, but 0 items matched (check the movie/series toggle).'
@@ -62628,6 +63325,20 @@ function buildConfig(entries, keys) {
   if (keys && keys.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
   if (keys && keys.adultContentFilter) payload.adultContentFilter = true;
   if (keys && keys.dedupeAcrossLists) payload.dedupeAcrossLists = true;
+  // BetterPosters. Only written when it is actually on, and each style key
+  // only when it differs from btttr.cc's default for that option -- an
+  // install link should not grow by eight keys for a feature left off, and a
+  // default style round-trips to the same URL either way.
+  if (keys && keys.betterPosters) {
+    payload.betterPosters = true;
+    if (keys.betterPostersGenre === false) payload.betterPostersGenre = false;
+    if (keys.betterPostersRating === false) payload.betterPostersRating = false;
+    if (keys.betterPostersTrendTags === false) payload.betterPostersTrendTags = false;
+    if (keys.betterPostersQuality) payload.betterPostersQuality = true;
+    if (keys.betterPostersAge) payload.betterPostersAge = true;
+    if (keys.betterPostersLang && keys.betterPostersLang !== 'en') payload.betterPostersLang = keys.betterPostersLang;
+    if (keys.betterPostersRatingSource && keys.betterPostersRatingSource !== 'avg') payload.betterPostersRatingSource = keys.betterPostersRatingSource;
+  }
   const jsonStr = JSON.stringify(payload);
   const bytes = new TextEncoder().encode(jsonStr);
   let bin = '';
@@ -62846,6 +63557,14 @@ function collectKeys() {
     syncTraktHistory: localStorage.getItem('myListAddon:syncTraktHistory') === 'true',
     syncMdblistHistory: localStorage.getItem('myListAddon:syncMdblistHistory') === 'true',
     syncSimklHistory: localStorage.getItem('myListAddon:syncSimklHistory') === 'true',
+    betterPosters: getBetterPostersSetting('betterPosters', false),
+    betterPostersGenre: getBetterPostersSetting('betterPostersGenre', true),
+    betterPostersRating: getBetterPostersSetting('betterPostersRating', true),
+    betterPostersTrendTags: getBetterPostersSetting('betterPostersTrendTags', true),
+    betterPostersQuality: getBetterPostersSetting('betterPostersQuality', false),
+    betterPostersAge: getBetterPostersSetting('betterPostersAge', false),
+    betterPostersLang: getBetterPostersChoice('betterPostersLang', 'en'),
+    betterPostersRatingSource: getBetterPostersChoice('betterPostersRatingSource', 'avg'),
     showBadgesAiringNext: getBadgeSetting('showBadgesAiringNext'),
     showBadgesContinueWatching: getBadgeSetting('showBadgesContinueWatching'),
     showBadgesTraktContinueWatching: getBadgeSetting('showBadgesTraktContinueWatching'),
@@ -62853,6 +63572,7 @@ function collectKeys() {
     showBadgesCatalogs: getBadgeSetting('showBadgesCatalogs'),
     showBadgesStremioAiringNext: getBadgeSetting('showBadgesStremioAiringNext'),
     showBadgesStremioContinueWatching: getBadgeSetting('showBadgesStremioContinueWatching'),
+    showBadgesStremioWatchlist: getBadgeSetting('showBadgesStremioWatchlist'),
     showBadgesStremioCatalogs: getBadgeSetting('showBadgesStremioCatalogs'),
     showBadgesStremio: getBadgeSetting('showBadgesStremio'),
     showBadgeAirDate: getBadgeSetting('showBadgeAirDate'),
@@ -62978,6 +63698,95 @@ function toggleBadgeSetting(key, isChecked) {
 }
 window.toggleBadgeSetting = toggleBadgeSetting;
 
+// --- Better Posters (btttr.cc) ---------------------------------------------
+//
+// Deliberately NOT getBadgeSetting: that one treats "absent" as on, which is
+// right for badges (they predate the stored setting) and wrong here -- the
+// master switch has to stay off until someone asks for it. So each key
+// carries its own default instead.
+function getBetterPostersSetting(key, defaultOn) {
+  try {
+    const v = localStorage.getItem('myListAddon:' + key);
+    if (v === null) return !!defaultOn;
+    return v === '1';
+  } catch (e) {
+    return !!defaultOn;
+  }
+}
+window.getBetterPostersSetting = getBetterPostersSetting;
+
+function getBetterPostersChoice(key, fallback) {
+  try {
+    return localStorage.getItem('myListAddon:' + key) || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+window.getBetterPostersChoice = getBetterPostersChoice;
+
+// One handler for both the checkboxes and the two dropdowns -- a boolean is
+// stored as 1/0, a dropdown value as itself.
+function toggleBetterPostersSetting(key, value) {
+  try {
+    localStorage.setItem('myListAddon:' + key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value));
+  } catch (e) {}
+  if (key === 'betterPosters') applyBetterPostersOptionsVisibility();
+  refreshBetterPostersSurfaces();
+  if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
+  if (typeof saveState === 'function') saveState();
+}
+window.toggleBetterPostersSetting = toggleBetterPostersSetting;
+
+// No refetch needed. Every website surface resolves its poster at render time
+// through resolveClientPoster (19), and nothing writes the resolved URL back
+// onto the item, so the original poster is always still there to fall back to
+// when the setting goes off again -- re-rendering is the whole job. Surfaces
+// not currently on screen pick the change up when they next render, the same
+// way the badge settings behave.
+function refreshBetterPostersSurfaces() {
+  if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+  // Tiles already patched carry a done-marker; clear it so they are
+  // reconsidered under the new setting.
+  try {
+    document.querySelectorAll('[data-better-poster-done]').forEach((el) => { delete el.dataset.betterPosterDone; });
+  } catch (e) {}
+  if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(document);
+  if (typeof renderLivePreview === 'function') renderLivePreview();
+  if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+}
+window.refreshBetterPostersSurfaces = refreshBetterPostersSurfaces;
+
+// The style controls are meaningless while the master switch is off, so they
+// collapse rather than sitting there inert.
+function applyBetterPostersOptionsVisibility() {
+  const wrap = document.getElementById('betterPostersOptions');
+  if (!wrap) return;
+  wrap.style.display = getBetterPostersSetting('betterPosters', false) ? 'flex' : 'none';
+}
+window.applyBetterPostersOptionsVisibility = applyBetterPostersOptionsVisibility;
+
+const BETTER_POSTERS_TOGGLES = [
+  { key: 'betterPosters', id: 'betterPostersCheckbox', on: false },
+  { key: 'betterPostersGenre', id: 'betterPostersGenreCheckbox', on: true },
+  { key: 'betterPostersRating', id: 'betterPostersRatingCheckbox', on: true },
+  { key: 'betterPostersTrendTags', id: 'betterPostersTrendTagsCheckbox', on: true },
+  { key: 'betterPostersQuality', id: 'betterPostersQualityCheckbox', on: false },
+  { key: 'betterPostersAge', id: 'betterPostersAgeCheckbox', on: false },
+];
+
+function initBetterPostersSettingsUI() {
+  BETTER_POSTERS_TOGGLES.forEach(({ key, id, on }) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = getBetterPostersSetting(key, on);
+  });
+  const langEl = document.getElementById('betterPostersLangSelect');
+  if (langEl) langEl.value = getBetterPostersChoice('betterPostersLang', 'en');
+  const rsEl = document.getElementById('betterPostersRatingSourceSelect');
+  if (rsEl) rsEl.value = getBetterPostersChoice('betterPostersRatingSource', 'avg');
+  applyBetterPostersOptionsVisibility();
+}
+window.initBetterPostersSettingsUI = initBetterPostersSettingsUI;
+
 function initBadgeSettingsUI() {
   const badgeKeys = [
     { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
@@ -62987,6 +63796,7 @@ function initBadgeSettingsUI() {
     { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
     { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
     { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+    { key: 'showBadgesStremioWatchlist', id: 'badgeStremioWatchlistCheckbox' },
     { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
     { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
     { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
@@ -63025,6 +63835,7 @@ function initBadgeSettingsUI() {
 window.initBadgeSettingsUI = initBadgeSettingsUI;
 document.addEventListener('DOMContentLoaded', () => {
   initBadgeSettingsUI();
+  initBetterPostersSettingsUI();
 });
 
 // --- Live Preview -----------------------------------------------------------
@@ -63076,7 +63887,17 @@ function _liveFallbackMeta(it, defaultType) {
     showId: it.showId || it.id,
     type: it.type || defaultType || (it.episodeTitle ? 'series' : 'series'),
     name: it.name || it.title,
-    poster: it.poster,
+    // Resolved the same way the Lists tab resolves it. Reading it.poster
+    // alone left every Airing Next tile as "No poster": those items carry no
+    // poster of their own, and My Lists only ever showed one because
+    // resolveListCardItemPoster falls back to showPoster and then to a
+    // metahub poster built from the show's IMDb id. Live Preview had no such
+    // fallback, so the two surfaces disagreed about the same item -- and
+    // turning Better Posters on masked it, since that builds a URL from the
+    // id and never needs a poster field at all.
+    poster: (typeof resolveListCardItemPoster === 'function')
+      ? resolveListCardItemPoster(it)
+      : (it.poster || it.showPoster || ''),
     year: it.year || it.releaseInfo,
     showTitle: it.showTitle || it.name || it.title,
     seasonNum: it.seasonNum != null ? it.seasonNum : it.season,
@@ -63159,13 +63980,7 @@ async function renderLivePreview() {
       // so only these get hidden rather than shown empty; the row's config
       // is untouched, so the moment the account has something in it again,
       // the same row picks it back up as it normally would.
-      const isPersonalTrackedShelf = (s.url || '').split('\\n').some((line) => {
-        const u = line.trim().toLowerCase();
-        return u.startsWith('autotrack:') ||
-          u.startsWith('trakt:watchlist') || u.startsWith('trakt:history') || u.startsWith('trakt:airing-next') || u.startsWith('trakt:continue-watching') || u.startsWith('trakt:user:') ||
-          u.startsWith('mdblist:watchlist') || u.startsWith('mdblist:history') || u.startsWith('mdblist:airing-next') || u.startsWith('mdblist:upnext') || u.startsWith('mdblist:user:') ||
-          u.startsWith('simkl:watchlist') || u.startsWith('simkl:history') || u.startsWith('simkl:airing-next') || u.startsWith('simkl:user:');
-      });
+      const isPersonalTrackedShelf = isPersonalShelfUrlClient(s.url);
 
       if (s.name && s.name.toLowerCase().includes('watch history')) {
         postersContainer.classList.add('is-watch-history-shelf');
@@ -63185,7 +64000,18 @@ async function renderLivePreview() {
         };
       }
       
-      function getFallbackShelfSample() {
+      // The sample to show INSTEAD of what /api/preview returned, for the two
+      // shelves that have a locally-known copy.
+      //
+      // It has to come from the account that actually backs THIS shelf. It
+      // used to try Trakt first for any Continue Watching / Airing Next row
+      // whatever its URL, so a row tracked by this add-on
+      // (autotrack:continue-watching:...) was shown the connected TRAKT
+      // account's shelf instead of its own. Two different accounts, two
+      // different sets of shows -- which is why the Lists tab and Live Preview
+      // could disagree about the same row, and why syncing the add-on's own
+      // shelf to the account changed nothing: this path never read it.
+      function traktShelfSample(stillUpcoming) {
         if (isCwShelf) {
           const lists = window._myPrivateTraktLists || window._myTraktLists || [];
           const cwList = lists.find((l) => l && (l.statusKey === 'continue-watching' || l.slug === 'continue-watching' || (l.url && (l.url === 'trakt:continue-watching' || l.url.includes(':continue-watching')))));
@@ -63206,7 +64032,6 @@ async function renderLivePreview() {
           // episode (or whose episode has since aired) get merged in as if
           // they were real Airing Next entries, inflating the shelf beyond
           // what Trakt actually has scheduled.
-          const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
           let cachedAiring = null;
           try {
             cachedAiring = JSON.parse(localStorage.getItem('myListAddon:traktAiringNextCache') || 'null');
@@ -63223,6 +64048,36 @@ async function renderLivePreview() {
           }
         }
         return null;
+      }
+
+      // This add-on's own auto-tracked shelf -- the exact list the Lists tab
+      // renders, and the only copy guaranteed current on this device.
+      function addonShelfSample(stillUpcoming) {
+        const localSlug = isCwShelf ? 'continue-watching' : (isAiringShelf ? 'airing-next' : '');
+        if (!localSlug || typeof loadLocalCustomLists !== 'function') return null;
+        const localList = loadLocalCustomLists()[localSlug];
+        let items = (localList && Array.isArray(localList.items)) ? localList.items : [];
+        if (!items.length) return null;
+        if (isAiringShelf) {
+          items = stillUpcoming(items);
+        } else if (s.type === 'movie') {
+          items = items.filter((it) => it && (it.type === 'movie' || it.kind === 'movie'));
+        } else if (s.type === 'series') {
+          items = items.filter((it) => it && (it.type === 'series' || it.kind === 'series' || it.episodeTitle || it.seasonNum != null || it.episodeNum != null || it.season != null));
+        }
+        return items.length ? items : null;
+      }
+
+      function getFallbackShelfSample() {
+        const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+        // An "autotrack:" row is this add-on's own shelf, so its own list is
+        // the only right answer -- never a connected Trakt account's.
+        if ((s.url || '').toLowerCase().indexOf('autotrack:') !== -1) {
+          return addonShelfSample(stillUpcoming);
+        }
+        // Everything else keeps the behaviour it had: Trakt's copy where there
+        // is one, and the add-on's own list only as a last resort.
+        return traktShelfSample(stillUpcoming) || addonShelfSample(stillUpcoming);
       }
       
       try {
@@ -63353,6 +64208,11 @@ async function renderLivePreview() {
     const seenByType = {};
     livePreviewShelfData.forEach((shelf, i) => {
       if (!shelf || !Array.isArray(shelf.sample) || !shelf.sample.length) return;
+      // Same exclusion the Worker applies in dedupeAcrossListEntries
+      // (05_catalog-core.js): a personal shelf is neither stripped nor a
+      // source of strips. Preview has to agree with what gets served, or the
+      // editor shows a shelf the install does not.
+      if (isPersonalShelfUrlClient(shelf.url)) return;
       const seen = seenByType[shelf.type] || (seenByType[shelf.type] = new Set());
       const before = shelf.sample.length;
       shelf.sample = shelf.sample.filter((item) => item && item.id && !seen.has(item.id));
@@ -63500,6 +64360,7 @@ function getPosterBadgeSettings() {
     traktContinueWatching: get('showBadgesTraktContinueWatching'),
     mdblistUpNext: get('showBadgesMdblistUpNext'),
     airingNext: get('showBadgesAiringNext'),
+    catalogs: get('showBadgesCatalogs'),
     airDate: get('showBadgeAirDate'),
     seasonPremiere: get('showBadgeSeasonPremiere'),
     seasonFinale: get('showBadgeSeasonFinale'),
@@ -63676,6 +64537,9 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
 
   var first = items.slice(0, POSTER_GRID_FIRST_CHUNK);
   gridEl.insertAdjacentHTML('beforeend', first.map(livePreviewPosterHtml).join(''));
+  // A TMDB-id-only item cannot get a BetterPosters URL at render time, so
+  // the ids for what just landed on screen are translated and patched in.
+  if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
 
   if (items.length <= POSTER_GRID_FIRST_CHUNK) {
     if (typeof onComplete === 'function') onComplete(items.length);
@@ -63698,6 +64562,7 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
       return;
     }
     gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
     cursor += slice.length;
     if (cursor < items.length) {
       schedule(step);
@@ -63732,6 +64597,7 @@ function appendPosterGridItems(gridEl, items) {
     var slice = items.slice(cursor, cursor + POSTER_GRID_BATCH);
     if (!slice.length) return;
     gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
     cursor += slice.length;
     if (cursor < items.length) schedule(step);
   }
@@ -63739,14 +64605,36 @@ function appendPosterGridItems(gridEl, items) {
 }
 window.appendPosterGridItems = appendPosterGridItems;
 
+// Client mirror of isPersonalShelfUrl (00_constants.js) -- Continue Watching,
+// Airing Next, Watch History and Watchlist, from any provider. Kept in step
+// with it by tests/personal-shelves.test.mjs, which asserts both sides answer
+// the same for the same URLs.
+function isPersonalShelfUrlClient(url) {
+  if (!url) return false;
+  return String(url).split(/[\\r\\n]+/).some((line) => {
+    const u = line.trim().toLowerCase();
+    if (!u) return false;
+    return u.indexOf('autotrack:') === 0 ||
+      u.indexOf('trakt:watchlist') === 0 || u.indexOf('trakt:history') === 0 || u.indexOf('trakt:airing-next') === 0 || u.indexOf('trakt:continue-watching') === 0 || u.indexOf('trakt:user:') === 0 ||
+      u.indexOf('mdblist:watchlist') === 0 || u.indexOf('mdblist:history') === 0 || u.indexOf('mdblist:airing-next') === 0 || u.indexOf('mdblist:upnext') === 0 || u.indexOf('mdblist:user:') === 0 ||
+      u.indexOf('simkl:watchlist') === 0 || u.indexOf('simkl:history') === 0 || u.indexOf('simkl:airing-next') === 0 || u.indexOf('simkl:user:') === 0;
+  });
+}
+window.isPersonalShelfUrlClient = isPersonalShelfUrlClient;
+
 function livePreviewPosterHtml(m) {
-  if (typeof resolveClientPoster === 'function') {
-    m.poster = resolveClientPoster(m, m.poster);
-  }
+  // Resolved into a local, never written back onto m. It used to assign
+  // "m.poster = ..." to it, which meant a re-render of the same cached item saw the
+  // already-resolved URL as its own original -- harmless while the result was
+  // stable, but it would make a Better Posters URL stick after the setting was
+  // switched back off, with no original left to restore.
+  const resolvedPoster = (typeof resolveClientPoster === 'function')
+    ? resolveClientPoster(m, m.poster)
+    : m.poster;
   const landscape = m.posterShape === 'landscape';
   const posterClass = 'live-preview-poster' + (landscape ? ' landscape' : '');
-  const posterEl = m.poster
-    ? '<img class="' + posterClass + '" src="' + escapeAttr(m.poster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)" data-imdb="' + escapeAttr(m.id || '') + '"><div class="' + posterClass + ' live-preview-poster-placeholder" style="display:none;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>'
+  const posterEl = resolvedPoster
+    ? '<img class="' + posterClass + '" src="' + escapeAttr(resolvedPoster) + '" alt="" loading="lazy" onerror="handlePosterImgError(this)" data-imdb="' + escapeAttr(m.id || '') + '"><div class="' + posterClass + ' live-preview-poster-placeholder" style="display:none;"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>'
     : '<div class="' + posterClass + ' live-preview-poster-placeholder"><small style="color:var(--muted); font-size:0.7rem;">No poster</small></div>';
   
   const parentUrl = (m.listUrl || (window._currentListDetailsParams ? window._currentListDetailsParams.listUrl : '') || '').toLowerCase();
@@ -63767,6 +64655,12 @@ function livePreviewPosterHtml(m) {
 
   const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext || isTraktCwContext || isMdblistUpNextContext);
   const isAiringItem = !!(m.isAiringNext || m.listSlug === 'airing-next' || isAiringListContext);
+  // A Watchlist shelf carries the same premiere / finale / air-date chips now
+  // that fetchAutoTrackedCatalog enriches it from the same Airing Next data
+  // (05_catalog-core.js). Checked AFTER the two above so a shelf that is both
+  // keeps its more specific meaning.
+  const isWatchlistListContext = parentUrl.includes('watchlist') || parentName.includes('watchlist') || decodedSlug === 'watchlist';
+  const isWatchlistItem = !isCwItem && !isAiringItem && !!(m.listSlug === 'watchlist' || isWatchlistListContext);
 
   let removeBtn = '';
   if (!m.isLivePreviewShelf && !m.hideRemoveBtn) {
@@ -63795,7 +64689,9 @@ function livePreviewPosterHtml(m) {
         ? (badgeSettings.mdblistUpNext !== false)
         : (isCwItem
             ? badgeSettings.continueWatching
-            : (isAiringItem ? badgeSettings.airingNext : false)));
+            : (isAiringItem
+                ? badgeSettings.airingNext
+                : (isWatchlistItem ? badgeSettings.catalogs !== false : false))));
 
   const showAirDate = locationAllowed && badgeSettings.airDate;
   const showPremiere = locationAllowed && badgeSettings.seasonPremiere;
@@ -63880,7 +64776,12 @@ function livePreviewPosterHtml(m) {
     subtitleHtml = '<div class="live-preview-poster-subtitle" style="display:flex; align-items:center; justify-content:flex-end; gap:4px; width:100%;">' + ratingSpan + '</div>';
   }
   const extraCardClass = isTraktCwContext ? ' detail-page-trakt-continue-watching' : (isMdblistUpNextContext ? ' detail-page-mdblist-up-next' : '');
-  return '<div class="live-preview-poster-card clickable-poster' + extraCardClass + '" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(m.poster || '') + '">' +
+  // resolvedPoster, not m.poster: this attribute is what the poster modal
+  // reads back, so it has to carry the same URL the tile is showing -- the
+  // safe-poster stand-in for a filtered adult item, and the Better Posters
+  // URL when that is on. It used to match only because the poster was
+  // assigned onto m above.
+  return '<div class="live-preview-poster-card clickable-poster' + extraCardClass + '" data-id="' + escapeAttr(m.id || '') + '" data-type="' + escapeAttr(m.type || '') + '" data-title="' + escapeAttr(m.name || '') + '" data-poster="' + escapeAttr(resolvedPoster || '') + '">' +
     '<div style="position:relative; width:100%;">' +
       posterEl +
       dateBadge +
@@ -65206,14 +66107,44 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       listUrl.startsWith('trakt:watchlist') || listUrl.startsWith('trakt:history') || listUrl.startsWith('trakt:airing-next') || listUrl.startsWith('trakt:continue-watching') ||
       listUrl.startsWith('trakt:user:') || listUrl.startsWith('mdblist:user:')
     );
-    if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
+    // A channel published to Explore Channels IS likeable -- the directory's
+    // own cards have had a heart all along -- but by its published code
+    // against /api/channel/like, not by a list URL against the list ledger.
+    // That is why the channel: exclusion below is right and the button was
+    // still missing here: there was no channel-flavoured branch to fall into.
+    // Only a channel opened FROM the directory has a code; one of your own
+    // saved channels has nothing published to like.
+    const channelLikeCode = (opts && opts.channelLikeCode) || '';
+    if (channelLikeCode) {
+      const chLiked = typeof _channelDirectoryLiked !== 'undefined' && !!_channelDirectoryLiked[channelLikeCode];
+      likeBtn.style.display = '';
+      // Cleared, not left stale: the delegated .searchLikeExternalBtn handler
+      // (19_client-search-and-likes.js) acts on dataset.url and returns early
+      // without one, so this button reaches only the channel path below --
+      // the same arrangement the directory's own hearts already use.
+      delete likeBtn.dataset.url;
+      likeBtn.dataset.channelLikeCode = channelLikeCode;
+      likeBtn.setAttribute('aria-label', 'Like this channel');
+      likeBtn.title = 'Like this channel';
+      likeBtn.classList.toggle('liked', chLiked);
+      likeBtn.innerHTML = chLiked ? '&#9829;' : '&#9825;';
+      likeBtn.onclick = function() {
+        if (typeof toggleChannelDirectoryLike === 'function') toggleChannelDirectoryLike(channelLikeCode, likeBtn);
+      };
+    } else if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;
+      delete likeBtn.dataset.channelLikeCode;
+      likeBtn.onclick = null;
+      likeBtn.setAttribute('aria-label', 'Like this list');
+      likeBtn.title = 'Like this list';
       likeBtn.classList.toggle('liked', isLiked);
       likeBtn.innerHTML = isLiked ? '&#9829;' : '&#9825;';
     } else {
       likeBtn.style.display = 'none';
+      delete likeBtn.dataset.channelLikeCode;
+      likeBtn.onclick = null;
     }
   }
 
@@ -67115,15 +68046,38 @@ function rebuildCustomListsFromPreset(name, isSilent = false) {
   }
 
   const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(preset);
+  // A preset records WHICH shelves you had, not what was on them -- and for a
+  // personal auto-tracked shelf the two are not the same thing. Continue
+  // Watching, Airing Next, Watch History and Watchlist are live views of the
+  // account, so the only correct content for them is whatever is tracked
+  // right now.
+  //
+  // This used to merge the preset's copy into the live list instead: additive,
+  // with nothing marking which items came from the preset, so a preset built
+  // months ago silently put months-old shows back into Continue Watching with
+  // no way to tell them apart or take them out again. Worse, the merge set
+  // hasTrackingChanges, which pushed that mixture up to the account -- so the
+  // stale copy then outlived the browser that loaded the preset.
+  //
+  // Deliberately NOT applied to Backup/Restore (the two callers of
+  // extractCustomListsAndChannelsFromPreset above): restoring your watch
+  // history is the entire point of a backup. It is only a PRESET, which is a
+  // set of shelves, that has no business carrying their contents.
+  const PRESET_SKIPS_TRACKED_SLUGS = ['continue-watching', 'airing-next', 'watch-history', 'watchlist'];
+  const skippedTrackedSlugs = Object.keys(extractedLists).filter((slug) => PRESET_SKIPS_TRACKED_SLUGS.includes(slug));
+  skippedTrackedSlugs.forEach((slug) => { delete extractedLists[slug]; });
   const listSlugs = Object.keys(extractedLists);
   const channelIds = Object.keys(extractedChannels);
 
   if (!listSlugs.length && !channelIds.length) {
     if (!isSilent) {
-      if (typeof showAppAlert === 'function') showAppAlert('No Custom Lists Found', 'Preset "' + name + '" does not contain any custom lists or channels.', false);
-      else alert('Preset "' + name + '" does not contain any custom lists or channels.');
+      const msg = skippedTrackedSlugs.length
+        ? 'Preset "' + name + '" has no custom lists or channels to restore. It does carry Continue Watching / Airing Next / Watch History / Watchlist, but those always follow your account rather than the preset, so they were left as they are.'
+        : 'Preset "' + name + '" does not contain any custom lists or channels.';
+      if (typeof showAppAlert === 'function') showAppAlert('No Custom Lists Found', msg, false);
+      else alert(msg);
     }
-    return { restoredLists: 0, restoredChannels: 0, listNames: [] };
+    return { restoredLists: 0, restoredChannels: 0, listNames: [], skippedTrackedSlugs: skippedTrackedSlugs };
   }
 
   // 1. Merge into local custom lists
@@ -67225,7 +68179,7 @@ function rebuildCustomListsFromPreset(name, isSilent = false) {
     }
   }
 
-  return { restoredLists: listSlugs.length, restoredChannels: channelIds.length, listNames: restoredListNames };
+  return { restoredLists: listSlugs.length, restoredChannels: channelIds.length, listNames: restoredListNames, skippedTrackedSlugs: skippedTrackedSlugs };
 }
 
 function renderPresetsList() {
@@ -67287,6 +68241,12 @@ function loadPreset(name) {
 
   // Rebuild and restore custom lists & channels from this preset
   const result = rebuildCustomListsFromPreset(name, true);
+  // Said out loud rather than silently: the shelves someone is most likely to
+  // notice not changing are exactly these, and "nothing happened" reads like
+  // a bug unless it says why.
+  const skipped = (result.skippedTrackedSlugs && result.skippedTrackedSlugs.length)
+    ? 'Continue Watching, Airing Next, Watch History and Watchlist always follow your account, so they were left as they are'
+    : '';
   if (result.restoredLists > 0 || result.restoredChannels > 0) {
     let msg = 'Preset "' + name + '" loaded';
     const parts = [];
@@ -67294,9 +68254,10 @@ function loadPreset(name) {
     if (result.restoredChannels) parts.push(result.restoredChannels + ' channel' + (result.restoredChannels === 1 ? '' : 's'));
     if (parts.length) msg += ' & ' + parts.join(', ') + ' restored to My Lists';
     msg += ' \u2713';
+    if (skipped) msg += ' \u2014 ' + skipped;
     showAddedToast(msg);
   } else {
-    showAddedToast('Preset "' + name + '" loaded \u2713');
+    showAddedToast('Preset "' + name + '" loaded \u2713' + (skipped ? ' \u2014 ' + skipped : ''));
   }
 }
 
@@ -67762,6 +68723,25 @@ async function generate() {
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
         adultContentFilter: keys.adultContentFilter,
         dedupeAcrossLists: keys.dedupeAcrossLists,
+        // Must be listed explicitly: this body is an allowlist, and /api/save
+        // is the link Stremio/Nuvio actually install. Left out, the setting
+        // never leaves the browser and the feature looks dead in the apps
+        // while the website shows it working.
+        // Same allowlist problem as betterPosters below: left out, switching
+        // any of these off never leaves the browser.
+        showBadgesStremio: keys.showBadgesStremio,
+        showBadgesStremioAiringNext: keys.showBadgesStremioAiringNext,
+        showBadgesStremioContinueWatching: keys.showBadgesStremioContinueWatching,
+        showBadgesStremioWatchlist: keys.showBadgesStremioWatchlist,
+        showBadgesStremioCatalogs: keys.showBadgesStremioCatalogs,
+        betterPosters: keys.betterPosters,
+        betterPostersGenre: keys.betterPostersGenre,
+        betterPostersRating: keys.betterPostersRating,
+        betterPostersTrendTags: keys.betterPostersTrendTags,
+        betterPostersQuality: keys.betterPostersQuality,
+        betterPostersAge: keys.betterPostersAge,
+        betterPostersLang: keys.betterPostersLang,
+        betterPostersRatingSource: keys.betterPostersRatingSource,
       }),
     });
     const data = await res.json();
@@ -69427,6 +70407,12 @@ const POSTER_IMAGE_HOSTS = new Set([
   "image.tmdb.org",
   "images.metahub.space",
   "simkl.in",
+  // BetterPosters. This set is "hosts this add-on itself puts in a poster
+  // field", and with the Better Posters setting on, it does. Missing here,
+  // /api/poster-badge 404s the moment a badge is drawn over BetterPosters
+  // artwork -- which is every Airing Next and Continue Watching tile, the
+  // two rows that always carry a badge, while unbadged rows looked fine.
+  "btttr.cc",
 ]);
 
 function isAllowedPosterUrl(raw) {
@@ -70275,15 +71261,24 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const isSearchCatalog = id === "search_movies" || id === "search_series" || id === "search" || id === "search_movie" || (id === "top" && searchQuery);
       if (isSearchCatalog) {
         if (!searchQuery) return jsonPublic({ metas: [] });
-        const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
-        const effectiveTmdbKey = tmdbKey || TMDB_API_KEY;
-        const metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        const searchConfig = config ? await resolveConfig(config, env) : {};
+        const effectiveTmdbKey = searchConfig.tmdbKey || TMDB_API_KEY;
+        let metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        // This route builds its metas directly rather than through
+        // fetchCatalog, so it needs its own call -- otherwise search results
+        // would be the one row in Stremio still showing the old artwork.
+        if (searchConfig.betterPosters) {
+          metas = applyBetterPostersToMetas(metas, betterPostersOptionsFrom(searchConfig));
+        }
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400" });
       }
 
       if (!config) return jsonPublic({ metas: [] });
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
+      // Kept as a whole object as well as destructured: the betterPosters*
+      // style keys are passed through wholesale rather than one at a time.
+      const resolvedConfig = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, betterPosters, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist } = resolvedConfig;
       const entryIndex = entries.findIndex((e) => e.id === id && e.type === type);
       const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
@@ -70306,7 +71301,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // to a config that PROVED it belongs to that account. See resolveConfig
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
-        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist, env, ctx, origin: url.origin });
         if (dedupeAcrossLists) {
           metas = await dedupeAcrossListEntries(entries, entryIndex, skip, metas, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, env, ctx });
         }
@@ -70660,10 +71655,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // 2. Standard title metadata for IMDb ids ("tt...") or TMDB ids ("tmdb:...")
       if (id.startsWith("tt") || id.startsWith("tmdb:")) {
         try {
-          const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
-          const effectiveKey = tmdbKey || TMDB_API_KEY;
-          const meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
+          const metaConfig = config ? await resolveConfig(config, env) : {};
+          const effectiveKey = metaConfig.tmdbKey || TMDB_API_KEY;
+          let meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
           if (!meta) return jsonPublic({ meta: null });
+          // Same opt-in artwork the catalog rows get, so a title's detail
+          // page does not fall back to the plain poster the moment it is
+          // opened. Only the poster is touched -- background, logo, cast and
+          // the episode list all stay exactly as fetchStandardItemMeta built
+          // them, and a non-IMDB id (tmdb:...) is left alone.
+          if (metaConfig.betterPosters) {
+            meta = applyBetterPosterToMeta(meta, betterPostersOptionsFrom(metaConfig));
+          }
           return jsonPublic(
             { meta },
             200,
@@ -72046,6 +73049,74 @@ function generateSearchVariations(query) {
 
     // /api/recommendations  (POST)  { movieIds: [...], showIds: [...] } -> { ok, movies: [...], shows: [...] }
     // Generates personalized movie and show recommendations from TMDB based on user watch history.
+    // /api/imdb-ids  (POST)  { items: [{ id, type }] } -> { ok, map: { "tmdb:278": "tt0068646" } }
+    //
+    // BetterPosters is keyed by IMDB id and nothing else -- there is no
+    // /poster/tmdb/... route, it 404s -- so a tile whose item carries only a
+    // TMDB id cannot have BetterPosters artwork built for it. That is exactly
+    // what the Curated For You / Recommended cards hold: /api/recommendations
+    // answers with "tmdb:<n>" ids, because TMDB's recommendation endpoints
+    // return TMDB ids and nothing else.
+    //
+    // fetchCuratedCatalog already pays for the same translation when it serves
+    // those lists as a catalog (one external_ids call per item, edge-cached for
+    // a day), which is why the identical rows DO get BetterPosters artwork in
+    // Live Preview and in Stremio/Nuvio while the dashboard cards did not.
+    //
+    // Deliberately per-request and small rather than resolving the whole list
+    // up front: /api/recommendations returns up to 40 movies AND 40 shows, and
+    // 80 extra subrequests on a dashboard load would blow the 50-subrequest
+    // ceiling a free Workers plan gets. The caller asks only for the tiles it
+    // is about to draw, so a card costs ~9 and a See All page resolves more as
+    // it is scrolled. Every answer is edge-cached for a day, so the second
+    // visit costs nothing.
+    if (path === "/api/imdb-ids" && request.method === "POST") {
+      let idBody;
+      try {
+        idBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const rawItems = Array.isArray(idBody.items) ? idBody.items.slice(0, IMDB_ID_LOOKUP_MAX) : [];
+      if (!rawItems.length) return json({ ok: true, map: {} });
+      const idTmdbKey = idBody.tmdbKey || TMDB_API_KEY;
+
+      // Same shape as /api/recommendations above, and for the same reason: a
+      // caller spending their own TMDB quota still spends this Worker's
+      // subrequest and CPU budget, so the ceiling differs but the limit does
+      // not go away.
+      const idIp = clientIpKey(request);
+      if (!idIp) return json({ ok: false, error: "Could not resolve those ids." }, 400);
+      if (await consumeRateLimit(env, ctx, "imdbids", idIp, idBody.tmdbKey ? 240 : 60)) {
+        return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
+      }
+
+      const map = {};
+      await Promise.all(rawItems.map(async (raw) => {
+        const key = String((raw && raw.id) || "").trim();
+        if (!key.startsWith("tmdb:")) return;
+        // The id segment only -- an episode id ("tmdb:1234:1:2") resolves to
+        // its show, which is the artwork a poster tile wants anyway.
+        const tmdbId = key.slice(5).split(":")[0];
+        if (!/^\d{1,12}$/.test(tmdbId)) return;
+        const isSeries = (raw && raw.type) === "series" || (raw && raw.type) === "tv";
+        try {
+          const res = await fetch(
+            `https://api.themoviedb.org/3/${isSeries ? "tv" : "movie"}/${tmdbId}/external_ids?api_key=${encodeURIComponent(idTmdbKey)}`,
+            { cf: { cacheTtl: 86400, cacheEverything: true } }
+          );
+          if (!res.ok) return;
+          const data = await res.json();
+          // Only a real IMDB id is useful here; anything else and the caller
+          // keeps the poster it already had.
+          if (data && typeof data.imdb_id === "string" && /^tt\d{5,12}$/.test(data.imdb_id)) {
+            map[key] = data.imdb_id;
+          }
+        } catch (e) {}
+      }));
+      return json({ ok: true, map }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/api/recommendations" && request.method === "POST") {
       let body;
       try {
@@ -76439,6 +77510,44 @@ function generateSearchVariations(query) {
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
       if (body.adultContentFilter) payload.adultContentFilter = true;
       if (body.dedupeAcrossLists) payload.dedupeAcrossLists = true;
+      // The Stremio/Nuvio artwork-overlay toggles. Stored only when switched
+      // OFF, because resolveConfig reads an absent key as on -- so a config
+      // with all of them on stays exactly the size it was.
+      //
+      // These were missing from this allowlist entirely, which meant turning
+      // any of them off never reached the install link: the setting looked
+      // saved, and the badges kept appearing in the apps. It read as harmless
+      // only because the default is on; the same gap left Better Posters
+      // (default off) looking completely dead. See that key below.
+      for (const badgeKey of STREMIO_BADGE_KEYS) {
+        if (body[badgeKey] === false) payload[badgeKey] = false;
+      }
+      // Better Posters. This builder is an allowlist -- a key it does not name
+      // is dropped on the floor -- and this is the PRIMARY install path
+      // whenever a CONFIGS KV namespace is bound, so a key missing here does
+      // not degrade the feature, it disables it outright: resolveConfig reads
+      // betterPosters back as false and Stremio/Nuvio get the plain artwork,
+      // no matter what the builder page shows. Only the base64 fallback link
+      // (buildConfig, 23_client-list-management.js) carried it before this.
+      // Each style key is stored only when it differs from btttr.cc's own
+      // default for that option, matching buildConfig.
+      if (body.betterPosters) {
+        payload.betterPosters = true;
+        if (body.betterPostersGenre === false) payload.betterPostersGenre = false;
+        if (body.betterPostersRating === false) payload.betterPostersRating = false;
+        if (body.betterPostersTrendTags === false) payload.betterPostersTrendTags = false;
+        if (body.betterPostersQuality) payload.betterPostersQuality = true;
+        if (body.betterPostersAge) payload.betterPostersAge = true;
+        // Validated at the door rather than only where the URL is built: this
+        // endpoint is unauthenticated, and there is no reason to persist a
+        // value btttr.cc would reject anyway.
+        if (BETTER_POSTERS_LANGS.some((l) => l.value === body.betterPostersLang) && body.betterPostersLang !== "en") {
+          payload.betterPostersLang = body.betterPostersLang;
+        }
+        if (BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === body.betterPostersRatingSource) && body.betterPostersRatingSource !== "avg") {
+          payload.betterPostersRatingSource = body.betterPostersRatingSource;
+        }
+      }
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a

@@ -940,3 +940,125 @@ const D1_SCHEMA_MANIFEST = [
   },
 ];
 
+
+// ---------------------------------------------------------------------------
+// BetterPosters (https://btttr.cc) -- optional replacement artwork.
+//
+// BetterPosters renders a title's poster with the text baked in: genre, star
+// rating, a trend tag ("Trending"/"New"), quality flags (4K/DV/Atmos) and an
+// age rating. It keys off the IMDB id alone -- no API key, no account, nothing
+// to register -- so the whole integration is a URL rewrite over metas this
+// add-on already built. Off by default; "Better Posters" in Settings ->
+// Artwork & Badges turns it on.
+//
+// The URL contract is the one btttr.cc's own configurator emits for external
+// add-ons (its "AIOMetadata / Other Addon" mode):
+//
+//   https://btttr.cc/{base}/imdb/poster-default/{imdb_id}.jpg[?tag=none][&lang=..][&rs=..]
+//
+// {base} is what selects the artwork -- NOT the literal "poster-default"
+// segment after it. That segment is fixed: the service ignores whatever is put
+// there (every value, including a nonsense one, returns byte-identical bytes),
+// which is why the nuvio-better-posters-addon project's single hard-coded
+// "/poster/imdb/poster-default/{id}.jpg" only ever yields the default style.
+// buildBetterPosterUrl (05_catalog-core.js) assembles the base properly.
+const BETTER_POSTERS_ORIGIN = "https://btttr.cc";
+
+// Rating sources btttr.cc accepts for "rs", straight off its configurator's
+// own dropdown. "avg" is its default and is sent as no parameter at all.
+const BETTER_POSTERS_RATING_SOURCES = [
+  { value: "avg", label: "Average" },
+  { value: "IM", label: "IMDb (/10)" },
+  { value: "TM", label: "TMDB (/10)" },
+  { value: "RT", label: "Rotten Tomatoes (%)" },
+  { value: "MC", label: "Metacritic (/100)" },
+  { value: "TR", label: "Trakt (/10)" },
+  { value: "LB", label: "Letterboxd (/5)" },
+  { value: "RE", label: "Roger Ebert (/4)" },
+];
+
+// Languages btttr.cc's configurator offers for "lang". Anything not on this
+// list is treated as English (again: sent as no parameter).
+const BETTER_POSTERS_LANGS = [
+  { value: "en", label: "English" },
+  { value: "es-ES", label: "Espa\u00f1ol (Espa\u00f1a)" },
+  { value: "es-MX", label: "Espa\u00f1ol (Latinoam\u00e9rica)" },
+  { value: "fr", label: "Fran\u00e7ais" },
+  { value: "de", label: "Deutsch" },
+  { value: "pt-BR", label: "Portugu\u00eas (Brasil)" },
+  { value: "pt-PT", label: "Portugu\u00eas (Portugal)" },
+  { value: "it", label: "Italiano" },
+  { value: "nl", label: "Nederlands" },
+  { value: "pl", label: "Polski" },
+  { value: "ru", label: "\u0420\u0443\u0441\u0441\u043a\u0438\u0439" },
+  { value: "tr", label: "T\u00fcrk\u00e7e" },
+  { value: "ar", label: "\u0627\u0644\u0639\u0631\u0628\u064a\u0629" },
+  { value: "ja", label: "\u65e5\u672c\u8a9e" },
+  { value: "ko", label: "\ud55c\uad6d\uc5b4" },
+  { value: "zh", label: "\u4e2d\u6587" },
+  { value: "hi", label: "\u0939\u093f\u0928\u094d\u0926\u0940" },
+  { value: "sv", label: "Svenska" },
+  { value: "cs", label: "\u010ce\u0161tina" },
+];
+
+function buildBetterPostersLangOptionsHtml(selected) {
+  const sel = BETTER_POSTERS_LANGS.some((l) => l.value === selected) ? selected : "en";
+  return BETTER_POSTERS_LANGS.map(
+    ({ value, label }) => `<option value="${value}"${value === sel ? " selected" : ""}>${label}</option>`
+  ).join("");
+}
+
+function buildBetterPostersRatingSourceOptionsHtml(selected) {
+  const sel = BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === selected) ? selected : "avg";
+  return BETTER_POSTERS_RATING_SOURCES.map(
+    ({ value, label }) => `<option value="${value}"${value === sel ? " selected" : ""}>${label}</option>`
+  ).join("");
+}
+
+// --- personal, auto-tracked shelves --------------------------------------
+//
+// Continue Watching, Airing Next, Watch History and Watchlist, across every
+// provider that can supply one. These are not lists in the ordinary sense:
+// each is a live view OF ONE ACCOUNT, derived per request, and its whole job
+// is to answer "what am I in the middle of / what is next for me".
+//
+// That makes them the wrong input and the wrong target for anything that
+// treats lists as interchangeable collections -- "Remove duplicate items
+// across lists" most of all, which would otherwise strip the show you are
+// three episodes into out of Continue Watching purely because it also turned
+// up in Trending higher on the page.
+const PERSONAL_SHELF_URL_PREFIXES = [
+  "autotrack:",
+  "trakt:watchlist", "trakt:history", "trakt:airing-next", "trakt:continue-watching", "trakt:user:",
+  "mdblist:watchlist", "mdblist:history", "mdblist:airing-next", "mdblist:upnext", "mdblist:user:",
+  "simkl:watchlist", "simkl:history", "simkl:airing-next", "simkl:user:",
+];
+
+// True when ANY source line of a (possibly merged) row names a personal
+// shelf -- a merged row carrying one is still reading somebody's account.
+function isPersonalShelfUrl(url) {
+  if (!url) return false;
+  return String(url).split(/[\r\n]+/).some((line) => {
+    const u = line.trim().toLowerCase();
+    return !!u && PERSONAL_SHELF_URL_PREFIXES.some((p) => u.startsWith(p));
+  });
+}
+
+// How many TMDB->IMDB translations one /api/imdb-ids call will do. Each is a
+// separate outbound request, so this is the per-request subrequest ceiling for
+// that endpoint -- sized to cover a Curated card's poster strip plus headroom,
+// and to stay well inside the 50 a free Workers plan allows per request.
+const IMDB_ID_LOOKUP_MAX = 24;
+
+// The Stremio/Nuvio artwork-overlay toggles, as stored in an install config.
+// Named in one place because they have to agree across four: the builder
+// page's save request, /api/save's stored payload, resolveConfig's read, and
+// the badge gate in fetchCatalog. Each reads as ON when absent, so only a
+// switched-off one is ever written.
+const STREMIO_BADGE_KEYS = [
+  "showBadgesStremio",
+  "showBadgesStremioAiringNext",
+  "showBadgesStremioContinueWatching",
+  "showBadgesStremioWatchlist",
+  "showBadgesStremioCatalogs",
+];

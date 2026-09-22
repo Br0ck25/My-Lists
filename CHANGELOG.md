@@ -6,6 +6,100 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ⭐ Better Posters (btttr.cc)
+
+- **Settings -> Account & Sync -> Better Posters** swaps plain poster artwork for [BetterPosters](https://btttr.cc/) -- posters with the genre, rating and tags drawn into the image itself rather than laid over it. **Off by default**, and needs no API key or account: BetterPosters keys off the IMDb id alone.
+- **Applies across the whole product.** On the website: Live Preview, Search, Discover, My Lists, creator profiles, the Custom List and Channel builders, list "See All" pages and the title details modal. In your apps: catalog rows, the search catalog and the title pages Stremio/Nuvio request (`/meta/`). The website re-renders the moment you tick the box; an existing install link needs a Save/Update for the app side.
+- Only movies and shows with an IMDb id are touched. A TMDB-only item, a TV Channel's generated artwork, an episode still and any landscape tile keep the poster they already had (BetterPosters only renders 2:3 artwork).
+- Style controls mirror btttr.cc's own configurator: **Genre**, **Rating** (with a source picker -- IMDb, TMDB, Rotten Tomatoes, Metacritic, Trakt, Letterboxd, Roger Ebert), **Trend tags**, **Quality tags** (4K/DV/Atmos), **Age rating**, and a **poster language**. Each defaults to btttr.cc's own default, so leaving them alone produces exactly the URL its configurator hands out.
+- **Poster badges still work on top of it.** The BetterPosters swap runs *before* the badge pass, so a premiere/finale/air-date chip is drawn over the BetterPosters artwork instead of replacing it. The Adult Content Filter still overrides both.
+- The settings ride the same Creator Profile sync as the badge settings, so enabling it in one browser enables it in the next.
+- Every poster on the website resolves through one funnel (`resolveClientPoster`, `19_client-search-and-likes.js`), which the surfaces above already reached via `resolveListCardItemPoster` (17), `resolveItemPoster` (22), `livePreviewPosterHtml` (23), `renderMediaCard` (16) and `loadPosterSlot` (19). The client mirror of the Worker's URL builder lives next to it, and the two are pinned to the same expected URLs by the same test file.
+
+### 🐛 Drag-to-reorder stopped dead at the bottom of the screen
+
+- Nothing scrolled the page while a drag was in progress. `moveItem` places the dragged row among the rows **currently on screen**, so on any list taller than the window -- which is most of them once Live Preview shelves carry posters and each row is ~200px -- dragging past the last visible row did nothing: the row stopped at the edge and sat there. That is what "the drag freezes and won't move the list" was, and it applied to every list `createSortableList` drives (Catalogs, Live Preview, Your Custom Lists, the builders) on desktop and touch alike.
+- `createSortableList` now auto-scrolls when the pointer comes within 90px of an edge, ramping to 20px per frame at the very edge, and re-places the row against the rows that scroll into view. It drives this from its own animation-frame loop rather than from `dragover`/`pointermove`, because those stop firing the moment the pointer is held still at the edge -- which is exactly when scrolling needs to continue. It scrolls the nearest scrollable ancestor when there is one (lists inside panels) and the window otherwise.
+- Verified against the failing case in a real browser: a 12-row list at 2584px in a 900px window. Before, dragging row 1 to the bottom edge and holding it there moved it three places and left `window.scrollY` at 0. After, the same drag carries it to seventh with the page scrolled 1008px. **Not covered by the test suite** -- it needs real layout and a real pointer, and CI runs on bare node + python with no browser.
+
+### ⭐ Watchlist posters now carry the same badges as Continue Watching and Airing Next
+
+- A show on your Watchlist with an episode coming got no premiere chip and no date chip. Three separate gates kept it out, all of them testing for `continue-watching`: the Airing Next data was only loaded for that slug, the lookup maps were only built for it, and the enrichment only ran for it. All three now include `watchlist`, so a watchlist entry is matched against the same Airing Next record and carries the same `airDate` / `isSeasonPremiere` / finale fields.
+- The fully-watched filtering stays Continue Watching only, deliberately: a watchlist is what you **mean** to watch, not a progress shelf, so dropping finished shows out of it would be wrong.
+- New **Watchlist Catalogs in Stremio** toggle under **Poster Badges & Labels → Stremio & Nuvio (Artwork Overlays)**, alongside the Airing Next and Continue Watching ones. It is independent of the catalogs toggle, and the master Stremio switch still overrides it.
+- Live Preview shows the same chips. On the website a Watchlist shelf is a catalog row, so it follows the existing **Catalogs & Live Preview** toggle there, while Stremio/Nuvio follow the new one.
+
+### 🐛 The Stremio badge toggles never reached your install link
+
+- `showBadgesStremio*` were missing from `/api/save`'s allowlist on **both** sides -- the builder page never sent them and the endpoint would have dropped them anyway -- so switching any of them off never left the browser. The setting looked saved and the badges kept appearing in Stremio/Nuvio. It read as harmless only because these default to ON; the identical gap left Better Posters, which defaults off, looking completely dead.
+- All five now travel, named once in `STREMIO_BADGE_KEYS` (`00_constants.js`) so the four places that must agree -- the save request, the stored payload, `resolveConfig`, and the badge gate in `fetchCatalog` -- cannot drift apart. Only a switched-off toggle is written, so an all-on config does not grow by a single key.
+- This was flagged earlier as a known gap and deliberately left alone. It stopped being optional the moment the new Watchlist toggle needed the same path to work at all.
+
+### ⭐ Better Posters on the Curated For You / Recommended cards
+
+- BetterPosters is keyed by **IMDB id and nothing else** -- there is no `/poster/tmdb/...` route, it 404s. `/api/recommendations` answers with `tmdb:<n>` ids, because TMDB's recommendation endpoints return TMDB ids and nothing else, so those two cards had nothing for a BetterPosters URL to be built from. The identical rows in Live Preview and in Stremio/Nuvio *did* get the artwork, because `fetchCuratedCatalog` translates the ids on the way through and the dashboard card never did.
+- New `/api/imdb-ids` translates a small batch of TMDB ids to IMDB ids, each edge-cached for a day, and the cards patch their tiles once it answers.
+- **Bounded on purpose.** `/api/recommendations` returns up to 40 movies *and* 40 shows; resolving all 80 up front would need 80 outbound requests on a dashboard load and blow the 50-subrequest ceiling a free Workers plan gets. The client asks only for the tiles it is about to draw -- roughly 9 for a card, more as a See All page is scrolled -- and the endpoint refuses more than `IMDB_ID_LOOKUP_MAX` (24) per call. A resolved id is cached in the page, and a miss is cached too, so a title TMDB has no IMDB id for is not asked about again.
+- 11 tests in `tests/imdb-ids.test.mjs` covering both halves: the endpoint's translation, its movie-vs-tv routing, an episode id resolving to its show, non-TMDB input making no outbound call at all, and the per-request cap; plus the client pass staying silent while the setting is off, patching both the tile and the `data-poster` the modal reads back, and never asking about an id twice. Both halves mutation-tested.
+
+### 🐛 Reset Account Data left created channels behind
+
+- Channels keep the same kind of in-memory copy custom lists do, and `loadLocalChannels` returns it **before** consulting storage. `clearLocalAccountData` cleared only the custom-list pair, so a reset wiped the stored channels and the very next read handed them straight back from memory -- and the next save wrote them out again and synced them up to the account that had just been emptied.
+- `_memoryChannelsMap` / `_memoryChannelsString` are now cleared alongside their custom-list equivalents. This is the same bug, one cache over, that the sessionStorage sweep beside it was added to fix for lists.
+- The server side was already correct: `purgeCreatorData` deletes `creatorchannels:` and `creatorsyncchannels:` along with everything else.
+- Three tests in `tests/account-reset.test.mjs`, including one pinning that a save *after* a reset cannot write the old channels back. Mutation-tested.
+
+### 🐛 Airing Next tiles showed "No poster" in Live Preview
+
+- `_liveFallbackMeta` read `it.poster` and nothing else. Airing Next items carry no poster of their own, and My Lists only ever showed one because `resolveListCardItemPoster` falls back to `showPoster` and then to a metahub poster built from the show's IMDb id. Live Preview had no such fallback, so the same items rendered as empty tiles there -- and turning Better Posters on masked it, since that builds a URL from the id and never needs a poster field at all.
+- Live Preview now resolves the poster through the same helper the Lists tab uses, so the two surfaces agree. Verified in a real browser with poster-less Airing Next items: the tiles render, against the same metahub URLs My Lists uses.
+
+### 🐛 Live Preview showed a different Continue Watching than the Lists tab
+
+- Live Preview substitutes a locally-known sample for what `/api/preview` returns on Continue Watching and Airing Next. `getFallbackShelfSample` tried a connected **Trakt** account **first, for any such row whatever its URL** -- so a row tracked by this add-on (`autotrack:continue-watching:...`) was shown the Trakt account's shelf instead of its own. Two different accounts, two different sets of shows: that is why the Lists tab and Live Preview disagreed about the same row, and why syncing the add-on's own shelf to the account changed nothing, since this path never read it.
+- The fallback now comes from the account that actually backs the row: an `autotrack:` row uses this add-on's own list -- the exact list the Lists tab renders -- and everything else keeps the behaviour it had, Trakt's copy first with the add-on's list only as a last resort.
+- Verified in a real browser with all three sources present at once and deliberately different: an `autotrack:` row renders the add-on's items, and a `trakt:` row still renders Trakt's. **Not covered by the test suite** -- it needs `renderLivePreview` against real DOM, and CI has no browser.
+
+### 🐛 Loading a preset put old Continue Watching / Airing Next items back, permanently
+
+- A preset records **which** shelves you had, not what was on them -- but for a personal auto-tracked shelf those are not the same thing. `rebuildCustomListsFromPreset` merged a preset's saved copy of `continue-watching`, `airing-next`, `watch-history` and `watchlist` **into your live shelf**: additive, with nothing marking which items came from the preset, so a preset built months ago silently put months-old shows back into Continue Watching with no way to tell them apart or take them out again.
+- Worse, that merge set `hasTrackingChanges`, which pushed the mixture up to your account via `pushTrackingSync`. The account's copy is what the add-on serves to Stremio/Nuvio and what Live Preview falls back to when My Lists has not loaded yet this session -- which is why the same shelf could show one thing on the Lists tab and something older in Live Preview and in your apps.
+- Loading a preset now leaves all four alone entirely: they always follow your account. The load toast says so, so "nothing happened" does not read as a bug.
+- **Backup/Restore is deliberately unchanged** -- restoring your watch history is the whole point of a backup. It is only a *preset*, which is a set of shelves, that has no business carrying their contents.
+
+### ⭐ "Remove duplicate items across lists" now skips your personal shelves
+
+- Continue Watching, Airing Next, Watch History and Watchlist are excluded from the feature **in both directions**: never stripped, and never a source of strips. Continue Watching exists to show what you are part-way through -- losing a show from it because Trending listed the same title higher up is not de-duplication, it is the shelf failing at its one job. The reverse would be just as surprising: a title vanishing from Trending because it is in your Watchlist.
+- Applies to every provider's version of these shelves (`autotrack:`, Trakt, MDBList, Simkl), and to a merged row that carries one among its sources. Live Preview applies the identical rule, so the editor shows what the install actually serves.
+- Deduplication between two ordinary lists is unchanged, and a test pins that.
+
+### ⭐ A Like button on a channel's "See All", the same as a list's
+
+- A list's **See All** page has always had a heart beside **+ Add**; a channel opened from **Explore Channels** did not -- even though the directory's own cards show a heart and `/api/channel/like` has been behind them all along. Both pages are the same page (`openChannelDetailsPage` delegates to `openListDetailsPage`), and its Like branch keyed entirely off a *list URL*, so a `channel:` URL fell through the exclusion list and the button was simply hidden.
+- A channel is liked by its **published code** against `/api/channel/like`, not by a URL against the list ledger, so the details page now has a channel-flavoured branch: `previewDirectoryChannel` hands its code to `openChannelDetailsPage`, which passes it on as `opts.channelLikeCode`. The button clears `dataset.url` in that mode, which is what makes the delegated `.searchLikeExternalBtn` handler stand aside -- exactly the arrangement the directory's own hearts already use.
+- The heart is shown only for a channel opened **from the directory**. One of your own saved channels has nothing published to like, so it stays hidden there, as before.
+- `syncChannelLikeButton` keeps the details-page heart in step: `renderChannelDirectory()` repaints the feed's own hearts, but that feed is not on screen while the details page is.
+
+### 🐛 Better Posters broke Airing Next and Continue Watching posters in Stremio/Nuvio
+
+- `/api/poster-badge` validates its `poster` parameter against `POSTER_IMAGE_HOSTS` -- an SSRF / open-image-proxy guard, and a set defined as "hosts this add-on itself puts in a poster field". Better Posters made btttr.cc one of those hosts without adding it, so the endpoint **404'd every badged BetterPosters poster**. That is precisely the Airing Next and Continue Watching rows, the two that always carry a badge, which is why they showed broken tiles while unbadged rows (Watchlist, provider lists) rendered fine.
+- `btttr.cc` added to the set. The guard itself is unchanged and still rejects everything else: new tests cover a look-alike host (`btttr.cc.evil.example.com`), a suffix match (`notbtttr.cc`), plain `http://`, and an unrelated origin, alongside the hosts that were already allowed.
+- The earlier ordering test asserted the badge URL *contained* the btttr.cc URL, and that stayed true the whole time -- it never asked whether the endpoint would then serve it. That is the gap these tests close.
+
+### 🐛 Better Posters never reached Stremio or Nuvio
+
+- **The setting was dropped on the way into the install link.** `/api/save` -- the KV-backed short link that Stremio and Nuvio actually install whenever a `CONFIGS` namespace is bound, i.e. the normal deployment -- rebuilds its stored payload from an **allowlist** of body fields, and so does the POST body the builder page sends it. `betterPosters` was named in neither, so it never left the browser and was never stored. `resolveConfig` then read it back as `false`, and the apps got the plain artwork while the website showed the feature working. Only the base64 fallback link (used when no KV is bound, or when the save fails) ever carried it.
+- Both halves now carry `betterPosters` and its style keys. The language and rating source are validated against btttr.cc's accepted values at the save endpoint too -- it is unauthenticated, and the value is interpolated into a URL, so there is no reason to persist one the service would reject.
+- Six new tests go through `/api/save` end to end rather than seeding KV directly, which is precisely how this slipped past the first round: every earlier test wrote the config straight into KV and so never exercised the allowlist on either side. Each half is mutation-tested -- reverting the server fix fails three, reverting the client fix fails two.
+
+### 🐛 Two poster bugs found while wiring Better Posters into the website
+
+- **`renderMediaCard` skipped the poster funnel whenever a card already had a poster.** It read `item.poster || resolveClientPoster(...)`, so the fallback only ran when there was nothing to fall back to -- meaning the **Adult Content Filter never applied to any card rendered through it** (search result cards, Custom List picks, Channel Builder picks). Now always resolved through the funnel. Covered by a test that fails against the old expression.
+- **A filtered adult poster leaked through `data-poster` in the Live Preview.** `livePreviewPosterHtml` assigned its resolved poster back onto the item (`m.poster = ...`) and the card's `data-poster` attribute -- what the poster modal reads back -- then happened to pick up the safe URL from that mutation. Resolving into a local (needed so a Better Posters URL cannot stick after the setting is switched off, with no original left to restore) exposed that the attribute had been relying on the side effect; it now uses the resolved value explicitly.
+
+**A note on the reference project.** [`StrayBer/nuvio-better-posters-addon`](https://github.com/StrayBer/nuvio-better-posters-addon) solves a different problem: it is a *wrapper* add-on that proxies somebody else's manifest and rewrites the posters in the responses flowing through it. This add-on builds its own catalogs, so none of that proxy machinery (upstream fetching, manifest merging, config tokens for wrapped URLs) is needed here -- the useful part was the poster-URL contract, about forty lines. Two things were corrected in the process: that project pins the single path `/poster/imdb/poster-default/{id}.jpg`, which is the **default style only** -- the style actually lives in the *first* path segment, and the `poster-default` segment it varies is ignored by the service (every value returns byte-identical artwork). It also scrapes `meta.poster` for an IMDb id, which here would match this add-on's own badge URLs (`/api/poster-badge?...&id=tt...`) and round-trip an already-badged poster back through BetterPosters; only the id fields are read.
+
+
 ### ⭐ Customize button on Discover and Search lists
 
 - Every list card on Discover (all sub-tabs -- All, Movies, Shows, Popular Lists, Curated, Hidden Gems, Kids, Holidays, Genres) and in the Search tab's list search now has a **Customize** button alongside its **+ Add**, the same idea as the Storylines & Universes grid's own Customize button. Since these lists are plain movie/show catalogs rather than a saga's episode-level programming, it loads the list's items into the **Custom List Builder**'s editable draft instead of the Channel Builder -- add, remove, or reorder titles, then Save -- rather than immediately copying the list as-is the way **+ Add** or the existing "Copy to Custom List" buttons do (`loadListToCustomListDraft`, `21_client-custom-list-builder.js`).

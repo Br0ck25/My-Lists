@@ -1510,15 +1510,38 @@ function rebuildCustomListsFromPreset(name, isSilent = false) {
   }
 
   const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(preset);
+  // A preset records WHICH shelves you had, not what was on them -- and for a
+  // personal auto-tracked shelf the two are not the same thing. Continue
+  // Watching, Airing Next, Watch History and Watchlist are live views of the
+  // account, so the only correct content for them is whatever is tracked
+  // right now.
+  //
+  // This used to merge the preset's copy into the live list instead: additive,
+  // with nothing marking which items came from the preset, so a preset built
+  // months ago silently put months-old shows back into Continue Watching with
+  // no way to tell them apart or take them out again. Worse, the merge set
+  // hasTrackingChanges, which pushed that mixture up to the account -- so the
+  // stale copy then outlived the browser that loaded the preset.
+  //
+  // Deliberately NOT applied to Backup/Restore (the two callers of
+  // extractCustomListsAndChannelsFromPreset above): restoring your watch
+  // history is the entire point of a backup. It is only a PRESET, which is a
+  // set of shelves, that has no business carrying their contents.
+  const PRESET_SKIPS_TRACKED_SLUGS = ['continue-watching', 'airing-next', 'watch-history', 'watchlist'];
+  const skippedTrackedSlugs = Object.keys(extractedLists).filter((slug) => PRESET_SKIPS_TRACKED_SLUGS.includes(slug));
+  skippedTrackedSlugs.forEach((slug) => { delete extractedLists[slug]; });
   const listSlugs = Object.keys(extractedLists);
   const channelIds = Object.keys(extractedChannels);
 
   if (!listSlugs.length && !channelIds.length) {
     if (!isSilent) {
-      if (typeof showAppAlert === 'function') showAppAlert('No Custom Lists Found', 'Preset "' + name + '" does not contain any custom lists or channels.', false);
-      else alert('Preset "' + name + '" does not contain any custom lists or channels.');
+      const msg = skippedTrackedSlugs.length
+        ? 'Preset "' + name + '" has no custom lists or channels to restore. It does carry Continue Watching / Airing Next / Watch History / Watchlist, but those always follow your account rather than the preset, so they were left as they are.'
+        : 'Preset "' + name + '" does not contain any custom lists or channels.';
+      if (typeof showAppAlert === 'function') showAppAlert('No Custom Lists Found', msg, false);
+      else alert(msg);
     }
-    return { restoredLists: 0, restoredChannels: 0, listNames: [] };
+    return { restoredLists: 0, restoredChannels: 0, listNames: [], skippedTrackedSlugs: skippedTrackedSlugs };
   }
 
   // 1. Merge into local custom lists
@@ -1620,7 +1643,7 @@ function rebuildCustomListsFromPreset(name, isSilent = false) {
     }
   }
 
-  return { restoredLists: listSlugs.length, restoredChannels: channelIds.length, listNames: restoredListNames };
+  return { restoredLists: listSlugs.length, restoredChannels: channelIds.length, listNames: restoredListNames, skippedTrackedSlugs: skippedTrackedSlugs };
 }
 
 function renderPresetsList() {
@@ -1682,6 +1705,12 @@ function loadPreset(name) {
 
   // Rebuild and restore custom lists & channels from this preset
   const result = rebuildCustomListsFromPreset(name, true);
+  // Said out loud rather than silently: the shelves someone is most likely to
+  // notice not changing are exactly these, and "nothing happened" reads like
+  // a bug unless it says why.
+  const skipped = (result.skippedTrackedSlugs && result.skippedTrackedSlugs.length)
+    ? 'Continue Watching, Airing Next, Watch History and Watchlist always follow your account, so they were left as they are'
+    : '';
   if (result.restoredLists > 0 || result.restoredChannels > 0) {
     let msg = 'Preset "' + name + '" loaded';
     const parts = [];
@@ -1689,9 +1718,10 @@ function loadPreset(name) {
     if (result.restoredChannels) parts.push(result.restoredChannels + ' channel' + (result.restoredChannels === 1 ? '' : 's'));
     if (parts.length) msg += ' & ' + parts.join(', ') + ' restored to My Lists';
     msg += ' \u2713';
+    if (skipped) msg += ' \u2014 ' + skipped;
     showAddedToast(msg);
   } else {
-    showAddedToast('Preset "' + name + '" loaded \u2713');
+    showAddedToast('Preset "' + name + '" loaded \u2713' + (skipped ? ' \u2014 ' + skipped : ''));
   }
 }
 
@@ -2157,6 +2187,25 @@ async function generate() {
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
         adultContentFilter: keys.adultContentFilter,
         dedupeAcrossLists: keys.dedupeAcrossLists,
+        // Must be listed explicitly: this body is an allowlist, and /api/save
+        // is the link Stremio/Nuvio actually install. Left out, the setting
+        // never leaves the browser and the feature looks dead in the apps
+        // while the website shows it working.
+        // Same allowlist problem as betterPosters below: left out, switching
+        // any of these off never leaves the browser.
+        showBadgesStremio: keys.showBadgesStremio,
+        showBadgesStremioAiringNext: keys.showBadgesStremioAiringNext,
+        showBadgesStremioContinueWatching: keys.showBadgesStremioContinueWatching,
+        showBadgesStremioWatchlist: keys.showBadgesStremioWatchlist,
+        showBadgesStremioCatalogs: keys.showBadgesStremioCatalogs,
+        betterPosters: keys.betterPosters,
+        betterPostersGenre: keys.betterPostersGenre,
+        betterPostersRating: keys.betterPostersRating,
+        betterPostersTrendTags: keys.betterPostersTrendTags,
+        betterPostersQuality: keys.betterPostersQuality,
+        betterPostersAge: keys.betterPostersAge,
+        betterPostersLang: keys.betterPostersLang,
+        betterPostersRatingSource: keys.betterPostersRatingSource,
       }),
     });
     const data = await res.json();

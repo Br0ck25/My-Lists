@@ -19,6 +19,12 @@ const POSTER_IMAGE_HOSTS = new Set([
   "image.tmdb.org",
   "images.metahub.space",
   "simkl.in",
+  // BetterPosters. This set is "hosts this add-on itself puts in a poster
+  // field", and with the Better Posters setting on, it does. Missing here,
+  // /api/poster-badge 404s the moment a badge is drawn over BetterPosters
+  // artwork -- which is every Airing Next and Continue Watching tile, the
+  // two rows that always carry a badge, while unbadged rows looked fine.
+  "btttr.cc",
 ]);
 
 function isAllowedPosterUrl(raw) {
@@ -867,15 +873,24 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const isSearchCatalog = id === "search_movies" || id === "search_series" || id === "search" || id === "search_movie" || (id === "top" && searchQuery);
       if (isSearchCatalog) {
         if (!searchQuery) return jsonPublic({ metas: [] });
-        const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
-        const effectiveTmdbKey = tmdbKey || TMDB_API_KEY;
-        const metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        const searchConfig = config ? await resolveConfig(config, env) : {};
+        const effectiveTmdbKey = searchConfig.tmdbKey || TMDB_API_KEY;
+        let metas = await searchCatalogMetas(searchQuery, type, skip, effectiveTmdbKey, env, ctx, url.origin);
+        // This route builds its metas directly rather than through
+        // fetchCatalog, so it needs its own call -- otherwise search results
+        // would be the one row in Stremio still showing the old artwork.
+        if (searchConfig.betterPosters) {
+          metas = applyBetterPostersToMetas(metas, betterPostersOptionsFrom(searchConfig));
+        }
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400" });
       }
 
       if (!config) return jsonPublic({ metas: [] });
 
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = await resolveConfig(config, env);
+      // Kept as a whole object as well as destructured: the betterPosters*
+      // style keys are passed through wholesale rather than one at a time.
+      const resolvedConfig = await resolveConfig(config, env);
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, betterPosters, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist } = resolvedConfig;
       const entryIndex = entries.findIndex((e) => e.id === id && e.type === type);
       const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
@@ -898,7 +913,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // to a config that PROVED it belongs to that account. See resolveConfig
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
-        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist, env, ctx, origin: url.origin });
         if (dedupeAcrossLists) {
           metas = await dedupeAcrossListEntries(entries, entryIndex, skip, metas, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, env, ctx });
         }
@@ -1252,10 +1267,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // 2. Standard title metadata for IMDb ids ("tt...") or TMDB ids ("tmdb:...")
       if (id.startsWith("tt") || id.startsWith("tmdb:")) {
         try {
-          const { tmdbKey } = config ? await resolveConfig(config, env) : { tmdbKey: null };
-          const effectiveKey = tmdbKey || TMDB_API_KEY;
-          const meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
+          const metaConfig = config ? await resolveConfig(config, env) : {};
+          const effectiveKey = metaConfig.tmdbKey || TMDB_API_KEY;
+          let meta = await fetchStandardItemMeta(id, metaType, effectiveKey, env, ctx);
           if (!meta) return jsonPublic({ meta: null });
+          // Same opt-in artwork the catalog rows get, so a title's detail
+          // page does not fall back to the plain poster the moment it is
+          // opened. Only the poster is touched -- background, logo, cast and
+          // the episode list all stay exactly as fetchStandardItemMeta built
+          // them, and a non-IMDB id (tmdb:...) is left alone.
+          if (metaConfig.betterPosters) {
+            meta = applyBetterPosterToMeta(meta, betterPostersOptionsFrom(metaConfig));
+          }
           return jsonPublic(
             { meta },
             200,
@@ -2638,6 +2661,74 @@ function generateSearchVariations(query) {
 
     // /api/recommendations  (POST)  { movieIds: [...], showIds: [...] } -> { ok, movies: [...], shows: [...] }
     // Generates personalized movie and show recommendations from TMDB based on user watch history.
+    // /api/imdb-ids  (POST)  { items: [{ id, type }] } -> { ok, map: { "tmdb:278": "tt0068646" } }
+    //
+    // BetterPosters is keyed by IMDB id and nothing else -- there is no
+    // /poster/tmdb/... route, it 404s -- so a tile whose item carries only a
+    // TMDB id cannot have BetterPosters artwork built for it. That is exactly
+    // what the Curated For You / Recommended cards hold: /api/recommendations
+    // answers with "tmdb:<n>" ids, because TMDB's recommendation endpoints
+    // return TMDB ids and nothing else.
+    //
+    // fetchCuratedCatalog already pays for the same translation when it serves
+    // those lists as a catalog (one external_ids call per item, edge-cached for
+    // a day), which is why the identical rows DO get BetterPosters artwork in
+    // Live Preview and in Stremio/Nuvio while the dashboard cards did not.
+    //
+    // Deliberately per-request and small rather than resolving the whole list
+    // up front: /api/recommendations returns up to 40 movies AND 40 shows, and
+    // 80 extra subrequests on a dashboard load would blow the 50-subrequest
+    // ceiling a free Workers plan gets. The caller asks only for the tiles it
+    // is about to draw, so a card costs ~9 and a See All page resolves more as
+    // it is scrolled. Every answer is edge-cached for a day, so the second
+    // visit costs nothing.
+    if (path === "/api/imdb-ids" && request.method === "POST") {
+      let idBody;
+      try {
+        idBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const rawItems = Array.isArray(idBody.items) ? idBody.items.slice(0, IMDB_ID_LOOKUP_MAX) : [];
+      if (!rawItems.length) return json({ ok: true, map: {} });
+      const idTmdbKey = idBody.tmdbKey || TMDB_API_KEY;
+
+      // Same shape as /api/recommendations above, and for the same reason: a
+      // caller spending their own TMDB quota still spends this Worker's
+      // subrequest and CPU budget, so the ceiling differs but the limit does
+      // not go away.
+      const idIp = clientIpKey(request);
+      if (!idIp) return json({ ok: false, error: "Could not resolve those ids." }, 400);
+      if (await consumeRateLimit(env, ctx, "imdbids", idIp, idBody.tmdbKey ? 240 : 60)) {
+        return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
+      }
+
+      const map = {};
+      await Promise.all(rawItems.map(async (raw) => {
+        const key = String((raw && raw.id) || "").trim();
+        if (!key.startsWith("tmdb:")) return;
+        // The id segment only -- an episode id ("tmdb:1234:1:2") resolves to
+        // its show, which is the artwork a poster tile wants anyway.
+        const tmdbId = key.slice(5).split(":")[0];
+        if (!/^\d{1,12}$/.test(tmdbId)) return;
+        const isSeries = (raw && raw.type) === "series" || (raw && raw.type) === "tv";
+        try {
+          const res = await fetch(
+            `https://api.themoviedb.org/3/${isSeries ? "tv" : "movie"}/${tmdbId}/external_ids?api_key=${encodeURIComponent(idTmdbKey)}`,
+            { cf: { cacheTtl: 86400, cacheEverything: true } }
+          );
+          if (!res.ok) return;
+          const data = await res.json();
+          // Only a real IMDB id is useful here; anything else and the caller
+          // keeps the poster it already had.
+          if (data && typeof data.imdb_id === "string" && /^tt\d{5,12}$/.test(data.imdb_id)) {
+            map[key] = data.imdb_id;
+          }
+        } catch (e) {}
+      }));
+      return json({ ok: true, map }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/api/recommendations" && request.method === "POST") {
       let body;
       try {
@@ -7031,6 +7122,44 @@ function generateSearchVariations(query) {
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
       if (body.adultContentFilter) payload.adultContentFilter = true;
       if (body.dedupeAcrossLists) payload.dedupeAcrossLists = true;
+      // The Stremio/Nuvio artwork-overlay toggles. Stored only when switched
+      // OFF, because resolveConfig reads an absent key as on -- so a config
+      // with all of them on stays exactly the size it was.
+      //
+      // These were missing from this allowlist entirely, which meant turning
+      // any of them off never reached the install link: the setting looked
+      // saved, and the badges kept appearing in the apps. It read as harmless
+      // only because the default is on; the same gap left Better Posters
+      // (default off) looking completely dead. See that key below.
+      for (const badgeKey of STREMIO_BADGE_KEYS) {
+        if (body[badgeKey] === false) payload[badgeKey] = false;
+      }
+      // Better Posters. This builder is an allowlist -- a key it does not name
+      // is dropped on the floor -- and this is the PRIMARY install path
+      // whenever a CONFIGS KV namespace is bound, so a key missing here does
+      // not degrade the feature, it disables it outright: resolveConfig reads
+      // betterPosters back as false and Stremio/Nuvio get the plain artwork,
+      // no matter what the builder page shows. Only the base64 fallback link
+      // (buildConfig, 23_client-list-management.js) carried it before this.
+      // Each style key is stored only when it differs from btttr.cc's own
+      // default for that option, matching buildConfig.
+      if (body.betterPosters) {
+        payload.betterPosters = true;
+        if (body.betterPostersGenre === false) payload.betterPostersGenre = false;
+        if (body.betterPostersRating === false) payload.betterPostersRating = false;
+        if (body.betterPostersTrendTags === false) payload.betterPostersTrendTags = false;
+        if (body.betterPostersQuality) payload.betterPostersQuality = true;
+        if (body.betterPostersAge) payload.betterPostersAge = true;
+        // Validated at the door rather than only where the URL is built: this
+        // endpoint is unauthenticated, and there is no reason to persist a
+        // value btttr.cc would reject anyway.
+        if (BETTER_POSTERS_LANGS.some((l) => l.value === body.betterPostersLang) && body.betterPostersLang !== "en") {
+          payload.betterPostersLang = body.betterPostersLang;
+        }
+        if (BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === body.betterPostersRatingSource) && body.betterPostersRatingSource !== "avg") {
+          payload.betterPostersRatingSource = body.betterPostersRatingSource;
+        }
+      }
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a

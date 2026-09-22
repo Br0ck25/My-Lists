@@ -1,5 +1,157 @@
 # Changes Log
 
+## 2026-09-21 - Better Posters (btttr.cc) integration
+
+### Files Changed
+`00_constants.js`, `02_http-and-creator-utils.js`, `04_config-resolution.js`, `05_catalog-core.js`,
+`09_page-shell.js`, `15_tab-settings-html.js`, `22_client-creator-profile.js`,
+`23_client-list-management.js`, `25_api-catalog-routes.js`, `worker_entry_combined.js`,
+`tests/better-posters.test.mjs`, `CHANGELOG.md`, `Changes.md`, `README.md`, `FUNCTION-MAP.md`
+
+### The request
+
+Integrate [BetterPosters](https://btttr.cc/) as replacement catalog artwork, behind a setting users can
+turn on. `StrayBer/nuvio-better-posters-addon` was flagged as possible code to reuse.
+
+### What was reusable from the reference project, and what was not
+
+That project is a **wrapper add-on**: it takes somebody else's manifest URL, proxies their catalog and
+meta responses, and rewrites the posters on the way through. Roughly 1,100 of its ~1,190 lines are that
+proxy (`upstreams.js`, `fetch-handler.js`, `config.js`, `server.js`) and none of it applies here -- this
+add-on builds its own catalogs, so it can rewrite posters at the point it assembles a meta instead of
+re-fetching somebody else's. The genuinely reusable part was `posters.js`, about forty lines, and two of
+its choices did not survive review:
+
+1. **The style path was wrong.** It hard-codes `/poster/imdb/poster-default/{id}.jpg`. Checked against the
+   live service, the `poster-default` segment is inert -- `poster-nologo`, `poster-textless` and an
+   outright nonsense value all return byte-identical bytes. The style actually lives in the **first**
+   segment (`poster`, `poster-g`, `poster-r`, `poster-n`, plus `q`/`a` flags), which is what btttr.cc's
+   own configurator varies in its "AIOMetadata / Other Addon" mode. Nine bases were confirmed to return
+   nine different images. Following the reference would have shipped default artwork with no way to
+   change it.
+2. **Scraping `meta.poster` for an IMDb id is unsafe here.** Its `findImdbId` falls back to the poster
+   URL. Several posters this add-on builds carry the id in a query string
+   (`/api/poster-badge?poster=...&id=tt...`), so an already-badged poster would look like a plain IMDb
+   title and get sent back through BetterPosters, losing the badge. `betterPostersImdbId` reads the id
+   fields only.
+
+### The fix
+
+`applyBetterPostersToMetas` (`05_catalog-core.js`) sits in `fetchCatalog` alongside the existing
+`applyBadgedPostersToMetas` / `applyAdultContentFilterToMetas` passes, as the same kind of 1:1 poster-URL
+map. Ordering is the load-bearing detail: it runs **before** the badge pass, because a badge wraps
+whatever poster URL it finds into `/api/poster-badge?poster=...`. Running it second would throw the
+BetterPosters artwork away; running it first means a badged poster is a badge drawn over BetterPosters
+art. The adult-content filter still runs after both and still wins, so nothing about poster safety
+changes. A mutation test (swapping the two passes) was used to confirm the ordering assertion actually
+bites.
+
+The search catalog and the `/meta/` detail route assemble metas without going through `fetchCatalog`, so
+both call the same helper directly -- otherwise search results and title pages would be the two surfaces
+still serving the old artwork.
+
+`dedupeAcrossListEntries` deliberately does **not** get the flag, matching the existing reasoning in its
+own comment: it only needs to know which ids come back, and a poster rewrite never changes that.
+
+### Settings
+
+`betterPosters` plus seven style keys, following the `showBadgesStremio*` pattern end to end (config
+resolution in both the KV and base64-in-URL paths, `collectKeys`, `buildConfig`, the settings panel, and
+the Creator Profile sync restore). The master switch defaults **off** -- so `getBadgeSetting`, which
+treats an absent value as on, is not reused; `getBetterPostersSetting` takes a per-key default instead.
+Style keys are only written into the install link when they differ from btttr.cc's default, so a config
+with the feature off grows by nothing and a default-style config grows by one key.
+
+Landscape tiles are skipped: BetterPosters only renders 2:3 artwork, and a TV Channel's 16:9 banner would
+be squeezed. `tt0000000`, the placeholder id used for a temporarily-unavailable list, is skipped too.
+
+### Second pass: the whole website, not just the add-on's responses
+
+The first pass rewrote posters server-side only, so the website's own surfaces still showed the plain
+artwork. Extending it turned out to be small, because the client already funnels every poster through one
+function: `resolveClientPoster` (`19_client-search-and-likes.js`). Twelve call sites reach it directly and
+the rest arrive via `resolveListCardItemPoster` (17, 8 sites), `resolveItemPoster` (22, 4 sites),
+`livePreviewPosterHtml` (23), `renderMediaCard` (16) and `loadPosterSlot` (19). Adding the rewrite inside
+it -- after the Adult Content Filter's early return, so the filter still wins exactly as it does
+server-side -- covered Live Preview, My Lists, creator profiles and the Discover/Search list-card strips in
+one edit.
+
+The client mirror of the URL builder sits next to it. It uses **no regex at all**, on purpose: this file's
+text passes through `09_page-shell.js`'s outer template literal, which eats one round of backslash escapes,
+so every `\\d` would have to be written doubled (see `parseListSearchIntent`'s own comment). Plain string
+scanning sidesteps the trap. The same constraint bit once during this work -- a backtick inside a code
+comment terminated the outer template literal and broke the entire bundle; `node --check` on the combined
+Worker caught it immediately, which is exactly the blind spot that check exists for.
+
+The remaining sites that did not reach the funnel were routed through it: Discover/curated list-card tiles,
+the title details modal's hero poster, search result cards (resolved once so the tile and the `data-poster`
+the modal reads back agree), Custom List Builder picks, Channel Builder show/spotlight/credit results,
+storyline cards, and the per-row Test button's thumbnail strip. Deliberately left alone: **episode stills**
+(a screenshot of that episode, not a poster the show's artwork could stand in for), **season posters** (a
+season's own artwork -- BetterPosters has no season concept, so every season would look identical), and
+**TV Channel logos/banners**, which the add-on generates itself.
+
+Switching the setting needs no refetch: posters resolve at render time and nothing writes the resolved URL
+back onto the item, so the original is always still there when the setting goes off again.
+`refreshBetterPostersSurfaces` just re-renders.
+
+### Third pass: the feature never actually reached Stremio or Nuvio
+
+Reported after the fact: Better Posters showed nothing in the apps. The cause was neither the URL builder nor
+the catalog wiring, both of which were right -- it was the install link.
+
+`/api/save` (`25_api-catalog-routes.js`) stores the config a short install link points at, and it builds that
+payload from an **allowlist** of body fields rather than passing the body through. The POST body `generate()`
+(`24_client-backup-restore-presets.js`) sends it is an allowlist too. `betterPosters` was named in neither, so
+it never left the browser and was never stored; `resolveConfig` read it back as `false` and served plain
+artwork. Because a CONFIGS KV namespace is bound on any normal deployment, that is the path essentially every
+install takes -- only the base64 fallback link (no KV, or a failed save) carried the setting, which is why the
+website looked correct while every app did not.
+
+The setting's other five legs were all wired correctly (`collectKeys`, `buildConfig`, `decodeConfig`,
+`resolveConfig`, `fetchCatalog`), which is exactly what made this easy to miss: the sixth leg is a pair of
+allowlists that fail silently and are only exercised by the real round trip.
+
+**Why the tests did not catch it.** Every earlier server-side test seeded KV directly --
+`kv.put(cfgId, JSON.stringify({ betterPosters: true, ... }))` -- which writes the config *past* both
+allowlists. The new tests POST to `/api/save` and then request the catalog from the id it returns, so the
+allowlists are on the path. Both halves are mutation-tested: reverting the server fix fails three of them,
+reverting the client fix fails the two client ones.
+
+The save endpoint also now validates `betterPostersLang` / `betterPostersRatingSource` against btttr.cc's
+accepted values before storing them. It is unauthenticated and the value ends up interpolated into a URL, so
+persisting something the service would reject has no upside.
+
+### Two pre-existing poster bugs this pass exposed
+
+1. **`renderMediaCard` (16) short-circuited past the funnel.** `item.poster || resolveClientPoster(...)`
+   only called the funnel when there was no poster to use -- so every card with artwork skipped it, and the
+   **Adult Content Filter never applied to any of them** (search result cards, Custom List picks, Channel
+   Builder picks). Now always resolved. Mutation-tested: restoring the old expression fails two tests,
+   including one specifically for the adult filter.
+2. **A filtered adult poster leaked through `data-poster` in the Live Preview.** `livePreviewPosterHtml`
+   assigned its resolved poster onto the item (`m.poster = ...`), and the card's `data-poster` -- what the
+   poster modal reads back -- picked up the safe URL from that side effect rather than on purpose. De-
+   mutating (required so a Better Posters URL cannot stick after the setting is switched off, with no
+   original left to restore) surfaced it; the attribute now uses the resolved value explicitly. The
+   existing test at `tests/client.test.mjs:3545` caught this the moment the mutation was removed.
+
+### Verification
+
+34 tests (`tests/better-posters.test.mjs`): the nine style bases against the strings btttr.cc's
+configurator emits, query-parameter defaults and validation, id resolution (including the episode-id and
+poster-scraping cases), and three end-to-end tests through the real Worker proving the stored setting
+reaches `fetchCatalog`, that style options reach the URL, and that a badge layers over BetterPosters art.
+Generated URLs were also confirmed to return HTTP 200 with distinct artwork from the live service. Full
+suite green (1,050 passing), plus `verify.sh` steps 3b/4/4b/4c/4d.
+
+The website half adds eleven tests that run the real client bundle through `tests/client-harness.mjs`:
+the setting off and on, the style options producing the same URL the Worker does, episode-id resolution,
+the Adult Content Filter still winning, generated add-on artwork left alone, landscape tiles and episode
+stills left alone, idempotence when the helper is handed its own URL back, and both shared renderers
+(`livePreviewPosterHtml`, `renderMediaCard`) -- including that the item object is not mutated.
+
+
 ## 2026-09-21 - Customize button on Discover and Search lists
 
 ### Files Changed

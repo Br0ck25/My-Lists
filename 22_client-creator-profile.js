@@ -1363,6 +1363,15 @@ function clearLocalAccountData() {
   if (typeof customListDraftItems !== 'undefined') customListDraftItems = [];
   _memoryCustomListsString = null;
   _memoryCustomListsObj = null;
+  // Channels keep the same kind of in-memory copy as custom lists do, and
+  // loadLocalChannels returns it BEFORE looking at storage (see
+  // 20_client-channel-builder.js). Clearing only the custom-list pair left
+  // every created channel sitting in memory, so Reset Account Data wiped the
+  // storage and the very next read handed them straight back -- and the next
+  // save wrote them to storage again and synced them up. Exactly the bug the
+  // sessionStorage sweep below was added to fix for lists, one cache over.
+  if (typeof _memoryChannelsMap !== 'undefined') _memoryChannelsMap = null;
+  if (typeof _memoryChannelsString !== 'undefined') _memoryChannelsString = null;
 
   // Clear all localStorage keys for account data, credentials, and custom lists
   try {
@@ -3046,6 +3055,7 @@ async function loadCreatorSync(opts) {
         { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
         { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
         { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+        { key: 'showBadgesStremioWatchlist', id: 'badgeStremioWatchlistCheckbox' },
         { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
         { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
         { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
@@ -3064,6 +3074,35 @@ async function loadCreatorSync(opts) {
           if (el) el.checked = synced.keys[key];
         }
       });
+      // Better Posters rides the same sync as the badge settings, so turning
+      // it on in one browser turns it on in the next. Handled separately
+      // because two of its keys are dropdown values rather than booleans,
+      // and because the master switch's default is off rather than on.
+      [
+        { key: 'betterPosters', id: 'betterPostersCheckbox' },
+        { key: 'betterPostersGenre', id: 'betterPostersGenreCheckbox' },
+        { key: 'betterPostersRating', id: 'betterPostersRatingCheckbox' },
+        { key: 'betterPostersTrendTags', id: 'betterPostersTrendTagsCheckbox' },
+        { key: 'betterPostersQuality', id: 'betterPostersQualityCheckbox' },
+        { key: 'betterPostersAge', id: 'betterPostersAgeCheckbox' },
+      ].forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'boolean') {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key] ? '1' : '0'); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.checked = synced.keys[key];
+        }
+      });
+      [
+        { key: 'betterPostersLang', id: 'betterPostersLangSelect' },
+        { key: 'betterPostersRatingSource', id: 'betterPostersRatingSourceSelect' },
+      ].forEach(({ key, id }) => {
+        if (typeof synced.keys[key] === 'string' && synced.keys[key]) {
+          try { localStorage.setItem('myListAddon:' + key, synced.keys[key]); } catch (e) {}
+          const el = document.getElementById(id);
+          if (el) el.value = synced.keys[key];
+        }
+      });
+      if (typeof applyBetterPostersOptionsVisibility === 'function') applyBetterPostersOptionsVisibility();
       if (typeof synced.keys.posterRatingSource === 'string' || typeof synced.keys.showBadgeTmdbRating !== 'undefined') {
         const isTmdb = synced.keys.posterRatingSource === 'tmdb' || (synced.keys.posterRatingSource !== 'none' && synced.keys.showBadgeTmdbRating !== false);
         try {

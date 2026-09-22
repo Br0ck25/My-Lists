@@ -59,6 +59,70 @@
     </div>
 
     <div class="panel" style="margin-top:12px;">
+      <h2 class="panel-title">Better Posters</h2>
+      <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Swap plain poster artwork for <a href="https://btttr.cc/" target="_blank" rel="noopener noreferrer" style="color:var(--accent);">BetterPosters</a> &mdash; posters with the genre, rating and tags drawn into the image itself. No API key or account needed. Only movies and shows with an IMDb id are affected; anything else keeps the poster it already had.</p>
+      <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+        <input type="checkbox" id="betterPostersCheckbox" ${initialBetterPosters ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPosters', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+        <div>
+          <span style="font-weight:600;">Use Better Posters artwork</span>
+          <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Applies everywhere: Live Preview, Search, Discover, My Lists, creator profiles and the builders here on the website, and the catalog rows and title pages Stremio and Nuvio request from the add-on. The website updates as soon as you tick this; Stremio/Nuvio need a Save/Update on an existing install link. Poster badges, if you have them on, are drawn over this artwork rather than replacing it, and the Adult Content Filter still overrides it. TV Channel artwork and episode stills are left as they are.</p>
+        </div>
+      </label>
+      <div id="betterPostersOptions" style="display:${initialBetterPosters ? 'flex' : 'none'}; flex-direction:column; gap:10px; margin-top:12px; padding-top:12px; border-top:1px solid var(--border);">
+        <div style="font-size:0.85rem; font-weight:700; color:var(--text);">What to draw on the poster</div>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersGenreCheckbox" ${initialBetterPostersGenre ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersGenre', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Genre</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Genre label along the bottom of the poster.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersRatingCheckbox" ${initialBetterPostersRating ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersRating', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Rating</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Star rating along the bottom of the poster.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersTrendTagsCheckbox" ${initialBetterPostersTrendTags ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersTrendTags', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Trend tags</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">A corner tag on titles that are currently trending or newly released.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersQualityCheckbox" ${initialBetterPostersQuality ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersQuality', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Quality tags</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">4K, Dolby Vision and Atmos badges, where BetterPosters knows them.</p>
+          </div>
+        </label>
+        <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+          <input type="checkbox" id="betterPostersAgeCheckbox" ${initialBetterPostersAge ? 'checked' : ''} onchange="toggleBetterPostersSetting('betterPostersAge', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+          <div>
+            <span style="font-weight:600;">Age rating</span>
+            <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Certification chip (PG-13, TV-MA, and so on).</p>
+          </div>
+        </label>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">
+          <label for="betterPostersRatingSourceSelect" style="font-size:0.85rem; font-weight:600; color:var(--text);">Rating source</label>
+          <select id="betterPostersRatingSourceSelect" onchange="toggleBetterPostersSetting('betterPostersRatingSource', this.value)" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            ${betterPostersRatingSourceOptionsHtml}
+          </select>
+          <p style="margin:0; color:var(--muted); font-size:0.8rem;">Which score the rating is taken from. Only used when Rating is on above.</p>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-top:4px;">
+          <label for="betterPostersLangSelect" style="font-size:0.85rem; font-weight:600; color:var(--text);">Poster language</label>
+          <select id="betterPostersLangSelect" onchange="toggleBetterPostersSetting('betterPostersLang', this.value)" style="width:100%; padding:8px 10px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text);">
+            ${betterPostersLangOptionsHtml}
+          </select>
+          <p style="margin:0; color:var(--muted); font-size:0.8rem;">Language BetterPosters draws the title and labels in, where it has artwork for it.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
       <h2 class="panel-title">Poster Badges &amp; Labels</h2>
       <p style="margin:0 0 12px; color:var(--muted); font-size:0.85rem;">Customize which badges and indicators are displayed on posters across your website dashboard, catalogs, and Stremio/Nuvio.</p>
       <div style="display:flex; flex-direction:column; gap:12px;">
@@ -115,6 +179,13 @@
             <div>
               <span style="font-weight:600;">Continue Watching Catalogs in Stremio</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Continue Watching poster artwork in Stremio and Nuvio.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeStremioWatchlistCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioWatchlist', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Watchlist Catalogs in Stremio</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Watchlist poster artwork in Stremio and Nuvio.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">

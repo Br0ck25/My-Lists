@@ -188,17 +188,32 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     result.totalItems = tot;
   }
 
+  // Before the badge pass below, never after: a badge wraps whatever poster
+  // URL it finds into /api/poster-badge?poster=..., so running this second
+  // would throw the badged poster away. Running it first means a badged
+  // poster is a badge drawn over BetterPosters artwork, which is the point.
+  // The adult-content filter still runs after both and still wins.
+  if (keys.betterPosters && Array.isArray(result) && result.length > 0) {
+    result = applyBetterPostersToMetas(result, keys.betterPostersOptions || {});
+  }
+
   if (keys.isStremioCatalog === true && keys.origin && Array.isArray(result) && result.length > 0) {
     const entryUrl = String(entry.url || '');
     const entryName = String(entry.name || '').toLowerCase();
     const isAiringNext = entryUrl.includes('airing-next') || entryUrl.includes('airing_next') || entry.statusKey === 'airing-next' || entry.slug === 'airing-next' || entry.id === 'airing-next' || entryName.includes('airing next');
     const isContinueWatching = entryUrl.includes('continue-watching') || entryUrl.includes('continue_watching') || entry.statusKey === 'continue-watching' || entry.slug === 'continue-watching' || entry.id === 'continue-watching' || entryName.includes('continue watching');
+    // Matched the same way as the two above. "upnext" is deliberately absent:
+    // that is MDBList's own Up Next shelf, which is a progress list rather
+    // than a watchlist and already lands on the catalogs toggle.
+    const isWatchlist = entryUrl.includes('watchlist') || entry.statusKey === 'watchlist' || entry.slug === 'watchlist' || entry.id === 'watchlist' || entryName.includes('watchlist');
 
     let allowBadges = false;
     if (isAiringNext) {
       allowBadges = keys.showBadgesStremioAiringNext !== false && keys.showBadgesStremio !== false;
     } else if (isContinueWatching) {
       allowBadges = keys.showBadgesStremioContinueWatching !== false && keys.showBadgesStremio !== false;
+    } else if (isWatchlist) {
+      allowBadges = keys.showBadgesStremioWatchlist !== false && keys.showBadgesStremio !== false;
     } else {
       allowBadges = keys.showBadgesStremioCatalogs !== false && keys.showBadgesStremio !== false;
     }
@@ -277,7 +292,16 @@ async function dedupeAcrossListEntries(entries, entryIndex, skip, metas, keys) {
   if (!Array.isArray(metas) || !metas.length) return metas;
   const entry = entries[entryIndex];
   if (!entry) return metas;
-  const priorEntries = entries.slice(0, entryIndex).filter((e) => e && e.enabled !== false && e.type === entry.type);
+  // A personal shelf sits outside this feature entirely, in both directions:
+  // it is never stripped, and it never strips anything else. Continue
+  // Watching exists to show what you are part-way through -- losing a show
+  // from it because Trending happened to list the same title higher up is
+  // not de-duplication, it is the shelf failing at its one job. And the
+  // reverse would be just as surprising: a title vanishing from Trending
+  // because it is in your Watchlist. See isPersonalShelfUrl (00_constants.js).
+  if (isPersonalShelfUrl(entry.url)) return metas;
+  const priorEntries = entries.slice(0, entryIndex).filter((e) =>
+    e && e.enabled !== false && e.type === entry.type && !isPersonalShelfUrl(e.url));
   if (!priorEntries.length) return metas;
 
   const priorResults = await Promise.all(
@@ -856,6 +880,110 @@ function applyAdultContentFilterToMetas(metas, origin, parentEntry) {
       poster: safeUrl,
       isAdultPosterFiltered: true,
     };
+  });
+  mapped.totalItems = tot;
+  return mapped;
+}
+
+// --- BetterPosters (https://btttr.cc) -------------------------------------
+// Replacement artwork with the metadata burned into the image itself. See the
+// contract note on BETTER_POSTERS_ORIGIN (00_constants.js) for the URL shape
+// and why the "poster-default" segment is a fixed literal rather than a style.
+
+const BETTER_POSTERS_IMDB_RE = /(?:^|[^a-z0-9])(tt\d{5,12})(?=$|[^0-9])/i;
+
+// tt0000000 is this add-on's own "temporarily unavailable" placeholder (see
+// the catalog route's catch in 25), not a title BetterPosters could render.
+const BETTER_POSTERS_PLACEHOLDER_ID = "tt0000000";
+
+// Deliberately reads the id fields only, never meta.poster. Several posters
+// this add-on builds itself carry an id in their query string
+// (/api/poster-badge?...&id=tt123...), so scraping the poster URL -- which is
+// what the nuvio-better-posters-addon project does -- would make an
+// already-processed poster look like a plain IMDB title and send it back
+// through BetterPosters a second time.
+function betterPostersImdbId(meta) {
+  if (!meta || typeof meta !== "object") return null;
+  for (const candidate of [meta.imdb_id, meta.imdbId, meta.imdb, meta.id]) {
+    if (typeof candidate !== "string") continue;
+    const hit = candidate.match(BETTER_POSTERS_IMDB_RE);
+    if (!hit) continue;
+    const id = hit[1].toLowerCase();
+    if (id !== BETTER_POSTERS_PLACEHOLDER_ID) return id;
+  }
+  return null;
+}
+
+// Mirrors updateAioUrl() in btttr.cc's own configurator: the bottom-row choice
+// picks the stem, then the quality/age flags are appended to it -- with a "-"
+// only when the stem does not already carry one. So genre+rating+quality is
+// "poster-q", genre-only+quality is "poster-gq".
+function betterPostersBase(opts) {
+  const genre = opts.genre !== false;
+  const rating = opts.rating !== false;
+  let base;
+  if (genre && rating) base = "poster";
+  else if (genre) base = "poster-g";
+  else if (rating) base = "poster-r";
+  else base = "poster-n";
+  const suffix = (opts.quality ? "q" : "") + (opts.age ? "a" : "");
+  if (suffix) base += base.includes("-") ? suffix : "-" + suffix;
+  return base;
+}
+
+function buildBetterPosterUrl(imdbId, opts) {
+  const o = opts || {};
+  const params = [];
+  // Every one of these is omitted at its btttr.cc default, so a default
+  // config produces the exact URL its configurator would hand out.
+  if (o.trendTags === false) params.push("tag=none");
+  if (o.lang && o.lang !== "en" && BETTER_POSTERS_LANGS.some((l) => l.value === o.lang)) {
+    params.push("lang=" + encodeURIComponent(o.lang));
+  }
+  if (o.ratingSource && o.ratingSource !== "avg" && BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === o.ratingSource)) {
+    params.push("rs=" + encodeURIComponent(o.ratingSource));
+  }
+  const qs = params.length ? "?" + params.join("&") : "";
+  return `${BETTER_POSTERS_ORIGIN}/${betterPostersBase(o)}/imdb/poster-default/${imdbId}.jpg${qs}`;
+}
+
+// Packs a resolved config's betterPosters* keys into the shape
+// buildBetterPosterUrl reads. Each default matches btttr.cc's own default for
+// that option, so an install that never touched the style controls gets the
+// same artwork its configurator hands out.
+function betterPostersOptionsFrom(cfg) {
+  const c = cfg || {};
+  return {
+    genre: c.betterPostersGenre !== false,
+    rating: c.betterPostersRating !== false,
+    quality: !!c.betterPostersQuality,
+    age: !!c.betterPostersAge,
+    trendTags: c.betterPostersTrendTags !== false,
+    lang: c.betterPostersLang || "en",
+    ratingSource: c.betterPostersRatingSource || "avg",
+  };
+}
+
+// Single-meta form, for the /meta/ detail route.
+function applyBetterPosterToMeta(meta, opts) {
+  if (!meta || typeof meta !== "object") return meta;
+  return applyBetterPostersToMetas([meta], opts)[0];
+}
+
+// 1:1 map, same shape as applyBadgedPostersToMetas/applyAdultContentFilterToMetas
+// below -- it only ever swaps a poster URL, never which ids come back.
+function applyBetterPostersToMetas(metas, opts) {
+  if (!Array.isArray(metas) || !metas.length) return metas;
+  const tot = metas.totalItems;
+  const mapped = metas.map((m) => {
+    if (!m) return m;
+    // BetterPosters only renders 2:3 artwork, so a landscape shelf (a TV
+    // channel's 16:9 banner) keeps whatever it already had rather than
+    // getting a portrait poster squeezed into a widescreen tile.
+    if (m.posterShape === "landscape") return m;
+    const imdbId = betterPostersImdbId(m);
+    if (!imdbId) return m;
+    return { ...m, poster: buildBetterPosterUrl(imdbId, opts) };
   });
   mapped.totalItems = tot;
   return mapped;
@@ -1523,8 +1651,16 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       if (trackingRaw) {
         const trackingBlob = JSON.parse(trackingRaw);
         items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
-        if (slug === 'continue-watching') {
+        // Loaded for the watchlist as well as continue-watching: it is the
+        // only source of "this show has an episode coming", and a watchlist
+        // entry wants that chip exactly as much as an in-progress one does.
+        // The fully-watched filtering below stays continue-watching only --
+        // a watchlist is what you mean to watch, not a progress shelf, so
+        // dropping finished shows from it would be wrong.
+        if (slug === 'continue-watching' || slug === 'watchlist') {
           airingItems = trackingBlob.airingNext || [];
+        }
+        if (slug === 'continue-watching') {
           const fwList = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
@@ -1546,8 +1682,16 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         if (!blobStr) return [];
         const blob = JSON.parse(blobStr);
         items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
-        if (slug === 'continue-watching') {
+        // Loaded for the watchlist as well as continue-watching: it is the
+        // only source of "this show has an episode coming", and a watchlist
+        // entry wants that chip exactly as much as an in-progress one does.
+        // The fully-watched filtering below stays continue-watching only --
+        // a watchlist is what you mean to watch, not a progress shelf, so
+        // dropping finished shows from it would be wrong.
+        if (slug === 'continue-watching' || slug === 'watchlist') {
           airingItems = blob.airingNext || [];
+        }
+        if (slug === 'continue-watching') {
           const fwList = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
@@ -1571,7 +1715,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
     const airingByShowId = new Map();
     const airingByBaseId = new Map();
     const airingByTitle = new Map();
-    if (slug === 'continue-watching' && Array.isArray(airingItems) && airingItems.length) {
+    if ((slug === 'continue-watching' || slug === 'watchlist') && Array.isArray(airingItems) && airingItems.length) {
       airingItems.forEach(an => {
         if (!an) return;
         const sid = String(an.showId || an.id || '');
@@ -1623,7 +1767,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       let seasonFinaleEpisodeNumber = it.seasonFinaleEpisodeNumber != null ? it.seasonFinaleEpisodeNumber : undefined;
       let airingMatch = null;
 
-      if (slug === 'continue-watching' && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
+      if ((slug === 'continue-watching' || slug === 'watchlist') && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
         if (it.showId && airingByShowId.has(String(it.showId))) airingMatch = airingByShowId.get(String(it.showId));
         else if (it.id && airingByShowId.has(String(it.id))) airingMatch = airingByShowId.get(String(it.id));
         else {
