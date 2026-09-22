@@ -1967,8 +1967,294 @@ async function sweepRapidApiNewOnStreaming(env, ctx, fetchBudget, maxUnits, opti
   return summary;
 }
 
-// RapidAPI-only sweep entrypoint (legacy TMDB walk removed).
+// --- JustWatch "new" feed (the engine mdblist's New on Streaming uses) ------
+//
+// One GraphQL query per page: newTitles(country, date, filter: {packages,
+// monetizationTypes: [FLATRATE]}). Every edge is a Movie or a Season getting
+// a subscription offer on that date, and a Season edge comes back whenever
+// the season gains episodes (newOffer.newElementCount) -- which is what
+// "a show moves back to the top when a new episode lands" means on mdblist.
+
+function newOnStreamingEngine(env) {
+  const v = String((env && env.NEW_ON_STREAMING_ENGINE) || NEW_ON_STREAMING_ENGINE || "").toLowerCase().trim();
+  return v === "rapidapi" ? "rapidapi" : "justwatch";
+}
+
+function newOnStreamingProviderByJwPackage(shortName) {
+  const k = String(shortName || "").toLowerCase();
+  return NEW_ON_STREAMING_PROVIDERS.find((p) => p.jwPackage === k) || null;
+}
+
+// "2026-09-22" for a day `offset` days before nowSec (UTC).
+function newOnStreamingIsoDay(nowSec, offset) {
+  return new Date((nowSec - offset * 86400) * 1000).toISOString().slice(0, 10);
+}
+
+const JUSTWATCH_NEW_TITLES_QUERY = `query NewTitles($country: Country!, $date: Date!, $filter: TitleFilter, $after: String, $first: Int!) {
+  newTitles(country: $country, date: $date, filter: $filter, first: $first, after: $after, pageType: NEW, priceDrops: false) {
+    totalCount
+    pageInfo { hasNextPage endCursor }
+    edges {
+      newOffer(platform: WEB) { monetizationType newElementCount dateCreated package { shortName } }
+      node {
+        __typename
+        objectId
+        ... on Movie { content(country: $country, language: "en") { title originalReleaseYear posterUrl externalIds { imdbId tmdbId } } }
+        ... on Season {
+          content(country: $country, language: "en") { seasonNumber }
+          show { objectId content(country: $country, language: "en") { title originalReleaseYear posterUrl externalIds { imdbId tmdbId } } }
+        }
+      }
+    }
+  }
+}`;
+
+async function fetchJustWatchNewTitles({ country, date, packages, after }) {
+  const res = await fetch(JUSTWATCH_GRAPHQL_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json", "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+    body: JSON.stringify({
+      operationName: "NewTitles",
+      query: JUSTWATCH_NEW_TITLES_QUERY,
+      variables: {
+        country,
+        date,
+        after: after || "",
+        first: NEW_ON_STREAMING_JW_PAGE_SIZE,
+        filter: { packages, monetizationTypes: ["FLATRATE"] },
+      },
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`JustWatch newTitles failed (HTTP ${res.status}): ${errText.slice(0, 100)}`);
+  }
+  const body = await res.json();
+  if (body && Array.isArray(body.errors) && body.errors.length) {
+    throw new Error(`JustWatch newTitles error: ${String(body.errors[0] && body.errors[0].message).slice(0, 120)}`);
+  }
+  const nt = body && body.data && body.data.newTitles;
+  if (!nt) throw new Error("JustWatch newTitles returned no data");
+  return nt;
+}
+
+function justWatchPosterUrl(path) {
+  const p = String(path || "");
+  if (!p.startsWith("/poster/")) return null;
+  return `https://images.justwatch.com${p.replace("{profile}", "s592").replace("{format}", "jpg")}`;
+}
+
+// One page of edges -> upserts. `position` is the edge's index within the
+// whole day; it orders titles inside a day the way JustWatch lists them (the
+// date is all JustWatch gives, so the time of day is synthetic: midnight UTC
+// plus a few seconds per place, earlier = higher, clamped to now).
+function processJustWatchNewTitles(edges, { env, region, dayEpoch, startPosition, nowSec, writes, summary }) {
+  let position = startPosition;
+  for (const edge of edges || []) {
+    const idx = position++;
+    const node = edge && edge.node;
+    const offer = (edge && edge.newOffer) || {};
+    if (!node) continue;
+    summary.seen++;
+    const provider = newOnStreamingProviderByJwPackage(offer.package && offer.package.shortName);
+    if (!provider) continue;
+    if (offer.monetizationType && offer.monetizationType !== "FLATRATE") continue;
+
+    const isSeason = node.__typename === "Season";
+    const content = isSeason ? (node.show && node.show.content) : node.content;
+    if (!content) continue;
+    const ext = content.externalIds || {};
+    const imdbId = ext.imdbId && /^tt\d+$/.test(ext.imdbId) ? ext.imdbId : null;
+    const tmdbId = extractCleanTmdbId(ext.tmdbId);
+    const id = imdbId || (tmdbId ? `tmdb:${tmdbId}` : null);
+    if (!id) {
+      summary.noId = (summary.noId || 0) + 1;
+      continue;
+    }
+    const eventAt = Math.min(nowSec, dayEpoch + Math.max(0, 9999 - idx));
+    const kind = isSeason ? "series" : "movie";
+    const eventKind = isSeason ? "season" : "added";
+    const season = isSeason && node.content && Number.isFinite(Number(node.content.seasonNumber)) ? Number(node.content.seasonNumber) : null;
+    const newEpisodes = isSeason && Number.isFinite(Number(offer.newElementCount)) ? Number(offer.newElementCount) : null;
+    const year = content.originalReleaseYear ? String(content.originalReleaseYear) : null;
+    if (isSeason) summary.bumped++; else summary.added++;
+
+    writes.push(
+      env.DB.prepare(
+        `INSERT INTO streaming_events
+           (region, service, imdb_id, tmdb_id, kind, added_at, last_event_at, event_kind,
+            season, episode, seeded, last_seen_walk, removed_at, name, poster, background, year)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL, ?, ?, NULL, ?)
+         ON CONFLICT (region, service, imdb_id) DO UPDATE SET
+           last_seen_walk = 1,
+           tmdb_id        = COALESCE(excluded.tmdb_id, streaming_events.tmdb_id),
+           name           = CASE WHEN excluded.name != '' THEN excluded.name ELSE streaming_events.name END,
+           poster         = COALESCE(excluded.poster, streaming_events.poster),
+           year           = COALESCE(excluded.year, streaming_events.year),
+           added_at       = MIN(streaming_events.added_at, excluded.added_at),
+           last_event_at  = MAX(streaming_events.last_event_at, excluded.last_event_at),
+           event_kind     = CASE WHEN excluded.last_event_at >= streaming_events.last_event_at THEN excluded.event_kind ELSE streaming_events.event_kind END,
+           season         = CASE WHEN excluded.last_event_at >= streaming_events.last_event_at THEN excluded.season ELSE streaming_events.season END,
+           episode        = CASE WHEN excluded.last_event_at >= streaming_events.last_event_at THEN excluded.episode ELSE streaming_events.episode END,
+           removed_at     = NULL`
+      ).bind(
+        region, provider.key, id, tmdbId, kind, eventAt, eventAt, eventKind,
+        season, newEpisodes, content.title || "", justWatchPosterUrl(content.posterUrl), year
+      )
+    );
+  }
+  return position;
+}
+
+function newOnStreamingJwDaysKey(region) {
+  return `cron:newonstreaming:jwdays:${region}`;
+}
+
+// Reads JustWatch's feed day by day across the 30-day window. The last
+// NEW_ON_STREAMING_JW_REFRESH_DAYS days are re-read every sweep; older days
+// are read once (resuming mid-day from a saved cursor if the page budget ran
+// out) and marked done in KV (cron:newonstreaming:jwdays:<region>).
+async function sweepJustWatchNewOnStreaming(env, ctx, fetchBudget, maxUnits, options = {}) {
+  const summary = {
+    ran: false, reason: "", units: 0, seen: 0, added: 0, bumped: 0, errors: 0, pruned: 0,
+    source: "justwatch", mode: "", days: [],
+  };
+  if (!env || !env.CONFIGS) {
+    summary.reason = "no KV binding";
+    return summary;
+  }
+  if (!env.DB) {
+    summary.reason = "no D1 database bound (this catalog is D1-only)";
+    return summary;
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  const isManual = options.manual === true;
+  const isReset = options.reset === true || options.clear === true;
+  const isFull = options.full === true || isReset;
+
+  let lastSweepAt = 0;
+  try {
+    const lastRaw = await env.CONFIGS.get("cron:newonstreaming:lastsweep");
+    const parsed = lastRaw ? JSON.parse(lastRaw) : null;
+    if (parsed && Number.isFinite(parsed.at) && parsed.source === "justwatch") lastSweepAt = parsed.at;
+  } catch (e) {}
+  if (!isManual && !isFull && lastSweepAt > 0 && nowSec - lastSweepAt < NEW_ON_STREAMING_JW_INTERVAL_SECONDS) {
+    const remainingMinutes = Math.ceil((NEW_ON_STREAMING_JW_INTERVAL_SECONDS - (nowSec - lastSweepAt)) / 60);
+    summary.reason = `Interval cooldown (${remainingMinutes}m until the next JustWatch sweep)`;
+    return summary;
+  }
+  summary.mode = isReset ? "reset" : (isFull ? "full" : (isManual ? "manual" : "tick"));
+
+  const region = newOnStreamingRegion(options.region);
+  const country = region;
+  const packages = NEW_ON_STREAMING_PROVIDERS.map((p) => p.jwPackage).filter(Boolean);
+  const windowStart = nowSec - (NEW_ON_STREAMING_WINDOW_DAYS * 86400);
+  const cap = Number.isFinite(maxUnits) && maxUnits > 0 ? Math.floor(maxUnits) : NEW_ON_STREAMING_JW_MAX_PAGES_PER_SWEEP;
+  let budget = Math.min(cap, Number.isFinite(fetchBudget) ? Math.max(0, fetchBudget) : Infinity);
+
+  let days = {};
+  if (!isFull) {
+    try {
+      const raw = await env.CONFIGS.get(newOnStreamingJwDaysKey(region));
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && typeof parsed === "object") days = parsed;
+    } catch (e) {}
+  }
+
+  const writes = [];
+  let pendingReset = isReset;
+  const clearOnce = async () => {
+    if (!pendingReset) return;
+    pendingReset = false;
+    try {
+      await env.DB.prepare("DELETE FROM streaming_events WHERE region = ?").bind(region).run();
+      summary.cleared = true;
+    } catch (e) {
+      console.warn("[Cron] New on Streaming clear failed:", e && e.message ? e.message : e);
+    }
+  };
+
+  // Newest day first, so a limited budget fills the top of the shelf first.
+  const order = [];
+  for (let offset = 0; offset < NEW_ON_STREAMING_WINDOW_DAYS; offset++) order.push(offset);
+  for (const offset of order) {
+    if (budget <= 0) break;
+    const date = newOnStreamingIsoDay(nowSec, offset);
+    const refresh = offset < NEW_ON_STREAMING_JW_REFRESH_DAYS;
+    const st = days[date] || {};
+    if (!refresh && st.done) continue;
+    let after = refresh ? "" : (st.after || "");
+    let position = refresh ? 0 : (Number(st.position) || 0);
+    const dayEpoch = Math.floor(Date.UTC(Number(date.slice(0, 4)), Number(date.slice(5, 7)) - 1, Number(date.slice(8, 10))) / 1000);
+    let done = false;
+    let failed = false;
+    while (budget > 0) {
+      let page;
+      try {
+        page = await fetchJustWatchNewTitles({ country, date, packages, after });
+      } catch (err) {
+        summary.errors++;
+        summary.lastError = err && err.message ? err.message : String(err);
+        console.warn(`[Cron] New on Streaming JustWatch ${date} failed:`, summary.lastError);
+        budget--;
+        summary.units++;
+        failed = true;
+        break;
+      }
+      budget--;
+      summary.units++;
+      await clearOnce();
+      position = processJustWatchNewTitles(page.edges, { env, region, dayEpoch, startPosition: position, nowSec, writes, summary });
+      if (writes.length >= 40) {
+        await d1BatchInChunks(env, writes, "New on Streaming JustWatch sweep");
+        writes.length = 0;
+      }
+      const info = page.pageInfo || {};
+      if (!info.hasNextPage || !info.endCursor) {
+        done = true;
+        break;
+      }
+      after = info.endCursor;
+    }
+    days[date] = done ? { done: true, at: nowSec } : { done: false, after: failed ? (st.after || "") : after, position, at: nowSec };
+    summary.days.push({ date, done, entries: position });
+    if (failed) break;
+  }
+
+  if (writes.length > 0) {
+    await d1BatchInChunks(env, writes, "New on Streaming JustWatch sweep");
+    writes.length = 0;
+  }
+  const minDay = newOnStreamingIsoDay(nowSec, NEW_ON_STREAMING_WINDOW_DAYS);
+  for (const date of Object.keys(days)) {
+    if (date < minDay) delete days[date];
+  }
+  try {
+    await env.CONFIGS.put(newOnStreamingJwDaysKey(region), JSON.stringify(days), { expirationTtl: 5184000 });
+  } catch (e) {}
+
+  try {
+    const pruneRes = await env.DB.prepare(
+      `DELETE FROM streaming_events WHERE region = ? AND last_event_at < ?`
+    ).bind(region, windowStart).run();
+    summary.pruned = (pruneRes && pruneRes.meta && pruneRes.meta.changes) || 0;
+  } catch (e) {
+    console.warn("[Cron] New on Streaming 30-day prune failed:", e && e.message ? e.message : e);
+  }
+
+  summary.ran = true;
+  try {
+    await env.CONFIGS.put("cron:newonstreaming:lastsweep", JSON.stringify({ at: nowSec, ...summary }), { expirationTtl: 2592000 });
+  } catch (e) {}
+  return summary;
+}
+
+// Sweep entrypoint: JustWatch by default, RapidAPI when
+// NEW_ON_STREAMING_ENGINE (or the Worker var of that name) says so.
 async function sweepNewOnStreaming(env, ctx, fetchBudget, maxUnits, options = {}) {
+  if (newOnStreamingEngine(env) === "justwatch") {
+    return sweepJustWatchNewOnStreaming(env, ctx, fetchBudget, maxUnits, options);
+  }
   const rapidKey = (env && (env.RAPIDAPI_KEY || env.STREAMING_AVAILABILITY_API_KEY)) || RAPIDAPI_KEY;
   if (!rapidKey) {
     const summary = {
@@ -2018,6 +2304,12 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
   const summary = { ran: false, reason: "", checked: 0, bumped: 0, errors: 0 };
   if (!env || !env.DB) {
     summary.reason = "needs a bound D1 database";
+    return summary;
+  }
+  // JustWatch's feed already carries every new episode as a dated Season
+  // entry; a TMDB air date could only add days mdblist does not have.
+  if (newOnStreamingEngine(env) === "justwatch") {
+    summary.reason = "not needed: the JustWatch feed carries new episodes itself";
     return summary;
   }
   const tmdbKey = (env && env.TMDB_API_KEY) || TMDB_API_KEY;
@@ -2624,7 +2916,7 @@ async function newOnStreamingStatus(env) {
     d1Bound: !!(env && env.DB),
     tableReady: false,
     rapidKeyConfigured: hasRapidKey,
-    engine: "rapidapi",
+    engine: newOnStreamingEngine(env),
     region: NEW_ON_STREAMING_REGIONS[0],
     providers: NEW_ON_STREAMING_PROVIDERS.map((p) => ({ key: p.key, name: p.name, rapidId: p.rapidId })),
     inQuickAdd: NEW_ON_STREAMING_IN_QUICK_ADD,
@@ -2667,6 +2959,13 @@ async function newOnStreamingStatus(env) {
       lastRunAt: st.lastRunAt || 0,
     };
   });
+  if (env && env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(newOnStreamingJwDaysKey(out.region));
+      const days = raw ? JSON.parse(raw) : {};
+      out.jwDaysDone = Object.values(days || {}).filter((d) => d && d.done).length;
+    } catch (e) {}
+  }
   if (!out.d1Bound) return out;
   try {
     const { results } = await env.DB.prepare(

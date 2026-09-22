@@ -6,6 +6,18 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🔁 New on Streaming now reads JustWatch, the same feed mdblist uses
+
+The fixes below made RapidAPI collect its data properly, but the list still didn't match mdblist. The rest of the gap was the **data itself**. RapidAPI's crawler lists titles mdblist never has, like the 2024 *Road House* "on Hulu", Peacock's *Velvet* and *seaQuest DSV*, or *Jimmy Kimmel Live!* dated four days after its last episode. The sweep now reads **JustWatch's `newTitles` GraphQL feed**, which is what mdblist's New on Streaming is built on:
+
+- **Same services as mdblist's picker.** It asks for the same eight JustWatch packages mdblist ticks by default: `nfx`, `amp`, `dnp`, `atp`, `hlu`, `mxx`, `pct` (Peacock Premium), `ppp` (Paramount Plus Premium). Subscription only (`FLATRATE`). They're stored as `jwPackage` on `NEW_ON_STREAMING_PROVIDERS`.
+- **Same dates, same episode rule.** Each Movie or Season edge is filed under the day JustWatch dates it. When a season gains episodes, JustWatch lists it again on that day, and that is what moves a show back to the top. Within a day, titles keep JustWatch's order.
+- **How the sweep reads the feed** (`sweepJustWatchNewOnStreaming`): the last 3 days are re-read every 2 hours, because a JustWatch day keeps filling up. Older days in the 30-day window are read once, newest first, and resume from a saved cursor if a sweep runs out of pages. Progress is saved in KV (`cron:newonstreaming:jwdays:US`). Up to 20 pages of 100 per sweep. No API key and no quota.
+- Posters come from `images.justwatch.com`. The TMDB episode bump is skipped, since the feed already has the episodes.
+- **Checked live against the real API:** Sep 22 includes every title in mdblist's Sep 22 row (All Saints, Call Me Fitz, Transformers: Rescue Bots, Haven, Yukon Gold, The Willies, Miss Dial, Stan Helsing), and *Tuner*, *Best Medicine* and *GTO* land on Sep 21 as they do on mdblist.
+- **RapidAPI is still there.** Set the Worker var `NEW_ON_STREAMING_ENGINE = "rapidapi"` to switch back.
+- **Terms of use:** JustWatch's GraphQL API is the one its own website calls. It has no key and no published terms for third-party use. Using it is the operator's decision.
+
 ### 🐛 New on Streaming: why it did not match mdblist, and the fixes
 
 What [mdblist.com/new-on-streaming](https://mdblist.com/new-on-streaming/) actually is (its own changelog, Aug 20 2026): JustWatch's "new" feed, grouped by day, sorted by the date a title became available on a service. JustWatch's feed has two kinds of entry: a **movie** getting an offer on a service, and a **season** getting one. That includes an existing season whose offer gains episodes, and it also includes daily shows (*The Daily Show, season 31, 1 new episode* dated Sep 22). So a show does jump back to the top when a new episode lands on the service. Our design was right about that. The data collection was what was broken:

@@ -305,16 +305,42 @@ const CRON_EPISODE_CHECK_SHARE = 0.5;
 // wrong catalog under the right label, and these were confirmed through the
 // admin dashboard's Provider Preview tab. Do NOT hand-edit them from memory --
 // re-verify through that tab, the same rule that block already carries.
+//
+// jwPackage is the JustWatch package shortName -- the same eight services
+// mdblist.com/new-on-streaming offers ticked by default in its service picker
+// (Netflix, Amazon Prime Video, Disney Plus, Apple TV, Hulu, HBO Max, Peacock
+// Premium, Paramount Plus Premium), confirmed against JustWatch's own
+// `packages(country: US)` query.
 const NEW_ON_STREAMING_PROVIDERS = [
-  { key: "netflix", name: "Netflix", rapidId: "netflix" },
-  { key: "primevideo", name: "Prime Video", rapidId: "prime" },
-  { key: "disney", name: "Disney+", rapidId: "disney" },
-  { key: "hbomax", name: "HBO Max", rapidId: "hbo" },
-  { key: "hulu", name: "Hulu", rapidId: "hulu" },
-  { key: "appletv", name: "Apple TV+", rapidId: "apple" },
-  { key: "paramount", name: "Paramount+", rapidId: "paramount" },
-  { key: "peacock", name: "Peacock", rapidId: "peacock" },
+  { key: "netflix", name: "Netflix", rapidId: "netflix", jwPackage: "nfx" },
+  { key: "primevideo", name: "Prime Video", rapidId: "prime", jwPackage: "amp" },
+  { key: "disney", name: "Disney+", rapidId: "disney", jwPackage: "dnp" },
+  { key: "hbomax", name: "HBO Max", rapidId: "hbo", jwPackage: "mxx" },
+  { key: "hulu", name: "Hulu", rapidId: "hulu", jwPackage: "hlu" },
+  { key: "appletv", name: "Apple TV+", rapidId: "apple", jwPackage: "atp" },
+  { key: "paramount", name: "Paramount+", rapidId: "paramount", jwPackage: "ppp" },
+  { key: "peacock", name: "Peacock", rapidId: "peacock", jwPackage: "pct" },
 ];
+
+// Where the sweep reads arrivals from. "justwatch" is what mdblist's New on
+// Streaming is built on (its changelog, Aug 20 2026), so it is the only way
+// to show the same titles on the same days -- RapidAPI's /changes feed is a
+// different crawler with different dates and, often, different titles (the
+// 2024 Road House "on Hulu", Velvet "on Peacock"). "rapidapi" is kept as a
+// fallback. A Worker var NEW_ON_STREAMING_ENGINE overrides this.
+//
+// JustWatch's GraphQL API is the one its own website calls. It has no key and
+// no published terms for third-party use -- mdblist presumably has an
+// arrangement. Using it here is the operator's call.
+const NEW_ON_STREAMING_ENGINE = "justwatch";
+const JUSTWATCH_GRAPHQL_URL = "https://apis.justwatch.com/graphql";
+// A JustWatch day keeps filling up for a while after it starts (the 1st of a
+// month has 600 entries by the evening), so the most recent days are re-read
+// on every sweep. Older days are read once and kept.
+const NEW_ON_STREAMING_JW_REFRESH_DAYS = 3;
+const NEW_ON_STREAMING_JW_PAGE_SIZE = 100;
+const NEW_ON_STREAMING_JW_MAX_PAGES_PER_SWEEP = 20;
+const NEW_ON_STREAMING_JW_INTERVAL_SECONDS = 7200;
 
 const RAPIDAPI_CHANGES_URL = "https://streaming-availability.p.rapidapi.com/changes";
 const RAPIDAPI_HOST = "streaming-availability.p.rapidapi.com";

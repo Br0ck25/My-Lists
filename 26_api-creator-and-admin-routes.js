@@ -6838,7 +6838,7 @@
         // dashboard sweep shows up in the API Usage tab rather than looking
         // like the key spent itself.
         const spent = (sweep && sweep.units ? sweep.units : 0) + (sweep && sweep.resolved ? sweep.resolved : 0);
-        if (spent > 0) {
+        if (spent > 0 && sweep.source !== "justwatch") {
           const statKey = sweep && sweep.source === "rapidapi" ? "apiuse:rapidapi" : "apiuse:tmdb";
           ctx.waitUntil(bumpStatBy(env, statKey, spent));
         }

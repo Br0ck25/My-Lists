@@ -345,7 +345,7 @@ function stubRapidApi(handler) {
 describe("RapidAPI Streaming Availability sweep", () => {
   it("pulls newest movies and shows with exact arrival dates, newest first", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     const net = stubRapidApi((url) => {
@@ -390,7 +390,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("pushes a show back to first in the list when a new episode is added", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     const net = stubRapidApi((url) => {
@@ -442,7 +442,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("marks a title removed when RapidAPI reports a removal change", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     let reportRemoval = false;
@@ -502,7 +502,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("prunes items older than 30 days during the sweep", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     // Seed an event older than 30 days (35 days old) and one within 30 days (5 days old)
@@ -524,7 +524,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("halts sweep when monthly usage reaches the 950 safety cap", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const currentMonth = new Date().toISOString().slice(0, 7);
     await env.CONFIGS.put(
       "cron:rapidapi:usage",
@@ -545,7 +545,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("skips automated sweep when within 4-hour interval cooldown, and runs when manual: true", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
     // Pretend a sweep ran 30 minutes ago (1800s ago)
     await env.CONFIGS.put(
@@ -574,7 +574,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("fails with clear error and does not fall back to TMDB when RAPIDAPI_KEY is missing", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const cookie = await adminCookie(env);
     const sweepRes = await sweep(env, cookie);
     assert.equal(sweepRes.ran, false);
@@ -583,7 +583,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("increments monthly request count in KV on each RapidAPI page fetched", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const currentMonth = new Date().toISOString().slice(0, 7);
 
     const net = stubRapidApi(() => ({
@@ -609,7 +609,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("clears existing items and pulls fresh data from RapidAPI when reset: true", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     // Seed existing old items into DB
@@ -649,7 +649,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("normalizes prime.subscription and apple.subscription and serves them under primevideo and appletv", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     const net = stubRapidApi((url) => {
@@ -693,7 +693,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("pushes a show back to first in the list when a new season drop is added", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     const net = stubRapidApi((url) => {
@@ -744,7 +744,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("allocates page budget across show, season, and episode without starvation", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
 
     const queriedTypes = [];
     const net = stubRapidApi((url) => {
@@ -773,7 +773,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
   // continues from RapidAPI's cursor on the next sweep.
   it("reads a busy stream oldest-first and finishes it from its cursor on the next sweep", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     const net = stubRapidApi((url) => {
@@ -819,7 +819,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("polls every stream once, then gives leftover pages to new titles before episodes", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const counts = {};
     const net = stubRapidApi((url) => {
       const u = new URL(url);
@@ -842,7 +842,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("asks RapidAPI only for subscription catalogs, never a whole store", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const net = stubRapidApi(() => ({ changes: [], shows: {}, hasMore: false }));
     try {
       const cookie = await adminCookie(env);
@@ -861,7 +861,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("throttles the removals stream to once a day on automated sweeps", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
     const net = stubRapidApi(() => ({ changes: [], shows: {}, hasMore: false }));
     const removedCalls = () => net.calls.filter((c) => new URL(c.url).searchParams.get("change_type") === "removed").length;
@@ -881,7 +881,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("keeps a backfill (Clear & pull fresh data) show-heavy and newest-first", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const counts = {};
     const directions = new Set();
     const net = stubRapidApi((url) => {
@@ -906,7 +906,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("skips add-on channels sold through a service (Starz via Prime Video Channels)", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
     const net = stubRapidApi((url) => {
       if (url.includes("item_type=show") && url.includes("change_type=new")) {
@@ -935,7 +935,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("filters out digital store buy/rent releases and preserves true subscription premiere date", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
     const sep16 = now - 259200; // 3 days ago
     const sep18 = now - 86400;  // 1 day ago
@@ -992,7 +992,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
   // the opposite of matching it.
   it("keeps daily shows (talk, news, game shows) the way mdblist does", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     const net = stubRapidApi((url) => {
@@ -1041,7 +1041,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("normalizes prefixed tmdbId like series/324931 to clean tmdb:324931 when imdbId is missing", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key" });
+    const env = makeEnv({ DB: db, RAPIDAPI_KEY: "test-rapidapi-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const now = Math.floor(Date.now() / 1000);
 
     const net = stubRapidApi((url) => {
@@ -1119,7 +1119,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("adds and syncs a title directly into streaming_events via /admin/api/new-on-streaming/add", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key" });
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const cookie = await adminCookie(env);
 
     // Stub TMDB fetch
@@ -1171,7 +1171,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
 
   it("bumps active series when TMDB reports a newer episode air date", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key", RAPIDAPI_KEY: "test-key" });
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key", RAPIDAPI_KEY: "test-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const cookie = await adminCookie(env);
     const now = Math.floor(Date.now() / 1000);
     const sep14 = now - 432000; // 5 days ago
@@ -1236,7 +1236,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
   // bumped to the new episode's air date.
   it("still checks and bumps a series buried past the old top-50-by-recency window", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key" });
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const cookie = await adminCookie(env);
     const now = Math.floor(Date.now() / 1000);
 
@@ -1306,7 +1306,7 @@ describe("RapidAPI Streaming Availability sweep", () => {
   // bumped by an episode airing on the show's broadcast network.
   it("does not bump a service's row from TMDB when the show is not that service's original", async () => {
     const db = makeD1();
-    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key" });
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb-key", NEW_ON_STREAMING_ENGINE: "rapidapi" });
     const cookie = await adminCookie(env);
     const now = Math.floor(Date.now() / 1000);
     const staleAt = now - 10 * 86400;
@@ -1341,6 +1341,147 @@ describe("RapidAPI Streaming Availability sweep", () => {
       assert.equal(row.last_event_at, staleAt);
     } finally {
       globalThis.fetch = origFetch;
+    }
+  });
+});
+
+// --- JustWatch engine (the default; what mdblist.com/new-on-streaming uses) --
+
+function jwEdge({ type = "Movie", title, imdbId, tmdbId = null, year = 2024, pkg = "nfx", season = null, newEps = null, monetization = "FLATRATE" }) {
+  const content = { title, originalReleaseYear: year, posterUrl: "/poster/1/{profile}/x.{format}", externalIds: { imdbId, tmdbId } };
+  return {
+    newOffer: { monetizationType: monetization, newElementCount: newEps, dateCreated: "", package: { shortName: pkg } },
+    node: type === "Season"
+      ? { __typename: "Season", objectId: 1, content: { seasonNumber: season }, show: { objectId: 2, content } }
+      : { __typename: "Movie", objectId: 3, content },
+  };
+}
+
+function stubJustWatch(byDate) {
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.includes("apis.justwatch.com")) {
+      const body = JSON.parse(opts.body);
+      calls.push(body.variables);
+      const pages = byDate[body.variables.date] || [[]];
+      const i = body.variables.after ? Number(body.variables.after) : 0;
+      const edges = pages[i] || [];
+      const more = i + 1 < pages.length;
+      return new Response(JSON.stringify({ data: { newTitles: { totalCount: 0, edges, pageInfo: { hasNextPage: more, endCursor: more ? String(i + 1) : null } } } }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }
+    if (u.includes("streaming-availability.p.rapidapi.com")) throw new Error("RapidAPI must not be called on the JustWatch engine");
+    return realFetch(url, opts);
+  };
+  return { restore: () => { globalThis.fetch = realFetch; }, calls };
+}
+
+describe("JustWatch New on Streaming sweep", () => {
+  const day = (offset) => new Date(Date.now() - offset * 86400000).toISOString().slice(0, 10);
+
+  it("files each title under the day JustWatch dated it, and a new episode moves a show to that day", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const net = stubJustWatch({
+      [day(0)]: [[
+        jwEdge({ type: "Season", title: "Old Show", imdbId: "tt1000001", pkg: "hlu", season: 5, newEps: 1 }),
+        jwEdge({ title: "Today Movie", imdbId: "tt1000002", pkg: "amp" }),
+      ]],
+      [day(1)]: [[jwEdge({ title: "Yesterday Movie", imdbId: "tt1000003", pkg: "nfx" })]],
+      [day(5)]: [[jwEdge({ type: "Season", title: "Old Show", imdbId: "tt1000001", pkg: "hlu", season: 5, newEps: 8 })]],
+    });
+    try {
+      const cookie = await adminCookie(env);
+      const res = await sweep(env, cookie, 40);
+      assert.equal(res.source, "justwatch");
+      const preview = await call(env, "/admin/api/new-on-streaming/preview?type=all", { headers: { cookie } });
+      const items = preview.body.items;
+      assert.deepEqual(items.map((m) => m.name), ["Old Show", "Today Movie", "Yesterday Movie"]);
+      assert.equal(new Date(items[0].addedAt * 1000).toISOString().slice(0, 10), day(0));
+      assert.equal(new Date(items[2].addedAt * 1000).toISOString().slice(0, 10), day(1));
+      assert.deepEqual(items[0].services, ["hulu"]);
+      assert.equal(items[1].service, "primevideo");
+      assert.equal(items[0].type, "series");
+      assert.match(items[1].poster, /^https:\/\/images\.justwatch\.com\/poster\/1\/s592\/x\.jpg$/);
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("asks for exactly mdblist's eight services, subscription only", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const net = stubJustWatch({});
+    try {
+      const cookie = await adminCookie(env);
+      await sweep(env, cookie, 3);
+      assert.equal(net.calls.length, 3);
+      for (const v of net.calls) {
+        assert.deepEqual(v.filter.packages.sort(), ["amp", "atp", "dnp", "hlu", "mxx", "nfx", "pct", "ppp"]);
+        assert.deepEqual(v.filter.monetizationTypes, ["FLATRATE"]);
+      }
+      assert.deepEqual(net.calls.map((v) => v.date), [day(0), day(1), day(2)], "newest day first");
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("skips services it does not track and titles with no usable id", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const net = stubJustWatch({
+      [day(0)]: [[
+        jwEdge({ title: "On Crunchyroll", imdbId: "tt2000001", pkg: "cru" }),
+        jwEdge({ title: "No Ids", imdbId: null }),
+        jwEdge({ title: "Tmdb Only", imdbId: null, tmdbId: "555" }),
+      ]],
+    });
+    try {
+      const cookie = await adminCookie(env);
+      await sweep(env, cookie, 1);
+      assert.deepEqual(liveTitles(db).map((r) => r.imdb_id), ["tmdb:555"]);
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("reads older days once, resuming a day from its cursor, while re-reading the last three days every sweep", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db });
+    const net = stubJustWatch({
+      [day(3)]: [[jwEdge({ title: "Day3 A", imdbId: "tt3000001" })], [jwEdge({ title: "Day3 B", imdbId: "tt3000002" })]],
+    });
+    try {
+      const cookie = await adminCookie(env);
+      // 4 pages: days 0,1,2 (one empty page each) + page 1 of day 3.
+      await sweep(env, cookie, 4);
+      assert.deepEqual(liveTitles(db).map((r) => r.name), ["Day3 A"]);
+      net.calls.length = 0;
+      await sweep(env, cookie, 5);
+      assert.deepEqual(net.calls.slice(0, 4).map((v) => [v.date, v.after]), [[day(0), ""], [day(1), ""], [day(2), ""], [day(3), "1"]]);
+      assert.deepEqual(liveTitles(db).map((r) => r.name).sort(), ["Day3 A", "Day3 B"]);
+      net.calls.length = 0;
+      await sweep(env, cookie, 4);
+      assert.equal(net.calls.some((v) => v.date === day(3)), false, "a finished older day is not read again");
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("does not run the TMDB episode bump (the feed already carries episodes)", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "k" });
+    const net = stubJustWatch({});
+    try {
+      const cookie = await adminCookie(env);
+      const r = await call(env, "/admin/api/new-on-streaming/sweep", { method: "POST", cookie, json: { units: 1, bump: true } });
+      assert.equal(r.body.bump.ran, false);
+      assert.equal(r.body.bump.checked, 0);
+    } finally {
+      net.restore();
     }
   });
 });

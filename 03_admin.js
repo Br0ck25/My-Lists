@@ -3588,10 +3588,13 @@ async function renderAdminDashboard(env) {
         if (st.error) {
           bits.push('<div style="color:#FF3B30;">' + escapeHtmlAdmin(st.error) + '</div>');
         }
+        if (st.engine === 'justwatch') {
+          bits.push('<div>Engine: <span style="color:#30d158; font-weight:600;">JustWatch &ldquo;new&rdquo; feed</span> &mdash; the same source mdblist.com/new-on-streaming uses. Last 3 days re-read every 2 hours; ' + (st.jwDaysDone || 0) + ' older days of the 30-day window fully read. (Set the Worker var NEW_ON_STREAMING_ENGINE=rapidapi to switch back.)</div>');
+        }
         if (st.engine === 'rapidapi') {
           bits.push('<div>Engine: <span style="color:#30d158; font-weight:600;">RapidAPI Streaming Availability</span> &mdash; pulling direct streaming arrivals &amp; episode updates (previous 30 days)</div>');
         }
-        if (!st.rapidKeyConfigured) {
+        if (st.engine === 'rapidapi' && !st.rapidKeyConfigured) {
           bits.push('<div style="color:#FF3B30;"><strong>RAPIDAPI_KEY is not set.</strong> Run <code>npx wrangler secret put RAPIDAPI_KEY</code> to enable sweeps.</div>');
         }
         const usage = st.monthlyUsage || { count: 0, limit: 1000, remaining: 1000, safetyCap: 950 };
