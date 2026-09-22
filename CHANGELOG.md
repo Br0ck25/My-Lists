@@ -29,8 +29,9 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ### 🐛 Live Preview showed a different Continue Watching than the Lists tab
 
-- Live Preview prefers a locally-known sample over the server's for Continue Watching and Airing Next -- but `getFallbackShelfSample` only ever looked at a connected **Trakt** account. A shelf tracked by the add-on itself found no local sample at all and fell through to `/api/preview`, which reads the **account's** copy rather than this device's. The two drift (see the preset bug below), and when they did, the Lists tab and Live Preview showed different things for the same shelf, with the editor showing the older one.
-- It now falls back to the add-on's own auto-tracked list -- the exact list the Lists tab renders -- so the two agree. This is what makes the divergence self-correcting rather than something to fix by hand.
+- Live Preview substitutes a locally-known sample for what `/api/preview` returns on Continue Watching and Airing Next. `getFallbackShelfSample` tried a connected **Trakt** account **first, for any such row whatever its URL** -- so a row tracked by this add-on (`autotrack:continue-watching:...`) was shown the Trakt account's shelf instead of its own. Two different accounts, two different sets of shows: that is why the Lists tab and Live Preview disagreed about the same row, and why syncing the add-on's own shelf to the account changed nothing, since this path never read it.
+- The fallback now comes from the account that actually backs the row: an `autotrack:` row uses this add-on's own list -- the exact list the Lists tab renders -- and everything else keeps the behaviour it had, Trakt's copy first with the add-on's list only as a last resort.
+- Verified in a real browser with all three sources present at once and deliberately different: an `autotrack:` row renders the add-on's items, and a `trakt:` row still renders Trakt's. **Not covered by the test suite** -- it needs `renderLivePreview` against real DOM, and CI has no browser.
 
 ### 🐛 Rebuild's confirm dialog rendered its own source code
 

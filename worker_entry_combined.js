@@ -63921,10 +63921,18 @@ async function renderLivePreview() {
         };
       }
       
-      function getFallbackShelfSample() {
-        // Hoisted: both the Trakt branch and the local-shelf fallback at the
-        // bottom need it, and it used to live inside the Trakt branch only.
-        const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+      // The sample to show INSTEAD of what /api/preview returned, for the two
+      // shelves that have a locally-known copy.
+      //
+      // It has to come from the account that actually backs THIS shelf. It
+      // used to try Trakt first for any Continue Watching / Airing Next row
+      // whatever its URL, so a row tracked by this add-on
+      // (autotrack:continue-watching:...) was shown the connected TRAKT
+      // account's shelf instead of its own. Two different accounts, two
+      // different sets of shows -- which is why the Lists tab and Live Preview
+      // could disagree about the same row, and why syncing the add-on's own
+      // shelf to the account changed nothing: this path never read it.
+      function traktShelfSample(stillUpcoming) {
         if (isCwShelf) {
           const lists = window._myPrivateTraktLists || window._myTraktLists || [];
           const cwList = lists.find((l) => l && (l.statusKey === 'continue-watching' || l.slug === 'continue-watching' || (l.url && (l.url === 'trakt:continue-watching' || l.url.includes(':continue-watching')))));
@@ -63960,33 +63968,37 @@ async function renderLivePreview() {
             if (filtered.length) return filtered;
           }
         }
-        // The add-on's OWN auto-tracked shelf, which is what the Lists tab
-        // shows and the only copy that is definitely current.
-        //
-        // Everything above this point looks exclusively at a connected TRAKT
-        // account, so a shelf tracked by this add-on itself found no fallback
-        // here at all and fell through to /api/preview -- which reads the
-        // ACCOUNT's copy of the shelf, not this device's. Those two drift (an
-        // old preset load used to push a stale copy up, see
-        // rebuildCustomListsFromPreset, 24_), and when they did, the Lists tab
-        // and Live Preview showed different things for the same shelf, with
-        // the editor showing the older one.
-        const localSlug = isCwShelf ? 'continue-watching' : (isAiringShelf ? 'airing-next' : '');
-        if (localSlug && typeof loadLocalCustomLists === 'function') {
-          const localList = loadLocalCustomLists()[localSlug];
-          let localItems = (localList && Array.isArray(localList.items)) ? localList.items : [];
-          if (localItems.length) {
-            if (isAiringShelf) {
-              localItems = stillUpcoming(localItems);
-            } else if (s.type === 'movie') {
-              localItems = localItems.filter((it) => it && (it.type === 'movie' || it.kind === 'movie'));
-            } else if (s.type === 'series') {
-              localItems = localItems.filter((it) => it && (it.type === 'series' || it.kind === 'series' || it.episodeTitle || it.seasonNum != null));
-            }
-            if (localItems.length) return localItems;
-          }
-        }
         return null;
+      }
+
+      // This add-on's own auto-tracked shelf -- the exact list the Lists tab
+      // renders, and the only copy guaranteed current on this device.
+      function addonShelfSample(stillUpcoming) {
+        const localSlug = isCwShelf ? 'continue-watching' : (isAiringShelf ? 'airing-next' : '');
+        if (!localSlug || typeof loadLocalCustomLists !== 'function') return null;
+        const localList = loadLocalCustomLists()[localSlug];
+        let items = (localList && Array.isArray(localList.items)) ? localList.items : [];
+        if (!items.length) return null;
+        if (isAiringShelf) {
+          items = stillUpcoming(items);
+        } else if (s.type === 'movie') {
+          items = items.filter((it) => it && (it.type === 'movie' || it.kind === 'movie'));
+        } else if (s.type === 'series') {
+          items = items.filter((it) => it && (it.type === 'series' || it.kind === 'series' || it.episodeTitle || it.seasonNum != null || it.episodeNum != null || it.season != null));
+        }
+        return items.length ? items : null;
+      }
+
+      function getFallbackShelfSample() {
+        const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
+        // An "autotrack:" row is this add-on's own shelf, so its own list is
+        // the only right answer -- never a connected Trakt account's.
+        if ((s.url || '').toLowerCase().indexOf('autotrack:') !== -1) {
+          return addonShelfSample(stillUpcoming);
+        }
+        // Everything else keeps the behaviour it had: Trakt's copy where there
+        // is one, and the add-on's own list only as a last resort.
+        return traktShelfSample(stillUpcoming) || addonShelfSample(stillUpcoming);
       }
       
       try {
