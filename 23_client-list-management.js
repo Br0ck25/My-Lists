@@ -3009,14 +3009,44 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       listUrl.startsWith('trakt:watchlist') || listUrl.startsWith('trakt:history') || listUrl.startsWith('trakt:airing-next') || listUrl.startsWith('trakt:continue-watching') ||
       listUrl.startsWith('trakt:user:') || listUrl.startsWith('mdblist:user:')
     );
-    if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
+    // A channel published to Explore Channels IS likeable -- the directory's
+    // own cards have had a heart all along -- but by its published code
+    // against /api/channel/like, not by a list URL against the list ledger.
+    // That is why the channel: exclusion below is right and the button was
+    // still missing here: there was no channel-flavoured branch to fall into.
+    // Only a channel opened FROM the directory has a code; one of your own
+    // saved channels has nothing published to like.
+    const channelLikeCode = (opts && opts.channelLikeCode) || '';
+    if (channelLikeCode) {
+      const chLiked = typeof _channelDirectoryLiked !== 'undefined' && !!_channelDirectoryLiked[channelLikeCode];
+      likeBtn.style.display = '';
+      // Cleared, not left stale: the delegated .searchLikeExternalBtn handler
+      // (19_client-search-and-likes.js) acts on dataset.url and returns early
+      // without one, so this button reaches only the channel path below --
+      // the same arrangement the directory's own hearts already use.
+      delete likeBtn.dataset.url;
+      likeBtn.dataset.channelLikeCode = channelLikeCode;
+      likeBtn.setAttribute('aria-label', 'Like this channel');
+      likeBtn.title = 'Like this channel';
+      likeBtn.classList.toggle('liked', chLiked);
+      likeBtn.innerHTML = chLiked ? '&#9829;' : '&#9825;';
+      likeBtn.onclick = function() {
+        if (typeof toggleChannelDirectoryLike === 'function') toggleChannelDirectoryLike(channelLikeCode, likeBtn);
+      };
+    } else if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;
+      delete likeBtn.dataset.channelLikeCode;
+      likeBtn.onclick = null;
+      likeBtn.setAttribute('aria-label', 'Like this list');
+      likeBtn.title = 'Like this list';
       likeBtn.classList.toggle('liked', isLiked);
       likeBtn.innerHTML = isLiked ? '&#9829;' : '&#9825;';
     } else {
       likeBtn.style.display = 'none';
+      delete likeBtn.dataset.channelLikeCode;
+      likeBtn.onclick = null;
     }
   }
 

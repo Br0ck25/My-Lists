@@ -49275,7 +49275,10 @@ function channelItemsInPlayOrder(items, channel) {
 // lookup below is about finding a channel that IS saved here, and none of
 // them can find one that is not, so a caller holding the channel already
 // hands it straight over.
-function openChannelDetailsPage(channelIdOrDivId, channelOverride) {
+// directoryCode is set only when this was opened from Explore Channels, and
+// it is what the Like button on the details page acts on -- a channel is
+// liked by its published code, not by a list URL the way a list is.
+function openChannelDetailsPage(channelIdOrDivId, channelOverride, directoryCode) {
   const map = loadLocalChannels();
   let channel = channelOverride || map[channelIdOrDivId];
   if (!channel) {
@@ -49476,7 +49479,11 @@ function channelItemId(it, idx) {
 
   const channelUrl = channel.channelId ? ('channel:id:' + channel.channelId) : ('channel:v1:' + (channel.name || 'channel'));
   if (typeof openListDetailsPage === 'function') {
-    openListDetailsPage(channel.name || 'TV Channel', 'series', channelUrl, { sample: sample, count: sample.length, maybeMore: false });
+    openListDetailsPage(
+      channel.name || 'TV Channel', 'series', channelUrl,
+      { sample: sample, count: sample.length, maybeMore: false },
+      directoryCode ? { channelLikeCode: directoryCode } : undefined
+    );
   }
 }
 
@@ -51367,7 +51374,7 @@ async function previewDirectoryChannel(code, btn) {
     // could collide with a saved channel's would make "+ Add" on the details
     // page act on the wrong one.
     const preview = Object.assign({}, data.channel, { channelId: 'directory:' + code });
-    openChannelDetailsPage(preview.channelId, preview);
+    openChannelDetailsPage(preview.channelId, preview, code);
   } catch (e) {
     showAppAlert('Explore Channels', 'Network error while opening that channel.');
   } finally {
@@ -51378,12 +51385,27 @@ async function previewDirectoryChannel(code, btn) {
   }
 }
 
+// Repaints a Like button that is NOT part of the directory feed -- the one on
+// a channel's "See All" page. renderChannelDirectory() redraws the feed's own
+// hearts, but that feed is not on screen while the details page is, so this
+// button has to be updated by hand.
+function syncChannelLikeButton(code) {
+  const sel = (window.CSS && CSS.escape) ? CSS.escape(String(code)) : String(code);
+  const el = document.querySelector('[data-channel-like-code="' + sel + '"]');
+  if (!el) return;
+  const liked = !!_channelDirectoryLiked[code];
+  el.classList.toggle('liked', liked);
+  el.innerHTML = liked ? '&#9829;' : '&#9825;';
+}
+window.syncChannelLikeButton = syncChannelLikeButton;
+
 async function toggleChannelDirectoryLike(code, btn) {
   const wasLiked = !!_channelDirectoryLiked[code];
   // Filled in before the round trip so the heart answers the tap, and put
   // back if the server disagrees -- it holds the ledger, this does not.
   _channelDirectoryLiked[code] = !wasLiked;
   renderChannelDirectory();
+  syncChannelLikeButton(code);
   try {
     const body = { code: code, action: wasLiked ? 'unlike' : 'like' };
     const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
@@ -51400,15 +51422,18 @@ async function toggleChannelDirectoryLike(code, btn) {
     if (!data.ok) {
       _channelDirectoryLiked[code] = wasLiked;
       renderChannelDirectory();
+      syncChannelLikeButton(code);
       return;
     }
     _channelDirectoryLiked[code] = !!data.liked;
     const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
     if (entry) entry.likes = data.likes;
     renderChannelDirectory();
+    syncChannelLikeButton(code);
   } catch (e) {
     _channelDirectoryLiked[code] = wasLiked;
     renderChannelDirectory();
+    syncChannelLikeButton(code);
   }
 }
 
@@ -65753,14 +65778,44 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       listUrl.startsWith('trakt:watchlist') || listUrl.startsWith('trakt:history') || listUrl.startsWith('trakt:airing-next') || listUrl.startsWith('trakt:continue-watching') ||
       listUrl.startsWith('trakt:user:') || listUrl.startsWith('mdblist:user:')
     );
-    if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
+    // A channel published to Explore Channels IS likeable -- the directory's
+    // own cards have had a heart all along -- but by its published code
+    // against /api/channel/like, not by a list URL against the list ledger.
+    // That is why the channel: exclusion below is right and the button was
+    // still missing here: there was no channel-flavoured branch to fall into.
+    // Only a channel opened FROM the directory has a code; one of your own
+    // saved channels has nothing published to like.
+    const channelLikeCode = (opts && opts.channelLikeCode) || '';
+    if (channelLikeCode) {
+      const chLiked = typeof _channelDirectoryLiked !== 'undefined' && !!_channelDirectoryLiked[channelLikeCode];
+      likeBtn.style.display = '';
+      // Cleared, not left stale: the delegated .searchLikeExternalBtn handler
+      // (19_client-search-and-likes.js) acts on dataset.url and returns early
+      // without one, so this button reaches only the channel path below --
+      // the same arrangement the directory's own hearts already use.
+      delete likeBtn.dataset.url;
+      likeBtn.dataset.channelLikeCode = channelLikeCode;
+      likeBtn.setAttribute('aria-label', 'Like this channel');
+      likeBtn.title = 'Like this channel';
+      likeBtn.classList.toggle('liked', chLiked);
+      likeBtn.innerHTML = chLiked ? '&#9829;' : '&#9825;';
+      likeBtn.onclick = function() {
+        if (typeof toggleChannelDirectoryLike === 'function') toggleChannelDirectoryLike(channelLikeCode, likeBtn);
+      };
+    } else if (listUrl && !isNoLikesList && !isPersonalSentinel && !listUrl.startsWith('custom:') && !listUrl.startsWith('channel:') && !listUrl.startsWith('channel:v1:') && !listUrl.startsWith('autotrack:') && !listUrl.startsWith('simkl:user:')) {
       const isLiked = getLikedListsSet().has(listUrl);
       likeBtn.style.display = '';
       likeBtn.dataset.url = listUrl;
+      delete likeBtn.dataset.channelLikeCode;
+      likeBtn.onclick = null;
+      likeBtn.setAttribute('aria-label', 'Like this list');
+      likeBtn.title = 'Like this list';
       likeBtn.classList.toggle('liked', isLiked);
       likeBtn.innerHTML = isLiked ? '&#9829;' : '&#9825;';
     } else {
       likeBtn.style.display = 'none';
+      delete likeBtn.dataset.channelLikeCode;
+      likeBtn.onclick = null;
     }
   }
 

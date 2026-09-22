@@ -16,6 +16,13 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - The settings ride the same Creator Profile sync as the badge settings, so enabling it in one browser enables it in the next.
 - Every poster on the website resolves through one funnel (`resolveClientPoster`, `19_client-search-and-likes.js`), which the surfaces above already reached via `resolveListCardItemPoster` (17), `resolveItemPoster` (22), `livePreviewPosterHtml` (23), `renderMediaCard` (16) and `loadPosterSlot` (19). The client mirror of the Worker's URL builder lives next to it, and the two are pinned to the same expected URLs by the same test file.
 
+### ⭐ A Like button on a channel's "See All", the same as a list's
+
+- A list's **See All** page has always had a heart beside **+ Add**; a channel opened from **Explore Channels** did not -- even though the directory's own cards show a heart and `/api/channel/like` has been behind them all along. Both pages are the same page (`openChannelDetailsPage` delegates to `openListDetailsPage`), and its Like branch keyed entirely off a *list URL*, so a `channel:` URL fell through the exclusion list and the button was simply hidden.
+- A channel is liked by its **published code** against `/api/channel/like`, not by a URL against the list ledger, so the details page now has a channel-flavoured branch: `previewDirectoryChannel` hands its code to `openChannelDetailsPage`, which passes it on as `opts.channelLikeCode`. The button clears `dataset.url` in that mode, which is what makes the delegated `.searchLikeExternalBtn` handler stand aside -- exactly the arrangement the directory's own hearts already use.
+- The heart is shown only for a channel opened **from the directory**. One of your own saved channels has nothing published to like, so it stays hidden there, as before.
+- `syncChannelLikeButton` keeps the details-page heart in step: `renderChannelDirectory()` repaints the feed's own hearts, but that feed is not on screen while the details page is.
+
 ### 🐛 Better Posters broke Airing Next and Continue Watching posters in Stremio/Nuvio
 
 - `/api/poster-badge` validates its `poster` parameter against `POSTER_IMAGE_HOSTS` -- an SSRF / open-image-proxy guard, and a set defined as "hosts this add-on itself puts in a poster field". Better Posters made btttr.cc one of those hosts without adding it, so the endpoint **404'd every badged BetterPosters poster**. That is precisely the Airing Next and Continue Watching rows, the two that always carry a badge, which is why they showed broken tiles while unbadged rows (Watchlist, provider lists) rendered fine.

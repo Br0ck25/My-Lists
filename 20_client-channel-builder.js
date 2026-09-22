@@ -10057,7 +10057,10 @@ function channelItemsInPlayOrder(items, channel) {
 // lookup below is about finding a channel that IS saved here, and none of
 // them can find one that is not, so a caller holding the channel already
 // hands it straight over.
-function openChannelDetailsPage(channelIdOrDivId, channelOverride) {
+// directoryCode is set only when this was opened from Explore Channels, and
+// it is what the Like button on the details page acts on -- a channel is
+// liked by its published code, not by a list URL the way a list is.
+function openChannelDetailsPage(channelIdOrDivId, channelOverride, directoryCode) {
   const map = loadLocalChannels();
   let channel = channelOverride || map[channelIdOrDivId];
   if (!channel) {
@@ -10258,7 +10261,11 @@ function channelItemId(it, idx) {
 
   const channelUrl = channel.channelId ? ('channel:id:' + channel.channelId) : ('channel:v1:' + (channel.name || 'channel'));
   if (typeof openListDetailsPage === 'function') {
-    openListDetailsPage(channel.name || 'TV Channel', 'series', channelUrl, { sample: sample, count: sample.length, maybeMore: false });
+    openListDetailsPage(
+      channel.name || 'TV Channel', 'series', channelUrl,
+      { sample: sample, count: sample.length, maybeMore: false },
+      directoryCode ? { channelLikeCode: directoryCode } : undefined
+    );
   }
 }
 
@@ -12149,7 +12156,7 @@ async function previewDirectoryChannel(code, btn) {
     // could collide with a saved channel's would make "+ Add" on the details
     // page act on the wrong one.
     const preview = Object.assign({}, data.channel, { channelId: 'directory:' + code });
-    openChannelDetailsPage(preview.channelId, preview);
+    openChannelDetailsPage(preview.channelId, preview, code);
   } catch (e) {
     showAppAlert('Explore Channels', 'Network error while opening that channel.');
   } finally {
@@ -12160,12 +12167,27 @@ async function previewDirectoryChannel(code, btn) {
   }
 }
 
+// Repaints a Like button that is NOT part of the directory feed -- the one on
+// a channel's "See All" page. renderChannelDirectory() redraws the feed's own
+// hearts, but that feed is not on screen while the details page is, so this
+// button has to be updated by hand.
+function syncChannelLikeButton(code) {
+  const sel = (window.CSS && CSS.escape) ? CSS.escape(String(code)) : String(code);
+  const el = document.querySelector('[data-channel-like-code="' + sel + '"]');
+  if (!el) return;
+  const liked = !!_channelDirectoryLiked[code];
+  el.classList.toggle('liked', liked);
+  el.innerHTML = liked ? '&#9829;' : '&#9825;';
+}
+window.syncChannelLikeButton = syncChannelLikeButton;
+
 async function toggleChannelDirectoryLike(code, btn) {
   const wasLiked = !!_channelDirectoryLiked[code];
   // Filled in before the round trip so the heart answers the tap, and put
   // back if the server disagrees -- it holds the ledger, this does not.
   _channelDirectoryLiked[code] = !wasLiked;
   renderChannelDirectory();
+  syncChannelLikeButton(code);
   try {
     const body = { code: code, action: wasLiked ? 'unlike' : 'like' };
     const signedIn = (typeof activeCreator !== 'undefined' && !!activeCreator);
@@ -12182,15 +12204,18 @@ async function toggleChannelDirectoryLike(code, btn) {
     if (!data.ok) {
       _channelDirectoryLiked[code] = wasLiked;
       renderChannelDirectory();
+      syncChannelLikeButton(code);
       return;
     }
     _channelDirectoryLiked[code] = !!data.liked;
     const entry = (_channelDirectoryEntries || []).find((x) => x && x.code === code);
     if (entry) entry.likes = data.likes;
     renderChannelDirectory();
+    syncChannelLikeButton(code);
   } catch (e) {
     _channelDirectoryLiked[code] = wasLiked;
     renderChannelDirectory();
+    syncChannelLikeButton(code);
   }
 }
 
