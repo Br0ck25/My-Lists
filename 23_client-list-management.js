@@ -973,6 +973,9 @@ async function renderLivePreview() {
       }
       
       function getFallbackShelfSample() {
+        // Hoisted: both the Trakt branch and the local-shelf fallback at the
+        // bottom need it, and it used to live inside the Trakt branch only.
+        const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
         if (isCwShelf) {
           const lists = window._myPrivateTraktLists || window._myTraktLists || [];
           const cwList = lists.find((l) => l && (l.statusKey === 'continue-watching' || l.slug === 'continue-watching' || (l.url && (l.url === 'trakt:continue-watching' || l.url.includes(':continue-watching')))));
@@ -993,7 +996,6 @@ async function renderLivePreview() {
           // episode (or whose episode has since aired) get merged in as if
           // they were real Airing Next entries, inflating the shelf beyond
           // what Trakt actually has scheduled.
-          const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
           let cachedAiring = null;
           try {
             cachedAiring = JSON.parse(localStorage.getItem('myListAddon:traktAiringNextCache') || 'null');
@@ -1007,6 +1009,32 @@ async function renderLivePreview() {
           if (aList && Array.isArray(aList.items) && aList.items.length) {
             const filtered = stillUpcoming(aList.items);
             if (filtered.length) return filtered;
+          }
+        }
+        // The add-on's OWN auto-tracked shelf, which is what the Lists tab
+        // shows and the only copy that is definitely current.
+        //
+        // Everything above this point looks exclusively at a connected TRAKT
+        // account, so a shelf tracked by this add-on itself found no fallback
+        // here at all and fell through to /api/preview -- which reads the
+        // ACCOUNT's copy of the shelf, not this device's. Those two drift (an
+        // old preset load used to push a stale copy up, see
+        // rebuildCustomListsFromPreset, 24_), and when they did, the Lists tab
+        // and Live Preview showed different things for the same shelf, with
+        // the editor showing the older one.
+        const localSlug = isCwShelf ? 'continue-watching' : (isAiringShelf ? 'airing-next' : '');
+        if (localSlug && typeof loadLocalCustomLists === 'function') {
+          const localList = loadLocalCustomLists()[localSlug];
+          let localItems = (localList && Array.isArray(localList.items)) ? localList.items : [];
+          if (localItems.length) {
+            if (isAiringShelf) {
+              localItems = stillUpcoming(localItems);
+            } else if (s.type === 'movie') {
+              localItems = localItems.filter((it) => it && (it.type === 'movie' || it.kind === 'movie'));
+            } else if (s.type === 'series') {
+              localItems = localItems.filter((it) => it && (it.type === 'series' || it.kind === 'series' || it.episodeTitle || it.seasonNum != null));
+            }
+            if (localItems.length) return localItems;
           }
         }
         return null;

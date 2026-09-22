@@ -4661,7 +4661,11 @@ async function rebuildTrackedShelf(slug, displayName) {
   }
   const msg = 'Replace "' + label + '" on your account with what this device has right now?\\n\\n' +
     'Your apps and Live Preview read the account\\u2019s copy, so use this when they are showing something older than this page does. Nothing on this device changes.';
-  if (typeof showAppConfirm === 'function') showAppConfirm('Rebuild ' + label, msg, go);
+  // showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger) -- five
+  // arguments. Passing the callback third makes it the BUTTON LABEL, which
+  // renders the function's own source into the dialog and leaves nothing
+  // wired to confirm.
+  if (typeof showAppConfirm === 'function') showAppConfirm('Rebuild ' + label, msg, 'Rebuild', go, false);
   else if (confirm(msg)) go();
 }
 window.rebuildTrackedShelf = rebuildTrackedShelf;

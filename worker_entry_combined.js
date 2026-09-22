@@ -28480,6 +28480,68 @@ function createSortableList(container, options = {}) {
     }
   }
 
+  // --- auto-scroll while dragging ------------------------------------------
+  //
+  // moveItem works in viewport coordinates, so a row can only ever be placed
+  // among the rows currently on screen. Nothing scrolled while a drag was in
+  // progress, so on any list taller than the window -- which is most of them
+  // once Live Preview shelves carry posters and each row is ~200px -- dragging
+  // past the last visible row did nothing at all: the row stopped at the edge
+  // and sat there. That is what "the drag freezes and won't move the list"
+  // was. It applied to every list this function drives, on desktop and touch
+  // alike.
+  const AUTO_SCROLL_EDGE = 90;   // distance from an edge where scrolling starts
+  const AUTO_SCROLL_MAX = 20;    // px per frame at the very edge
+  let autoScrollRaf = null;
+  let lastClientX = 0;
+  let lastClientY = 0;
+
+  // The page itself scrolls for the catalog and My Lists surfaces, but this
+  // same function also drives lists inside scrollable panels, so scroll
+  // whichever actually can.
+  function scrollHostFor(el) {
+    let n = el && el.parentElement;
+    while (n && n !== document.body && n !== document.documentElement) {
+      const oy = getComputedStyle(n).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 1) return n;
+      n = n.parentElement;
+    }
+    return null;
+  }
+
+  function autoScrollStep() {
+    autoScrollRaf = null;
+    if (!activeItem) return;
+    const host = scrollHostFor(activeItem);
+    const top = host ? host.getBoundingClientRect().top : 0;
+    const bottom = host ? host.getBoundingClientRect().bottom : (window.innerHeight || document.documentElement.clientHeight);
+    let delta = 0;
+    if (lastClientY < top + AUTO_SCROLL_EDGE) {
+      delta = -Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (top + AUTO_SCROLL_EDGE - lastClientY) / AUTO_SCROLL_EDGE));
+    } else if (lastClientY > bottom - AUTO_SCROLL_EDGE) {
+      delta = Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (lastClientY - (bottom - AUTO_SCROLL_EDGE)) / AUTO_SCROLL_EDGE));
+    }
+    if (delta) {
+      if (host) host.scrollTop += delta;
+      else window.scrollBy(0, delta);
+      // Re-place the row against the rows that just came into view, or the
+      // page would scroll underneath a row that never moves.
+      moveItem(lastClientY, lastClientX);
+    }
+    queueAutoScroll();
+  }
+
+  function queueAutoScroll() {
+    if (autoScrollRaf != null || !activeItem) return;
+    if (typeof requestAnimationFrame !== 'function') return;
+    autoScrollRaf = requestAnimationFrame(autoScrollStep);
+  }
+
+  function stopAutoScroll() {
+    if (autoScrollRaf != null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(autoScrollRaf);
+    autoScrollRaf = null;
+  }
+
   function startDragging(item) {
     isDragging = true;
     activeItem = item;
@@ -28492,6 +28554,7 @@ function createSortableList(container, options = {}) {
 
   function stopDragging() {
     cancelHold();
+    stopAutoScroll();
     if (isDragging && activeItem) {
       activeItem.classList.remove(dragClass);
       onReorder();
@@ -28520,10 +28583,17 @@ function createSortableList(container, options = {}) {
     container.addEventListener('dragover', (e) => {
       if (!activeItem) return;
       e.preventDefault();
+      lastClientX = e.clientX;
+      lastClientY = e.clientY;
       moveItem(e.clientY, e.clientX);
+      // dragover stops firing once the pointer is held still at the edge, so
+      // the scrolling has to be driven by its own frame loop rather than by
+      // the event.
+      queueAutoScroll();
     });
 
     container.addEventListener('dragend', () => {
+      stopAutoScroll();
       if (!activeItem) return;
       activeItem.classList.remove(dragClass);
       activeItem = null;
@@ -28572,7 +28642,10 @@ function createSortableList(container, options = {}) {
         return;
       }
       if (ev.cancelable) ev.preventDefault();
+      lastClientX = ev.clientX;
+      lastClientY = ev.clientY;
       moveItem(ev.clientY, ev.clientX);
+      queueAutoScroll();
     };
 
     const onPointerEnd = () => {
@@ -61000,7 +61073,11 @@ async function rebuildTrackedShelf(slug, displayName) {
   }
   const msg = 'Replace "' + label + '" on your account with what this device has right now?\\n\\n' +
     'Your apps and Live Preview read the account\\u2019s copy, so use this when they are showing something older than this page does. Nothing on this device changes.';
-  if (typeof showAppConfirm === 'function') showAppConfirm('Rebuild ' + label, msg, go);
+  // showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger) -- five
+  // arguments. Passing the callback third makes it the BUTTON LABEL, which
+  // renders the function's own source into the dialog and leaves nothing
+  // wired to confirm.
+  if (typeof showAppConfirm === 'function') showAppConfirm('Rebuild ' + label, msg, 'Rebuild', go, false);
   else if (confirm(msg)) go();
 }
 window.rebuildTrackedShelf = rebuildTrackedShelf;
@@ -63841,6 +63918,9 @@ async function renderLivePreview() {
       }
       
       function getFallbackShelfSample() {
+        // Hoisted: both the Trakt branch and the local-shelf fallback at the
+        // bottom need it, and it used to live inside the Trakt branch only.
+        const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
         if (isCwShelf) {
           const lists = window._myPrivateTraktLists || window._myTraktLists || [];
           const cwList = lists.find((l) => l && (l.statusKey === 'continue-watching' || l.slug === 'continue-watching' || (l.url && (l.url === 'trakt:continue-watching' || l.url.includes(':continue-watching')))));
@@ -63861,7 +63941,6 @@ async function renderLivePreview() {
           // episode (or whose episode has since aired) get merged in as if
           // they were real Airing Next entries, inflating the shelf beyond
           // what Trakt actually has scheduled.
-          const stillUpcoming = (arr) => arr.filter((it) => it && it.airDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(it.airDate)));
           let cachedAiring = null;
           try {
             cachedAiring = JSON.parse(localStorage.getItem('myListAddon:traktAiringNextCache') || 'null');
@@ -63875,6 +63954,32 @@ async function renderLivePreview() {
           if (aList && Array.isArray(aList.items) && aList.items.length) {
             const filtered = stillUpcoming(aList.items);
             if (filtered.length) return filtered;
+          }
+        }
+        // The add-on's OWN auto-tracked shelf, which is what the Lists tab
+        // shows and the only copy that is definitely current.
+        //
+        // Everything above this point looks exclusively at a connected TRAKT
+        // account, so a shelf tracked by this add-on itself found no fallback
+        // here at all and fell through to /api/preview -- which reads the
+        // ACCOUNT's copy of the shelf, not this device's. Those two drift (an
+        // old preset load used to push a stale copy up, see
+        // rebuildCustomListsFromPreset, 24_), and when they did, the Lists tab
+        // and Live Preview showed different things for the same shelf, with
+        // the editor showing the older one.
+        const localSlug = isCwShelf ? 'continue-watching' : (isAiringShelf ? 'airing-next' : '');
+        if (localSlug && typeof loadLocalCustomLists === 'function') {
+          const localList = loadLocalCustomLists()[localSlug];
+          let localItems = (localList && Array.isArray(localList.items)) ? localList.items : [];
+          if (localItems.length) {
+            if (isAiringShelf) {
+              localItems = stillUpcoming(localItems);
+            } else if (s.type === 'movie') {
+              localItems = localItems.filter((it) => it && (it.type === 'movie' || it.kind === 'movie'));
+            } else if (s.type === 'series') {
+              localItems = localItems.filter((it) => it && (it.type === 'series' || it.kind === 'series' || it.episodeTitle || it.seasonNum != null));
+            }
+            if (localItems.length) return localItems;
           }
         }
         return null;

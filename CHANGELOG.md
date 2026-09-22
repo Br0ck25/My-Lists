@@ -16,6 +16,21 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - The settings ride the same Creator Profile sync as the badge settings, so enabling it in one browser enables it in the next.
 - Every poster on the website resolves through one funnel (`resolveClientPoster`, `19_client-search-and-likes.js`), which the surfaces above already reached via `resolveListCardItemPoster` (17), `resolveItemPoster` (22), `livePreviewPosterHtml` (23), `renderMediaCard` (16) and `loadPosterSlot` (19). The client mirror of the Worker's URL builder lives next to it, and the two are pinned to the same expected URLs by the same test file.
 
+### 🐛 Drag-to-reorder stopped dead at the bottom of the screen
+
+- Nothing scrolled the page while a drag was in progress. `moveItem` places the dragged row among the rows **currently on screen**, so on any list taller than the window -- which is most of them once Live Preview shelves carry posters and each row is ~200px -- dragging past the last visible row did nothing: the row stopped at the edge and sat there. That is what "the drag freezes and won't move the list" was, and it applied to every list `createSortableList` drives (Catalogs, Live Preview, Your Custom Lists, the builders) on desktop and touch alike.
+- `createSortableList` now auto-scrolls when the pointer comes within 90px of an edge, ramping to 20px per frame at the very edge, and re-places the row against the rows that scroll into view. It drives this from its own animation-frame loop rather than from `dragover`/`pointermove`, because those stop firing the moment the pointer is held still at the edge -- which is exactly when scrolling needs to continue. It scrolls the nearest scrollable ancestor when there is one (lists inside panels) and the window otherwise.
+- Verified against the failing case in a real browser: a 12-row list at 2584px in a 900px window. Before, dragging row 1 to the bottom edge and holding it there moved it three places and left `window.scrollY` at 0. After, the same drag carries it to seventh with the page scrolled 1008px. **Not covered by the test suite** -- it needs real layout and a real pointer, and CI runs on bare node + python with no browser.
+
+### 🐛 Live Preview showed a different Continue Watching than the Lists tab
+
+- Live Preview prefers a locally-known sample over the server's for Continue Watching and Airing Next -- but `getFallbackShelfSample` only ever looked at a connected **Trakt** account. A shelf tracked by the add-on itself found no local sample at all and fell through to `/api/preview`, which reads the **account's** copy rather than this device's. The two drift (see the preset bug below), and when they did, the Lists tab and Live Preview showed different things for the same shelf, with the editor showing the older one.
+- It now falls back to the add-on's own auto-tracked list -- the exact list the Lists tab renders -- so the two agree. This is what makes the divergence self-correcting rather than something to fix by hand.
+
+### 🐛 Rebuild's confirm dialog rendered its own source code
+
+- `showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger)` takes five arguments. The new Rebuild button passed its callback third, so the function's source became the **button label** -- a wall of red text where "Rebuild" should have been -- and nothing was wired to confirm, so the button did nothing. Every other call site in the bundle already used the five-argument form; this was the only one wrong.
+
 ### 🐛 Loading a preset put old Continue Watching / Airing Next items back, permanently
 
 - A preset records **which** shelves you had, not what was on them -- but for a personal auto-tracked shelf those are not the same thing. `rebuildCustomListsFromPreset` merged a preset's saved copy of `continue-watching`, `airing-next`, `watch-history` and `watchlist` **into your live shelf**: additive, with nothing marking which items came from the preset, so a preset built months ago silently put months-old shows back into Continue Watching with no way to tell them apart or take them out again.

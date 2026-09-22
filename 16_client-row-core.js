@@ -1168,6 +1168,68 @@ function createSortableList(container, options = {}) {
     }
   }
 
+  // --- auto-scroll while dragging ------------------------------------------
+  //
+  // moveItem works in viewport coordinates, so a row can only ever be placed
+  // among the rows currently on screen. Nothing scrolled while a drag was in
+  // progress, so on any list taller than the window -- which is most of them
+  // once Live Preview shelves carry posters and each row is ~200px -- dragging
+  // past the last visible row did nothing at all: the row stopped at the edge
+  // and sat there. That is what "the drag freezes and won't move the list"
+  // was. It applied to every list this function drives, on desktop and touch
+  // alike.
+  const AUTO_SCROLL_EDGE = 90;   // distance from an edge where scrolling starts
+  const AUTO_SCROLL_MAX = 20;    // px per frame at the very edge
+  let autoScrollRaf = null;
+  let lastClientX = 0;
+  let lastClientY = 0;
+
+  // The page itself scrolls for the catalog and My Lists surfaces, but this
+  // same function also drives lists inside scrollable panels, so scroll
+  // whichever actually can.
+  function scrollHostFor(el) {
+    let n = el && el.parentElement;
+    while (n && n !== document.body && n !== document.documentElement) {
+      const oy = getComputedStyle(n).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 1) return n;
+      n = n.parentElement;
+    }
+    return null;
+  }
+
+  function autoScrollStep() {
+    autoScrollRaf = null;
+    if (!activeItem) return;
+    const host = scrollHostFor(activeItem);
+    const top = host ? host.getBoundingClientRect().top : 0;
+    const bottom = host ? host.getBoundingClientRect().bottom : (window.innerHeight || document.documentElement.clientHeight);
+    let delta = 0;
+    if (lastClientY < top + AUTO_SCROLL_EDGE) {
+      delta = -Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (top + AUTO_SCROLL_EDGE - lastClientY) / AUTO_SCROLL_EDGE));
+    } else if (lastClientY > bottom - AUTO_SCROLL_EDGE) {
+      delta = Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (lastClientY - (bottom - AUTO_SCROLL_EDGE)) / AUTO_SCROLL_EDGE));
+    }
+    if (delta) {
+      if (host) host.scrollTop += delta;
+      else window.scrollBy(0, delta);
+      // Re-place the row against the rows that just came into view, or the
+      // page would scroll underneath a row that never moves.
+      moveItem(lastClientY, lastClientX);
+    }
+    queueAutoScroll();
+  }
+
+  function queueAutoScroll() {
+    if (autoScrollRaf != null || !activeItem) return;
+    if (typeof requestAnimationFrame !== 'function') return;
+    autoScrollRaf = requestAnimationFrame(autoScrollStep);
+  }
+
+  function stopAutoScroll() {
+    if (autoScrollRaf != null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(autoScrollRaf);
+    autoScrollRaf = null;
+  }
+
   function startDragging(item) {
     isDragging = true;
     activeItem = item;
@@ -1180,6 +1242,7 @@ function createSortableList(container, options = {}) {
 
   function stopDragging() {
     cancelHold();
+    stopAutoScroll();
     if (isDragging && activeItem) {
       activeItem.classList.remove(dragClass);
       onReorder();
@@ -1208,10 +1271,17 @@ function createSortableList(container, options = {}) {
     container.addEventListener('dragover', (e) => {
       if (!activeItem) return;
       e.preventDefault();
+      lastClientX = e.clientX;
+      lastClientY = e.clientY;
       moveItem(e.clientY, e.clientX);
+      // dragover stops firing once the pointer is held still at the edge, so
+      // the scrolling has to be driven by its own frame loop rather than by
+      // the event.
+      queueAutoScroll();
     });
 
     container.addEventListener('dragend', () => {
+      stopAutoScroll();
       if (!activeItem) return;
       activeItem.classList.remove(dragClass);
       activeItem = null;
@@ -1260,7 +1330,10 @@ function createSortableList(container, options = {}) {
         return;
       }
       if (ev.cancelable) ev.preventDefault();
+      lastClientX = ev.clientX;
+      lastClientY = ev.clientY;
       moveItem(ev.clientY, ev.clientX);
+      queueAutoScroll();
     };
 
     const onPointerEnd = () => {
