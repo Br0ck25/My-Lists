@@ -31,6 +31,66 @@ const LOCAL_CUSTOM_LISTS_KEY = 'myListAddon:localCustomLists';
 let _memoryCustomListsString = null;
 let _memoryCustomListsObj = null;
 
+// The derived upcoming-episode fields a tracked entry carries. Season and
+// episode numbers are deliberately NOT in here: on Continue Watching they say
+// where the person is up to, which is the account's to state, not this
+// device's. See carryLocalAiringFields.
+const TRACKING_AIRING_FIELDS = [
+  'airDate',
+  'airTime',
+  'seasonFinaleAirDate',
+  'seasonFinaleEpisodeNumber',
+  'isSeasonPremiere',
+  'isSeasonFinale',
+  'isUnaired',
+];
+
+// Airing data is DERIVED, not authored: refreshAiringNext and
+// refreshWatchlistAiring work it out on this device and stamp it onto
+// the entries. The account holds whatever was last pushed, so on a load
+// its copy is routinely thinner than what this browser has already
+// resolved -- and both merges below let the server entry win wholesale
+// for an item present on both sides. That is why the premiere and date
+// chips rendered and then vanished a moment later while signed in, and
+// stayed put while signed out: signing in replaced the enriched entries
+// with bare ones.
+//
+// Only forward-looking data is carried, so a stale local date can never
+// put a chip back on an episode that has already aired, and only onto
+// an entry the server left blank, so the account still wins wherever it
+// actually knows something.
+function carryLocalAiringFields(merged, localItems, keyOf) {
+  if (!Array.isArray(merged) || !Array.isArray(localItems) || !localItems.length) return false;
+  const byKey = new Map();
+  localItems.forEach((it) => {
+    keyOf(it).forEach((k) => { if (k && !byKey.has(k)) byKey.set(k, it); });
+  });
+  let carried = false;
+  merged.forEach((it) => {
+    if (!it || it.airDate) return;
+    let local = null;
+    const keys = keyOf(it);
+    for (let i = 0; i < keys.length && !local; i++) local = byKey.get(keys[i]) || null;
+    if (!local || !local.airDate) return;
+    if (typeof isEpisodeAired === 'function' && isEpisodeAired(local.airDate)) return;
+    TRACKING_AIRING_FIELDS.forEach((f) => {
+      if (local[f] != null && it[f] == null) {
+        it[f] = local[f];
+        carried = true;
+      }
+    });
+    // Never over an episode the account already names -- on Continue
+    // Watching those two say where the person is up to, not when
+    // anything airs.
+    if (it.seasonNum == null && local.seasonNum != null) it.seasonNum = local.seasonNum;
+    if (it.episodeNum == null && local.episodeNum != null) it.episodeNum = local.episodeNum;
+  });
+  return carried;
+}
+function airingKeysForShow(it) { return it ? [it.showId, it.id, it.imdbId].filter(Boolean).map(String) : []; }
+function airingKeysForItem(it) { return it ? [it.id, it.imdbId, it.showId].filter(Boolean).map(String) : []; }
+window.carryLocalAiringFields = carryLocalAiringFields;
+
 function compactCustomListItem(it) {
   if (!it || typeof it !== 'object') return it;
   const clean = {
@@ -3225,6 +3285,7 @@ async function loadCreatorSync(opts) {
         if (isRecentRemoval) {
           mergedCW = localCWItems;
         }
+        const carriedCW = carryLocalAiringFields(mergedCW, localCWItems, airingKeysForShow);
 
         const cw = getOrCreateContinueWatchingList();
         cw.items = mergedCW;
@@ -3234,7 +3295,7 @@ async function loadCreatorSync(opts) {
         saveLocalCustomListsMap(map);
         window._inProgressShowIds = new Set(mergedCW.map((it) => String(it && it.showId)).filter(Boolean));
 
-        if (localOnlyCW.length > 0 && typeof scheduleTrackingSync === 'function') {
+        if ((localOnlyCW.length > 0 || carriedCW) && typeof scheduleTrackingSync === 'function') {
           scheduleTrackingSync();
         } else if (!isRecentRemoval) {
           recordTrackingLocalBaseline({ 'continue-watching': cw.updatedAt });
@@ -3254,12 +3315,13 @@ async function loadCreatorSync(opts) {
           ? localItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)))
           : [];
         const mergedWL = [...serverItems, ...localOnly];
+        const carriedWL = carryLocalAiringFields(mergedWL, localItems, airingKeysForItem);
 
         map['watchlist'].items = mergedWL;
         map['watchlist'].updatedAt = Date.now();
         saveLocalCustomListsMap(map);
 
-        if (localOnly.length > 0 && typeof pushTrackingSync === 'function') {
+        if ((localOnly.length > 0 || carriedWL) && typeof pushTrackingSync === 'function') {
           pushTrackingSync();
         } else if (!isRecentRemoval) {
           recordTrackingLocalBaseline({ 'watchlist': map['watchlist'].updatedAt });
@@ -6124,10 +6186,29 @@ function removeWatchlistItemDirect(id, btn) {
     }
   }
   const targetId = String(id);
+  // Every id this entry is addressable by, because the two sides of this
+  // removal did not agree on which one to use. The card's remove button
+  // passes "imdbId || id"; the filter here compared "id || imdbId". An entry
+  // holding both, with a TMDB id in one and an IMDb id in the other, matched
+  // neither test: the tile animated away, nothing was written, the item count
+  // beside the list never moved -- it is only re-rendered when something
+  // changed -- and the next load brought the item straight back.
+  const watchlistItemIds = (it) => {
+    if (!it) return [];
+    const out = [];
+    if (it.id) out.push(String(it.id));
+    if (it.imdbId) out.push(String(it.imdbId));
+    if (it.showId) out.push(String(it.showId));
+    if (it.tmdbId) {
+      out.push(String(it.tmdbId));
+      out.push('tmdb:' + it.tmdbId);
+    }
+    return out;
+  };
   // The edit itself, as a function, so saveCreatorListWithBaseline can re-apply it to
   // whatever another device saved instead of re-sending a stale array.
   const removeMatching = (items) => (items || []).filter(
-    (it) => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId
+    (it) => it && watchlistItemIds(it).indexOf(targetId) === -1
   );
   const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
   let changed = false;
@@ -6135,7 +6216,7 @@ function removeWatchlistItemDirect(id, btn) {
     const list = map[key];
     if (list && (list.slug === 'watchlist' || list.isWatchlist || (list.name && list.name.toLowerCase() === 'watchlist'))) {
       const initialLen = (list.items || []).length;
-      list.items = (list.items || []).filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+      list.items = removeMatching(list.items);
       if (list.items.length !== initialLen) {
         list.updatedAt = Date.now();
         changed = true;

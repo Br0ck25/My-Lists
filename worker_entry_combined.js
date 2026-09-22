@@ -26270,7 +26270,7 @@ if ('serviceWorker' in navigator) {
       <p style="margin-top:14px; margin-bottom:6px; font-weight:600; font-size:0.85rem;">Picks in this list:</p>
       <div id="customListDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>No items in this list yet &mdash; tap + on any movie or show across Discover, Search, or Charts to add it.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
-        <button type="button" class="secondary lc-btn" onclick="shuffleCustomListDraft()">Shuffle picks now</button>
+        <button type="button" class="secondary lc-btn" onclick="shuffleCustomListDraft()">Shuffle Picks Now</button>
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllCustomListDraftPicks()">Remove All</button>
       </div>
       <div id="customListVisibilityRow" style="margin-top:12px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; max-width:280px;">
@@ -26584,7 +26584,7 @@ if ('serviceWorker' in navigator) {
       </div>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
-        <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft(); showAddedToast('Channel picks shuffled.');">Shuffle picks now</button>
+        <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft(); showAddedToast('Channel picks shuffled.');">Shuffle Picks Now</button>
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove All</button>
       </div>
       <div id="channelVisibilityRow" style="margin-top:12px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; max-width:280px;">
@@ -40591,6 +40591,11 @@ function renderChannelDraftList() {
   // (see clearChannelDraftAutoSort), which is what lets a hand-moved pick
   // survive the render it triggers.
   applyChannelDraftAutoSort();
+  // Then the rules that are not a preference: Story Lock and multi-part
+  // pairing. Every path that moves picks ends here, so this is the one place
+  // that cannot be routed around -- a shuffle, a drag, a typed position, an
+  // import and the first draw of a saved channel all land within the rules.
+  applyChannelDraftOrderRules();
   const box = document.getElementById('channelDraftList');
   const badge = document.getElementById('channelDraftCountBadge');
   if (badge) badge.textContent = channelDraftItems.length ? '(' + channelDraftItems.length + ')' : '';
@@ -47702,6 +47707,12 @@ function shuffleChannelDraft() {
   if (channelDraftItems.length < 2) return;
   // A one-shot, so it cannot leave a sort armed to undo it on the next
   // render.
+  //
+  // Deals blind on purpose: Story Lock and multi-part pairing are put back
+  // by applyChannelDraftOrderRules on the render below, which is the same
+  // order the Worker uses -- shuffle, resequence the locked shows, then glue
+  // the stories back together last, because every earlier step can separate
+  // them again.
   clearChannelDraftAutoSort();
   for (let i = channelDraftItems.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -47960,6 +47971,199 @@ function channelDraftPairKey(it) {
   if (it.kind === 'movie') return showId;
   if (it.season == null || it.episode == null) return '';
   return showId + ':' + it.season + ':' + it.episode;
+}
+
+// --- keeping multi-part stories together in the builder ---------------------
+//
+// The Worker has glued them at play time for a while (glueMultiPartEpisodes,
+// 05_catalog-core.js), but the builder had no idea they existed: it knew
+// about hand-made pairs and nothing else, with no title detection at all. So
+// "Shuffle Picks Now" dealt Pilot (1) and Pilot (2) sixteen positions apart,
+// the list showed them that way, and the picks were SAVED that way. The
+// channel still played them together -- the Worker glued them back -- which
+// is exactly why this read as a bug rather than a wrong channel: what was on
+// screen was not what played.
+//
+// These are the client twins of channelPartTitleSplit, channelPartBaseKey,
+// channelItemNumber and channelPartGroups. They have to agree with the
+// Worker's exactly, which is what the parity test in
+// tests/channel-pairing.test.mjs holds them to.
+const CHANNEL_DRAFT_PART_ROMAN = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10 };
+
+function channelDraftItemNumber(value) {
+  const n = typeof value === 'number' ? value : parseInt(value, 10);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+function channelDraftPartBaseKey(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function channelDraftPartTitleSplit(rawName) {
+  const name = String(rawName == null ? '' : rawName).trim();
+  if (!name) return null;
+  const worded = name.match(/^(.*?)[\\s,:;–—-]*\\(?\\s*(?:part|pt\\.?)\\s*([0-9]{1,2}|[ivxIVX]{1,4})\\s*\\)?[\\s.]*$/i);
+  if (worded) {
+    const raw = worded[2].toLowerCase();
+    const part = /^[0-9]+$/.test(raw) ? parseInt(raw, 10) : (CHANNEL_DRAFT_PART_ROMAN[raw] || 0);
+    if (part > 0 && worded[1].trim()) return { base: channelDraftPartBaseKey(worded[1]), part: part };
+    return null;
+  }
+  const bracketed = name.match(/^(.*?)[\\s,:;–—-]*\\(([0-9]{1,2})\\)[\\s.]*$/);
+  if (bracketed) {
+    const part = parseInt(bracketed[2], 10);
+    if (part > 0 && bracketed[1].trim()) return { base: channelDraftPartBaseKey(bracketed[1]), part: part };
+  }
+  return null;
+}
+
+// Whether "Keep multi-part episodes together" is ticked right now. Read off
+// the checkbox rather than the saved payload, because this runs while the
+// panel is open and the point is that ticking it takes effect immediately.
+function channelDraftPairPartsOn() {
+  const check = document.getElementById('channelPairPartsCheck');
+  return !!(check && check.checked);
+}
+
+// Every multi-part story among the current picks, as a lookup from each
+// member's key to the whole story in part order. A hand-made pair wins over
+// a detected one, and applies whether the toggle is on or not -- it was
+// asked for explicitly.
+function channelDraftPartGroups() {
+  const byKey = new Map();
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftPairKey(it);
+    if (key && !byKey.has(key)) byKey.set(key, it);
+  });
+  const lookup = new Map();
+  const claim = (members) => {
+    if (members.length < 2) return;
+    const capped = members.slice(0, CHANNEL_DRAFT_PAIR_MAX);
+    if (capped.some((it) => lookup.has(channelDraftPairKey(it)))) return;
+    capped.forEach((it) => lookup.set(channelDraftPairKey(it), capped));
+  };
+  channelDraftPairedGroups.forEach((keys) => {
+    claim(keys.map((k) => byKey.get(k)).filter(Boolean));
+  });
+  if (!channelDraftPairPartsOn()) return lookup;
+  // Same show, same season, same story name, different part numbers. Season
+  // matters -- a remake's "Part 1" ten seasons later is a different story
+  // with the same name.
+  const stories = new Map();
+  channelDraftItems.forEach((it) => {
+    if (!it || it.kind === 'movie') return;
+    const key = channelDraftPairKey(it);
+    if (!key) return;
+    const split = channelDraftPartTitleSplit(it.epName);
+    if (!split) return;
+    const season = channelDraftItemNumber(it.season);
+    const storyKey = channelDraftShowKey(it) + '|' + (season === null ? '' : season) + '|' + split.base;
+    if (!stories.has(storyKey)) stories.set(storyKey, []);
+    stories.get(storyKey).push({ item: it, part: split.part });
+  });
+  stories.forEach((entries) => {
+    const seenParts = new Set();
+    const members = [];
+    entries.slice().sort((a, b) => a.part - b.part).forEach((e) => {
+      if (seenParts.has(e.part)) return;
+      seenParts.add(e.part);
+      members.push(e.item);
+    });
+    claim(members);
+  });
+  return lookup;
+}
+
+// Pulls each story back together where its first-listed member sits, in part
+// order. The twin of glueMultiPartEpisodes, with one difference that matters:
+// the Worker glues a lineup against the whole pool and may pull in a part the
+// lineup never drew, while here the list IS the pool, so nothing can be
+// added -- only moved. The length check below is what states that.
+function applyChannelDraftPairing() {
+  const groups = channelDraftPartGroups();
+  if (!groups.size) return false;
+  const played = new Set();
+  const out = [];
+  channelDraftItems.forEach((it) => {
+    const members = groups.get(channelDraftPairKey(it));
+    if (!members) {
+      out.push(it);
+      return;
+    }
+    const storyId = channelDraftPairKey(members[0]);
+    if (played.has(storyId)) return;
+    played.add(storyId);
+    members.forEach((m) => out.push(m));
+  });
+  if (out.length !== channelDraftItems.length) return false;
+  const changed = out.some((it, i) => it !== channelDraftItems[i]);
+  if (changed) channelDraftItems = out;
+  return changed;
+}
+
+// Story Lock, in the builder. The twin of resequenceLockedShows: the
+// POSITIONS a locked show holds are left exactly where they are -- so it
+// stays spread through the channel rather than collapsing into one block --
+// and the episodes that sit in them are dealt out in broadcast order, so the
+// show always advances E1, E2, E3 wherever it turns up. Nothing in the
+// builder did this, so a shuffle left a locked show's episodes in whatever
+// order it dealt them.
+function resequenceChannelDraftLockedShows() {
+  if (!channelDraftStoryLocked.length || channelDraftItems.length < 2) return false;
+  const locked = new Set(channelDraftStoryLocked);
+  const queues = new Map();
+  channelDraftItems.forEach((it) => {
+    const key = channelDraftShowKey(it);
+    if (!locked.has(key)) return;
+    if (!queues.has(key)) queues.set(key, []);
+    queues.get(key).push(it);
+  });
+  if (!queues.size) return false;
+  const bySeasonEpisode = (a, b) => {
+    const sa = channelDraftItemNumber(a.season);
+    const sb = channelDraftItemNumber(b.season);
+    if (sa !== sb) return (sa === null ? 0 : sa) - (sb === null ? 0 : sb);
+    const ea = channelDraftItemNumber(a.episode);
+    const eb = channelDraftItemNumber(b.episode);
+    return (ea === null ? 0 : ea) - (eb === null ? 0 : eb);
+  };
+  queues.forEach((queue, key) => queues.set(key, queue.slice().sort(bySeasonEpisode)));
+  const cursors = new Map();
+  let changed = false;
+  channelDraftItems = channelDraftItems.map((it) => {
+    const key = channelDraftShowKey(it);
+    const queue = queues.get(key);
+    if (!queue) return it;
+    const at = cursors.get(key) || 0;
+    cursors.set(key, at + 1);
+    const next = queue[at] || it;
+    if (next !== it) changed = true;
+    return next;
+  });
+  return changed;
+}
+
+// The two ordering rules that are not a preference: whatever just moved the
+// picks -- a shuffle, a sort, a drag, a typed position, an import -- these
+// run after it and put the picks back within the rules. Applied from
+// renderChannelDraftList, which every one of those paths ends with, so there
+// is no way to reorder the list and skip them.
+//
+// The selection is carried across by identity. It is stored as indices, and
+// reordering underneath it would otherwise leave "Pair" and "Unpair" acting
+// on whichever picks happened to land on those numbers.
+function applyChannelDraftOrderRules() {
+  if (channelDraftItems.length < 2) return;
+  const selected = channelDraftSelection.map((i) => channelDraftItems[i]).filter(Boolean);
+  const locked = resequenceChannelDraftLockedShows();
+  const paired = applyChannelDraftPairing();
+  if (!locked && !paired) return;
+  const nextSelection = [];
+  selected.forEach((it) => {
+    const at = channelDraftItems.indexOf(it);
+    if (at !== -1 && nextSelection.indexOf(at) === -1) nextSelection.push(at);
+  });
+  channelDraftSelection = nextSelection;
 }
 
 // "Pair" over the selection: these picks play back to back, in the order
@@ -56776,6 +56980,66 @@ const LOCAL_CUSTOM_LISTS_KEY = 'myListAddon:localCustomLists';
 let _memoryCustomListsString = null;
 let _memoryCustomListsObj = null;
 
+// The derived upcoming-episode fields a tracked entry carries. Season and
+// episode numbers are deliberately NOT in here: on Continue Watching they say
+// where the person is up to, which is the account's to state, not this
+// device's. See carryLocalAiringFields.
+const TRACKING_AIRING_FIELDS = [
+  'airDate',
+  'airTime',
+  'seasonFinaleAirDate',
+  'seasonFinaleEpisodeNumber',
+  'isSeasonPremiere',
+  'isSeasonFinale',
+  'isUnaired',
+];
+
+// Airing data is DERIVED, not authored: refreshAiringNext and
+// refreshWatchlistAiring work it out on this device and stamp it onto
+// the entries. The account holds whatever was last pushed, so on a load
+// its copy is routinely thinner than what this browser has already
+// resolved -- and both merges below let the server entry win wholesale
+// for an item present on both sides. That is why the premiere and date
+// chips rendered and then vanished a moment later while signed in, and
+// stayed put while signed out: signing in replaced the enriched entries
+// with bare ones.
+//
+// Only forward-looking data is carried, so a stale local date can never
+// put a chip back on an episode that has already aired, and only onto
+// an entry the server left blank, so the account still wins wherever it
+// actually knows something.
+function carryLocalAiringFields(merged, localItems, keyOf) {
+  if (!Array.isArray(merged) || !Array.isArray(localItems) || !localItems.length) return false;
+  const byKey = new Map();
+  localItems.forEach((it) => {
+    keyOf(it).forEach((k) => { if (k && !byKey.has(k)) byKey.set(k, it); });
+  });
+  let carried = false;
+  merged.forEach((it) => {
+    if (!it || it.airDate) return;
+    let local = null;
+    const keys = keyOf(it);
+    for (let i = 0; i < keys.length && !local; i++) local = byKey.get(keys[i]) || null;
+    if (!local || !local.airDate) return;
+    if (typeof isEpisodeAired === 'function' && isEpisodeAired(local.airDate)) return;
+    TRACKING_AIRING_FIELDS.forEach((f) => {
+      if (local[f] != null && it[f] == null) {
+        it[f] = local[f];
+        carried = true;
+      }
+    });
+    // Never over an episode the account already names -- on Continue
+    // Watching those two say where the person is up to, not when
+    // anything airs.
+    if (it.seasonNum == null && local.seasonNum != null) it.seasonNum = local.seasonNum;
+    if (it.episodeNum == null && local.episodeNum != null) it.episodeNum = local.episodeNum;
+  });
+  return carried;
+}
+function airingKeysForShow(it) { return it ? [it.showId, it.id, it.imdbId].filter(Boolean).map(String) : []; }
+function airingKeysForItem(it) { return it ? [it.id, it.imdbId, it.showId].filter(Boolean).map(String) : []; }
+window.carryLocalAiringFields = carryLocalAiringFields;
+
 function compactCustomListItem(it) {
   if (!it || typeof it !== 'object') return it;
   const clean = {
@@ -59970,6 +60234,7 @@ async function loadCreatorSync(opts) {
         if (isRecentRemoval) {
           mergedCW = localCWItems;
         }
+        const carriedCW = carryLocalAiringFields(mergedCW, localCWItems, airingKeysForShow);
 
         const cw = getOrCreateContinueWatchingList();
         cw.items = mergedCW;
@@ -59979,7 +60244,7 @@ async function loadCreatorSync(opts) {
         saveLocalCustomListsMap(map);
         window._inProgressShowIds = new Set(mergedCW.map((it) => String(it && it.showId)).filter(Boolean));
 
-        if (localOnlyCW.length > 0 && typeof scheduleTrackingSync === 'function') {
+        if ((localOnlyCW.length > 0 || carriedCW) && typeof scheduleTrackingSync === 'function') {
           scheduleTrackingSync();
         } else if (!isRecentRemoval) {
           recordTrackingLocalBaseline({ 'continue-watching': cw.updatedAt });
@@ -59999,12 +60264,13 @@ async function loadCreatorSync(opts) {
           ? localItems.filter((it) => it && !serverIds.has(String(it.id || it.imdbId)))
           : [];
         const mergedWL = [...serverItems, ...localOnly];
+        const carriedWL = carryLocalAiringFields(mergedWL, localItems, airingKeysForItem);
 
         map['watchlist'].items = mergedWL;
         map['watchlist'].updatedAt = Date.now();
         saveLocalCustomListsMap(map);
 
-        if (localOnly.length > 0 && typeof pushTrackingSync === 'function') {
+        if ((localOnly.length > 0 || carriedWL) && typeof pushTrackingSync === 'function') {
           pushTrackingSync();
         } else if (!isRecentRemoval) {
           recordTrackingLocalBaseline({ 'watchlist': map['watchlist'].updatedAt });
@@ -62869,10 +63135,29 @@ function removeWatchlistItemDirect(id, btn) {
     }
   }
   const targetId = String(id);
+  // Every id this entry is addressable by, because the two sides of this
+  // removal did not agree on which one to use. The card's remove button
+  // passes "imdbId || id"; the filter here compared "id || imdbId". An entry
+  // holding both, with a TMDB id in one and an IMDb id in the other, matched
+  // neither test: the tile animated away, nothing was written, the item count
+  // beside the list never moved -- it is only re-rendered when something
+  // changed -- and the next load brought the item straight back.
+  const watchlistItemIds = (it) => {
+    if (!it) return [];
+    const out = [];
+    if (it.id) out.push(String(it.id));
+    if (it.imdbId) out.push(String(it.imdbId));
+    if (it.showId) out.push(String(it.showId));
+    if (it.tmdbId) {
+      out.push(String(it.tmdbId));
+      out.push('tmdb:' + it.tmdbId);
+    }
+    return out;
+  };
   // The edit itself, as a function, so saveCreatorListWithBaseline can re-apply it to
   // whatever another device saved instead of re-sending a stale array.
   const removeMatching = (items) => (items || []).filter(
-    (it) => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId
+    (it) => it && watchlistItemIds(it).indexOf(targetId) === -1
   );
   const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
   let changed = false;
@@ -62880,7 +63165,7 @@ function removeWatchlistItemDirect(id, btn) {
     const list = map[key];
     if (list && (list.slug === 'watchlist' || list.isWatchlist || (list.name && list.name.toLowerCase() === 'watchlist'))) {
       const initialLen = (list.items || []).length;
-      list.items = (list.items || []).filter(it => it && String(it.id || it.imdbId) !== targetId && String(it.showId || '') !== targetId);
+      list.items = removeMatching(list.items);
       if (list.items.length !== initialLen) {
         list.updatedAt = Date.now();
         changed = true;

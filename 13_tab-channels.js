@@ -229,7 +229,7 @@
       </div>
       <div id="channelDraftList"><p style="color:var(--muted); font-size:0.85rem;"><small>Nothing added yet &mdash; search above to get started.</small></p></div>
       <div class="actions" style="margin-top:8px; justify-content:flex-start; gap:8px;">
-        <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft(); showAddedToast('Channel picks shuffled.');">Shuffle picks now</button>
+        <button type="button" class="secondary lc-btn" onclick="shuffleChannelDraft(); showAddedToast('Channel picks shuffled.');">Shuffle Picks Now</button>
         <button type="button" class="secondary lc-btn" style="color:var(--danger); border-color:rgba(255,59,48,0.25);" onclick="removeAllChannelDraftPicks()">Remove All</button>
       </div>
       <div id="channelVisibilityRow" style="margin-top:12px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center; max-width:280px;">
