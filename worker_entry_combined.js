@@ -1099,6 +1099,19 @@ function isPersonalShelfUrl(url) {
 // that endpoint -- sized to cover a Curated card's poster strip plus headroom,
 // and to stay well inside the 50 a free Workers plan allows per request.
 const IMDB_ID_LOOKUP_MAX = 24;
+
+// The Stremio/Nuvio artwork-overlay toggles, as stored in an install config.
+// Named in one place because they have to agree across four: the builder
+// page's save request, /api/save's stored payload, resolveConfig's read, and
+// the badge gate in fetchCatalog. Each reads as ON when absent, so only a
+// switched-off one is ever written.
+const STREMIO_BADGE_KEYS = [
+  "showBadgesStremio",
+  "showBadgesStremioAiringNext",
+  "showBadgesStremioContinueWatching",
+  "showBadgesStremioWatchlist",
+  "showBadgesStremioCatalogs",
+];
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -2906,6 +2919,9 @@ function decodeConfig(config) {
       // where this is actually applied. Defaults to false, same reasoning
       // as region/hideNonDigitalReleases above.
       dedupeAcrossLists: !!(!Array.isArray(parsed) && parsed.dedupeAcrossLists),
+      // Badge toggles default ON when absent, the way the others here do, so
+      // an install predating this one keeps showing them.
+      showBadgesStremioWatchlist: Array.isArray(parsed) || parsed.showBadgesStremioWatchlist !== false,
       // BetterPosters (btttr.cc) replacement artwork -- see
       // applyBetterPostersToMetas (05_catalog-core.js). Opt-in, so it
       // defaults to false and every install predating it is untouched. The
@@ -11822,6 +11838,7 @@ async function resolveConfig(configParam, env) {
           showBadgesStremioAiringNext: parsed.showBadgesStremioAiringNext !== false,
           showBadgesStremioContinueWatching: parsed.showBadgesStremioContinueWatching !== false,
           showBadgesStremioCatalogs: parsed.showBadgesStremioCatalogs !== false,
+          showBadgesStremioWatchlist: parsed.showBadgesStremioWatchlist !== false,
           showBadgesStremio: parsed.showBadgesStremio !== false,
         };
       } catch {
@@ -12413,12 +12430,18 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     const entryName = String(entry.name || '').toLowerCase();
     const isAiringNext = entryUrl.includes('airing-next') || entryUrl.includes('airing_next') || entry.statusKey === 'airing-next' || entry.slug === 'airing-next' || entry.id === 'airing-next' || entryName.includes('airing next');
     const isContinueWatching = entryUrl.includes('continue-watching') || entryUrl.includes('continue_watching') || entry.statusKey === 'continue-watching' || entry.slug === 'continue-watching' || entry.id === 'continue-watching' || entryName.includes('continue watching');
+    // Matched the same way as the two above. "upnext" is deliberately absent:
+    // that is MDBList's own Up Next shelf, which is a progress list rather
+    // than a watchlist and already lands on the catalogs toggle.
+    const isWatchlist = entryUrl.includes('watchlist') || entry.statusKey === 'watchlist' || entry.slug === 'watchlist' || entry.id === 'watchlist' || entryName.includes('watchlist');
 
     let allowBadges = false;
     if (isAiringNext) {
       allowBadges = keys.showBadgesStremioAiringNext !== false && keys.showBadgesStremio !== false;
     } else if (isContinueWatching) {
       allowBadges = keys.showBadgesStremioContinueWatching !== false && keys.showBadgesStremio !== false;
+    } else if (isWatchlist) {
+      allowBadges = keys.showBadgesStremioWatchlist !== false && keys.showBadgesStremio !== false;
     } else {
       allowBadges = keys.showBadgesStremioCatalogs !== false && keys.showBadgesStremio !== false;
     }
@@ -13856,8 +13879,16 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       if (trackingRaw) {
         const trackingBlob = JSON.parse(trackingRaw);
         items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
-        if (slug === 'continue-watching') {
+        // Loaded for the watchlist as well as continue-watching: it is the
+        // only source of "this show has an episode coming", and a watchlist
+        // entry wants that chip exactly as much as an in-progress one does.
+        // The fully-watched filtering below stays continue-watching only --
+        // a watchlist is what you mean to watch, not a progress shelf, so
+        // dropping finished shows from it would be wrong.
+        if (slug === 'continue-watching' || slug === 'watchlist') {
           airingItems = trackingBlob.airingNext || [];
+        }
+        if (slug === 'continue-watching') {
           const fwList = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
@@ -13879,8 +13910,16 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         if (!blobStr) return [];
         const blob = JSON.parse(blobStr);
         items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
-        if (slug === 'continue-watching') {
+        // Loaded for the watchlist as well as continue-watching: it is the
+        // only source of "this show has an episode coming", and a watchlist
+        // entry wants that chip exactly as much as an in-progress one does.
+        // The fully-watched filtering below stays continue-watching only --
+        // a watchlist is what you mean to watch, not a progress shelf, so
+        // dropping finished shows from it would be wrong.
+        if (slug === 'continue-watching' || slug === 'watchlist') {
           airingItems = blob.airingNext || [];
+        }
+        if (slug === 'continue-watching') {
           const fwList = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
@@ -13904,7 +13943,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
     const airingByShowId = new Map();
     const airingByBaseId = new Map();
     const airingByTitle = new Map();
-    if (slug === 'continue-watching' && Array.isArray(airingItems) && airingItems.length) {
+    if ((slug === 'continue-watching' || slug === 'watchlist') && Array.isArray(airingItems) && airingItems.length) {
       airingItems.forEach(an => {
         if (!an) return;
         const sid = String(an.showId || an.id || '');
@@ -13956,7 +13995,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       let seasonFinaleEpisodeNumber = it.seasonFinaleEpisodeNumber != null ? it.seasonFinaleEpisodeNumber : undefined;
       let airingMatch = null;
 
-      if (slug === 'continue-watching' && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
+      if ((slug === 'continue-watching' || slug === 'watchlist') && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
         if (it.showId && airingByShowId.has(String(it.showId))) airingMatch = airingByShowId.get(String(it.showId));
         else if (it.id && airingByShowId.has(String(it.id))) airingMatch = airingByShowId.get(String(it.id));
         else {
@@ -26989,6 +27028,13 @@ if ('serviceWorker' in navigator) {
             <div>
               <span style="font-weight:600;">Continue Watching Catalogs in Stremio</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Continue Watching poster artwork in Stremio and Nuvio.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeStremioWatchlistCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioWatchlist', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Watchlist Catalogs in Stremio</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Watchlist poster artwork in Stremio and Nuvio.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
@@ -59541,6 +59587,7 @@ async function loadCreatorSync(opts) {
         { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
         { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
         { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+        { key: 'showBadgesStremioWatchlist', id: 'badgeStremioWatchlistCheckbox' },
         { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
         { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
         { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
@@ -63525,6 +63572,7 @@ function collectKeys() {
     showBadgesCatalogs: getBadgeSetting('showBadgesCatalogs'),
     showBadgesStremioAiringNext: getBadgeSetting('showBadgesStremioAiringNext'),
     showBadgesStremioContinueWatching: getBadgeSetting('showBadgesStremioContinueWatching'),
+    showBadgesStremioWatchlist: getBadgeSetting('showBadgesStremioWatchlist'),
     showBadgesStremioCatalogs: getBadgeSetting('showBadgesStremioCatalogs'),
     showBadgesStremio: getBadgeSetting('showBadgesStremio'),
     showBadgeAirDate: getBadgeSetting('showBadgeAirDate'),
@@ -63748,6 +63796,7 @@ function initBadgeSettingsUI() {
     { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
     { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
     { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+    { key: 'showBadgesStremioWatchlist', id: 'badgeStremioWatchlistCheckbox' },
     { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
     { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
     { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
@@ -64311,6 +64360,7 @@ function getPosterBadgeSettings() {
     traktContinueWatching: get('showBadgesTraktContinueWatching'),
     mdblistUpNext: get('showBadgesMdblistUpNext'),
     airingNext: get('showBadgesAiringNext'),
+    catalogs: get('showBadgesCatalogs'),
     airDate: get('showBadgeAirDate'),
     seasonPremiere: get('showBadgeSeasonPremiere'),
     seasonFinale: get('showBadgeSeasonFinale'),
@@ -64605,6 +64655,12 @@ function livePreviewPosterHtml(m) {
 
   const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext || isTraktCwContext || isMdblistUpNextContext);
   const isAiringItem = !!(m.isAiringNext || m.listSlug === 'airing-next' || isAiringListContext);
+  // A Watchlist shelf carries the same premiere / finale / air-date chips now
+  // that fetchAutoTrackedCatalog enriches it from the same Airing Next data
+  // (05_catalog-core.js). Checked AFTER the two above so a shelf that is both
+  // keeps its more specific meaning.
+  const isWatchlistListContext = parentUrl.includes('watchlist') || parentName.includes('watchlist') || decodedSlug === 'watchlist';
+  const isWatchlistItem = !isCwItem && !isAiringItem && !!(m.listSlug === 'watchlist' || isWatchlistListContext);
 
   let removeBtn = '';
   if (!m.isLivePreviewShelf && !m.hideRemoveBtn) {
@@ -64633,7 +64689,9 @@ function livePreviewPosterHtml(m) {
         ? (badgeSettings.mdblistUpNext !== false)
         : (isCwItem
             ? badgeSettings.continueWatching
-            : (isAiringItem ? badgeSettings.airingNext : false)));
+            : (isAiringItem
+                ? badgeSettings.airingNext
+                : (isWatchlistItem ? badgeSettings.catalogs !== false : false))));
 
   const showAirDate = locationAllowed && badgeSettings.airDate;
   const showPremiere = locationAllowed && badgeSettings.seasonPremiere;
@@ -68669,6 +68727,13 @@ async function generate() {
         // is the link Stremio/Nuvio actually install. Left out, the setting
         // never leaves the browser and the feature looks dead in the apps
         // while the website shows it working.
+        // Same allowlist problem as betterPosters below: left out, switching
+        // any of these off never leaves the browser.
+        showBadgesStremio: keys.showBadgesStremio,
+        showBadgesStremioAiringNext: keys.showBadgesStremioAiringNext,
+        showBadgesStremioContinueWatching: keys.showBadgesStremioContinueWatching,
+        showBadgesStremioWatchlist: keys.showBadgesStremioWatchlist,
+        showBadgesStremioCatalogs: keys.showBadgesStremioCatalogs,
         betterPosters: keys.betterPosters,
         betterPostersGenre: keys.betterPostersGenre,
         betterPostersRating: keys.betterPostersRating,
@@ -71213,7 +71278,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // Kept as a whole object as well as destructured: the betterPosters*
       // style keys are passed through wholesale rather than one at a time.
       const resolvedConfig = await resolveConfig(config, env);
-      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, betterPosters, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs } = resolvedConfig;
+      const { entries, tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, trackCreatorName, trackOwner, region, hideNonDigitalReleases, adultContentFilter, dedupeAcrossLists, betterPosters, showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist } = resolvedConfig;
       const entryIndex = entries.findIndex((e) => e.id === id && e.type === type);
       const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
@@ -71236,7 +71301,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // to a config that PROVED it belongs to that account. See resolveConfig
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
-        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, env, ctx, origin: url.origin });
+        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist, env, ctx, origin: url.origin });
         if (dedupeAcrossLists) {
           metas = await dedupeAcrossListEntries(entries, entryIndex, skip, metas, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, env, ctx });
         }
@@ -77445,6 +77510,18 @@ function generateSearchVariations(query) {
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
       if (body.adultContentFilter) payload.adultContentFilter = true;
       if (body.dedupeAcrossLists) payload.dedupeAcrossLists = true;
+      // The Stremio/Nuvio artwork-overlay toggles. Stored only when switched
+      // OFF, because resolveConfig reads an absent key as on -- so a config
+      // with all of them on stays exactly the size it was.
+      //
+      // These were missing from this allowlist entirely, which meant turning
+      // any of them off never reached the install link: the setting looked
+      // saved, and the badges kept appearing in the apps. It read as harmless
+      // only because the default is on; the same gap left Better Posters
+      // (default off) looking completely dead. See that key below.
+      for (const badgeKey of STREMIO_BADGE_KEYS) {
+        if (body[badgeKey] === false) payload[badgeKey] = false;
+      }
       // Better Posters. This builder is an allowlist -- a key it does not name
       // is dropped on the floor -- and this is the PRIMARY install path
       // whenever a CONFIGS KV namespace is bound, so a key missing here does

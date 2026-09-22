@@ -2191,6 +2191,13 @@ async function generate() {
         // is the link Stremio/Nuvio actually install. Left out, the setting
         // never leaves the browser and the feature looks dead in the apps
         // while the website shows it working.
+        // Same allowlist problem as betterPosters below: left out, switching
+        // any of these off never leaves the browser.
+        showBadgesStremio: keys.showBadgesStremio,
+        showBadgesStremioAiringNext: keys.showBadgesStremioAiringNext,
+        showBadgesStremioContinueWatching: keys.showBadgesStremioContinueWatching,
+        showBadgesStremioWatchlist: keys.showBadgesStremioWatchlist,
+        showBadgesStremioCatalogs: keys.showBadgesStremioCatalogs,
         betterPosters: keys.betterPosters,
         betterPostersGenre: keys.betterPostersGenre,
         betterPostersRating: keys.betterPostersRating,

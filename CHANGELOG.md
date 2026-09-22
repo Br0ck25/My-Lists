@@ -22,6 +22,19 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - `createSortableList` now auto-scrolls when the pointer comes within 90px of an edge, ramping to 20px per frame at the very edge, and re-places the row against the rows that scroll into view. It drives this from its own animation-frame loop rather than from `dragover`/`pointermove`, because those stop firing the moment the pointer is held still at the edge -- which is exactly when scrolling needs to continue. It scrolls the nearest scrollable ancestor when there is one (lists inside panels) and the window otherwise.
 - Verified against the failing case in a real browser: a 12-row list at 2584px in a 900px window. Before, dragging row 1 to the bottom edge and holding it there moved it three places and left `window.scrollY` at 0. After, the same drag carries it to seventh with the page scrolled 1008px. **Not covered by the test suite** -- it needs real layout and a real pointer, and CI runs on bare node + python with no browser.
 
+### ⭐ Watchlist posters now carry the same badges as Continue Watching and Airing Next
+
+- A show on your Watchlist with an episode coming got no premiere chip and no date chip. Three separate gates kept it out, all of them testing for `continue-watching`: the Airing Next data was only loaded for that slug, the lookup maps were only built for it, and the enrichment only ran for it. All three now include `watchlist`, so a watchlist entry is matched against the same Airing Next record and carries the same `airDate` / `isSeasonPremiere` / finale fields.
+- The fully-watched filtering stays Continue Watching only, deliberately: a watchlist is what you **mean** to watch, not a progress shelf, so dropping finished shows out of it would be wrong.
+- New **Watchlist Catalogs in Stremio** toggle under **Poster Badges & Labels → Stremio & Nuvio (Artwork Overlays)**, alongside the Airing Next and Continue Watching ones. It is independent of the catalogs toggle, and the master Stremio switch still overrides it.
+- Live Preview shows the same chips. On the website a Watchlist shelf is a catalog row, so it follows the existing **Catalogs & Live Preview** toggle there, while Stremio/Nuvio follow the new one.
+
+### 🐛 The Stremio badge toggles never reached your install link
+
+- `showBadgesStremio*` were missing from `/api/save`'s allowlist on **both** sides -- the builder page never sent them and the endpoint would have dropped them anyway -- so switching any of them off never left the browser. The setting looked saved and the badges kept appearing in Stremio/Nuvio. It read as harmless only because these default to ON; the identical gap left Better Posters, which defaults off, looking completely dead.
+- All five now travel, named once in `STREMIO_BADGE_KEYS` (`00_constants.js`) so the four places that must agree -- the save request, the stored payload, `resolveConfig`, and the badge gate in `fetchCatalog` -- cannot drift apart. Only a switched-off toggle is written, so an all-on config does not grow by a single key.
+- This was flagged earlier as a known gap and deliberately left alone. It stopped being optional the moment the new Watchlist toggle needed the same path to work at all.
+
 ### ⭐ Better Posters on the Curated For You / Recommended cards
 
 - BetterPosters is keyed by **IMDB id and nothing else** -- there is no `/poster/tmdb/...` route, it 404s. `/api/recommendations` answers with `tmdb:<n>` ids, because TMDB's recommendation endpoints return TMDB ids and nothing else, so those two cards had nothing for a BetterPosters URL to be built from. The identical rows in Live Preview and in Stremio/Nuvio *did* get the artwork, because `fetchCuratedCatalog` translates the ids on the way through and the dashboard card never did.

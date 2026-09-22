@@ -1049,3 +1049,16 @@ function isPersonalShelfUrl(url) {
 // that endpoint -- sized to cover a Curated card's poster strip plus headroom,
 // and to stay well inside the 50 a free Workers plan allows per request.
 const IMDB_ID_LOOKUP_MAX = 24;
+
+// The Stremio/Nuvio artwork-overlay toggles, as stored in an install config.
+// Named in one place because they have to agree across four: the builder
+// page's save request, /api/save's stored payload, resolveConfig's read, and
+// the badge gate in fetchCatalog. Each reads as ON when absent, so only a
+// switched-off one is ever written.
+const STREMIO_BADGE_KEYS = [
+  "showBadgesStremio",
+  "showBadgesStremioAiringNext",
+  "showBadgesStremioContinueWatching",
+  "showBadgesStremioWatchlist",
+  "showBadgesStremioCatalogs",
+];

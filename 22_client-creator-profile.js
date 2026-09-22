@@ -3055,6 +3055,7 @@ async function loadCreatorSync(opts) {
         { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
         { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
         { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+        { key: 'showBadgesStremioWatchlist', id: 'badgeStremioWatchlistCheckbox' },
         { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
         { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
         { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },

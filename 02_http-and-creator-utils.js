@@ -412,6 +412,9 @@ function decodeConfig(config) {
       // where this is actually applied. Defaults to false, same reasoning
       // as region/hideNonDigitalReleases above.
       dedupeAcrossLists: !!(!Array.isArray(parsed) && parsed.dedupeAcrossLists),
+      // Badge toggles default ON when absent, the way the others here do, so
+      // an install predating this one keeps showing them.
+      showBadgesStremioWatchlist: Array.isArray(parsed) || parsed.showBadgesStremioWatchlist !== false,
       // BetterPosters (btttr.cc) replacement artwork -- see
       // applyBetterPostersToMetas (05_catalog-core.js). Opt-in, so it
       // defaults to false and every install predating it is untouched. The

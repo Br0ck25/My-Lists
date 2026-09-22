@@ -182,6 +182,13 @@
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeStremioWatchlistCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioWatchlist', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Watchlist Catalogs in Stremio</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Watchlist poster artwork in Stremio and Nuvio.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeStremioCatalogsCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioCatalogs', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
               <span style="font-weight:600;">Other Custom &amp; Provider Catalogs in Stremio</span>

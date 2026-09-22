@@ -202,12 +202,18 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     const entryName = String(entry.name || '').toLowerCase();
     const isAiringNext = entryUrl.includes('airing-next') || entryUrl.includes('airing_next') || entry.statusKey === 'airing-next' || entry.slug === 'airing-next' || entry.id === 'airing-next' || entryName.includes('airing next');
     const isContinueWatching = entryUrl.includes('continue-watching') || entryUrl.includes('continue_watching') || entry.statusKey === 'continue-watching' || entry.slug === 'continue-watching' || entry.id === 'continue-watching' || entryName.includes('continue watching');
+    // Matched the same way as the two above. "upnext" is deliberately absent:
+    // that is MDBList's own Up Next shelf, which is a progress list rather
+    // than a watchlist and already lands on the catalogs toggle.
+    const isWatchlist = entryUrl.includes('watchlist') || entry.statusKey === 'watchlist' || entry.slug === 'watchlist' || entry.id === 'watchlist' || entryName.includes('watchlist');
 
     let allowBadges = false;
     if (isAiringNext) {
       allowBadges = keys.showBadgesStremioAiringNext !== false && keys.showBadgesStremio !== false;
     } else if (isContinueWatching) {
       allowBadges = keys.showBadgesStremioContinueWatching !== false && keys.showBadgesStremio !== false;
+    } else if (isWatchlist) {
+      allowBadges = keys.showBadgesStremioWatchlist !== false && keys.showBadgesStremio !== false;
     } else {
       allowBadges = keys.showBadgesStremioCatalogs !== false && keys.showBadgesStremio !== false;
     }
@@ -1645,8 +1651,16 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       if (trackingRaw) {
         const trackingBlob = JSON.parse(trackingRaw);
         items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
-        if (slug === 'continue-watching') {
+        // Loaded for the watchlist as well as continue-watching: it is the
+        // only source of "this show has an episode coming", and a watchlist
+        // entry wants that chip exactly as much as an in-progress one does.
+        // The fully-watched filtering below stays continue-watching only --
+        // a watchlist is what you mean to watch, not a progress shelf, so
+        // dropping finished shows from it would be wrong.
+        if (slug === 'continue-watching' || slug === 'watchlist') {
           airingItems = trackingBlob.airingNext || [];
+        }
+        if (slug === 'continue-watching') {
           const fwList = Array.isArray(trackingBlob.fullyWatchedShowIds) ? trackingBlob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
@@ -1668,8 +1682,16 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         if (!blobStr) return [];
         const blob = JSON.parse(blobStr);
         items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
-        if (slug === 'continue-watching') {
+        // Loaded for the watchlist as well as continue-watching: it is the
+        // only source of "this show has an episode coming", and a watchlist
+        // entry wants that chip exactly as much as an in-progress one does.
+        // The fully-watched filtering below stays continue-watching only --
+        // a watchlist is what you mean to watch, not a progress shelf, so
+        // dropping finished shows from it would be wrong.
+        if (slug === 'continue-watching' || slug === 'watchlist') {
           airingItems = blob.airingNext || [];
+        }
+        if (slug === 'continue-watching') {
           const fwList = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds.map(String) : [];
           if (fwList.length && Array.isArray(items)) {
             const fwSet = new Set(fwList);
@@ -1693,7 +1715,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
     const airingByShowId = new Map();
     const airingByBaseId = new Map();
     const airingByTitle = new Map();
-    if (slug === 'continue-watching' && Array.isArray(airingItems) && airingItems.length) {
+    if ((slug === 'continue-watching' || slug === 'watchlist') && Array.isArray(airingItems) && airingItems.length) {
       airingItems.forEach(an => {
         if (!an) return;
         const sid = String(an.showId || an.id || '');
@@ -1745,7 +1767,7 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       let seasonFinaleEpisodeNumber = it.seasonFinaleEpisodeNumber != null ? it.seasonFinaleEpisodeNumber : undefined;
       let airingMatch = null;
 
-      if (slug === 'continue-watching' && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
+      if ((slug === 'continue-watching' || slug === 'watchlist') && (airingByShowId.size || airingByBaseId.size || airingByTitle.size)) {
         if (it.showId && airingByShowId.has(String(it.showId))) airingMatch = airingByShowId.get(String(it.showId));
         else if (it.id && airingByShowId.has(String(it.id))) airingMatch = airingByShowId.get(String(it.id));
         else {

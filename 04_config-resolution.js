@@ -143,6 +143,7 @@ async function resolveConfig(configParam, env) {
           showBadgesStremioAiringNext: parsed.showBadgesStremioAiringNext !== false,
           showBadgesStremioContinueWatching: parsed.showBadgesStremioContinueWatching !== false,
           showBadgesStremioCatalogs: parsed.showBadgesStremioCatalogs !== false,
+          showBadgesStremioWatchlist: parsed.showBadgesStremioWatchlist !== false,
           showBadgesStremio: parsed.showBadgesStremio !== false,
         };
       } catch {

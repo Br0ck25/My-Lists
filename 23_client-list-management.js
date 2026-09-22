@@ -562,6 +562,7 @@ function collectKeys() {
     showBadgesCatalogs: getBadgeSetting('showBadgesCatalogs'),
     showBadgesStremioAiringNext: getBadgeSetting('showBadgesStremioAiringNext'),
     showBadgesStremioContinueWatching: getBadgeSetting('showBadgesStremioContinueWatching'),
+    showBadgesStremioWatchlist: getBadgeSetting('showBadgesStremioWatchlist'),
     showBadgesStremioCatalogs: getBadgeSetting('showBadgesStremioCatalogs'),
     showBadgesStremio: getBadgeSetting('showBadgesStremio'),
     showBadgeAirDate: getBadgeSetting('showBadgeAirDate'),
@@ -785,6 +786,7 @@ function initBadgeSettingsUI() {
     { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
     { key: 'showBadgesStremioAiringNext', id: 'badgeStremioAiringNextCheckbox' },
     { key: 'showBadgesStremioContinueWatching', id: 'badgeStremioContinueWatchingCheckbox' },
+    { key: 'showBadgesStremioWatchlist', id: 'badgeStremioWatchlistCheckbox' },
     { key: 'showBadgesStremioCatalogs', id: 'badgeStremioCatalogsCheckbox' },
     { key: 'showBadgesStremio', id: 'badgeStremioCheckbox' },
     { key: 'showBadgeAirDate', id: 'badgeAirDateCheckbox' },
@@ -1348,6 +1350,7 @@ function getPosterBadgeSettings() {
     traktContinueWatching: get('showBadgesTraktContinueWatching'),
     mdblistUpNext: get('showBadgesMdblistUpNext'),
     airingNext: get('showBadgesAiringNext'),
+    catalogs: get('showBadgesCatalogs'),
     airDate: get('showBadgeAirDate'),
     seasonPremiere: get('showBadgeSeasonPremiere'),
     seasonFinale: get('showBadgeSeasonFinale'),
@@ -1642,6 +1645,12 @@ function livePreviewPosterHtml(m) {
 
   const isCwItem = !!(m.removeShowId || m.isCw || m.listSlug === 'continue-watching' || isCwListContext || isTraktCwContext || isMdblistUpNextContext);
   const isAiringItem = !!(m.isAiringNext || m.listSlug === 'airing-next' || isAiringListContext);
+  // A Watchlist shelf carries the same premiere / finale / air-date chips now
+  // that fetchAutoTrackedCatalog enriches it from the same Airing Next data
+  // (05_catalog-core.js). Checked AFTER the two above so a shelf that is both
+  // keeps its more specific meaning.
+  const isWatchlistListContext = parentUrl.includes('watchlist') || parentName.includes('watchlist') || decodedSlug === 'watchlist';
+  const isWatchlistItem = !isCwItem && !isAiringItem && !!(m.listSlug === 'watchlist' || isWatchlistListContext);
 
   let removeBtn = '';
   if (!m.isLivePreviewShelf && !m.hideRemoveBtn) {
@@ -1670,7 +1679,9 @@ function livePreviewPosterHtml(m) {
         ? (badgeSettings.mdblistUpNext !== false)
         : (isCwItem
             ? badgeSettings.continueWatching
-            : (isAiringItem ? badgeSettings.airingNext : false)));
+            : (isAiringItem
+                ? badgeSettings.airingNext
+                : (isWatchlistItem ? badgeSettings.catalogs !== false : false))));
 
   const showAirDate = locationAllowed && badgeSettings.airDate;
   const showPremiere = locationAllowed && badgeSettings.seasonPremiere;
