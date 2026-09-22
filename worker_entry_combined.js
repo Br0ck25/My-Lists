@@ -69986,6 +69986,12 @@ const POSTER_IMAGE_HOSTS = new Set([
   "image.tmdb.org",
   "images.metahub.space",
   "simkl.in",
+  // BetterPosters. This set is "hosts this add-on itself puts in a poster
+  // field", and with the Better Posters setting on, it does. Missing here,
+  // /api/poster-badge 404s the moment a badge is drawn over BetterPosters
+  // artwork -- which is every Airing Next and Continue Watching tile, the
+  // two rows that always carry a badge, while unbadged rows looked fine.
+  "btttr.cc",
 ]);
 
 function isAllowedPosterUrl(raw) {

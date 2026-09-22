@@ -16,6 +16,12 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - The settings ride the same Creator Profile sync as the badge settings, so enabling it in one browser enables it in the next.
 - Every poster on the website resolves through one funnel (`resolveClientPoster`, `19_client-search-and-likes.js`), which the surfaces above already reached via `resolveListCardItemPoster` (17), `resolveItemPoster` (22), `livePreviewPosterHtml` (23), `renderMediaCard` (16) and `loadPosterSlot` (19). The client mirror of the Worker's URL builder lives next to it, and the two are pinned to the same expected URLs by the same test file.
 
+### 🐛 Better Posters broke Airing Next and Continue Watching posters in Stremio/Nuvio
+
+- `/api/poster-badge` validates its `poster` parameter against `POSTER_IMAGE_HOSTS` -- an SSRF / open-image-proxy guard, and a set defined as "hosts this add-on itself puts in a poster field". Better Posters made btttr.cc one of those hosts without adding it, so the endpoint **404'd every badged BetterPosters poster**. That is precisely the Airing Next and Continue Watching rows, the two that always carry a badge, which is why they showed broken tiles while unbadged rows (Watchlist, provider lists) rendered fine.
+- `btttr.cc` added to the set. The guard itself is unchanged and still rejects everything else: new tests cover a look-alike host (`btttr.cc.evil.example.com`), a suffix match (`notbtttr.cc`), plain `http://`, and an unrelated origin, alongside the hosts that were already allowed.
+- The earlier ordering test asserted the badge URL *contained* the btttr.cc URL, and that stayed true the whole time -- it never asked whether the endpoint would then serve it. That is the gap these tests close.
+
 ### 🐛 Better Posters never reached Stremio or Nuvio
 
 - **The setting was dropped on the way into the install link.** `/api/save` -- the KV-backed short link that Stremio and Nuvio actually install whenever a `CONFIGS` namespace is bound, i.e. the normal deployment -- rebuilds its stored payload from an **allowlist** of body fields, and so does the POST body the builder page sends it. `betterPosters` was named in neither, so it never left the browser and was never stored. `resolveConfig` then read it back as `false`, and the apps got the plain artwork while the website showed the feature working. Only the base64 fallback link (used when no KV is bound, or when the save fails) ever carried it.

@@ -322,6 +322,50 @@ describe("BetterPosters end-to-end via the catalog route", () => {
   });
 });
 
+// --- the badge endpoint must accept the artwork --------------------------
+// Where this broke in the wild. /api/poster-badge validates its `poster`
+// parameter against POSTER_IMAGE_HOSTS -- an SSRF/open-proxy guard -- and
+// btttr.cc was not on it. So the moment a badge was drawn over BetterPosters
+// artwork the endpoint 404'd, which is EVERY Airing Next and Continue
+// Watching tile (the two rows that always carry a badge) while unbadged rows
+// rendered fine. The earlier ordering test asserted the badge URL *contains*
+// the btttr.cc URL; it never asked whether that URL could be served.
+
+describe("/api/poster-badge accepts BetterPosters artwork", () => {
+  const badgeUrl = (poster) =>
+    `/api/poster-badge?poster=${encodeURIComponent(poster)}&airDate=2099-02-15&premiere=1`;
+
+  it("does not 404 a btttr.cc poster", async () => {
+    const env = makeEnv();
+    const res = await call(env, badgeUrl("https://btttr.cc/poster/imdb/poster-default/tt0903747.jpg"));
+    assert.notEqual(res.status, 404, "a badge over BetterPosters artwork must render, not 404");
+  });
+
+  it("still accepts the hosts it always did", async () => {
+    const env = makeEnv();
+    for (const p of [
+      "https://image.tmdb.org/t/p/w500/abc.jpg",
+      "https://images.metahub.space/poster/medium/tt0903747/img",
+    ]) {
+      assert.notEqual((await call(env, badgeUrl(p))).status, 404, p);
+    }
+  });
+
+  // The guard is an SSRF / open-image-proxy boundary, so widening it by one
+  // host must not have opened it generally.
+  it("still rejects a host that is not on the allowlist", async () => {
+    const env = makeEnv();
+    for (const p of [
+      "https://evil.example.com/x.jpg",
+      "http://btttr.cc/poster/imdb/poster-default/tt0903747.jpg",
+      "https://btttr.cc.evil.example.com/x.jpg",
+      "https://notbtttr.cc/x.jpg",
+    ]) {
+      assert.equal((await call(env, badgeUrl(p))).status, 404, p);
+    }
+  });
+});
+
 // --- the real install path -------------------------------------------------
 // The tests above seed KV directly. That is exactly how the setting shipped
 // broken once: /api/save rebuilds its stored payload from an ALLOWLIST of body
