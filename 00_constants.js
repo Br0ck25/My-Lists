@@ -1014,3 +1014,32 @@ function buildBetterPostersRatingSourceOptionsHtml(selected) {
     ({ value, label }) => `<option value="${value}"${value === sel ? " selected" : ""}>${label}</option>`
   ).join("");
 }
+
+// --- personal, auto-tracked shelves --------------------------------------
+//
+// Continue Watching, Airing Next, Watch History and Watchlist, across every
+// provider that can supply one. These are not lists in the ordinary sense:
+// each is a live view OF ONE ACCOUNT, derived per request, and its whole job
+// is to answer "what am I in the middle of / what is next for me".
+//
+// That makes them the wrong input and the wrong target for anything that
+// treats lists as interchangeable collections -- "Remove duplicate items
+// across lists" most of all, which would otherwise strip the show you are
+// three episodes into out of Continue Watching purely because it also turned
+// up in Trending higher on the page.
+const PERSONAL_SHELF_URL_PREFIXES = [
+  "autotrack:",
+  "trakt:watchlist", "trakt:history", "trakt:airing-next", "trakt:continue-watching", "trakt:user:",
+  "mdblist:watchlist", "mdblist:history", "mdblist:airing-next", "mdblist:upnext", "mdblist:user:",
+  "simkl:watchlist", "simkl:history", "simkl:airing-next", "simkl:user:",
+];
+
+// True when ANY source line of a (possibly merged) row names a personal
+// shelf -- a merged row carrying one is still reading somebody's account.
+function isPersonalShelfUrl(url) {
+  if (!url) return false;
+  return String(url).split(/[\r\n]+/).some((line) => {
+    const u = line.trim().toLowerCase();
+    return !!u && PERSONAL_SHELF_URL_PREFIXES.some((p) => u.startsWith(p));
+  });
+}

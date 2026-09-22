@@ -16,6 +16,24 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - The settings ride the same Creator Profile sync as the badge settings, so enabling it in one browser enables it in the next.
 - Every poster on the website resolves through one funnel (`resolveClientPoster`, `19_client-search-and-likes.js`), which the surfaces above already reached via `resolveListCardItemPoster` (17), `resolveItemPoster` (22), `livePreviewPosterHtml` (23), `renderMediaCard` (16) and `loadPosterSlot` (19). The client mirror of the Worker's URL builder lives next to it, and the two are pinned to the same expected URLs by the same test file.
 
+### 🐛 Loading a preset put old Continue Watching / Airing Next items back, permanently
+
+- A preset records **which** shelves you had, not what was on them -- but for a personal auto-tracked shelf those are not the same thing. `rebuildCustomListsFromPreset` merged a preset's saved copy of `continue-watching`, `airing-next`, `watch-history` and `watchlist` **into your live shelf**: additive, with nothing marking which items came from the preset, so a preset built months ago silently put months-old shows back into Continue Watching with no way to tell them apart or take them out again.
+- Worse, that merge set `hasTrackingChanges`, which pushed the mixture up to your account via `pushTrackingSync`. The account's copy is what the add-on serves to Stremio/Nuvio and what Live Preview falls back to when My Lists has not loaded yet this session -- which is why the same shelf could show one thing on the Lists tab and something older in Live Preview and in your apps.
+- Loading a preset now leaves all four alone entirely: they always follow your account. The load toast says so, so "nothing happened" does not read as a bug.
+- **Backup/Restore is deliberately unchanged** -- restoring your watch history is the whole point of a backup. It is only a *preset*, which is a set of shelves, that has no business carrying their contents.
+
+### ⭐ Rebuild, on each tracked shelf
+
+- Continue Watching, Airing Next, Watch History and Watchlist each get a **Rebuild** button in My Lists. It replaces that shelf **on your account** with what the device you are looking at has right now, then refreshes the dashboard and Live Preview.
+- It only ever pushes, never pulls. The account's copy is the one that goes stale, and it is what your apps read -- pulling it back down would spread the bad copy rather than fix it. Use it when your apps or Live Preview show something older than the Lists tab does.
+
+### ⭐ "Remove duplicate items across lists" now skips your personal shelves
+
+- Continue Watching, Airing Next, Watch History and Watchlist are excluded from the feature **in both directions**: never stripped, and never a source of strips. Continue Watching exists to show what you are part-way through -- losing a show from it because Trending listed the same title higher up is not de-duplication, it is the shelf failing at its one job. The reverse would be just as surprising: a title vanishing from Trending because it is in your Watchlist.
+- Applies to every provider's version of these shelves (`autotrack:`, Trakt, MDBList, Simkl), and to a merged row that carries one among its sources. Live Preview applies the identical rule, so the editor shows what the install actually serves.
+- Deduplication between two ordinary lists is unchanged, and a test pins that.
+
 ### ⭐ A Like button on a channel's "See All", the same as a list's
 
 - A list's **See All** page has always had a heart beside **+ Add**; a channel opened from **Explore Channels** did not -- even though the directory's own cards show a heart and `/api/channel/like` has been behind them all along. Both pages are the same page (`openChannelDetailsPage` delegates to `openListDetailsPage`), and its Like branch keyed entirely off a *list URL*, so a `channel:` URL fell through the exclusion list and the button was simply hidden.

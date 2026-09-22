@@ -952,13 +952,7 @@ async function renderLivePreview() {
       // so only these get hidden rather than shown empty; the row's config
       // is untouched, so the moment the account has something in it again,
       // the same row picks it back up as it normally would.
-      const isPersonalTrackedShelf = (s.url || '').split('\\n').some((line) => {
-        const u = line.trim().toLowerCase();
-        return u.startsWith('autotrack:') ||
-          u.startsWith('trakt:watchlist') || u.startsWith('trakt:history') || u.startsWith('trakt:airing-next') || u.startsWith('trakt:continue-watching') || u.startsWith('trakt:user:') ||
-          u.startsWith('mdblist:watchlist') || u.startsWith('mdblist:history') || u.startsWith('mdblist:airing-next') || u.startsWith('mdblist:upnext') || u.startsWith('mdblist:user:') ||
-          u.startsWith('simkl:watchlist') || u.startsWith('simkl:history') || u.startsWith('simkl:airing-next') || u.startsWith('simkl:user:');
-      });
+      const isPersonalTrackedShelf = isPersonalShelfUrlClient(s.url);
 
       if (s.name && s.name.toLowerCase().includes('watch history')) {
         postersContainer.classList.add('is-watch-history-shelf');
@@ -1146,6 +1140,11 @@ async function renderLivePreview() {
     const seenByType = {};
     livePreviewShelfData.forEach((shelf, i) => {
       if (!shelf || !Array.isArray(shelf.sample) || !shelf.sample.length) return;
+      // Same exclusion the Worker applies in dedupeAcrossListEntries
+      // (05_catalog-core.js): a personal shelf is neither stripped nor a
+      // source of strips. Preview has to agree with what gets served, or the
+      // editor shows a shelf the install does not.
+      if (isPersonalShelfUrlClient(shelf.url)) return;
       const seen = seenByType[shelf.type] || (seenByType[shelf.type] = new Set());
       const before = shelf.sample.length;
       shelf.sample = shelf.sample.filter((item) => item && item.id && !seen.has(item.id));
@@ -1531,6 +1530,23 @@ function appendPosterGridItems(gridEl, items) {
   step();
 }
 window.appendPosterGridItems = appendPosterGridItems;
+
+// Client mirror of isPersonalShelfUrl (00_constants.js) -- Continue Watching,
+// Airing Next, Watch History and Watchlist, from any provider. Kept in step
+// with it by tests/personal-shelves.test.mjs, which asserts both sides answer
+// the same for the same URLs.
+function isPersonalShelfUrlClient(url) {
+  if (!url) return false;
+  return String(url).split(/[\\r\\n]+/).some((line) => {
+    const u = line.trim().toLowerCase();
+    if (!u) return false;
+    return u.indexOf('autotrack:') === 0 ||
+      u.indexOf('trakt:watchlist') === 0 || u.indexOf('trakt:history') === 0 || u.indexOf('trakt:airing-next') === 0 || u.indexOf('trakt:continue-watching') === 0 || u.indexOf('trakt:user:') === 0 ||
+      u.indexOf('mdblist:watchlist') === 0 || u.indexOf('mdblist:history') === 0 || u.indexOf('mdblist:airing-next') === 0 || u.indexOf('mdblist:upnext') === 0 || u.indexOf('mdblist:user:') === 0 ||
+      u.indexOf('simkl:watchlist') === 0 || u.indexOf('simkl:history') === 0 || u.indexOf('simkl:airing-next') === 0 || u.indexOf('simkl:user:') === 0;
+  });
+}
+window.isPersonalShelfUrlClient = isPersonalShelfUrlClient;
 
 function livePreviewPosterHtml(m) {
   // Resolved into a local, never written back onto m. It used to assign

@@ -286,7 +286,16 @@ async function dedupeAcrossListEntries(entries, entryIndex, skip, metas, keys) {
   if (!Array.isArray(metas) || !metas.length) return metas;
   const entry = entries[entryIndex];
   if (!entry) return metas;
-  const priorEntries = entries.slice(0, entryIndex).filter((e) => e && e.enabled !== false && e.type === entry.type);
+  // A personal shelf sits outside this feature entirely, in both directions:
+  // it is never stripped, and it never strips anything else. Continue
+  // Watching exists to show what you are part-way through -- losing a show
+  // from it because Trending happened to list the same title higher up is
+  // not de-duplication, it is the shelf failing at its one job. And the
+  // reverse would be just as surprising: a title vanishing from Trending
+  // because it is in your Watchlist. See isPersonalShelfUrl (00_constants.js).
+  if (isPersonalShelfUrl(entry.url)) return metas;
+  const priorEntries = entries.slice(0, entryIndex).filter((e) =>
+    e && e.enabled !== false && e.type === entry.type && !isPersonalShelfUrl(e.url));
   if (!priorEntries.length) return metas;
 
   const priorResults = await Promise.all(

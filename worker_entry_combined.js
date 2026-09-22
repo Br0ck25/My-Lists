@@ -1064,6 +1064,35 @@ function buildBetterPostersRatingSourceOptionsHtml(selected) {
     ({ value, label }) => `<option value="${value}"${value === sel ? " selected" : ""}>${label}</option>`
   ).join("");
 }
+
+// --- personal, auto-tracked shelves --------------------------------------
+//
+// Continue Watching, Airing Next, Watch History and Watchlist, across every
+// provider that can supply one. These are not lists in the ordinary sense:
+// each is a live view OF ONE ACCOUNT, derived per request, and its whole job
+// is to answer "what am I in the middle of / what is next for me".
+//
+// That makes them the wrong input and the wrong target for anything that
+// treats lists as interchangeable collections -- "Remove duplicate items
+// across lists" most of all, which would otherwise strip the show you are
+// three episodes into out of Continue Watching purely because it also turned
+// up in Trending higher on the page.
+const PERSONAL_SHELF_URL_PREFIXES = [
+  "autotrack:",
+  "trakt:watchlist", "trakt:history", "trakt:airing-next", "trakt:continue-watching", "trakt:user:",
+  "mdblist:watchlist", "mdblist:history", "mdblist:airing-next", "mdblist:upnext", "mdblist:user:",
+  "simkl:watchlist", "simkl:history", "simkl:airing-next", "simkl:user:",
+];
+
+// True when ANY source line of a (possibly merged) row names a personal
+// shelf -- a merged row carrying one is still reading somebody's account.
+function isPersonalShelfUrl(url) {
+  if (!url) return false;
+  return String(url).split(/[\r\n]+/).some((line) => {
+    const u = line.trim().toLowerCase();
+    return !!u && PERSONAL_SHELF_URL_PREFIXES.some((p) => u.startsWith(p));
+  });
+}
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -12462,7 +12491,16 @@ async function dedupeAcrossListEntries(entries, entryIndex, skip, metas, keys) {
   if (!Array.isArray(metas) || !metas.length) return metas;
   const entry = entries[entryIndex];
   if (!entry) return metas;
-  const priorEntries = entries.slice(0, entryIndex).filter((e) => e && e.enabled !== false && e.type === entry.type);
+  // A personal shelf sits outside this feature entirely, in both directions:
+  // it is never stripped, and it never strips anything else. Continue
+  // Watching exists to show what you are part-way through -- losing a show
+  // from it because Trending happened to list the same title higher up is
+  // not de-duplication, it is the shelf failing at its one job. And the
+  // reverse would be just as surprising: a title vanishing from Trending
+  // because it is in your Watchlist. See isPersonalShelfUrl (00_constants.js).
+  if (isPersonalShelfUrl(entry.url)) return metas;
+  const priorEntries = entries.slice(0, entryIndex).filter((e) =>
+    e && e.enabled !== false && e.type === entry.type && !isPersonalShelfUrl(e.url));
   if (!priorEntries.length) return metas;
 
   const priorResults = await Promise.all(
@@ -60924,6 +60962,49 @@ function formatWatchItemLabel(it) {
   return { title: it.title || it.name || '', subtitle: '' };
 }
 
+// The four shelves that are a live view of the account rather than a list of
+// their own. Mirrors PERSONAL_SHELF_URL_PREFIXES (00_constants.js), which
+// matches the same concept by catalog URL rather than by local slug.
+const TRACKED_SHELF_SLUGS = ['continue-watching', 'airing-next', 'watch-history', 'watchlist'];
+window.TRACKED_SHELF_SLUGS = TRACKED_SHELF_SLUGS;
+
+// Makes the account's copy of a tracked shelf match this device's.
+//
+// Only ever pushes, never pulls: the account's copy is the one that goes
+// stale (an old preset load used to overwrite it, and it is what
+// Stremio/Nuvio and Live Preview read), so pulling it back down would spread
+// the bad copy rather than fix it. intentionalRemoval is what makes the push
+// authoritative -- without it pushTrackingSync skips a push whose signature
+// has not changed, which is exactly the case here.
+async function rebuildTrackedShelf(slug, displayName) {
+  const label = displayName || slug;
+  const go = async () => {
+    try {
+      if (typeof pushTrackingSync === 'function') {
+        await pushTrackingSync({ intentionalRemoval: true });
+      }
+      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+      if (typeof renderMyCustomListsList === 'function') renderMyCustomListsList();
+      if (window._listPreviewCache) window._listPreviewCache.clear();
+      if (typeof renderLivePreview === 'function') renderLivePreview();
+      if (typeof showAddedToast === 'function') showAddedToast('"' + label + '" on your account now matches this device \\u2713');
+    } catch (e) {
+      if (typeof showAppAlert === 'function') showAppAlert('Rebuild Failed', 'Could not update "' + label + '" on your account. Check your connection and try again.', false);
+    }
+  };
+  if (typeof activeCreator === 'undefined' || !activeCreator) {
+    if (typeof showAppAlert === 'function') {
+      showAppAlert('Not Signed In', 'Rebuild copies this device\\u2019s "' + label + '" up to your account, so it needs you signed in to a Creator Profile.', false);
+    }
+    return;
+  }
+  const msg = 'Replace "' + label + '" on your account with what this device has right now?\\n\\n' +
+    'Your apps and Live Preview read the account\\u2019s copy, so use this when they are showing something older than this page does. Nothing on this device changes.';
+  if (typeof showAppConfirm === 'function') showAppConfirm('Rebuild ' + label, msg, go);
+  else if (confirm(msg)) go();
+}
+window.rebuildTrackedShelf = rebuildTrackedShelf;
+
 function buildLocalListCardHtml(l) {
   if (!l) return '';
   const isAutoTracked = l.slug === 'watch-history' || l.slug === 'continue-watching';
@@ -61122,6 +61203,17 @@ function buildLocalListCardHtml(l) {
     : '<button type="button" class="lc-btn secondary localListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>';
 
   const isSynced = !isAutoTracked && !!(l.synced && l.sourceUrl);
+  // A personal shelf lives in two places -- this device and the account --
+  // and they can drift apart: the account's copy is what the add-on serves to
+  // Stremio/Nuvio and what Live Preview falls back to, while this page shows
+  // the device's. Loading an old preset used to push a stale copy up (see
+  // rebuildCustomListsFromPreset, 24_), and nothing else forces the two back
+  // into agreement. This does, in the one direction that is safe: the device
+  // you are looking at wins.
+  const isTrackedShelf = TRACKED_SHELF_SLUGS.indexOf(l.slug) !== -1;
+  const rebuildBtnHtml = isTrackedShelf
+    ? '<button type="button" class="lc-btn secondary trackedShelfRebuildBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name || l.slug) + '" title="Replace this shelf on your account with what this device has">Rebuild</button>'
+    : '';
   const syncBtnHtml = isSynced
     ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
     : '';
@@ -61145,10 +61237,12 @@ function buildLocalListCardHtml(l) {
       (isAutoTracked
         ? '<div class="list-card-actions">' +
             '<span style="font-size:0.78rem; color:var(--muted); white-space:nowrap; margin-right:8px;">Auto-tracked</span>' +
+            rebuildBtnHtml +
             addBtnHtml +
           '</div>'
         : '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary localListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
+            rebuildBtnHtml +
             syncBtnHtml +
             deleteBtnHtml +
             shareBtn +
@@ -61489,6 +61583,11 @@ if (_creatorDashEl) {
       if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
     }
+    return;
+  }
+  const rebuildShelfBtn = e.target.closest('.trackedShelfRebuildBtn');
+  if (rebuildShelfBtn) {
+    rebuildTrackedShelf(rebuildShelfBtn.dataset.slug, rebuildShelfBtn.dataset.name);
     return;
   }
   const localEditBtn = e.target.closest('.localListEditBtn');
@@ -63721,13 +63820,7 @@ async function renderLivePreview() {
       // so only these get hidden rather than shown empty; the row's config
       // is untouched, so the moment the account has something in it again,
       // the same row picks it back up as it normally would.
-      const isPersonalTrackedShelf = (s.url || '').split('\\n').some((line) => {
-        const u = line.trim().toLowerCase();
-        return u.startsWith('autotrack:') ||
-          u.startsWith('trakt:watchlist') || u.startsWith('trakt:history') || u.startsWith('trakt:airing-next') || u.startsWith('trakt:continue-watching') || u.startsWith('trakt:user:') ||
-          u.startsWith('mdblist:watchlist') || u.startsWith('mdblist:history') || u.startsWith('mdblist:airing-next') || u.startsWith('mdblist:upnext') || u.startsWith('mdblist:user:') ||
-          u.startsWith('simkl:watchlist') || u.startsWith('simkl:history') || u.startsWith('simkl:airing-next') || u.startsWith('simkl:user:');
-      });
+      const isPersonalTrackedShelf = isPersonalShelfUrlClient(s.url);
 
       if (s.name && s.name.toLowerCase().includes('watch history')) {
         postersContainer.classList.add('is-watch-history-shelf');
@@ -63915,6 +64008,11 @@ async function renderLivePreview() {
     const seenByType = {};
     livePreviewShelfData.forEach((shelf, i) => {
       if (!shelf || !Array.isArray(shelf.sample) || !shelf.sample.length) return;
+      // Same exclusion the Worker applies in dedupeAcrossListEntries
+      // (05_catalog-core.js): a personal shelf is neither stripped nor a
+      // source of strips. Preview has to agree with what gets served, or the
+      // editor shows a shelf the install does not.
+      if (isPersonalShelfUrlClient(shelf.url)) return;
       const seen = seenByType[shelf.type] || (seenByType[shelf.type] = new Set());
       const before = shelf.sample.length;
       shelf.sample = shelf.sample.filter((item) => item && item.id && !seen.has(item.id));
@@ -64300,6 +64398,23 @@ function appendPosterGridItems(gridEl, items) {
   step();
 }
 window.appendPosterGridItems = appendPosterGridItems;
+
+// Client mirror of isPersonalShelfUrl (00_constants.js) -- Continue Watching,
+// Airing Next, Watch History and Watchlist, from any provider. Kept in step
+// with it by tests/personal-shelves.test.mjs, which asserts both sides answer
+// the same for the same URLs.
+function isPersonalShelfUrlClient(url) {
+  if (!url) return false;
+  return String(url).split(/[\\r\\n]+/).some((line) => {
+    const u = line.trim().toLowerCase();
+    if (!u) return false;
+    return u.indexOf('autotrack:') === 0 ||
+      u.indexOf('trakt:watchlist') === 0 || u.indexOf('trakt:history') === 0 || u.indexOf('trakt:airing-next') === 0 || u.indexOf('trakt:continue-watching') === 0 || u.indexOf('trakt:user:') === 0 ||
+      u.indexOf('mdblist:watchlist') === 0 || u.indexOf('mdblist:history') === 0 || u.indexOf('mdblist:airing-next') === 0 || u.indexOf('mdblist:upnext') === 0 || u.indexOf('mdblist:user:') === 0 ||
+      u.indexOf('simkl:watchlist') === 0 || u.indexOf('simkl:history') === 0 || u.indexOf('simkl:airing-next') === 0 || u.indexOf('simkl:user:') === 0;
+  });
+}
+window.isPersonalShelfUrlClient = isPersonalShelfUrlClient;
 
 function livePreviewPosterHtml(m) {
   // Resolved into a local, never written back onto m. It used to assign
@@ -67717,15 +67832,38 @@ function rebuildCustomListsFromPreset(name, isSilent = false) {
   }
 
   const { lists: extractedLists, channels: extractedChannels } = extractCustomListsAndChannelsFromPreset(preset);
+  // A preset records WHICH shelves you had, not what was on them -- and for a
+  // personal auto-tracked shelf the two are not the same thing. Continue
+  // Watching, Airing Next, Watch History and Watchlist are live views of the
+  // account, so the only correct content for them is whatever is tracked
+  // right now.
+  //
+  // This used to merge the preset's copy into the live list instead: additive,
+  // with nothing marking which items came from the preset, so a preset built
+  // months ago silently put months-old shows back into Continue Watching with
+  // no way to tell them apart or take them out again. Worse, the merge set
+  // hasTrackingChanges, which pushed that mixture up to the account -- so the
+  // stale copy then outlived the browser that loaded the preset.
+  //
+  // Deliberately NOT applied to Backup/Restore (the two callers of
+  // extractCustomListsAndChannelsFromPreset above): restoring your watch
+  // history is the entire point of a backup. It is only a PRESET, which is a
+  // set of shelves, that has no business carrying their contents.
+  const PRESET_SKIPS_TRACKED_SLUGS = ['continue-watching', 'airing-next', 'watch-history', 'watchlist'];
+  const skippedTrackedSlugs = Object.keys(extractedLists).filter((slug) => PRESET_SKIPS_TRACKED_SLUGS.includes(slug));
+  skippedTrackedSlugs.forEach((slug) => { delete extractedLists[slug]; });
   const listSlugs = Object.keys(extractedLists);
   const channelIds = Object.keys(extractedChannels);
 
   if (!listSlugs.length && !channelIds.length) {
     if (!isSilent) {
-      if (typeof showAppAlert === 'function') showAppAlert('No Custom Lists Found', 'Preset "' + name + '" does not contain any custom lists or channels.', false);
-      else alert('Preset "' + name + '" does not contain any custom lists or channels.');
+      const msg = skippedTrackedSlugs.length
+        ? 'Preset "' + name + '" has no custom lists or channels to restore. It does carry Continue Watching / Airing Next / Watch History / Watchlist, but those always follow your account rather than the preset, so they were left as they are.'
+        : 'Preset "' + name + '" does not contain any custom lists or channels.';
+      if (typeof showAppAlert === 'function') showAppAlert('No Custom Lists Found', msg, false);
+      else alert(msg);
     }
-    return { restoredLists: 0, restoredChannels: 0, listNames: [] };
+    return { restoredLists: 0, restoredChannels: 0, listNames: [], skippedTrackedSlugs: skippedTrackedSlugs };
   }
 
   // 1. Merge into local custom lists
@@ -67827,7 +67965,7 @@ function rebuildCustomListsFromPreset(name, isSilent = false) {
     }
   }
 
-  return { restoredLists: listSlugs.length, restoredChannels: channelIds.length, listNames: restoredListNames };
+  return { restoredLists: listSlugs.length, restoredChannels: channelIds.length, listNames: restoredListNames, skippedTrackedSlugs: skippedTrackedSlugs };
 }
 
 function renderPresetsList() {
@@ -67889,6 +68027,12 @@ function loadPreset(name) {
 
   // Rebuild and restore custom lists & channels from this preset
   const result = rebuildCustomListsFromPreset(name, true);
+  // Said out loud rather than silently: the shelves someone is most likely to
+  // notice not changing are exactly these, and "nothing happened" reads like
+  // a bug unless it says why.
+  const skipped = (result.skippedTrackedSlugs && result.skippedTrackedSlugs.length)
+    ? 'Continue Watching, Airing Next, Watch History and Watchlist always follow your account, so they were left as they are'
+    : '';
   if (result.restoredLists > 0 || result.restoredChannels > 0) {
     let msg = 'Preset "' + name + '" loaded';
     const parts = [];
@@ -67896,9 +68040,10 @@ function loadPreset(name) {
     if (result.restoredChannels) parts.push(result.restoredChannels + ' channel' + (result.restoredChannels === 1 ? '' : 's'));
     if (parts.length) msg += ' & ' + parts.join(', ') + ' restored to My Lists';
     msg += ' \u2713';
+    if (skipped) msg += ' \u2014 ' + skipped;
     showAddedToast(msg);
   } else {
-    showAddedToast('Preset "' + name + '" loaded \u2713');
+    showAddedToast('Preset "' + name + '" loaded \u2713' + (skipped ? ' \u2014 ' + skipped : ''));
   }
 }
 
