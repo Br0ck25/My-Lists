@@ -22,6 +22,13 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - `createSortableList` now auto-scrolls when the pointer comes within 90px of an edge, ramping to 20px per frame at the very edge, and re-places the row against the rows that scroll into view. It drives this from its own animation-frame loop rather than from `dragover`/`pointermove`, because those stop firing the moment the pointer is held still at the edge -- which is exactly when scrolling needs to continue. It scrolls the nearest scrollable ancestor when there is one (lists inside panels) and the window otherwise.
 - Verified against the failing case in a real browser: a 12-row list at 2584px in a 900px window. Before, dragging row 1 to the bottom edge and holding it there moved it three places and left `window.scrollY` at 0. After, the same drag carries it to seventh with the page scrolled 1008px. **Not covered by the test suite** -- it needs real layout and a real pointer, and CI runs on bare node + python with no browser.
 
+### 🐛 Reset Account Data left created channels behind
+
+- Channels keep the same kind of in-memory copy custom lists do, and `loadLocalChannels` returns it **before** consulting storage. `clearLocalAccountData` cleared only the custom-list pair, so a reset wiped the stored channels and the very next read handed them straight back from memory -- and the next save wrote them out again and synced them up to the account that had just been emptied.
+- `_memoryChannelsMap` / `_memoryChannelsString` are now cleared alongside their custom-list equivalents. This is the same bug, one cache over, that the sessionStorage sweep beside it was added to fix for lists.
+- The server side was already correct: `purgeCreatorData` deletes `creatorchannels:` and `creatorsyncchannels:` along with everything else.
+- Three tests in `tests/account-reset.test.mjs`, including one pinning that a save *after* a reset cannot write the old channels back. Mutation-tested.
+
 ### 🐛 Airing Next tiles showed "No poster" in Live Preview
 
 - `_liveFallbackMeta` read `it.poster` and nothing else. Airing Next items carry no poster of their own, and My Lists only ever showed one because `resolveListCardItemPoster` falls back to `showPoster` and then to a metahub poster built from the show's IMDb id. Live Preview had no such fallback, so the same items rendered as empty tiles there -- and turning Better Posters on masked it, since that builds a URL from the id and never needs a poster field at all.

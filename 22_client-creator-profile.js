@@ -1363,6 +1363,15 @@ function clearLocalAccountData() {
   if (typeof customListDraftItems !== 'undefined') customListDraftItems = [];
   _memoryCustomListsString = null;
   _memoryCustomListsObj = null;
+  // Channels keep the same kind of in-memory copy as custom lists do, and
+  // loadLocalChannels returns it BEFORE looking at storage (see
+  // 20_client-channel-builder.js). Clearing only the custom-list pair left
+  // every created channel sitting in memory, so Reset Account Data wiped the
+  // storage and the very next read handed them straight back -- and the next
+  // save wrote them to storage again and synced them up. Exactly the bug the
+  // sessionStorage sweep below was added to fix for lists, one cache over.
+  if (typeof _memoryChannelsMap !== 'undefined') _memoryChannelsMap = null;
+  if (typeof _memoryChannelsString !== 'undefined') _memoryChannelsString = null;
 
   // Clear all localStorage keys for account data, credentials, and custom lists
   try {
