@@ -557,6 +557,7 @@ function collectKeys() {
     betterPostersRatingSource: getBetterPostersChoice('betterPostersRatingSource', 'avg'),
     showBadgesAiringNext: getBadgeSetting('showBadgesAiringNext'),
     showBadgesContinueWatching: getBadgeSetting('showBadgesContinueWatching'),
+    showBadgesWatchlist: getBadgeSetting('showBadgesWatchlist'),
     showBadgesTraktContinueWatching: getBadgeSetting('showBadgesTraktContinueWatching'),
     showBadgesMdblistUpNext: getBadgeSetting('showBadgesMdblistUpNext'),
     showBadgesCatalogs: getBadgeSetting('showBadgesCatalogs'),
@@ -660,6 +661,7 @@ function applyBadgeBodyClasses() {
   if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
   b.classList.toggle('hide-airing-next-badges', !getBadgeSetting('showBadgesAiringNext'));
   b.classList.toggle('hide-continue-watching-badges', !getBadgeSetting('showBadgesContinueWatching'));
+  b.classList.toggle('hide-watchlist-badges', !getBadgeSetting('showBadgesWatchlist'));
   b.classList.toggle('hide-trakt-continue-watching-badges', !getBadgeSetting('showBadgesTraktContinueWatching'));
   b.classList.toggle('hide-mdblist-up-next-badges', !getBadgeSetting('showBadgesMdblistUpNext'));
   b.classList.toggle('hide-catalogs-badges', !getBadgeSetting('showBadgesCatalogs'));
@@ -781,6 +783,7 @@ function initBadgeSettingsUI() {
   const badgeKeys = [
     { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
     { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+    { key: 'showBadgesWatchlist', id: 'badgeWatchlistCheckbox' },
     { key: 'showBadgesTraktContinueWatching', id: 'badgeTraktContinueWatchingCheckbox' },
     { key: 'showBadgesMdblistUpNext', id: 'badgeMdblistUpNextCheckbox' },
     { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
@@ -960,6 +963,10 @@ async function renderLivePreview() {
       const sName = (s.name || '').toLowerCase();
       const isCwShelf = sUrl.includes('continue-watching') || sUrl.includes('continue_watching') || sName.includes('continue watching');
       const isAiringShelf = sUrl.includes('airing-next') || sUrl.includes('airing_next') || sName.includes('airing next');
+      // Checked after the other two so a shelf whose name mentions both
+      // keeps the more specific meaning, the same precedence
+      // livePreviewPosterHtml uses for an individual tile.
+      const isWatchlistShelf = !isCwShelf && !isAiringShelf && (sUrl.includes('watchlist') || sName.includes('watchlist'));
       // A personal/auto-tracked shelf (Continue Watching, Watchlist, Watch
       // History, Airing Next -- this add-on's own or a connected Trakt/
       // MDBList/Simkl account's) is legitimately empty a lot of the time --
@@ -979,8 +986,10 @@ async function renderLivePreview() {
       }
       postersContainer.classList.toggle('is-continue-watching-shelf', isCwShelf);
       postersContainer.classList.toggle('is-airing-next-shelf', isAiringShelf);
+      postersContainer.classList.toggle('is-watchlist-shelf', isWatchlistShelf);
       if (isCwShelf) entryDOM.dataset.listSlug = 'continue-watching';
       if (isAiringShelf) entryDOM.dataset.listSlug = 'airing-next';
+      if (isWatchlistShelf) entryDOM.dataset.listSlug = 'watchlist';
       
       const seeAllBtn = entryDOM.querySelector('.live-preview-shelf-title button');
       if (seeAllBtn) {
@@ -1347,6 +1356,7 @@ function getPosterBadgeSettings() {
   var get = (typeof getBadgeSetting === 'function') ? getBadgeSetting : function() { return true; };
   _posterBadgeCache = {
     continueWatching: get('showBadgesContinueWatching'),
+    watchlist: get('showBadgesWatchlist'),
     traktContinueWatching: get('showBadgesTraktContinueWatching'),
     mdblistUpNext: get('showBadgesMdblistUpNext'),
     airingNext: get('showBadgesAiringNext'),
@@ -1681,7 +1691,7 @@ function livePreviewPosterHtml(m) {
             ? badgeSettings.continueWatching
             : (isAiringItem
                 ? badgeSettings.airingNext
-                : (isWatchlistItem ? badgeSettings.catalogs !== false : false))));
+                : (isWatchlistItem ? badgeSettings.watchlist !== false : false))));
 
   const showAirDate = locationAllowed && badgeSettings.airDate;
   const showPremiere = locationAllowed && badgeSettings.seasonPremiere;
@@ -1689,7 +1699,7 @@ function livePreviewPosterHtml(m) {
   const showFinaleDate = locationAllowed && badgeSettings.seasonFinaleDate;
 
   let airingMatch = null;
-  if (isCwItem || isAiringItem) {
+  if (isCwItem || isAiringItem || isWatchlistItem) {
     airingMatch = findAiringMatchFor(m);
   }
 

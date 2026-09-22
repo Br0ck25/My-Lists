@@ -3599,6 +3599,203 @@ async function refreshAiringNext(force) {
 // reads.
 setTimeout(() => { refreshAiringNext(false).catch(() => {}); }, 600);
 
+// --- Upcoming episodes for Watchlist shows -----------------------------------
+//
+// Airing Next is built from shows being WATCHED: its candidate set comes out
+// of Watch History (collectAiringNextCandidateShowIds above), so a show that
+// has only ever been put on the Watchlist has never passed through it -- and
+// that is exactly the show most likely to be premiering, added because it is
+// coming rather than because an episode has been seen. The symptom was a
+// Watchlist tile with no premiere chip and no date sitting beside a Continue
+// Watching shelf that had both.
+//
+// The data is stamped ONTO the watchlist entries rather than adding those
+// shows to Airing Next. That shelf means "the next episode of something you
+// watch", which a watchlist entry is not, and widening it would change what
+// a shelf nobody complained about contains. Stamping in place also carries
+// the data everywhere on its own: pushTrackingSync sends the watchlist items
+// verbatim, so fetchAutoTrackedCatalog (05_catalog-core.js) reads the same
+// fields off the same entries -- which is what Stremio, Nuvio and the Live
+// Preview row are all served from -- with nothing extra to keep in step.
+const WATCHLIST_AIRING_REFRESH_MS = 6 * 60 * 60 * 1000;
+const WATCHLIST_AIRING_MAX_SHOWS = 60;
+const WATCHLIST_AIRING_CONCURRENCY = 4;
+var _watchlistAiringAt = 0;
+var _watchlistAiringRunning = false;
+// Show ids already resolved this session. A show added to the Watchlist a
+// minute ago is not covered by the refresh window -- it has never been asked
+// about at all -- so an unseen id is what lets a mid-session add get its
+// chips without waiting out the window or a reload.
+var _watchlistAiringSeen = new Set();
+
+// Every field this function owns on an entry. Kept as one list so the stamp
+// and the clear cannot drift apart.
+const WATCHLIST_AIRING_FIELDS = [
+  'airDate',
+  'airTime',
+  'seasonNum',
+  'episodeNum',
+  'isSeasonPremiere',
+  'isSeasonFinale',
+  'seasonFinaleAirDate',
+  'seasonFinaleEpisodeNumber',
+  'isUnaired',
+];
+
+// The id /api/details answers to, resolved the same way the MDBList and Trakt
+// enrichers resolve theirs.
+function watchlistAiringShowId(it) {
+  if (!it) return '';
+  if (it.imdbId) return String(it.imdbId);
+  const id = String(it.id || '');
+  if (id.indexOf('tt') === 0) return id;
+  if (it.tmdbId) return 'tmdb:' + it.tmdbId;
+  if (id.indexOf('tmdb:') === 0) return id;
+  return '';
+}
+
+function watchlistAiringSeriesItems(list) {
+  const items = (list && Array.isArray(list.items)) ? list.items : [];
+  // A Watchlist is mixed, and a movie has no next episode to ask about.
+  return items.filter((it) => it && (it.type === 'series' || it.kind === 'series'));
+}
+
+async function refreshWatchlistAiring(force) {
+  if (_watchlistAiringRunning) return;
+  if (typeof loadLocalCustomLists !== 'function') return;
+  const map = loadLocalCustomLists();
+  const wl = map['watchlist'];
+  const series = watchlistAiringSeriesItems(wl);
+  if (!series.length) return;
+
+  const byShowId = new Map();
+  series.forEach((it) => {
+    const sid = watchlistAiringShowId(it);
+    if (!sid) return;
+    if (!byShowId.has(sid)) byShowId.set(sid, []);
+    byShowId.get(sid).push(it);
+  });
+  const ids = [...byShowId.keys()].slice(0, WATCHLIST_AIRING_MAX_SHOWS);
+  if (!ids.length) return;
+
+  // A stamped date that has now passed is worth a refresh whatever the
+  // window says -- the chip on screen is wrong until this runs again.
+  const hasExpired = series.some((it) => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
+  const hasUnseen = ids.some((id) => !_watchlistAiringSeen.has(id));
+  if (!force && !hasExpired && !hasUnseen && _watchlistAiringAt && (Date.now() - _watchlistAiringAt) < WATCHLIST_AIRING_REFRESH_MS) return;
+
+  _watchlistAiringRunning = true;
+  try {
+    const tkInput = document.getElementById('tmdbKeyInput');
+    const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+    const bypassFresh = !!(force || hasExpired);
+    const details = {};
+    let batchOk = false;
+
+    try {
+      let pending = ids;
+      for (let round = 0; round < ${DETAILS_BATCH_MAX_ROUNDS} && pending.length; round++) {
+        const res = await fetch(ORIGIN + '/api/details/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ids: pending,
+            type: 'series',
+            tmdbKey: tmdbKey,
+            fresh: bypassFresh ? '1' : '',
+          }),
+        });
+        const data = await res.json();
+        if (!data || !data.ok || !data.results) break;
+        batchOk = true;
+        Object.assign(details, data.results);
+        if (data.done !== false || !Array.isArray(data.remainingIds) || !data.remainingIds.length) break;
+        pending = data.remainingIds;
+      }
+    } catch (e) {
+      // Falls through to the per-id path below.
+    }
+
+    // Same fallback refreshAiringNext keeps, and for the same reason: a
+    // self-hosted Worker older than /api/details/batch, or a network hiccup.
+    if (!batchOk) {
+      let cursor = 0;
+      const one = async () => {
+        while (cursor < ids.length) {
+          const sid = ids[cursor++];
+          try {
+            const bypass = bypassFresh ? '&fresh=1&_t=' + Date.now() : '';
+            const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(sid) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
+            const data = await res.json();
+            if (data && data.ok && data.details) details[sid] = data.details;
+          } catch (e) {
+            // Retried on the next run rather than blocking the rest.
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(WATCHLIST_AIRING_CONCURRENCY, ids.length) }, one));
+    }
+
+    let changed = false;
+    ids.forEach((sid) => {
+      _watchlistAiringSeen.add(sid);
+      const d = details[sid];
+      const upcoming = (d && d.nextEpisodeAirDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(d.nextEpisodeAirDate))) ? d : null;
+      // Fills the per-show air-time store the date chip reads the hour from,
+      // exactly as the Airing Next rebuild does.
+      if (upcoming && typeof rememberShowAirTime === 'function') rememberShowAirTime(upcoming);
+      const next = upcoming ? {
+        airDate: upcoming.nextEpisodeAirDate,
+        airTime: upcoming.nextEpisodeAirTimeLabel || (upcoming.airTime && upcoming.airTime.label) || null,
+        seasonNum: upcoming.nextEpisodeSeasonNumber,
+        episodeNum: upcoming.nextEpisodeNumber,
+        isSeasonPremiere: upcoming.nextEpisodeNumber === 1,
+        isSeasonFinale: !!(upcoming.isSeasonFinale || (upcoming.totalEpisodesInSeason != null && upcoming.nextEpisodeNumber === upcoming.totalEpisodesInSeason && upcoming.nextEpisodeNumber > 1)),
+        seasonFinaleAirDate: upcoming.seasonFinaleAirDate || null,
+        seasonFinaleEpisodeNumber: upcoming.seasonFinaleEpisodeNumber || null,
+        isUnaired: true,
+      } : null;
+      (byShowId.get(sid) || []).forEach((it) => {
+        if (next) {
+          WATCHLIST_AIRING_FIELDS.forEach((f) => {
+            if (it[f] !== next[f]) {
+              it[f] = next[f];
+              changed = true;
+            }
+          });
+        } else if (it.isUnaired) {
+          // Cleared only on an entry this function stamped -- isUnaired is
+          // the marker it sets -- so air dates that came in with an import
+          // from Trakt or MDBList are never stomped.
+          WATCHLIST_AIRING_FIELDS.forEach((f) => {
+            if (it[f] != null) {
+              delete it[f];
+              changed = true;
+            }
+          });
+        }
+      });
+    });
+
+    _watchlistAiringAt = Date.now();
+    if (!changed) return;
+    map['watchlist'] = wl;
+    saveLocalCustomListsMap(map);
+    if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    // Up to the account, so the Watchlist catalog the apps and the Live
+    // Preview row are both served from carries the same chips.
+    if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  } finally {
+    _watchlistAiringRunning = false;
+  }
+}
+window.refreshWatchlistAiring = refreshWatchlistAiring;
+
+// After Airing Next, which shares the same /api/details cache -- a show on
+// both lists is then a cache hit rather than a second upstream call.
+setTimeout(() => { refreshWatchlistAiring(false).catch(() => {}); }, 900);
+
 // --- Watch History episode stills -------------------------------------------
 //
 // A Watch History entry keeps the episode's own still image in poster and

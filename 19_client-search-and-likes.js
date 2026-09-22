@@ -4261,6 +4261,10 @@ async function syncCustomListPayload(payload, name, applyEdit) {
     if (typeof pushTrackingSync === 'function') pushTrackingSync();
     if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    // A show just added here has never been asked about, so this resolves its
+    // upcoming episode now rather than at the next reload. It no-ops when
+    // every show on the list has already been looked up this session.
+    if (typeof refreshWatchlistAiring === 'function') refreshWatchlistAiring(false).catch(() => {});
   }
 
   if (payload.creatorSlug && !isWatchlist) {

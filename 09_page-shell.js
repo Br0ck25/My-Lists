@@ -2004,11 +2004,11 @@ ${seoHeadHtml}
   .live-preview-posters .rating-badge, .live-preview-shelf-row .rating-badge,
   .live-preview-posters .poster-rating, .live-preview-shelf-row .poster-rating { display: none !important; }
   body.hide-badge-watched .watched-badge, body.hide-badge-watched .cw-watched-indicator { display: none !important; }
-  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .cw-date-badge,
-  body.hide-catalogs-badges .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]) .cw-date-badge,
-  body.hide-catalogs-badges #catalogsTab .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]) .cw-date-badge,
-  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .rating-badge,
-  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .watched-badge { display: none !important; }
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf):not(.is-watchlist-shelf) .cw-date-badge,
+  body.hide-catalogs-badges .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]):not([data-list-slug="watchlist"]) .cw-date-badge,
+  body.hide-catalogs-badges #catalogsTab .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]):not([data-list-slug="watchlist"]) .cw-date-badge,
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf):not(.is-watchlist-shelf) .rating-badge,
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf):not(.is-watchlist-shelf) .watched-badge { display: none !important; }
   body.hide-airing-next-badges #myPrivateTraktListsResult .cw-date-badge,
   body.hide-airing-next-badges #mySimklListsResult .cw-date-badge,
   body.hide-airing-next-badges #myMdblistListsResult .cw-date-badge,
@@ -2016,6 +2016,10 @@ ${seoHeadHtml}
   body.hide-airing-next-badges .airing-next-card .cw-date-badge,
   body.hide-airing-next-badges .live-preview-shelf-row[data-list-slug="airing-next"] .cw-date-badge,
   body.hide-airing-next-badges .live-preview-posters.is-airing-next-shelf .cw-date-badge { display: none !important; }
+  body.hide-watchlist-badges [data-list-key="watchlist"] .cw-date-badge,
+  body.hide-watchlist-badges .watchlist-card .cw-date-badge,
+  body.hide-watchlist-badges .live-preview-shelf-row[data-list-slug="watchlist"] .cw-date-badge,
+  body.hide-watchlist-badges .live-preview-posters.is-watchlist-shelf .cw-date-badge { display: none !important; }
   body.hide-continue-watching-badges [data-list-key="continue-watching"] .cw-date-badge,
   body.hide-continue-watching-badges .continue-watching-card .cw-date-badge,
   body.hide-continue-watching-badges .live-preview-shelf-row[data-list-slug="continue-watching"] .cw-date-badge,

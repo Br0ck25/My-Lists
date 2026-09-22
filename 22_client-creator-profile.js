@@ -57,6 +57,14 @@ function compactCustomListItem(it) {
   // being computed and the map being saved -- which is to say, never.
   if (it.canonicalTmdbId) clean.canonicalTmdbId = it.canonicalTmdbId;
   if (it.airDate) clean.airDate = it.airDate;
+  // The hour the episode airs, and which episode ends the season. Both are
+  // stamped onto an entry deliberately -- airingEntryFrom says so in as many
+  // words, "so a tile restored from local storage on a cold start still knows
+  // the hour without waiting for the shelf to refresh" -- and both were being
+  // dropped here on the way to storage, so the cold start never had them.
+  // Same class of loss as canonicalTmdbId above.
+  if (it.airTime) clean.airTime = it.airTime;
+  if (it.seasonFinaleEpisodeNumber != null) clean.seasonFinaleEpisodeNumber = Number(it.seasonFinaleEpisodeNumber);
   if (it.isUnaired) clean.isUnaired = true;
   if (it.seasonFinaleAirDate) clean.seasonFinaleAirDate = it.seasonFinaleAirDate;
   if (it.isSeasonPremiere) clean.isSeasonPremiere = true;
@@ -2366,6 +2374,23 @@ function trackingSyncSignature(localMap) {
     return items.length + '/' + (first.id || first.imdbId || first.showId || '') +
       '/' + (last.id || last.imdbId || last.showId || '') + '/' + newest;
   }
+  // The upcoming-episode fields refreshWatchlistAiring stamps onto watchlist
+  // entries move nothing listSig looks at -- not the length, not the first or
+  // last id, not a watchedAt -- so without this the enriched copy would sit
+  // in the browser until the heartbeat, and the Watchlist catalog the apps
+  // read would keep serving tiles with no chips for up to ten minutes after
+  // this device had the dates.
+  function watchlistAiringSig(items) {
+    if (!Array.isArray(items) || !items.length) return '0';
+    var out = '';
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it && it.airDate) {
+        out += (it.id || it.imdbId || '') + ':' + it.airDate + ':' + (it.episodeNum == null ? '' : it.episodeNum) + ',';
+      }
+    }
+    return out || '0';
+  }
   var wl = localMap['watchlist'] || {};
   return [
     listSig((localMap['watch-history'] || {}).items),
@@ -2373,6 +2398,7 @@ function trackingSyncSignature(localMap) {
     listSig((localMap['airing-next'] || {}).items),
     curatedRecsSignature(loadCuratedRecommendations()),
     listSig(wl.items),
+    watchlistAiringSig(wl.items),
     Number(wl.updatedAt) || 0,
     (window._fullyWatchedShowIds ? window._fullyWatchedShowIds.size || [...window._fullyWatchedShowIds].length : 0),
     Object.keys(window._dismissedContinueWatching || {}).length,
@@ -3050,6 +3076,7 @@ async function loadCreatorSync(opts) {
       const badgeKeys = [
         { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
         { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+        { key: 'showBadgesWatchlist', id: 'badgeWatchlistCheckbox' },
         { key: 'showBadgesTraktContinueWatching', id: 'badgeTraktContinueWatchingCheckbox' },
         { key: 'showBadgesMdblistUpNext', id: 'badgeMdblistUpNextCheckbox' },
         { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
@@ -4700,14 +4727,14 @@ function buildLocalListCardHtml(l) {
     const isAiringList = l.slug === 'airing-next' || l.statusKey === 'airing-next';
     const isCwList = l.slug === 'continue-watching' || l.statusKey === 'continue-watching';
     const showLocationBadges = typeof getBadgeSetting === 'function'
-      ? (isAiringList ? getBadgeSetting('showBadgesAiringNext') : (isCwList ? getBadgeSetting('showBadgesContinueWatching') : getBadgeSetting('showBadgesCatalogs')))
+      ? (isAiringList ? getBadgeSetting('showBadgesAiringNext') : (isCwList ? getBadgeSetting('showBadgesContinueWatching') : (isWatchlist ? getBadgeSetting('showBadgesWatchlist') : getBadgeSetting('showBadgesCatalogs'))))
       : true;
     const showAirDate = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
     const showPremiere = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
     const showFinale = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
     const showFinaleDate = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
 
-    const airingList = (isCwList && typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+    const airingList = ((isCwList || isWatchlist) && typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
     let airingMatch = airingList.find((a) => {
       if (!a) return false;
       const aShowId = String(a.showId || a.id || '').split(':')[0];
@@ -4794,7 +4821,7 @@ function buildLocalListCardHtml(l) {
     '</div>';
   }).join('');
   const typeLabel = l.type === 'series' ? 'Shows' : l.type === 'movie' ? 'Movies' : 'Mixed';
-  const cardClass = 'creator-list-row list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : (l.slug === 'continue-watching' ? ' continue-watching-card is-continue-watching-shelf' : (l.slug === 'airing-next' ? ' airing-next-card is-airing-next-shelf' : '')));
+  const cardClass = 'creator-list-row list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : (l.slug === 'continue-watching' ? ' continue-watching-card is-continue-watching-shelf' : (l.slug === 'airing-next' ? ' airing-next-card is-airing-next-shelf' : (isWatchlist ? ' watchlist-card is-watchlist-shelf' : ''))));
   const isPublic = l.visibility === 'public';
   const shareUrl = l.url || ((typeof activeCreator !== 'undefined' && activeCreator)
     ? (location.origin + '/lists/' + activeCreator.creatorName + '/' + (l.slug || 'watchlist'))

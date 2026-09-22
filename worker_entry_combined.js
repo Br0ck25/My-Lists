@@ -11832,6 +11832,7 @@ async function resolveConfig(configParam, env) {
           betterPostersRatingSource: parsed.betterPostersRatingSource || "avg",
           showBadgesAiringNext: parsed.showBadgesAiringNext !== false,
           showBadgesContinueWatching: parsed.showBadgesContinueWatching !== false,
+          showBadgesWatchlist: parsed.showBadgesWatchlist !== false,
           showBadgesTraktContinueWatching: parsed.showBadgesTraktContinueWatching !== false,
           showBadgesMdblistUpNext: parsed.showBadgesMdblistUpNext !== false,
           showBadgesCatalogs: parsed.showBadgesCatalogs !== false,
@@ -23934,11 +23935,11 @@ ${seoHeadHtml}
   .live-preview-posters .rating-badge, .live-preview-shelf-row .rating-badge,
   .live-preview-posters .poster-rating, .live-preview-shelf-row .poster-rating { display: none !important; }
   body.hide-badge-watched .watched-badge, body.hide-badge-watched .cw-watched-indicator { display: none !important; }
-  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .cw-date-badge,
-  body.hide-catalogs-badges .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]) .cw-date-badge,
-  body.hide-catalogs-badges #catalogsTab .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]) .cw-date-badge,
-  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .rating-badge,
-  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf) .watched-badge { display: none !important; }
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf):not(.is-watchlist-shelf) .cw-date-badge,
+  body.hide-catalogs-badges .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]):not([data-list-slug="watchlist"]) .cw-date-badge,
+  body.hide-catalogs-badges #catalogsTab .live-preview-shelf-row:not([data-list-slug="continue-watching"]):not([data-list-slug="airing-next"]):not([data-list-slug="watchlist"]) .cw-date-badge,
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf):not(.is-watchlist-shelf) .rating-badge,
+  body.hide-catalogs-badges .live-preview-posters:not(.is-continue-watching-shelf):not(.is-airing-next-shelf):not(.is-watchlist-shelf) .watched-badge { display: none !important; }
   body.hide-airing-next-badges #myPrivateTraktListsResult .cw-date-badge,
   body.hide-airing-next-badges #mySimklListsResult .cw-date-badge,
   body.hide-airing-next-badges #myMdblistListsResult .cw-date-badge,
@@ -23946,6 +23947,10 @@ ${seoHeadHtml}
   body.hide-airing-next-badges .airing-next-card .cw-date-badge,
   body.hide-airing-next-badges .live-preview-shelf-row[data-list-slug="airing-next"] .cw-date-badge,
   body.hide-airing-next-badges .live-preview-posters.is-airing-next-shelf .cw-date-badge { display: none !important; }
+  body.hide-watchlist-badges [data-list-key="watchlist"] .cw-date-badge,
+  body.hide-watchlist-badges .watchlist-card .cw-date-badge,
+  body.hide-watchlist-badges .live-preview-shelf-row[data-list-slug="watchlist"] .cw-date-badge,
+  body.hide-watchlist-badges .live-preview-posters.is-watchlist-shelf .cw-date-badge { display: none !important; }
   body.hide-continue-watching-badges [data-list-key="continue-watching"] .cw-date-badge,
   body.hide-continue-watching-badges .continue-watching-card .cw-date-badge,
   body.hide-continue-watching-badges .live-preview-shelf-row[data-list-slug="continue-watching"] .cw-date-badge,
@@ -26980,7 +26985,7 @@ if ('serviceWorker' in navigator) {
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeAiringNextCheckbox" checked onchange="toggleBadgeSetting('showBadgesAiringNext', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Airing Next (Dashboard &amp; My Lists)</span>
+              <span style="font-weight:600;">Airing Next (Dashboard)</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and upcoming air date badges on the Airing Next shelf and provider lists.</p>
             </div>
           </label>
@@ -26989,6 +26994,13 @@ if ('serviceWorker' in navigator) {
             <div>
               <span style="font-weight:600;">Continue Watching (Dashboard)</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and air date badges on your in-progress Continue Watching series.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeWatchlistCheckbox" checked onchange="toggleBadgeSetting('showBadgesWatchlist', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Watchlist (Dashboard)</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and air date badges on shows in your Watchlist that have an episode coming.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
@@ -27019,29 +27031,29 @@ if ('serviceWorker' in navigator) {
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeStremioAiringNextCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioAiringNext', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Airing Next Catalogs in Stremio</span>
+              <span style="font-weight:600;">Airing Next Catalogs in Stremio &amp; Nuvio</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Airing Next poster artwork in Stremio and Nuvio.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeStremioContinueWatchingCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioContinueWatching', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Continue Watching Catalogs in Stremio</span>
+              <span style="font-weight:600;">Continue Watching Catalogs in Stremio &amp; Nuvio</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Continue Watching poster artwork in Stremio and Nuvio.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeStremioWatchlistCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioWatchlist', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Watchlist Catalogs in Stremio</span>
+              <span style="font-weight:600;">Watchlist Catalogs in Stremio &amp; Nuvio</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Watchlist poster artwork in Stremio and Nuvio.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeStremioCatalogsCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioCatalogs', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Other Custom &amp; Provider Catalogs in Stremio</span>
-              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay badges on MDBList, Trakt, Simkl, and Custom list catalog rows in Stremio.</p>
+              <span style="font-weight:600;">Other Custom &amp; Provider Catalogs in Stremio &amp; Nuvio</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay badges on MDBList, Trakt, Simkl, and Custom list catalog rows in Stremio and Nuvio.</p>
             </div>
           </label>
         </div>
@@ -39008,6 +39020,10 @@ async function syncCustomListPayload(payload, name, applyEdit) {
     if (typeof pushTrackingSync === 'function') pushTrackingSync();
     if (typeof scheduleCreatorSyncSave === 'function') scheduleCreatorSyncSave();
     if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    // A show just added here has never been asked about, so this resolves its
+    // upcoming episode now rather than at the next reload. It no-ops when
+    // every show on the list has already been looked up this session.
+    if (typeof refreshWatchlistAiring === 'function') refreshWatchlistAiring(false).catch(() => {});
   }
 
   if (payload.creatorSlug && !isWatchlist) {
@@ -56073,6 +56089,203 @@ async function refreshAiringNext(force) {
 // reads.
 setTimeout(() => { refreshAiringNext(false).catch(() => {}); }, 600);
 
+// --- Upcoming episodes for Watchlist shows -----------------------------------
+//
+// Airing Next is built from shows being WATCHED: its candidate set comes out
+// of Watch History (collectAiringNextCandidateShowIds above), so a show that
+// has only ever been put on the Watchlist has never passed through it -- and
+// that is exactly the show most likely to be premiering, added because it is
+// coming rather than because an episode has been seen. The symptom was a
+// Watchlist tile with no premiere chip and no date sitting beside a Continue
+// Watching shelf that had both.
+//
+// The data is stamped ONTO the watchlist entries rather than adding those
+// shows to Airing Next. That shelf means "the next episode of something you
+// watch", which a watchlist entry is not, and widening it would change what
+// a shelf nobody complained about contains. Stamping in place also carries
+// the data everywhere on its own: pushTrackingSync sends the watchlist items
+// verbatim, so fetchAutoTrackedCatalog (05_catalog-core.js) reads the same
+// fields off the same entries -- which is what Stremio, Nuvio and the Live
+// Preview row are all served from -- with nothing extra to keep in step.
+const WATCHLIST_AIRING_REFRESH_MS = 6 * 60 * 60 * 1000;
+const WATCHLIST_AIRING_MAX_SHOWS = 60;
+const WATCHLIST_AIRING_CONCURRENCY = 4;
+var _watchlistAiringAt = 0;
+var _watchlistAiringRunning = false;
+// Show ids already resolved this session. A show added to the Watchlist a
+// minute ago is not covered by the refresh window -- it has never been asked
+// about at all -- so an unseen id is what lets a mid-session add get its
+// chips without waiting out the window or a reload.
+var _watchlistAiringSeen = new Set();
+
+// Every field this function owns on an entry. Kept as one list so the stamp
+// and the clear cannot drift apart.
+const WATCHLIST_AIRING_FIELDS = [
+  'airDate',
+  'airTime',
+  'seasonNum',
+  'episodeNum',
+  'isSeasonPremiere',
+  'isSeasonFinale',
+  'seasonFinaleAirDate',
+  'seasonFinaleEpisodeNumber',
+  'isUnaired',
+];
+
+// The id /api/details answers to, resolved the same way the MDBList and Trakt
+// enrichers resolve theirs.
+function watchlistAiringShowId(it) {
+  if (!it) return '';
+  if (it.imdbId) return String(it.imdbId);
+  const id = String(it.id || '');
+  if (id.indexOf('tt') === 0) return id;
+  if (it.tmdbId) return 'tmdb:' + it.tmdbId;
+  if (id.indexOf('tmdb:') === 0) return id;
+  return '';
+}
+
+function watchlistAiringSeriesItems(list) {
+  const items = (list && Array.isArray(list.items)) ? list.items : [];
+  // A Watchlist is mixed, and a movie has no next episode to ask about.
+  return items.filter((it) => it && (it.type === 'series' || it.kind === 'series'));
+}
+
+async function refreshWatchlistAiring(force) {
+  if (_watchlistAiringRunning) return;
+  if (typeof loadLocalCustomLists !== 'function') return;
+  const map = loadLocalCustomLists();
+  const wl = map['watchlist'];
+  const series = watchlistAiringSeriesItems(wl);
+  if (!series.length) return;
+
+  const byShowId = new Map();
+  series.forEach((it) => {
+    const sid = watchlistAiringShowId(it);
+    if (!sid) return;
+    if (!byShowId.has(sid)) byShowId.set(sid, []);
+    byShowId.get(sid).push(it);
+  });
+  const ids = [...byShowId.keys()].slice(0, WATCHLIST_AIRING_MAX_SHOWS);
+  if (!ids.length) return;
+
+  // A stamped date that has now passed is worth a refresh whatever the
+  // window says -- the chip on screen is wrong until this runs again.
+  const hasExpired = series.some((it) => it && it.airDate && typeof isEpisodeAired === 'function' && isEpisodeAired(it.airDate));
+  const hasUnseen = ids.some((id) => !_watchlistAiringSeen.has(id));
+  if (!force && !hasExpired && !hasUnseen && _watchlistAiringAt && (Date.now() - _watchlistAiringAt) < WATCHLIST_AIRING_REFRESH_MS) return;
+
+  _watchlistAiringRunning = true;
+  try {
+    const tkInput = document.getElementById('tmdbKeyInput');
+    const tmdbKey = tkInput && tkInput.value ? tkInput.value.trim() : '';
+    const bypassFresh = !!(force || hasExpired);
+    const details = {};
+    let batchOk = false;
+
+    try {
+      let pending = ids;
+      for (let round = 0; round < ${DETAILS_BATCH_MAX_ROUNDS} && pending.length; round++) {
+        const res = await fetch(ORIGIN + '/api/details/batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ids: pending,
+            type: 'series',
+            tmdbKey: tmdbKey,
+            fresh: bypassFresh ? '1' : '',
+          }),
+        });
+        const data = await res.json();
+        if (!data || !data.ok || !data.results) break;
+        batchOk = true;
+        Object.assign(details, data.results);
+        if (data.done !== false || !Array.isArray(data.remainingIds) || !data.remainingIds.length) break;
+        pending = data.remainingIds;
+      }
+    } catch (e) {
+      // Falls through to the per-id path below.
+    }
+
+    // Same fallback refreshAiringNext keeps, and for the same reason: a
+    // self-hosted Worker older than /api/details/batch, or a network hiccup.
+    if (!batchOk) {
+      let cursor = 0;
+      const one = async () => {
+        while (cursor < ids.length) {
+          const sid = ids[cursor++];
+          try {
+            const bypass = bypassFresh ? '&fresh=1&_t=' + Date.now() : '';
+            const res = await fetch(ORIGIN + '/api/details?imdbId=' + encodeURIComponent(sid) + '&type=series&tmdbKey=' + encodeURIComponent(tmdbKey) + bypass);
+            const data = await res.json();
+            if (data && data.ok && data.details) details[sid] = data.details;
+          } catch (e) {
+            // Retried on the next run rather than blocking the rest.
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(WATCHLIST_AIRING_CONCURRENCY, ids.length) }, one));
+    }
+
+    let changed = false;
+    ids.forEach((sid) => {
+      _watchlistAiringSeen.add(sid);
+      const d = details[sid];
+      const upcoming = (d && d.nextEpisodeAirDate && (typeof isEpisodeAired !== 'function' || !isEpisodeAired(d.nextEpisodeAirDate))) ? d : null;
+      // Fills the per-show air-time store the date chip reads the hour from,
+      // exactly as the Airing Next rebuild does.
+      if (upcoming && typeof rememberShowAirTime === 'function') rememberShowAirTime(upcoming);
+      const next = upcoming ? {
+        airDate: upcoming.nextEpisodeAirDate,
+        airTime: upcoming.nextEpisodeAirTimeLabel || (upcoming.airTime && upcoming.airTime.label) || null,
+        seasonNum: upcoming.nextEpisodeSeasonNumber,
+        episodeNum: upcoming.nextEpisodeNumber,
+        isSeasonPremiere: upcoming.nextEpisodeNumber === 1,
+        isSeasonFinale: !!(upcoming.isSeasonFinale || (upcoming.totalEpisodesInSeason != null && upcoming.nextEpisodeNumber === upcoming.totalEpisodesInSeason && upcoming.nextEpisodeNumber > 1)),
+        seasonFinaleAirDate: upcoming.seasonFinaleAirDate || null,
+        seasonFinaleEpisodeNumber: upcoming.seasonFinaleEpisodeNumber || null,
+        isUnaired: true,
+      } : null;
+      (byShowId.get(sid) || []).forEach((it) => {
+        if (next) {
+          WATCHLIST_AIRING_FIELDS.forEach((f) => {
+            if (it[f] !== next[f]) {
+              it[f] = next[f];
+              changed = true;
+            }
+          });
+        } else if (it.isUnaired) {
+          // Cleared only on an entry this function stamped -- isUnaired is
+          // the marker it sets -- so air dates that came in with an import
+          // from Trakt or MDBList are never stomped.
+          WATCHLIST_AIRING_FIELDS.forEach((f) => {
+            if (it[f] != null) {
+              delete it[f];
+              changed = true;
+            }
+          });
+        }
+      });
+    });
+
+    _watchlistAiringAt = Date.now();
+    if (!changed) return;
+    map['watchlist'] = wl;
+    saveLocalCustomListsMap(map);
+    if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+    if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
+    // Up to the account, so the Watchlist catalog the apps and the Live
+    // Preview row are both served from carries the same chips.
+    if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
+  } finally {
+    _watchlistAiringRunning = false;
+  }
+}
+window.refreshWatchlistAiring = refreshWatchlistAiring;
+
+// After Airing Next, which shares the same /api/details cache -- a show on
+// both lists is then a cache hit rather than a second upstream call.
+setTimeout(() => { refreshWatchlistAiring(false).catch(() => {}); }, 900);
+
 // --- Watch History episode stills -------------------------------------------
 //
 // A Watch History entry keeps the episode's own still image in poster and
@@ -56589,6 +56802,14 @@ function compactCustomListItem(it) {
   // being computed and the map being saved -- which is to say, never.
   if (it.canonicalTmdbId) clean.canonicalTmdbId = it.canonicalTmdbId;
   if (it.airDate) clean.airDate = it.airDate;
+  // The hour the episode airs, and which episode ends the season. Both are
+  // stamped onto an entry deliberately -- airingEntryFrom says so in as many
+  // words, "so a tile restored from local storage on a cold start still knows
+  // the hour without waiting for the shelf to refresh" -- and both were being
+  // dropped here on the way to storage, so the cold start never had them.
+  // Same class of loss as canonicalTmdbId above.
+  if (it.airTime) clean.airTime = it.airTime;
+  if (it.seasonFinaleEpisodeNumber != null) clean.seasonFinaleEpisodeNumber = Number(it.seasonFinaleEpisodeNumber);
   if (it.isUnaired) clean.isUnaired = true;
   if (it.seasonFinaleAirDate) clean.seasonFinaleAirDate = it.seasonFinaleAirDate;
   if (it.isSeasonPremiere) clean.isSeasonPremiere = true;
@@ -58898,6 +59119,23 @@ function trackingSyncSignature(localMap) {
     return items.length + '/' + (first.id || first.imdbId || first.showId || '') +
       '/' + (last.id || last.imdbId || last.showId || '') + '/' + newest;
   }
+  // The upcoming-episode fields refreshWatchlistAiring stamps onto watchlist
+  // entries move nothing listSig looks at -- not the length, not the first or
+  // last id, not a watchedAt -- so without this the enriched copy would sit
+  // in the browser until the heartbeat, and the Watchlist catalog the apps
+  // read would keep serving tiles with no chips for up to ten minutes after
+  // this device had the dates.
+  function watchlistAiringSig(items) {
+    if (!Array.isArray(items) || !items.length) return '0';
+    var out = '';
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it && it.airDate) {
+        out += (it.id || it.imdbId || '') + ':' + it.airDate + ':' + (it.episodeNum == null ? '' : it.episodeNum) + ',';
+      }
+    }
+    return out || '0';
+  }
   var wl = localMap['watchlist'] || {};
   return [
     listSig((localMap['watch-history'] || {}).items),
@@ -58905,6 +59143,7 @@ function trackingSyncSignature(localMap) {
     listSig((localMap['airing-next'] || {}).items),
     curatedRecsSignature(loadCuratedRecommendations()),
     listSig(wl.items),
+    watchlistAiringSig(wl.items),
     Number(wl.updatedAt) || 0,
     (window._fullyWatchedShowIds ? window._fullyWatchedShowIds.size || [...window._fullyWatchedShowIds].length : 0),
     Object.keys(window._dismissedContinueWatching || {}).length,
@@ -59582,6 +59821,7 @@ async function loadCreatorSync(opts) {
       const badgeKeys = [
         { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
         { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+        { key: 'showBadgesWatchlist', id: 'badgeWatchlistCheckbox' },
         { key: 'showBadgesTraktContinueWatching', id: 'badgeTraktContinueWatchingCheckbox' },
         { key: 'showBadgesMdblistUpNext', id: 'badgeMdblistUpNextCheckbox' },
         { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
@@ -61232,14 +61472,14 @@ function buildLocalListCardHtml(l) {
     const isAiringList = l.slug === 'airing-next' || l.statusKey === 'airing-next';
     const isCwList = l.slug === 'continue-watching' || l.statusKey === 'continue-watching';
     const showLocationBadges = typeof getBadgeSetting === 'function'
-      ? (isAiringList ? getBadgeSetting('showBadgesAiringNext') : (isCwList ? getBadgeSetting('showBadgesContinueWatching') : getBadgeSetting('showBadgesCatalogs')))
+      ? (isAiringList ? getBadgeSetting('showBadgesAiringNext') : (isCwList ? getBadgeSetting('showBadgesContinueWatching') : (isWatchlist ? getBadgeSetting('showBadgesWatchlist') : getBadgeSetting('showBadgesCatalogs'))))
       : true;
     const showAirDate = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeAirDate') : true);
     const showPremiere = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonPremiere') : true);
     const showFinale = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinale') : true);
     const showFinaleDate = showLocationBadges && (typeof getBadgeSetting === 'function' ? getBadgeSetting('showBadgeSeasonFinaleDate') : true);
 
-    const airingList = (isCwList && typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
+    const airingList = ((isCwList || isWatchlist) && typeof loadLocalCustomLists === 'function') ? ((loadLocalCustomLists()['airing-next'] || {}).items || []) : [];
     let airingMatch = airingList.find((a) => {
       if (!a) return false;
       const aShowId = String(a.showId || a.id || '').split(':')[0];
@@ -61326,7 +61566,7 @@ function buildLocalListCardHtml(l) {
     '</div>';
   }).join('');
   const typeLabel = l.type === 'series' ? 'Shows' : l.type === 'movie' ? 'Movies' : 'Mixed';
-  const cardClass = 'creator-list-row list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : (l.slug === 'continue-watching' ? ' continue-watching-card is-continue-watching-shelf' : (l.slug === 'airing-next' ? ' airing-next-card is-airing-next-shelf' : '')));
+  const cardClass = 'creator-list-row list-card' + (l.slug === 'watch-history' ? ' is-watch-history-shelf' : (l.slug === 'continue-watching' ? ' continue-watching-card is-continue-watching-shelf' : (l.slug === 'airing-next' ? ' airing-next-card is-airing-next-shelf' : (isWatchlist ? ' watchlist-card is-watchlist-shelf' : ''))));
   const isPublic = l.visibility === 'public';
   const shareUrl = l.url || ((typeof activeCreator !== 'undefined' && activeCreator)
     ? (location.origin + '/lists/' + activeCreator.creatorName + '/' + (l.slug || 'watchlist'))
@@ -63567,6 +63807,7 @@ function collectKeys() {
     betterPostersRatingSource: getBetterPostersChoice('betterPostersRatingSource', 'avg'),
     showBadgesAiringNext: getBadgeSetting('showBadgesAiringNext'),
     showBadgesContinueWatching: getBadgeSetting('showBadgesContinueWatching'),
+    showBadgesWatchlist: getBadgeSetting('showBadgesWatchlist'),
     showBadgesTraktContinueWatching: getBadgeSetting('showBadgesTraktContinueWatching'),
     showBadgesMdblistUpNext: getBadgeSetting('showBadgesMdblistUpNext'),
     showBadgesCatalogs: getBadgeSetting('showBadgesCatalogs'),
@@ -63670,6 +63911,7 @@ function applyBadgeBodyClasses() {
   if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
   b.classList.toggle('hide-airing-next-badges', !getBadgeSetting('showBadgesAiringNext'));
   b.classList.toggle('hide-continue-watching-badges', !getBadgeSetting('showBadgesContinueWatching'));
+  b.classList.toggle('hide-watchlist-badges', !getBadgeSetting('showBadgesWatchlist'));
   b.classList.toggle('hide-trakt-continue-watching-badges', !getBadgeSetting('showBadgesTraktContinueWatching'));
   b.classList.toggle('hide-mdblist-up-next-badges', !getBadgeSetting('showBadgesMdblistUpNext'));
   b.classList.toggle('hide-catalogs-badges', !getBadgeSetting('showBadgesCatalogs'));
@@ -63791,6 +64033,7 @@ function initBadgeSettingsUI() {
   const badgeKeys = [
     { key: 'showBadgesAiringNext', id: 'badgeAiringNextCheckbox' },
     { key: 'showBadgesContinueWatching', id: 'badgeContinueWatchingCheckbox' },
+    { key: 'showBadgesWatchlist', id: 'badgeWatchlistCheckbox' },
     { key: 'showBadgesTraktContinueWatching', id: 'badgeTraktContinueWatchingCheckbox' },
     { key: 'showBadgesMdblistUpNext', id: 'badgeMdblistUpNextCheckbox' },
     { key: 'showBadgesCatalogs', id: 'badgeCatalogsCheckbox' },
@@ -63970,6 +64213,10 @@ async function renderLivePreview() {
       const sName = (s.name || '').toLowerCase();
       const isCwShelf = sUrl.includes('continue-watching') || sUrl.includes('continue_watching') || sName.includes('continue watching');
       const isAiringShelf = sUrl.includes('airing-next') || sUrl.includes('airing_next') || sName.includes('airing next');
+      // Checked after the other two so a shelf whose name mentions both
+      // keeps the more specific meaning, the same precedence
+      // livePreviewPosterHtml uses for an individual tile.
+      const isWatchlistShelf = !isCwShelf && !isAiringShelf && (sUrl.includes('watchlist') || sName.includes('watchlist'));
       // A personal/auto-tracked shelf (Continue Watching, Watchlist, Watch
       // History, Airing Next -- this add-on's own or a connected Trakt/
       // MDBList/Simkl account's) is legitimately empty a lot of the time --
@@ -63989,8 +64236,10 @@ async function renderLivePreview() {
       }
       postersContainer.classList.toggle('is-continue-watching-shelf', isCwShelf);
       postersContainer.classList.toggle('is-airing-next-shelf', isAiringShelf);
+      postersContainer.classList.toggle('is-watchlist-shelf', isWatchlistShelf);
       if (isCwShelf) entryDOM.dataset.listSlug = 'continue-watching';
       if (isAiringShelf) entryDOM.dataset.listSlug = 'airing-next';
+      if (isWatchlistShelf) entryDOM.dataset.listSlug = 'watchlist';
       
       const seeAllBtn = entryDOM.querySelector('.live-preview-shelf-title button');
       if (seeAllBtn) {
@@ -64357,6 +64606,7 @@ function getPosterBadgeSettings() {
   var get = (typeof getBadgeSetting === 'function') ? getBadgeSetting : function() { return true; };
   _posterBadgeCache = {
     continueWatching: get('showBadgesContinueWatching'),
+    watchlist: get('showBadgesWatchlist'),
     traktContinueWatching: get('showBadgesTraktContinueWatching'),
     mdblistUpNext: get('showBadgesMdblistUpNext'),
     airingNext: get('showBadgesAiringNext'),
@@ -64691,7 +64941,7 @@ function livePreviewPosterHtml(m) {
             ? badgeSettings.continueWatching
             : (isAiringItem
                 ? badgeSettings.airingNext
-                : (isWatchlistItem ? badgeSettings.catalogs !== false : false))));
+                : (isWatchlistItem ? badgeSettings.watchlist !== false : false))));
 
   const showAirDate = locationAllowed && badgeSettings.airDate;
   const showPremiere = locationAllowed && badgeSettings.seasonPremiere;
@@ -64699,7 +64949,7 @@ function livePreviewPosterHtml(m) {
   const showFinaleDate = locationAllowed && badgeSettings.seasonFinaleDate;
 
   let airingMatch = null;
-  if (isCwItem || isAiringItem) {
+  if (isCwItem || isAiringItem || isWatchlistItem) {
     airingMatch = findAiringMatchFor(m);
   }
 

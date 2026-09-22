@@ -131,7 +131,7 @@
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeAiringNextCheckbox" checked onchange="toggleBadgeSetting('showBadgesAiringNext', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Airing Next (Dashboard &amp; My Lists)</span>
+              <span style="font-weight:600;">Airing Next (Dashboard)</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and upcoming air date badges on the Airing Next shelf and provider lists.</p>
             </div>
           </label>
@@ -140,6 +140,13 @@
             <div>
               <span style="font-weight:600;">Continue Watching (Dashboard)</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and air date badges on your in-progress Continue Watching series.</p>
+            </div>
+          </label>
+          <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
+            <input type="checkbox" id="badgeWatchlistCheckbox" checked onchange="toggleBadgeSetting('showBadgesWatchlist', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
+            <div>
+              <span style="font-weight:600;">Watchlist (Dashboard)</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Show premiere, finale, and air date badges on shows in your Watchlist that have an episode coming.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
@@ -170,29 +177,29 @@
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeStremioAiringNextCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioAiringNext', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Airing Next Catalogs in Stremio</span>
+              <span style="font-weight:600;">Airing Next Catalogs in Stremio &amp; Nuvio</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Airing Next poster artwork in Stremio and Nuvio.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeStremioContinueWatchingCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioContinueWatching', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Continue Watching Catalogs in Stremio</span>
+              <span style="font-weight:600;">Continue Watching Catalogs in Stremio &amp; Nuvio</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Continue Watching poster artwork in Stremio and Nuvio.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeStremioWatchlistCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioWatchlist', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Watchlist Catalogs in Stremio</span>
+              <span style="font-weight:600;">Watchlist Catalogs in Stremio &amp; Nuvio</span>
               <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay premiere, finale, and date chips on Watchlist poster artwork in Stremio and Nuvio.</p>
             </div>
           </label>
           <label style="display:flex; align-items:flex-start; gap:10px; cursor:pointer; font-size:0.9rem; user-select:none;">
             <input type="checkbox" id="badgeStremioCatalogsCheckbox" checked onchange="toggleBadgeSetting('showBadgesStremioCatalogs', this.checked)" style="margin-top:2px; cursor:pointer; width:16px; height:16px;">
             <div>
-              <span style="font-weight:600;">Other Custom &amp; Provider Catalogs in Stremio</span>
-              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay badges on MDBList, Trakt, Simkl, and Custom list catalog rows in Stremio.</p>
+              <span style="font-weight:600;">Other Custom &amp; Provider Catalogs in Stremio &amp; Nuvio</span>
+              <p style="margin:2px 0 0; color:var(--muted); font-size:0.8rem;">Overlay badges on MDBList, Trakt, Simkl, and Custom list catalog rows in Stremio and Nuvio.</p>
             </div>
           </label>
         </div>
