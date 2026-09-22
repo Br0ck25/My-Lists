@@ -7048,6 +7048,32 @@ function generateSearchVariations(query) {
       if (body.hideNonDigitalReleases) payload.hideNonDigitalReleases = true;
       if (body.adultContentFilter) payload.adultContentFilter = true;
       if (body.dedupeAcrossLists) payload.dedupeAcrossLists = true;
+      // Better Posters. This builder is an allowlist -- a key it does not name
+      // is dropped on the floor -- and this is the PRIMARY install path
+      // whenever a CONFIGS KV namespace is bound, so a key missing here does
+      // not degrade the feature, it disables it outright: resolveConfig reads
+      // betterPosters back as false and Stremio/Nuvio get the plain artwork,
+      // no matter what the builder page shows. Only the base64 fallback link
+      // (buildConfig, 23_client-list-management.js) carried it before this.
+      // Each style key is stored only when it differs from btttr.cc's own
+      // default for that option, matching buildConfig.
+      if (body.betterPosters) {
+        payload.betterPosters = true;
+        if (body.betterPostersGenre === false) payload.betterPostersGenre = false;
+        if (body.betterPostersRating === false) payload.betterPostersRating = false;
+        if (body.betterPostersTrendTags === false) payload.betterPostersTrendTags = false;
+        if (body.betterPostersQuality) payload.betterPostersQuality = true;
+        if (body.betterPostersAge) payload.betterPostersAge = true;
+        // Validated at the door rather than only where the URL is built: this
+        // endpoint is unauthenticated, and there is no reason to persist a
+        // value btttr.cc would reject anyway.
+        if (BETTER_POSTERS_LANGS.some((l) => l.value === body.betterPostersLang) && body.betterPostersLang !== "en") {
+          payload.betterPostersLang = body.betterPostersLang;
+        }
+        if (BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === body.betterPostersRatingSource) && body.betterPostersRatingSource !== "avg") {
+          payload.betterPostersRatingSource = body.betterPostersRatingSource;
+        }
+      }
 
       const savePayload = JSON.stringify(payload);
       // Row count alone is not a size bound -- a row carries a URL, a

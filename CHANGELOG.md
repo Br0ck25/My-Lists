@@ -16,6 +16,12 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - The settings ride the same Creator Profile sync as the badge settings, so enabling it in one browser enables it in the next.
 - Every poster on the website resolves through one funnel (`resolveClientPoster`, `19_client-search-and-likes.js`), which the surfaces above already reached via `resolveListCardItemPoster` (17), `resolveItemPoster` (22), `livePreviewPosterHtml` (23), `renderMediaCard` (16) and `loadPosterSlot` (19). The client mirror of the Worker's URL builder lives next to it, and the two are pinned to the same expected URLs by the same test file.
 
+### 🐛 Better Posters never reached Stremio or Nuvio
+
+- **The setting was dropped on the way into the install link.** `/api/save` -- the KV-backed short link that Stremio and Nuvio actually install whenever a `CONFIGS` namespace is bound, i.e. the normal deployment -- rebuilds its stored payload from an **allowlist** of body fields, and so does the POST body the builder page sends it. `betterPosters` was named in neither, so it never left the browser and was never stored. `resolveConfig` then read it back as `false`, and the apps got the plain artwork while the website showed the feature working. Only the base64 fallback link (used when no KV is bound, or when the save fails) ever carried it.
+- Both halves now carry `betterPosters` and its style keys. The language and rating source are validated against btttr.cc's accepted values at the save endpoint too -- it is unauthenticated, and the value is interpolated into a URL, so there is no reason to persist one the service would reject.
+- Six new tests go through `/api/save` end to end rather than seeding KV directly, which is precisely how this slipped past the first round: every earlier test wrote the config straight into KV and so never exercised the allowlist on either side. Each half is mutation-tested -- reverting the server fix fails three, reverting the client fix fails two.
+
 ### 🐛 Two poster bugs found while wiring Better Posters into the website
 
 - **`renderMediaCard` skipped the poster funnel whenever a card already had a poster.** It read `item.poster || resolveClientPoster(...)`, so the fallback only ran when there was nothing to fall back to -- meaning the **Adult Content Filter never applied to any card rendered through it** (search result cards, Custom List picks, Channel Builder picks). Now always resolved through the funnel. Covered by a test that fails against the old expression.

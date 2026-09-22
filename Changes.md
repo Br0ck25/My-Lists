@@ -95,6 +95,33 @@ Switching the setting needs no refetch: posters resolve at render time and nothi
 back onto the item, so the original is always still there when the setting goes off again.
 `refreshBetterPostersSurfaces` just re-renders.
 
+### Third pass: the feature never actually reached Stremio or Nuvio
+
+Reported after the fact: Better Posters showed nothing in the apps. The cause was neither the URL builder nor
+the catalog wiring, both of which were right -- it was the install link.
+
+`/api/save` (`25_api-catalog-routes.js`) stores the config a short install link points at, and it builds that
+payload from an **allowlist** of body fields rather than passing the body through. The POST body `generate()`
+(`24_client-backup-restore-presets.js`) sends it is an allowlist too. `betterPosters` was named in neither, so
+it never left the browser and was never stored; `resolveConfig` read it back as `false` and served plain
+artwork. Because a CONFIGS KV namespace is bound on any normal deployment, that is the path essentially every
+install takes -- only the base64 fallback link (no KV, or a failed save) carried the setting, which is why the
+website looked correct while every app did not.
+
+The setting's other five legs were all wired correctly (`collectKeys`, `buildConfig`, `decodeConfig`,
+`resolveConfig`, `fetchCatalog`), which is exactly what made this easy to miss: the sixth leg is a pair of
+allowlists that fail silently and are only exercised by the real round trip.
+
+**Why the tests did not catch it.** Every earlier server-side test seeded KV directly --
+`kv.put(cfgId, JSON.stringify({ betterPosters: true, ... }))` -- which writes the config *past* both
+allowlists. The new tests POST to `/api/save` and then request the catalog from the id it returns, so the
+allowlists are on the path. Both halves are mutation-tested: reverting the server fix fails three of them,
+reverting the client fix fails the two client ones.
+
+The save endpoint also now validates `betterPostersLang` / `betterPostersRatingSource` against btttr.cc's
+accepted values before storing them. It is unauthenticated and the value ends up interpolated into a URL, so
+persisting something the service would reject has no upside.
+
 ### Two pre-existing poster bugs this pass exposed
 
 1. **`renderMediaCard` (16) short-circuited past the funnel.** `item.poster || resolveClientPoster(...)`

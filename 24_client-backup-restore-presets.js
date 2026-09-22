@@ -2157,6 +2157,18 @@ async function generate() {
         hideNonDigitalReleases: keys.hideNonDigitalReleases,
         adultContentFilter: keys.adultContentFilter,
         dedupeAcrossLists: keys.dedupeAcrossLists,
+        // Must be listed explicitly: this body is an allowlist, and /api/save
+        // is the link Stremio/Nuvio actually install. Left out, the setting
+        // never leaves the browser and the feature looks dead in the apps
+        // while the website shows it working.
+        betterPosters: keys.betterPosters,
+        betterPostersGenre: keys.betterPostersGenre,
+        betterPostersRating: keys.betterPostersRating,
+        betterPostersTrendTags: keys.betterPostersTrendTags,
+        betterPostersQuality: keys.betterPostersQuality,
+        betterPostersAge: keys.betterPostersAge,
+        betterPostersLang: keys.betterPostersLang,
+        betterPostersRatingSource: keys.betterPostersRatingSource,
       }),
     });
     const data = await res.json();

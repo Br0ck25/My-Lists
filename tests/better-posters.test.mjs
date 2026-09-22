@@ -322,12 +322,84 @@ describe("BetterPosters end-to-end via the catalog route", () => {
   });
 });
 
+// --- the real install path -------------------------------------------------
+// The tests above seed KV directly. That is exactly how the setting shipped
+// broken once: /api/save rebuilds its stored payload from an ALLOWLIST of body
+// fields, and a key missing from either side of that round trip is dropped
+// silently. With a CONFIGS KV namespace bound -- the normal deployment -- this
+// is the link Stremio and Nuvio actually install, so a drop here does not
+// degrade the feature, it disables it while the website still shows it on.
+// These go through /api/save end to end rather than around it.
+
+describe("Better Posters survives the /api/save install round trip", () => {
+  const SAVE_SHOW = "tt0903747";
+  // A custom list with its items inline: self-contained, so the save needs no
+  // account and the catalog needs no network.
+  const CUSTOM_URL = "customlist:v1:" + JSON.stringify({
+    listSlug: "bp-roundtrip",
+    items: [{ id: SAVE_SHOW, title: "BP Show", year: "2008", type: "series" }],
+  });
+
+  async function saveAndFetch(extra) {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const saved = await call(env, "/api/save", { method: "POST", json: {
+      entries: [{ id: "bp-roundtrip", type: "series", name: "BP List", url: CUSTOM_URL }],
+      showBadgesStremio: false,
+      ...extra,
+    } });
+    assert.equal(saved.body.ok, true, JSON.stringify(saved.body));
+    const res = await call(env, `/${saved.body.id}/catalog/series/bp-roundtrip.json`);
+    assert.equal(res.status, 200);
+    assert.ok(res.body.metas && res.body.metas.length, "the saved list must serve an item");
+    return res.body.metas[0].poster || "";
+  }
+
+  it("carries the setting through /api/save into the served catalog", async () => {
+    assert.equal(
+      await saveAndFetch({ betterPosters: true }),
+      `https://btttr.cc/poster/imdb/poster-default/${SAVE_SHOW}.jpg`,
+      "a config saved through /api/save must serve BetterPosters artwork"
+    );
+  });
+
+  it("carries the style options through too", async () => {
+    assert.equal(
+      await saveAndFetch({
+        betterPosters: true,
+        betterPostersGenre: false,
+        betterPostersQuality: true,
+        betterPostersTrendTags: false,
+        betterPostersLang: "de",
+        betterPostersRatingSource: "IM",
+      }),
+      `https://btttr.cc/poster-rq/imdb/poster-default/${SAVE_SHOW}.jpg?tag=none&lang=de&rs=IM`
+    );
+  });
+
+  it("still serves the original artwork when the setting is off", async () => {
+    assert.ok(!(await saveAndFetch({})).includes("btttr.cc"));
+  });
+
+  // /api/save is unauthenticated and the stored value is interpolated into a
+  // URL, so a value btttr.cc would reject has no business being persisted.
+  it("drops a language or rating source btttr.cc does not accept", async () => {
+    assert.equal(
+      await saveAndFetch({
+        betterPosters: true,
+        betterPostersLang: "zh-CN",
+        betterPostersRatingSource: "../../evil",
+      }),
+      `https://btttr.cc/poster/imdb/poster-default/${SAVE_SHOW}.jpg`
+    );
+  });
+});
+
 // --- the website's own surfaces -------------------------------------------
 // The Worker rewrites posters for Stremio/Nuvio; resolveClientPoster (19) does
 // the same for every poster the website itself renders. These run the real
 // client bundle -- see tests/client-harness.mjs.
 
-const { loadClient } = await import("./client-harness.mjs");
+const { loadClient, requestsTo } = await import("./client-harness.mjs");
 
 const ON = { "myListAddon:betterPosters": "1" };
 const movie = (extra = {}) => ({ id: "tt0111161", type: "movie", name: "Shawshank", poster: "orig.jpg", ...extra });
@@ -407,6 +479,48 @@ describe("Better Posters on the website", () => {
     const twice = c.call("resolveClientPoster", movie(), once);
     assert.equal(once, "https://btttr.cc/poster-g/imdb/poster-default/tt0111161.jpg");
     assert.equal(twice, once);
+  });
+});
+
+// The client half of the same round trip. The POST body in generate()
+// (24_client-backup-restore-presets.js) is an allowlist too, so a key missing
+// there never leaves the browser -- the website would show Better Posters
+// working while every app kept the plain artwork.
+describe("Better Posters is sent to /api/save", () => {
+  function runGenerate(storage) {
+    const c = loadClient({
+      storage,
+      routes: { "/api/save": () => ({ json: { ok: true, id: "cfg123" } }) },
+    });
+    c.set("collectEntries", () => [{ id: "l1", type: "movie", name: "L1", url: "https://mdblist.com/lists/a/b" }]);
+    return c;
+  }
+
+  it("includes the setting and its style options in the POST body", async () => {
+    const c = runGenerate({
+      "myListAddon:betterPosters": "1",
+      "myListAddon:betterPostersGenre": "0",
+      "myListAddon:betterPostersQuality": "1",
+      "myListAddon:betterPostersTrendTags": "0",
+      "myListAddon:betterPostersLang": "de",
+      "myListAddon:betterPostersRatingSource": "IM",
+    });
+    await c.call("generate");
+    const sent = requestsTo(c, "/api/save");
+    assert.equal(sent.length, 1, "generate() must POST to /api/save");
+    const b = sent[0].body;
+    assert.equal(b.betterPosters, true);
+    assert.equal(b.betterPostersGenre, false);
+    assert.equal(b.betterPostersQuality, true);
+    assert.equal(b.betterPostersTrendTags, false);
+    assert.equal(b.betterPostersLang, "de");
+    assert.equal(b.betterPostersRatingSource, "IM");
+  });
+
+  it("sends it as false when the setting is off", async () => {
+    const c = runGenerate({});
+    await c.call("generate");
+    assert.equal(requestsTo(c, "/api/save")[0].body.betterPosters, false);
   });
 });
 
