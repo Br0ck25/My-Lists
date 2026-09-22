@@ -1093,6 +1093,12 @@ function isPersonalShelfUrl(url) {
     return !!u && PERSONAL_SHELF_URL_PREFIXES.some((p) => u.startsWith(p));
   });
 }
+
+// How many TMDB->IMDB translations one /api/imdb-ids call will do. Each is a
+// separate outbound request, so this is the per-request subrequest ceiling for
+// that endpoint -- sized to cover a Curated card's poster strip plus headroom,
+// and to stay well inside the 50 a free Workers plan allows per request.
+const IMDB_ID_LOOKUP_MAX = 24;
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -35031,6 +35037,71 @@ function applyBetterPosterWeb(it, poster) {
 }
 window.applyBetterPosterWeb = applyBetterPosterWeb;
 
+// Gives BetterPosters artwork to tiles whose item has only a TMDB id.
+//
+// BetterPosters is keyed by IMDB id and nothing else, so applyBetterPosterWeb
+// leaves a "tmdb:..." item alone -- correctly, because there is nothing to
+// build a URL from. The Curated For You / Recommended cards are entirely such
+// items (/api/recommendations answers with TMDB ids), which is why those two
+// cards kept their plain artwork while the identical rows in Live Preview and
+// in Stremio/Nuvio did not: the catalog path translates the ids on the way
+// through and the dashboard card never did.
+//
+// So the translation happens here instead, after render and only for the tiles
+// actually on screen -- see /api/imdb-ids (25_api-catalog-routes.js) for why it
+// is not done for the whole list up front.
+const _betterPostersIdCache = {};
+
+async function applyBetterPostersToTmdbTiles(rootEl) {
+  if (typeof betterPostersOnWeb !== 'function' || !betterPostersOnWeb()) return;
+  const root = rootEl || document;
+  const wraps = [...root.querySelectorAll('[data-id^="tmdb:"]')].filter((el) => {
+    if (el.dataset.betterPosterDone) return false;
+    return !!el.querySelector('img');
+  });
+  if (!wraps.length) return;
+
+  // Marked before the request, not after: a re-render while one is in flight
+  // would otherwise queue the same ids again.
+  const needed = [];
+  wraps.forEach((el) => {
+    el.dataset.betterPosterDone = '1';
+    const id = el.dataset.id;
+    if (!(id in _betterPostersIdCache)) {
+      needed.push({ id: id, type: el.dataset.type === 'series' ? 'series' : 'movie' });
+    }
+  });
+
+  if (needed.length) {
+    // One in-flight batch at a time, capped to what the endpoint accepts.
+    const batch = needed.slice(0, 24);
+    try {
+      const res = await fetch(ORIGIN + '/api/imdb-ids', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: batch }),
+      });
+      const data = await res.json();
+      // A miss is cached as '' too, so a title TMDB has no IMDB id for is not
+      // asked about again on every re-render.
+      batch.forEach((it) => { _betterPostersIdCache[it.id] = (data && data.ok && data.map && data.map[it.id]) || ''; });
+    } catch (e) {
+      batch.forEach((it) => { _betterPostersIdCache[it.id] = ''; });
+    }
+  }
+
+  wraps.forEach((el) => {
+    const imdbId = _betterPostersIdCache[el.dataset.id];
+    if (!imdbId) return;
+    const url = betterPostersWebUrl(imdbId);
+    const img = el.querySelector('img');
+    if (img) img.src = url;
+    // The poster modal reads this back, so it has to match what is shown.
+    if (el.dataset.poster) el.dataset.poster = url;
+  });
+}
+window.applyBetterPostersToTmdbTiles = applyBetterPostersToTmdbTiles;
+
 // The one funnel every poster on the website passes through -- directly, or
 // via resolveListCardItemPoster (17), resolveItemPoster (22),
 // livePreviewPosterHtml (23), renderMediaCard (16) and loadPosterSlot below.
@@ -36568,6 +36639,9 @@ async function loadCuratedListsFeed(forceRefresh) {
 
     container.innerHTML = sectionsHtml;
     populateSearchResultPosters();
+    // These cards are built from TMDB-id-only items, so BetterPosters cannot
+    // be applied at render time -- see applyBetterPostersToTmdbTiles.
+    applyBetterPostersToTmdbTiles(container);
     lastCuratedWatchCount = currentCount;
     curatedListsFeedLoaded = true;
   } catch (err) {
@@ -63623,6 +63697,12 @@ window.toggleBetterPostersSetting = toggleBetterPostersSetting;
 // way the badge settings behave.
 function refreshBetterPostersSurfaces() {
   if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+  // Tiles already patched carry a done-marker; clear it so they are
+  // reconsidered under the new setting.
+  try {
+    document.querySelectorAll('[data-better-poster-done]').forEach((el) => { delete el.dataset.betterPosterDone; });
+  } catch (e) {}
+  if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(document);
   if (typeof renderLivePreview === 'function') renderLivePreview();
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
 }
@@ -64407,6 +64487,9 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
 
   var first = items.slice(0, POSTER_GRID_FIRST_CHUNK);
   gridEl.insertAdjacentHTML('beforeend', first.map(livePreviewPosterHtml).join(''));
+  // A TMDB-id-only item cannot get a BetterPosters URL at render time, so
+  // the ids for what just landed on screen are translated and patched in.
+  if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
 
   if (items.length <= POSTER_GRID_FIRST_CHUNK) {
     if (typeof onComplete === 'function') onComplete(items.length);
@@ -64429,6 +64512,7 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
       return;
     }
     gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
     cursor += slice.length;
     if (cursor < items.length) {
       schedule(step);
@@ -64463,6 +64547,7 @@ function appendPosterGridItems(gridEl, items) {
     var slice = items.slice(cursor, cursor + POSTER_GRID_BATCH);
     if (!slice.length) return;
     gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
     cursor += slice.length;
     if (cursor < items.length) schedule(step);
   }
@@ -72899,6 +72984,74 @@ function generateSearchVariations(query) {
 
     // /api/recommendations  (POST)  { movieIds: [...], showIds: [...] } -> { ok, movies: [...], shows: [...] }
     // Generates personalized movie and show recommendations from TMDB based on user watch history.
+    // /api/imdb-ids  (POST)  { items: [{ id, type }] } -> { ok, map: { "tmdb:278": "tt0068646" } }
+    //
+    // BetterPosters is keyed by IMDB id and nothing else -- there is no
+    // /poster/tmdb/... route, it 404s -- so a tile whose item carries only a
+    // TMDB id cannot have BetterPosters artwork built for it. That is exactly
+    // what the Curated For You / Recommended cards hold: /api/recommendations
+    // answers with "tmdb:<n>" ids, because TMDB's recommendation endpoints
+    // return TMDB ids and nothing else.
+    //
+    // fetchCuratedCatalog already pays for the same translation when it serves
+    // those lists as a catalog (one external_ids call per item, edge-cached for
+    // a day), which is why the identical rows DO get BetterPosters artwork in
+    // Live Preview and in Stremio/Nuvio while the dashboard cards did not.
+    //
+    // Deliberately per-request and small rather than resolving the whole list
+    // up front: /api/recommendations returns up to 40 movies AND 40 shows, and
+    // 80 extra subrequests on a dashboard load would blow the 50-subrequest
+    // ceiling a free Workers plan gets. The caller asks only for the tiles it
+    // is about to draw, so a card costs ~9 and a See All page resolves more as
+    // it is scrolled. Every answer is edge-cached for a day, so the second
+    // visit costs nothing.
+    if (path === "/api/imdb-ids" && request.method === "POST") {
+      let idBody;
+      try {
+        idBody = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const rawItems = Array.isArray(idBody.items) ? idBody.items.slice(0, IMDB_ID_LOOKUP_MAX) : [];
+      if (!rawItems.length) return json({ ok: true, map: {} });
+      const idTmdbKey = idBody.tmdbKey || TMDB_API_KEY;
+
+      // Same shape as /api/recommendations above, and for the same reason: a
+      // caller spending their own TMDB quota still spends this Worker's
+      // subrequest and CPU budget, so the ceiling differs but the limit does
+      // not go away.
+      const idIp = clientIpKey(request);
+      if (!idIp) return json({ ok: false, error: "Could not resolve those ids." }, 400);
+      if (await consumeRateLimit(env, ctx, "imdbids", idIp, idBody.tmdbKey ? 240 : 60)) {
+        return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
+      }
+
+      const map = {};
+      await Promise.all(rawItems.map(async (raw) => {
+        const key = String((raw && raw.id) || "").trim();
+        if (!key.startsWith("tmdb:")) return;
+        // The id segment only -- an episode id ("tmdb:1234:1:2") resolves to
+        // its show, which is the artwork a poster tile wants anyway.
+        const tmdbId = key.slice(5).split(":")[0];
+        if (!/^\d{1,12}$/.test(tmdbId)) return;
+        const isSeries = (raw && raw.type) === "series" || (raw && raw.type) === "tv";
+        try {
+          const res = await fetch(
+            `https://api.themoviedb.org/3/${isSeries ? "tv" : "movie"}/${tmdbId}/external_ids?api_key=${encodeURIComponent(idTmdbKey)}`,
+            { cf: { cacheTtl: 86400, cacheEverything: true } }
+          );
+          if (!res.ok) return;
+          const data = await res.json();
+          // Only a real IMDB id is useful here; anything else and the caller
+          // keeps the poster it already had.
+          if (data && typeof data.imdb_id === "string" && /^tt\d{5,12}$/.test(data.imdb_id)) {
+            map[key] = data.imdb_id;
+          }
+        } catch (e) {}
+      }));
+      return json({ ok: true, map }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/api/recommendations" && request.method === "POST") {
       let body;
       try {

@@ -734,6 +734,12 @@ window.toggleBetterPostersSetting = toggleBetterPostersSetting;
 // way the badge settings behave.
 function refreshBetterPostersSurfaces() {
   if (typeof invalidatePosterRenderCaches === 'function') invalidatePosterRenderCaches();
+  // Tiles already patched carry a done-marker; clear it so they are
+  // reconsidered under the new setting.
+  try {
+    document.querySelectorAll('[data-better-poster-done]').forEach((el) => { delete el.dataset.betterPosterDone; });
+  } catch (e) {}
+  if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(document);
   if (typeof renderLivePreview === 'function') renderLivePreview();
   if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
 }
@@ -1518,6 +1524,9 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
 
   var first = items.slice(0, POSTER_GRID_FIRST_CHUNK);
   gridEl.insertAdjacentHTML('beforeend', first.map(livePreviewPosterHtml).join(''));
+  // A TMDB-id-only item cannot get a BetterPosters URL at render time, so
+  // the ids for what just landed on screen are translated and patched in.
+  if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
 
   if (items.length <= POSTER_GRID_FIRST_CHUNK) {
     if (typeof onComplete === 'function') onComplete(items.length);
@@ -1540,6 +1549,7 @@ function renderPosterGridChunked(gridEl, items, onComplete) {
       return;
     }
     gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
     cursor += slice.length;
     if (cursor < items.length) {
       schedule(step);
@@ -1574,6 +1584,7 @@ function appendPosterGridItems(gridEl, items) {
     var slice = items.slice(cursor, cursor + POSTER_GRID_BATCH);
     if (!slice.length) return;
     gridEl.insertAdjacentHTML('beforeend', slice.map(livePreviewPosterHtml).join(''));
+    if (typeof applyBetterPostersToTmdbTiles === 'function') applyBetterPostersToTmdbTiles(gridEl);
     cursor += slice.length;
     if (cursor < items.length) schedule(step);
   }

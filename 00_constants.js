@@ -1043,3 +1043,9 @@ function isPersonalShelfUrl(url) {
     return !!u && PERSONAL_SHELF_URL_PREFIXES.some((p) => u.startsWith(p));
   });
 }
+
+// How many TMDB->IMDB translations one /api/imdb-ids call will do. Each is a
+// separate outbound request, so this is the per-request subrequest ceiling for
+// that endpoint -- sized to cover a Curated card's poster strip plus headroom,
+// and to stay well inside the 50 a free Workers plan allows per request.
+const IMDB_ID_LOOKUP_MAX = 24;
