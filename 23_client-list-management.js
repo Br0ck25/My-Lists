@@ -869,7 +869,17 @@ function _liveFallbackMeta(it, defaultType) {
     showId: it.showId || it.id,
     type: it.type || defaultType || (it.episodeTitle ? 'series' : 'series'),
     name: it.name || it.title,
-    poster: it.poster,
+    // Resolved the same way the Lists tab resolves it. Reading it.poster
+    // alone left every Airing Next tile as "No poster": those items carry no
+    // poster of their own, and My Lists only ever showed one because
+    // resolveListCardItemPoster falls back to showPoster and then to a
+    // metahub poster built from the show's IMDb id. Live Preview had no such
+    // fallback, so the two surfaces disagreed about the same item -- and
+    // turning Better Posters on masked it, since that builds a URL from the
+    // id and never needs a poster field at all.
+    poster: (typeof resolveListCardItemPoster === 'function')
+      ? resolveListCardItemPoster(it)
+      : (it.poster || it.showPoster || ''),
     year: it.year || it.releaseInfo,
     showTitle: it.showTitle || it.name || it.title,
     seasonNum: it.seasonNum != null ? it.seasonNum : it.season,

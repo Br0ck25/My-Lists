@@ -4623,53 +4623,6 @@ function formatWatchItemLabel(it) {
   return { title: it.title || it.name || '', subtitle: '' };
 }
 
-// The four shelves that are a live view of the account rather than a list of
-// their own. Mirrors PERSONAL_SHELF_URL_PREFIXES (00_constants.js), which
-// matches the same concept by catalog URL rather than by local slug.
-const TRACKED_SHELF_SLUGS = ['continue-watching', 'airing-next', 'watch-history', 'watchlist'];
-window.TRACKED_SHELF_SLUGS = TRACKED_SHELF_SLUGS;
-
-// Makes the account's copy of a tracked shelf match this device's.
-//
-// Only ever pushes, never pulls: the account's copy is the one that goes
-// stale (an old preset load used to overwrite it, and it is what
-// Stremio/Nuvio and Live Preview read), so pulling it back down would spread
-// the bad copy rather than fix it. intentionalRemoval is what makes the push
-// authoritative -- without it pushTrackingSync skips a push whose signature
-// has not changed, which is exactly the case here.
-async function rebuildTrackedShelf(slug, displayName) {
-  const label = displayName || slug;
-  const go = async () => {
-    try {
-      if (typeof pushTrackingSync === 'function') {
-        await pushTrackingSync({ intentionalRemoval: true });
-      }
-      if (typeof renderCreatorDashboard === 'function') renderCreatorDashboard({ silent: true });
-      if (typeof renderMyCustomListsList === 'function') renderMyCustomListsList();
-      if (window._listPreviewCache) window._listPreviewCache.clear();
-      if (typeof renderLivePreview === 'function') renderLivePreview();
-      if (typeof showAddedToast === 'function') showAddedToast('"' + label + '" on your account now matches this device \\u2713');
-    } catch (e) {
-      if (typeof showAppAlert === 'function') showAppAlert('Rebuild Failed', 'Could not update "' + label + '" on your account. Check your connection and try again.', false);
-    }
-  };
-  if (typeof activeCreator === 'undefined' || !activeCreator) {
-    if (typeof showAppAlert === 'function') {
-      showAppAlert('Not Signed In', 'Rebuild copies this device\\u2019s "' + label + '" up to your account, so it needs you signed in to a Creator Profile.', false);
-    }
-    return;
-  }
-  const msg = 'Replace "' + label + '" on your account with what this device has right now?\\n\\n' +
-    'Your apps and Live Preview read the account\\u2019s copy, so use this when they are showing something older than this page does. Nothing on this device changes.';
-  // showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger) -- five
-  // arguments. Passing the callback third makes it the BUTTON LABEL, which
-  // renders the function's own source into the dialog and leaves nothing
-  // wired to confirm.
-  if (typeof showAppConfirm === 'function') showAppConfirm('Rebuild ' + label, msg, 'Rebuild', go, false);
-  else if (confirm(msg)) go();
-}
-window.rebuildTrackedShelf = rebuildTrackedShelf;
-
 function buildLocalListCardHtml(l) {
   if (!l) return '';
   const isAutoTracked = l.slug === 'watch-history' || l.slug === 'continue-watching';
@@ -4868,17 +4821,6 @@ function buildLocalListCardHtml(l) {
     : '<button type="button" class="lc-btn secondary localListDeleteBtn" data-slug="' + escapeAttr(l.slug) + '">Delete</button>';
 
   const isSynced = !isAutoTracked && !!(l.synced && l.sourceUrl);
-  // A personal shelf lives in two places -- this device and the account --
-  // and they can drift apart: the account's copy is what the add-on serves to
-  // Stremio/Nuvio and what Live Preview falls back to, while this page shows
-  // the device's. Loading an old preset used to push a stale copy up (see
-  // rebuildCustomListsFromPreset, 24_), and nothing else forces the two back
-  // into agreement. This does, in the one direction that is safe: the device
-  // you are looking at wins.
-  const isTrackedShelf = TRACKED_SHELF_SLUGS.indexOf(l.slug) !== -1;
-  const rebuildBtnHtml = isTrackedShelf
-    ? '<button type="button" class="lc-btn secondary trackedShelfRebuildBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name || l.slug) + '" title="Replace this shelf on your account with what this device has">Rebuild</button>'
-    : '';
   const syncBtnHtml = isSynced
     ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
     : '';
@@ -4902,12 +4844,10 @@ function buildLocalListCardHtml(l) {
       (isAutoTracked
         ? '<div class="list-card-actions">' +
             '<span style="font-size:0.78rem; color:var(--muted); white-space:nowrap; margin-right:8px;">Auto-tracked</span>' +
-            rebuildBtnHtml +
             addBtnHtml +
           '</div>'
         : '<div class="list-card-actions">' +
             '<button type="button" class="lc-btn secondary localListEditBtn" data-slug="' + escapeAttr(l.slug) + '">Edit</button>' +
-            rebuildBtnHtml +
             syncBtnHtml +
             deleteBtnHtml +
             shareBtn +
@@ -5248,11 +5188,6 @@ if (_creatorDashEl) {
       if (typeof updateAllListAddButtons === 'function') updateAllListAddButtons();
       showAddedToast('Added "' + listMeta.name + '" to your Catalogs.');
     }
-    return;
-  }
-  const rebuildShelfBtn = e.target.closest('.trackedShelfRebuildBtn');
-  if (rebuildShelfBtn) {
-    rebuildTrackedShelf(rebuildShelfBtn.dataset.slug, rebuildShelfBtn.dataset.name);
     return;
   }
   const localEditBtn = e.target.closest('.localListEditBtn');

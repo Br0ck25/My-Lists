@@ -16,16 +16,16 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - The settings ride the same Creator Profile sync as the badge settings, so enabling it in one browser enables it in the next.
 - Every poster on the website resolves through one funnel (`resolveClientPoster`, `19_client-search-and-likes.js`), which the surfaces above already reached via `resolveListCardItemPoster` (17), `resolveItemPoster` (22), `livePreviewPosterHtml` (23), `renderMediaCard` (16) and `loadPosterSlot` (19). The client mirror of the Worker's URL builder lives next to it, and the two are pinned to the same expected URLs by the same test file.
 
-### 🐛 Airing Next was the one tracked shelf with no Rebuild button
-
-- Every other shelf renders through `buildLocalListCardHtml`; Airing Next has its own renderer (`buildAiringNextCardHtml`, `21_client-custom-list-builder.js`), which the Rebuild change missed. Its card now carries the same button.
-- The test for this passed the whole time, because it called the *shared* renderer for all four slugs -- including the one slug that never reaches it. It now exercises `buildAiringNextCardHtml` directly, which is the renderer the dashboard actually calls for that card.
-
 ### 🐛 Drag-to-reorder stopped dead at the bottom of the screen
 
 - Nothing scrolled the page while a drag was in progress. `moveItem` places the dragged row among the rows **currently on screen**, so on any list taller than the window -- which is most of them once Live Preview shelves carry posters and each row is ~200px -- dragging past the last visible row did nothing: the row stopped at the edge and sat there. That is what "the drag freezes and won't move the list" was, and it applied to every list `createSortableList` drives (Catalogs, Live Preview, Your Custom Lists, the builders) on desktop and touch alike.
 - `createSortableList` now auto-scrolls when the pointer comes within 90px of an edge, ramping to 20px per frame at the very edge, and re-places the row against the rows that scroll into view. It drives this from its own animation-frame loop rather than from `dragover`/`pointermove`, because those stop firing the moment the pointer is held still at the edge -- which is exactly when scrolling needs to continue. It scrolls the nearest scrollable ancestor when there is one (lists inside panels) and the window otherwise.
 - Verified against the failing case in a real browser: a 12-row list at 2584px in a 900px window. Before, dragging row 1 to the bottom edge and holding it there moved it three places and left `window.scrollY` at 0. After, the same drag carries it to seventh with the page scrolled 1008px. **Not covered by the test suite** -- it needs real layout and a real pointer, and CI runs on bare node + python with no browser.
+
+### 🐛 Airing Next tiles showed "No poster" in Live Preview
+
+- `_liveFallbackMeta` read `it.poster` and nothing else. Airing Next items carry no poster of their own, and My Lists only ever showed one because `resolveListCardItemPoster` falls back to `showPoster` and then to a metahub poster built from the show's IMDb id. Live Preview had no such fallback, so the same items rendered as empty tiles there -- and turning Better Posters on masked it, since that builds a URL from the id and never needs a poster field at all.
+- Live Preview now resolves the poster through the same helper the Lists tab uses, so the two surfaces agree. Verified in a real browser with poster-less Airing Next items: the tiles render, against the same metahub URLs My Lists uses.
 
 ### 🐛 Live Preview showed a different Continue Watching than the Lists tab
 
@@ -33,21 +33,12 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - The fallback now comes from the account that actually backs the row: an `autotrack:` row uses this add-on's own list -- the exact list the Lists tab renders -- and everything else keeps the behaviour it had, Trakt's copy first with the add-on's list only as a last resort.
 - Verified in a real browser with all three sources present at once and deliberately different: an `autotrack:` row renders the add-on's items, and a `trakt:` row still renders Trakt's. **Not covered by the test suite** -- it needs `renderLivePreview` against real DOM, and CI has no browser.
 
-### 🐛 Rebuild's confirm dialog rendered its own source code
-
-- `showAppConfirm(title, message, confirmBtnText, onConfirm, isDanger)` takes five arguments. The new Rebuild button passed its callback third, so the function's source became the **button label** -- a wall of red text where "Rebuild" should have been -- and nothing was wired to confirm, so the button did nothing. Every other call site in the bundle already used the five-argument form; this was the only one wrong.
-
 ### 🐛 Loading a preset put old Continue Watching / Airing Next items back, permanently
 
 - A preset records **which** shelves you had, not what was on them -- but for a personal auto-tracked shelf those are not the same thing. `rebuildCustomListsFromPreset` merged a preset's saved copy of `continue-watching`, `airing-next`, `watch-history` and `watchlist` **into your live shelf**: additive, with nothing marking which items came from the preset, so a preset built months ago silently put months-old shows back into Continue Watching with no way to tell them apart or take them out again.
 - Worse, that merge set `hasTrackingChanges`, which pushed the mixture up to your account via `pushTrackingSync`. The account's copy is what the add-on serves to Stremio/Nuvio and what Live Preview falls back to when My Lists has not loaded yet this session -- which is why the same shelf could show one thing on the Lists tab and something older in Live Preview and in your apps.
 - Loading a preset now leaves all four alone entirely: they always follow your account. The load toast says so, so "nothing happened" does not read as a bug.
 - **Backup/Restore is deliberately unchanged** -- restoring your watch history is the whole point of a backup. It is only a *preset*, which is a set of shelves, that has no business carrying their contents.
-
-### ⭐ Rebuild, on each tracked shelf
-
-- Continue Watching, Airing Next, Watch History and Watchlist each get a **Rebuild** button in My Lists. It replaces that shelf **on your account** with what the device you are looking at has right now, then refreshes the dashboard and Live Preview.
-- It only ever pushes, never pulls. The account's copy is the one that goes stale, and it is what your apps read -- pulling it back down would spread the bad copy rather than fix it. Use it when your apps or Live Preview show something older than the Lists tab does.
 
 ### ⭐ "Remove duplicate items across lists" now skips your personal shelves
 
