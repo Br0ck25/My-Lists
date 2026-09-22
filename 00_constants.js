@@ -319,7 +319,26 @@ const NEW_ON_STREAMING_PROVIDERS = [
 const RAPIDAPI_CHANGES_URL = "https://streaming-availability.p.rapidapi.com/changes";
 const RAPIDAPI_HOST = "streaming-availability.p.rapidapi.com";
 const NEW_ON_STREAMING_WINDOW_DAYS = 30;
-const NEW_ON_STREAMING_DEFAULT_CATALOGS = "netflix,prime,hulu,disney,hbo,apple,paramount,peacock";
+// Subscription (and Peacock's free tier) catalogs ONLY. The bare service ids
+// ("prime", "apple", "hulu") also match that service's rent/buy store and its
+// add-on channels -- "prime" is every Prime Video Channels title and every
+// Amazon digital rental, "apple" is essentially the iTunes Store -- and every
+// one of those changes spent one of a page's 25 slots before being thrown
+// away client-side. That is also how a Starz-via-Prime title ended up labelled
+// "Prime Video". JustWatch (what mdblist.com/new-on-streaming reads) lists
+// those channels as separate providers, so leaving them out here is what
+// matching it means, not just what saves quota.
+const NEW_ON_STREAMING_DEFAULT_CATALOGS = [
+  "netflix.subscription",
+  "prime.subscription",
+  "hulu.subscription",
+  "disney.subscription",
+  "hbo.subscription",
+  "apple.subscription",
+  "paramount.subscription",
+  "peacock.subscription",
+  "peacock.free",
+].join(",");
 const NEW_ON_STREAMING_REGIONS = ["US"];
 
 // RapidAPI Streaming Availability Quota Limits & Schedule:
@@ -328,26 +347,68 @@ const NEW_ON_STREAMING_REGIONS = ["US"];
 const RAPIDAPI_MONTHLY_LIMIT = 1000;
 const RAPIDAPI_MONTHLY_SAFETY_CAP = 950;
 
-// Runs every 4 hours via cron (~180 runs/month). With 4 pages + 1 removed-check
-// per incremental run, this uses ~900 requests/month (180 * 5), staying under
-// the 950 safety cap with a small margin.
-const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 14400;
-
-// Maximum pages fetched per sweep.
+// Automated sweeps run every 6 hours (~120/month). The page budget of each one
+// is not fixed: it is whatever is left of the month's safety cap divided by the
+// sweeps left in the month (newOnStreamingTickBudget), clamped to the range
+// below. So a month with a few big manual sweeps spends less per tick later,
+// and one that has been quiet can afford to catch up -- the cap is never the
+// thing that stops the sweep in the last week.
 //
-// RapidAPI's /changes endpoint returns only 25 changes per page (see its
-// openapi.yaml), and a regular sweep never pages past what this budget
-// allows -- there is no cursor continuation once a type's page budget for
-// the tick runs out. 8 major streaming services can easily produce more
-// than 25 real episode-arrival events in a single 4-5 hour sweep window, so
-// this is the actual ceiling on how much of the catalog's real-time bump
-// coverage comes from RapidAPI directly (the rest falls to the slower,
-// TMDB-based bumpNewOnStreamingEpisodes safety net). Raised from 3 to 4 so a
-// regular tick can give `episode` a second page (see itemTypeShares below)
-// instead of the single page every type got before.
+// Every tick has to spend one request per change stream just to ask "anything
+// new?" (see NEW_ON_STREAMING_STREAMS), so fewer, fuller ticks buy more real
+// changes per request than frequent near-empty ones. mdblist's own list moves
+// once a day; four sweeps a day is already finer than that.
+const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 21600;
+const NEW_ON_STREAMING_MIN_PAGES_PER_TICK = 4;
+const NEW_ON_STREAMING_MAX_PAGES_PER_TICK = 16;
+
+// The /changes feed as four independent streams, each with its own resume
+// point in KV (cron:newonstreaming:streams:<region>). A stream is read oldest
+// first from where it last stopped and follows RapidAPI's cursor across ticks,
+// so a busy day (the 1st of the month, a 20-episode season drop) is finished on
+// the next tick instead of everything past the first page being dropped --
+// which is what reading newest-first with a fixed page count per tick did.
+//
+// Listed in priority order: a tick polls every due stream once, then spends
+// what is left in this order. A title's first arrival matters most; episode
+// changes are by far the largest stream (one change per episode, per service)
+// and so get what remains. `everySeconds` throttles a stream that does not need
+// polling every tick. `maxLagSeconds` lets a stream that has fallen hopelessly
+// behind skip forward rather than spend days replaying stale changes that
+// could only ever land below what is already on the shelf.
+const NEW_ON_STREAMING_STREAMS = [
+  { id: "show", changeType: "new", itemType: "show", everySeconds: 0, maxLagSeconds: 0 },
+  { id: "season", changeType: "new", itemType: "season", everySeconds: 0, maxLagSeconds: 0 },
+  { id: "episode", changeType: "new", itemType: "episode", everySeconds: 0, maxLagSeconds: 3 * 86400 },
+  { id: "removed", changeType: "removed", itemType: "show", everySeconds: 86400, maxLagSeconds: 0 },
+];
+// A stream's next query starts this far before where the last one ended, in
+// case a change is published with a timestamp slightly older than the moment
+// it became visible. Re-reading it costs a slot on a page, never a wrong row:
+// every write is an idempotent upsert.
+const NEW_ON_STREAMING_RESUME_OVERLAP_SECONDS = 1800;
+
+// Kept for the admin route's default and the "Clear & pull fresh data" path,
+// which still backfills newest-first (see sweepRapidApiNewOnStreaming).
 const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 4;
 const NEW_ON_STREAMING_PAGES_PER_TICK = NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP;
 const NEW_ON_STREAMING_SWEEP_FETCHES = 1;
+
+// TMDB network ids of each service's own originals. bumpNewOnStreamingEpisodes
+// (the TMDB-based fallback for episode bumps) only moves a service's row when
+// the show is that service's original, because a broadcast air date says
+// nothing about when -- or whether -- a library service gets the episode:
+// Live PD airing on A&E is not new on Netflix, which only has old seasons.
+const NEW_ON_STREAMING_ORIGINAL_NETWORKS = {
+  netflix: [213],
+  primevideo: [1024],
+  disney: [2739],
+  hbomax: [49, 3186],
+  hulu: [453],
+  appletv: [2552],
+  paramount: [4330],
+  peacock: [3353],
+};
 const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 
 // Ships dark. The sweep, the catalog and the /lists route are live as soon as

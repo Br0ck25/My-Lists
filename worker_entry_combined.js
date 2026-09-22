@@ -369,7 +369,26 @@ const NEW_ON_STREAMING_PROVIDERS = [
 const RAPIDAPI_CHANGES_URL = "https://streaming-availability.p.rapidapi.com/changes";
 const RAPIDAPI_HOST = "streaming-availability.p.rapidapi.com";
 const NEW_ON_STREAMING_WINDOW_DAYS = 30;
-const NEW_ON_STREAMING_DEFAULT_CATALOGS = "netflix,prime,hulu,disney,hbo,apple,paramount,peacock";
+// Subscription (and Peacock's free tier) catalogs ONLY. The bare service ids
+// ("prime", "apple", "hulu") also match that service's rent/buy store and its
+// add-on channels -- "prime" is every Prime Video Channels title and every
+// Amazon digital rental, "apple" is essentially the iTunes Store -- and every
+// one of those changes spent one of a page's 25 slots before being thrown
+// away client-side. That is also how a Starz-via-Prime title ended up labelled
+// "Prime Video". JustWatch (what mdblist.com/new-on-streaming reads) lists
+// those channels as separate providers, so leaving them out here is what
+// matching it means, not just what saves quota.
+const NEW_ON_STREAMING_DEFAULT_CATALOGS = [
+  "netflix.subscription",
+  "prime.subscription",
+  "hulu.subscription",
+  "disney.subscription",
+  "hbo.subscription",
+  "apple.subscription",
+  "paramount.subscription",
+  "peacock.subscription",
+  "peacock.free",
+].join(",");
 const NEW_ON_STREAMING_REGIONS = ["US"];
 
 // RapidAPI Streaming Availability Quota Limits & Schedule:
@@ -378,26 +397,68 @@ const NEW_ON_STREAMING_REGIONS = ["US"];
 const RAPIDAPI_MONTHLY_LIMIT = 1000;
 const RAPIDAPI_MONTHLY_SAFETY_CAP = 950;
 
-// Runs every 4 hours via cron (~180 runs/month). With 4 pages + 1 removed-check
-// per incremental run, this uses ~900 requests/month (180 * 5), staying under
-// the 950 safety cap with a small margin.
-const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 14400;
-
-// Maximum pages fetched per sweep.
+// Automated sweeps run every 6 hours (~120/month). The page budget of each one
+// is not fixed: it is whatever is left of the month's safety cap divided by the
+// sweeps left in the month (newOnStreamingTickBudget), clamped to the range
+// below. So a month with a few big manual sweeps spends less per tick later,
+// and one that has been quiet can afford to catch up -- the cap is never the
+// thing that stops the sweep in the last week.
 //
-// RapidAPI's /changes endpoint returns only 25 changes per page (see its
-// openapi.yaml), and a regular sweep never pages past what this budget
-// allows -- there is no cursor continuation once a type's page budget for
-// the tick runs out. 8 major streaming services can easily produce more
-// than 25 real episode-arrival events in a single 4-5 hour sweep window, so
-// this is the actual ceiling on how much of the catalog's real-time bump
-// coverage comes from RapidAPI directly (the rest falls to the slower,
-// TMDB-based bumpNewOnStreamingEpisodes safety net). Raised from 3 to 4 so a
-// regular tick can give `episode` a second page (see itemTypeShares below)
-// instead of the single page every type got before.
+// Every tick has to spend one request per change stream just to ask "anything
+// new?" (see NEW_ON_STREAMING_STREAMS), so fewer, fuller ticks buy more real
+// changes per request than frequent near-empty ones. mdblist's own list moves
+// once a day; four sweeps a day is already finer than that.
+const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 21600;
+const NEW_ON_STREAMING_MIN_PAGES_PER_TICK = 4;
+const NEW_ON_STREAMING_MAX_PAGES_PER_TICK = 16;
+
+// The /changes feed as four independent streams, each with its own resume
+// point in KV (cron:newonstreaming:streams:<region>). A stream is read oldest
+// first from where it last stopped and follows RapidAPI's cursor across ticks,
+// so a busy day (the 1st of the month, a 20-episode season drop) is finished on
+// the next tick instead of everything past the first page being dropped --
+// which is what reading newest-first with a fixed page count per tick did.
+//
+// Listed in priority order: a tick polls every due stream once, then spends
+// what is left in this order. A title's first arrival matters most; episode
+// changes are by far the largest stream (one change per episode, per service)
+// and so get what remains. `everySeconds` throttles a stream that does not need
+// polling every tick. `maxLagSeconds` lets a stream that has fallen hopelessly
+// behind skip forward rather than spend days replaying stale changes that
+// could only ever land below what is already on the shelf.
+const NEW_ON_STREAMING_STREAMS = [
+  { id: "show", changeType: "new", itemType: "show", everySeconds: 0, maxLagSeconds: 0 },
+  { id: "season", changeType: "new", itemType: "season", everySeconds: 0, maxLagSeconds: 0 },
+  { id: "episode", changeType: "new", itemType: "episode", everySeconds: 0, maxLagSeconds: 3 * 86400 },
+  { id: "removed", changeType: "removed", itemType: "show", everySeconds: 86400, maxLagSeconds: 0 },
+];
+// A stream's next query starts this far before where the last one ended, in
+// case a change is published with a timestamp slightly older than the moment
+// it became visible. Re-reading it costs a slot on a page, never a wrong row:
+// every write is an idempotent upsert.
+const NEW_ON_STREAMING_RESUME_OVERLAP_SECONDS = 1800;
+
+// Kept for the admin route's default and the "Clear & pull fresh data" path,
+// which still backfills newest-first (see sweepRapidApiNewOnStreaming).
 const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 4;
 const NEW_ON_STREAMING_PAGES_PER_TICK = NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP;
 const NEW_ON_STREAMING_SWEEP_FETCHES = 1;
+
+// TMDB network ids of each service's own originals. bumpNewOnStreamingEpisodes
+// (the TMDB-based fallback for episode bumps) only moves a service's row when
+// the show is that service's original, because a broadcast air date says
+// nothing about when -- or whether -- a library service gets the episode:
+// Live PD airing on A&E is not new on Netflix, which only has old seasons.
+const NEW_ON_STREAMING_ORIGINAL_NETWORKS = {
+  netflix: [213],
+  primevideo: [1024],
+  disney: [2739],
+  hbomax: [49, 3186],
+  hulu: [453],
+  appletv: [2552],
+  paramount: [4330],
+  peacock: [3353],
+};
 const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 
 // Ships dark. The sweep, the catalog and the /lists route are live as soon as
@@ -9573,7 +9634,7 @@ async function renderAdminDashboard(env) {
         <button type="button" class="secondary lc-btn" style="cursor:pointer; color:#FF9500; border-color:rgba(255,149,0,0.4);" id="nosResetBtn" onclick="runNewOnStreamingSweep(true)">Clear &amp; pull fresh data</button>
         <span id="nosSweepStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
       </div>
-      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Each page fetches up to 25 changes from RapidAPI. Automated sweeps run every 4 hours via cron (~180 runs/month) to stay strictly within your 1,000 req/month plan limit. A safety cap halts sweeps at 950 calls to ensure zero overages. Older titles (&gt;30 days) are pruned automatically each sweep.</p>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Each page fetches up to 25 changes from RapidAPI. Automated sweeps run every 6 hours via cron and read each change stream (new titles, new seasons, new episodes, removals) oldest-first from where the last sweep stopped, so a busy day is finished on the next run instead of being cut off. The per-run budget is the month&#39;s remaining quota spread over the runs left; a safety cap halts sweeps at 950 calls to ensure zero overages. "Run a sweep now" continues the same streams with the page count given. Older titles (&gt;30 days) are pruned automatically each sweep.</p>
     </div>
 
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
@@ -10894,7 +10955,16 @@ async function renderAdminDashboard(env) {
         const usage = st.monthlyUsage || { count: 0, limit: 1000, remaining: 1000, safetyCap: 950 };
         const quotaColor = usage.count >= usage.safetyCap ? '#FF3B30' : (usage.count >= 750 ? '#FF9500' : '#30d158');
         bits.push('<div>Monthly Quota (' + escapeHtmlAdmin(usage.month || '') + '): <strong style="color:' + quotaColor + ';">' + usage.count + ' / ' + usage.limit + ' requests</strong> (' + usage.remaining + ' remaining; safety cap: ' + usage.safetyCap + ')</div>');
-        bits.push('<div>Automated Schedule: <strong>every 4 hours</strong> (~6 runs/day to stay within 1,000 req/mo quota)</div>');
+        const hrs = Math.round((st.intervalSeconds || 21600) / 3600);
+        bits.push('<div>Automated Schedule: <strong>every ' + hrs + ' hours</strong>' + (st.nextTickPages ? ', next run may use up to <strong>' + st.nextTickPages + '</strong> requests (the month&#39;s remaining quota spread over the runs left)' : '') + '</div>');
+        if (st.streams && st.streams.length) {
+          bits.push('<div>Change streams: ' + st.streams.map(function (s) {
+            const label = s.changeType === 'removed' ? 'removals' : (s.itemType === 'show' ? 'new titles' : 'new ' + s.itemType + 's');
+            const upTo = s.readUpTo ? nosEpochToDay(s.readUpTo) + ' ' + new Date(s.readUpTo * 1000).toISOString().slice(11, 16) + ' UTC' : 'not started';
+            return '<strong>' + escapeHtmlAdmin(label) + '</strong> read to ' + escapeHtmlAdmin(upTo) +
+              (s.catchingUp ? ' <span style="color:#FF9500;">(catching up)</span>' : '');
+          }).join(' &middot; ') + '</div>');
+        }
         bits.push('<div>Region: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong> &mdash; 30-day rolling window</div>');
         bits.push('<div>Visible to users: ' + (st.inQuickAdd
           ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
@@ -11080,6 +11150,9 @@ async function renderAdminDashboard(env) {
           resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">Empty -- no matching titles found.</p>';
           return;
         }
+        // Grouped by day like mdblist.com/new-on-streaming, so the two can be
+        // compared side by side.
+        let lastDay = '';
         resultsEl.innerHTML =
           '<div class="table-wrap"><table><tr><th>#</th><th>Poster</th><th>Title</th><th>Type</th><th>Service</th><th>Added Date</th><th>Year</th><th>Id</th></tr>' +
           data.items.map(function (it, i) {
@@ -11094,8 +11167,13 @@ async function renderAdminDashboard(env) {
                 }).join('')
               : '<span style="color:var(--muted);">--</span>';
             const dateStr = it.addedAt ? nosEpochToDay(it.addedAt) : '--';
+            let dayHeader = '';
+            if (dateStr !== lastDay) {
+              lastDay = dateStr;
+              dayHeader = '<tr><td colspan="8" style="font-weight:600; padding-top:14px;">' + escapeHtmlAdmin(dateStr) + '</td></tr>';
+            }
 
-            return '<tr><td>' + (skip + i + 1) + '</td>' +
+            return dayHeader + '<tr><td>' + (skip + i + 1) + '</td>' +
               '<td>' + (it.poster ? '<img src="' + escapeHtmlAdmin(it.poster) + '" alt="" style="width:38px; height:56px; object-fit:cover; border-radius:4px; display:block;">' : '') + '</td>' +
               '<td><strong>' + escapeHtmlAdmin(it.name || '') + '</strong></td>' +
               '<td>' + typeBadge + '</td>' +
@@ -18410,16 +18488,27 @@ async function recordRapidApiUsage(env, addCount = 1) {
 }
 //
 // Uses the Streaming Availability API's GET /changes endpoint to pull the
-// newest movies, shows and episodes added to streaming services.
+// movies, shows, seasons and episodes added to streaming services.
 //
-// New movies and series enter the table dated by their arrival on that service.
-// New episodes update last_event_at on the show's row, pushing the entire show
-// back to the top of the shelf.
+// This is modelled on what mdblist.com/new-on-streaming actually shows. That
+// page is built from JustWatch's "new" feed (mdblist's own changelog, Aug 20
+// 2026), and JustWatch's feed has exactly two kinds of entry: a movie getting
+// an offer on a service, and a SEASON getting one -- including when an existing
+// season's offer gains new episodes (the entry carries newElementCount, e.g.
+// "The Daily Show, season 31, 1 new episode", dated the day it landed). So:
+//
+//   - New movies and series enter the table dated by their arrival on that
+//     service (item_type=show).
+//   - A new season or new episode on a service moves last_event_at on that
+//     service's row, pushing the show back to the top of the shelf
+//     (item_type=season / item_type=episode). Daily shows included: JustWatch
+//     and mdblist list Good Morning America and The Daily Show like anything
+//     else.
 //
 // Pruning removes items older than 30 days, maintaining a strictly rolling
 // 30-day window of recent arrivals and episode drops.
 
-async function fetchRapidApiStreamingChanges({ apiKey, country = "us", changeType = "new", itemType = "show", showType = null, from, to, catalogs, cursor }) {
+async function fetchRapidApiStreamingChanges({ apiKey, country = "us", changeType = "new", itemType = "show", showType = null, from, to, catalogs, cursor, orderDirection = "desc" }) {
   const params = new URLSearchParams();
   params.set("country", String(country || "us").toLowerCase());
   params.set("change_type", String(changeType || "new"));
@@ -18427,7 +18516,7 @@ async function fetchRapidApiStreamingChanges({ apiKey, country = "us", changeTyp
   if (showType && itemType === "show") {
     params.set("show_type", String(showType));
   }
-  params.set("order_direction", "desc");
+  params.set("order_direction", orderDirection === "asc" ? "asc" : "desc");
   params.set("output_language", "en");
   if (Number.isFinite(Number(from)) && Number(from) > 0) {
     params.set("from", String(Math.floor(Number(from))));
@@ -18498,11 +18587,19 @@ function extractRapidApiTmdbId(show) {
   return extractCleanTmdbId(show.tmdbId);
 }
 
+// Turns one /changes page into upserts on `writes`. Returns the newest change
+// timestamp on the page (0 if none) -- filtered-out changes included, since
+// what the stream reader needs to know is how far through the feed it got.
 function processRapidApiStreamingChanges(data, { env, region, nowSec, writes, summary }) {
-  if (!data) return;
+  if (!data) return 0;
   const changes = Array.isArray(data.changes) ? data.changes : [];
   summary.seen += changes.length;
-  if (!changes.length) return;
+  if (!changes.length) return 0;
+  let newestTs = 0;
+  for (const change of changes) {
+    const ts = Number(change && change.timestamp);
+    if (Number.isFinite(ts) && ts > newestTs) newestTs = Math.floor(ts);
+  }
 
   const showsMap = new Map();
   const indexShow = (key, s) => {
@@ -18551,13 +18648,16 @@ function processRapidApiStreamingChanges(data, { env, region, nowSec, writes, su
     const rawServiceStr = String(rawService).toLowerCase().trim();
     const streamingOptionType = String(change.streamingOptionType || (change.service && change.service.streamingOptionType) || "").toLowerCase();
 
-    // Filter out transactional digital store purchases and rentals (e.g. iTunes or Amazon VOD store).
-    // "New on Streaming" is strictly for subscription streaming services (SVOD) and free ad-supported streaming,
-    // exactly matching MDBList.
-    if (streamingOptionType === "rent" || streamingOptionType === "buy") {
+    // Subscription and free only. Rent/buy is a store, not a streaming service,
+    // and an addon is a different provider sold through this one (Starz via
+    // Prime Video Channels, Max via Hulu) -- JustWatch, and so mdblist, list
+    // those as providers of their own. The sweep asks for .subscription
+    // catalogs already (NEW_ON_STREAMING_DEFAULT_CATALOGS); this is for an
+    // admin-supplied catalogs override, and for a response that ignores it.
+    if (streamingOptionType === "rent" || streamingOptionType === "buy" || streamingOptionType === "addon") {
       continue;
     }
-    if (rawServiceStr.includes(".rent") || rawServiceStr.includes(".buy")) {
+    if (rawServiceStr.includes(".rent") || rawServiceStr.includes(".buy") || rawServiceStr.includes(".addon")) {
       continue;
     }
     // Apple TV's bare "apple" catalog represents iTunes Store digital rentals and purchases.
@@ -18566,43 +18666,11 @@ function processRapidApiStreamingChanges(data, { env, region, nowSec, writes, su
       continue;
     }
 
-    // Filter out unscripted daily broadcast TV (daily talk shows, news broadcasts, game shows)
-    // which release hundreds of daily episodes and crowd out movies and scripted series,
-    // matching MDBList's exclusion of daily unscripted television.
-    const showGenres = Array.isArray(show.genres)
-      ? show.genres.map((g) => (typeof g === "object" && g ? (g.id || g.name || "") : String(g)).toLowerCase().trim())
-      : [];
-    const isDailyUnscriptedGenre = showGenres.some((g) =>
-      g === "news" || g === "talk-show" || g === "talk" || g === "game-show" || g === "gameshow" ||
-      g.includes("news") || g.includes("talk") || g.includes("game show")
-    );
-    const nameLower = (show.title || show.name || "").toLowerCase().trim();
-    const isDailyUnscriptedTitle = (
-      nameLower.includes("tonight show starring") ||
-      nameLower.includes("jimmy kimmel live") ||
-      nameLower.includes("the daily show") ||
-      nameLower.includes("late night with") ||
-      nameLower.includes("late show with") ||
-      nameLower.includes("today with jenna") ||
-      nameLower.includes("good morning america") ||
-      nameLower.includes("world news tonight") ||
-      nameLower.includes("cbs evening news") ||
-      nameLower.includes("nbc nightly news") ||
-      nameLower.includes("wheel of fortune") ||
-      nameLower.startsWith("jeopardy") ||
-      nameLower.includes("howard stern") ||
-      nameLower.includes("watch what happens live")
-    );
-
-    if (isDailyUnscriptedGenre || isDailyUnscriptedTitle) {
-      continue;
-    }
-
     const serviceKey = normalizeNewOnStreamingServiceKey(rawService);
     if (!serviceKey) continue;
 
     const eventAt = Number.isFinite(Number(change.timestamp)) && Number(change.timestamp) > 0
-      ? Math.floor(Number(change.timestamp))
+      ? Math.min(Math.floor(Number(change.timestamp)), nowSec)
       : nowSec;
 
     if (change.changeType === "removed") {
@@ -18620,7 +18688,7 @@ function processRapidApiStreamingChanges(data, { env, region, nowSec, writes, su
     const itemType = String(change.itemType || "show").toLowerCase();
     const isEpisode = itemType === "episode";
     const isSeason = itemType === "season";
-    const kind = (isEpisode || isSeason || show.showType === "series") ? "series" : "movie";
+    const kind = (isEpisode || isSeason || change.showType === "series" || show.showType === "series") ? "series" : "movie";
     const eventKind = isEpisode ? "episode" : (isSeason ? "season" : "added");
     const season = Number.isFinite(Number(change.season))
       ? Number(change.season)
@@ -18658,8 +18726,8 @@ function processRapidApiStreamingChanges(data, { env, region, nowSec, writes, su
            event_kind     = CASE WHEN excluded.last_event_at >= streaming_events.last_event_at THEN excluded.event_kind ELSE streaming_events.event_kind END,
            season         = CASE WHEN excluded.last_event_at >= streaming_events.last_event_at THEN excluded.season ELSE streaming_events.season END,
            episode        = CASE WHEN excluded.last_event_at >= streaming_events.last_event_at THEN excluded.episode ELSE streaming_events.episode END,
-           added_at       = CASE WHEN streaming_events.removed_at IS NOT NULL THEN excluded.added_at ELSE streaming_events.added_at END,
-           removed_at     = NULL`
+           added_at       = CASE WHEN streaming_events.removed_at IS NOT NULL AND excluded.last_event_at > streaming_events.removed_at THEN excluded.added_at ELSE streaming_events.added_at END,
+           removed_at     = CASE WHEN streaming_events.removed_at IS NOT NULL AND excluded.last_event_at <= streaming_events.removed_at THEN streaming_events.removed_at ELSE NULL END`
       ).bind(
         region,
         serviceKey,
@@ -18678,12 +18746,156 @@ function processRapidApiStreamingChanges(data, { env, region, nowSec, writes, su
       )
     );
   }
+  return newestTs;
+}
+
+// Pages one automated tick may spend: what is left of the month's safety cap,
+// spread evenly over the sweeps left in the month, clamped to
+// NEW_ON_STREAMING_MIN/MAX_PAGES_PER_TICK and never past what is left.
+function newOnStreamingTickBudget(usedThisMonth, nowSec) {
+  const now = new Date(nowSec * 1000);
+  const monthEnd = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1) / 1000;
+  const ticksLeft = Math.max(1, Math.ceil((monthEnd - nowSec) / NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS));
+  const remaining = Math.max(0, RAPIDAPI_MONTHLY_SAFETY_CAP - Math.max(0, Number(usedThisMonth) || 0));
+  const even = Math.floor(remaining / ticksLeft);
+  return Math.min(
+    remaining,
+    NEW_ON_STREAMING_MAX_PAGES_PER_TICK,
+    Math.max(NEW_ON_STREAMING_MIN_PAGES_PER_TICK, even)
+  );
+}
+
+function newOnStreamingStreamsKey(region) {
+  return `cron:newonstreaming:streams:${region}`;
+}
+
+// Per-stream resume state: { hwm, pending: { from, to, cursor, reachedAt } | null, lastRunAt }.
+//   hwm        every change up to this timestamp has been read
+//   pending    a query in progress -- the same from/to must be re-sent with
+//              its cursor, so they are stored with it
+//   reachedAt  newest change timestamp read so far inside `pending`
+async function readNewOnStreamingStreams(env, region) {
+  const out = {};
+  if (env && env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(newOnStreamingStreamsKey(region));
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (parsed && typeof parsed === "object") Object.assign(out, parsed);
+    } catch (e) {}
+  }
+  for (const stream of NEW_ON_STREAMING_STREAMS) {
+    const st = out[stream.id] && typeof out[stream.id] === "object" ? out[stream.id] : {};
+    out[stream.id] = {
+      hwm: Number.isFinite(st.hwm) ? st.hwm : 0,
+      pending: st.pending && Number.isFinite(st.pending.from) && Number.isFinite(st.pending.to) ? st.pending : null,
+      lastRunAt: Number.isFinite(st.lastRunAt) ? st.lastRunAt : 0,
+    };
+  }
+  return out;
+}
+
+async function writeNewOnStreamingStreams(env, region, state) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    await env.CONFIGS.put(newOnStreamingStreamsKey(region), JSON.stringify(state), { expirationTtl: 5184000 });
+  } catch (e) {}
+}
+
+// Reads up to `pageCap` pages of one stream, oldest first, picking up exactly
+// where the last tick stopped. Returns the pages spent. Leaves `st.pending` set
+// when the stream still has more to read, so the next tick continues the same
+// query with RapidAPI's cursor instead of dropping the rest.
+async function readNewOnStreamingStream(stream, st, pageCap, run) {
+  const { env, rapidKey, country, catalogs, nowSec, windowStart, initialFrom, summary } = run;
+  let pages = 0;
+  if (pageCap <= 0) return 0;
+
+  if (!st.pending) {
+    const from = st.hwm > 0 ? st.hwm - NEW_ON_STREAMING_RESUME_OVERLAP_SECONDS : initialFrom;
+    st.pending = { from: Math.max(windowStart, from), to: nowSec, cursor: null, reachedAt: 0 };
+  }
+  // The API refuses a `from` older than 31 days; a query that has aged past
+  // the window restarts from its edge (the rows it would have written are
+  // pruned anyway).
+  if (st.pending.from < windowStart) {
+    st.pending = { from: windowStart, to: Math.max(windowStart, st.pending.to), cursor: null, reachedAt: 0 };
+  }
+  const reached = Math.max(st.pending.from, st.pending.reachedAt || 0);
+  if (stream.maxLagSeconds > 0 && reached < nowSec - stream.maxLagSeconds) {
+    st.pending = { from: nowSec - stream.maxLagSeconds, to: nowSec, cursor: null, reachedAt: 0 };
+    summary.skippedAhead = summary.skippedAhead || {};
+    summary.skippedAhead[stream.id] = reached;
+  }
+
+  while (pages < pageCap) {
+    let data = null;
+    try {
+      data = await fetchRapidApiStreamingChanges({
+        apiKey: rapidKey,
+        country,
+        changeType: stream.changeType,
+        itemType: stream.itemType,
+        from: st.pending.from,
+        to: st.pending.to,
+        catalogs,
+        cursor: st.pending.cursor,
+        orderDirection: "asc",
+      });
+    } catch (err) {
+      pages++;
+      summary.units++;
+      await recordRapidApiUsage(env, 1);
+      summary.errors++;
+      summary.lastError = err && err.message ? err.message : String(err);
+      console.warn(`[Cron] RapidAPI changes fetch (${stream.id}) failed:`, summary.lastError);
+      // A cursor RapidAPI no longer accepts would fail forever; restart the
+      // query from the newest change already read (re-reading it is harmless,
+      // every write is an idempotent upsert).
+      if (st.pending.cursor) {
+        st.pending = {
+          from: Math.max(windowStart, st.pending.reachedAt || st.pending.from),
+          to: st.pending.to,
+          cursor: null,
+          reachedAt: 0,
+        };
+      }
+      return pages;
+    }
+    pages++;
+    summary.units++;
+    await recordRapidApiUsage(env, 1);
+    summary.pages[stream.id] = (summary.pages[stream.id] || 0) + 1;
+
+    await run.beforeFirstWrite();
+    const newest = processRapidApiStreamingChanges(data, {
+      env,
+      region: run.region,
+      nowSec,
+      writes: run.writes,
+      summary,
+    });
+    if (newest > (st.pending.reachedAt || 0)) st.pending.reachedAt = newest;
+    if (run.writes.length >= 40) {
+      await d1BatchInChunks(env, run.writes, "New on Streaming RapidAPI sweep");
+      run.writes.length = 0;
+    }
+
+    if (data && data.hasMore && data.nextCursor) {
+      st.pending.cursor = data.nextCursor;
+      continue;
+    }
+    st.hwm = st.pending.to;
+    st.pending = null;
+    st.lastRunAt = nowSec;
+    break;
+  }
+  return pages;
 }
 
 async function sweepRapidApiNewOnStreaming(env, ctx, fetchBudget, maxUnits, options = {}) {
   const summary = {
     ran: false, reason: "", units: 0, seen: 0, added: 0, bumped: 0, markedRemoved: 0,
-    errors: 0, pruned: 0, source: "rapidapi",
+    errors: 0, pruned: 0, source: "rapidapi", mode: "", pages: {},
   };
   if (!env || !env.CONFIGS) {
     summary.reason = "no KV binding";
@@ -18712,11 +18924,11 @@ async function sweepRapidApiNewOnStreaming(env, ctx, fetchBudget, maxUnits, opti
     return summary;
   }
 
-  // Automated sweep interval check: runs every 4 hours (14,400s) to fit within 1,000 req/mo.
+  // Automated sweep interval check (NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS).
   // Manual admin sweeps or full backfill bypass interval gating.
   const isManual = options.manual === true;
-  const isFull = options.full === true;
   const isReset = options.reset === true || options.clear === true;
+  const isFull = options.full === true || isReset;
   let lastSweepAt = 0;
   try {
     const lastRaw = await env.CONFIGS.get("cron:newonstreaming:lastsweep");
@@ -18728,11 +18940,12 @@ async function sweepRapidApiNewOnStreaming(env, ctx, fetchBudget, maxUnits, opti
     }
   } catch (e) {}
 
-  if (!isManual && !isFull && !isReset && lastSweepAt > 0) {
+  if (!isManual && !isFull && lastSweepAt > 0) {
     const elapsed = nowSec - lastSweepAt;
     if (elapsed < NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS) {
       const remainingMinutes = Math.ceil((NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS - elapsed) / 60);
-      summary.reason = `Interval cooldown (${remainingMinutes}m until next 4h run to preserve 1,000 req/mo quota)`;
+      const hours = Math.round(NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS / 3600);
+      summary.reason = `Interval cooldown (${remainingMinutes}m until next ${hours}h run to preserve 1,000 req/mo quota)`;
       return summary;
     }
   }
@@ -18740,163 +18953,120 @@ async function sweepRapidApiNewOnStreaming(env, ctx, fetchBudget, maxUnits, opti
   const region = newOnStreamingRegion(options.region);
   const country = region.toLowerCase();
   const catalogs = options.catalogs || NEW_ON_STREAMING_DEFAULT_CATALOGS;
-
-  // Clear existing items if requested so fresh data can be pulled safely
-  // (we defer the DELETE until the first page succeeds so an API error does not wipe data)
-  let pendingReset = isReset;
-  if (isReset) {
-    lastSweepAt = 0;
-    if (env.CONFIGS) {
-      try {
-        await env.CONFIGS.delete("cron:newonstreaming:lastsweep");
-      } catch (e) {}
-    }
-  }
-
-  const thirtyDaysAgo = nowSec - (NEW_ON_STREAMING_WINDOW_DAYS * 86400);
-  let from = thirtyDaysAgo;
-
-  if (!isFull && !isReset && lastSweepAt && lastSweepAt > thirtyDaysAgo) {
-    from = Math.max(thirtyDaysAgo, lastSweepAt - 3600);
-  }
-  if (options.from && Number.isFinite(Number(options.from))) {
-    from = Math.max(thirtyDaysAgo, Number(options.from));
-  }
-  const to = options.to && Number.isFinite(Number(options.to)) ? Number(options.to) : nowSec;
-
-  const defaultLimit = isReset ? 30 : NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP;
-  const effectiveBudget = Number.isFinite(fetchBudget) ? (isReset ? Math.max(30, fetchBudget) : Math.max(0, fetchBudget)) : Infinity;
-  const limitUnits = Number.isFinite(maxUnits) && maxUnits > 0 ? Math.floor(maxUnits) : defaultLimit;
+  const windowStart = nowSec - (NEW_ON_STREAMING_WINDOW_DAYS * 86400);
   const remainingInQuota = Math.max(0, RAPIDAPI_MONTHLY_SAFETY_CAP - monthlyUsage.count);
-  const maxPages = Math.min(effectiveBudget, limitUnits, remainingInQuota);
-
+  const budgetCap = Number.isFinite(fetchBudget) ? Math.max(0, fetchBudget) : Infinity;
   const writes = [];
-  // A regular tick and a backfill (isFull/isReset) want different splits.
-  // A backfill is reconstructing history across up to 30-150 pages, where
-  // `show` (a title's very first sighting) dominates and this split already
-  // reaches back 7-10 days across all 8 services (see CHANGELOG). A regular
-  // 4-page tick has a completely different job: it is not discovering new
-  // history, it is catching *today's* real-time drops -- and per-tick, that
-  // is almost entirely episode changes on shows already known to the
-  // catalog, not brand-new titles. With RapidAPI's /changes page capped at
-  // 25 items and no cursor continuation once a tick's page budget runs out,
-  // giving `episode` a second page (1 -> 2, so 25 -> 50 items/tick) is what
-  // actually moves the real ceiling on this path -- see
-  // NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP in 00_constants.js.
-  const itemTypeConfigs = (isFull || isReset)
-    ? [
-        { type: "show", share: 0.70 },
-        { type: "episode", share: 0.20 },
-        { type: "season", share: 0.10 },
-      ]
-    : [
-        { type: "show", share: 0.25 },
-        { type: "episode", share: 0.50 },
-        { type: "season", share: 0.25 },
-      ];
 
-  let remainingBudget = maxPages;
-
-  for (let i = 0; i < itemTypeConfigs.length; i++) {
-    const { type: itemType, share } = itemTypeConfigs[i];
-    if (remainingBudget <= 0 || summary.units >= maxPages) break;
-
-    const remainingTypes = itemTypeConfigs.length - i;
-    const targetForThisType = remainingTypes === 1
-      ? remainingBudget
-      : Math.max(1, Math.min(remainingBudget - (remainingTypes - 1), Math.round(maxPages * share)));
-
-    let cursor = null;
-    let pages = 0;
-
-    while (pages < targetForThisType && summary.units < maxPages) {
-      let pageData = null;
-      try {
-        pageData = await fetchRapidApiStreamingChanges({
-          apiKey: rapidKey,
-          country,
-          changeType: "new",
-          itemType,
-          from,
-          to,
-          catalogs,
-          cursor,
-        });
-        summary.units++;
-        pages++;
-        remainingBudget--;
-        await recordRapidApiUsage(env, 1);
-      } catch (err) {
-        summary.errors++;
-        const errMsg = err && err.message ? err.message : String(err);
-        summary.lastError = errMsg;
-        console.warn(`[Cron] RapidAPI changes fetch (${itemType}, page ${pages + 1}) failed:`, errMsg);
-        break;
-      }
-
-      if (pageData) {
-        if (pendingReset && env.DB) {
-          try {
-            await env.DB.prepare("DELETE FROM streaming_events WHERE region = ?").bind(region).run();
-            summary.cleared = true;
-          } catch (e) {
-            console.warn("[Cron] New on Streaming clear failed:", e && e.message ? e.message : e);
-          }
-          pendingReset = false;
-        }
-        processRapidApiStreamingChanges(pageData, {
-          env,
-          region,
-          nowSec,
-          writes,
-          summary,
-        });
-        if (writes.length >= 40) {
-          await d1BatchInChunks(env, writes, "New on Streaming RapidAPI sweep");
-          writes.length = 0;
-        }
-        if (!pageData.hasMore || !pageData.nextCursor) {
-          break;
-        }
-        cursor = pageData.nextCursor;
-      } else {
-        break;
-      }
-    }
-  }
-
-  // Also query recent removals if budget permits
-  if (summary.units < maxPages) {
-    try {
-      const removedData = await fetchRapidApiStreamingChanges({
-        apiKey: rapidKey,
-        country,
-        changeType: "removed",
-        itemType: "show",
-        from,
-        to,
-        catalogs,
-      });
-      summary.units++;
-      await recordRapidApiUsage(env, 1);
-      if (removedData) {
-        processRapidApiStreamingChanges(removedData, {
-          env,
-          region,
-          nowSec,
-          writes,
-          summary,
-        });
-      }
-    } catch (e) {}
-  }
-
-  if (pendingReset && summary.errors === 0 && env.DB) {
+  // "Clear & pull fresh data" deletes the region's rows, but only once the
+  // first page has actually come back -- an API error must not leave an
+  // empty table behind.
+  let pendingReset = isReset;
+  const beforeFirstWrite = async () => {
+    if (!pendingReset) return;
+    pendingReset = false;
     try {
       await env.DB.prepare("DELETE FROM streaming_events WHERE region = ?").bind(region).run();
       summary.cleared = true;
     } catch (e) {
       console.warn("[Cron] New on Streaming clear failed:", e && e.message ? e.message : e);
+    }
+  };
+
+  const streams = await readNewOnStreamingStreams(env, region);
+
+  if (isFull) {
+    // Backfill: rebuild the last 30 days newest-first, so whatever the page
+    // budget reaches is the part of the shelf people actually look at. It
+    // then hands over to the incremental streams from "now" -- anything older
+    // it did not reach stays unread, which is the right trade for a rebuild.
+    summary.mode = isReset ? "reset" : "full";
+    if (isReset) {
+      try { await env.CONFIGS.delete("cron:newonstreaming:lastsweep"); } catch (e) {}
+    }
+    const limitUnits = Number.isFinite(maxUnits) && maxUnits > 0 ? Math.floor(maxUnits) : 30;
+    const maxPages = Math.min(isReset ? Math.max(30, budgetCap) : budgetCap, limitUnits, remainingInQuota);
+    const from = options.from && Number.isFinite(Number(options.from)) ? Math.max(windowStart, Number(options.from)) : windowStart;
+    const to = options.to && Number.isFinite(Number(options.to)) ? Number(options.to) : nowSec;
+    const itemTypeConfigs = [
+      { type: "show", share: 0.70 },
+      { type: "episode", share: 0.20 },
+      { type: "season", share: 0.10 },
+    ];
+    let remainingBudget = maxPages;
+    for (let i = 0; i < itemTypeConfigs.length; i++) {
+      const { type: itemType, share } = itemTypeConfigs[i];
+      if (remainingBudget <= 0 || summary.units >= maxPages) break;
+      const remainingTypes = itemTypeConfigs.length - i;
+      const targetForThisType = remainingTypes === 1
+        ? remainingBudget
+        : Math.max(1, Math.min(remainingBudget - (remainingTypes - 1), Math.round(maxPages * share)));
+      let cursor = null;
+      let pages = 0;
+      while (pages < targetForThisType && summary.units < maxPages) {
+        let pageData = null;
+        try {
+          pageData = await fetchRapidApiStreamingChanges({
+            apiKey: rapidKey, country, changeType: "new", itemType, from, to, catalogs, cursor, orderDirection: "desc",
+          });
+        } catch (err) {
+          summary.errors++;
+          summary.lastError = err && err.message ? err.message : String(err);
+          console.warn(`[Cron] RapidAPI changes fetch (${itemType}, page ${pages + 1}) failed:`, summary.lastError);
+          break;
+        } finally {
+          summary.units++;
+          pages++;
+          remainingBudget--;
+          await recordRapidApiUsage(env, 1);
+        }
+        summary.pages[itemType] = (summary.pages[itemType] || 0) + 1;
+        await beforeFirstWrite();
+        processRapidApiStreamingChanges(pageData, { env, region, nowSec, writes, summary });
+        if (writes.length >= 40) {
+          await d1BatchInChunks(env, writes, "New on Streaming RapidAPI sweep");
+          writes.length = 0;
+        }
+        if (!pageData || !pageData.hasMore || !pageData.nextCursor) break;
+        cursor = pageData.nextCursor;
+      }
+    }
+    if (pendingReset && summary.errors === 0) await beforeFirstWrite();
+    for (const stream of NEW_ON_STREAMING_STREAMS) {
+      streams[stream.id] = { hwm: to, pending: null, lastRunAt: stream.changeType === "removed" ? 0 : nowSec };
+    }
+  } else {
+    // Incremental: every due stream is asked once, then what is left of the
+    // budget goes to whichever still has more to read, in priority order.
+    summary.mode = isManual ? "manual" : "tick";
+    const tickBudget = Number.isFinite(maxUnits) && maxUnits > 0
+      ? Math.floor(maxUnits)
+      : newOnStreamingTickBudget(monthlyUsage.count, nowSec);
+    let budget = Math.min(tickBudget, budgetCap, remainingInQuota);
+
+    // A first run after the switch to resumable streams starts where the old
+    // newest-first sweep left off, not 30 days back.
+    const initialFrom = lastSweepAt > 0 ? lastSweepAt - 3600 : nowSec - 86400;
+    const run = { env, rapidKey, country, catalogs, region, nowSec, windowStart, initialFrom, writes, summary, beforeFirstWrite };
+
+    const due = NEW_ON_STREAMING_STREAMS.filter((stream) => {
+      const st = streams[stream.id];
+      if (isManual || !stream.everySeconds || st.pending) return true;
+      return !st.lastRunAt || nowSec - st.lastRunAt >= stream.everySeconds;
+    });
+    for (const stream of due) {
+      if (budget <= 0) break;
+      budget -= await readNewOnStreamingStream(stream, streams[stream.id], 1, run);
+    }
+    for (const stream of due) {
+      if (budget <= 0) break;
+      if (!streams[stream.id].pending) continue;
+      budget -= await readNewOnStreamingStream(stream, streams[stream.id], budget, run);
+    }
+    summary.behind = {};
+    for (const stream of NEW_ON_STREAMING_STREAMS) {
+      const st = streams[stream.id];
+      if (st.pending) summary.behind[stream.id] = Math.max(0, nowSec - Math.max(st.pending.from, st.pending.reachedAt || 0));
     }
   }
 
@@ -18904,12 +19074,13 @@ async function sweepRapidApiNewOnStreaming(env, ctx, fetchBudget, maxUnits, opti
     await d1BatchInChunks(env, writes, "New on Streaming RapidAPI sweep");
     writes.length = 0;
   }
+  await writeNewOnStreamingStreams(env, region, streams);
 
   // Prune items older than 30 days
   try {
     const pruneRes = await env.DB.prepare(
       `DELETE FROM streaming_events WHERE region = ? AND last_event_at < ?`
-    ).bind(region, thirtyDaysAgo).run();
+    ).bind(region, windowStart).run();
     summary.pruned = (pruneRes && pruneRes.meta && pruneRes.meta.changes) || 0;
   } catch (e) {
     console.warn("[Cron] New on Streaming 30-day prune failed:", e && e.message ? e.message : e);
@@ -18957,6 +19128,11 @@ async function d1BatchInChunks(env, statements, label) {
 }
 
 // Episode bumps check active streaming series against TMDB for recent air dates.
+//
+// A fallback, and deliberately a narrow one: it only moves the row of a
+// service the show is an ORIGINAL of (NEW_ON_STREAMING_ORIGINAL_NETWORKS),
+// where the air date and the streaming date are the same day. RapidAPI's
+// episode stream is the real source for everything else.
 //
 // Which 50 shows get checked on a given tick used to be `ORDER BY
 // last_event_at DESC LIMIT 50` -- the shows that were bumped most recently.
@@ -19019,9 +19195,11 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
   let shows = [];
   try {
     const { results } = await env.DB.prepare(
-      `SELECT DISTINCT imdb_id, tmdb_id, name, last_event_at
+      `SELECT imdb_id, MAX(tmdb_id) AS tmdb_id, MAX(name) AS name,
+              GROUP_CONCAT(service || ':' || last_event_at) AS services
          FROM streaming_events
         WHERE region = ? AND kind = 'series' AND removed_at IS NULL
+        GROUP BY imdb_id
         ORDER BY imdb_id
         LIMIT ? OFFSET ?`
     ).bind(region, batchSize, offset).all();
@@ -19084,7 +19262,32 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
       const lastAir = tvData && tvData.last_episode_to_air;
       if (lastAir && lastAir.air_date) {
         const epEpoch = newOnStreamingDateToEpoch(lastAir.air_date, nowSec);
-        if (epEpoch > (row.last_event_at || 0) && epEpoch >= sevenDaysAgo) {
+        if (epEpoch >= sevenDaysAgo) {
+          // Only the rows of services this show is an original of: an air
+          // date is when the episode reached ITS network, which says nothing
+          // about a service that merely licenses older seasons. Bumping every
+          // row put library titles (Live PD, Dance Moms on Netflix) at the
+          // top of the shelf for episodes Netflix never got -- rows
+          // mdblist.com/new-on-streaming, correctly, never shows. Everything
+          // else is left to RapidAPI's episode stream, which sees the
+          // episode land on the service itself.
+          const networkIds = new Set(
+            (Array.isArray(tvData.networks) ? tvData.networks : []).map((n) => Number(n && n.id)).filter(Number.isFinite)
+          );
+          const serviceRows = String(row.services || "").split(",").filter(Boolean).map((part) => {
+            const at = part.lastIndexOf(":");
+            return { service: part.slice(0, at), lastEventAt: Number(part.slice(at + 1)) || 0 };
+          });
+          const originals = serviceRows.filter((r) =>
+            (NEW_ON_STREAMING_ORIGINAL_NETWORKS[r.service] || []).some((id) => networkIds.has(id))
+          );
+          if (!originals.length) {
+            summary.notOriginal = (summary.notOriginal || 0) + 1;
+            continue;
+          }
+          const services = originals.filter((r) => epEpoch > r.lastEventAt).map((r) => r.service);
+          if (!services.length) continue;
+          const placeholders = services.map(() => "?").join(",");
           writes.push(
             env.DB.prepare(
               `UPDATE streaming_events
@@ -19093,8 +19296,8 @@ async function bumpNewOnStreamingEpisodes(env, ctx, fetchBudget) {
                       season = ?,
                       episode = ?,
                       tmdb_id = COALESCE(streaming_events.tmdb_id, ?)
-                WHERE region = ? AND (tmdb_id = ? OR imdb_id = ?) AND ? > last_event_at`
-            ).bind(epEpoch, lastAir.season_number || null, lastAir.episode_number || null, tmdbId, region, tmdbId, row.imdb_id, epEpoch)
+                WHERE region = ? AND imdb_id = ? AND service IN (${placeholders}) AND ? > last_event_at`
+            ).bind(epEpoch, lastAir.season_number || null, lastAir.episode_number || null, tmdbId, region, row.imdb_id, ...services, epEpoch)
           );
           summary.bumped++;
         }
@@ -19578,6 +19781,24 @@ async function newOnStreamingStatus(env) {
       if (raw) out.lastSweep = JSON.parse(raw);
     } catch (e) {}
   }
+  // How far each /changes stream has read. `readUpTo` is the newest change
+  // timestamp every earlier change is known to be in the table for; a stream
+  // with `catchingUp` set is still paging through a busy stretch.
+  const nowSec = Math.floor(Date.now() / 1000);
+  const streamState = await readNewOnStreamingStreams(env, out.region);
+  out.nextTickPages = newOnStreamingTickBudget(usage.count, nowSec);
+  out.streams = NEW_ON_STREAMING_STREAMS.map((stream) => {
+    const st = streamState[stream.id];
+    const readUpTo = st.pending ? Math.max(st.pending.from, st.pending.reachedAt || 0) : st.hwm;
+    return {
+      id: stream.id,
+      changeType: stream.changeType,
+      itemType: stream.itemType,
+      readUpTo: readUpTo || 0,
+      catchingUp: !!st.pending,
+      lastRunAt: st.lastRunAt || 0,
+    };
+  });
   if (!out.d1Bound) return out;
   try {
     const { results } = await env.DB.prepare(

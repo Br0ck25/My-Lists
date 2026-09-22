@@ -2276,7 +2276,7 @@ async function renderAdminDashboard(env) {
         <button type="button" class="secondary lc-btn" style="cursor:pointer; color:#FF9500; border-color:rgba(255,149,0,0.4);" id="nosResetBtn" onclick="runNewOnStreamingSweep(true)">Clear &amp; pull fresh data</button>
         <span id="nosSweepStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
       </div>
-      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Each page fetches up to 25 changes from RapidAPI. Automated sweeps run every 4 hours via cron (~180 runs/month) to stay strictly within your 1,000 req/month plan limit. A safety cap halts sweeps at 950 calls to ensure zero overages. Older titles (&gt;30 days) are pruned automatically each sweep.</p>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Each page fetches up to 25 changes from RapidAPI. Automated sweeps run every 6 hours via cron and read each change stream (new titles, new seasons, new episodes, removals) oldest-first from where the last sweep stopped, so a busy day is finished on the next run instead of being cut off. The per-run budget is the month&#39;s remaining quota spread over the runs left; a safety cap halts sweeps at 950 calls to ensure zero overages. "Run a sweep now" continues the same streams with the page count given. Older titles (&gt;30 days) are pruned automatically each sweep.</p>
     </div>
 
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
@@ -3597,7 +3597,16 @@ async function renderAdminDashboard(env) {
         const usage = st.monthlyUsage || { count: 0, limit: 1000, remaining: 1000, safetyCap: 950 };
         const quotaColor = usage.count >= usage.safetyCap ? '#FF3B30' : (usage.count >= 750 ? '#FF9500' : '#30d158');
         bits.push('<div>Monthly Quota (' + escapeHtmlAdmin(usage.month || '') + '): <strong style="color:' + quotaColor + ';">' + usage.count + ' / ' + usage.limit + ' requests</strong> (' + usage.remaining + ' remaining; safety cap: ' + usage.safetyCap + ')</div>');
-        bits.push('<div>Automated Schedule: <strong>every 4 hours</strong> (~6 runs/day to stay within 1,000 req/mo quota)</div>');
+        const hrs = Math.round((st.intervalSeconds || 21600) / 3600);
+        bits.push('<div>Automated Schedule: <strong>every ' + hrs + ' hours</strong>' + (st.nextTickPages ? ', next run may use up to <strong>' + st.nextTickPages + '</strong> requests (the month&#39;s remaining quota spread over the runs left)' : '') + '</div>');
+        if (st.streams && st.streams.length) {
+          bits.push('<div>Change streams: ' + st.streams.map(function (s) {
+            const label = s.changeType === 'removed' ? 'removals' : (s.itemType === 'show' ? 'new titles' : 'new ' + s.itemType + 's');
+            const upTo = s.readUpTo ? nosEpochToDay(s.readUpTo) + ' ' + new Date(s.readUpTo * 1000).toISOString().slice(11, 16) + ' UTC' : 'not started';
+            return '<strong>' + escapeHtmlAdmin(label) + '</strong> read to ' + escapeHtmlAdmin(upTo) +
+              (s.catchingUp ? ' <span style="color:#FF9500;">(catching up)</span>' : '');
+          }).join(' &middot; ') + '</div>');
+        }
         bits.push('<div>Region: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong> &mdash; 30-day rolling window</div>');
         bits.push('<div>Visible to users: ' + (st.inQuickAdd
           ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
@@ -3783,6 +3792,9 @@ async function renderAdminDashboard(env) {
           resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">Empty -- no matching titles found.</p>';
           return;
         }
+        // Grouped by day like mdblist.com/new-on-streaming, so the two can be
+        // compared side by side.
+        let lastDay = '';
         resultsEl.innerHTML =
           '<div class="table-wrap"><table><tr><th>#</th><th>Poster</th><th>Title</th><th>Type</th><th>Service</th><th>Added Date</th><th>Year</th><th>Id</th></tr>' +
           data.items.map(function (it, i) {
@@ -3797,8 +3809,13 @@ async function renderAdminDashboard(env) {
                 }).join('')
               : '<span style="color:var(--muted);">--</span>';
             const dateStr = it.addedAt ? nosEpochToDay(it.addedAt) : '--';
+            let dayHeader = '';
+            if (dateStr !== lastDay) {
+              lastDay = dateStr;
+              dayHeader = '<tr><td colspan="8" style="font-weight:600; padding-top:14px;">' + escapeHtmlAdmin(dateStr) + '</td></tr>';
+            }
 
-            return '<tr><td>' + (skip + i + 1) + '</td>' +
+            return dayHeader + '<tr><td>' + (skip + i + 1) + '</td>' +
               '<td>' + (it.poster ? '<img src="' + escapeHtmlAdmin(it.poster) + '" alt="" style="width:38px; height:56px; object-fit:cover; border-radius:4px; display:block;">' : '') + '</td>' +
               '<td><strong>' + escapeHtmlAdmin(it.name || '') + '</strong></td>' +
               '<td>' + typeBadge + '</td>' +
