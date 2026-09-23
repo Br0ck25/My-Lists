@@ -156,7 +156,7 @@ describe("My Lists Addon Most Watched catalog", () => {
 });
 
 describe("New on Streaming as a My Lists Addon chart", () => {
-  it("serves 25 titles to Stremio and the website, while the admin preview still sees the whole window", async () => {
+  it("is not capped: the whole window pages through, on the website and in the admin preview", async () => {
     const db = makeD1();
     const env = makeEnv({ DB: db });
     const now = Math.floor(Date.now() / 1000);
@@ -167,8 +167,8 @@ describe("New on Streaming as a My Lists Addon chart", () => {
       ).run(`tt40000${String(i).padStart(2, "0")}`, now - i, now - i, `Arrival ${i}`);
     }
     const pub = await preview(env, "tmdb:new-on-streaming", "movie");
-    assert.equal(pub.sample.length, 25);
-    assert.equal(pub.totalItems, 25);
+    assert.equal(pub.sample.length, 30);
+    assert.equal(pub.totalItems, 30);
     assert.equal(pub.sample[0].name, "Arrival 0");
 
     const login = await call(env, "/admin/login", { method: "POST", form: { key: env.ADMIN_KEY } });

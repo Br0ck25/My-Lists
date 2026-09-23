@@ -6862,7 +6862,7 @@
       const region = (url.searchParams.get("region") || "US").trim().toUpperCase().slice(0, 2) || "US";
       const source = servicesParam ? `tmdb:new-on-streaming:${servicesParam}` : "tmdb:new-on-streaming";
       try {
-        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming", q }, skip, { env, ctx, region, limit, wantTotal: true, uncapped: true });
+        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming", q }, skip, { env, ctx, region, limit, wantTotal: true });
         return json({
           ok: true,
           source,

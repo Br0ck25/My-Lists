@@ -391,6 +391,11 @@ const NEW_ON_STREAMING_JW_REFRESH_DAYS = 3;
 const NEW_ON_STREAMING_JW_PAGE_SIZE = 100;
 const NEW_ON_STREAMING_JW_MAX_PAGES_PER_SWEEP = 30;
 const JUSTWATCH_NEW_TITLES_CAP = 600;
+// TMDB lookups one sweep may spend checking the IMDb ids JustWatch gives
+// (resolveJustWatchIds). Each title is checked once and remembered in the
+// table, so only first sightings cost one; a busy day spills into the next
+// sweep rather than going unchecked.
+const NEW_ON_STREAMING_JW_MAX_ID_LOOKUPS = 300;
 const NEW_ON_STREAMING_JW_INTERVAL_SECONDS = 7200;
 
 const RAPIDAPI_CHANGES_URL = "https://streaming-availability.p.rapidapi.com/changes";
@@ -505,11 +510,9 @@ const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 // at midnight would sit empty all morning.
 const MOST_WATCHED_WINDOWS = ["today", "7", "30"];
 const MOST_WATCHED_TODAY_REFRESH_SECONDS = 3600;
-// Every My Lists Addon chart is capped at this many titles -- Most Watched
-// and New on Streaming alike (the admin New on Streaming preview is not: it
-// is the tool for checking the whole 30-day window).
-const MY_LISTS_ADDON_CHART_MAX_ITEMS = 25;
-const MOST_WATCHED_MAX_ITEMS = MY_LISTS_ADDON_CHART_MAX_ITEMS;
+// Each Most Watched chart is its top 25. (New on Streaming is not capped: it
+// is the whole 30-day window.)
+const MOST_WATCHED_MAX_ITEMS = 25;
 // Titles with an IMDb id get a Metahub poster with no API call at all. Only
 // the rest (a tmdb: id, or no stored name) need a TMDB lookup, and a build is
 // capped at this many so it fits a free-plan request's 50-fetch allowance.
@@ -19245,13 +19248,104 @@ function justWatchPosterUrl(path) {
   return `https://images.justwatch.com${p.replace("{profile}", "s592").replace("{format}", "jpg")}`;
 }
 
+// JustWatch's IMDb id is sometimes wrong -- stale, or an IMDb duplicate record
+// (WWE Raw came through as tt2932286, which IMDb has merged into tt0185103 and
+// Cinemeta lists as "#DUPE#"). A wrong id means no poster, a "Not found" on
+// click and no streams in Stremio. Its TMDB id is reliable, so the IMDb id is
+// taken from TMDB instead: /{movie|tv}/{id}?append_to_response=external_ids,
+// which also yields a poster for the titles JustWatch has none for.
+//
+// Each title is looked up once. A row written from a TMDB answer is stamped
+// last_seen_walk = NOS_ID_CHECKED (a column left over from the old TMDB-walk
+// engine and unused by both current ones), and the next sweep that meets the
+// same TMDB id reuses that row's id instead of asking again -- so the three
+// days re-read every sweep cost no lookups once they have been read once.
+const NOS_ID_CHECKED = 2;
+
+function justWatchEdgeTmdbKey(edge) {
+  const node = edge && edge.node;
+  if (!node) return null;
+  const isSeason = node.__typename === "Season";
+  const content = isSeason ? (node.show && node.show.content) : node.content;
+  const tmdbId = extractCleanTmdbId(content && content.externalIds && content.externalIds.tmdbId);
+  return tmdbId ? { kind: isSeason ? "series" : "movie", tmdbId, key: `${isSeason ? "series" : "movie"}:${tmdbId}` } : null;
+}
+
+async function fetchTmdbIdsForJustWatch(kind, tmdbId, tmdbKey) {
+  const type = kind === "series" ? "tv" : "movie";
+  const res = await fetch(
+    `https://api.themoviedb.org/3/${type}/${tmdbId}?api_key=${encodeURIComponent(tmdbKey)}&append_to_response=external_ids`,
+    { headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` }, cf: { cacheTtl: 604800, cacheEverything: true } }
+  );
+  if (res.status === 404) return { imdbId: null, poster: null };
+  if (!res.ok) throw new Error(`TMDB ${type}/${tmdbId} failed (HTTP ${res.status})`);
+  const d = await res.json();
+  const imdb = (d && d.external_ids && d.external_ids.imdb_id) || (d && d.imdb_id) || null;
+  return {
+    imdbId: imdb && /^tt\d+$/.test(imdb) ? imdb : null,
+    poster: d && d.poster_path ? `https://image.tmdb.org/t/p/w500${d.poster_path}` : null,
+  };
+}
+
+// Resolves every TMDB id on a page to { id, poster }. Returns null when the
+// lookups this page still needs exceed what the sweep has left (`lookups`
+// counts down), so the caller can stop the day here and resume next sweep.
+async function resolveJustWatchIds(env, region, edges, lookups, cache, summary) {
+  const wanted = new Map();
+  for (const e of edges || []) {
+    const k = justWatchEdgeTmdbKey(e);
+    if (k && !cache.has(k.key)) wanted.set(k.key, k);
+  }
+  if (!wanted.size) return cache;
+
+  // Already checked on an earlier sweep?
+  const byKind = { movie: [], series: [] };
+  for (const k of wanted.values()) byKind[k.kind].push(k.tmdbId);
+  for (const kind of ["movie", "series"]) {
+    const ids = byKind[kind];
+    for (let i = 0; i < ids.length; i += 90) {
+      const chunk = ids.slice(i, i + 90);
+      try {
+        const { results } = await env.DB.prepare(
+          `SELECT tmdb_id, imdb_id, MAX(poster) AS poster FROM streaming_events
+            WHERE region = ? AND kind = ? AND last_seen_walk = ? AND tmdb_id IN (${chunk.map(() => "?").join(",")})
+            GROUP BY tmdb_id, imdb_id`
+        ).bind(region, kind, NOS_ID_CHECKED, ...chunk).all();
+        for (const r of results || []) {
+          const key = `${kind}:${r.tmdb_id}`;
+          cache.set(key, { id: r.imdb_id, poster: r.poster || null });
+          wanted.delete(key);
+        }
+      } catch (e) {}
+    }
+  }
+  if (!wanted.size) return cache;
+
+  const tmdbKey = (env && env.TMDB_API_KEY) || TMDB_API_KEY;
+  if (!tmdbKey) return cache; // No key: fall back to JustWatch's ids (processJustWatchNewTitles).
+  if (wanted.size > lookups.left) return null;
+  for (const k of wanted.values()) {
+    lookups.left--;
+    summary.idLookups = (summary.idLookups || 0) + 1;
+    try {
+      const r = await fetchTmdbIdsForJustWatch(k.kind, k.tmdbId, tmdbKey);
+      cache.set(k.key, { id: r.imdbId || `tmdb:${k.tmdbId}`, poster: r.poster, fresh: true });
+    } catch (e) {
+      // Left unresolved: this edge falls back to JustWatch's id, unstamped,
+      // and is checked again on a later sweep.
+      summary.idLookupErrors = (summary.idLookupErrors || 0) + 1;
+    }
+  }
+  return cache;
+}
+
 // One page of edges -> upserts. `position` is the edge's index within the
 // whole day; it orders titles inside a day the way JustWatch lists them (the
 // date is all JustWatch gives, so the time of day is synthetic: midnight UTC
 // plus a few seconds per place, earlier = higher). Deliberately NOT clamped to
 // now: in the first ~2.8 hours of a UTC day every entry of that day would
 // clamp to the same second and lose its order. It never leaves the day.
-function processJustWatchNewTitles(edges, { env, region, dayEpoch, startPosition, nowSec, writes, summary }) {
+function processJustWatchNewTitles(edges, { env, region, dayEpoch, startPosition, nowSec, writes, summary, idCache }) {
   let position = startPosition;
   for (const edge of edges || []) {
     const idx = position++;
@@ -19267,9 +19361,14 @@ function processJustWatchNewTitles(edges, { env, region, dayEpoch, startPosition
     const content = isSeason ? (node.show && node.show.content) : node.content;
     if (!content) continue;
     const ext = content.externalIds || {};
-    const imdbId = ext.imdbId && /^tt\d+$/.test(ext.imdbId) ? ext.imdbId : null;
+    const jwImdbId = ext.imdbId && /^tt\d+$/.test(ext.imdbId) ? ext.imdbId : null;
     const tmdbId = extractCleanTmdbId(ext.tmdbId);
-    const id = imdbId || (tmdbId ? `tmdb:${tmdbId}` : null);
+    // TMDB's answer for this title when there is one (resolveJustWatchIds),
+    // JustWatch's own ids only when there is not.
+    const checked = tmdbId && idCache ? idCache.get(`${isSeason ? "series" : "movie"}:${tmdbId}`) : null;
+    const id = checked ? checked.id : (jwImdbId || (tmdbId ? `tmdb:${tmdbId}` : null));
+    const walkMark = checked ? NOS_ID_CHECKED : 1;
+    const poster = justWatchPosterUrl(content.posterUrl) || (checked && checked.poster) || null;
     if (!id) {
       summary.noId = (summary.noId || 0) + 1;
       continue;
@@ -19287,9 +19386,9 @@ function processJustWatchNewTitles(edges, { env, region, dayEpoch, startPosition
         `INSERT INTO streaming_events
            (region, service, imdb_id, tmdb_id, kind, added_at, last_event_at, event_kind,
             season, episode, seeded, last_seen_walk, removed_at, name, poster, background, year)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL, ?, ?, NULL, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, NULL, ?)
          ON CONFLICT (region, service, imdb_id) DO UPDATE SET
-           last_seen_walk = 1,
+           last_seen_walk = MAX(streaming_events.last_seen_walk, excluded.last_seen_walk),
            tmdb_id        = COALESCE(excluded.tmdb_id, streaming_events.tmdb_id),
            name           = CASE WHEN excluded.name != '' THEN excluded.name ELSE streaming_events.name END,
            poster         = COALESCE(excluded.poster, streaming_events.poster),
@@ -19302,9 +19401,19 @@ function processJustWatchNewTitles(edges, { env, region, dayEpoch, startPosition
            removed_at     = NULL`
       ).bind(
         region, provider.key, id, tmdbId, kind, eventAt, eventAt, eventKind,
-        season, newEpisodes, content.title || "", justWatchPosterUrl(content.posterUrl), year
+        season, newEpisodes, walkMark, content.title || "", poster, year
       )
     );
+    // A title first written under JustWatch's wrong id: drop that row, now
+    // that the right one exists. Once per title per sweep.
+    if (checked && checked.fresh && !checked.cleaned) {
+      checked.cleaned = true;
+      writes.push(
+        env.DB.prepare(
+          `DELETE FROM streaming_events WHERE region = ? AND kind = ? AND tmdb_id = ? AND imdb_id != ?`
+        ).bind(region, kind, tmdbId, id)
+      );
+    }
   }
   return position;
 }
@@ -19381,6 +19490,16 @@ async function sweepJustWatchNewOnStreaming(env, ctx, fetchBudget, maxUnits, opt
   }
 
   const writes = [];
+  // TMDB id checks this sweep may spend (see resolveJustWatchIds), and what
+  // they have found so far. On the cron tick they come out of the same
+  // outbound-fetch share as the pages (whatever the pages leave); an admin
+  // sweep runs in its own request and gets the full allowance.
+  const lookups = {
+    left: isManual || isFull || !Number.isFinite(fetchBudget)
+      ? NEW_ON_STREAMING_JW_MAX_ID_LOOKUPS
+      : Math.max(0, Math.min(NEW_ON_STREAMING_JW_MAX_ID_LOOKUPS, Math.floor(fetchBudget) - budget)),
+  };
+  const idCache = new Map();
   let pendingReset = isReset;
   const clearOnce = async () => {
     if (!pendingReset) return;
@@ -19411,6 +19530,7 @@ async function sweepJustWatchNewOnStreaming(env, ctx, fetchBudget, maxUnits, opt
     let position = resume ? (Number(st.position) || 0) : 0;
     const dayEpoch = Math.floor(Date.UTC(Number(date.slice(0, 4)), Number(date.slice(5, 7)) - 1, Number(date.slice(8, 10))) / 1000);
     let failed = false;
+    let outOfLookups = false;
     while (budget > 0 && queue.length) {
       const slice = queue[0];
       let page;
@@ -19436,7 +19556,14 @@ async function sweepJustWatchNewOnStreaming(env, ctx, fetchBudget, maxUnits, opt
           continue;
         }
       }
-      position = processJustWatchNewTitles(page.edges, { env, region, dayEpoch, startPosition: position, nowSec, writes, summary });
+      const resolved = await resolveJustWatchIds(env, region, page.edges, lookups, idCache, summary);
+      if (!resolved) {
+        // Not enough TMDB lookups left for this page: stop the day here, on
+        // this page's own cursor, and pick it up next sweep.
+        outOfLookups = true;
+        break;
+      }
+      position = processJustWatchNewTitles(page.edges, { env, region, dayEpoch, startPosition: position, nowSec, writes, summary, idCache });
       if (writes.length >= 40) {
         await d1BatchInChunks(env, writes, "New on Streaming JustWatch sweep");
         writes.length = 0;
@@ -19449,10 +19576,10 @@ async function sweepJustWatchNewOnStreaming(env, ctx, fetchBudget, maxUnits, opt
         after = info.endCursor;
       }
     }
-    const done = !failed && queue.length === 0;
+    const done = !failed && !outOfLookups && queue.length === 0;
     days[date] = done ? { done: true, at: nowSec } : { done: false, queue, after, position, at: nowSec };
     summary.days.push({ date, done, entries: position });
-    if (failed) break;
+    if (failed || outOfLookups) break;
   }
 
   if (writes.length > 0) {
@@ -20077,20 +20204,8 @@ async function fetchNewOnStreaming(entry, skip = 0, keys = {}) {
   const services = parseNewOnStreamingServices(suffix);
   const selected = services || NEW_ON_STREAMING_PROVIDERS.map((p) => p.key);
   const placeholders = selected.map(() => "?").join(",");
-  // The public row is a My Lists Addon chart, capped like the others
-  // (MY_LISTS_ADDON_CHART_MAX_ITEMS). Only the admin preview reads past it.
-  const cap = keys.uncapped === true ? Infinity : MY_LISTS_ADDON_CHART_MAX_ITEMS;
-  if (Math.max(0, skip) >= cap) {
-    const none = [];
-    none.totalItems = cap;
-    none.limit = 0;
-    none.skip = Math.max(0, skip);
-    return none;
-  }
-  const pageSize = Math.min(
-    Number.isFinite(keys.limit) && keys.limit > 0 ? Math.min(100, Math.floor(keys.limit)) : PAGE_SIZE,
-    cap - Math.max(0, skip)
-  );
+  // Not capped: the whole 30-day window pages like any other catalog.
+  const pageSize = Number.isFinite(keys.limit) && keys.limit > 0 ? Math.min(100, Math.floor(keys.limit)) : PAGE_SIZE;
   const qStr = entry && typeof entry.q === "string" ? entry.q.trim().toLowerCase() : "";
   const searchFilter = qStr ? "AND (LOWER(name) LIKE ? OR LOWER(imdb_id) LIKE ?) " : "";
   const searchParams = qStr ? [`%${qStr}%`, `%${qStr}%`] : [];
@@ -20149,7 +20264,7 @@ async function fetchNewOnStreaming(entry, skip = 0, keys = {}) {
     services: row.services ? row.services.split(",") : (row.service ? [row.service] : []),
     addedAt: row.ev || undefined,
   }));
-  metas.totalItems = total == null ? total : Math.min(total, cap);
+  metas.totalItems = total;
   metas.limit = pageSize;
   metas.skip = Math.max(0, skip);
   return metas;
@@ -86062,7 +86177,7 @@ function generateSearchVariations(query) {
       const region = (url.searchParams.get("region") || "US").trim().toUpperCase().slice(0, 2) || "US";
       const source = servicesParam ? `tmdb:new-on-streaming:${servicesParam}` : "tmdb:new-on-streaming";
       try {
-        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming", q }, skip, { env, ctx, region, limit, wantTotal: true, uncapped: true });
+        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming", q }, skip, { env, ctx, region, limit, wantTotal: true });
         return json({
           ok: true,
           source,

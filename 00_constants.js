@@ -341,6 +341,11 @@ const NEW_ON_STREAMING_JW_REFRESH_DAYS = 3;
 const NEW_ON_STREAMING_JW_PAGE_SIZE = 100;
 const NEW_ON_STREAMING_JW_MAX_PAGES_PER_SWEEP = 30;
 const JUSTWATCH_NEW_TITLES_CAP = 600;
+// TMDB lookups one sweep may spend checking the IMDb ids JustWatch gives
+// (resolveJustWatchIds). Each title is checked once and remembered in the
+// table, so only first sightings cost one; a busy day spills into the next
+// sweep rather than going unchecked.
+const NEW_ON_STREAMING_JW_MAX_ID_LOOKUPS = 300;
 const NEW_ON_STREAMING_JW_INTERVAL_SECONDS = 7200;
 
 const RAPIDAPI_CHANGES_URL = "https://streaming-availability.p.rapidapi.com/changes";
@@ -455,11 +460,9 @@ const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 // at midnight would sit empty all morning.
 const MOST_WATCHED_WINDOWS = ["today", "7", "30"];
 const MOST_WATCHED_TODAY_REFRESH_SECONDS = 3600;
-// Every My Lists Addon chart is capped at this many titles -- Most Watched
-// and New on Streaming alike (the admin New on Streaming preview is not: it
-// is the tool for checking the whole 30-day window).
-const MY_LISTS_ADDON_CHART_MAX_ITEMS = 25;
-const MOST_WATCHED_MAX_ITEMS = MY_LISTS_ADDON_CHART_MAX_ITEMS;
+// Each Most Watched chart is its top 25. (New on Streaming is not capped: it
+// is the whole 30-day window.)
+const MOST_WATCHED_MAX_ITEMS = 25;
 // Titles with an IMDb id get a Metahub poster with no API call at all. Only
 // the rest (a tmdb: id, or no stored name) need a TMDB lookup, and a build is
 // capped at this many so it fits a free-plan request's 50-fetch allowance.

@@ -1515,6 +1515,109 @@ describe("JustWatch New on Streaming sweep", () => {
     }
   });
 
+  // JustWatch's IMDb id is sometimes wrong (WWE Raw arrived as tt2932286, an
+  // IMDb duplicate record), which showed as "No poster" and "Not found" on the
+  // website. Its TMDB id is right, so the IMDb id comes from TMDB.
+  function stubJustWatchAndTmdb(byDate, tmdb) {
+    const net = stubJustWatch(byDate);
+    const inner = globalThis.fetch;
+    const tmdbCalls = [];
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      const m = u.match(/api\.themoviedb\.org\/3\/(tv|movie)\/(\d+)\?/);
+      if (m) {
+        tmdbCalls.push(`${m[1]}/${m[2]}`);
+        const body = tmdb[`${m[1]}/${m[2]}`];
+        if (!body) return new Response("{}", { status: 404 });
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return inner(url, opts);
+    };
+    return { restore: () => { globalThis.fetch = inner; net.restore(); }, calls: net.calls, tmdbCalls };
+  }
+
+  it("takes the IMDb id from TMDB rather than JustWatch, once per title", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb" });
+    const net = stubJustWatchAndTmdb(
+      {
+        [day(0)]: [[
+          jwEdge({ type: "Season", title: "WWE Raw", imdbId: "tt2932286", tmdbId: "4656", pkg: "nfx", season: 34, newEps: 1 }),
+          jwEdge({ title: "No IMDb On TMDB", imdbId: "tt0000404", tmdbId: "777", pkg: "amp" }),
+        ]],
+      },
+      {
+        "tv/4656": { id: 4656, poster_path: "/raw.jpg", external_ids: { imdb_id: "tt0185103" } },
+        "movie/777": { id: 777, poster_path: null, external_ids: { imdb_id: null } },
+      }
+    );
+    try {
+      const cookie = await adminCookie(env);
+      await sweep(env, cookie, 3);
+      const rows = db.q("SELECT imdb_id, tmdb_id, last_seen_walk FROM streaming_events ORDER BY imdb_id");
+      assert.deepEqual(rows.map((r) => r.imdb_id), ["tmdb:777", "tt0185103"]);
+      assert.ok(rows.every((r) => r.last_seen_walk === 2), "rows written from a TMDB answer are marked checked");
+      assert.deepEqual(net.tmdbCalls.sort(), ["movie/777", "tv/4656"]);
+
+      // The next sweep re-reads the same days and asks TMDB nothing.
+      net.tmdbCalls.length = 0;
+      await sweep(env, cookie, 3);
+      assert.deepEqual(net.tmdbCalls, []);
+      assert.equal(db.q("SELECT COUNT(*) AS n FROM streaming_events")[0].n, 2);
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("drops a row an earlier sweep wrote under JustWatch's wrong id", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb" });
+    const now = Math.floor(Date.now() / 1000);
+    db._db.prepare(
+      `INSERT INTO streaming_events (region, service, imdb_id, tmdb_id, kind, added_at, last_event_at, event_kind, name)
+       VALUES ('US', 'netflix', 'tt2932286', 4656, 'series', ?, ?, 'season', 'WWE Raw')`
+    ).run(now - 86400, now - 86400);
+    const net = stubJustWatchAndTmdb(
+      { [day(0)]: [[jwEdge({ type: "Season", title: "WWE Raw", imdbId: "tt2932286", tmdbId: "4656", pkg: "nfx", season: 34, newEps: 1 })]] },
+      { "tv/4656": { id: 4656, poster_path: "/raw.jpg", external_ids: { imdb_id: "tt0185103" } } }
+    );
+    try {
+      const cookie = await adminCookie(env);
+      await sweep(env, cookie, 3);
+      assert.deepEqual(liveTitles(db).map((r) => r.imdb_id), ["tt0185103"]);
+    } finally {
+      net.restore();
+    }
+  });
+
+  it("stops a day when this sweep is out of TMDB lookups, and finishes it on the next", async () => {
+    const db = makeD1();
+    const env = makeEnv({ DB: db, TMDB_API_KEY: "test-tmdb" });
+    const pages = [];
+    const tmdb = {};
+    for (let p = 0; p < 4; p++) {
+      const page = [];
+      for (let i = 0; i < 100; i++) {
+        const n = p * 100 + i + 1;
+        page.push(jwEdge({ title: `Movie ${n}`, imdbId: `tt9${String(n).padStart(6, "0")}`, tmdbId: String(n), pkg: "nfx" }));
+        tmdb[`movie/${n}`] = { id: n, poster_path: "/p.jpg", external_ids: { imdb_id: `tt9${String(n).padStart(6, "0")}` } };
+      }
+      pages.push(page);
+    }
+    const net = stubJustWatchAndTmdb({ [day(0)]: pages }, tmdb);
+    try {
+      const cookie = await adminCookie(env);
+      const first = await sweep(env, cookie, 10);
+      assert.equal(first.idLookups, 300);
+      assert.equal(db.q("SELECT COUNT(*) AS n FROM streaming_events")[0].n, 300);
+      const second = await sweep(env, cookie, 10);
+      assert.equal(second.idLookups, 100);
+      assert.equal(db.q("SELECT COUNT(*) AS n FROM streaming_events")[0].n, 400);
+    } finally {
+      net.restore();
+    }
+  });
+
   it("does not run the TMDB episode bump (the feed already carries episodes)", async () => {
     const db = makeD1();
     const env = makeEnv({ DB: db, TMDB_API_KEY: "k" });

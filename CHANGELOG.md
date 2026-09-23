@@ -13,7 +13,16 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
   - `computeLeaderboard` skips such ids, so the counts already recorded under "null" disappear from the admin table and the charts without touching stored data.
   - Most Watched only charts real title ids (`tt…` or `tmdb:…`). A bare number is ambiguous: the Trakt importer falls back to an episode's TMDB id when a show has no IMDb id. The snapshot key moved to `v2`, so live charts rebuild on their next request.
 - **Renamed:** "Most Watched Today", "Most Watched 7 Days" and "Most Watched 30 Days". Links using the old `/lists/My-Lists-Addon-Most-Watched-…` slugs still resolve (`LEGACY_CHART_SLUGS`).
-- **Every My Lists Addon chart is capped at 25 titles** (`MY_LISTS_ADDON_CHART_MAX_ITEMS`): the three Most Watched charts and New on Streaming, in Stremio and on the website. The admin New on Streaming preview is not capped, so it can still page through the whole 30-day window.
+- **The three Most Watched charts are capped at 25 titles** (`MOST_WATCHED_MAX_ITEMS`). New on Streaming is not capped: it pages through the whole 30-day window.
+
+### 🐛 New on Streaming: "No poster" and "Not found or TMDB error" on some shows
+
+JustWatch's IMDb id is sometimes wrong. *Mysteries at the Museum* came through as tt8113838 and *The Kitchen* as tt3547488, and Cinemeta has nothing for either. *WWE Raw* came through as tt2932286, an IMDb duplicate record that Cinemeta lists as `#DUPE#`; the real one is tt0185103. With a wrong id, TMDB has no match, so the website shows "No poster" and clicking the title says "Not found or TMDB error". Stremio can't find streams for it either. JustWatch's TMDB id is right (4656 for WWE Raw, which Cinemeta also maps to tt0185103).
+
+- **The sweep now takes the IMDb id from TMDB** (`resolveJustWatchIds`): `/{movie|tv}/{tmdbId}?append_to_response=external_ids`. The same request also gives a poster when JustWatch has none. A title TMDB knows with no IMDb id is stored as `tmdb:<id>`, which the website opens fine.
+- **Each title is checked once.** Rows written from TMDB's answer are stamped `last_seen_walk = 2` (`NOS_ID_CHECKED`). That column is left over from the old TMDB-walk engine, so no migration is needed. Later sweeps reuse a checked row's id without asking TMDB again.
+- **Old rows under a wrong id are deleted** once the right one is written.
+- **Lookup budget:** up to 300 lookups per sweep (`NEW_ON_STREAMING_JW_MAX_ID_LOOKUPS`), taken from the cron's outbound-fetch share. A day that needs more stops at that page and finishes on the next sweep. If `TMDB_API_KEY` is not set, JustWatch's ids are used as before.
 
 ### ⭐ My Lists Addon Charts: New on Streaming and Most Watched, on the website
 
