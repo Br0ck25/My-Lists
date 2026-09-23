@@ -488,14 +488,28 @@ const NEW_ON_STREAMING_ORIGINAL_NETWORKS = {
 };
 const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 
-// Ships dark. The sweep, the catalog and the /lists route are live as soon as
-// this deploys -- tmdb:new-on-streaming resolves, installs into Stremio and
-// pages like any other row -- but the Quick Add shelf and the Discover
-// entries stay hidden until this is true, so the list can be tested from the
-// admin dashboard against real data before anyone else can add it. Flipping
-// this to true is the entire "move it to the live site" step; nothing else
-// about the feature changes.
-const NEW_ON_STREAMING_IN_QUICK_ADD = false;
+// The shelf is public: "New on Streaming" is in the My Lists Addon Charts
+// section of Quick Add and in Discover (MY_LISTS_ADDON_CHARTS,
+// 08_quickadd-chart-data.js).
+
+// --- My Lists Addon Most Watched ---------------------------------------------
+//
+// mylists:most-watched:<window> -- this add-on's own chart, built from the
+// same "watched" counts as the admin dashboard's Trending Data tab
+// (computeLeaderboard, 03_admin.js). Windows are Eastern calendar days, the
+// same buckets that tab uses.
+//
+// Each window/type is a snapshot in KV (mylists:mostwatched:v1:<window>:<type>),
+// rebuilt on the first request after it goes stale: the 7- and 30-day charts
+// once per Eastern day, "today" once an hour -- a "today" that only refreshed
+// at midnight would sit empty all morning.
+const MOST_WATCHED_WINDOWS = ["today", "7", "30"];
+const MOST_WATCHED_TODAY_REFRESH_SECONDS = 3600;
+const MOST_WATCHED_MAX_ITEMS = 100;
+// Titles with an IMDb id get a Metahub poster with no API call at all. Only
+// the rest (a tmdb: id, or no stored name) need a TMDB lookup, and a build is
+// capped at this many so it fits a free-plan request's 50-fetch allowance.
+const MOST_WATCHED_MAX_LOOKUPS = 20;
 
 // --- Quick Add network channel presets --------------------------------------
 //
@@ -9462,7 +9476,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="trending">
-    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. Meant to eventually seed this add-on's own trending/popular catalogs once there's enough data.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. The <strong>Most Watched</strong> counts for Today, Last 7 Days and Last 30 Days are what the public <strong>My Lists Addon Most Watched</strong> charts show (Quick Add &rarr; My Lists Addon Charts, and Discover); those refresh hourly for Today and daily for 7/30 days.</p>
     <div style="margin:12px 0;">
       <select class="admin-select" id="trendingTypeSelect" onchange="loadTrendingData()">
         <option value="watched">Most Watched</option>
@@ -9646,7 +9660,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="newonstreaming">
-    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it just has no Quick Add card and no Discover entry until it is turned on for everyone.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it is in the My Lists Addon Charts section of Quick Add and in Discover.</p>
     <p style="color:#8E8E93; margin:0 0 16px; font-size:0.82rem;">Powered by RapidAPI's <strong>Streaming Availability API</strong> (/changes) to capture the exact date titles and new episodes are added to streaming services (not release dates), with new arrivals first and recent episodes bumping shows to the top within a rolling 30-day window.</p>
 
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
@@ -10996,9 +11010,7 @@ async function renderAdminDashboard(env) {
           }).join(' &middot; ') + '</div>');
         }
         bits.push('<div>Region: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong> &mdash; 30-day rolling window</div>');
-        bits.push('<div>Visible to users: ' + (st.inQuickAdd
-          ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
-          : '<span style="color:#FF9500;">no -- admin only (NEW_ON_STREAMING_IN_QUICK_ADD is false)</span>') + '</div>');
+        bits.push('<div>Visible to users: <span style="color:#30d158;">yes -- My Lists Addon Charts in Quick Add, and Discover</span></div>');
         const totals = st.totals || {};
         bits.push('<div>Active titles in 30d window: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows (' + (totals.removed || 0) + ' marked removed)</div>');
         if (st.lastSweep) {
@@ -12093,6 +12105,8 @@ function detectSource(input) {
     s === "rapidapi:new-on-streaming" || s.startsWith("rapidapi:new-on-streaming:") ||
     s === "streaming:new-on-streaming" || s.startsWith("streaming:new-on-streaming:")
   ) return "tmdb-new-on-streaming";
+  // This add-on's own Most Watched chart -- "mylists:most-watched:today|7|30".
+  if (s.startsWith("mylists:most-watched:")) return "mylists-most-watched";
   if (s.startsWith("trakt:chart:")) return "trakt-chart";
   if (s.startsWith("simkl:chart:")) return "simkl-chart";
   if (s.startsWith("simkl:user:")) return "simkl-user";
@@ -12128,7 +12142,8 @@ function isAllowedCatalogSourceUrl(raw) {
     s.startsWith("customlist:v1:") ||
     s.startsWith("autotrack:") ||
     s.startsWith("custom:") ||
-    s.startsWith("curated:")
+    s.startsWith("curated:") ||
+    s.startsWith("mylists:most-watched:")
   ) {
     return true;
   }
@@ -12505,6 +12520,9 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     // where it is already counted against the sweep's own budget rather than
     // against whoever happened to open the shelf.
     else if (source === "tmdb-new-on-streaming") { result = await fetchNewOnStreaming(entry, skip, keys); }
+    // Reads this add-on's own watch counts (a KV snapshot, rebuilt at most
+    // hourly/daily); see fetchMostWatchedCatalog.
+    else if (source === "mylists-most-watched") { result = await fetchMostWatchedCatalog(entry, skip, keys); }
     else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length), keys.env, keys.ctx); }
     else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length), keys.env, keys.ctx); }
     else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length), keys.tmdbKey, keys.env, keys.ctx); }
@@ -20117,7 +20135,6 @@ async function newOnStreamingStatus(env) {
     engine: newOnStreamingEngine(env),
     region: NEW_ON_STREAMING_REGIONS[0],
     providers: NEW_ON_STREAMING_PROVIDERS.map((p) => ({ key: p.key, name: p.name, rapidId: p.rapidId })),
-    inQuickAdd: NEW_ON_STREAMING_IN_QUICK_ADD,
     monthlyUsage: {
       month: usage.month,
       count: usage.count,
@@ -20196,6 +20213,122 @@ async function newOnStreamingStatus(env) {
       : safeErrorMessage(e);
   }
   return out;
+}
+
+// --- My Lists Addon Most Watched ---------------------------------------------
+//
+// mylists:most-watched:today|7|30 -- the add-on's own chart of what people
+// using it watched, from the admin Trending Data "Most Watched" counts. See
+// MOST_WATCHED_* (00_constants.js) for the refresh rules.
+
+function parseMostWatchedWindow(url) {
+  const m = /^mylists:most-watched:([a-z0-9]+)$/i.exec(String(url || "").trim());
+  const w = m ? m[1].toLowerCase() : "";
+  return MOST_WATCHED_WINDOWS.includes(w) ? w : null;
+}
+
+function mostWatchedSnapshotKey(window, type) {
+  return `mylists:mostwatched:v1:${window}:${type}`;
+}
+
+// Is a stored snapshot still the current one?
+function mostWatchedSnapshotFresh(snap, window, nowMs) {
+  if (!snap || !Array.isArray(snap.metas) || !Number.isFinite(snap.builtAt)) return false;
+  if (window === "today") {
+    return snap.day === easternDateKey(new Date(nowMs)) && nowMs - snap.builtAt < MOST_WATCHED_TODAY_REFRESH_SECONDS * 1000;
+  }
+  return snap.day === easternDateKey(new Date(nowMs));
+}
+
+async function buildMostWatchedMetas(env, ctx, window, type) {
+  const entries = await computeLeaderboard(env, "watched", window, type);
+  // Counts are per show already (the website sends showId, the scrobbler the
+  // show's IMDb id), but an episode id ("tt123:1:2") that slipped through is
+  // folded into its show rather than charting on its own.
+  const byId = new Map();
+  for (const e of entries || []) {
+    if (!e || !e.id) continue;
+    const tt = /^tt\d+/.exec(e.id);
+    const id = tt ? tt[0] : e.id;
+    const prev = byId.get(id);
+    if (prev) prev.count += Number(e.count) || 0;
+    else byId.set(id, { ...e, id, count: Number(e.count) || 0 });
+  }
+  const ranked = [...byId.values()]
+    .filter((e) => e.count > 0)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, MOST_WATCHED_MAX_ITEMS);
+
+  const tmdbKey = (env && env.TMDB_API_KEY) || TMDB_API_KEY;
+  let lookups = 0;
+  const metas = [];
+  for (const e of ranked) {
+    const isImdb = /^tt\d+$/.test(e.id);
+    let name = e.title && e.title !== e.id ? e.title : "";
+    let poster = isImdb ? `https://images.metahub.space/poster/medium/${e.id}/img` : "";
+    let releaseInfo;
+    if ((!poster || !name) && tmdbKey && lookups < MOST_WATCHED_MAX_LOOKUPS) {
+      lookups++;
+      const det = await fetchTmdbItemDetails(e.id, tmdbKey, type, "", false, env, ctx).catch(() => null);
+      if (det) {
+        name = name || det.title || "";
+        poster = poster || det.poster || "";
+        if (det.releaseYear) releaseInfo = String(det.releaseYear);
+      }
+    }
+    // A row Stremio cannot draw or name is worse than a shorter chart.
+    if (!name || !poster) continue;
+    metas.push({ id: e.id, type, name, poster, releaseInfo, watchCount: e.count });
+  }
+  return metas;
+}
+
+async function fetchMostWatchedCatalog(entry, skip = 0, keys = {}) {
+  const env = keys && keys.env;
+  const window = parseMostWatchedWindow(entry && entry.url);
+  if (!window) throw new Error("Unknown Most Watched window.");
+  const type = entry && entry.type === "series" ? "series" : "movie";
+  const pageSize = Number.isFinite(keys.limit) && keys.limit > 0 ? Math.min(100, Math.floor(keys.limit)) : PAGE_SIZE;
+  const nowMs = Date.now();
+  const key = mostWatchedSnapshotKey(window, type);
+
+  let snap = null;
+  if (env && env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(key);
+      snap = raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      snap = null;
+    }
+  }
+  if (!mostWatchedSnapshotFresh(snap, window, nowMs)) {
+    try {
+      const metas = await buildMostWatchedMetas(env, keys.ctx, window, type);
+      snap = { builtAt: nowMs, day: easternDateKey(new Date(nowMs)), metas };
+      if (env && env.CONFIGS) {
+        const put = env.CONFIGS.put(key, JSON.stringify(snap), { expirationTtl: 3 * 86400 }).catch(() => {});
+        if (keys.ctx && typeof keys.ctx.waitUntil === "function") keys.ctx.waitUntil(put);
+        else await put;
+      }
+    } catch (e) {
+      // A failed rebuild serves the last snapshot rather than nothing.
+      if (!snap || !Array.isArray(snap.metas)) throw e;
+    }
+  }
+
+  const all = snap && Array.isArray(snap.metas) ? snap.metas : [];
+  const start = Math.max(0, skip);
+  const page = all.slice(start, start + pageSize).map((m) => ({
+    id: m.id,
+    type: m.type || type,
+    name: m.name,
+    poster: m.poster,
+    releaseInfo: m.releaseInfo || undefined,
+  }));
+  page.totalItems = all.length;
+  page.limit = pageSize;
+  page.skip = start;
+  return page;
 }
 
 // --- Anime Unpacking & Multi-Season Parts Resolution -------------------------
@@ -22361,51 +22494,30 @@ function buildGenresHtml() {
   return buildStreamingRowsHtml(GENRE_LISTS, "", "Genres");
 }
 
-// --- New on Streaming ------------------------------------------------------
+// --- My Lists Addon Charts --------------------------------------------------
 //
-// One row per service plus an everything row, all served by the same source
-// (tmdb:new-on-streaming, 07_source-fetchers-tmdb-simkl.js) and all sorted the
-// same way: most recently arrived first, with a show pushed back to the top
-// when a new episode airs.
+// This add-on's own charts, built from its own data rather than a provider's:
 //
-// Built from NEW_ON_STREAMING_PROVIDERS rather than written out, so the
-// service list has exactly one definition -- the sweep and the shelf cannot
-// disagree about which services exist, and adding a provider is one line in
-// 00_constants.js rather than a line here that someone has to remember.
-const NEW_ON_STREAMING_LISTS = [
+//   New on Streaming  what just arrived on the eight tracked services, newest
+//                     first, a show moving back to the top when new episodes
+//                     land (tmdb:new-on-streaming, 07_source-fetchers-tmdb-simkl.js)
+//   Most Watched      what people using this add-on watched today / in the
+//                     last 7 / 30 days, from the same counts as the admin
+//                     Trending Data tab (mylists:most-watched:<window>)
+//
+// One table drives every place they appear -- the Quick Add card, the Discover
+// All / Movies / Shows feed, "+ Add all" and the /lists/<slug> pages -- so the
+// names and urls cannot drift between them. Every one updates at least daily
+// (see MOST_WATCHED_* and the New on Streaming sweep, 00_constants.js).
+const MY_LISTS_ADDON_CHARTS = [
   { name: "New on Streaming", movieUrl: "tmdb:new-on-streaming", showUrl: "tmdb:new-on-streaming" },
-  ...NEW_ON_STREAMING_PROVIDERS.map((p) => ({
-    name: `New on ${p.name}`,
-    movieUrl: `tmdb:new-on-streaming:${p.key}`,
-    showUrl: `tmdb:new-on-streaming:${p.key}`,
-  })),
+  { name: "My Lists Addon Most Watched Today", movieUrl: "mylists:most-watched:today", showUrl: "mylists:most-watched:today" },
+  { name: "My Lists Addon Most Watched (7 Days)", movieUrl: "mylists:most-watched:7", showUrl: "mylists:most-watched:7" },
+  { name: "My Lists Addon Most Watched (30 Days)", movieUrl: "mylists:most-watched:30", showUrl: "mylists:most-watched:30" },
 ];
 
-// Hidden until NEW_ON_STREAMING_IN_QUICK_ADD is flipped. The source itself
-// stays live the whole time -- the point of shipping it dark is to test the
-// real catalog against real swept data from the admin dashboard, which cannot
-// be done if the fetcher is off too.
-function buildNewOnStreamingHtml() {
-  if (!NEW_ON_STREAMING_IN_QUICK_ADD) return "";
-  return buildStreamingRowsHtml(NEW_ON_STREAMING_LISTS, "", "New on Streaming");
-}
-
-// The Quick Add tab wraps each group in its own titled card with an "+ Add
-// all" button, unlike the Discover tab which drops the rows in bare -- so the
-// whole card has to be gated, not just its contents, or hiding the shelf would
-// leave a titled empty box behind.
-function buildNewOnStreamingQuickAddCard() {
-  const rows = buildNewOnStreamingHtml();
-  if (!rows) return "";
-  return `
-    <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
-      <div class="shelf-header" style="margin-bottom:8px;">
-        <h2 class="shelf-title">New on Streaming</h2>
-        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="new-on-streaming">+ Add all</button>
-      </div>
-      <p class="qa-shelf-sub">What just arrived on each service, newest first &mdash; and a show returns to the top the day a new episode airs:</p>
-      ${rows}
-    </div>`;
+function buildMyListsAddonChartsHtml() {
+  return buildStreamingRowsHtml(MY_LISTS_ADDON_CHARTS, "", "My Lists Addon Charts");
 }
 
 // --- Clean, shareable /lists/<slug> urls for every native/official chart ---
@@ -22451,11 +22563,7 @@ const CHART_SLUG_ENTRIES = (() => {
     ...KIDS_LISTS,
     ...HOLIDAY_LISTS,
     ...GENRE_LISTS,
-    // Gated with the shelf itself: a /lists/New-on-Streaming page that works
-    // while nothing links to it is still a public page, and "admin only for
-    // now" has to mean the catalog is reachable by pasting its source url,
-    // not by guessing a slug.
-    ...(NEW_ON_STREAMING_IN_QUICK_ADD ? NEW_ON_STREAMING_LISTS : []),
+    ...MY_LISTS_ADDON_CHARTS,
   ].forEach((p) => add(p.name, p.movieUrl, p.showUrl));
   [...TRAKT_BOXOFFICE_LIST, SIMKL_ANIME_LIST[0]].forEach((p) => add(p.name, p.url, p.url));
   COMBINED_CHART_LISTS.forEach((p) => add(p.name, p.movieUrls.join("\n"), p.showUrls.join("\n")));
@@ -22556,11 +22664,8 @@ function renderBuilder(
   const kidsHtml = buildKidsHtml();
   const holidaysHtml = buildHolidaysHtml();
   const genresHtml = buildGenresHtml();
-  // Both empty strings until NEW_ON_STREAMING_IN_QUICK_ADD is flipped -- the
-  // catalog itself is live either way, it just has no entry in the two places
-  // a visitor would find it. See buildNewOnStreamingHtml (08).
-  const newOnStreamingHtml = buildNewOnStreamingHtml();
-  const newOnStreamingQuickAddCard = buildNewOnStreamingQuickAddCard();
+  // New on Streaming + My Lists Addon Most Watched -- see MY_LISTS_ADDON_CHARTS (08).
+  const myListsAddonChartsHtml = buildMyListsAddonChartsHtml();
   // Precomputed here (same pattern as the *Html fragments above) rather
   // than built inline inside the giant HTML template literal below --
   // this file's template literal has bitten past changes before with
@@ -26480,7 +26585,7 @@ window._CHARTS_STREAMING_ALL = ${jsonForScript(STREAMING_ALL)};
 window._CHARTS_KIDS = ${jsonForScript(KIDS_LISTS)};
 window._CHARTS_HOLIDAYS = ${jsonForScript(HOLIDAY_LISTS)};
 window._CHARTS_GENRES = ${jsonForScript(GENRE_LISTS)};
-window._CHARTS_NEW_ON_STREAMING = ${jsonForScript(NEW_ON_STREAMING_IN_QUICK_ADD ? NEW_ON_STREAMING_LISTS : [])};
+window._CHARTS_MY_LISTS_ADDON = ${jsonForScript(MY_LISTS_ADDON_CHARTS)};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }
@@ -26565,6 +26670,16 @@ if ('serviceWorker' in navigator) {
   <div class="lists-subpanel" id="catalogsSubQuickAdd" style="display:none;">
     <div id="catalogsQuickAddContainer">
 
+    <!-- My Lists Addon Charts Shelf -- this add-on's own charts (MY_LISTS_ADDON_CHARTS, 08). -->
+    <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">My Lists Addon Charts</h2>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="mylists-charts">+ Add all</button>
+      </div>
+      <p class="qa-shelf-sub">Our own charts, updated daily: what just arrived on Netflix, Prime Video, Disney+, HBO Max, Hulu, Apple TV+, Paramount+ and Peacock (a show moves back to the top when new episodes land), and what people using My Lists Addon are watching most today, this week and this month:</p>
+      ${myListsAddonChartsHtml}
+    </div>
+
     <!-- Combined Charts Shelf -->
     <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
       <div class="shelf-header" style="margin-bottom:8px;">
@@ -26635,10 +26750,6 @@ if ('serviceWorker' in navigator) {
       ${streamingHtml}
     </div>
 
-    <!-- New on Streaming Shelf -- renders as an empty string, card and all,
-         until NEW_ON_STREAMING_IN_QUICK_ADD is turned on (00_constants.js). -->
-    ${newOnStreamingQuickAddCard}
-
     <!-- Kids Shelf -->
     <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
       <div class="shelf-header" style="margin-bottom:8px;">
@@ -26688,6 +26799,9 @@ if ('serviceWorker' in navigator) {
 
   <!-- Discover Shelves Feed -->
   <div id="discoverShelvesContainer">
+    <!-- My Lists Addon Charts Shelf -->
+    ${myListsAddonChartsHtml}
+
     <!-- Combined Charts Shelf -->
     ${combinedChartsHtml}
 
@@ -26708,9 +26822,6 @@ if ('serviceWorker' in navigator) {
 
     <!-- Streaming Catalogs Shelf -->
     ${streamingHtml}
-
-    <!-- New on Streaming Shelf -->
-    ${newOnStreamingHtml}
 
     <!-- Hidden Gems Shelf -->
     ${hiddenGemsHtml}
@@ -30322,6 +30433,11 @@ function renderDiscoverChartsList(type, forceRefresh) {
   // They are exposed as window._CHARTS_* globals by 09_page-shell.js.
 
   if (type !== 'gems' && type !== 'kids' && type !== 'holidays' && type !== 'genres' && type !== 'curated') {
+    // This add-on's own charts lead the feed -- New on Streaming and Most
+    // Watched (MY_LISTS_ADDON_CHARTS, 08_quickadd-chart-data.js).
+    if (window._CHARTS_MY_LISTS_ADDON) {
+      window._CHARTS_MY_LISTS_ADDON.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'My Lists Addon'); });
+    }
     if (type === 'movie' || type === 'all') {
       pushSingle('New Releases', 'tmdb:chart:new_movies', 'movie', 'TMDB');
     }
@@ -30354,12 +30470,6 @@ function renderDiscoverChartsList(type, forceRefresh) {
     }
     if (window._CHARTS_STREAMING_ALL) {
       window._CHARTS_STREAMING_ALL.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'My Lists Addon'); });
-    }
-    // Empty until the feature is public -- 09_page-shell.js bakes in an empty
-    // array rather than the real one while NEW_ON_STREAMING_IN_QUICK_ADD is
-    // false, so this loop is a no-op instead of needing its own gate.
-    if (window._CHARTS_NEW_ON_STREAMING) {
-      window._CHARTS_NEW_ON_STREAMING.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'New on Streaming'); });
     }
   }
 
@@ -31004,12 +31114,7 @@ ${buildAddAllCombinedChartsJs()}
 ${buildAddAllFnJs("addAllKidsCharts", buildAddAllPairsCallsJs(KIDS_LISTS, "Kids", ""))}
 ${buildAddAllFnJs("addAllHolidayCharts", buildAddAllPairsCallsJs(HOLIDAY_LISTS, "Holidays", ""))}
 ${buildAddAllFnJs("addAllGenreCharts", buildAddAllPairsCallsJs(GENRE_LISTS, "Genres", ""))}
-// Always DEFINED, so the click handler below resolves whether or not the shelf
-// exists -- but empty while the shelf is hidden. Generating the calls
-// unconditionally put every row's name and source url in the page source of a
-// feature nobody is supposed to be able to add yet, which is most of what
-// shipping it dark was for.
-${buildAddAllFnJs("addAllNewOnStreaming", NEW_ON_STREAMING_IN_QUICK_ADD ? buildAddAllPairsCallsJs(NEW_ON_STREAMING_LISTS, "New on Streaming", "") : "")}
+${buildAddAllFnJs("addAllMyListsAddonCharts", buildAddAllPairsCallsJs(MY_LISTS_ADDON_CHARTS, "My Lists Addon Charts", ""))}
 
 function addAllHiddenGems() {
   addRow("Hidden Gems", "tmdb:hidden-gems", "movie", true, "Hidden Gems");
@@ -31034,7 +31139,7 @@ document.addEventListener('click', (e) => {
   else if (action === 'kids') addAllKidsCharts();
   else if (action === 'holidays') addAllHolidayCharts();
   else if (action === 'genres') addAllGenreCharts();
-  else if (action === 'new-on-streaming') addAllNewOnStreaming();
+  else if (action === 'mylists-charts') addAllMyListsAddonCharts();
 });
 
 // Adds a blank source row to an existing entry -- this is how a normal
@@ -66897,6 +67002,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     nLower === 'streaming (all services)' ||
     urlLower.startsWith('tmdb:genre:') ||
     urlLower.startsWith('tmdb:holiday:') ||
+    urlLower.startsWith('mylists:') ||
+    urlLower.startsWith('tmdb:new-on-streaming') ||
     urlLower === 'tmdb:chart:appletv' ||
     urlLower === 'tmdb:chart:disney' ||
     urlLower === 'tmdb:chart:discovery' ||
@@ -67352,6 +67459,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         addRow(listMeta.name || name || 'Custom List', 'customlist:v1:' + JSON.stringify(payload), listMeta.type || type || 'movie', true, 'Custom Lists');
       } else if (listUrl && listUrl.startsWith('custom:curated:')) {
         addRow(name || 'Curated List', listUrl, type, true, 'Curated');
+      } else if (listUrl && (listUrl.startsWith('mylists:') || listUrl.startsWith('tmdb:new-on-streaming'))) {
+        addRow(name || 'List', listUrl, type === 'series' ? 'series' : 'movie', true, 'My Lists Addon Charts');
       } else if (listUrl && (listUrl.startsWith('tmdb:chart:') || listUrl.startsWith('tmdb:') || listUrl.startsWith('autotrack:'))) {
         addRow(name || 'List', listUrl, type, true, 'New Releases');
       } else {
@@ -85815,17 +85924,13 @@ function generateSearchVariations(query) {
       }
     }
 
-    // --- New on Streaming (admin-only while the shelf ships dark) -----------
+    // --- New on Streaming admin routes ---------------------------------------
     //
-    // tmdb:new-on-streaming is a real catalog the moment this deploys -- it
-    // resolves, installs into Stremio and pages like any other row -- but it
-    // has no Quick Add card and no Discover entry until
-    // NEW_ON_STREAMING_IN_QUICK_ADD is flipped (00_constants.js). These three
-    // routes are how it gets judged before that: what the sweep has actually
-    // collected, a way to push the walk along without waiting out the cron,
-    // and a preview that reads through the SAME fetchNewOnStreaming the
-    // add-on serves, so what the dashboard shows is what Stremio would get
-    // rather than a second implementation that can drift from it.
+    // What the sweep has actually collected, a way to push it along without
+    // waiting out the cron, and a preview that reads through the SAME
+    // fetchNewOnStreaming the add-on serves, so what the dashboard shows is
+    // what Stremio would get rather than a second implementation that can
+    // drift from it.
 
     // /admin/api/new-on-streaming -> the sweep's own state: cursor position,
     // walk generation, rows per service, and how much of it is seeded (dated

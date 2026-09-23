@@ -438,14 +438,28 @@ const NEW_ON_STREAMING_ORIGINAL_NETWORKS = {
 };
 const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 
-// Ships dark. The sweep, the catalog and the /lists route are live as soon as
-// this deploys -- tmdb:new-on-streaming resolves, installs into Stremio and
-// pages like any other row -- but the Quick Add shelf and the Discover
-// entries stay hidden until this is true, so the list can be tested from the
-// admin dashboard against real data before anyone else can add it. Flipping
-// this to true is the entire "move it to the live site" step; nothing else
-// about the feature changes.
-const NEW_ON_STREAMING_IN_QUICK_ADD = false;
+// The shelf is public: "New on Streaming" is in the My Lists Addon Charts
+// section of Quick Add and in Discover (MY_LISTS_ADDON_CHARTS,
+// 08_quickadd-chart-data.js).
+
+// --- My Lists Addon Most Watched ---------------------------------------------
+//
+// mylists:most-watched:<window> -- this add-on's own chart, built from the
+// same "watched" counts as the admin dashboard's Trending Data tab
+// (computeLeaderboard, 03_admin.js). Windows are Eastern calendar days, the
+// same buckets that tab uses.
+//
+// Each window/type is a snapshot in KV (mylists:mostwatched:v1:<window>:<type>),
+// rebuilt on the first request after it goes stale: the 7- and 30-day charts
+// once per Eastern day, "today" once an hour -- a "today" that only refreshed
+// at midnight would sit empty all morning.
+const MOST_WATCHED_WINDOWS = ["today", "7", "30"];
+const MOST_WATCHED_TODAY_REFRESH_SECONDS = 3600;
+const MOST_WATCHED_MAX_ITEMS = 100;
+// Titles with an IMDb id get a Metahub poster with no API call at all. Only
+// the rest (a tmdb: id, or no stored name) need a TMDB lookup, and a build is
+// capped at this many so it fits a free-plan request's 50-fetch allowance.
+const MOST_WATCHED_MAX_LOOKUPS = 20;
 
 // --- Quick Add network channel presets --------------------------------------
 //

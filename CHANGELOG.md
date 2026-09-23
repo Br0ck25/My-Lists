@@ -6,6 +6,17 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ⭐ My Lists Addon Charts: New on Streaming and Most Watched, on the website
+
+- **New Quick Add section, "My Lists Addon Charts"** (Catalogs → Quick Add, first card), with "+ Movies" / "+ Shows" on each chart and "+ Add all":
+  - **New on Streaming**: what just arrived on Netflix, Prime Video, Disney+, HBO Max, Hulu, Apple TV+, Paramount+ and Peacock, newest first. A show moves back to the top when new episodes land. It was already a working catalog; it just had no public entry until now. The separate "ships dark" card and its per-service rows are gone, along with `NEW_ON_STREAMING_IN_QUICK_ADD`.
+  - **My Lists Addon Most Watched Today / (7 Days) / (30 Days)**: what people using the add-on watched, ranked by the same "watched" counts as the admin Trending Data tab (`computeLeaderboard`). New source `mylists:most-watched:today|7|30` (`fetchMostWatchedCatalog`), split into movies and shows. Windows are Eastern calendar days, like that tab.
+- **Discover All / Movies / Shows** lead with the same four charts, credited "by My Lists Addon". Each chart also gets a shareable `/lists/<slug>` page, e.g. `/lists/My-Lists-Addon-Most-Watched-7-Days`. Everything is driven by one table, `MY_LISTS_ADDON_CHARTS` (08_quickadd-chart-data.js).
+- **How Most Watched stays current:** each window/type is a KV snapshot (`mylists:mostwatched:v1:<window>:<type>`). The 7- and 30-day charts rebuild on the first request of each Eastern day. "Today" rebuilds hourly, because a once-a-day "today" would sit empty all morning.
+- **Cost of a rebuild:** one D1 query plus the stored titles. Posters for IMDb ids are Metahub URLs, so they need no API call. At most 20 TMDB lookups per build (`MOST_WATCHED_MAX_LOOKUPS`), for ids with no IMDb poster, which keeps a build within a free-plan request's 50-fetch allowance. Stray episode ids are folded into their show. A failed rebuild serves the previous snapshot.
+- `mylists:most-watched:` is allowed by the preview endpoint's source allowlist (`isAllowedCatalogSourceUrl`). The list page's "Add" button files these rows under "My Lists Addon Charts".
+- Tests: tests/my-lists-addon-charts.test.mjs covers ranking, the movie/show split, episode folding, snapshot refresh (daily and hourly), KV-only deployments, the empty state, the Quick Add card, the Discover feed and the `/lists/<slug>` pages.
+
 ### 🐛 New on Streaming: days over JustWatch's 600-entry cap were cut short
 
 Compared the whole Sep 5–21 range against a saved copy of mdblist.com/new-on-streaming. The biggest gap was **Sep 12**: mdblist had 864 titles, and we had 600 entries. JustWatch's `newTitles` stops every query at 600 (`JUSTWATCH_NEW_TITLES_CAP`), and that day Prime Video alone added more than 600 movies. Now a query that reports a capped `totalCount` is split into narrower queries that together cover the same results: by service, then movies vs. seasons, then by halving the release-year range (`splitJustWatchSlice`). The split pieces are saved with each day's progress, so a big day can finish over several sweeps. Up to 30 pages per sweep.

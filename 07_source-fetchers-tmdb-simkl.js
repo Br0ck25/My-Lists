@@ -2955,7 +2955,6 @@ async function newOnStreamingStatus(env) {
     engine: newOnStreamingEngine(env),
     region: NEW_ON_STREAMING_REGIONS[0],
     providers: NEW_ON_STREAMING_PROVIDERS.map((p) => ({ key: p.key, name: p.name, rapidId: p.rapidId })),
-    inQuickAdd: NEW_ON_STREAMING_IN_QUICK_ADD,
     monthlyUsage: {
       month: usage.month,
       count: usage.count,
@@ -3034,6 +3033,122 @@ async function newOnStreamingStatus(env) {
       : safeErrorMessage(e);
   }
   return out;
+}
+
+// --- My Lists Addon Most Watched ---------------------------------------------
+//
+// mylists:most-watched:today|7|30 -- the add-on's own chart of what people
+// using it watched, from the admin Trending Data "Most Watched" counts. See
+// MOST_WATCHED_* (00_constants.js) for the refresh rules.
+
+function parseMostWatchedWindow(url) {
+  const m = /^mylists:most-watched:([a-z0-9]+)$/i.exec(String(url || "").trim());
+  const w = m ? m[1].toLowerCase() : "";
+  return MOST_WATCHED_WINDOWS.includes(w) ? w : null;
+}
+
+function mostWatchedSnapshotKey(window, type) {
+  return `mylists:mostwatched:v1:${window}:${type}`;
+}
+
+// Is a stored snapshot still the current one?
+function mostWatchedSnapshotFresh(snap, window, nowMs) {
+  if (!snap || !Array.isArray(snap.metas) || !Number.isFinite(snap.builtAt)) return false;
+  if (window === "today") {
+    return snap.day === easternDateKey(new Date(nowMs)) && nowMs - snap.builtAt < MOST_WATCHED_TODAY_REFRESH_SECONDS * 1000;
+  }
+  return snap.day === easternDateKey(new Date(nowMs));
+}
+
+async function buildMostWatchedMetas(env, ctx, window, type) {
+  const entries = await computeLeaderboard(env, "watched", window, type);
+  // Counts are per show already (the website sends showId, the scrobbler the
+  // show's IMDb id), but an episode id ("tt123:1:2") that slipped through is
+  // folded into its show rather than charting on its own.
+  const byId = new Map();
+  for (const e of entries || []) {
+    if (!e || !e.id) continue;
+    const tt = /^tt\d+/.exec(e.id);
+    const id = tt ? tt[0] : e.id;
+    const prev = byId.get(id);
+    if (prev) prev.count += Number(e.count) || 0;
+    else byId.set(id, { ...e, id, count: Number(e.count) || 0 });
+  }
+  const ranked = [...byId.values()]
+    .filter((e) => e.count > 0)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, MOST_WATCHED_MAX_ITEMS);
+
+  const tmdbKey = (env && env.TMDB_API_KEY) || TMDB_API_KEY;
+  let lookups = 0;
+  const metas = [];
+  for (const e of ranked) {
+    const isImdb = /^tt\d+$/.test(e.id);
+    let name = e.title && e.title !== e.id ? e.title : "";
+    let poster = isImdb ? `https://images.metahub.space/poster/medium/${e.id}/img` : "";
+    let releaseInfo;
+    if ((!poster || !name) && tmdbKey && lookups < MOST_WATCHED_MAX_LOOKUPS) {
+      lookups++;
+      const det = await fetchTmdbItemDetails(e.id, tmdbKey, type, "", false, env, ctx).catch(() => null);
+      if (det) {
+        name = name || det.title || "";
+        poster = poster || det.poster || "";
+        if (det.releaseYear) releaseInfo = String(det.releaseYear);
+      }
+    }
+    // A row Stremio cannot draw or name is worse than a shorter chart.
+    if (!name || !poster) continue;
+    metas.push({ id: e.id, type, name, poster, releaseInfo, watchCount: e.count });
+  }
+  return metas;
+}
+
+async function fetchMostWatchedCatalog(entry, skip = 0, keys = {}) {
+  const env = keys && keys.env;
+  const window = parseMostWatchedWindow(entry && entry.url);
+  if (!window) throw new Error("Unknown Most Watched window.");
+  const type = entry && entry.type === "series" ? "series" : "movie";
+  const pageSize = Number.isFinite(keys.limit) && keys.limit > 0 ? Math.min(100, Math.floor(keys.limit)) : PAGE_SIZE;
+  const nowMs = Date.now();
+  const key = mostWatchedSnapshotKey(window, type);
+
+  let snap = null;
+  if (env && env.CONFIGS) {
+    try {
+      const raw = await env.CONFIGS.get(key);
+      snap = raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      snap = null;
+    }
+  }
+  if (!mostWatchedSnapshotFresh(snap, window, nowMs)) {
+    try {
+      const metas = await buildMostWatchedMetas(env, keys.ctx, window, type);
+      snap = { builtAt: nowMs, day: easternDateKey(new Date(nowMs)), metas };
+      if (env && env.CONFIGS) {
+        const put = env.CONFIGS.put(key, JSON.stringify(snap), { expirationTtl: 3 * 86400 }).catch(() => {});
+        if (keys.ctx && typeof keys.ctx.waitUntil === "function") keys.ctx.waitUntil(put);
+        else await put;
+      }
+    } catch (e) {
+      // A failed rebuild serves the last snapshot rather than nothing.
+      if (!snap || !Array.isArray(snap.metas)) throw e;
+    }
+  }
+
+  const all = snap && Array.isArray(snap.metas) ? snap.metas : [];
+  const start = Math.max(0, skip);
+  const page = all.slice(start, start + pageSize).map((m) => ({
+    id: m.id,
+    type: m.type || type,
+    name: m.name,
+    poster: m.poster,
+    releaseInfo: m.releaseInfo || undefined,
+  }));
+  page.totalItems = all.length;
+  page.limit = pageSize;
+  page.skip = start;
+  return page;
 }
 
 // --- Anime Unpacking & Multi-Season Parts Resolution -------------------------

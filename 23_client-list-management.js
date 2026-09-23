@@ -2776,6 +2776,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
     nLower === 'streaming (all services)' ||
     urlLower.startsWith('tmdb:genre:') ||
     urlLower.startsWith('tmdb:holiday:') ||
+    urlLower.startsWith('mylists:') ||
+    urlLower.startsWith('tmdb:new-on-streaming') ||
     urlLower === 'tmdb:chart:appletv' ||
     urlLower === 'tmdb:chart:disney' ||
     urlLower === 'tmdb:chart:discovery' ||
@@ -3231,6 +3233,8 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
         addRow(listMeta.name || name || 'Custom List', 'customlist:v1:' + JSON.stringify(payload), listMeta.type || type || 'movie', true, 'Custom Lists');
       } else if (listUrl && listUrl.startsWith('custom:curated:')) {
         addRow(name || 'Curated List', listUrl, type, true, 'Curated');
+      } else if (listUrl && (listUrl.startsWith('mylists:') || listUrl.startsWith('tmdb:new-on-streaming'))) {
+        addRow(name || 'List', listUrl, type === 'series' ? 'series' : 'movie', true, 'My Lists Addon Charts');
       } else if (listUrl && (listUrl.startsWith('tmdb:chart:') || listUrl.startsWith('tmdb:') || listUrl.startsWith('autotrack:'))) {
         addRow(name || 'List', listUrl, type, true, 'New Releases');
       } else {

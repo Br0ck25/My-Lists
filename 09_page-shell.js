@@ -39,11 +39,8 @@ function renderBuilder(
   const kidsHtml = buildKidsHtml();
   const holidaysHtml = buildHolidaysHtml();
   const genresHtml = buildGenresHtml();
-  // Both empty strings until NEW_ON_STREAMING_IN_QUICK_ADD is flipped -- the
-  // catalog itself is live either way, it just has no entry in the two places
-  // a visitor would find it. See buildNewOnStreamingHtml (08).
-  const newOnStreamingHtml = buildNewOnStreamingHtml();
-  const newOnStreamingQuickAddCard = buildNewOnStreamingQuickAddCard();
+  // New on Streaming + My Lists Addon Most Watched -- see MY_LISTS_ADDON_CHARTS (08).
+  const myListsAddonChartsHtml = buildMyListsAddonChartsHtml();
   // Precomputed here (same pattern as the *Html fragments above) rather
   // than built inline inside the giant HTML template literal below --
   // this file's template literal has bitten past changes before with
@@ -3963,7 +3960,7 @@ window._CHARTS_STREAMING_ALL = ${jsonForScript(STREAMING_ALL)};
 window._CHARTS_KIDS = ${jsonForScript(KIDS_LISTS)};
 window._CHARTS_HOLIDAYS = ${jsonForScript(HOLIDAY_LISTS)};
 window._CHARTS_GENRES = ${jsonForScript(GENRE_LISTS)};
-window._CHARTS_NEW_ON_STREAMING = ${jsonForScript(NEW_ON_STREAMING_IN_QUICK_ADD ? NEW_ON_STREAMING_LISTS : [])};
+window._CHARTS_MY_LISTS_ADDON = ${jsonForScript(MY_LISTS_ADDON_CHARTS)};
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(e => console.error(e));
 }

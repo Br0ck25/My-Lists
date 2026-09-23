@@ -2077,7 +2077,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="trending">
-    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. Meant to eventually seed this add-on's own trending/popular catalogs once there's enough data.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. The <strong>Most Watched</strong> counts for Today, Last 7 Days and Last 30 Days are what the public <strong>My Lists Addon Most Watched</strong> charts show (Quick Add &rarr; My Lists Addon Charts, and Discover); those refresh hourly for Today and daily for 7/30 days.</p>
     <div style="margin:12px 0;">
       <select class="admin-select" id="trendingTypeSelect" onchange="loadTrendingData()">
         <option value="watched">Most Watched</option>
@@ -2261,7 +2261,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="newonstreaming">
-    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it just has no Quick Add card and no Discover entry until it is turned on for everyone.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it is in the My Lists Addon Charts section of Quick Add and in Discover.</p>
     <p style="color:#8E8E93; margin:0 0 16px; font-size:0.82rem;">Powered by RapidAPI's <strong>Streaming Availability API</strong> (/changes) to capture the exact date titles and new episodes are added to streaming services (not release dates), with new arrivals first and recent episodes bumping shows to the top within a rolling 30-day window.</p>
 
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
@@ -3611,9 +3611,7 @@ async function renderAdminDashboard(env) {
           }).join(' &middot; ') + '</div>');
         }
         bits.push('<div>Region: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong> &mdash; 30-day rolling window</div>');
-        bits.push('<div>Visible to users: ' + (st.inQuickAdd
-          ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
-          : '<span style="color:#FF9500;">no -- admin only (NEW_ON_STREAMING_IN_QUICK_ADD is false)</span>') + '</div>');
+        bits.push('<div>Visible to users: <span style="color:#30d158;">yes -- My Lists Addon Charts in Quick Add, and Discover</span></div>');
         const totals = st.totals || {};
         bits.push('<div>Active titles in 30d window: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows (' + (totals.removed || 0) + ' marked removed)</div>');
         if (st.lastSweep) {

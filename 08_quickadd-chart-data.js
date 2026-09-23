@@ -456,51 +456,30 @@ function buildGenresHtml() {
   return buildStreamingRowsHtml(GENRE_LISTS, "", "Genres");
 }
 
-// --- New on Streaming ------------------------------------------------------
+// --- My Lists Addon Charts --------------------------------------------------
 //
-// One row per service plus an everything row, all served by the same source
-// (tmdb:new-on-streaming, 07_source-fetchers-tmdb-simkl.js) and all sorted the
-// same way: most recently arrived first, with a show pushed back to the top
-// when a new episode airs.
+// This add-on's own charts, built from its own data rather than a provider's:
 //
-// Built from NEW_ON_STREAMING_PROVIDERS rather than written out, so the
-// service list has exactly one definition -- the sweep and the shelf cannot
-// disagree about which services exist, and adding a provider is one line in
-// 00_constants.js rather than a line here that someone has to remember.
-const NEW_ON_STREAMING_LISTS = [
+//   New on Streaming  what just arrived on the eight tracked services, newest
+//                     first, a show moving back to the top when new episodes
+//                     land (tmdb:new-on-streaming, 07_source-fetchers-tmdb-simkl.js)
+//   Most Watched      what people using this add-on watched today / in the
+//                     last 7 / 30 days, from the same counts as the admin
+//                     Trending Data tab (mylists:most-watched:<window>)
+//
+// One table drives every place they appear -- the Quick Add card, the Discover
+// All / Movies / Shows feed, "+ Add all" and the /lists/<slug> pages -- so the
+// names and urls cannot drift between them. Every one updates at least daily
+// (see MOST_WATCHED_* and the New on Streaming sweep, 00_constants.js).
+const MY_LISTS_ADDON_CHARTS = [
   { name: "New on Streaming", movieUrl: "tmdb:new-on-streaming", showUrl: "tmdb:new-on-streaming" },
-  ...NEW_ON_STREAMING_PROVIDERS.map((p) => ({
-    name: `New on ${p.name}`,
-    movieUrl: `tmdb:new-on-streaming:${p.key}`,
-    showUrl: `tmdb:new-on-streaming:${p.key}`,
-  })),
+  { name: "My Lists Addon Most Watched Today", movieUrl: "mylists:most-watched:today", showUrl: "mylists:most-watched:today" },
+  { name: "My Lists Addon Most Watched (7 Days)", movieUrl: "mylists:most-watched:7", showUrl: "mylists:most-watched:7" },
+  { name: "My Lists Addon Most Watched (30 Days)", movieUrl: "mylists:most-watched:30", showUrl: "mylists:most-watched:30" },
 ];
 
-// Hidden until NEW_ON_STREAMING_IN_QUICK_ADD is flipped. The source itself
-// stays live the whole time -- the point of shipping it dark is to test the
-// real catalog against real swept data from the admin dashboard, which cannot
-// be done if the fetcher is off too.
-function buildNewOnStreamingHtml() {
-  if (!NEW_ON_STREAMING_IN_QUICK_ADD) return "";
-  return buildStreamingRowsHtml(NEW_ON_STREAMING_LISTS, "", "New on Streaming");
-}
-
-// The Quick Add tab wraps each group in its own titled card with an "+ Add
-// all" button, unlike the Discover tab which drops the rows in bare -- so the
-// whole card has to be gated, not just its contents, or hiding the shelf would
-// leave a titled empty box behind.
-function buildNewOnStreamingQuickAddCard() {
-  const rows = buildNewOnStreamingHtml();
-  if (!rows) return "";
-  return `
-    <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
-      <div class="shelf-header" style="margin-bottom:8px;">
-        <h2 class="shelf-title">New on Streaming</h2>
-        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="new-on-streaming">+ Add all</button>
-      </div>
-      <p class="qa-shelf-sub">What just arrived on each service, newest first &mdash; and a show returns to the top the day a new episode airs:</p>
-      ${rows}
-    </div>`;
+function buildMyListsAddonChartsHtml() {
+  return buildStreamingRowsHtml(MY_LISTS_ADDON_CHARTS, "", "My Lists Addon Charts");
 }
 
 // --- Clean, shareable /lists/<slug> urls for every native/official chart ---
@@ -546,11 +525,7 @@ const CHART_SLUG_ENTRIES = (() => {
     ...KIDS_LISTS,
     ...HOLIDAY_LISTS,
     ...GENRE_LISTS,
-    // Gated with the shelf itself: a /lists/New-on-Streaming page that works
-    // while nothing links to it is still a public page, and "admin only for
-    // now" has to mean the catalog is reachable by pasting its source url,
-    // not by guessing a slug.
-    ...(NEW_ON_STREAMING_IN_QUICK_ADD ? NEW_ON_STREAMING_LISTS : []),
+    ...MY_LISTS_ADDON_CHARTS,
   ].forEach((p) => add(p.name, p.movieUrl, p.showUrl));
   [...TRAKT_BOXOFFICE_LIST, SIMKL_ANIME_LIST[0]].forEach((p) => add(p.name, p.url, p.url));
   COMBINED_CHART_LISTS.forEach((p) => add(p.name, p.movieUrls.join("\n"), p.showUrls.join("\n")));
