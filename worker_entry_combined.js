@@ -14989,27 +14989,70 @@ function channelRotationDay(now, turnoverMinutes) {
 // episodes each, rather than a flat random slice that could easily skew to
 // dozens of episodes of one show and none of many others. Stable within a
 // day, different the next.
-function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys) {
+//
+// hideWatchedKeys (null when the channel is not hiding watched -- or when
+// everything has been seen and the pool has reset) only trims what a block
+// CONTAINS. fullItems is the pool BEFORE that trim, and it is what a
+// story-locked show's walk is measured against: a locked block is a position
+// in the show's WHOLE run, and shrinking the run underneath the walk
+// re-maps every position at once. That is what used to teleport a show to a
+// different season overnight -- one watched episode removed re-phased every
+// later day's `day % blocks`.
+function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys, hideWatchedKeys, fullItems) {
   const byShow = new Map();
   for (const it of playableItems) {
     const key = channelItemShowKey(it);
     if (!byShow.has(key)) byShow.set(key, []);
     byShow.get(key).push(it);
   }
-  const showKeys = seededShuffle([...byShow.keys()], seed).slice(0, plan.shows);
+  // The whole runs of the story-locked shows, watched episodes included.
+  const lockedRuns = new Map();
+  if (lockedKeys.size) {
+    for (const it of (fullItems || playableItems)) {
+      const key = channelItemShowKey(it);
+      if (!lockedKeys.has(key)) continue;
+      if (!lockedRuns.has(key)) lockedRuns.set(key, []);
+      lockedRuns.get(key).push(it);
+    }
+  }
+  // A story-locked show never sits out a night. Its whole promise is that it
+  // ADVANCES, and a day without an airing is a day the walk would skip: the
+  // seeded draw below used to drop it at will, so a show that missed a night
+  // came back two blocks on -- one gap day meant landing in a different
+  // season. Locked shows are kept unconditionally (they count against the
+  // shows-per-day dial, and only the remaining slots go to the draw), so
+  // "yesterday's block" is always yesterday.
+  const order = seededShuffle([...byShow.keys()], seed);
+  let unlockedLeft = plan.shows;
+  for (const key of order) if (lockedKeys.has(key)) unlockedLeft -= 1;
+  if (unlockedLeft < 0) unlockedLeft = 0;
+  const showKeys = order.filter((key) => {
+    if (lockedKeys.has(key)) return true;
+    if (unlockedLeft <= 0) return false;
+    unlockedLeft -= 1;
+    return true;
+  });
   const items = [];
   showKeys.forEach((key, i) => {
     const isLocked = lockedKeys.has(key);
-    const showEpisodes = isLocked ? sortChannelItemsSequential(byShow.get(key)) : byShow.get(key);
+    const showEpisodes = isLocked
+      ? sortChannelItemsSequential(lockedRuns.get(key) || byShow.get(key))
+      : byShow.get(key);
     const perShow = Math.min(plan.episodes, showEpisodes.length);
     let start;
     if (isLocked) {
       // A story-locked show gets no random starting point: it picks up
-      // where yesterday's block left off and walks its run in order,
-      // wrapping back to the beginning once it reaches the end.
+      // where yesterday's block left off and walks its run in broadcast
+      // order -- tonight's E1-3 means tomorrow's E4-6 and the day after's
+      // E7-9 -- wrapping back to the beginning once it reaches the end.
+      //
+      // The cycle's last block may be SHORT when the run is not a multiple
+      // of the block size (eight episodes at three a night end on E7-8)
+      // rather than clamping the start back to fill the block, which
+      // replayed the episode before it -- a run of eight used to air E6
+      // twice every cycle. "Always in order" means no episode twice.
       const blocks = Math.max(1, Math.ceil(showEpisodes.length / perShow));
       start = (((day % blocks) + blocks) % blocks) * perShow;
-      if (start > showEpisodes.length - perShow) start = Math.max(0, showEpisodes.length - perShow);
     } else {
       // A contiguous block (not scattered episodes) feels like an actual
       // evening's run of a show -- seeded per-show so different shows
@@ -15021,7 +15064,16 @@ function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys) {
       );
       start = starts.length ? starts[0] : 0;
     }
-    items.push(...showEpisodes.slice(start, start + perShow));
+    // Hide watched drops seen episodes from the block AFTER it is chosen.
+    // The walk keeps its place in the run either way: what has already been
+    // seen is not re-aired, and the day after still continues the same
+    // sequence. (For an unlocked show this is a no-op -- its pool was
+    // already trimmed, which is what keeps a seen episode from costing it a
+    // slot.)
+    for (const it of showEpisodes.slice(start, start + perShow)) {
+      if (hideWatchedKeys && channelItemIsWatched(it, hideWatchedKeys)) continue;
+      items.push(it);
+    }
   });
   return items;
 }
@@ -15618,15 +15670,27 @@ async function resolveChannelLineup(payload, opts = {}) {
   // today's lineup. When the whole pool has been seen the channel resets to
   // the full pool rather than going dark -- an empty channel reads as
   // broken, and there is nothing else left to offer.
+  //
+  // The untrimmed pool and the watched set both travel on to the rotation
+  // (see rotateChannelDayLineup): a story-locked show's block is a position
+  // in its WHOLE run, and trimming the run underneath that walk is what
+  // re-phased it, day by day, into a different season. hideWatchedKeys
+  // stays null on the all-seen reset, because there the channel has chosen
+  // to forget what was seen.
+  const fullPlayableItems = playableItems;
+  let hideWatchedKeys = null;
   if (payload.hideWatched) {
     const watchedKeys = channelWatchedKeySet(opts.watchHistory);
     const unwatched = playableItems.filter((it) => !channelItemIsWatched(it, watchedKeys));
-    if (unwatched.length) playableItems = unwatched;
+    if (unwatched.length) {
+      playableItems = unwatched;
+      hideWatchedKeys = watchedKeys;
+    }
   }
   if (!playableItems.length) return null;
   let items;
   if (payload.dailyRotate) {
-    items = rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys);
+    items = rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys, hideWatchedKeys, fullPlayableItems);
   } else if (payload.shuffle && !payload.sortByAired) {
     items = shuffleChannelItems(playableItems, seed, lockedKeys);
   } else {

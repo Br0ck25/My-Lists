@@ -11256,6 +11256,122 @@ describe("worker: channel video ids are real stream requests", () => {
     assert.equal(eps(day2)[0], expectedNextStart, "tomorrow picks up where today left off");
   });
 
+  // The ids one day's lineup gave a show, in the order they play.
+  const idsOf = (m, showId) => Array.from(m.videos, (v) => v.id).filter((id) => id.startsWith(showId + ":"));
+
+  // The reported bug: a locked show kept its day's three episodes together
+  // but its next day could land in a completely different season -- S1E1-3
+  // tonight, S3E1-3 tomorrow. A whole cycle must therefore read like the run
+  // itself: consecutive blocks wrapping at the end, every episode exactly
+  // once. A scramble of the run, a skipped block or one episode twice all
+  // fail this.
+  function assertWalkedInOrder(aired, run, label) {
+    assert.deepEqual([...aired].sort(), [...run].sort(), `${label}: one cycle must air every episode exactly once`);
+    const at = run.indexOf(aired[0]);
+    assert.deepEqual(
+      aired,
+      [...run.slice(at), ...run.slice(0, at)],
+      `${label}: broadcast order block by block, wrapping at the end of the run`
+    );
+  }
+
+  it("walks a multi-season run in order across a full cycle -- never jumping to another season", async () => {
+    // The literal complaint: 3 seasons x 4 episodes at three a night is a
+    // four-day cycle, and the days must read S1E1-3, S1E4 + the wrap tail --
+    // in run order whatever day the cycle is on -- not one season's start
+    // one night and another's the next.
+    const items = [];
+    for (let s = 1; s <= 3; s++)
+      for (let e = 1; e <= 4; e++)
+        items.push(ep({ imdbId: "tt9001", season: s, episode: e, title: `S${s}E${e}` }));
+    items.push(...poolOf(8, 4));
+    const opts = { dailyRotate: true, rotateShows: 3, rotateEpisodes: 3, storyLocked: ["tt9001"] };
+    const run = [1, 2, 3].flatMap((s) => [1, 2, 3, 4].map((e) => `tt9001:${s}:${e}`));
+    const aired = [];
+    for (let d = 0; d < 4; d++) {
+      const meta = await channelMeta(items, opts, { now: new Date(Date.UTC(2026, 2, 4 + d, 12)) });
+      const serial = idsOf(meta, "tt9001");
+      assert.equal(serial.length, 3, `day ${d}: a story-locked show never sits out a night`);
+      aired.push(...serial);
+    }
+    assertWalkedInOrder(aired, run, "a four-day cycle of S1-S3");
+  });
+
+  it("never lets a story-locked show drop out of the day's lineup, even with a full dial", async () => {
+    // A night off used to cost a block: the walk advanced on calendar days,
+    // so the show's next airing jumped by the gap -- a day skipped meant
+    // three episodes skipped, and short seasons put that jump in a different
+    // season. Locked shows now count against the shows-per-day dial but are
+    // never the ones the dial drops.
+    const items = poolOf(30, 4);
+    items.push(...[1, 2, 3, 4, 5, 6].map((e) => ep({ imdbId: "tt9001", season: 1, episode: e, title: `serial E${e}` })));
+    const opts = { dailyRotate: true, rotateShows: 3, rotateEpisodes: 3, storyLocked: ["tt9001"] };
+    for (let d = 0; d < 7; d++) {
+      const meta = await channelMeta(items, opts, { now: new Date(Date.UTC(2026, 2, 4 + d, 12)) });
+      assert.equal(idsOf(meta, "tt9001").length, 3, `day ${d}: the locked show must be on`);
+      assert.equal(meta.videos.length, 9, `day ${d}: 1 locked + 2 drawn shows x 3 episodes`);
+    }
+  });
+
+  it("keeps the walk in step while hide watched trims what has already aired", async () => {
+    // Hide watched used to shrink the pool the walk counted over, so every
+    // watched episode re-mapped every later day to a different block -- the
+    // show could rewind to S1E1 or jump to S3E1 overnight. The walk is now
+    // measured against the whole run: seen episodes inside a block are not
+    // re-aired, and the next day still continues the same sequence.
+    const items = [];
+    for (let s = 1; s <= 3; s++)
+      for (let e = 1; e <= 6; e++)
+        items.push(ep({ imdbId: "tt9001", season: s, episode: e, title: `S${s}E${e}` }));
+    const opts = { dailyRotate: true, rotateShows: 1, rotateEpisodes: 3, storyLocked: ["tt9001"], hideWatched: true };
+    const pos = (id) => {
+      const [, s, e] = id.split(":");
+      return (Number(s) - 1) * 6 + (Number(e) - 1);
+    };
+    let history = [];
+    let prev = null;
+    for (let d = 0; d < 5; d++) {
+      const meta = await channelMeta(items, opts, {
+        now: new Date(Date.UTC(2026, 2, 4 + d, 12)),
+        watchHistory: history,
+      });
+      const serial = idsOf(meta, "tt9001");
+      assert.equal(serial.length, 3, `day ${d}: a block the viewer has not seen plays whole`);
+      assert.ok(serial.every((id) => !history.some((h) => h.id === id)), `day ${d}: nothing re-airs`);
+      if (prev !== null) {
+        assert.equal(pos(serial[0]), (pos(prev) + 1) % 18, `day ${d}: picks up exactly where yesterday stopped`);
+      }
+      const p = pos(serial[0]);
+      assert.deepEqual(serial.map(pos), [p, (p + 1) % 18, (p + 2) % 18],
+        `day ${d}: three consecutive episodes of the run`);
+      prev = serial[serial.length - 1];
+      history = [...history, ...serial.map((id) => {
+        const [, s, e] = id.split(":");
+        return { type: "episode", id, showId: "tt9001", seasonNum: Number(s), episodeNum: Number(e) };
+      })];
+    }
+  });
+
+  it("ends the cycle on a short block instead of replaying the episode before it", async () => {
+    // Eight episodes at three a night: the blocks are [1-3][4-6][7-8] and
+    // then wrap. Clamping the last block back to fill it used to air [6-8],
+    // so E6 played twice every cycle -- "in order, and never twice" is the
+    // whole promise.
+    const items = [1, 2, 3, 4, 5, 6, 7, 8].map((e) => ep({ imdbId: "tt9001", season: 1, episode: e, title: `E${e}` }));
+    const opts = { dailyRotate: true, rotateShows: 1, rotateEpisodes: 3, storyLocked: ["tt9001"] };
+    const run = [1, 2, 3, 4, 5, 6, 7, 8].map((e) => `tt9001:1:${e}`);
+    const aired = [];
+    const lengths = [];
+    for (let d = 0; d < 3; d++) {
+      const meta = await channelMeta(items, opts, { now: new Date(Date.UTC(2026, 2, 4 + d, 12)) });
+      const serial = idsOf(meta, "tt9001");
+      lengths.push(serial.length);
+      aired.push(...serial);
+    }
+    assertWalkedInOrder(aired, run, "a three-day cycle of eight episodes");
+    assert.deepEqual([...lengths].sort(), [2, 3, 3], "exactly one short block -- the tail of the run");
+  });
+
   it("keeps a locked show sequential even when its picks were saved out of order", async () => {
     const items = [5, 1, 3, 2, 4].map((e) => ep({ imdbId: "tt9001", season: 1, episode: e, title: `E${e}` }));
     items.push(...[1, 2, 3, 4, 5].map((e) => ep({ imdbId: "tt9002", season: 1, episode: e, title: `proc E${e}` })));

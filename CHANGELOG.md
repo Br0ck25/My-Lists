@@ -6,6 +6,18 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 Story Lock: the next day jumped to a different season instead of continuing the story
+
+Story Lock walks a locked show's run in broadcast order — 3 a night on a rotating channel: S1E1-3, then S1E4-6, then S1E7-9. It only held for the day it aired: the next day's block could land in a completely different season (S1E1-3 tonight, S3E1-3 tomorrow). Three things broke the walk:
+
+- **The show could sit out a night.** The day's shows were a seeded draw (24 out of whatever the pool holds), but the walk advanced on calendar days — so a night off *skipped a block*. A show that missed one night came back three episodes on, and with short seasons that jump was into another season. Over a full cycle some episodes never aired at all and others repeated. A story-locked show is now on **every** night: it counts against the shows-per-day dial, and only the slots left over go to the draw. "Yesterday's block left off at E3" now really means yesterday.
+- **"Hide watched" moved the run underneath the walk.** The block index counted modulo the pool's size, and hide watched shrank that pool as you watched — every episode the filter removed re-mapped every later day to a different block. Watching along dutifully made it *worse*: one night rewound to S1E1-3, the next jumped to S3E1-3. The walk is now measured against the **whole** run; hiding watched only trims what a day's block contains (a block you already binged past airs just its unwatched parts) and never re-phases the sequence.
+- **The last block of a cycle replayed the episode before it** whenever the run wasn't a multiple of the block size — a run of eight aired E6 twice every cycle. The cycle now ends on a short block (E7-8) and wraps to E1.
+
+Net effect, as promised: tonight's S1E1-3 means tomorrow's S1E4-6 and the day after's S1E7-9, block by block through every season in order, wrapping to the beginning once the run ends.
+
+- Tests: tests/worker.test.mjs — a full cycle airs every episode exactly once in broadcast order across seasons; a locked show never drops out of the day's lineup even with a full dial; hide watched does not rewind or skip the walk while the viewer watches along; a short final block instead of a repeated episode.
+
 ### 🐛 My Lists Addon Charts: "null iv", shorter names, 25 titles each
 
 - **"null iv" at the top of Most Watched (and in the admin Trending table) was not a title.** Some watches reached `/api/track-event` with an id that had already been through `String(null)`, so they arrived as the text `"null"`. All of them counted as one title with the id "null". The chart then asked TMDB to name that id, which returned an unrelated movie called "null iv". Fixed in three places:
