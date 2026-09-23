@@ -493,8 +493,21 @@ async function writeEventMetaIfChanged(env, eventType, id, title, mediaType) {
   return changed;
 }
 
+// An id that is a stringified missing value -- String(null) is "null" -- not
+// a title. Every one of them counted as ONE title, so all the watches with a
+// lost id piled up under "null" and it topped the Most Watched chart (named
+// "null iv" by the TMDB lookup that tried to resolve it). Rejected on the way
+// in (/api/track-event, recordTrackedEvent) and skipped on the way out
+// (computeLeaderboard), so counts already recorded under one stop showing too.
+function isJunkTrackedId(id) {
+  const s = String(id == null ? "" : id).trim().toLowerCase();
+  if (!s) return true;
+  const base = s.split(":")[0];
+  return base === "null" || base === "undefined" || base === "nan" || base === "false" || base === "true" || s.startsWith("[object");
+}
+
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
-  if (!env || !env.CONFIGS || !id) return;
+  if (!env || !env.CONFIGS || !id || isJunkTrackedId(id)) return;
   try {
     const day = statsToday();
     // With D1 bound the counts go there and cost ZERO KV writes, the same way
@@ -746,6 +759,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     dropZero = true;
   }
 
+  candidates = candidates.filter((c) => !isJunkTrackedId(c.id));
   const meta = await attachEventMeta(env, eventType, candidates.map((c) => c.id));
   const entries = candidates.map((c, i) => ({ ...meta[i], count: c.count }));
 
@@ -2077,7 +2091,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="trending">
-    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. The <strong>Most Watched</strong> counts for Today, Last 7 Days and Last 30 Days are what the public <strong>My Lists Addon Most Watched</strong> charts show (Quick Add &rarr; My Lists Addon Charts, and Discover); those refresh hourly for Today and daily for 7/30 days.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. The <strong>Most Watched</strong> counts for Today, Last 7 Days and Last 30 Days are what the public <strong>Most Watched Today / 7 Days / 30 Days</strong> charts show (top 25; Quick Add &rarr; My Lists Addon Charts, and Discover); those refresh hourly for Today and daily for 7/30 days. Entries recorded without a real title id (such as "null") are left out of both this table and those charts.</p>
     <div style="margin:12px 0;">
       <select class="admin-select" id="trendingTypeSelect" onchange="loadTrendingData()">
         <option value="watched">Most Watched</option>

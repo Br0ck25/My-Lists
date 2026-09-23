@@ -2879,7 +2879,20 @@ async function fetchNewOnStreaming(entry, skip = 0, keys = {}) {
   const services = parseNewOnStreamingServices(suffix);
   const selected = services || NEW_ON_STREAMING_PROVIDERS.map((p) => p.key);
   const placeholders = selected.map(() => "?").join(",");
-  const pageSize = Number.isFinite(keys.limit) && keys.limit > 0 ? Math.min(100, Math.floor(keys.limit)) : PAGE_SIZE;
+  // The public row is a My Lists Addon chart, capped like the others
+  // (MY_LISTS_ADDON_CHART_MAX_ITEMS). Only the admin preview reads past it.
+  const cap = keys.uncapped === true ? Infinity : MY_LISTS_ADDON_CHART_MAX_ITEMS;
+  if (Math.max(0, skip) >= cap) {
+    const none = [];
+    none.totalItems = cap;
+    none.limit = 0;
+    none.skip = Math.max(0, skip);
+    return none;
+  }
+  const pageSize = Math.min(
+    Number.isFinite(keys.limit) && keys.limit > 0 ? Math.min(100, Math.floor(keys.limit)) : PAGE_SIZE,
+    cap - Math.max(0, skip)
+  );
   const qStr = entry && typeof entry.q === "string" ? entry.q.trim().toLowerCase() : "";
   const searchFilter = qStr ? "AND (LOWER(name) LIKE ? OR LOWER(imdb_id) LIKE ?) " : "";
   const searchParams = qStr ? [`%${qStr}%`, `%${qStr}%`] : [];
@@ -2938,7 +2951,7 @@ async function fetchNewOnStreaming(entry, skip = 0, keys = {}) {
     services: row.services ? row.services.split(",") : (row.service ? [row.service] : []),
     addedAt: row.ev || undefined,
   }));
-  metas.totalItems = total;
+  metas.totalItems = total == null ? total : Math.min(total, cap);
   metas.limit = pageSize;
   metas.skip = Math.max(0, skip);
   return metas;
@@ -3047,8 +3060,11 @@ function parseMostWatchedWindow(url) {
   return MOST_WATCHED_WINDOWS.includes(w) ? w : null;
 }
 
+// v2: v1 snapshots could hold the "null" entry and up to 100 titles; bumping
+// the version rebuilds every live chart on its next request instead of
+// waiting out the day.
 function mostWatchedSnapshotKey(window, type) {
-  return `mylists:mostwatched:v1:${window}:${type}`;
+  return `mylists:mostwatched:v2:${window}:${type}`;
 }
 
 // Is a stored snapshot still the current one?
@@ -3068,8 +3084,12 @@ async function buildMostWatchedMetas(env, ctx, window, type) {
   const byId = new Map();
   for (const e of entries || []) {
     if (!e || !e.id) continue;
-    const tt = /^tt\d+/.exec(e.id);
-    const id = tt ? tt[0] : e.id;
+    // Only a real title id charts: an IMDb id, or tmdb:<n>. A bare number is
+    // ambiguous -- the Trakt importer falls back to an episode's TMDB id when
+    // the show has no IMDb id -- and anything else ("null") is not a title.
+    const m = /^(tt\d+|tmdb:\d+)(?::\d+:\d+)?$/.exec(String(e.id).trim());
+    if (!m) continue;
+    const id = m[1];
     const prev = byId.get(id);
     if (prev) prev.count += Number(e.count) || 0;
     else byId.set(id, { ...e, id, count: Number(e.count) || 0 });

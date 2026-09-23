@@ -473,9 +473,9 @@ function buildGenresHtml() {
 // (see MOST_WATCHED_* and the New on Streaming sweep, 00_constants.js).
 const MY_LISTS_ADDON_CHARTS = [
   { name: "New on Streaming", movieUrl: "tmdb:new-on-streaming", showUrl: "tmdb:new-on-streaming" },
-  { name: "My Lists Addon Most Watched Today", movieUrl: "mylists:most-watched:today", showUrl: "mylists:most-watched:today" },
-  { name: "My Lists Addon Most Watched (7 Days)", movieUrl: "mylists:most-watched:7", showUrl: "mylists:most-watched:7" },
-  { name: "My Lists Addon Most Watched (30 Days)", movieUrl: "mylists:most-watched:30", showUrl: "mylists:most-watched:30" },
+  { name: "Most Watched Today", movieUrl: "mylists:most-watched:today", showUrl: "mylists:most-watched:today" },
+  { name: "Most Watched 7 Days", movieUrl: "mylists:most-watched:7", showUrl: "mylists:most-watched:7" },
+  { name: "Most Watched 30 Days", movieUrl: "mylists:most-watched:30", showUrl: "mylists:most-watched:30" },
 ];
 
 function buildMyListsAddonChartsHtml() {
@@ -538,8 +538,17 @@ const CHART_SLUG_REGISTRY = Object.fromEntries(CHART_SLUG_ENTRIES.map((e) => [e.
 // null on an unknown slug rather than throwing, since a stale or
 // hand-edited link should land the visitor in the app (default view)
 // rather than a hard error.
+// Slugs a chart used to have, so a link shared under the old name still lands
+// on the chart. The Most Watched charts first shipped as "My Lists Addon Most
+// Watched Today / (7 Days) / (30 Days)".
+const LEGACY_CHART_SLUGS = {
+  "My-Lists-Addon-Most-Watched-Today": "Most-Watched-Today",
+  "My-Lists-Addon-Most-Watched-7-Days": "Most-Watched-7-Days",
+  "My-Lists-Addon-Most-Watched-30-Days": "Most-Watched-30-Days",
+};
+
 function resolveChartSlug(slug) {
-  return CHART_SLUG_REGISTRY[slug] || null;
+  return CHART_SLUG_REGISTRY[slug] || CHART_SLUG_REGISTRY[LEGACY_CHART_SLUGS[slug]] || null;
 }
 
 // --- The curated shelves, in one place ---------------------------------------

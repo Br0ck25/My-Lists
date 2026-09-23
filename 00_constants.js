@@ -449,13 +449,17 @@ const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 // (computeLeaderboard, 03_admin.js). Windows are Eastern calendar days, the
 // same buckets that tab uses.
 //
-// Each window/type is a snapshot in KV (mylists:mostwatched:v1:<window>:<type>),
+// Each window/type is a snapshot in KV (mylists:mostwatched:v2:<window>:<type>),
 // rebuilt on the first request after it goes stale: the 7- and 30-day charts
 // once per Eastern day, "today" once an hour -- a "today" that only refreshed
 // at midnight would sit empty all morning.
 const MOST_WATCHED_WINDOWS = ["today", "7", "30"];
 const MOST_WATCHED_TODAY_REFRESH_SECONDS = 3600;
-const MOST_WATCHED_MAX_ITEMS = 100;
+// Every My Lists Addon chart is capped at this many titles -- Most Watched
+// and New on Streaming alike (the admin New on Streaming preview is not: it
+// is the tool for checking the whole 30-day window).
+const MY_LISTS_ADDON_CHART_MAX_ITEMS = 25;
+const MOST_WATCHED_MAX_ITEMS = MY_LISTS_ADDON_CHART_MAX_ITEMS;
 // Titles with an IMDb id get a Metahub poster with no API call at all. Only
 // the rest (a tmdb: id, or no stored name) need a TMDB lookup, and a build is
 // capped at this many so it fits a free-plan request's 50-fetch allowance.

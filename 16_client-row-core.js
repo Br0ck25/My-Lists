@@ -2205,8 +2205,11 @@ function trackEvent(eventType, id, title, mediaType) {
 function trackEventsBatch(eventType, items) {
   if (!items || !items.length) return;
   try {
+    // A missing id that has already been through String() arrives here as
+    // the text "null" / "undefined" -- not a title, so not a watch to count.
+    const junkId = /^(null|undefined|nan|true|false)(:|$)/i;
     const events = items.slice(0, 50)
-      .filter((it) => it && it.id)
+      .filter((it) => it && it.id && !junkId.test(String(it.id).trim()))
       .map((it) => ({ eventType: eventType, id: String(it.id), title: it.title || '', mediaType: it.mediaType === 'series' ? 'series' : 'movie' }));
     if (!events.length) return;
     fetch(ORIGIN + '/api/track-event', {

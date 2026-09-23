@@ -6,6 +6,15 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 My Lists Addon Charts: "null iv", shorter names, 25 titles each
+
+- **"null iv" at the top of Most Watched (and in the admin Trending table) was not a title.** Some watches reached `/api/track-event` with an id that had already been through `String(null)`, so they arrived as the text `"null"`. All of them counted as one title with the id "null". The chart then asked TMDB to name that id, which returned an unrelated movie called "null iv". Fixed in three places:
+  - `isJunkTrackedId` (03_admin.js) rejects `null` / `undefined` / `NaN` / `true` / `false` ids in `/api/track-event`, `recordTrackedEvent` (which also covers the scrobbler) and the website's beacon.
+  - `computeLeaderboard` skips such ids, so the counts already recorded under "null" disappear from the admin table and the charts without touching stored data.
+  - Most Watched only charts real title ids (`tt…` or `tmdb:…`). A bare number is ambiguous: the Trakt importer falls back to an episode's TMDB id when a show has no IMDb id. The snapshot key moved to `v2`, so live charts rebuild on their next request.
+- **Renamed:** "Most Watched Today", "Most Watched 7 Days" and "Most Watched 30 Days". Links using the old `/lists/My-Lists-Addon-Most-Watched-…` slugs still resolve (`LEGACY_CHART_SLUGS`).
+- **Every My Lists Addon chart is capped at 25 titles** (`MY_LISTS_ADDON_CHART_MAX_ITEMS`): the three Most Watched charts and New on Streaming, in Stremio and on the website. The admin New on Streaming preview is not capped, so it can still page through the whole 30-day window.
+
 ### ⭐ My Lists Addon Charts: New on Streaming and Most Watched, on the website
 
 - **New Quick Add section, "My Lists Addon Charts"** (Catalogs → Quick Add, first card), with "+ Movies" / "+ Shows" on each chart and "+ Add all":

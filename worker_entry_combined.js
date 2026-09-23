@@ -499,13 +499,17 @@ const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 // (computeLeaderboard, 03_admin.js). Windows are Eastern calendar days, the
 // same buckets that tab uses.
 //
-// Each window/type is a snapshot in KV (mylists:mostwatched:v1:<window>:<type>),
+// Each window/type is a snapshot in KV (mylists:mostwatched:v2:<window>:<type>),
 // rebuilt on the first request after it goes stale: the 7- and 30-day charts
 // once per Eastern day, "today" once an hour -- a "today" that only refreshed
 // at midnight would sit empty all morning.
 const MOST_WATCHED_WINDOWS = ["today", "7", "30"];
 const MOST_WATCHED_TODAY_REFRESH_SECONDS = 3600;
-const MOST_WATCHED_MAX_ITEMS = 100;
+// Every My Lists Addon chart is capped at this many titles -- Most Watched
+// and New on Streaming alike (the admin New on Streaming preview is not: it
+// is the tool for checking the whole 30-day window).
+const MY_LISTS_ADDON_CHART_MAX_ITEMS = 25;
+const MOST_WATCHED_MAX_ITEMS = MY_LISTS_ADDON_CHART_MAX_ITEMS;
 // Titles with an IMDb id get a Metahub poster with no API call at all. Only
 // the rest (a tmdb: id, or no stored name) need a TMDB lookup, and a build is
 // capped at this many so it fits a free-plan request's 50-fetch allowance.
@@ -7892,8 +7896,21 @@ async function writeEventMetaIfChanged(env, eventType, id, title, mediaType) {
   return changed;
 }
 
+// An id that is a stringified missing value -- String(null) is "null" -- not
+// a title. Every one of them counted as ONE title, so all the watches with a
+// lost id piled up under "null" and it topped the Most Watched chart (named
+// "null iv" by the TMDB lookup that tried to resolve it). Rejected on the way
+// in (/api/track-event, recordTrackedEvent) and skipped on the way out
+// (computeLeaderboard), so counts already recorded under one stop showing too.
+function isJunkTrackedId(id) {
+  const s = String(id == null ? "" : id).trim().toLowerCase();
+  if (!s) return true;
+  const base = s.split(":")[0];
+  return base === "null" || base === "undefined" || base === "nan" || base === "false" || base === "true" || s.startsWith("[object");
+}
+
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
-  if (!env || !env.CONFIGS || !id) return;
+  if (!env || !env.CONFIGS || !id || isJunkTrackedId(id)) return;
   try {
     const day = statsToday();
     // With D1 bound the counts go there and cost ZERO KV writes, the same way
@@ -8145,6 +8162,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     dropZero = true;
   }
 
+  candidates = candidates.filter((c) => !isJunkTrackedId(c.id));
   const meta = await attachEventMeta(env, eventType, candidates.map((c) => c.id));
   const entries = candidates.map((c, i) => ({ ...meta[i], count: c.count }));
 
@@ -9476,7 +9494,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="trending">
-    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. The <strong>Most Watched</strong> counts for Today, Last 7 Days and Last 30 Days are what the public <strong>My Lists Addon Most Watched</strong> charts show (Quick Add &rarr; My Lists Addon Charts, and Discover); those refresh hourly for Today and daily for 7/30 days.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. The <strong>Most Watched</strong> counts for Today, Last 7 Days and Last 30 Days are what the public <strong>Most Watched Today / 7 Days / 30 Days</strong> charts show (top 25; Quick Add &rarr; My Lists Addon Charts, and Discover); those refresh hourly for Today and daily for 7/30 days. Entries recorded without a real title id (such as "null") are left out of both this table and those charts.</p>
     <div style="margin:12px 0;">
       <select class="admin-select" id="trendingTypeSelect" onchange="loadTrendingData()">
         <option value="watched">Most Watched</option>
@@ -20059,7 +20077,20 @@ async function fetchNewOnStreaming(entry, skip = 0, keys = {}) {
   const services = parseNewOnStreamingServices(suffix);
   const selected = services || NEW_ON_STREAMING_PROVIDERS.map((p) => p.key);
   const placeholders = selected.map(() => "?").join(",");
-  const pageSize = Number.isFinite(keys.limit) && keys.limit > 0 ? Math.min(100, Math.floor(keys.limit)) : PAGE_SIZE;
+  // The public row is a My Lists Addon chart, capped like the others
+  // (MY_LISTS_ADDON_CHART_MAX_ITEMS). Only the admin preview reads past it.
+  const cap = keys.uncapped === true ? Infinity : MY_LISTS_ADDON_CHART_MAX_ITEMS;
+  if (Math.max(0, skip) >= cap) {
+    const none = [];
+    none.totalItems = cap;
+    none.limit = 0;
+    none.skip = Math.max(0, skip);
+    return none;
+  }
+  const pageSize = Math.min(
+    Number.isFinite(keys.limit) && keys.limit > 0 ? Math.min(100, Math.floor(keys.limit)) : PAGE_SIZE,
+    cap - Math.max(0, skip)
+  );
   const qStr = entry && typeof entry.q === "string" ? entry.q.trim().toLowerCase() : "";
   const searchFilter = qStr ? "AND (LOWER(name) LIKE ? OR LOWER(imdb_id) LIKE ?) " : "";
   const searchParams = qStr ? [`%${qStr}%`, `%${qStr}%`] : [];
@@ -20118,7 +20149,7 @@ async function fetchNewOnStreaming(entry, skip = 0, keys = {}) {
     services: row.services ? row.services.split(",") : (row.service ? [row.service] : []),
     addedAt: row.ev || undefined,
   }));
-  metas.totalItems = total;
+  metas.totalItems = total == null ? total : Math.min(total, cap);
   metas.limit = pageSize;
   metas.skip = Math.max(0, skip);
   return metas;
@@ -20227,8 +20258,11 @@ function parseMostWatchedWindow(url) {
   return MOST_WATCHED_WINDOWS.includes(w) ? w : null;
 }
 
+// v2: v1 snapshots could hold the "null" entry and up to 100 titles; bumping
+// the version rebuilds every live chart on its next request instead of
+// waiting out the day.
 function mostWatchedSnapshotKey(window, type) {
-  return `mylists:mostwatched:v1:${window}:${type}`;
+  return `mylists:mostwatched:v2:${window}:${type}`;
 }
 
 // Is a stored snapshot still the current one?
@@ -20248,8 +20282,12 @@ async function buildMostWatchedMetas(env, ctx, window, type) {
   const byId = new Map();
   for (const e of entries || []) {
     if (!e || !e.id) continue;
-    const tt = /^tt\d+/.exec(e.id);
-    const id = tt ? tt[0] : e.id;
+    // Only a real title id charts: an IMDb id, or tmdb:<n>. A bare number is
+    // ambiguous -- the Trakt importer falls back to an episode's TMDB id when
+    // the show has no IMDb id -- and anything else ("null") is not a title.
+    const m = /^(tt\d+|tmdb:\d+)(?::\d+:\d+)?$/.exec(String(e.id).trim());
+    if (!m) continue;
+    const id = m[1];
     const prev = byId.get(id);
     if (prev) prev.count += Number(e.count) || 0;
     else byId.set(id, { ...e, id, count: Number(e.count) || 0 });
@@ -22511,9 +22549,9 @@ function buildGenresHtml() {
 // (see MOST_WATCHED_* and the New on Streaming sweep, 00_constants.js).
 const MY_LISTS_ADDON_CHARTS = [
   { name: "New on Streaming", movieUrl: "tmdb:new-on-streaming", showUrl: "tmdb:new-on-streaming" },
-  { name: "My Lists Addon Most Watched Today", movieUrl: "mylists:most-watched:today", showUrl: "mylists:most-watched:today" },
-  { name: "My Lists Addon Most Watched (7 Days)", movieUrl: "mylists:most-watched:7", showUrl: "mylists:most-watched:7" },
-  { name: "My Lists Addon Most Watched (30 Days)", movieUrl: "mylists:most-watched:30", showUrl: "mylists:most-watched:30" },
+  { name: "Most Watched Today", movieUrl: "mylists:most-watched:today", showUrl: "mylists:most-watched:today" },
+  { name: "Most Watched 7 Days", movieUrl: "mylists:most-watched:7", showUrl: "mylists:most-watched:7" },
+  { name: "Most Watched 30 Days", movieUrl: "mylists:most-watched:30", showUrl: "mylists:most-watched:30" },
 ];
 
 function buildMyListsAddonChartsHtml() {
@@ -22576,8 +22614,17 @@ const CHART_SLUG_REGISTRY = Object.fromEntries(CHART_SLUG_ENTRIES.map((e) => [e.
 // null on an unknown slug rather than throwing, since a stale or
 // hand-edited link should land the visitor in the app (default view)
 // rather than a hard error.
+// Slugs a chart used to have, so a link shared under the old name still lands
+// on the chart. The Most Watched charts first shipped as "My Lists Addon Most
+// Watched Today / (7 Days) / (30 Days)".
+const LEGACY_CHART_SLUGS = {
+  "My-Lists-Addon-Most-Watched-Today": "Most-Watched-Today",
+  "My-Lists-Addon-Most-Watched-7-Days": "Most-Watched-7-Days",
+  "My-Lists-Addon-Most-Watched-30-Days": "Most-Watched-30-Days",
+};
+
 function resolveChartSlug(slug) {
-  return CHART_SLUG_REGISTRY[slug] || null;
+  return CHART_SLUG_REGISTRY[slug] || CHART_SLUG_REGISTRY[LEGACY_CHART_SLUGS[slug]] || null;
 }
 
 // --- The curated shelves, in one place ---------------------------------------
@@ -30278,8 +30325,11 @@ function trackEvent(eventType, id, title, mediaType) {
 function trackEventsBatch(eventType, items) {
   if (!items || !items.length) return;
   try {
+    // A missing id that has already been through String() arrives here as
+    // the text "null" / "undefined" -- not a title, so not a watch to count.
+    const junkId = /^(null|undefined|nan|true|false)(:|$)/i;
     const events = items.slice(0, 50)
-      .filter((it) => it && it.id)
+      .filter((it) => it && it.id && !junkId.test(String(it.id).trim()))
       .map((it) => ({ eventType: eventType, id: String(it.id), title: it.title || '', mediaType: it.mediaType === 'series' ? 'series' : 'movie' }));
     if (!events.length) return;
     fetch(ORIGIN + '/api/track-event', {
@@ -78094,7 +78144,7 @@ function generateSearchVariations(query) {
           // bounded the length but not the contents, which let arbitrary
           // text (including markup) end up in key names.
           const evtId = String(e.id).trim();
-          if (!/^[A-Za-z0-9][A-Za-z0-9:_.-]{0,99}$/.test(evtId)) return Promise.resolve();
+          if (!/^[A-Za-z0-9][A-Za-z0-9:_.-]{0,99}$/.test(evtId) || isJunkTrackedId(evtId)) return Promise.resolve();
           return recordTrackedEvent(
             env,
             e.eventType,
@@ -86012,7 +86062,7 @@ function generateSearchVariations(query) {
       const region = (url.searchParams.get("region") || "US").trim().toUpperCase().slice(0, 2) || "US";
       const source = servicesParam ? `tmdb:new-on-streaming:${servicesParam}` : "tmdb:new-on-streaming";
       try {
-        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming", q }, skip, { env, ctx, region, limit, wantTotal: true });
+        const items = await fetchNewOnStreaming({ type, url: source, name: "New on Streaming", q }, skip, { env, ctx, region, limit, wantTotal: true, uncapped: true });
         return json({
           ok: true,
           source,
