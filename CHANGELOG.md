@@ -16,6 +16,8 @@ Story Lock walks a locked show's run in broadcast order — 3 a night on a rotat
 
 Net effect, as promised: tonight's S1E1-3 means tomorrow's S1E4-6 and the day after's S1E7-9, block by block through every season in order, wrapping to the beginning once the run ends.
 
+One known edge, documented in `rotateChannelDayLineup`: a pool that changes size ("Automatically add new episodes" folding in a new season, Live Cloud Sync rebuilding, picks added or removed in the builder) re-phases the cycle at that moment — one block of it is skipped or repeated at the change, never out of order. Surviving that needs a stored cursor, and lineups are resolved statelessly from the payload and the clock.
+
 - Tests: tests/worker.test.mjs — a full cycle airs every episode exactly once in broadcast order across seasons; a locked show never drops out of the day's lineup even with a full dial; hide watched does not rewind or skip the walk while the viewer watches along; a short final block instead of a repeated episode.
 
 ### 🐛 My Lists Addon Charts: "null iv", shorter names, 25 titles each

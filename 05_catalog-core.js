@@ -2678,6 +2678,15 @@ function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys, hide
       // rather than clamping the start back to fill the block, which
       // replayed the episode before it -- a run of eight used to air E6
       // twice every cycle. "Always in order" means no episode twice.
+      //
+      // What this deliberately does not survive: the pool itself changing
+      // size -- auto new episodes folding in a season, Live Cloud Sync
+      // rebuilding, picks added or removed in the builder. `day % blocks`
+      // then re-phases AT the change, so the cycle skips or repeats one
+      // block of it (never out of order: the night is still one contiguous
+      // in-order block). Surviving that needs a stored cursor, and a
+      // lineup is resolved statelessly from the payload and the clock --
+      // so one re-phase per pool change is the accepted cost.
       const blocks = Math.max(1, Math.ceil(showEpisodes.length / perShow));
       start = (((day % blocks) + blocks) % blocks) * perShow;
     } else {
