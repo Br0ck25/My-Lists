@@ -77,6 +77,16 @@
   <div class="lists-subpanel" id="catalogsSubQuickAdd" style="display:none;">
     <div id="catalogsQuickAddContainer">
 
+    <!-- My Lists Addon Charts Shelf -- this add-on's own charts (MY_LISTS_ADDON_CHARTS, 08). -->
+    <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
+      <div class="shelf-header" style="margin-bottom:8px;">
+        <h2 class="shelf-title">My Lists Addon Charts</h2>
+        <button type="button" class="qa-add-all-btn lc-btn primary" data-add-all-action="mylists-charts">+ Add all</button>
+      </div>
+      <p class="qa-shelf-sub">Our own charts, updated daily: what just arrived on Netflix, Prime Video, Disney+, HBO Max, Hulu, Apple TV+, Paramount+ and Peacock (a show moves back to the top when new episodes land), and what people using My Lists Addon are watching most today, this week and this month:</p>
+      ${myListsAddonChartsHtml}
+    </div>
+
     <!-- Combined Charts Shelf -->
     <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">
       <div class="shelf-header" style="margin-bottom:8px;">
@@ -146,10 +156,6 @@
       <p class="qa-shelf-sub">The full catalog of each of the ten streaming services, browsable as its own row:</p>
       ${streamingHtml}
     </div>
-
-    <!-- New on Streaming Shelf -- renders as an empty string, card and all,
-         until NEW_ON_STREAMING_IN_QUICK_ADD is turned on (00_constants.js). -->
-    ${newOnStreamingQuickAddCard}
 
     <!-- Kids Shelf -->
     <div class="shelf-section discover-shelf panel qa-shelf-card" data-shelf-type="all">

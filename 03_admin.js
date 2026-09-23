@@ -493,8 +493,21 @@ async function writeEventMetaIfChanged(env, eventType, id, title, mediaType) {
   return changed;
 }
 
+// An id that is a stringified missing value -- String(null) is "null" -- not
+// a title. Every one of them counted as ONE title, so all the watches with a
+// lost id piled up under "null" and it topped the Most Watched chart (named
+// "null iv" by the TMDB lookup that tried to resolve it). Rejected on the way
+// in (/api/track-event, recordTrackedEvent) and skipped on the way out
+// (computeLeaderboard), so counts already recorded under one stop showing too.
+function isJunkTrackedId(id) {
+  const s = String(id == null ? "" : id).trim().toLowerCase();
+  if (!s) return true;
+  const base = s.split(":")[0];
+  return base === "null" || base === "undefined" || base === "nan" || base === "false" || base === "true" || s.startsWith("[object");
+}
+
 async function recordTrackedEvent(env, eventType, id, title, mediaType) {
-  if (!env || !env.CONFIGS || !id) return;
+  if (!env || !env.CONFIGS || !id || isJunkTrackedId(id)) return;
   try {
     const day = statsToday();
     // With D1 bound the counts go there and cost ZERO KV writes, the same way
@@ -746,6 +759,7 @@ async function computeLeaderboard(env, eventType, window, mediaTypeFilter) {
     dropZero = true;
   }
 
+  candidates = candidates.filter((c) => !isJunkTrackedId(c.id));
   const meta = await attachEventMeta(env, eventType, candidates.map((c) => c.id));
   const entries = candidates.map((c, i) => ({ ...meta[i], count: c.count }));
 
@@ -2077,7 +2091,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="trending">
-    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. Meant to eventually seed this add-on's own trending/popular catalogs once there's enough data.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">How many times each title has been marked watched or added to a list, across everyone using this add-on. The <strong>Most Watched</strong> counts for Today, Last 7 Days and Last 30 Days are what the public <strong>Most Watched Today / 7 Days / 30 Days</strong> charts show (top 25; Quick Add &rarr; My Lists Addon Charts, and Discover); those refresh hourly for Today and daily for 7/30 days. Entries recorded without a real title id (such as "null") are left out of both this table and those charts.</p>
     <div style="margin:12px 0;">
       <select class="admin-select" id="trendingTypeSelect" onchange="loadTrendingData()">
         <option value="watched">Most Watched</option>
@@ -2261,7 +2275,7 @@ async function renderAdminDashboard(env) {
   </div>
 
   <div class="admin-tab-panel" data-admin-panel="newonstreaming">
-    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it just has no Quick Add card and no Discover entry until it is turned on for everyone.</p>
+    <p style="color:#8E8E93; margin-top:0; font-size:0.9rem;">The <strong>New on Streaming</strong> catalog &mdash; what actually arrived on a streaming service, newest first, with a show pushed back to the top the day a new episode airs. It is a real catalog row right now and can be installed into Stremio or Nuvio from the URLs below; it is in the My Lists Addon Charts section of Quick Add and in Discover.</p>
     <p style="color:#8E8E93; margin:0 0 16px; font-size:0.82rem;">Powered by RapidAPI's <strong>Streaming Availability API</strong> (/changes) to capture the exact date titles and new episodes are added to streaming services (not release dates), with new arrivals first and recent episodes bumping shows to the top within a rolling 30-day window.</p>
 
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
@@ -2276,7 +2290,7 @@ async function renderAdminDashboard(env) {
         <button type="button" class="secondary lc-btn" style="cursor:pointer; color:#FF9500; border-color:rgba(255,149,0,0.4);" id="nosResetBtn" onclick="runNewOnStreamingSweep(true)">Clear &amp; pull fresh data</button>
         <span id="nosSweepStatus" style="color:#8E8E93; font-size:0.85rem;"></span>
       </div>
-      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Each page fetches up to 25 changes from RapidAPI. Automated sweeps run every 4 hours via cron (~180 runs/month) to stay strictly within your 1,000 req/month plan limit. A safety cap halts sweeps at 950 calls to ensure zero overages. Older titles (&gt;30 days) are pruned automatically each sweep.</p>
+      <p style="color:#8E8E93; margin:10px 0 0; font-size:0.8rem;">Each page fetches up to 25 changes from RapidAPI. Automated sweeps run every 6 hours via cron and read each change stream (new titles, new seasons, new episodes, removals) oldest-first from where the last sweep stopped, so a busy day is finished on the next run instead of being cut off. The per-run budget is the month&#39;s remaining quota spread over the runs left; a safety cap halts sweeps at 950 calls to ensure zero overages. "Run a sweep now" continues the same streams with the page count given. Older titles (&gt;30 days) are pruned automatically each sweep.</p>
     </div>
 
     <div class="panel" style="margin:0 0 18px; padding:14px 16px;">
@@ -3588,20 +3602,30 @@ async function renderAdminDashboard(env) {
         if (st.error) {
           bits.push('<div style="color:#FF3B30;">' + escapeHtmlAdmin(st.error) + '</div>');
         }
+        if (st.engine === 'justwatch') {
+          bits.push('<div>Engine: <span style="color:#30d158; font-weight:600;">JustWatch &ldquo;new&rdquo; feed</span> &mdash; the same source mdblist.com/new-on-streaming uses. Last 3 days re-read every 2 hours; ' + (st.jwDaysDone || 0) + ' older days of the 30-day window fully read. (Set the Worker var NEW_ON_STREAMING_ENGINE=rapidapi to switch back.)</div>');
+        }
         if (st.engine === 'rapidapi') {
           bits.push('<div>Engine: <span style="color:#30d158; font-weight:600;">RapidAPI Streaming Availability</span> &mdash; pulling direct streaming arrivals &amp; episode updates (previous 30 days)</div>');
         }
-        if (!st.rapidKeyConfigured) {
+        if (st.engine === 'rapidapi' && !st.rapidKeyConfigured) {
           bits.push('<div style="color:#FF3B30;"><strong>RAPIDAPI_KEY is not set.</strong> Run <code>npx wrangler secret put RAPIDAPI_KEY</code> to enable sweeps.</div>');
         }
         const usage = st.monthlyUsage || { count: 0, limit: 1000, remaining: 1000, safetyCap: 950 };
         const quotaColor = usage.count >= usage.safetyCap ? '#FF3B30' : (usage.count >= 750 ? '#FF9500' : '#30d158');
         bits.push('<div>Monthly Quota (' + escapeHtmlAdmin(usage.month || '') + '): <strong style="color:' + quotaColor + ';">' + usage.count + ' / ' + usage.limit + ' requests</strong> (' + usage.remaining + ' remaining; safety cap: ' + usage.safetyCap + ')</div>');
-        bits.push('<div>Automated Schedule: <strong>every 4 hours</strong> (~6 runs/day to stay within 1,000 req/mo quota)</div>');
+        const hrs = Math.round((st.intervalSeconds || 21600) / 3600);
+        bits.push('<div>Automated Schedule: <strong>every ' + hrs + ' hours</strong>' + (st.nextTickPages ? ', next run may use up to <strong>' + st.nextTickPages + '</strong> requests (the month&#39;s remaining quota spread over the runs left)' : '') + '</div>');
+        if (st.streams && st.streams.length) {
+          bits.push('<div>Change streams: ' + st.streams.map(function (s) {
+            const label = s.changeType === 'removed' ? 'removals' : (s.itemType === 'show' ? 'new titles' : 'new ' + s.itemType + 's');
+            const upTo = s.readUpTo ? nosEpochToDay(s.readUpTo) + ' ' + new Date(s.readUpTo * 1000).toISOString().slice(11, 16) + ' UTC' : 'not started';
+            return '<strong>' + escapeHtmlAdmin(label) + '</strong> read to ' + escapeHtmlAdmin(upTo) +
+              (s.catchingUp ? ' <span style="color:#FF9500;">(catching up)</span>' : '');
+          }).join(' &middot; ') + '</div>');
+        }
         bits.push('<div>Region: <strong>' + escapeHtmlAdmin(st.region || '') + '</strong> &mdash; 30-day rolling window</div>');
-        bits.push('<div>Visible to users: ' + (st.inQuickAdd
-          ? '<span style="color:#30d158;">yes -- it is in Quick Add and Discover</span>'
-          : '<span style="color:#FF9500;">no -- admin only (NEW_ON_STREAMING_IN_QUICK_ADD is false)</span>') + '</div>');
+        bits.push('<div>Visible to users: <span style="color:#30d158;">yes -- My Lists Addon Charts in Quick Add, and Discover</span></div>');
         const totals = st.totals || {};
         bits.push('<div>Active titles in 30d window: <strong>' + (totals.movie || 0) + '</strong> movies, <strong>' + (totals.series || 0) + '</strong> shows (' + (totals.removed || 0) + ' marked removed)</div>');
         if (st.lastSweep) {
@@ -3783,6 +3807,9 @@ async function renderAdminDashboard(env) {
           resultsEl.innerHTML = '<p style="color:#8E8E93; font-size:0.85rem;">Empty -- no matching titles found.</p>';
           return;
         }
+        // Grouped by day like mdblist.com/new-on-streaming, so the two can be
+        // compared side by side.
+        let lastDay = '';
         resultsEl.innerHTML =
           '<div class="table-wrap"><table><tr><th>#</th><th>Poster</th><th>Title</th><th>Type</th><th>Service</th><th>Added Date</th><th>Year</th><th>Id</th></tr>' +
           data.items.map(function (it, i) {
@@ -3797,8 +3824,13 @@ async function renderAdminDashboard(env) {
                 }).join('')
               : '<span style="color:var(--muted);">--</span>';
             const dateStr = it.addedAt ? nosEpochToDay(it.addedAt) : '--';
+            let dayHeader = '';
+            if (dateStr !== lastDay) {
+              lastDay = dateStr;
+              dayHeader = '<tr><td colspan="8" style="font-weight:600; padding-top:14px;">' + escapeHtmlAdmin(dateStr) + '</td></tr>';
+            }
 
-            return '<tr><td>' + (skip + i + 1) + '</td>' +
+            return dayHeader + '<tr><td>' + (skip + i + 1) + '</td>' +
               '<td>' + (it.poster ? '<img src="' + escapeHtmlAdmin(it.poster) + '" alt="" style="width:38px; height:56px; object-fit:cover; border-radius:4px; display:block;">' : '') + '</td>' +
               '<td><strong>' + escapeHtmlAdmin(it.name || '') + '</strong></td>' +
               '<td>' + typeBadge + '</td>' +

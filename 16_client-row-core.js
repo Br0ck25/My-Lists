@@ -2205,8 +2205,11 @@ function trackEvent(eventType, id, title, mediaType) {
 function trackEventsBatch(eventType, items) {
   if (!items || !items.length) return;
   try {
+    // A missing id that has already been through String() arrives here as
+    // the text "null" / "undefined" -- not a title, so not a watch to count.
+    const junkId = /^(null|undefined|nan|true|false)(:|$)/i;
     const events = items.slice(0, 50)
-      .filter((it) => it && it.id)
+      .filter((it) => it && it.id && !junkId.test(String(it.id).trim()))
       .map((it) => ({ eventType: eventType, id: String(it.id), title: it.title || '', mediaType: it.mediaType === 'series' ? 'series' : 'movie' }));
     if (!events.length) return;
     fetch(ORIGIN + '/api/track-event', {
@@ -2360,6 +2363,11 @@ function renderDiscoverChartsList(type, forceRefresh) {
   // They are exposed as window._CHARTS_* globals by 09_page-shell.js.
 
   if (type !== 'gems' && type !== 'kids' && type !== 'holidays' && type !== 'genres' && type !== 'curated') {
+    // This add-on's own charts lead the feed -- New on Streaming and Most
+    // Watched (MY_LISTS_ADDON_CHARTS, 08_quickadd-chart-data.js).
+    if (window._CHARTS_MY_LISTS_ADDON) {
+      window._CHARTS_MY_LISTS_ADDON.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'My Lists Addon'); });
+    }
     if (type === 'movie' || type === 'all') {
       pushSingle('New Releases', 'tmdb:chart:new_movies', 'movie', 'TMDB');
     }
@@ -2392,12 +2400,6 @@ function renderDiscoverChartsList(type, forceRefresh) {
     }
     if (window._CHARTS_STREAMING_ALL) {
       window._CHARTS_STREAMING_ALL.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'My Lists Addon'); });
-    }
-    // Empty until the feature is public -- 09_page-shell.js bakes in an empty
-    // array rather than the real one while NEW_ON_STREAMING_IN_QUICK_ADD is
-    // false, so this loop is a no-op instead of needing its own gate.
-    if (window._CHARTS_NEW_ON_STREAMING) {
-      window._CHARTS_NEW_ON_STREAMING.forEach(function(p) { pushPair(p.name, p.movieUrl, p.showUrl, 'New on Streaming'); });
     }
   }
 
@@ -3042,12 +3044,7 @@ ${buildAddAllCombinedChartsJs()}
 ${buildAddAllFnJs("addAllKidsCharts", buildAddAllPairsCallsJs(KIDS_LISTS, "Kids", ""))}
 ${buildAddAllFnJs("addAllHolidayCharts", buildAddAllPairsCallsJs(HOLIDAY_LISTS, "Holidays", ""))}
 ${buildAddAllFnJs("addAllGenreCharts", buildAddAllPairsCallsJs(GENRE_LISTS, "Genres", ""))}
-// Always DEFINED, so the click handler below resolves whether or not the shelf
-// exists -- but empty while the shelf is hidden. Generating the calls
-// unconditionally put every row's name and source url in the page source of a
-// feature nobody is supposed to be able to add yet, which is most of what
-// shipping it dark was for.
-${buildAddAllFnJs("addAllNewOnStreaming", NEW_ON_STREAMING_IN_QUICK_ADD ? buildAddAllPairsCallsJs(NEW_ON_STREAMING_LISTS, "New on Streaming", "") : "")}
+${buildAddAllFnJs("addAllMyListsAddonCharts", buildAddAllPairsCallsJs(MY_LISTS_ADDON_CHARTS, "My Lists Addon Charts", ""))}
 
 function addAllHiddenGems() {
   addRow("Hidden Gems", "tmdb:hidden-gems", "movie", true, "Hidden Gems");
@@ -3072,7 +3069,7 @@ document.addEventListener('click', (e) => {
   else if (action === 'kids') addAllKidsCharts();
   else if (action === 'holidays') addAllHolidayCharts();
   else if (action === 'genres') addAllGenreCharts();
-  else if (action === 'new-on-streaming') addAllNewOnStreaming();
+  else if (action === 'mylists-charts') addAllMyListsAddonCharts();
 });
 
 // Adds a blank source row to an existing entry -- this is how a normal

@@ -6476,7 +6476,7 @@ function generateSearchVariations(query) {
           // bounded the length but not the contents, which let arbitrary
           // text (including markup) end up in key names.
           const evtId = String(e.id).trim();
-          if (!/^[A-Za-z0-9][A-Za-z0-9:_.-]{0,99}$/.test(evtId)) return Promise.resolve();
+          if (!/^[A-Za-z0-9][A-Za-z0-9:_.-]{0,99}$/.test(evtId) || isJunkTrackedId(evtId)) return Promise.resolve();
           return recordTrackedEvent(
             env,
             e.eventType,

@@ -168,6 +168,9 @@ async function fetchCatalog(entry, skip = 0, keys = {}) {
     // where it is already counted against the sweep's own budget rather than
     // against whoever happened to open the shelf.
     else if (source === "tmdb-new-on-streaming") { result = await fetchNewOnStreaming(entry, skip, keys); }
+    // Reads this add-on's own watch counts (a KV snapshot, rebuilt at most
+    // hourly/daily); see fetchMostWatchedCatalog.
+    else if (source === "mylists-most-watched") { result = await fetchMostWatchedCatalog(entry, skip, keys); }
     else if (source === "trakt-chart") { trackSharedApiUse(keys, !keys.traktKey, "trakt"); result = await fetchTraktChart(entry, skip, traktKey, entry.url.trim().slice("trakt:chart:".length), keys.env, keys.ctx); }
     else if (source === "simkl-chart") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklChart(entry, skip, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:chart:".length), keys.env, keys.ctx); }
     else if (source === "simkl-user") { trackSharedApiUse(keys, true, "simkl"); result = await fetchSimklUserList(entry, skip, keys.simklAccessToken, SIMKL_CLIENT_ID, entry.url.trim().slice("simkl:user:".length), keys.tmdbKey, keys.env, keys.ctx); }

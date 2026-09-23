@@ -6,6 +6,66 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 My Lists Addon Charts: "null iv", shorter names, 25 titles each
+
+- **"null iv" at the top of Most Watched (and in the admin Trending table) was not a title.** Some watches reached `/api/track-event` with an id that had already been through `String(null)`, so they arrived as the text `"null"`. All of them counted as one title with the id "null". The chart then asked TMDB to name that id, which returned an unrelated movie called "null iv". Fixed in three places:
+  - `isJunkTrackedId` (03_admin.js) rejects `null` / `undefined` / `NaN` / `true` / `false` ids in `/api/track-event`, `recordTrackedEvent` (which also covers the scrobbler) and the website's beacon.
+  - `computeLeaderboard` skips such ids, so the counts already recorded under "null" disappear from the admin table and the charts without touching stored data.
+  - Most Watched only charts real title ids (`tt…` or `tmdb:…`). A bare number is ambiguous: the Trakt importer falls back to an episode's TMDB id when a show has no IMDb id. The snapshot key moved to `v2`, so live charts rebuild on their next request.
+- **Renamed:** "Most Watched Today", "Most Watched 7 Days" and "Most Watched 30 Days". Links using the old `/lists/My-Lists-Addon-Most-Watched-…` slugs still resolve (`LEGACY_CHART_SLUGS`).
+- **The three Most Watched charts are capped at 25 titles** (`MOST_WATCHED_MAX_ITEMS`). New on Streaming is not capped: it pages through the whole 30-day window.
+
+### 🐛 New on Streaming: "No poster" and "Not found or TMDB error" on some shows
+
+JustWatch's IMDb id is sometimes wrong. *Mysteries at the Museum* came through as tt8113838 and *The Kitchen* as tt3547488, and Cinemeta has nothing for either. *WWE Raw* came through as tt2932286, an IMDb duplicate record that Cinemeta lists as `#DUPE#`; the real one is tt0185103. With a wrong id, TMDB has no match, so the website shows "No poster" and clicking the title says "Not found or TMDB error". Stremio can't find streams for it either. JustWatch's TMDB id is right (4656 for WWE Raw, which Cinemeta also maps to tt0185103).
+
+- **The sweep now takes the IMDb id from TMDB** (`resolveJustWatchIds`): `/{movie|tv}/{tmdbId}?append_to_response=external_ids`. The same request also gives a poster when JustWatch has none. A title TMDB knows with no IMDb id is stored as `tmdb:<id>`, which the website opens fine.
+- **Each title is checked once.** Rows written from TMDB's answer are stamped `last_seen_walk = 2` (`NOS_ID_CHECKED`). That column is left over from the old TMDB-walk engine, so no migration is needed. Later sweeps reuse a checked row's id without asking TMDB again.
+- **Old rows under a wrong id are deleted** once the right one is written.
+- **Lookup budget:** up to 300 lookups per sweep (`NEW_ON_STREAMING_JW_MAX_ID_LOOKUPS`), taken from the cron's outbound-fetch share. A day that needs more stops at that page and finishes on the next sweep. If `TMDB_API_KEY` is not set, JustWatch's ids are used as before.
+
+### ⭐ My Lists Addon Charts: New on Streaming and Most Watched, on the website
+
+- **New Quick Add section, "My Lists Addon Charts"** (Catalogs → Quick Add, first card), with "+ Movies" / "+ Shows" on each chart and "+ Add all":
+  - **New on Streaming**: what just arrived on Netflix, Prime Video, Disney+, HBO Max, Hulu, Apple TV+, Paramount+ and Peacock, newest first. A show moves back to the top when new episodes land. It was already a working catalog; it just had no public entry until now. The separate "ships dark" card and its per-service rows are gone, along with `NEW_ON_STREAMING_IN_QUICK_ADD`.
+  - **My Lists Addon Most Watched Today / (7 Days) / (30 Days)**: what people using the add-on watched, ranked by the same "watched" counts as the admin Trending Data tab (`computeLeaderboard`). New source `mylists:most-watched:today|7|30` (`fetchMostWatchedCatalog`), split into movies and shows. Windows are Eastern calendar days, like that tab.
+- **Discover All / Movies / Shows** lead with the same four charts, credited "by My Lists Addon". Each chart also gets a shareable `/lists/<slug>` page, e.g. `/lists/My-Lists-Addon-Most-Watched-7-Days`. Everything is driven by one table, `MY_LISTS_ADDON_CHARTS` (08_quickadd-chart-data.js).
+- **How Most Watched stays current:** each window/type is a KV snapshot (`mylists:mostwatched:v1:<window>:<type>`). The 7- and 30-day charts rebuild on the first request of each Eastern day. "Today" rebuilds hourly, because a once-a-day "today" would sit empty all morning.
+- **Cost of a rebuild:** one D1 query plus the stored titles. Posters for IMDb ids are Metahub URLs, so they need no API call. At most 20 TMDB lookups per build (`MOST_WATCHED_MAX_LOOKUPS`), for ids with no IMDb poster, which keeps a build within a free-plan request's 50-fetch allowance. Stray episode ids are folded into their show. A failed rebuild serves the previous snapshot.
+- `mylists:most-watched:` is allowed by the preview endpoint's source allowlist (`isAllowedCatalogSourceUrl`). The list page's "Add" button files these rows under "My Lists Addon Charts".
+- Tests: tests/my-lists-addon-charts.test.mjs covers ranking, the movie/show split, episode folding, snapshot refresh (daily and hourly), KV-only deployments, the empty state, the Quick Add card, the Discover feed and the `/lists/<slug>` pages.
+
+### 🐛 New on Streaming: days over JustWatch's 600-entry cap were cut short
+
+Compared the whole Sep 5–21 range against a saved copy of mdblist.com/new-on-streaming. The biggest gap was **Sep 12**: mdblist had 864 titles, and we had 600 entries. JustWatch's `newTitles` stops every query at 600 (`JUSTWATCH_NEW_TITLES_CAP`), and that day Prime Video alone added more than 600 movies. Now a query that reports a capped `totalCount` is split into narrower queries that together cover the same results: by service, then movies vs. seasons, then by halving the release-year range (`splitJustWatchSlice`). The split pieces are saved with each day's progress, so a big day can finish over several sweeps. Up to 30 pages per sweep.
+
+Result of the comparison: of 2,189 mdblist titles, 1,934 match ours on the same day. About 160 more are probably the same title named differently (JustWatch sometimes gives the original-language title, e.g. *W jak morderstwo* for *In for a Murder*). 30 are titles we already moved to Sep 22, a day mdblist had not finished loading. That leaves about 55 unexplained titles on each side.
+
+### 🔁 New on Streaming now reads JustWatch, the same feed mdblist uses
+
+The fixes below made RapidAPI collect its data properly, but the list still didn't match mdblist. The rest of the gap was the **data itself**. RapidAPI's crawler lists titles mdblist never has, like the 2024 *Road House* "on Hulu", Peacock's *Velvet* and *seaQuest DSV*, or *Jimmy Kimmel Live!* dated four days after its last episode. The sweep now reads **JustWatch's `newTitles` GraphQL feed**, which is what mdblist's New on Streaming is built on:
+
+- **Same services as mdblist's picker.** It asks for the same eight JustWatch packages mdblist ticks by default: `nfx`, `amp`, `dnp`, `atp`, `hlu`, `mxx`, `pct` (Peacock Premium), `ppp` (Paramount Plus Premium). Subscription only (`FLATRATE`). They're stored as `jwPackage` on `NEW_ON_STREAMING_PROVIDERS`.
+- **Same dates, same episode rule.** Each Movie or Season edge is filed under the day JustWatch dates it. When a season gains episodes, JustWatch lists it again on that day, and that is what moves a show back to the top. Within a day, titles keep JustWatch's order.
+- **How the sweep reads the feed** (`sweepJustWatchNewOnStreaming`): the last 3 days are re-read every 2 hours, because a JustWatch day keeps filling up. Older days in the 30-day window are read once, newest first, and resume from a saved cursor if a sweep runs out of pages. Progress is saved in KV (`cron:newonstreaming:jwdays:US`). Up to 20 pages of 100 per sweep. No API key and no quota.
+- Posters come from `images.justwatch.com`. The TMDB episode bump is skipped, since the feed already has the episodes.
+- **Checked live against the real API:** Sep 22 includes every title in mdblist's Sep 22 row (All Saints, Call Me Fitz, Transformers: Rescue Bots, Haven, Yukon Gold, The Willies, Miss Dial, Stan Helsing), and *Tuner*, *Best Medicine* and *GTO* land on Sep 21 as they do on mdblist.
+- **RapidAPI is still there.** Set the Worker var `NEW_ON_STREAMING_ENGINE = "rapidapi"` to switch back.
+- **Terms of use:** JustWatch's GraphQL API is the one its own website calls. It has no key and no published terms for third-party use. Using it is the operator's decision.
+
+### 🐛 New on Streaming: why it did not match mdblist, and the fixes
+
+What [mdblist.com/new-on-streaming](https://mdblist.com/new-on-streaming/) actually is (its own changelog, Aug 20 2026): JustWatch's "new" feed, grouped by day, sorted by the date a title became available on a service. JustWatch's feed has two kinds of entry: a **movie** getting an offer on a service, and a **season** getting one. That includes an existing season whose offer gains episodes, and it also includes daily shows (*The Daily Show, season 31, 1 new episode* dated Sep 22). So a show does jump back to the top when a new episode lands on the service. Our design was right about that. The data collection was what was broken:
+
+- **Most changes were never read.** A regular sweep read each change type **newest-first** with a fixed page count (1 page of new titles, 2 of episodes, 1 of seasons: 25 changes a page), then moved its window forward to the next sweep. Anything past those pages was gone for good: the 1st-of-the-month catalogue dumps, a 20-episode season drop, a busy evening of next-day episodes. The `/changes` feed is now four resumable streams (`NEW_ON_STREAMING_STREAMS`: new titles, new seasons, new episodes, removals), each read **oldest-first** from where it last stopped, and each follows RapidAPI's cursor across sweeps. A tick polls every stream once, then spends what is left on new titles first, then seasons, then episodes. Resume state is in KV (`cron:newonstreaming:streams:US`), and the admin tab shows how far each stream has read.
+- **Page slots were spent on the wrong catalogues.** The sweep asked for bare `prime` and `apple`, which is every Prime Video Channels title, every Amazon rental and essentially the whole iTunes Store. Each of those changes used a slot on the page before being thrown away. It now asks for `<service>.subscription` (plus `peacock.free`) only. Add-on channels (Starz via Prime, Max via Hulu) are also filtered out, because JustWatch lists them as providers of their own. Before, they were labelled with the service they were sold through.
+- **Daily shows were filtered out.** The old comment said this matched MDBList, but it does not: mdblist's Sep 21 row has *Good Morning America* in it. Talk, news and game shows are kept now.
+- **The TMDB fallback bumped the wrong rows.** `bumpNewOnStreamingEpisodes` moved **every** service row of a show to the day an episode aired on its broadcast network. So *Live PD* airing on A&E put Netflix's library copy at the top as "new on Netflix". Now it only moves a service's own row, and only when the show is that service's original (`NEW_ON_STREAMING_ORIGINAL_NETWORKS`, TMDB network ids). RapidAPI's episode stream handles everything else, because it sees the episode land on the service itself.
+- **A removed title could come back.** Replaying an arrival older than a recorded removal cleared `removed_at`. The upsert now only clears it for a change newer than the removal.
+- **Budget:** sweeps run every 6 hours. Each one spends the month's remaining quota spread over the runs left (`newOnStreamingTickBudget`, 4–16 pages), still under the 950 safety cap. "Clear & pull fresh data" still backfills newest-first and then hands over to the streams.
+- The admin preview is grouped by day, like mdblist, so the two can be compared side by side.
+- Tests: resuming across sweeps from the cursor, poll-then-priority page allocation, subscription-only catalogues, add-on filtering, the daily removals throttle, daily shows kept, removals not undone by a replay, originals-only TMDB bumps, and the tick budget. The TMDB bump tests no longer send real requests to RapidAPI.
+
 ### ⭐ Better Posters (btttr.cc)
 
 - **Settings -> Account & Sync -> Better Posters** swaps plain poster artwork for [BetterPosters](https://btttr.cc/) -- posters with the genre, rating and tags drawn into the image itself rather than laid over it. **Off by default**, and needs no API key or account: BetterPosters keys off the IMDb id alone.

@@ -290,6 +290,8 @@ function detectSource(input) {
     s === "rapidapi:new-on-streaming" || s.startsWith("rapidapi:new-on-streaming:") ||
     s === "streaming:new-on-streaming" || s.startsWith("streaming:new-on-streaming:")
   ) return "tmdb-new-on-streaming";
+  // This add-on's own Most Watched chart -- "mylists:most-watched:today|7|30".
+  if (s.startsWith("mylists:most-watched:")) return "mylists-most-watched";
   if (s.startsWith("trakt:chart:")) return "trakt-chart";
   if (s.startsWith("simkl:chart:")) return "simkl-chart";
   if (s.startsWith("simkl:user:")) return "simkl-user";
@@ -325,7 +327,8 @@ function isAllowedCatalogSourceUrl(raw) {
     s.startsWith("customlist:v1:") ||
     s.startsWith("autotrack:") ||
     s.startsWith("custom:") ||
-    s.startsWith("curated:")
+    s.startsWith("curated:") ||
+    s.startsWith("mylists:most-watched:")
   ) {
     return true;
   }

@@ -305,21 +305,72 @@ const CRON_EPISODE_CHECK_SHARE = 0.5;
 // wrong catalog under the right label, and these were confirmed through the
 // admin dashboard's Provider Preview tab. Do NOT hand-edit them from memory --
 // re-verify through that tab, the same rule that block already carries.
+//
+// jwPackage is the JustWatch package shortName -- the same eight services
+// mdblist.com/new-on-streaming offers ticked by default in its service picker
+// (Netflix, Amazon Prime Video, Disney Plus, Apple TV, Hulu, HBO Max, Peacock
+// Premium, Paramount Plus Premium), confirmed against JustWatch's own
+// `packages(country: US)` query.
 const NEW_ON_STREAMING_PROVIDERS = [
-  { key: "netflix", name: "Netflix", rapidId: "netflix" },
-  { key: "primevideo", name: "Prime Video", rapidId: "prime" },
-  { key: "disney", name: "Disney+", rapidId: "disney" },
-  { key: "hbomax", name: "HBO Max", rapidId: "hbo" },
-  { key: "hulu", name: "Hulu", rapidId: "hulu" },
-  { key: "appletv", name: "Apple TV+", rapidId: "apple" },
-  { key: "paramount", name: "Paramount+", rapidId: "paramount" },
-  { key: "peacock", name: "Peacock", rapidId: "peacock" },
+  { key: "netflix", name: "Netflix", rapidId: "netflix", jwPackage: "nfx" },
+  { key: "primevideo", name: "Prime Video", rapidId: "prime", jwPackage: "amp" },
+  { key: "disney", name: "Disney+", rapidId: "disney", jwPackage: "dnp" },
+  { key: "hbomax", name: "HBO Max", rapidId: "hbo", jwPackage: "mxx" },
+  { key: "hulu", name: "Hulu", rapidId: "hulu", jwPackage: "hlu" },
+  { key: "appletv", name: "Apple TV+", rapidId: "apple", jwPackage: "atp" },
+  { key: "paramount", name: "Paramount+", rapidId: "paramount", jwPackage: "ppp" },
+  { key: "peacock", name: "Peacock", rapidId: "peacock", jwPackage: "pct" },
 ];
+
+// Where the sweep reads arrivals from. "justwatch" is what mdblist's New on
+// Streaming is built on (its changelog, Aug 20 2026), so it is the only way
+// to show the same titles on the same days -- RapidAPI's /changes feed is a
+// different crawler with different dates and, often, different titles (the
+// 2024 Road House "on Hulu", Velvet "on Peacock"). "rapidapi" is kept as a
+// fallback. A Worker var NEW_ON_STREAMING_ENGINE overrides this.
+//
+// JustWatch's GraphQL API is the one its own website calls. It has no key and
+// no published terms for third-party use -- mdblist presumably has an
+// arrangement. Using it here is the operator's call.
+const NEW_ON_STREAMING_ENGINE = "justwatch";
+const JUSTWATCH_GRAPHQL_URL = "https://apis.justwatch.com/graphql";
+// A JustWatch day keeps filling up for a while after it starts (the 1st of a
+// month has 600 entries by the evening), so the most recent days are re-read
+// on every sweep. Older days are read once and kept.
+const NEW_ON_STREAMING_JW_REFRESH_DAYS = 3;
+const NEW_ON_STREAMING_JW_PAGE_SIZE = 100;
+const NEW_ON_STREAMING_JW_MAX_PAGES_PER_SWEEP = 30;
+const JUSTWATCH_NEW_TITLES_CAP = 600;
+// TMDB lookups one sweep may spend checking the IMDb ids JustWatch gives
+// (resolveJustWatchIds). Each title is checked once and remembered in the
+// table, so only first sightings cost one; a busy day spills into the next
+// sweep rather than going unchecked.
+const NEW_ON_STREAMING_JW_MAX_ID_LOOKUPS = 300;
+const NEW_ON_STREAMING_JW_INTERVAL_SECONDS = 7200;
 
 const RAPIDAPI_CHANGES_URL = "https://streaming-availability.p.rapidapi.com/changes";
 const RAPIDAPI_HOST = "streaming-availability.p.rapidapi.com";
 const NEW_ON_STREAMING_WINDOW_DAYS = 30;
-const NEW_ON_STREAMING_DEFAULT_CATALOGS = "netflix,prime,hulu,disney,hbo,apple,paramount,peacock";
+// Subscription (and Peacock's free tier) catalogs ONLY. The bare service ids
+// ("prime", "apple", "hulu") also match that service's rent/buy store and its
+// add-on channels -- "prime" is every Prime Video Channels title and every
+// Amazon digital rental, "apple" is essentially the iTunes Store -- and every
+// one of those changes spent one of a page's 25 slots before being thrown
+// away client-side. That is also how a Starz-via-Prime title ended up labelled
+// "Prime Video". JustWatch (what mdblist.com/new-on-streaming reads) lists
+// those channels as separate providers, so leaving them out here is what
+// matching it means, not just what saves quota.
+const NEW_ON_STREAMING_DEFAULT_CATALOGS = [
+  "netflix.subscription",
+  "prime.subscription",
+  "hulu.subscription",
+  "disney.subscription",
+  "hbo.subscription",
+  "apple.subscription",
+  "paramount.subscription",
+  "peacock.subscription",
+  "peacock.free",
+].join(",");
 const NEW_ON_STREAMING_REGIONS = ["US"];
 
 // RapidAPI Streaming Availability Quota Limits & Schedule:
@@ -328,36 +379,94 @@ const NEW_ON_STREAMING_REGIONS = ["US"];
 const RAPIDAPI_MONTHLY_LIMIT = 1000;
 const RAPIDAPI_MONTHLY_SAFETY_CAP = 950;
 
-// Runs every 4 hours via cron (~180 runs/month). With 4 pages + 1 removed-check
-// per incremental run, this uses ~900 requests/month (180 * 5), staying under
-// the 950 safety cap with a small margin.
-const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 14400;
-
-// Maximum pages fetched per sweep.
+// Automated sweeps run every 6 hours (~120/month). The page budget of each one
+// is not fixed: it is whatever is left of the month's safety cap divided by the
+// sweeps left in the month (newOnStreamingTickBudget), clamped to the range
+// below. So a month with a few big manual sweeps spends less per tick later,
+// and one that has been quiet can afford to catch up -- the cap is never the
+// thing that stops the sweep in the last week.
 //
-// RapidAPI's /changes endpoint returns only 25 changes per page (see its
-// openapi.yaml), and a regular sweep never pages past what this budget
-// allows -- there is no cursor continuation once a type's page budget for
-// the tick runs out. 8 major streaming services can easily produce more
-// than 25 real episode-arrival events in a single 4-5 hour sweep window, so
-// this is the actual ceiling on how much of the catalog's real-time bump
-// coverage comes from RapidAPI directly (the rest falls to the slower,
-// TMDB-based bumpNewOnStreamingEpisodes safety net). Raised from 3 to 4 so a
-// regular tick can give `episode` a second page (see itemTypeShares below)
-// instead of the single page every type got before.
+// Every tick has to spend one request per change stream just to ask "anything
+// new?" (see NEW_ON_STREAMING_STREAMS), so fewer, fuller ticks buy more real
+// changes per request than frequent near-empty ones. mdblist's own list moves
+// once a day; four sweeps a day is already finer than that.
+const NEW_ON_STREAMING_SWEEP_INTERVAL_SECONDS = 21600;
+const NEW_ON_STREAMING_MIN_PAGES_PER_TICK = 4;
+const NEW_ON_STREAMING_MAX_PAGES_PER_TICK = 16;
+
+// The /changes feed as four independent streams, each with its own resume
+// point in KV (cron:newonstreaming:streams:<region>). A stream is read oldest
+// first from where it last stopped and follows RapidAPI's cursor across ticks,
+// so a busy day (the 1st of the month, a 20-episode season drop) is finished on
+// the next tick instead of everything past the first page being dropped --
+// which is what reading newest-first with a fixed page count per tick did.
+//
+// Listed in priority order: a tick polls every due stream once, then spends
+// what is left in this order. A title's first arrival matters most; episode
+// changes are by far the largest stream (one change per episode, per service)
+// and so get what remains. `everySeconds` throttles a stream that does not need
+// polling every tick. `maxLagSeconds` lets a stream that has fallen hopelessly
+// behind skip forward rather than spend days replaying stale changes that
+// could only ever land below what is already on the shelf.
+const NEW_ON_STREAMING_STREAMS = [
+  { id: "show", changeType: "new", itemType: "show", everySeconds: 0, maxLagSeconds: 0 },
+  { id: "season", changeType: "new", itemType: "season", everySeconds: 0, maxLagSeconds: 0 },
+  { id: "episode", changeType: "new", itemType: "episode", everySeconds: 0, maxLagSeconds: 3 * 86400 },
+  { id: "removed", changeType: "removed", itemType: "show", everySeconds: 86400, maxLagSeconds: 0 },
+];
+// A stream's next query starts this far before where the last one ended, in
+// case a change is published with a timestamp slightly older than the moment
+// it became visible. Re-reading it costs a slot on a page, never a wrong row:
+// every write is an idempotent upsert.
+const NEW_ON_STREAMING_RESUME_OVERLAP_SECONDS = 1800;
+
+// Kept for the admin route's default and the "Clear & pull fresh data" path,
+// which still backfills newest-first (see sweepRapidApiNewOnStreaming).
 const NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP = 4;
 const NEW_ON_STREAMING_PAGES_PER_TICK = NEW_ON_STREAMING_MAX_PAGES_PER_SWEEP;
 const NEW_ON_STREAMING_SWEEP_FETCHES = 1;
+
+// TMDB network ids of each service's own originals. bumpNewOnStreamingEpisodes
+// (the TMDB-based fallback for episode bumps) only moves a service's row when
+// the show is that service's original, because a broadcast air date says
+// nothing about when -- or whether -- a library service gets the episode:
+// Live PD airing on A&E is not new on Netflix, which only has old seasons.
+const NEW_ON_STREAMING_ORIGINAL_NETWORKS = {
+  netflix: [213],
+  primevideo: [1024],
+  disney: [2739],
+  hbomax: [49, 3186],
+  hulu: [453],
+  appletv: [2552],
+  paramount: [4330],
+  peacock: [3353],
+};
 const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 
-// Ships dark. The sweep, the catalog and the /lists route are live as soon as
-// this deploys -- tmdb:new-on-streaming resolves, installs into Stremio and
-// pages like any other row -- but the Quick Add shelf and the Discover
-// entries stay hidden until this is true, so the list can be tested from the
-// admin dashboard against real data before anyone else can add it. Flipping
-// this to true is the entire "move it to the live site" step; nothing else
-// about the feature changes.
-const NEW_ON_STREAMING_IN_QUICK_ADD = false;
+// The shelf is public: "New on Streaming" is in the My Lists Addon Charts
+// section of Quick Add and in Discover (MY_LISTS_ADDON_CHARTS,
+// 08_quickadd-chart-data.js).
+
+// --- My Lists Addon Most Watched ---------------------------------------------
+//
+// mylists:most-watched:<window> -- this add-on's own chart, built from the
+// same "watched" counts as the admin dashboard's Trending Data tab
+// (computeLeaderboard, 03_admin.js). Windows are Eastern calendar days, the
+// same buckets that tab uses.
+//
+// Each window/type is a snapshot in KV (mylists:mostwatched:v2:<window>:<type>),
+// rebuilt on the first request after it goes stale: the 7- and 30-day charts
+// once per Eastern day, "today" once an hour -- a "today" that only refreshed
+// at midnight would sit empty all morning.
+const MOST_WATCHED_WINDOWS = ["today", "7", "30"];
+const MOST_WATCHED_TODAY_REFRESH_SECONDS = 3600;
+// Each Most Watched chart is its top 25. (New on Streaming is not capped: it
+// is the whole 30-day window.)
+const MOST_WATCHED_MAX_ITEMS = 25;
+// Titles with an IMDb id get a Metahub poster with no API call at all. Only
+// the rest (a tmdb: id, or no stored name) need a TMDB lookup, and a build is
+// capped at this many so it fits a free-plan request's 50-fetch allowance.
+const MOST_WATCHED_MAX_LOOKUPS = 20;
 
 // --- Quick Add network channel presets --------------------------------------
 //

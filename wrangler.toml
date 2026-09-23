@@ -119,6 +119,10 @@ crons = ["*/6 * * * *"]
 #   npx wrangler secret put TMDB_API_KEY            # themoviedb.org/settings/api
 #   npx wrangler secret put RAPIDAPI_KEY            # rapidapi.com (Streaming Availability API for New on Streaming)
 #   npx wrangler secret put STREAMING_AVAILABILITY_API_KEY # optional alias for RAPIDAPI_KEY
+#
+# New on Streaming reads JustWatch's "new" feed by default (no key needed).
+# To use RapidAPI instead, set the plain var NEW_ON_STREAMING_ENGINE = "rapidapi"
+# under [vars].
 #   npx wrangler secret put TRAKT_CLIENT_ID         # trakt.tv/oauth/applications
 #   npx wrangler secret put TRAKT_CLIENT_SECRET     # required only for Trakt OAuth login
 #   npx wrangler secret put MDBLIST_API_KEY         # mdblist.com/preferences

@@ -6774,17 +6774,13 @@
       }
     }
 
-    // --- New on Streaming (admin-only while the shelf ships dark) -----------
+    // --- New on Streaming admin routes ---------------------------------------
     //
-    // tmdb:new-on-streaming is a real catalog the moment this deploys -- it
-    // resolves, installs into Stremio and pages like any other row -- but it
-    // has no Quick Add card and no Discover entry until
-    // NEW_ON_STREAMING_IN_QUICK_ADD is flipped (00_constants.js). These three
-    // routes are how it gets judged before that: what the sweep has actually
-    // collected, a way to push the walk along without waiting out the cron,
-    // and a preview that reads through the SAME fetchNewOnStreaming the
-    // add-on serves, so what the dashboard shows is what Stremio would get
-    // rather than a second implementation that can drift from it.
+    // What the sweep has actually collected, a way to push it along without
+    // waiting out the cron, and a preview that reads through the SAME
+    // fetchNewOnStreaming the add-on serves, so what the dashboard shows is
+    // what Stremio would get rather than a second implementation that can
+    // drift from it.
 
     // /admin/api/new-on-streaming -> the sweep's own state: cursor position,
     // walk generation, rows per service, and how much of it is seeded (dated
@@ -6838,7 +6834,7 @@
         // dashboard sweep shows up in the API Usage tab rather than looking
         // like the key spent itself.
         const spent = (sweep && sweep.units ? sweep.units : 0) + (sweep && sweep.resolved ? sweep.resolved : 0);
-        if (spent > 0) {
+        if (spent > 0 && sweep.source !== "justwatch") {
           const statKey = sweep && sweep.source === "rapidapi" ? "apiuse:rapidapi" : "apiuse:tmdb";
           ctx.waitUntil(bumpStatBy(env, statKey, spent));
         }

@@ -14,6 +14,9 @@
 
   <!-- Discover Shelves Feed -->
   <div id="discoverShelvesContainer">
+    <!-- My Lists Addon Charts Shelf -->
+    ${myListsAddonChartsHtml}
+
     <!-- Combined Charts Shelf -->
     ${combinedChartsHtml}
 
@@ -34,9 +37,6 @@
 
     <!-- Streaming Catalogs Shelf -->
     ${streamingHtml}
-
-    <!-- New on Streaming Shelf -->
-    ${newOnStreamingHtml}
 
     <!-- Hidden Gems Shelf -->
     ${hiddenGemsHtml}
