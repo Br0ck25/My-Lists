@@ -19212,7 +19212,9 @@ function justWatchPosterUrl(path) {
 // One page of edges -> upserts. `position` is the edge's index within the
 // whole day; it orders titles inside a day the way JustWatch lists them (the
 // date is all JustWatch gives, so the time of day is synthetic: midnight UTC
-// plus a few seconds per place, earlier = higher, clamped to now).
+// plus a few seconds per place, earlier = higher). Deliberately NOT clamped to
+// now: in the first ~2.8 hours of a UTC day every entry of that day would
+// clamp to the same second and lose its order. It never leaves the day.
 function processJustWatchNewTitles(edges, { env, region, dayEpoch, startPosition, nowSec, writes, summary }) {
   let position = startPosition;
   for (const edge of edges || []) {
@@ -19236,7 +19238,7 @@ function processJustWatchNewTitles(edges, { env, region, dayEpoch, startPosition
       summary.noId = (summary.noId || 0) + 1;
       continue;
     }
-    const eventAt = Math.min(nowSec, dayEpoch + Math.max(0, 9999 - idx));
+    const eventAt = dayEpoch + Math.max(0, 9999 - idx);
     const kind = isSeason ? "series" : "movie";
     const eventKind = isSeason ? "season" : "added";
     const season = isSeason && node.content && Number.isFinite(Number(node.content.seasonNumber)) ? Number(node.content.seasonNumber) : null;
