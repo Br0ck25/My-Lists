@@ -6,6 +6,25 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 Airing Next and Recommended froze when the website wasn't opened
+
+Both shelves are built by the website and pushed up as snapshots, and nothing on the server rebuilt them. Someone who used only Stremio or Nuvio for ten days saw the same Airing Next the whole time: episodes that had aired still listed as coming, newly announced episodes missing, and shows started since never added. Recommended stayed frozen at whatever the Discover tab last showed.
+
+- **Airing Next drops aired episodes when it's read.** The Stremio/Nuvio row leaves out any episode whose air date is before today, the way the website's own copy already did. Today's episode stays.
+- **The cron rebuilds Airing Next.** `refreshAiringNextSweep` (in `07_source-fetchers-tmdb-simkl.js`) applies the website's own rules to the account's tracking record:
+  - The same shows qualify: every show with a watched episode plus fully watched ones, up to 60.
+  - The same "removed from Airing Next" rule applies.
+  - Entries are built field for field like the website's, with the same de-duplication and soonest-first order.
+  - Each show is looked up through the same cached details lookup the website's `/api/details/batch` uses.
+
+  Each account is rebuilt at most every 6 hours, which is the website's own refresh interval. The sweep does 3 accounts per tick at the 6-minute cron, so it covers about 180 accounts at that interval before stretching. It is paid from the episode sweep's unused reserve, like New on Streaming.
+
+  A rebuild writes only the Airing Next field of the tracking record, against a fresh read, so nothing a browser or playback saved meanwhile is lost. It does not touch `clientVersion`, so the next website save doesn't conflict. In D1 it writes only the `airing_next` rows (`saveAiringNextD1`), and only when D1 was already current.
+- **Recommended builds its own list once the Discover snapshot is 3 days old.** It uses the same algorithm the website calls. `/api/recommendations` and the catalog row now share `buildTmdbRecommendations`. The row is seeded from the account's Continue Watching, Watch History and Watchlist, up to 12 per side, so recent viewing shapes it. The old snapshot is kept as a fallback only if nothing can be built.
+- **The website re-stamps an unchanged snapshot every 12 hours.** It used to skip saving when its recommendations hadn't changed. A daily Discover user who got the same list would then have looked abandoned and been switched to the server's list. The stamp now records when Discover was last shown, and it is part of the tracking push signature, so the re-stamp is actually sent.
+
+- Tests: `tests/airing-and-recs-live.test.mjs` (11). They cover aired episodes leaving the row, the cron rebuilding from Watch History (including a show watched since the last snapshot, served through D1), removals honoured, a TMDB outage keeping entries instead of emptying the shelf, the rest of the record and `clientVersion` left alone, Recommended serving a fresh snapshot, building its own for a stale one, falling back to the stale one, the route and row sharing one builder, and the website's 12-hour re-stamp. The six behavior tests fail on the previous code.
+
 ### 🐛 Personal lists in Stremio and Nuvio stopped updating
 
 - **Playing anything in Stremio, Nuvio or Plex emptied the Watchlist row.** The Watchlist is stored in three places, and the Stremio/Nuvio row read the one inside the account's tracking record. Both playback scrobbles read that record from D1, which has no Watchlist column, and then wrote it back, so every play left it with an empty Watchlist or none. The row showed nothing, or only what the website had pushed since the last play. New additions never seemed to arrive. The row, and the Watchlist the website loads, now use whichever copy is newest. The list record is never rebuilt by anything else, so accounts already hit by this recover without doing anything. The scrobbles now put the Watchlist back before they write.

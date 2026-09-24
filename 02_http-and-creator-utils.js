@@ -3210,6 +3210,7 @@ async function purgeCreatorData(env, username, options = {}) {
     // Set while this account's D1 tracking rows are behind its KV record --
     // see trackingD1BehindKey.
     trackingD1BehindKey(u),
+    airingNextCheckedKey(u),
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
     `creatorshare:${u}`,
@@ -4137,6 +4138,61 @@ async function d1HasAiringRemovalColumns(env) {
   return _d1AiringRemovalColumns;
 }
 
+// The upserts for one account's Airing Next, one row per show (first entry
+// wins, matching the client's own dedupe). Shared by the full tracking write
+// below and by saveAiringNextD1, the cron's narrow one.
+function airingNextD1Statements(env, username, items, fallbackUpdatedAt) {
+  const stmts = [];
+  const anSeen = new Set();
+  for (const item of items) {
+    if (!item) continue;
+    const showId = String(item.showId || item.id || "");
+    if (!showId || anSeen.has(showId)) continue;
+    anSeen.add(showId);
+    const itemId = String(item.id || showId);
+    const name = item.name || null;
+    const poster = item.poster || null;
+    const showTitle = item.showTitle || null;
+    const showPoster = item.showPoster || null;
+    const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
+    const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
+    const airDate = item.airDate || null;
+    const isSeasonPremiere = item.isSeasonPremiere ? 1 : 0;
+    const isSeasonFinale = item.isSeasonFinale ? 1 : 0;
+    const seasonFinaleAirDate = item.seasonFinaleAirDate || null;
+    const seasonFinaleEpisodeNumber = item.seasonFinaleEpisodeNumber != null ? Number(item.seasonFinaleEpisodeNumber) : null;
+    const itemUpdated = Number(item.updatedAt) || fallbackUpdatedAt;
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO airing_next (
+          username, show_id, item_id, name, poster, show_title, show_poster,
+          season_num, episode_num, air_date, is_season_premiere, is_season_finale,
+          season_finale_air_date, season_finale_episode_number, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(username, show_id) DO UPDATE SET
+           item_id = excluded.item_id,
+           name = excluded.name,
+           poster = excluded.poster,
+           show_title = excluded.show_title,
+           show_poster = excluded.show_poster,
+           season_num = excluded.season_num,
+           episode_num = excluded.episode_num,
+           air_date = excluded.air_date,
+           is_season_premiere = excluded.is_season_premiere,
+           is_season_finale = excluded.is_season_finale,
+           season_finale_air_date = excluded.season_finale_air_date,
+           season_finale_episode_number = excluded.season_finale_episode_number,
+           updated_at = excluded.updated_at`
+      ).bind(
+        username, showId, itemId, name, poster, showTitle, showPoster,
+        seasonNum, episodeNum, airDate, isSeasonPremiere, isSeasonFinale,
+        seasonFinaleAirDate, seasonFinaleEpisodeNumber, itemUpdated
+      )
+    );
+  }
+  return { stmts, seen: anSeen };
+}
+
 // Set while an account's D1 tracking rows are known to be behind its KV
 // record: saveCreatorTrackingD1 writes it when a write fails and removes it
 // when one succeeds.
@@ -4152,6 +4208,15 @@ function trackingD1BehindKey(username) {
   return `trackingd1behind:${username}`;
 }
 
+// Present, with a TTL of AIRING_NEXT_SERVER_REFRESH_MS, for as long as an
+// account's Airing Next was rebuilt by the cron recently enough not to need it
+// again -- see refreshAiringNextSweep (07_source-fetchers-tmdb-simkl.js). A
+// TTL rather than a stored time so "due" is simply "absent", and nothing ever
+// has to clean the key up.
+function airingNextCheckedKey(username) {
+  return `airingnextchecked:${username}`;
+}
+
 async function isTrackingD1Behind(env, username) {
   if (!env || !env.CONFIGS || !username) return false;
   try {
@@ -4161,24 +4226,69 @@ async function isTrackingD1Behind(env, username) {
   }
 }
 
+async function recordTrackingD1Result(env, username, ok, stamp) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    const key = trackingD1BehindKey(username);
+    if (!ok) {
+      await env.CONFIGS.put(key, String(Number(stamp) || Date.now()));
+    } else if (await env.CONFIGS.get(key)) {
+      // Read first so an ordinary save -- the usual case, with no marker --
+      // costs no KV write.
+      await env.CONFIGS.delete(key);
+    }
+  } catch {
+    // The marker is an optimisation for the catalog rows; the write's own
+    // result is what the caller acts on.
+  }
+}
+
 async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   if (!env || !env.DB || !username || !trackingData) return false;
   const ok = await writeCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval);
-  if (env.CONFIGS) {
-    try {
-      const key = trackingD1BehindKey(username);
-      if (!ok) {
-        await env.CONFIGS.put(key, String(Number(trackingData.updatedAt) || Date.now()));
-      } else if (await env.CONFIGS.get(key)) {
-        // Read first so an ordinary save -- the usual case, with no marker --
-        // costs no KV write.
-        await env.CONFIGS.delete(key);
-      }
-    } catch {
-      // The marker is an optimisation for the catalog rows; the write's own
-      // result is what the caller acts on.
+  await recordTrackingD1Result(env, username, ok, trackingData.updatedAt);
+  return ok;
+}
+
+// Airing Next alone, for the cron that rebuilds it (refreshAiringNextSweep,
+// 07_source-fetchers-tmdb-simkl.js). saveCreatorTrackingD1 rewrites every row
+// the account has -- one statement per Watch History item -- which is fine
+// for a browser's save but not for a cron tick working through many accounts
+// under one invocation's operation cap. This writes the one table that
+// changed, then moves the stamp.
+//
+// Only when D1 was current to begin with: previousStamp is the KV record's
+// updatedAt from BEFORE this rebuild. If D1 was already behind that, stamping
+// it current after writing one table would hide every other table's lag from
+// readCreatorTrackingD1 -- so D1 is left alone, still visibly behind, for the
+// next full write or read-repair to catch up.
+async function saveAiringNextD1(env, username, items, updatedAt, previousStamp) {
+  if (!env || !env.DB || !username || !Array.isArray(items)) return false;
+  let ok = true;
+  try {
+    const metaRow = await env.DB.prepare(
+      "SELECT updated_at FROM creator_tracking_meta WHERE username = ?"
+    ).bind(username).first();
+    // An account with no D1 record reads from KV anyway.
+    if (!metaRow) return true;
+    if ((Number(metaRow.updated_at) || 0) < (Number(previousStamp) || 0)) return true;
+    if (await isTrackingD1Behind(env, username)) return true;
+    const an = airingNextD1Statements(env, username, items, updatedAt);
+    const prunes = await d1ReplaceRowsById(env, "airing_next", username, "show_id", an.seen);
+    const stamp = env.DB.prepare(
+      "UPDATE creator_tracking_meta SET updated_at = ? WHERE username = ?"
+    ).bind(updatedAt, username);
+    // Upserts, then deletions, then the stamp -- writeCreatorTrackingD1's
+    // ordering, for its reasons.
+    const ordered = an.stmts.concat(prunes, [stamp]);
+    for (let i = 0; i < ordered.length; i += 80) {
+      await env.DB.batch(ordered.slice(i, i + 80));
     }
+  } catch (err) {
+    console.error("D1 write error (saveAiringNextD1):", err);
+    ok = false;
   }
+  await recordTrackingD1Result(env, username, ok, updatedAt);
   return ok;
 }
 
@@ -4355,54 +4465,9 @@ async function writeCreatorTrackingD1(env, username, trackingData, isIntentional
     // 4. Airing Next: replace whole set
     if (Array.isArray(trackingData.airingNext)) {
       // Same key, same reasoning as Continue Watching above.
-      const anSeen = new Set();
-      for (const item of trackingData.airingNext) {
-        if (!item) continue;
-        const showId = String(item.showId || item.id || "");
-        if (!showId || anSeen.has(showId)) continue;
-        anSeen.add(showId);
-        const itemId = String(item.id || showId);
-        const name = item.name || null;
-        const poster = item.poster || null;
-        const showTitle = item.showTitle || null;
-        const showPoster = item.showPoster || null;
-        const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
-        const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
-        const airDate = item.airDate || null;
-        const isSeasonPremiere = item.isSeasonPremiere ? 1 : 0;
-        const isSeasonFinale = item.isSeasonFinale ? 1 : 0;
-        const seasonFinaleAirDate = item.seasonFinaleAirDate || null;
-        const seasonFinaleEpisodeNumber = item.seasonFinaleEpisodeNumber != null ? Number(item.seasonFinaleEpisodeNumber) : null;
-        const itemUpdated = Number(item.updatedAt) || meta.updatedAt;
-        stmts.push(
-          env.DB.prepare(
-            `INSERT INTO airing_next (
-              username, show_id, item_id, name, poster, show_title, show_poster,
-              season_num, episode_num, air_date, is_season_premiere, is_season_finale,
-              season_finale_air_date, season_finale_episode_number, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(username, show_id) DO UPDATE SET
-               item_id = excluded.item_id,
-               name = excluded.name,
-               poster = excluded.poster,
-               show_title = excluded.show_title,
-               show_poster = excluded.show_poster,
-               season_num = excluded.season_num,
-               episode_num = excluded.episode_num,
-               air_date = excluded.air_date,
-               is_season_premiere = excluded.is_season_premiere,
-               is_season_finale = excluded.is_season_finale,
-               season_finale_air_date = excluded.season_finale_air_date,
-               season_finale_episode_number = excluded.season_finale_episode_number,
-               updated_at = excluded.updated_at`
-          ).bind(
-            username, showId, itemId, name, poster, showTitle, showPoster,
-            seasonNum, episodeNum, airDate, isSeasonPremiere, isSeasonFinale,
-            seasonFinaleAirDate, seasonFinaleEpisodeNumber, itemUpdated
-          )
-        );
-      }
-      prunes.push(...await d1ReplaceRowsById(env, "airing_next", username, "show_id", anSeen));
+      const an = airingNextD1Statements(env, username, trackingData.airingNext, meta.updatedAt);
+      stmts.push(...an.stmts);
+      prunes.push(...await d1ReplaceRowsById(env, "airing_next", username, "show_id", an.seen));
     }
 
     // 5. Watch History

@@ -1236,6 +1236,146 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
 // external_ids call. Those are edge-cached for a day, and the list is
 // capped at CURATED_RECOMMENDATION_LIMIT, so this is a bounded, mostly
 // cache-served fan-out rather than the up-to-PAGE_SIZE one this replaced.
+// TMDB's recommendations (or, where it has none, its "similar" titles) for a
+// set of seed titles, merged and de-duplicated -- the Discover tab's
+// Recommended Movies/Shows. One implementation for both callers: the
+// /api/recommendations route the website calls, and fetchCuratedCatalog when
+// the website's snapshot has gone stale. Two copies of this would drift, and
+// the whole point of the catalog row is that it shows what the card showed.
+//
+// Either side may be empty; a side with fewer than ten results is topped up
+// from that week's trending titles, exactly as the route always did.
+async function buildTmdbRecommendations(movieIds, showIds, tmdbKey) {
+  const listFor = (kind) => async (rawId) => {
+    try {
+      let tmdbId = "";
+      let strId = String(rawId || "").trim();
+      if (strId.startsWith("tmdb:")) strId = strId.slice(5);
+      const baseId = strId.split(":")[0];
+      if (/^\d+$/.test(baseId)) {
+        tmdbId = baseId;
+      } else {
+        const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(baseId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
+          cf: { cacheTtl: 86400, cacheEverything: true }
+        });
+        const findData = await findRes.json();
+        const results = kind === "movie" ? findData.movie_results : findData.tv_results;
+        if (results && results[0]) tmdbId = results[0].id;
+      }
+      if (!tmdbId) return [];
+      const recRes = await fetch(`https://api.themoviedb.org/3/${kind}/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+        cf: { cacheTtl: 86400, cacheEverything: true }
+      });
+      const recData = await recRes.json();
+      let list = recData.results || [];
+      if (!list.length) {
+        const simRes = await fetch(`https://api.themoviedb.org/3/${kind}/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+          cf: { cacheTtl: 86400, cacheEverything: true }
+        });
+        const simData = await simRes.json();
+        list = simData.results || [];
+      }
+      return list;
+    } catch {
+      return [];
+    }
+  };
+
+  const toItem = (kind, m) => kind === "movie"
+    ? {
+        id: "tmdb:" + m.id,
+        tmdbId: String(m.id),
+        name: m.title || "Movie",
+        poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
+        year: (m.release_date || "").slice(0, 4),
+        type: "movie",
+        rating: m.vote_average ? m.vote_average.toFixed(1) : null
+      }
+    : {
+        id: "tmdb:" + m.id,
+        tmdbId: String(m.id),
+        name: m.name || "Show",
+        poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
+        year: (m.first_air_date || "").slice(0, 4),
+        type: "series",
+        rating: m.vote_average ? m.vote_average.toFixed(1) : null
+      };
+
+  const side = async (kind, ids) => {
+    const lists = await Promise.all((ids || []).map(listFor(kind)));
+    const seen = new Set();
+    const out = [];
+    for (const list of lists) {
+      for (const m of list) {
+        if (m && m.id && !seen.has(m.id) && m.poster_path) {
+          seen.add(m.id);
+          out.push(toItem(kind, m));
+        }
+      }
+    }
+    if (out.length < 10) {
+      try {
+        const popRes = await fetch(`https://api.themoviedb.org/3/trending/${kind}/week?api_key=${encodeURIComponent(tmdbKey)}`, {
+          cf: { cacheTtl: 86400, cacheEverything: true }
+        });
+        const popData = await popRes.json();
+        for (const m of (popData.results || [])) {
+          if (m && m.id && !seen.has(m.id) && m.poster_path) {
+            seen.add(m.id);
+            out.push(toItem(kind, m));
+          }
+        }
+      } catch {}
+    }
+    return out.slice(0, CURATED_RECOMMENDATION_LIMIT);
+  };
+
+  const [movies, shows] = await Promise.all([
+    movieIds ? side("movie", movieIds) : Promise.resolve([]),
+    showIds ? side("tv", showIds) : Promise.resolve([]),
+  ]);
+  return { movies, shows };
+}
+
+// The seed titles the website would send /api/recommendations for this
+// account, from what the server can see of it: Continue Watching, Watch
+// History and the Watchlist, in that order -- the order the Discover tab
+// gathers them in (19_client-search-and-likes.js). The website also reads
+// the account's other custom lists; those only ever add seeds after these,
+// and with twelve a side the first three almost always fill it.
+//
+// Classified the way the website classifies them: anything with a showId, or
+// typed/shaped as a series, seeds shows; everything else seeds movies.
+function recommendationSeedsFrom(items) {
+  const movieIds = [];
+  const showIds = [];
+  const seenShows = new Set();
+  const seenMovies = new Set();
+  for (const it of items) {
+    if (!it) continue;
+    const rawShowId = it.showId || (it.type === "series" || it.type === "tv" || it.kind === "series" || it.kind === "tv" || it.showTitle ? (it.id || it.imdbId) : null);
+    if (rawShowId) {
+      const clean = String(rawShowId).replace(/^tmdb:/, "").split(":")[0].trim();
+      if (clean && !seenShows.has(clean)) {
+        seenShows.add(clean);
+        showIds.push(clean);
+      }
+    } else {
+      const rawMovieId = it.imdbId || it.id;
+      if (!rawMovieId) continue;
+      const clean = String(rawMovieId).replace(/^tmdb:/, "").split(":")[0].trim();
+      if (clean && !seenMovies.has(clean)) {
+        seenMovies.add(clean);
+        movieIds.push(clean);
+      }
+    }
+  }
+  return {
+    movieIds: movieIds.slice(0, RECOMMENDATION_SEEDS_PER_SIDE),
+    showIds: showIds.slice(0, RECOMMENDATION_SEEDS_PER_SIDE),
+  };
+}
+
 async function mapStoredRecommendationToMeta(it, isSeries, tmdbKey) {
   if (!it) return null;
   const tmdbId = String(it.tmdbId || String(it.id || '').replace(/^tmdb:/, '') || '').trim();
@@ -1266,15 +1406,6 @@ async function mapStoredRecommendationToMeta(it, isSeries, tmdbKey) {
 async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
   const isSeries = entry.type === 'series' || (entry.url && entry.url.includes('shows'));
   const tmdbKey = keys.tmdbKey || TMDB_API_KEY;
-  let sampleIds = [];
-  // The exact list the Discover tab last showed for this account, pushed
-  // up alongside Watch History/Continue Watching/Airing Next by
-  // pushTrackingSync (22_client-creator-profile.js). Preferred over
-  // re-deriving below because re-deriving cannot reproduce it: the card's
-  // seeds come from the browser's full picture (Continue Watching + Watch
-  // History + Watchlist + every other custom list), while this function
-  // can only see what tracking data made it to the server. Same reason
-  // Airing Next is served from a pushed snapshot rather than recomputed.
   let storedRecs = null;
 
   if (keys.env && keys.env.CONFIGS) {
@@ -1285,33 +1416,53 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
         if (resolved && resolved.trackCreatorName) username = resolved.trackCreatorName;
       } catch {}
     }
+    let tracking = null;
     if (username) {
       try {
         const trackingRaw = await keys.env.CONFIGS.get(`creatorsynctracking:${username}`);
-        if (trackingRaw) {
-          const tracking = JSON.parse(trackingRaw);
-          const recBlob = tracking.curatedRecommendations;
-          if (recBlob && typeof recBlob === 'object') {
-            const candidate = isSeries ? recBlob.shows : recBlob.movies;
-            if (Array.isArray(candidate) && candidate.length) storedRecs = candidate;
-          }
-          if (isSeries) {
-            const list = Array.isArray(tracking.continueWatching) && tracking.continueWatching.length
-              ? tracking.continueWatching
-              : (Array.isArray(tracking.watchHistory) ? tracking.watchHistory : []);
-            sampleIds = list.map(it => it.showId || it.id).filter(Boolean).slice(0, 10);
-          } else {
-            const list = Array.isArray(tracking.watchHistory) ? tracking.watchHistory : [];
-            sampleIds = list.filter(it => it.type === 'movie' || !it.seasonNum).map(it => it.id || it.imdbId).filter(Boolean).slice(0, 10);
-          }
-        }
+        if (trackingRaw) tracking = JSON.parse(trackingRaw);
       } catch {}
+    }
+    if (tracking) {
+      // The Discover card's own list, while the website is still the one
+      // keeping it current. Preferred over building one here because only the
+      // browser sees the account's whole picture (every custom list, not just
+      // tracking data), so only its list matches the card item for item.
+      const recBlob = tracking.curatedRecommendations;
+      const snapshot = recBlob && typeof recBlob === 'object' ? (isSeries ? recBlob.shows : recBlob.movies) : null;
+      const snapshotAge = Date.now() - ((recBlob && Number(recBlob.updatedAt)) || 0);
+      if (Array.isArray(snapshot) && snapshot.length && snapshotAge < CURATED_SNAPSHOT_MAX_AGE_MS) {
+        storedRecs = snapshot;
+      } else {
+        // No snapshot, or one the website has not refreshed in days --
+        // someone watching only in Stremio or Nuvio, whose row used to stay
+        // frozen at whatever Discover last showed. Built the way the website
+        // builds it (buildTmdbRecommendations), from the account's current
+        // Continue Watching, Watch History and Watchlist, so what has been
+        // watched since shapes it. The stale snapshot is the fallback only if
+        // that produces nothing (no viewing to seed from, TMDB down).
+        try {
+          const wl = await readAccountWatchlist(keys.env, username, tracking);
+          const seeds = recommendationSeedsFrom([
+            ...(Array.isArray(tracking.continueWatching) ? tracking.continueWatching : []),
+            ...(Array.isArray(tracking.watchHistory) ? tracking.watchHistory : []),
+            ...(wl ? wl.items : []),
+          ]);
+          const sideSeeds = isSeries ? seeds.showIds : seeds.movieIds;
+          if (sideSeeds.length) {
+            const built = await buildTmdbRecommendations(isSeries ? null : sideSeeds, isSeries ? sideSeeds : null, tmdbKey);
+            const side = isSeries ? built.shows : built.movies;
+            if (side.length) storedRecs = side;
+          }
+        } catch {}
+        if (!storedRecs && Array.isArray(snapshot) && snapshot.length) storedRecs = snapshot;
+      }
     }
   }
 
-  // The snapshot path. Serves exactly the items the Discover card last
-  // showed, in exactly that order, cut to exactly the same length -- so
-  // "40 items" on the card and 40 items in the shelf are the same 40.
+  // Serves the list chosen above -- the Discover snapshot, or the one built
+  // in its place -- in its own order, cut to the card's length, so "40
+  // items" on the card and 40 items in the shelf are the same 40.
   if (storedRecs) {
     const capped = storedRecs.slice(0, CURATED_RECOMMENDATION_LIMIT);
     if (skip >= capped.length) return [];
@@ -1319,103 +1470,16 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
       capped.slice(skip, skip + PAGE_SIZE).map((it) => mapStoredRecommendationToMeta(it, isSeries, tmdbKey).catch(() => null))
     );
     const out = mapped.filter(Boolean);
-    // Only trust the snapshot if it actually resolved to something. An
-    // empty result here (every external_ids call failed, say) falls
-    // through to the live derivation below rather than serving an empty
-    // shelf, the same fallback shape fetchCustomListCatalog already uses.
+    // Only trust the list if it actually resolved to something. An empty
+    // result here (every external_ids call failed, say) falls through to
+    // the popular chart below rather than serving an empty shelf, the same
+    // fallback shape fetchCustomListCatalog already uses.
     if (out.length) {
       out.totalItems = capped.length;
       return out;
     }
   }
 
-  if (sampleIds.length > 0) {
-    try {
-      const recs = await Promise.all(sampleIds.map(async (rawId) => {
-        try {
-          let tmdbId = '';
-          if (String(rawId).startsWith('tmdb:')) {
-            tmdbId = String(rawId).slice(5);
-          } else {
-            const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(rawId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const findData = await findRes.json();
-            const resKey = isSeries ? 'tv_results' : 'movie_results';
-            if (findData[resKey] && findData[resKey][0]) {
-              tmdbId = findData[resKey][0].id;
-            }
-          }
-          if (!tmdbId) return [];
-          const endpoint = isSeries ? 'tv' : 'movie';
-          const recRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-            cf: { cacheTtl: 86400, cacheEverything: true }
-          });
-          const recData = await recRes.json();
-          let list = recData.results || [];
-          if (!list.length) {
-            const simRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const simData = await simRes.json();
-            list = simData.results || [];
-          }
-          return list;
-        } catch {
-          return [];
-        }
-      }));
-
-      const seenTmdb = new Set();
-      const combined = [];
-      recs.forEach(list => {
-        (list || []).forEach(item => {
-          if (item && item.id && !seenTmdb.has(item.id)) {
-            seenTmdb.add(item.id);
-            combined.push(item);
-          }
-        });
-      });
-
-      if (combined.length > 0) {
-        // CURATED_RECOMMENDATION_LIMIT, not PAGE_SIZE: this list is the
-        // same list the Discover card shows, and that card is built from
-        // a response cut to exactly this many items. Cutting the pool
-        // first (rather than the page) also means paging stops where the
-        // card says the list ends instead of running on to 100.
-        const capped = combined.slice(0, CURATED_RECOMMENDATION_LIMIT);
-        if (skip >= capped.length) {
-          return [];
-        }
-        const mapped = await Promise.all(capped.slice(skip, skip + PAGE_SIZE).map(async (it) => {
-          try {
-            let imdbId = '';
-            const detailRes = await fetch(`https://api.themoviedb.org/3/${isSeries ? 'tv' : 'movie'}/${it.id}/external_ids?api_key=${encodeURIComponent(tmdbKey)}`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const detailData = await detailRes.json();
-            imdbId = detailData.imdb_id;
-            if (!imdbId) imdbId = `tmdb:${it.id}`;
-            const releaseYear = (it.release_date || it.first_air_date || '').slice(0, 4);
-            return {
-              id: imdbId,
-              type: isSeries ? 'series' : 'movie',
-              name: it.title || it.name || 'Untitled',
-              poster: it.poster_path ? `https://image.tmdb.org/t/p/w500${it.poster_path}` : undefined,
-              releaseInfo: releaseYear || undefined,
-            };
-          } catch {
-            return null;
-          }
-        }));
-        const derived = mapped.filter(Boolean);
-        derived.totalItems = capped.length;
-        return derived;
-      }
-    } catch {}
-  }
-
-  // Fallback: If user has no personalized history, return only the first page of TMDB Popular
   if (skip === 0) {
     return fetchTmdbChart(entry, 0, tmdbKey, 'popular');
   }
@@ -1729,8 +1793,18 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         }
       }
     }
+    // Airing Next lists what is still to come, and it is a snapshot: rebuilt
+    // by the website when it is open and by the cron (refreshAiringNextSweep,
+    // 07_source-fetchers-tmdb-simkl.js) every few hours. In between, an
+    // episode can air -- and it used to sit on the shelf with its old date
+    // for as long as nobody rebuilt it. The website's own copy drops those
+    // (refreshAiringNext treats an aired entry as expired); so does this.
+    // "Aired" is isEpisodeAired's: before today, so today's episode stays.
+    if (slug === 'airing-next' && Array.isArray(items) && typeof isEpisodeAired === 'function') {
+      items = items.filter((it) => !(it && it.airDate && isEpisodeAired(it.airDate)));
+    }
     if (!items || !items.length) return [];
-    
+
     const airingByShowId = new Map();
     const airingByBaseId = new Map();
     const airingByTitle = new Map();

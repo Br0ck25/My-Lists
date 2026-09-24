@@ -7374,10 +7374,22 @@ export default {
       "sweepNewOnStreaming",
       episodeSweep.then(() => sweepNewOnStreaming(env, ctx, newOnStreamingBudget))
     );
+    // Airing Next for accounts whose website has not rebuilt it lately --
+    // paid for out of the same reserve, as a slice of the same size, so the
+    // two together take half of what checkForNewEpisodes can never reach and
+    // the pre-warm's share is untouched. Behind the episode sweep for the
+    // same reason New on Streaming is; beside it rather than behind it
+    // because the two spend separate slices and neither waits on the other.
+    const airingNextBudget = Math.floor((episodeBudget - episodeCeiling) * CRON_AIRING_NEXT_SHARE);
+    const airingNextSweep = guard(
+      "refreshAiringNextSweep",
+      episodeSweep.then(() => refreshAiringNextSweep(env, ctx, airingNextBudget))
+    );
     ctx.waitUntil(
       Promise.all([
         episodeSweep,
         streamingSweep,
+        airingNextSweep,
         guard("bumpNewOnStreamingEpisodes", streamingSweep.then(() => bumpNewOnStreamingEpisodes(env, ctx, newOnStreamingBudget))),
         guard("prewarmSharedCatalogs", streamingSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
         // One Quick Add network per tick (see prewarmChannelPresets,

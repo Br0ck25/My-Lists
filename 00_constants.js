@@ -1199,3 +1199,45 @@ const STREMIO_LIVE_ROW_SOURCES = new Set([
   "mdblist-airing-next",
   "mdblist-upnext",
 ]);
+
+// --- Keeping Airing Next and Recommended fresh without the website ----------
+//
+// Both shelves are built by the website and pushed up as snapshots (see
+// refreshAiringNext, 21_client-custom-list-builder.js, and
+// persistCuratedRecommendations, 22_client-creator-profile.js). Someone who
+// only uses Stremio or Nuvio for a while used to keep seeing the last snapshot
+// indefinitely: Airing Next with episodes that had long since aired, and
+// Recommended frozen at whatever Discover last showed.
+
+// How often the cron rebuilds an account's Airing Next -- the same cadence the
+// website refreshes its own copy at (AIRING_NEXT_REFRESH_MS), so an account is
+// never refreshed more often than its own browser would.
+const AIRING_NEXT_SERVER_REFRESH_MS = 6 * 3600 * 1000;
+// Shows looked up per account per rebuild -- the website's own
+// AIRING_NEXT_MAX_SHOWS_PER_RUN, so the two build the same shelf.
+const AIRING_NEXT_SERVER_MAX_SHOWS = 60;
+// Share of the episode sweep's unreachable reserve the Airing Next sweep may
+// spend -- the same arithmetic, and the same size of slice, New on Streaming
+// is paid for with (CRON_NEW_ON_STREAMING_SHARE), so the two together take
+// half of a reserve checkForNewEpisodes can never reach and the pre-warm's
+// share is untouched.
+const CRON_AIRING_NEXT_SHARE = 0.25;
+
+// How old the Discover snapshot may be before the Recommended row stops
+// serving it and builds its own from the account's viewing. The website
+// re-stamps an unchanged snapshot at most every CURATED_RECS_RESTAMP_MS
+// (22_client-creator-profile.js), so a snapshot this old means the website
+// has not shown Discover for days -- not that its recommendations happened
+// not to change.
+const CURATED_SNAPSHOT_MAX_AGE_MS = 3 * 24 * 3600 * 1000;
+// Seeds per side, as the website sends /api/recommendations (sampleMovieIds /
+// sampleShowIds, 19_client-search-and-likes.js).
+const RECOMMENDATION_SEEDS_PER_SIDE = 12;
+// Accounts the Airing Next sweep rebuilds per tick. Each rebuild is up to
+// AIRING_NEXT_SERVER_MAX_SHOWS cached details lookups, and every one of those
+// reads a cache (a KV operation) even when it spends no outbound fetch -- so
+// this, not the fetch budget, is what keeps one tick under the invocation's
+// 1,000-operation cap. 3 a tick at a 6-minute cron is 720 rebuilds a day:
+// every account every six hours up to ~180 accounts, and a proportionally
+// slower cadence beyond that rather than a tick that fails.
+const AIRING_NEXT_SWEEP_ACCOUNTS_PER_TICK = 3;
