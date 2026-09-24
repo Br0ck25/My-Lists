@@ -6,6 +6,29 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 Dragging to reorder froze the page until it was reloaded
+
+Mouse reordering (Live Preview, its Edit mode, and every other reorderable list) used the browser's native drag-and-drop. That hands the gesture to the operating system's drag loop, while `createSortableList` moves the dragged row around the page underneath it. Moving or re-rendering the source of a native drag is what native drag-and-drop handles worst: the drag can end without `dragend`, or not end at all, and the page ignores clicks until it's reloaded. The earlier fixes reduced the work done on each step of a drag, which never touched this. Automated drags don't exercise the real OS drag loop, which is why none of the tests could reproduce it.
+
+- Every reorder is now driven by pointer events, for mouse, touch and pen alike. That means no native drag, no drag image and no OS drag loop. A drag always ends, on `pointerup`, `pointercancel` or the window losing focus.
+- A mouse on a handle starts dragging once it actually moves, so a plain click on a handle isn't a reorder.
+- `draggable="true"` was removed from every handle and card. Any native drag that still starts inside a list (an `<img>` is draggable by default) is refused.
+- The Edit-mode handle gets `touch-action: none`, like the preview handle, so a touch drag isn't taken over by page scrolling.
+
+Verified in Chromium with real mouse input:
+- Live Preview: row 8 dragged to row 19, with the page auto-scrolling about 4,000 px.
+- Edit mode: row 8 dragged to row 37.
+- A click on a handle leaves the order alone, and the page takes clicks right after a drop.
+- Touch drags and a list re-rendered mid-drag still behave.
+
+### 🐛 Better Posters: some tiles stayed blank
+
+btttr.cc draws a title's artwork the first time anyone asks for it. For titles it hadn't drawn yet, that took 40–50 seconds (measured: Ted Lasso 50 s, Slow Horses 39 s, against about 0.3 s for one already drawn). The request neither failed nor answered in that time, so the tile's error fallback never ran and it stayed blank. Switching Better Posters off made them appear.
+
+A Better Poster that hasn't loaded 4 seconds after it comes near the screen now shows the poster it replaced, or the generic poster for its IMDb id. It swaps back in as soon as btttr.cc delivers it; btttr.cc's own `max-age` makes that instant. A Better Poster that loads promptly is never touched, so there's no flicker in the usual case. This is website-only: Stremio and Nuvio fetch the btttr.cc URL themselves, so a not-yet-drawn title shows late there until btttr.cc has drawn it once.
+
+- Tests: `tests/slow-better-posters.test.mjs` (3) checks which poster is shown meanwhile. The timing was verified in Chromium against a btttr.cc stand-in: the fast title untouched, the slow one plain at 6.5 s and the Better Poster at 15 s.
+
 ### 🐛 Airing Next and Recommended froze when the website wasn't opened
 
 Both shelves are built by the website and pushed up as snapshots, and nothing on the server rebuilt them. Someone who used only Stremio or Nuvio for ten days saw the same Airing Next the whole time: episodes that had aired still listed as coming, newly announced episodes missing, and shows started since never added. Recommended stayed frozen at whatever the Discover tab last showed.

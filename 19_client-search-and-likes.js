@@ -332,9 +332,129 @@ function applyBetterPosterWeb(it, poster) {
   // Rebuilt from the current settings every time rather than kept, so
   // changing a style option re-renders with the new one instead of keeping
   // whatever URL happened to be produced first.
-  return betterPostersWebUrl(imdbId);
+  const url = betterPostersWebUrl(imdbId);
+  if (!alreadyBetter) rememberBetterPosterOriginal(url, poster);
+  return url;
 }
 window.applyBetterPosterWeb = applyBetterPosterWeb;
+
+// --- A Better Poster that is slow to arrive shows the plain one meanwhile ----
+//
+// btttr.cc draws a title's artwork the first time anyone asks for it, and for
+// a title it has not drawn yet that took 40-50 seconds (measured: Ted Lasso
+// 50s, Slow Horses 39s, against ~0.3s for one already drawn). The request
+// neither fails nor answers in that time, so the tile's onerror fallback
+// never ran and the tile sat blank -- the empty tiles on Discover and Live
+// Preview that disappeared the moment Better Posters was switched off.
+//
+// So a Better Poster still not loaded BETTER_POSTER_SLOW_MS after it came on
+// screen shows the poster it replaced, and is swapped back in the moment
+// btttr.cc delivers it. One that loads promptly is never touched, so there is
+// no flicker in the ordinary case.
+const BETTER_POSTER_SLOW_MS = 4000;
+// var, not const: applyBetterPosterWeb above can run before this line has
+// (a render during start-up), and a const read that early throws.
+var _betterPosterOriginals = new Map();
+
+function rememberBetterPosterOriginal(url, original) {
+  if (!_betterPosterOriginals) return;
+  if (!url || !original || typeof original !== 'string') return;
+  if (original.indexOf(BETTER_POSTERS_ORIGIN_WEB) === 0) return;
+  // Bounded: every poster on a long session passes through here.
+  if (_betterPosterOriginals.size > 5000) _betterPosterOriginals.clear();
+  _betterPosterOriginals.set(url, original);
+}
+
+// The poster to show while btttr.cc is drawing: the one this URL replaced, or,
+// when that is unknown, the generic poster for the same IMDb id.
+// Plain string scanning, not a regex: this file is embedded in a template
+// literal that eats one round of backslashes (see betterPostersWebImdbId).
+function plainPosterFor(betterUrl) {
+  const known = _betterPosterOriginals && _betterPosterOriginals.get(betterUrl);
+  if (known) return known;
+  const marker = '/imdb/poster-default/';
+  const at = betterUrl.indexOf(marker);
+  if (at < 0) return '';
+  const id = betterUrl.slice(at + marker.length).split('.')[0];
+  return /^tt[0-9]+$/.test(id) ? 'https://images.metahub.space/poster/medium/' + id + '/img' : '';
+}
+
+function startBetterPosterTimer(img) {
+  const src = img.dataset.bpWatched;
+  setTimeout(() => {
+    // Gone, loaded, or already replaced by something else (its own onerror
+    // fallback, a re-render) -- nothing to do.
+    if (!img.isConnected || img.getAttribute('src') !== src) return;
+    if (img.complete && img.naturalWidth > 0) return;
+    const plain = plainPosterFor(src);
+    if (!plain) return;
+    img.src = plain;
+    const pending = new Image();
+    pending.onload = () => {
+      if (img.isConnected && img.getAttribute('src') === plain) img.src = src;
+    };
+    pending.src = src;
+  }, BETTER_POSTER_SLOW_MS);
+}
+
+// Timed from when the tile comes near the screen, not from when it was built:
+// most posters are loading="lazy", and one far down a page has not even been
+// requested yet.
+const _betterPosterSeen = typeof IntersectionObserver === 'function'
+  ? new IntersectionObserver((entries) => {
+      entries.forEach((en) => {
+        if (!en.isIntersecting) return;
+        _betterPosterSeen.unobserve(en.target);
+        startBetterPosterTimer(en.target);
+      });
+    }, { rootMargin: '200px' })
+  : null;
+
+function watchBetterPoster(img) {
+  const src = img.getAttribute('src') || '';
+  if (src.indexOf(BETTER_POSTERS_ORIGIN_WEB) !== 0) return;
+  if (img.dataset.bpWatched === src) return;
+  img.dataset.bpWatched = src;
+  if (img.complete && img.naturalWidth > 0) return;
+  if (_betterPosterSeen) _betterPosterSeen.observe(img);
+  else startBetterPosterTimer(img);
+}
+
+function watchBetterPostersIn(root) {
+  if (!root || root.nodeType !== 1) return;
+  if (root.tagName === 'IMG') { watchBetterPoster(root); return; }
+  const imgs = root.querySelectorAll('img[src^="' + BETTER_POSTERS_ORIGIN_WEB + '"]');
+  for (let i = 0; i < imgs.length; i++) watchBetterPoster(imgs[i]);
+}
+
+// New tiles, and tiles whose src is set after render (applyBetterPostersToTmdb-
+// Tiles below). Collected and handled once per frame, like the poster badges'
+// observer (initWatchHistory), so a grid rendering in batches costs a pass per
+// frame rather than one per tile.
+(function watchBetterPostersOnPage() {
+  if (typeof MutationObserver !== 'function' || !document.body) return;
+  let queue = [];
+  let scheduled = false;
+  const drain = () => {
+    scheduled = false;
+    const nodes = queue;
+    queue = [];
+    if (!betterPostersOnWeb()) return;
+    for (let i = 0; i < nodes.length; i++) if (nodes[i].isConnected) watchBetterPostersIn(nodes[i]);
+  };
+  new MutationObserver((mutations) => {
+    for (let i = 0; i < mutations.length; i++) {
+      const m = mutations[i];
+      if (m.type === 'attributes') queue.push(m.target);
+      else for (let j = 0; j < m.addedNodes.length; j++) queue.push(m.addedNodes[j]);
+    }
+    if (!queue.length || scheduled) return;
+    scheduled = true;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(drain);
+    else setTimeout(drain, 16);
+  }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+  if (betterPostersOnWeb()) watchBetterPostersIn(document.body);
+})();
 
 // Gives BetterPosters artwork to tiles whose item has only a TMDB id.
 //
@@ -394,7 +514,10 @@ async function applyBetterPostersToTmdbTiles(rootEl) {
     if (!imdbId) return;
     const url = betterPostersWebUrl(imdbId);
     const img = el.querySelector('img');
-    if (img) img.src = url;
+    if (img) {
+      rememberBetterPosterOriginal(url, img.getAttribute('src'));
+      img.src = url;
+    }
     // The poster modal reads this back, so it has to match what is shown.
     if (el.dataset.poster) el.dataset.poster = url;
   });

@@ -3497,6 +3497,12 @@ ${seoHeadHtml}
   .shelf-drag-handle:active {
     cursor: grabbing;
   }
+  /* The Edit-mode handle is dragged by pointer events too (createSortableList),
+     so on a touch screen it must not hand the gesture to page scrolling. */
+  .entry .drag-handle {
+    touch-action: none;
+    user-select: none;
+  }
   .entry.dragging {
     opacity: 0.45;
     transform: scale(0.99);
