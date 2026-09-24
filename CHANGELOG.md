@@ -6,6 +6,21 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🐛 Story Lock: the next day jumped to a different season instead of continuing the story
+
+Story Lock walks a locked show's run in broadcast order, 3 a night on a rotating channel: S1E1-3, then S1E4-6, then S1E7-9. That only held within one day. The next day's block could land in a completely different season (S1E1-3 tonight, S3E1-3 tomorrow). Four things broke the walk:
+
+- **The show could sit out a night.** Each day's shows were a seeded draw (24 out of whatever the pool holds), but the walk moved forward on calendar days, so a night off *skipped a block*. A show that missed one night came back three episodes further on, and with short seasons that jump landed in another season. A story-locked show is now on **every** night. It counts against the shows-per-day dial, and only the slots left over go to the draw.
+- **The walk counted days since 1970.** A block was `day % blocks`, with `day` in the tens of thousands. Any change to the length of the run (a new episode from "Automatically add new episodes", a Live Cloud Sync rebuild, an edit in the builder) changed `blocks` and threw the show to an unrelated block, often in another season. The walk now counts nights **from the day the show was locked** (`storyLockedSince`, stamped by the builder when the box is ticked). A newly locked show starts at its first episode that day. On the first pass through the run, new episodes just extend the walk and nothing moves.
+- **"Hide watched" re-cut the run underneath the walk.** Watching along dutifully made it *worse*: one night rewound to S1E4-6 and the next jumped to S2E4-6. With Hide watched on and a watch history to follow, a locked show now just follows the viewer and airs the first unwatched episodes in order. Watch S1E1-3 and S1E4-6 is next. Miss a night and S1E1-3 waits for you. Binge to E9 and E10 is next. With no history at all (an account with no tracking), it walks the calendar, so it is never stuck on S1E1-3.
+- **The last block of the run replayed the episode before it** whenever the run wasn't a multiple of the block size. A run of eight aired E6 twice every cycle. The cycle now ends on a short block (E7-8) and wraps to E1.
+
+Locks saved before this change have no start date. They count from 24 September 2026 and keep walking in order. Unticking and ticking a show again starts it over from episode 1.
+
+What this still does not survive: once a show has looped through its whole run, a change in the run's length moves the walk by about one block per loop so far. It stays in order within the night, but a stretch replays (the run grew) or is skipped (it shrank). Changing the episodes-a-night dial re-cuts the blocks the same way. Avoiding both would need a stored cursor, and lineups are resolved statelessly from the payload and the clock. With Hide watched on and a watch history to follow, the history is the cursor, so neither applies.
+
+- Tests: tests/worker.test.mjs covers a new lock starting at episode 1, a growing run that keeps its place, Hide watched following the viewer through a missed night and a binge, an empty history falling back to the calendar, a full cycle in broadcast order across seasons, no night off with a full dial, a short final block, and share links carrying the lock dates. tests/client.test.mjs covers the builder stamping a lock and keeping the stamp through saves.
+
 ### 🐛 My Lists Addon Charts: "null iv", shorter names, 25 titles each
 
 - **"null iv" at the top of Most Watched (and in the admin Trending table) was not a title.** Some watches reached `/api/track-event` with an id that had already been through `String(null)`, so they arrived as the text `"null"`. All of them counted as one title with the id "null". The chart then asked TMDB to name that id, which returned an unrelated movie called "null iv". Fixed in three places:

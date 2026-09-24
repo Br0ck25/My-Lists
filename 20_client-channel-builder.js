@@ -8288,6 +8288,12 @@ const CHANNEL_DRAFT_PAIR_MAX = 6;
 // created the channel (Import from link, the Next Up button) rather than
 // typed.
 let channelDraftStoryLocked = [];
+// When each of those shows was locked, as { showKey: epoch ms }. A rotating
+// channel starts a locked show at its first episode on that day and walks
+// forward from there (channelStoryLockStartDays, 05_catalog-core.js), so the
+// stamp is taken when the box is ticked and kept through every later save --
+// re-saving a channel must not send its locked shows back to episode 1.
+let channelDraftStoryLockedSince = {};
 let channelDraftSourceUrl = '';
 let channelDraftDynamic = '';
 // Pairs made by hand in the draft: arrays of stream ids, the same keys the
@@ -8310,6 +8316,7 @@ function channelDraftShowKey(it) {
 // is a flag that silently disappears on the next save.
 function channelBroadcastFields(src) {
   const o = src || {};
+  const storyLocked = Array.isArray(o.storyLocked) ? o.storyLocked.slice() : [];
   return {
     description: String(o.description || '').slice(0, 400),
     dailyRotate: !!o.dailyRotate,
@@ -8319,7 +8326,8 @@ function channelBroadcastFields(src) {
     rotateTurnoverTime: o.rotateTurnoverTime || '',
     rotateTurnoverZone: o.rotateTurnoverZone === 'local' ? 'local' : 'utc',
     hideWatched: !!o.hideWatched,
-    storyLocked: Array.isArray(o.storyLocked) ? o.storyLocked.slice() : [],
+    storyLocked: storyLocked,
+    storyLockedSince: channelStoryLockSinceFields(o.storyLockedSince, storyLocked),
     pairParts: !!o.pairParts,
     pairedGroups: Array.isArray(o.pairedGroups)
       ? o.pairedGroups.filter((g) => Array.isArray(g) && g.length > 1).map((g) => g.slice())
@@ -8330,6 +8338,19 @@ function channelBroadcastFields(src) {
     sourceUrl: o.sourceUrl || '',
     dynamic: o.dynamic || '',
   };
+}
+
+// The lock dates for the shows that are locked, and only those, as real
+// timestamps -- the client twin of the Worker's channelStoryLockSince.
+function channelStoryLockSinceFields(raw, locked) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  (locked || []).forEach((key) => {
+    if (!Object.prototype.hasOwnProperty.call(raw, key)) return;
+    const ts = Number(raw[key]);
+    if (isFinite(ts) && ts > 0) out[key] = ts;
+  });
+  return out;
 }
 
 // "HH:MM" in the chosen zone -> minutes past midnight UTC, which is the only
@@ -8379,8 +8400,13 @@ function isChannelShowStoryLocked(key) {
 
 function toggleChannelStoryLock(key, on) {
   const at = channelDraftStoryLocked.indexOf(key);
-  if (on && at === -1) channelDraftStoryLocked.push(key);
-  else if (!on && at !== -1) channelDraftStoryLocked.splice(at, 1);
+  if (on && at === -1) {
+    channelDraftStoryLocked.push(key);
+    channelDraftStoryLockedSince[key] = Date.now();
+  } else if (!on && at !== -1) {
+    channelDraftStoryLocked.splice(at, 1);
+    delete channelDraftStoryLockedSince[key];
+  }
 }
 
 // Story Lock only makes sense per SHOW, and only for a channel that shuffles
@@ -8416,6 +8442,12 @@ function renderChannelStoryLock() {
       'Shuffling suits a procedural &mdash; Seinfeld, The Office, Law &amp; Order. It ruins a serialized one. ' +
       'Tick a show here and it always advances to its next episode in order, while everything else keeps shuffling around it.' +
     '</p>' +
+    (rotating
+      ? '<p style="margin:0 0 4px; color:var(--muted); font-size:0.78rem;">' +
+          'On a daily schedule a locked show airs every day, starting from its first episode on the day you tick it and picking up where the day before stopped. ' +
+          'With Hide watched on, it picks up from the first episode you have not seen instead. Untick and tick again to start it over.' +
+        '</p>'
+      : '') +
     (active ? '' : '<p style="margin:0 0 4px; color:var(--muted); font-size:0.78rem;"><em>This channel plays in the order listed above, so nothing is being shuffled for a lock to protect against yet.</em></p>') +
     '<div class="channel-storylock-grid">' + rows + '</div>';
 }
@@ -8768,6 +8800,7 @@ function readChannelBroadcastSettings() {
     rotateTurnoverZone: zone,
     hideWatched: !!(hideCheck && hideCheck.checked),
     storyLocked: channelDraftStoryLocked.slice(),
+    storyLockedSince: channelStoryLockSinceFields(channelDraftStoryLockedSince, channelDraftStoryLocked),
     pairParts: !!(pairCheck && pairCheck.checked),
     pairedGroups: channelDraftPairedGroups.map((g) => g.slice()),
     autoNewEpisodes: !!(newEpCheck && newEpCheck.checked),
@@ -8794,6 +8827,7 @@ function applyChannelBroadcastSettings(channel) {
   const descInput = document.getElementById('channelDescriptionInput');
   if (descInput) descInput.value = f.description;
   channelDraftStoryLocked = f.storyLocked;
+  channelDraftStoryLockedSince = f.storyLockedSince;
   channelDraftPairedGroups = f.pairedGroups;
   channelDraftSourceUrl = f.sourceUrl;
   channelDraftDynamic = f.dynamic;
