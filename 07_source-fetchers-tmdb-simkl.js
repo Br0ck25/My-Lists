@@ -4493,6 +4493,256 @@ async function findNextAiredEpisodeForShow(imdbId, latestSeasonNum, latestEpisod
 // more like "gets covered every so often as the cursor cycles back
 // around" -- there's no hard per-account freshness guarantee here, just
 // steady, bounded progress.
+// --- Airing Next, rebuilt without the website ----------------------------------
+//
+// Airing Next is built by the website (refreshAiringNext, 21_client-custom-
+// list-builder.js) and pushed up as a snapshot, and nothing else ever rebuilt
+// it -- so someone who used only Stremio or Nuvio for a while saw episodes
+// that had aired days ago, never saw newly announced ones, and never saw
+// shows they had started watching since. The functions below are the
+// website's rules run over the account's tracking record instead of this
+// browser's localStorage, so the two build the same shelf.
+
+// The furthest-along watched episode of one show -- latestWatchedEpisodeFor-
+// ShowIds on the website.
+function latestWatchedEpisodeInHistory(watchHistory, showId) {
+  let best = null;
+  for (const it of watchHistory) {
+    if (!it || it.type !== 'episode' || String(it.showId || '') !== showId) continue;
+    if (it.seasonNum == null || it.episodeNum == null) continue;
+    const s = Number(it.seasonNum);
+    const e = Number(it.episodeNum);
+    if (!best || s > best.seasonNum || (s === best.seasonNum && e > best.episodeNum)) best = { seasonNum: s, episodeNum: e };
+  }
+  return best;
+}
+
+// Whether a removal from Airing Next still stands -- isAiringNextRemoved: it
+// lasts until an episode newer than the one it was made at is watched.
+function airingNextRemovalStands(record, showId) {
+  const marks = record.removedAiringNext && typeof record.removedAiringNext === 'object' ? record.removedAiringNext : {};
+  const mark = marks[showId];
+  if (!mark) return false;
+  const latest = latestWatchedEpisodeInHistory(Array.isArray(record.watchHistory) ? record.watchHistory : [], showId);
+  if (!latest) return true;
+  const atSeason = Number(mark.seasonNum) || 0;
+  const atEpisode = Number(mark.episodeNum) || 0;
+  if (latest.seasonNum > atSeason) return false;
+  if (latest.seasonNum === atSeason && latest.episodeNum > atEpisode) return false;
+  return true;
+}
+
+// The shows to look up -- collectAiringNextCandidateShowIds: every show with
+// a watched episode, plus any known to be fully watched, less the removed ones
+// that are not in Continue Watching.
+function airingNextCandidatesFromRecord(record) {
+  const ids = new Set();
+  for (const it of (Array.isArray(record.watchHistory) ? record.watchHistory : [])) {
+    if (it && it.type === 'episode' && it.showId) ids.add(String(it.showId));
+  }
+  for (const id of (Array.isArray(record.fullyWatchedShowIds) ? record.fullyWatchedShowIds : [])) ids.add(String(id));
+  const cw = new Set();
+  for (const it of (Array.isArray(record.continueWatching) ? record.continueWatching : [])) {
+    if (it && it.showId) cw.add(String(it.showId));
+    if (it && it.id) cw.add(String(it.id));
+  }
+  for (const id of [...ids]) {
+    if (airingNextRemovalStands(record, id) && !cw.has(id)) ids.delete(id);
+  }
+  return [...ids].slice(0, AIRING_NEXT_SERVER_MAX_SHOWS);
+}
+
+// One details payload -> one Airing Next entry, or null when nothing is
+// coming. airingEntryFrom on the website, field for field.
+function airingNextEntryFromDetails(showId, d, known) {
+  if (!d || !d.nextEpisodeAirDate) return null;
+  if (isEpisodeAired(d.nextEpisodeAirDate)) return null;
+  const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
+  const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
+  return {
+    id: showId,
+    type: 'series',
+    showId: showId,
+    canonicalTmdbId: d.tmdbId ? String(d.tmdbId) : null,
+    showTitle: (known && known.title) || d.title || '',
+    showPoster: (known && known.poster) || d.poster || '',
+    name: epName,
+    episodeTitle: epName,
+    airDate: d.nextEpisodeAirDate,
+    seasonNum: d.nextEpisodeSeasonNumber,
+    episodeNum: d.nextEpisodeNumber,
+    isSeasonPremiere: d.nextEpisodeNumber === 1,
+    isSeasonFinale: isFinale,
+    seasonFinaleAirDate: d.seasonFinaleAirDate || null,
+    seasonFinaleEpisodeNumber: d.seasonFinaleEpisodeNumber || null,
+    airTime: d.nextEpisodeAirTimeLabel || (d.airTime && d.airTime.label) || null,
+    isUnaired: true,
+  };
+}
+
+// Rebuilds one account's Airing Next from its tracking record. `pool` is the
+// tick's shared outbound-fetch budget ({ budget, reserved }), reserved per
+// lookup at TMDB_ITEM_DETAILS_MAX_FETCHES and refunded down to what the
+// lookup really spent -- the /api/details/batch route's accounting, since a
+// cached lookup spends nothing.
+//
+// Returns { items, complete }. A show the budget did not reach keeps the entry
+// it already had (if that has not aired), so running out part-way leaves the
+// shelf as it was for those shows rather than dropping them.
+async function rebuildAiringNextForRecord(env, ctx, record, pool) {
+  const candidates = airingNextCandidatesFromRecord(record);
+  const known = new Map();
+  for (const it of (Array.isArray(record.watchHistory) ? record.watchHistory : [])) {
+    if (it && it.showId && it.showTitle && !known.has(String(it.showId))) {
+      known.set(String(it.showId), { title: it.showTitle, poster: it.showPoster });
+    }
+  }
+  const resolved = new Map();
+  let cursor = 0;
+  let complete = true;
+  async function worker() {
+    while (cursor < candidates.length) {
+      if (pool.reserved + TMDB_ITEM_DETAILS_MAX_FETCHES > pool.budget) {
+        complete = false;
+        return;
+      }
+      const showId = candidates[cursor++];
+      pool.reserved += TMDB_ITEM_DETAILS_MAX_FETCHES;
+      const meter = { spent: 0 };
+      try {
+        const d = await fetchTmdbItemDetails(showId, TMDB_API_KEY, 'series', '', false, env, ctx, meter);
+        // No details at all is a lookup that failed (TMDB down, nothing
+        // cached), not a show with nothing coming -- left unresolved so it
+        // keeps its entry. Only real details decide a show is off the shelf,
+        // or an outage would empty everyone's Airing Next and save it.
+        if (d) resolved.set(showId, airingNextEntryFromDetails(showId, d, known.get(showId)));
+      } catch {
+        // Unresolved rather than "nothing coming": keeps its current entry.
+      }
+      pool.reserved -= TMDB_ITEM_DETAILS_MAX_FETCHES - Math.min(meter.spent, TMDB_ITEM_DETAILS_MAX_FETCHES);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(4, candidates.length) }, worker));
+  if (cursor < candidates.length) complete = false;
+
+  const existing = new Map();
+  for (const it of (Array.isArray(record.airingNext) ? record.airingNext : [])) {
+    if (it && it.showId && !(it.airDate && isEpisodeAired(it.airDate))) existing.set(String(it.showId), it);
+  }
+  const results = [];
+  for (const showId of candidates) {
+    if (resolved.has(showId)) {
+      const entry = resolved.get(showId);
+      if (entry) results.push(entry);
+    } else if (existing.has(showId)) {
+      results.push(existing.get(showId));
+    }
+  }
+
+  // The website's dedupe and order: one entry per show whichever id Watch
+  // History recorded it under, soonest first, removed shows left off.
+  const seen = new Set();
+  const items = results.filter((it) => {
+    const normalized = String(it.showId).startsWith('tmdb:') ? String(it.showId).slice(5) : String(it.showId);
+    const key = it.canonicalTmdbId ? 'tmdb:' + it.canonicalTmdbId : 'id:' + normalized;
+    if (seen.has(key) || seen.has('id:' + normalized)) return false;
+    seen.add(key);
+    seen.add('id:' + normalized);
+    return true;
+  }).filter((it) => !airingNextRemovalStands(record, String(it.showId)));
+  items.sort((a, b) => String(a.airDate || '').localeCompare(String(b.airDate || '')));
+  return { items, complete };
+}
+
+// The cron's half of Airing Next: a few accounts per tick, each at most every
+// AIRING_NEXT_SERVER_REFRESH_MS. Walks accounts with the same page-cursor-
+// plus-offset position checkForNewEpisodes keeps (below), for the same
+// reasons, under its own key.
+async function refreshAiringNextSweep(env, ctx, fetchBudget) {
+  if (!env || !env.CONFIGS || !TMDB_API_KEY) return;
+  if (!(Number.isFinite(fetchBudget) && fetchBudget >= TMDB_ITEM_DETAILS_MAX_FETCHES)) return;
+  const CURSOR_KEY = 'cron:airingnext:cursor';
+  let sweep = { c: '', o: 0 };
+  try {
+    const raw = await env.CONFIGS.get(CURSOR_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.c === 'string') sweep = { c: parsed.c, o: Number(parsed.o) || 0 };
+    }
+  } catch {}
+
+  const listOpts = { prefix: 'creator:', limit: 25 };
+  if (sweep.c) listOpts.cursor = sweep.c;
+  let listResult;
+  try {
+    listResult = await env.CONFIGS.list(listOpts);
+  } catch (e) {
+    console.error('[Cron] Airing Next: account listing failed, restarting from the beginning:', e);
+    if (sweep.c) {
+      try { await env.CONFIGS.put(CURSOR_KEY, ''); } catch {}
+    }
+    return;
+  }
+
+  const pool = { budget: fetchBudget, reserved: 0 };
+  const pageKeys = listResult.keys || [];
+  let nextOffset = Math.min(Math.max(sweep.o, 0), pageKeys.length);
+  let rebuilt = 0;
+  for (let i = nextOffset; i < pageKeys.length; i++) {
+    if (rebuilt >= AIRING_NEXT_SWEEP_ACCOUNTS_PER_TICK || pool.reserved + TMDB_ITEM_DETAILS_MAX_FETCHES > pool.budget) break;
+    nextOffset = i + 1;
+    const username = pageKeys[i].name.slice('creator:'.length);
+    // One account must not be able to stop the sweep -- see checkForNewEpisodes.
+    try {
+      const checkedKey = airingNextCheckedKey(username);
+      if (await env.CONFIGS.get(checkedKey)) continue;
+      const trackingKey = `creatorsynctracking:${username}`;
+      const raw = await env.CONFIGS.get(trackingKey);
+      if (!raw) continue;
+      const record = JSON.parse(raw);
+      if (!airingNextCandidatesFromRecord(record).length) continue;
+      rebuilt++;
+      const { items, complete } = await rebuildAiringNextForRecord(env, ctx, record, pool);
+
+      // Written against a fresh read, owning only the one field it computed:
+      // the lookups above took real time, and anything the account's browser
+      // or a playback scrobble saved meanwhile must survive. The same rule
+      // checkForNewEpisodes follows for Continue Watching.
+      let target = record;
+      try {
+        const freshRaw = await env.CONFIGS.get(trackingKey);
+        if (freshRaw) target = JSON.parse(freshRaw);
+      } catch {}
+      const before = JSON.stringify(Array.isArray(target.airingNext) ? target.airingNext : []);
+      if (JSON.stringify(items) !== before) {
+        const previousStamp = Number(target.updatedAt) || 0;
+        target.airingNext = items;
+        target.updatedAt = Math.max(Date.now(), previousStamp + 1);
+        await env.CONFIGS.put(trackingKey, JSON.stringify(target));
+        if (env.DB) await saveAiringNextD1(env, username, items, target.updatedAt, previousStamp);
+      }
+      // A rebuild the budget cut short is due again in half an hour rather
+      // than six, by which time the lookups it did make have warmed the cache
+      // for the ones it did not.
+      const ttlSec = complete ? Math.round(AIRING_NEXT_SERVER_REFRESH_MS / 1000) : 1800;
+      await env.CONFIGS.put(checkedKey, '1', { expirationTtl: ttlSec });
+    } catch (accountErr) {
+      console.error(`[Cron] Airing Next: skipping ${username} this cycle:`, accountErr);
+    }
+  }
+
+  // Past the end of this page: move to the next one, or start over.
+  let next;
+  if (nextOffset >= pageKeys.length) {
+    next = listResult.list_complete ? { c: '', o: 0 } : { c: listResult.cursor || '', o: 0 };
+  } else {
+    next = { c: sweep.c, o: nextOffset };
+  }
+  if (next.c !== sweep.c || next.o !== sweep.o) {
+    try { await env.CONFIGS.put(CURSOR_KEY, JSON.stringify(next)); } catch {}
+  }
+}
+
 async function checkForNewEpisodes(env, fetchBudget) {
   if (!env || !env.CONFIGS || !env.TMDB_API_KEY) return;
 

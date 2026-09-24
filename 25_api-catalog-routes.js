@@ -895,9 +895,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
-      const source = detectSource(entry.url);
-      const isAutoTrack = source === "autotrack";
-      const isUserPersonal = isAutoTrack || source === "simkl-user" || source === "trakt-watchlist" || source === "trakt-history" || source === "mdblist-watchlist" || source === "mdblist-history";
+      // Every line of the row, not just the first: a merged row stores its
+      // sources newline-separated (see fetchCatalog), and one personal source
+      // anywhere in it makes the whole row one account's live state.
+      const rowSources = String(entry.url || "").split("\n").map((u) => u.trim()).filter(Boolean).map(detectSource);
+      const isAutoTrack = rowSources.includes("autotrack");
+      // Rows whose content is one account's live state, and so must never be
+      // cached: the next request has to see what changed since. "curated" is
+      // Recommended Movies/Shows (the account's pushed Discover snapshot),
+      // and the Trakt/MDBList progress shelves change every time something
+      // is watched. All of them used to fall through to the 24-hour public
+      // cache below, which let Stremio and Nuvio keep a day-old copy.
+      const isUserPersonal = rowSources.some((src) => STREMIO_LIVE_ROW_SOURCES.has(src));
 
       // Graceful degradation only applies to the first page (skip === 0):
       // that's the case that makes a whole shelf silently vanish from the
@@ -2762,172 +2771,11 @@ function generateSearchVariations(query) {
         return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
       }
 
-      const [movieLists, showLists] = await Promise.all([
-        Promise.all(movieIds.map(async (rawId) => {
-          try {
-            let tmdbId = "";
-            let strId = String(rawId || "").trim();
-            if (strId.startsWith("tmdb:")) strId = strId.slice(5);
-            const baseId = strId.split(":")[0];
-            if (/^\d+$/.test(baseId)) {
-              tmdbId = baseId;
-            } else {
-              const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(baseId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
-                cf: { cacheTtl: 86400, cacheEverything: true }
-              });
-              const findData = await findRes.json();
-              if (findData.movie_results && findData.movie_results[0]) {
-                tmdbId = findData.movie_results[0].id;
-              }
-            }
-            if (!tmdbId) return [];
-            const recRes = await fetch(`https://api.themoviedb.org/3/movie/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const recData = await recRes.json();
-            let list = recData.results || [];
-            if (!list.length) {
-              const simRes = await fetch(`https://api.themoviedb.org/3/movie/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-                cf: { cacheTtl: 86400, cacheEverything: true }
-              });
-              const simData = await simRes.json();
-              list = simData.results || [];
-            }
-            return list;
-          } catch {
-            return [];
-          }
-        })),
-        Promise.all(showIds.map(async (rawId) => {
-          try {
-            let tmdbId = "";
-            let strId = String(rawId || "").trim();
-            if (strId.startsWith("tmdb:")) strId = strId.slice(5);
-            const baseId = strId.split(":")[0];
-            if (/^\d+$/.test(baseId)) {
-              tmdbId = baseId;
-            } else {
-              const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(baseId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
-                cf: { cacheTtl: 86400, cacheEverything: true }
-              });
-              const findData = await findRes.json();
-              if (findData.tv_results && findData.tv_results[0]) {
-                tmdbId = findData.tv_results[0].id;
-              }
-            }
-            if (!tmdbId) return [];
-            const recRes = await fetch(`https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const recData = await recRes.json();
-            let list = recData.results || [];
-            if (!list.length) {
-              const simRes = await fetch(`https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-                cf: { cacheTtl: 86400, cacheEverything: true }
-              });
-              const simData = await simRes.json();
-              list = simData.results || [];
-            }
-            return list;
-          } catch {
-            return [];
-          }
-        }))
-      ]);
-
-      const seenMovieIds = new Set();
-      const recMovies = [];
-      for (const list of movieLists) {
-        for (const m of list) {
-          if (m && m.id && !seenMovieIds.has(m.id) && m.poster_path) {
-            seenMovieIds.add(m.id);
-            recMovies.push({
-              id: "tmdb:" + m.id,
-              tmdbId: String(m.id),
-              name: m.title || "Movie",
-              poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
-              year: (m.release_date || "").slice(0, 4),
-              type: "movie",
-              rating: m.vote_average ? m.vote_average.toFixed(1) : null
-            });
-          }
-        }
-      }
-
-      if (recMovies.length < 10) {
-        try {
-          const popRes = await fetch(`https://api.themoviedb.org/3/trending/movie/week?api_key=${encodeURIComponent(tmdbKey)}`, {
-            cf: { cacheTtl: 86400, cacheEverything: true }
-          });
-          const popData = await popRes.json();
-          for (const m of (popData.results || [])) {
-            if (m && m.id && !seenMovieIds.has(m.id) && m.poster_path) {
-              seenMovieIds.add(m.id);
-              recMovies.push({
-                id: "tmdb:" + m.id,
-                tmdbId: String(m.id),
-                name: m.title || "Movie",
-                poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
-                year: (m.release_date || "").slice(0, 4),
-                type: "movie",
-                rating: m.vote_average ? m.vote_average.toFixed(1) : null
-              });
-            }
-          }
-        } catch {}
-      }
-
-      const seenShowIds = new Set();
-      const recShows = [];
-      for (const list of showLists) {
-        for (const s of list) {
-          if (s && s.id && !seenShowIds.has(s.id) && s.poster_path) {
-            seenShowIds.add(s.id);
-            recShows.push({
-              id: "tmdb:" + s.id,
-              tmdbId: String(s.id),
-              name: s.name || "Show",
-              poster: "https://image.tmdb.org/t/p/w500" + s.poster_path,
-              year: (s.first_air_date || "").slice(0, 4),
-              type: "series",
-              rating: s.vote_average ? s.vote_average.toFixed(1) : null
-            });
-          }
-        }
-      }
-
-      if (recShows.length < 10) {
-        try {
-          const popRes = await fetch(`https://api.themoviedb.org/3/trending/tv/week?api_key=${encodeURIComponent(tmdbKey)}`, {
-            cf: { cacheTtl: 86400, cacheEverything: true }
-          });
-          const popData = await popRes.json();
-          for (const s of (popData.results || [])) {
-            if (s && s.id && !seenShowIds.has(s.id) && s.poster_path) {
-              seenShowIds.add(s.id);
-              recShows.push({
-                id: "tmdb:" + s.id,
-                tmdbId: String(s.id),
-                name: s.name || "Show",
-                poster: "https://image.tmdb.org/t/p/w500" + s.poster_path,
-                year: (s.first_air_date || "").slice(0, 4),
-                type: "series",
-                rating: s.vote_average ? s.vote_average.toFixed(1) : null
-              });
-            }
-          }
-        } catch {}
-      }
-
-      // CURATED_RECOMMENDATION_LIMIT, not a literal -- fetchCuratedCatalog
-      // (05_catalog-core.js) serves the catalog row for this same list and
-      // has to cut it to exactly the same length, or the Discover card and
-      // the shelf it adds disagree about how many items the list has.
-      return json({
-        ok: true,
-        movies: recMovies.slice(0, CURATED_RECOMMENDATION_LIMIT),
-        shows: recShows.slice(0, CURATED_RECOMMENDATION_LIMIT),
-      });
+      // Shared with the Recommended catalog row, which builds the same list
+      // itself once the website's snapshot of it has gone stale -- see
+      // buildTmdbRecommendations (05_catalog-core.js).
+      const recs = await buildTmdbRecommendations(movieIds, showIds, tmdbKey);
+      return json({ ok: true, movies: recs.movies, shows: recs.shows });
     }
 
     // /api/tmdb-search-lists?q=...[&tmdbKey=...]

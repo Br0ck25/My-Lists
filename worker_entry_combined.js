@@ -1221,6 +1221,76 @@ const STREMIO_BADGE_KEYS = [
   "showBadgesStremioWatchlist",
   "showBadgesStremioCatalogs",
 ];
+
+// --- Catalog rows that are one account's live state -------------------------
+//
+// The detectSource names (04_config-resolution.js) whose catalog response is
+// sent no-store instead of the 24-hour public cache every other row gets --
+// see the catalog route (25_api-catalog-routes.js). A row belongs here when
+// its items change because of something the account DID (watched, added,
+// removed), under a URL that stays the same: the install link's config id
+// only changes when the config does, so a cached copy of one of these would
+// sit there, stale, for a day.
+//
+//   autotrack        Watchlist, Watch History, Continue Watching, Airing Next
+//   curated          Recommended Movies / Recommended Shows
+//   trakt-*, mdblist-*, simkl-user
+//                    the same shelves read from a connected account
+const STREMIO_LIVE_ROW_SOURCES = new Set([
+  "autotrack",
+  "curated",
+  "simkl-user",
+  "trakt-watchlist",
+  "trakt-history",
+  "trakt-continue-watching",
+  "trakt-airing-next",
+  "mdblist-watchlist",
+  "mdblist-history",
+  "mdblist-airing-next",
+  "mdblist-upnext",
+]);
+
+// --- Keeping Airing Next and Recommended fresh without the website ----------
+//
+// Both shelves are built by the website and pushed up as snapshots (see
+// refreshAiringNext, 21_client-custom-list-builder.js, and
+// persistCuratedRecommendations, 22_client-creator-profile.js). Someone who
+// only uses Stremio or Nuvio for a while used to keep seeing the last snapshot
+// indefinitely: Airing Next with episodes that had long since aired, and
+// Recommended frozen at whatever Discover last showed.
+
+// How often the cron rebuilds an account's Airing Next -- the same cadence the
+// website refreshes its own copy at (AIRING_NEXT_REFRESH_MS), so an account is
+// never refreshed more often than its own browser would.
+const AIRING_NEXT_SERVER_REFRESH_MS = 6 * 3600 * 1000;
+// Shows looked up per account per rebuild -- the website's own
+// AIRING_NEXT_MAX_SHOWS_PER_RUN, so the two build the same shelf.
+const AIRING_NEXT_SERVER_MAX_SHOWS = 60;
+// Share of the episode sweep's unreachable reserve the Airing Next sweep may
+// spend -- the same arithmetic, and the same size of slice, New on Streaming
+// is paid for with (CRON_NEW_ON_STREAMING_SHARE), so the two together take
+// half of a reserve checkForNewEpisodes can never reach and the pre-warm's
+// share is untouched.
+const CRON_AIRING_NEXT_SHARE = 0.25;
+
+// How old the Discover snapshot may be before the Recommended row stops
+// serving it and builds its own from the account's viewing. The website
+// re-stamps an unchanged snapshot at most every CURATED_RECS_RESTAMP_MS
+// (22_client-creator-profile.js), so a snapshot this old means the website
+// has not shown Discover for days -- not that its recommendations happened
+// not to change.
+const CURATED_SNAPSHOT_MAX_AGE_MS = 3 * 24 * 3600 * 1000;
+// Seeds per side, as the website sends /api/recommendations (sampleMovieIds /
+// sampleShowIds, 19_client-search-and-likes.js).
+const RECOMMENDATION_SEEDS_PER_SIDE = 12;
+// Accounts the Airing Next sweep rebuilds per tick. Each rebuild is up to
+// AIRING_NEXT_SERVER_MAX_SHOWS cached details lookups, and every one of those
+// reads a cache (a KV operation) even when it spends no outbound fetch -- so
+// this, not the fetch budget, is what keeps one tick under the invocation's
+// 1,000-operation cap. 3 a tick at a 6-minute cron is 720 rebuilds a day:
+// every account every six hours up to ~180 accounts, and a proportionally
+// slower cadence beyond that rather than a tick that fails.
+const AIRING_NEXT_SWEEP_ACCOUNTS_PER_TICK = 3;
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -5823,6 +5893,10 @@ async function purgeCreatorData(env, username, options = {}) {
     // re-registered username's browsers to discard lists it never deleted.
     creatorListTombstoneKey(u),
     `creatorscrobblequeue:${u}`,
+    // Set while this account's D1 tracking rows are behind its KV record --
+    // see trackingD1BehindKey.
+    trackingD1BehindKey(u),
+    airingNextCheckedKey(u),
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
     `creatorshare:${u}`,
@@ -6750,8 +6824,161 @@ async function d1HasAiringRemovalColumns(env) {
   return _d1AiringRemovalColumns;
 }
 
+// The upserts for one account's Airing Next, one row per show (first entry
+// wins, matching the client's own dedupe). Shared by the full tracking write
+// below and by saveAiringNextD1, the cron's narrow one.
+function airingNextD1Statements(env, username, items, fallbackUpdatedAt) {
+  const stmts = [];
+  const anSeen = new Set();
+  for (const item of items) {
+    if (!item) continue;
+    const showId = String(item.showId || item.id || "");
+    if (!showId || anSeen.has(showId)) continue;
+    anSeen.add(showId);
+    const itemId = String(item.id || showId);
+    const name = item.name || null;
+    const poster = item.poster || null;
+    const showTitle = item.showTitle || null;
+    const showPoster = item.showPoster || null;
+    const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
+    const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
+    const airDate = item.airDate || null;
+    const isSeasonPremiere = item.isSeasonPremiere ? 1 : 0;
+    const isSeasonFinale = item.isSeasonFinale ? 1 : 0;
+    const seasonFinaleAirDate = item.seasonFinaleAirDate || null;
+    const seasonFinaleEpisodeNumber = item.seasonFinaleEpisodeNumber != null ? Number(item.seasonFinaleEpisodeNumber) : null;
+    const itemUpdated = Number(item.updatedAt) || fallbackUpdatedAt;
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO airing_next (
+          username, show_id, item_id, name, poster, show_title, show_poster,
+          season_num, episode_num, air_date, is_season_premiere, is_season_finale,
+          season_finale_air_date, season_finale_episode_number, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(username, show_id) DO UPDATE SET
+           item_id = excluded.item_id,
+           name = excluded.name,
+           poster = excluded.poster,
+           show_title = excluded.show_title,
+           show_poster = excluded.show_poster,
+           season_num = excluded.season_num,
+           episode_num = excluded.episode_num,
+           air_date = excluded.air_date,
+           is_season_premiere = excluded.is_season_premiere,
+           is_season_finale = excluded.is_season_finale,
+           season_finale_air_date = excluded.season_finale_air_date,
+           season_finale_episode_number = excluded.season_finale_episode_number,
+           updated_at = excluded.updated_at`
+      ).bind(
+        username, showId, itemId, name, poster, showTitle, showPoster,
+        seasonNum, episodeNum, airDate, isSeasonPremiere, isSeasonFinale,
+        seasonFinaleAirDate, seasonFinaleEpisodeNumber, itemUpdated
+      )
+    );
+  }
+  return { stmts, seen: anSeen };
+}
+
+// Set while an account's D1 tracking rows are known to be behind its KV
+// record: saveCreatorTrackingD1 writes it when a write fails and removes it
+// when one succeeds.
+//
+// The Stremio/Nuvio rows for Watch History, Continue Watching and Airing Next
+// read D1 directly, which is the point -- they are the cheap path, and the KV
+// record they would otherwise parse can run to megabytes. But that meant they
+// had no way to notice D1 was stale: a failed write left the rows as they were
+// and the apps kept serving them, while the website (which reads through
+// readCreatorTrackingD1's stamp check) showed the new state. This key is the
+// one-small-read answer to "can D1 be trusted right now?".
+function trackingD1BehindKey(username) {
+  return `trackingd1behind:${username}`;
+}
+
+// Present, with a TTL of AIRING_NEXT_SERVER_REFRESH_MS, for as long as an
+// account's Airing Next was rebuilt by the cron recently enough not to need it
+// again -- see refreshAiringNextSweep (07_source-fetchers-tmdb-simkl.js). A
+// TTL rather than a stored time so "due" is simply "absent", and nothing ever
+// has to clean the key up.
+function airingNextCheckedKey(username) {
+  return `airingnextchecked:${username}`;
+}
+
+async function isTrackingD1Behind(env, username) {
+  if (!env || !env.CONFIGS || !username) return false;
+  try {
+    return !!(await env.CONFIGS.get(trackingD1BehindKey(username)));
+  } catch {
+    return false;
+  }
+}
+
+async function recordTrackingD1Result(env, username, ok, stamp) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    const key = trackingD1BehindKey(username);
+    if (!ok) {
+      await env.CONFIGS.put(key, String(Number(stamp) || Date.now()));
+    } else if (await env.CONFIGS.get(key)) {
+      // Read first so an ordinary save -- the usual case, with no marker --
+      // costs no KV write.
+      await env.CONFIGS.delete(key);
+    }
+  } catch {
+    // The marker is an optimisation for the catalog rows; the write's own
+    // result is what the caller acts on.
+  }
+}
+
 async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   if (!env || !env.DB || !username || !trackingData) return false;
+  const ok = await writeCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval);
+  await recordTrackingD1Result(env, username, ok, trackingData.updatedAt);
+  return ok;
+}
+
+// Airing Next alone, for the cron that rebuilds it (refreshAiringNextSweep,
+// 07_source-fetchers-tmdb-simkl.js). saveCreatorTrackingD1 rewrites every row
+// the account has -- one statement per Watch History item -- which is fine
+// for a browser's save but not for a cron tick working through many accounts
+// under one invocation's operation cap. This writes the one table that
+// changed, then moves the stamp.
+//
+// Only when D1 was current to begin with: previousStamp is the KV record's
+// updatedAt from BEFORE this rebuild. If D1 was already behind that, stamping
+// it current after writing one table would hide every other table's lag from
+// readCreatorTrackingD1 -- so D1 is left alone, still visibly behind, for the
+// next full write or read-repair to catch up.
+async function saveAiringNextD1(env, username, items, updatedAt, previousStamp) {
+  if (!env || !env.DB || !username || !Array.isArray(items)) return false;
+  let ok = true;
+  try {
+    const metaRow = await env.DB.prepare(
+      "SELECT updated_at FROM creator_tracking_meta WHERE username = ?"
+    ).bind(username).first();
+    // An account with no D1 record reads from KV anyway.
+    if (!metaRow) return true;
+    if ((Number(metaRow.updated_at) || 0) < (Number(previousStamp) || 0)) return true;
+    if (await isTrackingD1Behind(env, username)) return true;
+    const an = airingNextD1Statements(env, username, items, updatedAt);
+    const prunes = await d1ReplaceRowsById(env, "airing_next", username, "show_id", an.seen);
+    const stamp = env.DB.prepare(
+      "UPDATE creator_tracking_meta SET updated_at = ? WHERE username = ?"
+    ).bind(updatedAt, username);
+    // Upserts, then deletions, then the stamp -- writeCreatorTrackingD1's
+    // ordering, for its reasons.
+    const ordered = an.stmts.concat(prunes, [stamp]);
+    for (let i = 0; i < ordered.length; i += 80) {
+      await env.DB.batch(ordered.slice(i, i + 80));
+    }
+  } catch (err) {
+    console.error("D1 write error (saveAiringNextD1):", err);
+    ok = false;
+  }
+  await recordTrackingD1Result(env, username, ok, updatedAt);
+  return ok;
+}
+
+async function writeCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   try {
     const meta = {
       trackPlayback: trackingData.trackPlayback ? 1 : 0,
@@ -6766,8 +6993,11 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
 
     const stmts = [];
 
-    // 1. Meta
-    stmts.push(
+    // 1. Meta -- built here, written LAST (see the ordering note at the end).
+    // Its updated_at is the stamp readCreatorTrackingD1 compares against the
+    // KV copy to decide which one is current, so it may only advance once
+    // every row it vouches for has landed.
+    const metaStmt = (
       env.DB.prepare(
         `INSERT INTO creator_tracking_meta (
           username, track_playback, remove_watched_watchlist, scrobble_filter_users,
@@ -6921,54 +7151,9 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
     // 4. Airing Next: replace whole set
     if (Array.isArray(trackingData.airingNext)) {
       // Same key, same reasoning as Continue Watching above.
-      const anSeen = new Set();
-      for (const item of trackingData.airingNext) {
-        if (!item) continue;
-        const showId = String(item.showId || item.id || "");
-        if (!showId || anSeen.has(showId)) continue;
-        anSeen.add(showId);
-        const itemId = String(item.id || showId);
-        const name = item.name || null;
-        const poster = item.poster || null;
-        const showTitle = item.showTitle || null;
-        const showPoster = item.showPoster || null;
-        const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
-        const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
-        const airDate = item.airDate || null;
-        const isSeasonPremiere = item.isSeasonPremiere ? 1 : 0;
-        const isSeasonFinale = item.isSeasonFinale ? 1 : 0;
-        const seasonFinaleAirDate = item.seasonFinaleAirDate || null;
-        const seasonFinaleEpisodeNumber = item.seasonFinaleEpisodeNumber != null ? Number(item.seasonFinaleEpisodeNumber) : null;
-        const itemUpdated = Number(item.updatedAt) || meta.updatedAt;
-        stmts.push(
-          env.DB.prepare(
-            `INSERT INTO airing_next (
-              username, show_id, item_id, name, poster, show_title, show_poster,
-              season_num, episode_num, air_date, is_season_premiere, is_season_finale,
-              season_finale_air_date, season_finale_episode_number, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(username, show_id) DO UPDATE SET
-               item_id = excluded.item_id,
-               name = excluded.name,
-               poster = excluded.poster,
-               show_title = excluded.show_title,
-               show_poster = excluded.show_poster,
-               season_num = excluded.season_num,
-               episode_num = excluded.episode_num,
-               air_date = excluded.air_date,
-               is_season_premiere = excluded.is_season_premiere,
-               is_season_finale = excluded.is_season_finale,
-               season_finale_air_date = excluded.season_finale_air_date,
-               season_finale_episode_number = excluded.season_finale_episode_number,
-               updated_at = excluded.updated_at`
-          ).bind(
-            username, showId, itemId, name, poster, showTitle, showPoster,
-            seasonNum, episodeNum, airDate, isSeasonPremiere, isSeasonFinale,
-            seasonFinaleAirDate, seasonFinaleEpisodeNumber, itemUpdated
-          )
-        );
-      }
-      prunes.push(...await d1ReplaceRowsById(env, "airing_next", username, "show_id", anSeen));
+      const an = airingNextD1Statements(env, username, trackingData.airingNext, meta.updatedAt);
+      stmts.push(...an.stmts);
+      prunes.push(...await d1ReplaceRowsById(env, "airing_next", username, "show_id", an.seen));
     }
 
     // 5. Watch History
@@ -7022,7 +7207,8 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       }
     }
 
-    // Upserts first, deletions last, in that order across the whole write.
+    // Upserts first, deletions next, the meta stamp last, in that order across
+    // the whole write.
     //
     // The statements are chunked because one account can be thousands of them
     // and a D1 batch is one transaction with a real size bound -- so the write
@@ -7030,8 +7216,17 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
     // ordering: nothing is removed until everything that replaces it has
     // already landed. A chunk that fails partway leaves stale extras, which the
     // next push corrects; it can no longer leave a hole.
+    //
+    // And the stamp goes last so that a write which dies partway -- one of the
+    // later chunks, or the per-request operation cap on an account with a long
+    // Watch History -- leaves D1 visibly BEHIND the KV copy rather than
+    // claiming to be current. It used to go first: a write that got no further
+    // than its first chunk still advanced updated_at, so D1 read as up to date
+    // while holding the old rows, and nothing ever served KV or repaired it.
+    // Continue Watching and Airing Next removals (the prunes) were the first
+    // casualties, being the last statements of all.
     const CHUNK_SIZE = 80;
-    const ordered = stmts.concat(prunes);
+    const ordered = stmts.concat(prunes, [metaStmt]);
     for (let i = 0; i < ordered.length; i += CHUNK_SIZE) {
       const chunk = ordered.slice(i, i + CHUNK_SIZE);
       await env.DB.batch(chunk);
@@ -7041,6 +7236,75 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
     console.error("D1 write error (saveCreatorTrackingD1):", err);
     return false;
   }
+}
+
+// The account's Watchlist, from whichever of its three copies is newest.
+//
+// The Watchlist is written in three places by /api/creator/sync/save-tracking
+// -- the tracking record's `watchlist` field, and the list record
+// creatorlist:{user}:watchlist in both KV and D1 -- and only the list record
+// is never rebuilt by anything else. The tracking record's copy used to be
+// the one everything READ (the Stremio/Nuvio Watchlist row, and the Watchlist
+// /api/creator/sync/load hands the browser), and it was the fragile one:
+// readCreatorTrackingD1 below did not return a watchlist at all, and the two
+// playback scrobbles read through it and wrote the record back -- so one
+// play in Stremio or Plex left the tracking record with an empty Watchlist
+// or none. The row then showed nothing until the website next pushed.
+//
+// So: every copy is a candidate, the newest stamp wins, and on a tie the list
+// record wins, being the copy nothing but a save writes. A tracking record
+// that was emptied that way carries no watchlistUpdatedAt (the scrobbles never
+// set one), so it loses to any list record that has ever been saved.
+//
+// Read-only on purpose: getCreatorList repairs as it reads, which costs a KV
+// write per call -- not something a catalog request should spend.
+async function readAccountWatchlist(env, username, trackingBlob) {
+  if (!env || !username) return null;
+  const [row, kvRaw] = await Promise.all([
+    env.DB
+      ? env.DB.prepare("SELECT items_json, updated_at FROM creator_lists WHERE id = ?")
+          .bind(`${username}:watchlist`).first().catch(() => null)
+      : Promise.resolve(null),
+    env.CONFIGS
+      ? env.CONFIGS.get(`creatorlist:${username}:watchlist`).catch(() => null)
+      : Promise.resolve(null),
+  ]);
+  const candidates = [];
+  if (kvRaw) {
+    try {
+      const l = JSON.parse(kvRaw);
+      if (l && Array.isArray(l.items)) candidates.push({ items: l.items, updatedAt: Number(l.updatedAt) || 0 });
+    } catch {}
+  }
+  if (row) {
+    try {
+      const items = JSON.parse(row.items_json || "[]");
+      if (Array.isArray(items)) candidates.push({ items, updatedAt: Number(row.updated_at) || 0 });
+    } catch {}
+  }
+  if (trackingBlob && Array.isArray(trackingBlob.watchlist)) {
+    candidates.push({ items: trackingBlob.watchlist, updatedAt: Number(trackingBlob.watchlistUpdatedAt) || 0 });
+  }
+  let best = null;
+  for (const c of candidates) if (!best || c.updatedAt > best.updatedAt) best = c;
+  return best;
+}
+
+// Makes sure a tracking record about to be written back carries the
+// account's Watchlist. A record straight from save-tracking already does
+// (with its stamp), so this costs nothing there; one read through
+// readCreatorTrackingD1 before it returned a watchlist, or emptied by a
+// scrobble that did, gets the newest copy put back instead of written out
+// empty.
+async function ensureTrackingWatchlist(env, username, blob) {
+  if (!blob || typeof blob !== "object") return blob;
+  if (Array.isArray(blob.watchlist) && Number(blob.watchlistUpdatedAt) > 0) return blob;
+  const wl = await readAccountWatchlist(env, username, blob);
+  if (wl) {
+    blob.watchlist = wl.items;
+    blob.watchlistUpdatedAt = wl.updatedAt;
+  }
+  return blob;
 }
 
 // D1 is authoritative for this record -- /api/creator/sync/load and every
@@ -7069,11 +7333,15 @@ async function readCreatorTrackingD1(env, username) {
     // A KV copy stamped later than D1's means a push landed in KV and not here.
     // Returning null hands the caller back to its own KV branch, which is the
     // copy that actually holds the user's data.
+    //
+    // The KV copy is also where the Watchlist lives -- D1's tracking tables
+    // have no column for it -- so it is kept for the return value below.
+    let kvBlob = null;
     if (env.CONFIGS) {
       try {
         const kvRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
         if (kvRaw) {
-          const kvBlob = JSON.parse(kvRaw);
+          kvBlob = JSON.parse(kvRaw);
           const kvStamp = Number(kvBlob && kvBlob.updatedAt) || 0;
           const d1Stamp = Number(metaRow.updated_at) || 0;
           if (kvStamp > d1Stamp) {
@@ -7213,10 +7481,17 @@ async function readCreatorTrackingD1(env, username) {
       try { curatedRecs = JSON.parse(metaRow.curated_recommendations); } catch {}
     }
 
+    // Every writer that reads through here writes the whole record back, so a
+    // record without its Watchlist is a Watchlist deleted. See
+    // readAccountWatchlist for which copy this is.
+    const watchlist = await readAccountWatchlist(env, username, kvBlob);
+
     return {
       watchHistory,
       continueWatching,
       airingNext,
+      watchlist: watchlist ? watchlist.items : [],
+      watchlistUpdatedAt: watchlist ? watchlist.updatedAt : 0,
       fullyWatchedShowIds,
       dismissedContinueWatching,
       removedAiringNext,
@@ -13609,6 +13884,146 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
 // external_ids call. Those are edge-cached for a day, and the list is
 // capped at CURATED_RECOMMENDATION_LIMIT, so this is a bounded, mostly
 // cache-served fan-out rather than the up-to-PAGE_SIZE one this replaced.
+// TMDB's recommendations (or, where it has none, its "similar" titles) for a
+// set of seed titles, merged and de-duplicated -- the Discover tab's
+// Recommended Movies/Shows. One implementation for both callers: the
+// /api/recommendations route the website calls, and fetchCuratedCatalog when
+// the website's snapshot has gone stale. Two copies of this would drift, and
+// the whole point of the catalog row is that it shows what the card showed.
+//
+// Either side may be empty; a side with fewer than ten results is topped up
+// from that week's trending titles, exactly as the route always did.
+async function buildTmdbRecommendations(movieIds, showIds, tmdbKey) {
+  const listFor = (kind) => async (rawId) => {
+    try {
+      let tmdbId = "";
+      let strId = String(rawId || "").trim();
+      if (strId.startsWith("tmdb:")) strId = strId.slice(5);
+      const baseId = strId.split(":")[0];
+      if (/^\d+$/.test(baseId)) {
+        tmdbId = baseId;
+      } else {
+        const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(baseId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
+          cf: { cacheTtl: 86400, cacheEverything: true }
+        });
+        const findData = await findRes.json();
+        const results = kind === "movie" ? findData.movie_results : findData.tv_results;
+        if (results && results[0]) tmdbId = results[0].id;
+      }
+      if (!tmdbId) return [];
+      const recRes = await fetch(`https://api.themoviedb.org/3/${kind}/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+        cf: { cacheTtl: 86400, cacheEverything: true }
+      });
+      const recData = await recRes.json();
+      let list = recData.results || [];
+      if (!list.length) {
+        const simRes = await fetch(`https://api.themoviedb.org/3/${kind}/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
+          cf: { cacheTtl: 86400, cacheEverything: true }
+        });
+        const simData = await simRes.json();
+        list = simData.results || [];
+      }
+      return list;
+    } catch {
+      return [];
+    }
+  };
+
+  const toItem = (kind, m) => kind === "movie"
+    ? {
+        id: "tmdb:" + m.id,
+        tmdbId: String(m.id),
+        name: m.title || "Movie",
+        poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
+        year: (m.release_date || "").slice(0, 4),
+        type: "movie",
+        rating: m.vote_average ? m.vote_average.toFixed(1) : null
+      }
+    : {
+        id: "tmdb:" + m.id,
+        tmdbId: String(m.id),
+        name: m.name || "Show",
+        poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
+        year: (m.first_air_date || "").slice(0, 4),
+        type: "series",
+        rating: m.vote_average ? m.vote_average.toFixed(1) : null
+      };
+
+  const side = async (kind, ids) => {
+    const lists = await Promise.all((ids || []).map(listFor(kind)));
+    const seen = new Set();
+    const out = [];
+    for (const list of lists) {
+      for (const m of list) {
+        if (m && m.id && !seen.has(m.id) && m.poster_path) {
+          seen.add(m.id);
+          out.push(toItem(kind, m));
+        }
+      }
+    }
+    if (out.length < 10) {
+      try {
+        const popRes = await fetch(`https://api.themoviedb.org/3/trending/${kind}/week?api_key=${encodeURIComponent(tmdbKey)}`, {
+          cf: { cacheTtl: 86400, cacheEverything: true }
+        });
+        const popData = await popRes.json();
+        for (const m of (popData.results || [])) {
+          if (m && m.id && !seen.has(m.id) && m.poster_path) {
+            seen.add(m.id);
+            out.push(toItem(kind, m));
+          }
+        }
+      } catch {}
+    }
+    return out.slice(0, CURATED_RECOMMENDATION_LIMIT);
+  };
+
+  const [movies, shows] = await Promise.all([
+    movieIds ? side("movie", movieIds) : Promise.resolve([]),
+    showIds ? side("tv", showIds) : Promise.resolve([]),
+  ]);
+  return { movies, shows };
+}
+
+// The seed titles the website would send /api/recommendations for this
+// account, from what the server can see of it: Continue Watching, Watch
+// History and the Watchlist, in that order -- the order the Discover tab
+// gathers them in (19_client-search-and-likes.js). The website also reads
+// the account's other custom lists; those only ever add seeds after these,
+// and with twelve a side the first three almost always fill it.
+//
+// Classified the way the website classifies them: anything with a showId, or
+// typed/shaped as a series, seeds shows; everything else seeds movies.
+function recommendationSeedsFrom(items) {
+  const movieIds = [];
+  const showIds = [];
+  const seenShows = new Set();
+  const seenMovies = new Set();
+  for (const it of items) {
+    if (!it) continue;
+    const rawShowId = it.showId || (it.type === "series" || it.type === "tv" || it.kind === "series" || it.kind === "tv" || it.showTitle ? (it.id || it.imdbId) : null);
+    if (rawShowId) {
+      const clean = String(rawShowId).replace(/^tmdb:/, "").split(":")[0].trim();
+      if (clean && !seenShows.has(clean)) {
+        seenShows.add(clean);
+        showIds.push(clean);
+      }
+    } else {
+      const rawMovieId = it.imdbId || it.id;
+      if (!rawMovieId) continue;
+      const clean = String(rawMovieId).replace(/^tmdb:/, "").split(":")[0].trim();
+      if (clean && !seenMovies.has(clean)) {
+        seenMovies.add(clean);
+        movieIds.push(clean);
+      }
+    }
+  }
+  return {
+    movieIds: movieIds.slice(0, RECOMMENDATION_SEEDS_PER_SIDE),
+    showIds: showIds.slice(0, RECOMMENDATION_SEEDS_PER_SIDE),
+  };
+}
+
 async function mapStoredRecommendationToMeta(it, isSeries, tmdbKey) {
   if (!it) return null;
   const tmdbId = String(it.tmdbId || String(it.id || '').replace(/^tmdb:/, '') || '').trim();
@@ -13639,15 +14054,6 @@ async function mapStoredRecommendationToMeta(it, isSeries, tmdbKey) {
 async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
   const isSeries = entry.type === 'series' || (entry.url && entry.url.includes('shows'));
   const tmdbKey = keys.tmdbKey || TMDB_API_KEY;
-  let sampleIds = [];
-  // The exact list the Discover tab last showed for this account, pushed
-  // up alongside Watch History/Continue Watching/Airing Next by
-  // pushTrackingSync (22_client-creator-profile.js). Preferred over
-  // re-deriving below because re-deriving cannot reproduce it: the card's
-  // seeds come from the browser's full picture (Continue Watching + Watch
-  // History + Watchlist + every other custom list), while this function
-  // can only see what tracking data made it to the server. Same reason
-  // Airing Next is served from a pushed snapshot rather than recomputed.
   let storedRecs = null;
 
   if (keys.env && keys.env.CONFIGS) {
@@ -13658,33 +14064,53 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
         if (resolved && resolved.trackCreatorName) username = resolved.trackCreatorName;
       } catch {}
     }
+    let tracking = null;
     if (username) {
       try {
         const trackingRaw = await keys.env.CONFIGS.get(`creatorsynctracking:${username}`);
-        if (trackingRaw) {
-          const tracking = JSON.parse(trackingRaw);
-          const recBlob = tracking.curatedRecommendations;
-          if (recBlob && typeof recBlob === 'object') {
-            const candidate = isSeries ? recBlob.shows : recBlob.movies;
-            if (Array.isArray(candidate) && candidate.length) storedRecs = candidate;
-          }
-          if (isSeries) {
-            const list = Array.isArray(tracking.continueWatching) && tracking.continueWatching.length
-              ? tracking.continueWatching
-              : (Array.isArray(tracking.watchHistory) ? tracking.watchHistory : []);
-            sampleIds = list.map(it => it.showId || it.id).filter(Boolean).slice(0, 10);
-          } else {
-            const list = Array.isArray(tracking.watchHistory) ? tracking.watchHistory : [];
-            sampleIds = list.filter(it => it.type === 'movie' || !it.seasonNum).map(it => it.id || it.imdbId).filter(Boolean).slice(0, 10);
-          }
-        }
+        if (trackingRaw) tracking = JSON.parse(trackingRaw);
       } catch {}
+    }
+    if (tracking) {
+      // The Discover card's own list, while the website is still the one
+      // keeping it current. Preferred over building one here because only the
+      // browser sees the account's whole picture (every custom list, not just
+      // tracking data), so only its list matches the card item for item.
+      const recBlob = tracking.curatedRecommendations;
+      const snapshot = recBlob && typeof recBlob === 'object' ? (isSeries ? recBlob.shows : recBlob.movies) : null;
+      const snapshotAge = Date.now() - ((recBlob && Number(recBlob.updatedAt)) || 0);
+      if (Array.isArray(snapshot) && snapshot.length && snapshotAge < CURATED_SNAPSHOT_MAX_AGE_MS) {
+        storedRecs = snapshot;
+      } else {
+        // No snapshot, or one the website has not refreshed in days --
+        // someone watching only in Stremio or Nuvio, whose row used to stay
+        // frozen at whatever Discover last showed. Built the way the website
+        // builds it (buildTmdbRecommendations), from the account's current
+        // Continue Watching, Watch History and Watchlist, so what has been
+        // watched since shapes it. The stale snapshot is the fallback only if
+        // that produces nothing (no viewing to seed from, TMDB down).
+        try {
+          const wl = await readAccountWatchlist(keys.env, username, tracking);
+          const seeds = recommendationSeedsFrom([
+            ...(Array.isArray(tracking.continueWatching) ? tracking.continueWatching : []),
+            ...(Array.isArray(tracking.watchHistory) ? tracking.watchHistory : []),
+            ...(wl ? wl.items : []),
+          ]);
+          const sideSeeds = isSeries ? seeds.showIds : seeds.movieIds;
+          if (sideSeeds.length) {
+            const built = await buildTmdbRecommendations(isSeries ? null : sideSeeds, isSeries ? sideSeeds : null, tmdbKey);
+            const side = isSeries ? built.shows : built.movies;
+            if (side.length) storedRecs = side;
+          }
+        } catch {}
+        if (!storedRecs && Array.isArray(snapshot) && snapshot.length) storedRecs = snapshot;
+      }
     }
   }
 
-  // The snapshot path. Serves exactly the items the Discover card last
-  // showed, in exactly that order, cut to exactly the same length -- so
-  // "40 items" on the card and 40 items in the shelf are the same 40.
+  // Serves the list chosen above -- the Discover snapshot, or the one built
+  // in its place -- in its own order, cut to the card's length, so "40
+  // items" on the card and 40 items in the shelf are the same 40.
   if (storedRecs) {
     const capped = storedRecs.slice(0, CURATED_RECOMMENDATION_LIMIT);
     if (skip >= capped.length) return [];
@@ -13692,103 +14118,16 @@ async function fetchCuratedCatalog(entry, skip = 0, keys = {}) {
       capped.slice(skip, skip + PAGE_SIZE).map((it) => mapStoredRecommendationToMeta(it, isSeries, tmdbKey).catch(() => null))
     );
     const out = mapped.filter(Boolean);
-    // Only trust the snapshot if it actually resolved to something. An
-    // empty result here (every external_ids call failed, say) falls
-    // through to the live derivation below rather than serving an empty
-    // shelf, the same fallback shape fetchCustomListCatalog already uses.
+    // Only trust the list if it actually resolved to something. An empty
+    // result here (every external_ids call failed, say) falls through to
+    // the popular chart below rather than serving an empty shelf, the same
+    // fallback shape fetchCustomListCatalog already uses.
     if (out.length) {
       out.totalItems = capped.length;
       return out;
     }
   }
 
-  if (sampleIds.length > 0) {
-    try {
-      const recs = await Promise.all(sampleIds.map(async (rawId) => {
-        try {
-          let tmdbId = '';
-          if (String(rawId).startsWith('tmdb:')) {
-            tmdbId = String(rawId).slice(5);
-          } else {
-            const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(rawId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const findData = await findRes.json();
-            const resKey = isSeries ? 'tv_results' : 'movie_results';
-            if (findData[resKey] && findData[resKey][0]) {
-              tmdbId = findData[resKey][0].id;
-            }
-          }
-          if (!tmdbId) return [];
-          const endpoint = isSeries ? 'tv' : 'movie';
-          const recRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-            cf: { cacheTtl: 86400, cacheEverything: true }
-          });
-          const recData = await recRes.json();
-          let list = recData.results || [];
-          if (!list.length) {
-            const simRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const simData = await simRes.json();
-            list = simData.results || [];
-          }
-          return list;
-        } catch {
-          return [];
-        }
-      }));
-
-      const seenTmdb = new Set();
-      const combined = [];
-      recs.forEach(list => {
-        (list || []).forEach(item => {
-          if (item && item.id && !seenTmdb.has(item.id)) {
-            seenTmdb.add(item.id);
-            combined.push(item);
-          }
-        });
-      });
-
-      if (combined.length > 0) {
-        // CURATED_RECOMMENDATION_LIMIT, not PAGE_SIZE: this list is the
-        // same list the Discover card shows, and that card is built from
-        // a response cut to exactly this many items. Cutting the pool
-        // first (rather than the page) also means paging stops where the
-        // card says the list ends instead of running on to 100.
-        const capped = combined.slice(0, CURATED_RECOMMENDATION_LIMIT);
-        if (skip >= capped.length) {
-          return [];
-        }
-        const mapped = await Promise.all(capped.slice(skip, skip + PAGE_SIZE).map(async (it) => {
-          try {
-            let imdbId = '';
-            const detailRes = await fetch(`https://api.themoviedb.org/3/${isSeries ? 'tv' : 'movie'}/${it.id}/external_ids?api_key=${encodeURIComponent(tmdbKey)}`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const detailData = await detailRes.json();
-            imdbId = detailData.imdb_id;
-            if (!imdbId) imdbId = `tmdb:${it.id}`;
-            const releaseYear = (it.release_date || it.first_air_date || '').slice(0, 4);
-            return {
-              id: imdbId,
-              type: isSeries ? 'series' : 'movie',
-              name: it.title || it.name || 'Untitled',
-              poster: it.poster_path ? `https://image.tmdb.org/t/p/w500${it.poster_path}` : undefined,
-              releaseInfo: releaseYear || undefined,
-            };
-          } catch {
-            return null;
-          }
-        }));
-        const derived = mapped.filter(Boolean);
-        derived.totalItems = capped.length;
-        return derived;
-      }
-    } catch {}
-  }
-
-  // Fallback: If user has no personalized history, return only the first page of TMDB Popular
   if (skip === 0) {
     return fetchTmdbChart(entry, 0, tmdbKey, 'popular');
   }
@@ -13883,7 +14222,12 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
   try {
     let items;
     let airingItems;
-    if (env && env.DB) {
+    // D1 is the cheap read, but only while it is current: a tracking write
+    // that failed leaves the rows as they were, and these rows used to keep
+    // serving them regardless. The KV record below is the newer copy then.
+    // See isTrackingD1Behind.
+    const d1Current = !!(env && env.DB) && slug !== 'watchlist' && !(await isTrackingD1Behind(env, username));
+    if (d1Current) {
       if (slug === 'watch-history') {
         const rows = await env.DB.prepare(
           "SELECT * FROM watch_history WHERE username = ? ORDER BY watched_at DESC LIMIT 100"
@@ -14027,6 +14371,13 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       if (trackingRaw) {
         const trackingBlob = JSON.parse(trackingRaw);
         items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
+        // The Watchlist has three copies and this record's is the one a
+        // playback scrobble used to empty -- serve the newest of them, which
+        // is also what the website shows. See readAccountWatchlist.
+        if (slug === 'watchlist') {
+          const wl = await readAccountWatchlist(env, username, trackingBlob);
+          items = wl ? wl.items : [];
+        }
         // Loaded for the watchlist as well as continue-watching: it is the
         // only source of "this show has an episode coming", and a watchlist
         // entry wants that chip exactly as much as an in-progress one does.
@@ -14058,6 +14409,10 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         if (!blobStr) return [];
         const blob = JSON.parse(blobStr);
         items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
+        if (slug === 'watchlist') {
+          const wl = await readAccountWatchlist(env, username, blob);
+          items = wl ? wl.items : [];
+        }
         // Loaded for the watchlist as well as continue-watching: it is the
         // only source of "this show has an episode coming", and a watchlist
         // entry wants that chip exactly as much as an in-progress one does.
@@ -14086,8 +14441,18 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         }
       }
     }
+    // Airing Next lists what is still to come, and it is a snapshot: rebuilt
+    // by the website when it is open and by the cron (refreshAiringNextSweep,
+    // 07_source-fetchers-tmdb-simkl.js) every few hours. In between, an
+    // episode can air -- and it used to sit on the shelf with its old date
+    // for as long as nobody rebuilt it. The website's own copy drops those
+    // (refreshAiringNext treats an aired entry as expired); so does this.
+    // "Aired" is isEpisodeAired's: before today, so today's episode stays.
+    if (slug === 'airing-next' && Array.isArray(items) && typeof isEpisodeAired === 'function') {
+      items = items.filter((it) => !(it && it.airDate && isEpisodeAired(it.airDate)));
+    }
     if (!items || !items.length) return [];
-    
+
     const airingByShowId = new Map();
     const airingByBaseId = new Map();
     const airingByTitle = new Map();
@@ -21803,6 +22168,256 @@ async function findNextAiredEpisodeForShow(imdbId, latestSeasonNum, latestEpisod
 // more like "gets covered every so often as the cursor cycles back
 // around" -- there's no hard per-account freshness guarantee here, just
 // steady, bounded progress.
+// --- Airing Next, rebuilt without the website ----------------------------------
+//
+// Airing Next is built by the website (refreshAiringNext, 21_client-custom-
+// list-builder.js) and pushed up as a snapshot, and nothing else ever rebuilt
+// it -- so someone who used only Stremio or Nuvio for a while saw episodes
+// that had aired days ago, never saw newly announced ones, and never saw
+// shows they had started watching since. The functions below are the
+// website's rules run over the account's tracking record instead of this
+// browser's localStorage, so the two build the same shelf.
+
+// The furthest-along watched episode of one show -- latestWatchedEpisodeFor-
+// ShowIds on the website.
+function latestWatchedEpisodeInHistory(watchHistory, showId) {
+  let best = null;
+  for (const it of watchHistory) {
+    if (!it || it.type !== 'episode' || String(it.showId || '') !== showId) continue;
+    if (it.seasonNum == null || it.episodeNum == null) continue;
+    const s = Number(it.seasonNum);
+    const e = Number(it.episodeNum);
+    if (!best || s > best.seasonNum || (s === best.seasonNum && e > best.episodeNum)) best = { seasonNum: s, episodeNum: e };
+  }
+  return best;
+}
+
+// Whether a removal from Airing Next still stands -- isAiringNextRemoved: it
+// lasts until an episode newer than the one it was made at is watched.
+function airingNextRemovalStands(record, showId) {
+  const marks = record.removedAiringNext && typeof record.removedAiringNext === 'object' ? record.removedAiringNext : {};
+  const mark = marks[showId];
+  if (!mark) return false;
+  const latest = latestWatchedEpisodeInHistory(Array.isArray(record.watchHistory) ? record.watchHistory : [], showId);
+  if (!latest) return true;
+  const atSeason = Number(mark.seasonNum) || 0;
+  const atEpisode = Number(mark.episodeNum) || 0;
+  if (latest.seasonNum > atSeason) return false;
+  if (latest.seasonNum === atSeason && latest.episodeNum > atEpisode) return false;
+  return true;
+}
+
+// The shows to look up -- collectAiringNextCandidateShowIds: every show with
+// a watched episode, plus any known to be fully watched, less the removed ones
+// that are not in Continue Watching.
+function airingNextCandidatesFromRecord(record) {
+  const ids = new Set();
+  for (const it of (Array.isArray(record.watchHistory) ? record.watchHistory : [])) {
+    if (it && it.type === 'episode' && it.showId) ids.add(String(it.showId));
+  }
+  for (const id of (Array.isArray(record.fullyWatchedShowIds) ? record.fullyWatchedShowIds : [])) ids.add(String(id));
+  const cw = new Set();
+  for (const it of (Array.isArray(record.continueWatching) ? record.continueWatching : [])) {
+    if (it && it.showId) cw.add(String(it.showId));
+    if (it && it.id) cw.add(String(it.id));
+  }
+  for (const id of [...ids]) {
+    if (airingNextRemovalStands(record, id) && !cw.has(id)) ids.delete(id);
+  }
+  return [...ids].slice(0, AIRING_NEXT_SERVER_MAX_SHOWS);
+}
+
+// One details payload -> one Airing Next entry, or null when nothing is
+// coming. airingEntryFrom on the website, field for field.
+function airingNextEntryFromDetails(showId, d, known) {
+  if (!d || !d.nextEpisodeAirDate) return null;
+  if (isEpisodeAired(d.nextEpisodeAirDate)) return null;
+  const epName = d.nextEpisodeName || (d.nextEpisodeNumber === 1 ? 'Season Premiere' : (d.nextEpisodeNumber != null ? ('Episode ' + d.nextEpisodeNumber) : ''));
+  const isFinale = !!(d.isSeasonFinale || (d.totalEpisodesInSeason != null && d.nextEpisodeNumber === d.totalEpisodesInSeason && d.nextEpisodeNumber > 1));
+  return {
+    id: showId,
+    type: 'series',
+    showId: showId,
+    canonicalTmdbId: d.tmdbId ? String(d.tmdbId) : null,
+    showTitle: (known && known.title) || d.title || '',
+    showPoster: (known && known.poster) || d.poster || '',
+    name: epName,
+    episodeTitle: epName,
+    airDate: d.nextEpisodeAirDate,
+    seasonNum: d.nextEpisodeSeasonNumber,
+    episodeNum: d.nextEpisodeNumber,
+    isSeasonPremiere: d.nextEpisodeNumber === 1,
+    isSeasonFinale: isFinale,
+    seasonFinaleAirDate: d.seasonFinaleAirDate || null,
+    seasonFinaleEpisodeNumber: d.seasonFinaleEpisodeNumber || null,
+    airTime: d.nextEpisodeAirTimeLabel || (d.airTime && d.airTime.label) || null,
+    isUnaired: true,
+  };
+}
+
+// Rebuilds one account's Airing Next from its tracking record. `pool` is the
+// tick's shared outbound-fetch budget ({ budget, reserved }), reserved per
+// lookup at TMDB_ITEM_DETAILS_MAX_FETCHES and refunded down to what the
+// lookup really spent -- the /api/details/batch route's accounting, since a
+// cached lookup spends nothing.
+//
+// Returns { items, complete }. A show the budget did not reach keeps the entry
+// it already had (if that has not aired), so running out part-way leaves the
+// shelf as it was for those shows rather than dropping them.
+async function rebuildAiringNextForRecord(env, ctx, record, pool) {
+  const candidates = airingNextCandidatesFromRecord(record);
+  const known = new Map();
+  for (const it of (Array.isArray(record.watchHistory) ? record.watchHistory : [])) {
+    if (it && it.showId && it.showTitle && !known.has(String(it.showId))) {
+      known.set(String(it.showId), { title: it.showTitle, poster: it.showPoster });
+    }
+  }
+  const resolved = new Map();
+  let cursor = 0;
+  let complete = true;
+  async function worker() {
+    while (cursor < candidates.length) {
+      if (pool.reserved + TMDB_ITEM_DETAILS_MAX_FETCHES > pool.budget) {
+        complete = false;
+        return;
+      }
+      const showId = candidates[cursor++];
+      pool.reserved += TMDB_ITEM_DETAILS_MAX_FETCHES;
+      const meter = { spent: 0 };
+      try {
+        const d = await fetchTmdbItemDetails(showId, TMDB_API_KEY, 'series', '', false, env, ctx, meter);
+        // No details at all is a lookup that failed (TMDB down, nothing
+        // cached), not a show with nothing coming -- left unresolved so it
+        // keeps its entry. Only real details decide a show is off the shelf,
+        // or an outage would empty everyone's Airing Next and save it.
+        if (d) resolved.set(showId, airingNextEntryFromDetails(showId, d, known.get(showId)));
+      } catch {
+        // Unresolved rather than "nothing coming": keeps its current entry.
+      }
+      pool.reserved -= TMDB_ITEM_DETAILS_MAX_FETCHES - Math.min(meter.spent, TMDB_ITEM_DETAILS_MAX_FETCHES);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(4, candidates.length) }, worker));
+  if (cursor < candidates.length) complete = false;
+
+  const existing = new Map();
+  for (const it of (Array.isArray(record.airingNext) ? record.airingNext : [])) {
+    if (it && it.showId && !(it.airDate && isEpisodeAired(it.airDate))) existing.set(String(it.showId), it);
+  }
+  const results = [];
+  for (const showId of candidates) {
+    if (resolved.has(showId)) {
+      const entry = resolved.get(showId);
+      if (entry) results.push(entry);
+    } else if (existing.has(showId)) {
+      results.push(existing.get(showId));
+    }
+  }
+
+  // The website's dedupe and order: one entry per show whichever id Watch
+  // History recorded it under, soonest first, removed shows left off.
+  const seen = new Set();
+  const items = results.filter((it) => {
+    const normalized = String(it.showId).startsWith('tmdb:') ? String(it.showId).slice(5) : String(it.showId);
+    const key = it.canonicalTmdbId ? 'tmdb:' + it.canonicalTmdbId : 'id:' + normalized;
+    if (seen.has(key) || seen.has('id:' + normalized)) return false;
+    seen.add(key);
+    seen.add('id:' + normalized);
+    return true;
+  }).filter((it) => !airingNextRemovalStands(record, String(it.showId)));
+  items.sort((a, b) => String(a.airDate || '').localeCompare(String(b.airDate || '')));
+  return { items, complete };
+}
+
+// The cron's half of Airing Next: a few accounts per tick, each at most every
+// AIRING_NEXT_SERVER_REFRESH_MS. Walks accounts with the same page-cursor-
+// plus-offset position checkForNewEpisodes keeps (below), for the same
+// reasons, under its own key.
+async function refreshAiringNextSweep(env, ctx, fetchBudget) {
+  if (!env || !env.CONFIGS || !TMDB_API_KEY) return;
+  if (!(Number.isFinite(fetchBudget) && fetchBudget >= TMDB_ITEM_DETAILS_MAX_FETCHES)) return;
+  const CURSOR_KEY = 'cron:airingnext:cursor';
+  let sweep = { c: '', o: 0 };
+  try {
+    const raw = await env.CONFIGS.get(CURSOR_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.c === 'string') sweep = { c: parsed.c, o: Number(parsed.o) || 0 };
+    }
+  } catch {}
+
+  const listOpts = { prefix: 'creator:', limit: 25 };
+  if (sweep.c) listOpts.cursor = sweep.c;
+  let listResult;
+  try {
+    listResult = await env.CONFIGS.list(listOpts);
+  } catch (e) {
+    console.error('[Cron] Airing Next: account listing failed, restarting from the beginning:', e);
+    if (sweep.c) {
+      try { await env.CONFIGS.put(CURSOR_KEY, ''); } catch {}
+    }
+    return;
+  }
+
+  const pool = { budget: fetchBudget, reserved: 0 };
+  const pageKeys = listResult.keys || [];
+  let nextOffset = Math.min(Math.max(sweep.o, 0), pageKeys.length);
+  let rebuilt = 0;
+  for (let i = nextOffset; i < pageKeys.length; i++) {
+    if (rebuilt >= AIRING_NEXT_SWEEP_ACCOUNTS_PER_TICK || pool.reserved + TMDB_ITEM_DETAILS_MAX_FETCHES > pool.budget) break;
+    nextOffset = i + 1;
+    const username = pageKeys[i].name.slice('creator:'.length);
+    // One account must not be able to stop the sweep -- see checkForNewEpisodes.
+    try {
+      const checkedKey = airingNextCheckedKey(username);
+      if (await env.CONFIGS.get(checkedKey)) continue;
+      const trackingKey = `creatorsynctracking:${username}`;
+      const raw = await env.CONFIGS.get(trackingKey);
+      if (!raw) continue;
+      const record = JSON.parse(raw);
+      if (!airingNextCandidatesFromRecord(record).length) continue;
+      rebuilt++;
+      const { items, complete } = await rebuildAiringNextForRecord(env, ctx, record, pool);
+
+      // Written against a fresh read, owning only the one field it computed:
+      // the lookups above took real time, and anything the account's browser
+      // or a playback scrobble saved meanwhile must survive. The same rule
+      // checkForNewEpisodes follows for Continue Watching.
+      let target = record;
+      try {
+        const freshRaw = await env.CONFIGS.get(trackingKey);
+        if (freshRaw) target = JSON.parse(freshRaw);
+      } catch {}
+      const before = JSON.stringify(Array.isArray(target.airingNext) ? target.airingNext : []);
+      if (JSON.stringify(items) !== before) {
+        const previousStamp = Number(target.updatedAt) || 0;
+        target.airingNext = items;
+        target.updatedAt = Math.max(Date.now(), previousStamp + 1);
+        await env.CONFIGS.put(trackingKey, JSON.stringify(target));
+        if (env.DB) await saveAiringNextD1(env, username, items, target.updatedAt, previousStamp);
+      }
+      // A rebuild the budget cut short is due again in half an hour rather
+      // than six, by which time the lookups it did make have warmed the cache
+      // for the ones it did not.
+      const ttlSec = complete ? Math.round(AIRING_NEXT_SERVER_REFRESH_MS / 1000) : 1800;
+      await env.CONFIGS.put(checkedKey, '1', { expirationTtl: ttlSec });
+    } catch (accountErr) {
+      console.error(`[Cron] Airing Next: skipping ${username} this cycle:`, accountErr);
+    }
+  }
+
+  // Past the end of this page: move to the next one, or start over.
+  let next;
+  if (nextOffset >= pageKeys.length) {
+    next = listResult.list_complete ? { c: '', o: 0 } : { c: listResult.cursor || '', o: 0 };
+  } else {
+    next = { c: sweep.c, o: nextOffset };
+  }
+  if (next.c !== sweep.c || next.o !== sweep.o) {
+    try { await env.CONFIGS.put(CURSOR_KEY, JSON.stringify(next)); } catch {}
+  }
+}
+
 async function checkForNewEpisodes(env, fetchBudget) {
   if (!env || !env.CONFIGS || !env.TMDB_API_KEY) return;
 
@@ -29472,10 +30087,42 @@ function createSortableList(container, options = {}) {
     }
   }
 
+  // The rows a dragged row is placed among: its SIBLINGS, not every matching
+  // descendant. This used to be a querySelectorAll over the whole subtree,
+  // which on Live Preview walks every poster of every shelf -- thousands of
+  // nodes -- on every dragover and every auto-scroll frame.
+  function siblingItems(parent) {
+    const out = [];
+    const kids = parent.children;
+    for (let i = 0; i < kids.length; i++) {
+      const child = kids[i];
+      if (child === activeItem || child.classList.contains(dragClass) || !child.matches(itemSelector)) continue;
+      out.push(child);
+    }
+    return out;
+  }
+
+  function nextItemSibling(el) {
+    let n = el.nextElementSibling;
+    while (n && !n.matches(itemSelector)) n = n.nextElementSibling;
+    return n;
+  }
+
+  // Moves the row only when its place actually changes.
+  //
+  // It used to re-insert the row on every call whether or not it had moved --
+  // several times a second from dragover, and every frame from auto-scroll.
+  // A re-insert is a real DOM mutation even when the row lands where it was:
+  // it throws away the page's layout, so the getBoundingClientRect reads on
+  // the next call re-laid-out the entire page, and it hands the moved row to
+  // the page-wide MutationObserver that badges posters (initWatchHistory),
+  // which re-badged every poster in it. On a Live Preview with poster
+  // shelves that was the whole frame budget and more, on every frame --
+  // what "the page freezes when I drag" was on a phone.
   function moveItem(y, x) {
     if (!activeItem) return;
     const targetParent = activeItem.parentNode || container;
-    const items = [...targetParent.querySelectorAll(itemSelector + ':not(.' + dragClass + ')')];
+    const items = siblingItems(targetParent);
     if (axis === 'xy' && typeof x === 'number') {
       let targetCard = null;
       for (const child of items) {
@@ -29485,29 +30132,36 @@ function createSortableList(container, options = {}) {
           break;
         }
       }
-      if (targetCard && targetCard !== activeItem) {
+      if (targetCard) {
         const box = targetCard.getBoundingClientRect();
         const isAfter = (y > box.top + box.height / 2) || (y >= box.top && x > box.left + box.width / 2);
         if (isAfter) {
-          targetParent.insertBefore(activeItem, targetCard.nextSibling);
-        } else {
+          if (targetCard.nextElementSibling !== activeItem) targetParent.insertBefore(activeItem, targetCard.nextSibling);
+        } else if (activeItem.nextElementSibling !== targetCard) {
           targetParent.insertBefore(activeItem, targetCard);
         }
         return;
       }
     }
-    const afterEl = items.reduce((closest, child) => {
+    let afterEl = null;
+    let closest = -Infinity;
+    for (const child of items) {
       const box = child.getBoundingClientRect();
       const offset = y - box.top - box.height / 2;
-      if (offset < 0 && offset > closest.offset) {
-        return { offset: offset, element: child };
+      if (offset < 0 && offset > closest) {
+        closest = offset;
+        afterEl = child;
       }
-      return closest;
-    }, { offset: -Infinity, element: null }).element;
+    }
 
     if (afterEl == null) {
-      targetParent.appendChild(activeItem);
-    } else if (afterEl !== activeItem) {
+      // Belongs after every other row -- already there if the last one comes
+      // before it.
+      const last = items[items.length - 1];
+      if (last && !(last.compareDocumentPosition(activeItem) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+        targetParent.appendChild(activeItem);
+      }
+    } else if (nextItemSibling(activeItem) !== afterEl) {
       targetParent.insertBefore(activeItem, afterEl);
     }
   }
@@ -29519,18 +30173,29 @@ function createSortableList(container, options = {}) {
   // progress, so on any list taller than the window -- which is most of them
   // once Live Preview shelves carry posters and each row is ~200px -- dragging
   // past the last visible row did nothing at all: the row stopped at the edge
-  // and sat there. That is what "the drag freezes and won't move the list"
-  // was. It applied to every list this function drives, on desktop and touch
-  // alike.
+  // and sat there. It applied to every list this function drives, on desktop
+  // and touch alike.
   const AUTO_SCROLL_EDGE = 90;   // distance from an edge where scrolling starts
   const AUTO_SCROLL_MAX = 20;    // px per frame at the very edge
+  // A native (HTML5) drag fires dragover continuously -- the spec says at
+  // least every 350ms, even with the pointer held still -- for as long as it
+  // lasts. Silence well past that means it ended without dragend reaching
+  // this list.
+  const HTML5_DRAG_SILENCE_MS = 1500;
   let autoScrollRaf = null;
   let lastClientX = 0;
   let lastClientY = 0;
+  let scrollHost = null;
+  let anchorEl = null;
+  let anchorPrev = '';
+  let html5Drag = false;
+  let lastDragEventAt = 0;
 
   // The page itself scrolls for the catalog and My Lists surfaces, but this
   // same function also drives lists inside scrollable panels, so scroll
-  // whichever actually can.
+  // whichever actually can. Resolved once when a drag starts: it walks every
+  // ancestor through getComputedStyle, and doing that every frame forced a
+  // style recalculation of the whole page sixty times a second.
   function scrollHostFor(el) {
     let n = el && el.parentElement;
     while (n && n !== document.body && n !== document.documentElement) {
@@ -29541,12 +30206,46 @@ function createSortableList(container, options = {}) {
     return null;
   }
 
+  // Called when a drag starts, by either path.
+  function beginDragSession() {
+    scrollHost = scrollHostFor(activeItem);
+    // Scroll anchoring off for the drag. Moving a tall row from above the
+    // fold to below it (which is what every step of a downward drag does)
+    // makes the browser shift the scroll position to keep what is on screen
+    // still -- underneath a drag that is itself scrolling and re-placing the
+    // row from the pointer's position, so the two fight each other.
+    anchorEl = scrollHost || document.scrollingElement || document.documentElement;
+    anchorPrev = anchorEl.style.overflowAnchor;
+    anchorEl.style.overflowAnchor = 'none';
+  }
+
+  function endDragSession() {
+    stopAutoScroll();
+    if (anchorEl) anchorEl.style.overflowAnchor = anchorPrev;
+    anchorEl = null;
+    scrollHost = null;
+    html5Drag = false;
+  }
+
+  function scrollPos() {
+    return scrollHost ? scrollHost.scrollTop : (window.scrollY || window.pageYOffset || 0);
+  }
+
   function autoScrollStep() {
     autoScrollRaf = null;
     if (!activeItem) return;
-    const host = scrollHostFor(activeItem);
-    const top = host ? host.getBoundingClientRect().top : 0;
-    const bottom = host ? host.getBoundingClientRect().bottom : (window.innerHeight || document.documentElement.clientHeight);
+    // A drag can end without this list hearing about it: the row is no
+    // longer on the page (the list was re-rendered under it -- dragend then
+    // fires on a detached node and never bubbles here), or a native drag has
+    // gone silent. Left running, this loop kept scrolling the page and
+    // re-attaching the stale row every frame, indefinitely.
+    if (!activeItem.isConnected || (html5Drag && Date.now() - lastDragEventAt > HTML5_DRAG_SILENCE_MS)) {
+      finishHtml5OrPointerDrag();
+      return;
+    }
+    const hostBox = scrollHost ? scrollHost.getBoundingClientRect() : null;
+    const top = hostBox ? hostBox.top : 0;
+    const bottom = hostBox ? hostBox.bottom : (window.innerHeight || document.documentElement.clientHeight);
     let delta = 0;
     if (lastClientY < top + AUTO_SCROLL_EDGE) {
       delta = -Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (top + AUTO_SCROLL_EDGE - lastClientY) / AUTO_SCROLL_EDGE));
@@ -29554,11 +30253,14 @@ function createSortableList(container, options = {}) {
       delta = Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (lastClientY - (bottom - AUTO_SCROLL_EDGE)) / AUTO_SCROLL_EDGE));
     }
     if (delta) {
-      if (host) host.scrollTop += delta;
+      const before = scrollPos();
+      if (scrollHost) scrollHost.scrollTop += delta;
       else window.scrollBy(0, delta);
       // Re-place the row against the rows that just came into view, or the
-      // page would scroll underneath a row that never moves.
-      moveItem(lastClientY, lastClientX);
+      // page would scroll underneath a row that never moves -- but only if
+      // it did scroll: at the top or bottom of the page there is nothing new
+      // to place it against.
+      if (scrollPos() !== before) moveItem(lastClientY, lastClientX);
     }
     queueAutoScroll();
   }
@@ -29579,6 +30281,7 @@ function createSortableList(container, options = {}) {
     activeItem = item;
     activeItem.classList.add(dragClass);
     document.body.style.userSelect = 'none';
+    beginDragSession();
     if (typeof navigator !== 'undefined' && navigator.vibrate) {
       try { navigator.vibrate(30); } catch (err) {}
     }
@@ -29586,7 +30289,7 @@ function createSortableList(container, options = {}) {
 
   function stopDragging() {
     cancelHold();
-    stopAutoScroll();
+    endDragSession();
     if (isDragging && activeItem) {
       activeItem.classList.remove(dragClass);
       onReorder();
@@ -29594,6 +30297,19 @@ function createSortableList(container, options = {}) {
     isDragging = false;
     activeItem = null;
     document.body.style.userSelect = '';
+  }
+
+  // Ends whichever kind of drag is in progress -- the path the watchdog in
+  // autoScrollStep takes when the drag's own end event never arrived.
+  function finishHtml5OrPointerDrag() {
+    if (html5Drag) {
+      endDragSession();
+      if (activeItem) activeItem.classList.remove(dragClass);
+      activeItem = null;
+      onReorder();
+    } else {
+      stopDragging();
+    }
   }
 
   // HTML5 Drag events for desktop when handle exists
@@ -29606,6 +30322,9 @@ function createSortableList(container, options = {}) {
       activeItem = handle.closest(itemSelector);
       if (!activeItem) return;
       activeItem.classList.add(dragClass);
+      html5Drag = true;
+      lastDragEventAt = Date.now();
+      beginDragSession();
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = 'move';
         try { e.dataTransfer.setData('text/plain', activeItem.dataset && activeItem.dataset.slug ? activeItem.dataset.slug : ''); } catch (err) {}
@@ -29615,21 +30334,28 @@ function createSortableList(container, options = {}) {
     container.addEventListener('dragover', (e) => {
       if (!activeItem) return;
       e.preventDefault();
-      lastClientX = e.clientX;
-      lastClientY = e.clientY;
       moveItem(e.clientY, e.clientX);
-      // dragover stops firing once the pointer is held still at the edge, so
-      // the scrolling has to be driven by its own frame loop rather than by
-      // the event.
+      // dragover arrives in uneven bursts, and only every few hundred
+      // milliseconds once the pointer is held still -- which is exactly when
+      // an edge scroll has to keep going smoothly -- so the scrolling runs on
+      // its own frame loop rather than on the event.
       queueAutoScroll();
     });
 
+    // Where the pointer is, and that the drag is still alive, wherever on the
+    // page it has wandered: near the top edge it is usually over the header,
+    // not this list, and the auto-scroll (and the silence watchdog above)
+    // must keep hearing about it there.
+    document.addEventListener('dragover', (e) => {
+      if (!activeItem || !html5Drag) return;
+      lastDragEventAt = Date.now();
+      lastClientX = e.clientX;
+      lastClientY = e.clientY;
+    }, true);
+
     container.addEventListener('dragend', () => {
-      stopAutoScroll();
-      if (!activeItem) return;
-      activeItem.classList.remove(dragClass);
-      activeItem = null;
-      onReorder();
+      if (!activeItem) { endDragSession(); return; }
+      finishHtml5OrPointerDrag();
     });
   }
 
@@ -60348,11 +61074,20 @@ function curatedRecsSignature(blob) {
   return ends(m) + '|' + ends(s);
 }
 
+// How often an UNCHANGED list is re-stamped anyway. The Recommended catalog
+// row stops serving this snapshot once it is CURATED_SNAPSHOT_MAX_AGE_MS old
+// (fetchCuratedCatalog, 05_catalog-core.js) and builds its own instead, on
+// the reading that the website has stopped keeping it current. Its stamp has
+// to say when the website last SHOWED it, then, not when it last changed --
+// or someone who opens Discover every day and happens to get the same
+// recommendations would have the row switched away from them.
+const CURATED_RECS_RESTAMP_MS = 12 * 60 * 60 * 1000;
+
 // Called by the Discover tab every time it renders those two cards (see
 // 19_client-search-and-likes.js). Writing unconditionally would bump
 // updatedAt on every visit and make the tracking signature look changed,
 // forcing a pointless full push each time -- so an unchanged list is a
-// no-op.
+// no-op, until its stamp is CURATED_RECS_RESTAMP_MS old.
 function persistCuratedRecommendations(movies, shows) {
   const blob = {
     movies: Array.isArray(movies) ? movies : [],
@@ -60361,7 +61096,8 @@ function persistCuratedRecommendations(movies, shows) {
   };
   if (!blob.movies.length && !blob.shows.length) return;
   const existing = loadCuratedRecommendations();
-  if (existing && curatedRecsSignature(existing) === curatedRecsSignature(blob)) return;
+  if (existing && curatedRecsSignature(existing) === curatedRecsSignature(blob) &&
+      Date.now() - (Number(existing.updatedAt) || 0) < CURATED_RECS_RESTAMP_MS) return;
   try {
     localStorage.setItem(CURATED_RECS_KEY, JSON.stringify(blob));
   } catch (e) {}
@@ -60405,6 +61141,10 @@ function trackingSyncSignature(localMap) {
     listSig((localMap['continue-watching'] || {}).items),
     listSig((localMap['airing-next'] || {}).items),
     curatedRecsSignature(loadCuratedRecommendations()),
+    // Its stamp too, which moves at most every CURATED_RECS_RESTAMP_MS when
+    // the list itself has not: a re-stamp is news the account needs, or the
+    // Recommended row would still judge the snapshot abandoned.
+    Number((loadCuratedRecommendations() || {}).updatedAt) || 0,
     listSig(wl.items),
     watchlistAiringSig(wl.items),
     Number(wl.updatedAt) || 0,
@@ -72821,9 +73561,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
-      const source = detectSource(entry.url);
-      const isAutoTrack = source === "autotrack";
-      const isUserPersonal = isAutoTrack || source === "simkl-user" || source === "trakt-watchlist" || source === "trakt-history" || source === "mdblist-watchlist" || source === "mdblist-history";
+      // Every line of the row, not just the first: a merged row stores its
+      // sources newline-separated (see fetchCatalog), and one personal source
+      // anywhere in it makes the whole row one account's live state.
+      const rowSources = String(entry.url || "").split("\n").map((u) => u.trim()).filter(Boolean).map(detectSource);
+      const isAutoTrack = rowSources.includes("autotrack");
+      // Rows whose content is one account's live state, and so must never be
+      // cached: the next request has to see what changed since. "curated" is
+      // Recommended Movies/Shows (the account's pushed Discover snapshot),
+      // and the Trakt/MDBList progress shelves change every time something
+      // is watched. All of them used to fall through to the 24-hour public
+      // cache below, which let Stremio and Nuvio keep a day-old copy.
+      const isUserPersonal = rowSources.some((src) => STREMIO_LIVE_ROW_SOURCES.has(src));
 
       // Graceful degradation only applies to the first page (skip === 0):
       // that's the case that makes a whole shelf silently vanish from the
@@ -74688,172 +75437,11 @@ function generateSearchVariations(query) {
         return json({ ok: false, error: "Too many requests just now. Please wait a minute and try again." }, 429);
       }
 
-      const [movieLists, showLists] = await Promise.all([
-        Promise.all(movieIds.map(async (rawId) => {
-          try {
-            let tmdbId = "";
-            let strId = String(rawId || "").trim();
-            if (strId.startsWith("tmdb:")) strId = strId.slice(5);
-            const baseId = strId.split(":")[0];
-            if (/^\d+$/.test(baseId)) {
-              tmdbId = baseId;
-            } else {
-              const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(baseId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
-                cf: { cacheTtl: 86400, cacheEverything: true }
-              });
-              const findData = await findRes.json();
-              if (findData.movie_results && findData.movie_results[0]) {
-                tmdbId = findData.movie_results[0].id;
-              }
-            }
-            if (!tmdbId) return [];
-            const recRes = await fetch(`https://api.themoviedb.org/3/movie/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const recData = await recRes.json();
-            let list = recData.results || [];
-            if (!list.length) {
-              const simRes = await fetch(`https://api.themoviedb.org/3/movie/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-                cf: { cacheTtl: 86400, cacheEverything: true }
-              });
-              const simData = await simRes.json();
-              list = simData.results || [];
-            }
-            return list;
-          } catch {
-            return [];
-          }
-        })),
-        Promise.all(showIds.map(async (rawId) => {
-          try {
-            let tmdbId = "";
-            let strId = String(rawId || "").trim();
-            if (strId.startsWith("tmdb:")) strId = strId.slice(5);
-            const baseId = strId.split(":")[0];
-            if (/^\d+$/.test(baseId)) {
-              tmdbId = baseId;
-            } else {
-              const findRes = await fetch(`https://api.themoviedb.org/3/find/${encodeURIComponent(baseId)}?api_key=${encodeURIComponent(tmdbKey)}&external_source=imdb_id`, {
-                cf: { cacheTtl: 86400, cacheEverything: true }
-              });
-              const findData = await findRes.json();
-              if (findData.tv_results && findData.tv_results[0]) {
-                tmdbId = findData.tv_results[0].id;
-              }
-            }
-            if (!tmdbId) return [];
-            const recRes = await fetch(`https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/recommendations?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-              cf: { cacheTtl: 86400, cacheEverything: true }
-            });
-            const recData = await recRes.json();
-            let list = recData.results || [];
-            if (!list.length) {
-              const simRes = await fetch(`https://api.themoviedb.org/3/tv/${encodeURIComponent(tmdbId)}/similar?api_key=${encodeURIComponent(tmdbKey)}&page=1`, {
-                cf: { cacheTtl: 86400, cacheEverything: true }
-              });
-              const simData = await simRes.json();
-              list = simData.results || [];
-            }
-            return list;
-          } catch {
-            return [];
-          }
-        }))
-      ]);
-
-      const seenMovieIds = new Set();
-      const recMovies = [];
-      for (const list of movieLists) {
-        for (const m of list) {
-          if (m && m.id && !seenMovieIds.has(m.id) && m.poster_path) {
-            seenMovieIds.add(m.id);
-            recMovies.push({
-              id: "tmdb:" + m.id,
-              tmdbId: String(m.id),
-              name: m.title || "Movie",
-              poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
-              year: (m.release_date || "").slice(0, 4),
-              type: "movie",
-              rating: m.vote_average ? m.vote_average.toFixed(1) : null
-            });
-          }
-        }
-      }
-
-      if (recMovies.length < 10) {
-        try {
-          const popRes = await fetch(`https://api.themoviedb.org/3/trending/movie/week?api_key=${encodeURIComponent(tmdbKey)}`, {
-            cf: { cacheTtl: 86400, cacheEverything: true }
-          });
-          const popData = await popRes.json();
-          for (const m of (popData.results || [])) {
-            if (m && m.id && !seenMovieIds.has(m.id) && m.poster_path) {
-              seenMovieIds.add(m.id);
-              recMovies.push({
-                id: "tmdb:" + m.id,
-                tmdbId: String(m.id),
-                name: m.title || "Movie",
-                poster: "https://image.tmdb.org/t/p/w500" + m.poster_path,
-                year: (m.release_date || "").slice(0, 4),
-                type: "movie",
-                rating: m.vote_average ? m.vote_average.toFixed(1) : null
-              });
-            }
-          }
-        } catch {}
-      }
-
-      const seenShowIds = new Set();
-      const recShows = [];
-      for (const list of showLists) {
-        for (const s of list) {
-          if (s && s.id && !seenShowIds.has(s.id) && s.poster_path) {
-            seenShowIds.add(s.id);
-            recShows.push({
-              id: "tmdb:" + s.id,
-              tmdbId: String(s.id),
-              name: s.name || "Show",
-              poster: "https://image.tmdb.org/t/p/w500" + s.poster_path,
-              year: (s.first_air_date || "").slice(0, 4),
-              type: "series",
-              rating: s.vote_average ? s.vote_average.toFixed(1) : null
-            });
-          }
-        }
-      }
-
-      if (recShows.length < 10) {
-        try {
-          const popRes = await fetch(`https://api.themoviedb.org/3/trending/tv/week?api_key=${encodeURIComponent(tmdbKey)}`, {
-            cf: { cacheTtl: 86400, cacheEverything: true }
-          });
-          const popData = await popRes.json();
-          for (const s of (popData.results || [])) {
-            if (s && s.id && !seenShowIds.has(s.id) && s.poster_path) {
-              seenShowIds.add(s.id);
-              recShows.push({
-                id: "tmdb:" + s.id,
-                tmdbId: String(s.id),
-                name: s.name || "Show",
-                poster: "https://image.tmdb.org/t/p/w500" + s.poster_path,
-                year: (s.first_air_date || "").slice(0, 4),
-                type: "series",
-                rating: s.vote_average ? s.vote_average.toFixed(1) : null
-              });
-            }
-          }
-        } catch {}
-      }
-
-      // CURATED_RECOMMENDATION_LIMIT, not a literal -- fetchCuratedCatalog
-      // (05_catalog-core.js) serves the catalog row for this same list and
-      // has to cut it to exactly the same length, or the Discover card and
-      // the shelf it adds disagree about how many items the list has.
-      return json({
-        ok: true,
-        movies: recMovies.slice(0, CURATED_RECOMMENDATION_LIMIT),
-        shows: recShows.slice(0, CURATED_RECOMMENDATION_LIMIT),
-      });
+      // Shared with the Recommended catalog row, which builds the same list
+      // itself once the website's snapshot of it has gone stale -- see
+      // buildTmdbRecommendations (05_catalog-core.js).
+      const recs = await buildTmdbRecommendations(movieIds, showIds, tmdbKey);
+      return json({ ok: true, movies: recs.movies, shows: recs.shows });
     }
 
     // /api/tmdb-search-lists?q=...[&tmdbKey=...]
@@ -79793,6 +80381,9 @@ function generateSearchVariations(query) {
             if (!blob || typeof blob !== "object") {
               blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: false };
             }
+            // This whole record is written back below, Watchlist included --
+            // see ensureTrackingWatchlist for why it has to be put back first.
+            await ensureTrackingWatchlist(env, auth.username, blob);
             blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
             blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
             blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
@@ -80374,6 +80965,8 @@ function generateSearchVariations(query) {
         if (!blob || typeof blob !== "object") {
           blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: true };
         }
+        // Written back whole below -- see ensureTrackingWatchlist.
+        await ensureTrackingWatchlist(env, authUser, blob);
         blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
         blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
         blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
@@ -83441,13 +84034,15 @@ function generateSearchVariations(query) {
         data.scrobbleFilterUsers = typeof d1Tracking.scrobbleFilterUsers === "boolean" ? d1Tracking.scrobbleFilterUsers : false;
         data.scrobbleAllowedUsers = typeof d1Tracking.scrobbleAllowedUsers === "string" ? d1Tracking.scrobbleAllowedUsers : "";
         data.scrobbleBlockAnonymous = typeof d1Tracking.scrobbleBlockAnonymous === "boolean" ? d1Tracking.scrobbleBlockAnonymous : false;
-        data.watchlist = [];
-        data.watchlistUpdatedAt = 0;
+        // The newest of the Watchlist's copies, which readCreatorTrackingD1
+        // has already chosen -- see readAccountWatchlist. Reading only the
+        // tracking record's copy handed this browser an EMPTY Watchlist after
+        // any play in Stremio or Plex had emptied that copy.
+        data.watchlist = Array.isArray(d1Tracking.watchlist) ? d1Tracking.watchlist : [];
+        data.watchlistUpdatedAt = Number(d1Tracking.watchlistUpdatedAt) || 0;
         if (trackingRaw) {
           try {
             const tb = JSON.parse(trackingRaw);
-            if (Array.isArray(tb.watchlist)) data.watchlist = tb.watchlist;
-            if (Number(tb.watchlistUpdatedAt)) data.watchlistUpdatedAt = Number(tb.watchlistUpdatedAt);
             if (Array.isArray(tb.continueWatching) && tb.continueWatching.length && Array.isArray(data.continueWatching)) {
               const tbCwMap = new Map();
               tb.continueWatching.forEach((it) => {
@@ -83482,8 +84077,10 @@ function generateSearchVariations(query) {
           }
           data.watchHistory = Array.isArray(trackingBlob.watchHistory) ? trackingBlob.watchHistory : [];
           data.continueWatching = Array.isArray(trackingBlob.continueWatching) ? trackingBlob.continueWatching : [];
-          data.watchlist = Array.isArray(trackingBlob.watchlist) ? trackingBlob.watchlist : [];
-          data.watchlistUpdatedAt = Number(trackingBlob.watchlistUpdatedAt) || 0;
+          // Newest copy, not just this record's -- see readAccountWatchlist.
+          const wl = await readAccountWatchlist(env, auth.username, trackingBlob);
+          data.watchlist = wl ? wl.items : [];
+          data.watchlistUpdatedAt = wl ? wl.updatedAt : 0;
           // Airing Next and the Discover recommendations were stored by
           // save-tracking but never handed back here, so loadCreatorSync's
           // own restore branches for them (22_client-creator-profile.js)
@@ -86823,10 +87420,22 @@ export default {
       "sweepNewOnStreaming",
       episodeSweep.then(() => sweepNewOnStreaming(env, ctx, newOnStreamingBudget))
     );
+    // Airing Next for accounts whose website has not rebuilt it lately --
+    // paid for out of the same reserve, as a slice of the same size, so the
+    // two together take half of what checkForNewEpisodes can never reach and
+    // the pre-warm's share is untouched. Behind the episode sweep for the
+    // same reason New on Streaming is; beside it rather than behind it
+    // because the two spend separate slices and neither waits on the other.
+    const airingNextBudget = Math.floor((episodeBudget - episodeCeiling) * CRON_AIRING_NEXT_SHARE);
+    const airingNextSweep = guard(
+      "refreshAiringNextSweep",
+      episodeSweep.then(() => refreshAiringNextSweep(env, ctx, airingNextBudget))
+    );
     ctx.waitUntil(
       Promise.all([
         episodeSweep,
         streamingSweep,
+        airingNextSweep,
         guard("bumpNewOnStreamingEpisodes", streamingSweep.then(() => bumpNewOnStreamingEpisodes(env, ctx, newOnStreamingBudget))),
         guard("prewarmSharedCatalogs", streamingSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
         // One Quick Add network per tick (see prewarmChannelPresets,

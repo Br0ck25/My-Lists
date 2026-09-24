@@ -7862,6 +7862,7 @@ describe("FE-17: the custom-lists stamp cannot silently stop working", () => {
   // entry is a claim someone has to re-justify if this list ever grows.
   const NON_MUTATORS = {
     "02_http-and-creator-utils.js :: getCreatorList": "reads one record",
+    "02_http-and-creator-utils.js :: readAccountWatchlist": "reads the Watchlist's list record to pick its newest copy; writes nothing",
     "26_api-creator-and-admin-routes.js :: /admin/api/creator-lists": "enumerates one creator's records for the admin browse; changes nothing",
     "26_api-creator-and-admin-routes.js :: /api/creator/lists": "self-heals the order key on a read; the same response already carries the healed order",
     "26_api-creator-and-admin-routes.js :: /api/creator/sync/load": "reads the order key",

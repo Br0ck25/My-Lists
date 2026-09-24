@@ -2400,11 +2400,20 @@ function curatedRecsSignature(blob) {
   return ends(m) + '|' + ends(s);
 }
 
+// How often an UNCHANGED list is re-stamped anyway. The Recommended catalog
+// row stops serving this snapshot once it is CURATED_SNAPSHOT_MAX_AGE_MS old
+// (fetchCuratedCatalog, 05_catalog-core.js) and builds its own instead, on
+// the reading that the website has stopped keeping it current. Its stamp has
+// to say when the website last SHOWED it, then, not when it last changed --
+// or someone who opens Discover every day and happens to get the same
+// recommendations would have the row switched away from them.
+const CURATED_RECS_RESTAMP_MS = 12 * 60 * 60 * 1000;
+
 // Called by the Discover tab every time it renders those two cards (see
 // 19_client-search-and-likes.js). Writing unconditionally would bump
 // updatedAt on every visit and make the tracking signature look changed,
 // forcing a pointless full push each time -- so an unchanged list is a
-// no-op.
+// no-op, until its stamp is CURATED_RECS_RESTAMP_MS old.
 function persistCuratedRecommendations(movies, shows) {
   const blob = {
     movies: Array.isArray(movies) ? movies : [],
@@ -2413,7 +2422,8 @@ function persistCuratedRecommendations(movies, shows) {
   };
   if (!blob.movies.length && !blob.shows.length) return;
   const existing = loadCuratedRecommendations();
-  if (existing && curatedRecsSignature(existing) === curatedRecsSignature(blob)) return;
+  if (existing && curatedRecsSignature(existing) === curatedRecsSignature(blob) &&
+      Date.now() - (Number(existing.updatedAt) || 0) < CURATED_RECS_RESTAMP_MS) return;
   try {
     localStorage.setItem(CURATED_RECS_KEY, JSON.stringify(blob));
   } catch (e) {}
@@ -2457,6 +2467,10 @@ function trackingSyncSignature(localMap) {
     listSig((localMap['continue-watching'] || {}).items),
     listSig((localMap['airing-next'] || {}).items),
     curatedRecsSignature(loadCuratedRecommendations()),
+    // Its stamp too, which moves at most every CURATED_RECS_RESTAMP_MS when
+    // the list itself has not: a re-stamp is news the account needs, or the
+    // Recommended row would still judge the snapshot abandoned.
+    Number((loadCuratedRecommendations() || {}).updatedAt) || 0,
     listSig(wl.items),
     watchlistAiringSig(wl.items),
     Number(wl.updatedAt) || 0,

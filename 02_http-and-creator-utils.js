@@ -3207,6 +3207,10 @@ async function purgeCreatorData(env, username, options = {}) {
     // re-registered username's browsers to discard lists it never deleted.
     creatorListTombstoneKey(u),
     `creatorscrobblequeue:${u}`,
+    // Set while this account's D1 tracking rows are behind its KV record --
+    // see trackingD1BehindKey.
+    trackingD1BehindKey(u),
+    airingNextCheckedKey(u),
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
     `creatorshare:${u}`,
@@ -4134,8 +4138,161 @@ async function d1HasAiringRemovalColumns(env) {
   return _d1AiringRemovalColumns;
 }
 
+// The upserts for one account's Airing Next, one row per show (first entry
+// wins, matching the client's own dedupe). Shared by the full tracking write
+// below and by saveAiringNextD1, the cron's narrow one.
+function airingNextD1Statements(env, username, items, fallbackUpdatedAt) {
+  const stmts = [];
+  const anSeen = new Set();
+  for (const item of items) {
+    if (!item) continue;
+    const showId = String(item.showId || item.id || "");
+    if (!showId || anSeen.has(showId)) continue;
+    anSeen.add(showId);
+    const itemId = String(item.id || showId);
+    const name = item.name || null;
+    const poster = item.poster || null;
+    const showTitle = item.showTitle || null;
+    const showPoster = item.showPoster || null;
+    const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
+    const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
+    const airDate = item.airDate || null;
+    const isSeasonPremiere = item.isSeasonPremiere ? 1 : 0;
+    const isSeasonFinale = item.isSeasonFinale ? 1 : 0;
+    const seasonFinaleAirDate = item.seasonFinaleAirDate || null;
+    const seasonFinaleEpisodeNumber = item.seasonFinaleEpisodeNumber != null ? Number(item.seasonFinaleEpisodeNumber) : null;
+    const itemUpdated = Number(item.updatedAt) || fallbackUpdatedAt;
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO airing_next (
+          username, show_id, item_id, name, poster, show_title, show_poster,
+          season_num, episode_num, air_date, is_season_premiere, is_season_finale,
+          season_finale_air_date, season_finale_episode_number, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(username, show_id) DO UPDATE SET
+           item_id = excluded.item_id,
+           name = excluded.name,
+           poster = excluded.poster,
+           show_title = excluded.show_title,
+           show_poster = excluded.show_poster,
+           season_num = excluded.season_num,
+           episode_num = excluded.episode_num,
+           air_date = excluded.air_date,
+           is_season_premiere = excluded.is_season_premiere,
+           is_season_finale = excluded.is_season_finale,
+           season_finale_air_date = excluded.season_finale_air_date,
+           season_finale_episode_number = excluded.season_finale_episode_number,
+           updated_at = excluded.updated_at`
+      ).bind(
+        username, showId, itemId, name, poster, showTitle, showPoster,
+        seasonNum, episodeNum, airDate, isSeasonPremiere, isSeasonFinale,
+        seasonFinaleAirDate, seasonFinaleEpisodeNumber, itemUpdated
+      )
+    );
+  }
+  return { stmts, seen: anSeen };
+}
+
+// Set while an account's D1 tracking rows are known to be behind its KV
+// record: saveCreatorTrackingD1 writes it when a write fails and removes it
+// when one succeeds.
+//
+// The Stremio/Nuvio rows for Watch History, Continue Watching and Airing Next
+// read D1 directly, which is the point -- they are the cheap path, and the KV
+// record they would otherwise parse can run to megabytes. But that meant they
+// had no way to notice D1 was stale: a failed write left the rows as they were
+// and the apps kept serving them, while the website (which reads through
+// readCreatorTrackingD1's stamp check) showed the new state. This key is the
+// one-small-read answer to "can D1 be trusted right now?".
+function trackingD1BehindKey(username) {
+  return `trackingd1behind:${username}`;
+}
+
+// Present, with a TTL of AIRING_NEXT_SERVER_REFRESH_MS, for as long as an
+// account's Airing Next was rebuilt by the cron recently enough not to need it
+// again -- see refreshAiringNextSweep (07_source-fetchers-tmdb-simkl.js). A
+// TTL rather than a stored time so "due" is simply "absent", and nothing ever
+// has to clean the key up.
+function airingNextCheckedKey(username) {
+  return `airingnextchecked:${username}`;
+}
+
+async function isTrackingD1Behind(env, username) {
+  if (!env || !env.CONFIGS || !username) return false;
+  try {
+    return !!(await env.CONFIGS.get(trackingD1BehindKey(username)));
+  } catch {
+    return false;
+  }
+}
+
+async function recordTrackingD1Result(env, username, ok, stamp) {
+  if (!env || !env.CONFIGS) return;
+  try {
+    const key = trackingD1BehindKey(username);
+    if (!ok) {
+      await env.CONFIGS.put(key, String(Number(stamp) || Date.now()));
+    } else if (await env.CONFIGS.get(key)) {
+      // Read first so an ordinary save -- the usual case, with no marker --
+      // costs no KV write.
+      await env.CONFIGS.delete(key);
+    }
+  } catch {
+    // The marker is an optimisation for the catalog rows; the write's own
+    // result is what the caller acts on.
+  }
+}
+
 async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   if (!env || !env.DB || !username || !trackingData) return false;
+  const ok = await writeCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval);
+  await recordTrackingD1Result(env, username, ok, trackingData.updatedAt);
+  return ok;
+}
+
+// Airing Next alone, for the cron that rebuilds it (refreshAiringNextSweep,
+// 07_source-fetchers-tmdb-simkl.js). saveCreatorTrackingD1 rewrites every row
+// the account has -- one statement per Watch History item -- which is fine
+// for a browser's save but not for a cron tick working through many accounts
+// under one invocation's operation cap. This writes the one table that
+// changed, then moves the stamp.
+//
+// Only when D1 was current to begin with: previousStamp is the KV record's
+// updatedAt from BEFORE this rebuild. If D1 was already behind that, stamping
+// it current after writing one table would hide every other table's lag from
+// readCreatorTrackingD1 -- so D1 is left alone, still visibly behind, for the
+// next full write or read-repair to catch up.
+async function saveAiringNextD1(env, username, items, updatedAt, previousStamp) {
+  if (!env || !env.DB || !username || !Array.isArray(items)) return false;
+  let ok = true;
+  try {
+    const metaRow = await env.DB.prepare(
+      "SELECT updated_at FROM creator_tracking_meta WHERE username = ?"
+    ).bind(username).first();
+    // An account with no D1 record reads from KV anyway.
+    if (!metaRow) return true;
+    if ((Number(metaRow.updated_at) || 0) < (Number(previousStamp) || 0)) return true;
+    if (await isTrackingD1Behind(env, username)) return true;
+    const an = airingNextD1Statements(env, username, items, updatedAt);
+    const prunes = await d1ReplaceRowsById(env, "airing_next", username, "show_id", an.seen);
+    const stamp = env.DB.prepare(
+      "UPDATE creator_tracking_meta SET updated_at = ? WHERE username = ?"
+    ).bind(updatedAt, username);
+    // Upserts, then deletions, then the stamp -- writeCreatorTrackingD1's
+    // ordering, for its reasons.
+    const ordered = an.stmts.concat(prunes, [stamp]);
+    for (let i = 0; i < ordered.length; i += 80) {
+      await env.DB.batch(ordered.slice(i, i + 80));
+    }
+  } catch (err) {
+    console.error("D1 write error (saveAiringNextD1):", err);
+    ok = false;
+  }
+  await recordTrackingD1Result(env, username, ok, updatedAt);
+  return ok;
+}
+
+async function writeCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   try {
     const meta = {
       trackPlayback: trackingData.trackPlayback ? 1 : 0,
@@ -4150,8 +4307,11 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
 
     const stmts = [];
 
-    // 1. Meta
-    stmts.push(
+    // 1. Meta -- built here, written LAST (see the ordering note at the end).
+    // Its updated_at is the stamp readCreatorTrackingD1 compares against the
+    // KV copy to decide which one is current, so it may only advance once
+    // every row it vouches for has landed.
+    const metaStmt = (
       env.DB.prepare(
         `INSERT INTO creator_tracking_meta (
           username, track_playback, remove_watched_watchlist, scrobble_filter_users,
@@ -4305,54 +4465,9 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
     // 4. Airing Next: replace whole set
     if (Array.isArray(trackingData.airingNext)) {
       // Same key, same reasoning as Continue Watching above.
-      const anSeen = new Set();
-      for (const item of trackingData.airingNext) {
-        if (!item) continue;
-        const showId = String(item.showId || item.id || "");
-        if (!showId || anSeen.has(showId)) continue;
-        anSeen.add(showId);
-        const itemId = String(item.id || showId);
-        const name = item.name || null;
-        const poster = item.poster || null;
-        const showTitle = item.showTitle || null;
-        const showPoster = item.showPoster || null;
-        const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
-        const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
-        const airDate = item.airDate || null;
-        const isSeasonPremiere = item.isSeasonPremiere ? 1 : 0;
-        const isSeasonFinale = item.isSeasonFinale ? 1 : 0;
-        const seasonFinaleAirDate = item.seasonFinaleAirDate || null;
-        const seasonFinaleEpisodeNumber = item.seasonFinaleEpisodeNumber != null ? Number(item.seasonFinaleEpisodeNumber) : null;
-        const itemUpdated = Number(item.updatedAt) || meta.updatedAt;
-        stmts.push(
-          env.DB.prepare(
-            `INSERT INTO airing_next (
-              username, show_id, item_id, name, poster, show_title, show_poster,
-              season_num, episode_num, air_date, is_season_premiere, is_season_finale,
-              season_finale_air_date, season_finale_episode_number, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(username, show_id) DO UPDATE SET
-               item_id = excluded.item_id,
-               name = excluded.name,
-               poster = excluded.poster,
-               show_title = excluded.show_title,
-               show_poster = excluded.show_poster,
-               season_num = excluded.season_num,
-               episode_num = excluded.episode_num,
-               air_date = excluded.air_date,
-               is_season_premiere = excluded.is_season_premiere,
-               is_season_finale = excluded.is_season_finale,
-               season_finale_air_date = excluded.season_finale_air_date,
-               season_finale_episode_number = excluded.season_finale_episode_number,
-               updated_at = excluded.updated_at`
-          ).bind(
-            username, showId, itemId, name, poster, showTitle, showPoster,
-            seasonNum, episodeNum, airDate, isSeasonPremiere, isSeasonFinale,
-            seasonFinaleAirDate, seasonFinaleEpisodeNumber, itemUpdated
-          )
-        );
-      }
-      prunes.push(...await d1ReplaceRowsById(env, "airing_next", username, "show_id", anSeen));
+      const an = airingNextD1Statements(env, username, trackingData.airingNext, meta.updatedAt);
+      stmts.push(...an.stmts);
+      prunes.push(...await d1ReplaceRowsById(env, "airing_next", username, "show_id", an.seen));
     }
 
     // 5. Watch History
@@ -4406,7 +4521,8 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       }
     }
 
-    // Upserts first, deletions last, in that order across the whole write.
+    // Upserts first, deletions next, the meta stamp last, in that order across
+    // the whole write.
     //
     // The statements are chunked because one account can be thousands of them
     // and a D1 batch is one transaction with a real size bound -- so the write
@@ -4414,8 +4530,17 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
     // ordering: nothing is removed until everything that replaces it has
     // already landed. A chunk that fails partway leaves stale extras, which the
     // next push corrects; it can no longer leave a hole.
+    //
+    // And the stamp goes last so that a write which dies partway -- one of the
+    // later chunks, or the per-request operation cap on an account with a long
+    // Watch History -- leaves D1 visibly BEHIND the KV copy rather than
+    // claiming to be current. It used to go first: a write that got no further
+    // than its first chunk still advanced updated_at, so D1 read as up to date
+    // while holding the old rows, and nothing ever served KV or repaired it.
+    // Continue Watching and Airing Next removals (the prunes) were the first
+    // casualties, being the last statements of all.
     const CHUNK_SIZE = 80;
-    const ordered = stmts.concat(prunes);
+    const ordered = stmts.concat(prunes, [metaStmt]);
     for (let i = 0; i < ordered.length; i += CHUNK_SIZE) {
       const chunk = ordered.slice(i, i + CHUNK_SIZE);
       await env.DB.batch(chunk);
@@ -4425,6 +4550,75 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
     console.error("D1 write error (saveCreatorTrackingD1):", err);
     return false;
   }
+}
+
+// The account's Watchlist, from whichever of its three copies is newest.
+//
+// The Watchlist is written in three places by /api/creator/sync/save-tracking
+// -- the tracking record's `watchlist` field, and the list record
+// creatorlist:{user}:watchlist in both KV and D1 -- and only the list record
+// is never rebuilt by anything else. The tracking record's copy used to be
+// the one everything READ (the Stremio/Nuvio Watchlist row, and the Watchlist
+// /api/creator/sync/load hands the browser), and it was the fragile one:
+// readCreatorTrackingD1 below did not return a watchlist at all, and the two
+// playback scrobbles read through it and wrote the record back -- so one
+// play in Stremio or Plex left the tracking record with an empty Watchlist
+// or none. The row then showed nothing until the website next pushed.
+//
+// So: every copy is a candidate, the newest stamp wins, and on a tie the list
+// record wins, being the copy nothing but a save writes. A tracking record
+// that was emptied that way carries no watchlistUpdatedAt (the scrobbles never
+// set one), so it loses to any list record that has ever been saved.
+//
+// Read-only on purpose: getCreatorList repairs as it reads, which costs a KV
+// write per call -- not something a catalog request should spend.
+async function readAccountWatchlist(env, username, trackingBlob) {
+  if (!env || !username) return null;
+  const [row, kvRaw] = await Promise.all([
+    env.DB
+      ? env.DB.prepare("SELECT items_json, updated_at FROM creator_lists WHERE id = ?")
+          .bind(`${username}:watchlist`).first().catch(() => null)
+      : Promise.resolve(null),
+    env.CONFIGS
+      ? env.CONFIGS.get(`creatorlist:${username}:watchlist`).catch(() => null)
+      : Promise.resolve(null),
+  ]);
+  const candidates = [];
+  if (kvRaw) {
+    try {
+      const l = JSON.parse(kvRaw);
+      if (l && Array.isArray(l.items)) candidates.push({ items: l.items, updatedAt: Number(l.updatedAt) || 0 });
+    } catch {}
+  }
+  if (row) {
+    try {
+      const items = JSON.parse(row.items_json || "[]");
+      if (Array.isArray(items)) candidates.push({ items, updatedAt: Number(row.updated_at) || 0 });
+    } catch {}
+  }
+  if (trackingBlob && Array.isArray(trackingBlob.watchlist)) {
+    candidates.push({ items: trackingBlob.watchlist, updatedAt: Number(trackingBlob.watchlistUpdatedAt) || 0 });
+  }
+  let best = null;
+  for (const c of candidates) if (!best || c.updatedAt > best.updatedAt) best = c;
+  return best;
+}
+
+// Makes sure a tracking record about to be written back carries the
+// account's Watchlist. A record straight from save-tracking already does
+// (with its stamp), so this costs nothing there; one read through
+// readCreatorTrackingD1 before it returned a watchlist, or emptied by a
+// scrobble that did, gets the newest copy put back instead of written out
+// empty.
+async function ensureTrackingWatchlist(env, username, blob) {
+  if (!blob || typeof blob !== "object") return blob;
+  if (Array.isArray(blob.watchlist) && Number(blob.watchlistUpdatedAt) > 0) return blob;
+  const wl = await readAccountWatchlist(env, username, blob);
+  if (wl) {
+    blob.watchlist = wl.items;
+    blob.watchlistUpdatedAt = wl.updatedAt;
+  }
+  return blob;
 }
 
 // D1 is authoritative for this record -- /api/creator/sync/load and every
@@ -4453,11 +4647,15 @@ async function readCreatorTrackingD1(env, username) {
     // A KV copy stamped later than D1's means a push landed in KV and not here.
     // Returning null hands the caller back to its own KV branch, which is the
     // copy that actually holds the user's data.
+    //
+    // The KV copy is also where the Watchlist lives -- D1's tracking tables
+    // have no column for it -- so it is kept for the return value below.
+    let kvBlob = null;
     if (env.CONFIGS) {
       try {
         const kvRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
         if (kvRaw) {
-          const kvBlob = JSON.parse(kvRaw);
+          kvBlob = JSON.parse(kvRaw);
           const kvStamp = Number(kvBlob && kvBlob.updatedAt) || 0;
           const d1Stamp = Number(metaRow.updated_at) || 0;
           if (kvStamp > d1Stamp) {
@@ -4597,10 +4795,17 @@ async function readCreatorTrackingD1(env, username) {
       try { curatedRecs = JSON.parse(metaRow.curated_recommendations); } catch {}
     }
 
+    // Every writer that reads through here writes the whole record back, so a
+    // record without its Watchlist is a Watchlist deleted. See
+    // readAccountWatchlist for which copy this is.
+    const watchlist = await readAccountWatchlist(env, username, kvBlob);
+
     return {
       watchHistory,
       continueWatching,
       airingNext,
+      watchlist: watchlist ? watchlist.items : [],
+      watchlistUpdatedAt: watchlist ? watchlist.updatedAt : 0,
       fullyWatchedShowIds,
       dismissedContinueWatching,
       removedAiringNext,

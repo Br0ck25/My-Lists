@@ -1128,10 +1128,42 @@ function createSortableList(container, options = {}) {
     }
   }
 
+  // The rows a dragged row is placed among: its SIBLINGS, not every matching
+  // descendant. This used to be a querySelectorAll over the whole subtree,
+  // which on Live Preview walks every poster of every shelf -- thousands of
+  // nodes -- on every dragover and every auto-scroll frame.
+  function siblingItems(parent) {
+    const out = [];
+    const kids = parent.children;
+    for (let i = 0; i < kids.length; i++) {
+      const child = kids[i];
+      if (child === activeItem || child.classList.contains(dragClass) || !child.matches(itemSelector)) continue;
+      out.push(child);
+    }
+    return out;
+  }
+
+  function nextItemSibling(el) {
+    let n = el.nextElementSibling;
+    while (n && !n.matches(itemSelector)) n = n.nextElementSibling;
+    return n;
+  }
+
+  // Moves the row only when its place actually changes.
+  //
+  // It used to re-insert the row on every call whether or not it had moved --
+  // several times a second from dragover, and every frame from auto-scroll.
+  // A re-insert is a real DOM mutation even when the row lands where it was:
+  // it throws away the page's layout, so the getBoundingClientRect reads on
+  // the next call re-laid-out the entire page, and it hands the moved row to
+  // the page-wide MutationObserver that badges posters (initWatchHistory),
+  // which re-badged every poster in it. On a Live Preview with poster
+  // shelves that was the whole frame budget and more, on every frame --
+  // what "the page freezes when I drag" was on a phone.
   function moveItem(y, x) {
     if (!activeItem) return;
     const targetParent = activeItem.parentNode || container;
-    const items = [...targetParent.querySelectorAll(itemSelector + ':not(.' + dragClass + ')')];
+    const items = siblingItems(targetParent);
     if (axis === 'xy' && typeof x === 'number') {
       let targetCard = null;
       for (const child of items) {
@@ -1141,29 +1173,36 @@ function createSortableList(container, options = {}) {
           break;
         }
       }
-      if (targetCard && targetCard !== activeItem) {
+      if (targetCard) {
         const box = targetCard.getBoundingClientRect();
         const isAfter = (y > box.top + box.height / 2) || (y >= box.top && x > box.left + box.width / 2);
         if (isAfter) {
-          targetParent.insertBefore(activeItem, targetCard.nextSibling);
-        } else {
+          if (targetCard.nextElementSibling !== activeItem) targetParent.insertBefore(activeItem, targetCard.nextSibling);
+        } else if (activeItem.nextElementSibling !== targetCard) {
           targetParent.insertBefore(activeItem, targetCard);
         }
         return;
       }
     }
-    const afterEl = items.reduce((closest, child) => {
+    let afterEl = null;
+    let closest = -Infinity;
+    for (const child of items) {
       const box = child.getBoundingClientRect();
       const offset = y - box.top - box.height / 2;
-      if (offset < 0 && offset > closest.offset) {
-        return { offset: offset, element: child };
+      if (offset < 0 && offset > closest) {
+        closest = offset;
+        afterEl = child;
       }
-      return closest;
-    }, { offset: -Infinity, element: null }).element;
+    }
 
     if (afterEl == null) {
-      targetParent.appendChild(activeItem);
-    } else if (afterEl !== activeItem) {
+      // Belongs after every other row -- already there if the last one comes
+      // before it.
+      const last = items[items.length - 1];
+      if (last && !(last.compareDocumentPosition(activeItem) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+        targetParent.appendChild(activeItem);
+      }
+    } else if (nextItemSibling(activeItem) !== afterEl) {
       targetParent.insertBefore(activeItem, afterEl);
     }
   }
@@ -1175,18 +1214,29 @@ function createSortableList(container, options = {}) {
   // progress, so on any list taller than the window -- which is most of them
   // once Live Preview shelves carry posters and each row is ~200px -- dragging
   // past the last visible row did nothing at all: the row stopped at the edge
-  // and sat there. That is what "the drag freezes and won't move the list"
-  // was. It applied to every list this function drives, on desktop and touch
-  // alike.
+  // and sat there. It applied to every list this function drives, on desktop
+  // and touch alike.
   const AUTO_SCROLL_EDGE = 90;   // distance from an edge where scrolling starts
   const AUTO_SCROLL_MAX = 20;    // px per frame at the very edge
+  // A native (HTML5) drag fires dragover continuously -- the spec says at
+  // least every 350ms, even with the pointer held still -- for as long as it
+  // lasts. Silence well past that means it ended without dragend reaching
+  // this list.
+  const HTML5_DRAG_SILENCE_MS = 1500;
   let autoScrollRaf = null;
   let lastClientX = 0;
   let lastClientY = 0;
+  let scrollHost = null;
+  let anchorEl = null;
+  let anchorPrev = '';
+  let html5Drag = false;
+  let lastDragEventAt = 0;
 
   // The page itself scrolls for the catalog and My Lists surfaces, but this
   // same function also drives lists inside scrollable panels, so scroll
-  // whichever actually can.
+  // whichever actually can. Resolved once when a drag starts: it walks every
+  // ancestor through getComputedStyle, and doing that every frame forced a
+  // style recalculation of the whole page sixty times a second.
   function scrollHostFor(el) {
     let n = el && el.parentElement;
     while (n && n !== document.body && n !== document.documentElement) {
@@ -1197,12 +1247,46 @@ function createSortableList(container, options = {}) {
     return null;
   }
 
+  // Called when a drag starts, by either path.
+  function beginDragSession() {
+    scrollHost = scrollHostFor(activeItem);
+    // Scroll anchoring off for the drag. Moving a tall row from above the
+    // fold to below it (which is what every step of a downward drag does)
+    // makes the browser shift the scroll position to keep what is on screen
+    // still -- underneath a drag that is itself scrolling and re-placing the
+    // row from the pointer's position, so the two fight each other.
+    anchorEl = scrollHost || document.scrollingElement || document.documentElement;
+    anchorPrev = anchorEl.style.overflowAnchor;
+    anchorEl.style.overflowAnchor = 'none';
+  }
+
+  function endDragSession() {
+    stopAutoScroll();
+    if (anchorEl) anchorEl.style.overflowAnchor = anchorPrev;
+    anchorEl = null;
+    scrollHost = null;
+    html5Drag = false;
+  }
+
+  function scrollPos() {
+    return scrollHost ? scrollHost.scrollTop : (window.scrollY || window.pageYOffset || 0);
+  }
+
   function autoScrollStep() {
     autoScrollRaf = null;
     if (!activeItem) return;
-    const host = scrollHostFor(activeItem);
-    const top = host ? host.getBoundingClientRect().top : 0;
-    const bottom = host ? host.getBoundingClientRect().bottom : (window.innerHeight || document.documentElement.clientHeight);
+    // A drag can end without this list hearing about it: the row is no
+    // longer on the page (the list was re-rendered under it -- dragend then
+    // fires on a detached node and never bubbles here), or a native drag has
+    // gone silent. Left running, this loop kept scrolling the page and
+    // re-attaching the stale row every frame, indefinitely.
+    if (!activeItem.isConnected || (html5Drag && Date.now() - lastDragEventAt > HTML5_DRAG_SILENCE_MS)) {
+      finishHtml5OrPointerDrag();
+      return;
+    }
+    const hostBox = scrollHost ? scrollHost.getBoundingClientRect() : null;
+    const top = hostBox ? hostBox.top : 0;
+    const bottom = hostBox ? hostBox.bottom : (window.innerHeight || document.documentElement.clientHeight);
     let delta = 0;
     if (lastClientY < top + AUTO_SCROLL_EDGE) {
       delta = -Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (top + AUTO_SCROLL_EDGE - lastClientY) / AUTO_SCROLL_EDGE));
@@ -1210,11 +1294,14 @@ function createSortableList(container, options = {}) {
       delta = Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (lastClientY - (bottom - AUTO_SCROLL_EDGE)) / AUTO_SCROLL_EDGE));
     }
     if (delta) {
-      if (host) host.scrollTop += delta;
+      const before = scrollPos();
+      if (scrollHost) scrollHost.scrollTop += delta;
       else window.scrollBy(0, delta);
       // Re-place the row against the rows that just came into view, or the
-      // page would scroll underneath a row that never moves.
-      moveItem(lastClientY, lastClientX);
+      // page would scroll underneath a row that never moves -- but only if
+      // it did scroll: at the top or bottom of the page there is nothing new
+      // to place it against.
+      if (scrollPos() !== before) moveItem(lastClientY, lastClientX);
     }
     queueAutoScroll();
   }
@@ -1235,6 +1322,7 @@ function createSortableList(container, options = {}) {
     activeItem = item;
     activeItem.classList.add(dragClass);
     document.body.style.userSelect = 'none';
+    beginDragSession();
     if (typeof navigator !== 'undefined' && navigator.vibrate) {
       try { navigator.vibrate(30); } catch (err) {}
     }
@@ -1242,7 +1330,7 @@ function createSortableList(container, options = {}) {
 
   function stopDragging() {
     cancelHold();
-    stopAutoScroll();
+    endDragSession();
     if (isDragging && activeItem) {
       activeItem.classList.remove(dragClass);
       onReorder();
@@ -1250,6 +1338,19 @@ function createSortableList(container, options = {}) {
     isDragging = false;
     activeItem = null;
     document.body.style.userSelect = '';
+  }
+
+  // Ends whichever kind of drag is in progress -- the path the watchdog in
+  // autoScrollStep takes when the drag's own end event never arrived.
+  function finishHtml5OrPointerDrag() {
+    if (html5Drag) {
+      endDragSession();
+      if (activeItem) activeItem.classList.remove(dragClass);
+      activeItem = null;
+      onReorder();
+    } else {
+      stopDragging();
+    }
   }
 
   // HTML5 Drag events for desktop when handle exists
@@ -1262,6 +1363,9 @@ function createSortableList(container, options = {}) {
       activeItem = handle.closest(itemSelector);
       if (!activeItem) return;
       activeItem.classList.add(dragClass);
+      html5Drag = true;
+      lastDragEventAt = Date.now();
+      beginDragSession();
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = 'move';
         try { e.dataTransfer.setData('text/plain', activeItem.dataset && activeItem.dataset.slug ? activeItem.dataset.slug : ''); } catch (err) {}
@@ -1271,21 +1375,28 @@ function createSortableList(container, options = {}) {
     container.addEventListener('dragover', (e) => {
       if (!activeItem) return;
       e.preventDefault();
-      lastClientX = e.clientX;
-      lastClientY = e.clientY;
       moveItem(e.clientY, e.clientX);
-      // dragover stops firing once the pointer is held still at the edge, so
-      // the scrolling has to be driven by its own frame loop rather than by
-      // the event.
+      // dragover arrives in uneven bursts, and only every few hundred
+      // milliseconds once the pointer is held still -- which is exactly when
+      // an edge scroll has to keep going smoothly -- so the scrolling runs on
+      // its own frame loop rather than on the event.
       queueAutoScroll();
     });
 
+    // Where the pointer is, and that the drag is still alive, wherever on the
+    // page it has wandered: near the top edge it is usually over the header,
+    // not this list, and the auto-scroll (and the silence watchdog above)
+    // must keep hearing about it there.
+    document.addEventListener('dragover', (e) => {
+      if (!activeItem || !html5Drag) return;
+      lastDragEventAt = Date.now();
+      lastClientX = e.clientX;
+      lastClientY = e.clientY;
+    }, true);
+
     container.addEventListener('dragend', () => {
-      stopAutoScroll();
-      if (!activeItem) return;
-      activeItem.classList.remove(dragClass);
-      activeItem = null;
-      onReorder();
+      if (!activeItem) { endDragSession(); return; }
+      finishHtml5OrPointerDrag();
     });
   }
 
