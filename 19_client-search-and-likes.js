@@ -388,6 +388,8 @@ async function drainBetterPosterWarm() {
         // Rate-limited: stop for now. Whatever is left loads on its own as
         // it is scrolled to.
         if (res.status === 429) { _betterPosterWarmQueue = []; break; }
+        const data = await res.json().catch(() => null);
+        if (data && Array.isArray(data.ready)) betterPostersReady(data.ready);
       } catch (e) {
         break;
       }
@@ -395,6 +397,63 @@ async function drainBetterPosterWarm() {
   } finally {
     _betterPosterWarmBusy = false;
   }
+}
+
+// --- Tiles waiting on their Better Poster ----------------------------------
+//
+// A poster btttr.cc has not drawn cannot be had quickly -- the Worker gives it
+// a few seconds and then answers 503 (serveBetterPoster, 05_catalog-core.js).
+// handlePosterImgError (23) shows the title's ordinary poster in the meantime
+// and parks the tile here, and the page's /api/bp/warm call, which keeps
+// trying for most of a minute, reports the ones it got. Each tile waiting on
+// one of those is switched over -- after the image has loaded, so the swap is
+// a single clean change and never a flash of an empty tile.
+var _betterPosterWaiting = new Map();
+var _betterPosterReadyUrls = new Set();
+
+function waitForBetterPoster(img, url) {
+  if (!img || !url) return;
+  if (_betterPosterReadyUrls.has(url)) { swapInBetterPoster(url, [img]); return; }
+  const list = _betterPosterWaiting.get(url) || [];
+  list.push(img);
+  _betterPosterWaiting.set(url, list);
+}
+
+function betterPostersReady(paths) {
+  for (let i = 0; i < paths.length; i++) {
+    const p = String(paths[i] || '');
+    const url = p.indexOf('/') === 0 ? ORIGIN + p : p;
+    _betterPosterReadyUrls.add(url);
+    const waiting = _betterPosterWaiting.get(url);
+    if (!waiting) continue;
+    _betterPosterWaiting.delete(url);
+    swapInBetterPoster(url, waiting);
+  }
+}
+
+function swapInBetterPoster(url, imgs) {
+  if (typeof Image !== 'function') return;
+  const probe = new Image();
+  probe.onload = function() {
+    for (let i = 0; i < imgs.length; i++) {
+      const img = imgs[i];
+      // Re-rendered, or pointed somewhere else since: not this tile any more.
+      if (!img.isConnected || !img.dataset.posterStandIn || img.getAttribute('src') !== img.dataset.posterStandIn) continue;
+      img.src = url;
+    }
+  };
+  probe.src = url;
+}
+
+// The IMDb id in a Better Poster URL -- ours (/bp/<style>/tt123.jpg) or
+// btttr.cc's (.../poster-default/tt123.jpg). String scanning, not a regex,
+// for the reason given at the top of this section.
+function betterPosterImdbFromUrl(url) {
+  if (!isBetterPosterUrl(url)) return '';
+  const path = url.split('?')[0];
+  const file = path.slice(path.lastIndexOf('/') + 1);
+  if (file.slice(-4) !== '.jpg') return '';
+  return betterPostersWebImdbId({ id: file.slice(0, -4) });
 }
 
 function warmBetterPostersIn(root) {

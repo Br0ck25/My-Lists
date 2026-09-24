@@ -247,10 +247,10 @@ async function handleFetch(request, env, ctx) {
     if (path.startsWith("/bp/") && (request.method === "GET" || request.method === "HEAD")) {
       const bp = parseBetterPosterPath(path, url.searchParams);
       if (!bp) return new Response(null, { status: 404 });
-      return await serveBetterPoster(env, ctx, bp, url.origin);
+      return await serveBetterPoster(env, ctx, bp, url.origin, request);
     }
 
-    // /api/bp/warm  (POST)  { urls: ["/bp/...", ...] } -> { ok, stored, fetched }
+    // /api/bp/warm  (POST)  { urls: ["/bp/...", ...] } -> { ok, stored, fetched, ready: [...] }
     //
     // Fetches, from btttr.cc, any of these posters this Worker does not hold
     // yet -- so the wait for a poster btttr.cc has never drawn happens before
@@ -258,9 +258,15 @@ async function handleFetch(request, env, ctx) {
     // website sends every BetterPosters image on a page as soon as it is
     // rendered, including the lazy ones far below the fold.
     //
+    // `ready` lists which of the urls, exactly as sent, this Worker now holds:
+    // a tile that has been showing the title's ordinary poster while its
+    // Better one was fetched is switched over when it appears there.
+    //
     // The request stays open until the fetches finish rather than running
     // them after the response: a draw can take most of a minute, and work
-    // left to waitUntil is cut off 30 seconds after the response is sent.
+    // left to waitUntil is cut off 30 seconds after the response is sent. A
+    // poster btttr.cc failed to supply in the last few minutes is not asked
+    // for again here -- the cron retries those.
     if (path === "/api/bp/warm" && request.method === "POST") {
       let body;
       try {
@@ -277,26 +283,28 @@ async function handleFetch(request, env, ctx) {
         try { u = new URL(String(raw || ""), url.origin); } catch { continue; }
         if (u.origin !== url.origin) continue;
         const bp = parseBetterPosterPath(u.pathname, u.searchParams);
-        if (bp && !seen.has(bp.kvKey)) { seen.add(bp.kvKey); wanted.push(bp); }
+        if (bp && !seen.has(bp.kvKey)) { seen.add(bp.kvKey); wanted.push({ bp, sent: String(raw) }); }
       }
-      if (!wanted.length) return json({ ok: true, stored: 0, fetched: 0 }, 200, { "Cache-Control": "no-store" });
+      if (!wanted.length) return json({ ok: true, stored: 0, fetched: 0, ready: [] }, 200, { "Cache-Control": "no-store" });
       if (await consumeRateLimit(env, ctx, "bpwarm", warmIp, BETTER_POSTER_WARM_IDS_PER_MINUTE, 60, wanted.length)) {
         return json({ ok: false, error: "Too many requests just now." }, 429, { "Cache-Control": "no-store" });
       }
       let stored = 0;
       let fetched = 0;
+      const ready = [];
       let cursor = 0;
       // A few at a time: btttr.cc's origin is the thing being slow, and
       // piling onto it would make every draw slower, ours included.
       await Promise.all(Array.from({ length: Math.min(4, wanted.length) }, async () => {
         while (cursor < wanted.length) {
-          const bp = wanted[cursor++];
-          const have = await readStoredBetterPoster(env, ctx, bp);
-          if (have) { stored++; continue; }
-          if (await fetchBetterPosterUpstream(env, bp)) fetched++;
+          const { bp, sent } = wanted[cursor++];
+          if (await readStoredBetterPoster(env, ctx, bp)) { stored++; ready.push(sent); continue; }
+          if (await betterPosterRecentlyMissed(url.origin, bp)) continue;
+          if (await fetchBetterPosterForPage(env, ctx, bp, url.origin, BETTER_POSTER_UPSTREAM_TIMEOUT_MS)) { fetched++; ready.push(sent); }
         }
       }));
-      return json({ ok: true, stored, fetched }, 200, { "Cache-Control": "no-store" });
+      await flushBetterPosterRetries(env, true);
+      return json({ ok: true, stored, fetched, ready }, 200, { "Cache-Control": "no-store" });
     }
 
     if (path === "/api/poster-badge") {
@@ -344,7 +352,9 @@ async function handleFetch(request, env, ctx) {
         let contentType = "";
         let buffer = null;
         if (ownBetterPoster) {
-          const found = await getBetterPoster(env, ctx, ownBetterPoster, url.origin);
+          // Waits no longer than a tile would; without it, the redirect below
+          // hands the app the same URL, which answers with a stand-in.
+          const found = await getBetterPoster(env, ctx, ownBetterPoster, url.origin, { waitMs: BETTER_POSTER_PAGE_WAIT_MS });
           if (found) {
             contentType = found.contentType;
             buffer = found.bytes;

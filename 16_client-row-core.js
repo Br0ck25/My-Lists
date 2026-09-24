@@ -1447,10 +1447,12 @@ function resolveMissingPostersInDom(rootEl) {
   container.querySelectorAll('.live-preview-poster-placeholder[data-needs-fallback="1"]').forEach(ph => {
     if (ph.dataset.fallbackRequested) return;
     ph.dataset.fallbackRequested = '1';
-    const card = ph.closest('.live-preview-poster-card') || ph.closest('.list-card') || ph.closest('[data-title]');
-    const title = (card && card.dataset.title) || (card && card.dataset.name) || '';
-    const type = (card && card.dataset.type) || (card && card.dataset.listType) || 'movie';
-    const id = (card && card.dataset.id) || '';
+    // The tile's own title, never its list card's -- see posterItemIdentity
+    // (23_client-list-management.js).
+    const who = posterItemIdentity(ph);
+    const title = who.title;
+    const type = who.type || 'movie';
+    const id = who.id;
     if (!title && !id) return;
     const tmdbId = id.startsWith('tmdb:') ? id.slice(5) : '';
     const imdbId = id.startsWith('tt') ? id : '';

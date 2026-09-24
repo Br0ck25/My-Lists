@@ -1281,24 +1281,63 @@ function showPosterPlaceholderFor(img) {
   ph.style.display = 'flex';
 }
 
+// The title a poster belongs to: { id, title, type }.
+//
+// Read from the img itself, then from the nearest elements above it that
+// describe one title -- stopping at a list card. It used to take the first of
+// .live-preview-poster-card, .list-card or [data-title], and the mini tiles
+// on Discover, My Lists and creator profiles sit inside a .list-card, whose
+// data-name is the LIST's name. So a failed poster in the "Hulu" card was
+// looked up as a show called "Hulu" (Paradise), in "Prime Video Top 10" as
+// one called that (Video & Arcade Top 10), and so on: the right tile, the
+// wrong title's poster. Anything carrying data-url is a list too (the curated
+// cards' tile wrapper holds the list's title in data-title), so it is skipped.
+function posterItemIdentity(el) {
+  const who = { id: '', title: '', type: '' };
+  let node = el;
+  for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+    const cl = node.classList;
+    if (depth > 0 && cl && (cl.contains('list-card') || cl.contains('list-card-posters') || cl.contains('entry'))) break;
+    const d = node.dataset || {};
+    if (d.url || d.listType) continue;
+    const id = d.id || d.imdb || d.imdbId || '';
+    if (!who.id && id) who.id = id;
+    if (!who.title && d.title) who.title = d.title;
+    if (!who.type && d.type && (id || d.title)) who.type = d.type;
+    if (who.id && who.title) break;
+  }
+  return who;
+}
+
 function handlePosterImgError(img) {
   if (!img) return;
+  // A Better Poster swapped in over its stand-in (swapInBetterPoster, 19)
+  // that failed after all: back to the stand-in.
+  const standIn = img.dataset.posterStandIn;
+  if (standIn && img.getAttribute('src') !== standIn) {
+    img.src = standIn;
+    return;
+  }
   if (img.dataset.hasFailedFallback) {
     showPosterPlaceholderFor(img);
     return;
   }
   img.dataset.hasFailedFallback = '1';
 
-  const card = img.closest('.live-preview-poster-card') || img.closest('.list-card') || img.closest('[data-title]');
-  let title = (card && (card.dataset.title || card.dataset.name)) || '';
-  const type = (card && (card.dataset.type || card.dataset.listType)) || 'movie';
-  const id = (card && (card.dataset.id || card.dataset.imdbId)) || '';
+  const failedSrc = img.getAttribute('src') || '';
+  const who = posterItemIdentity(img);
+  const title = who.title;
+  const type = who.type || 'movie';
+  const id = who.id;
+  // A Better Poster names its title in its own URL, which is as certain as
+  // an id gets -- and the one thing to go on for a tile carrying none.
+  const betterPosterId = typeof betterPosterImdbFromUrl === 'function' ? betterPosterImdbFromUrl(failedSrc) : '';
 
   // Clean episode indicators from show title for fallback lookup, e.g. "Ted Lasso S03E01" -> "Ted Lasso"
   const cleanTitle = title.replace(/\s+S\d+E\d+.*$/i, '').trim();
 
-  const tmdbId = id.startsWith('tmdb:') ? id.slice(5).split(':')[0] : (/^\d+/.test(id) ? id.split(':')[0] : '');
-  const imdbId = id.startsWith('tt') ? id.split(':')[0] : '';
+  const tmdbId = betterPosterId ? '' : (id.startsWith('tmdb:') ? id.slice(5).split(':')[0] : (/^\d+/.test(id) ? id.split(':')[0] : ''));
+  const imdbId = betterPosterId || (id.startsWith('tt') ? id.split(':')[0] : '');
 
   if (cleanTitle || tmdbId || imdbId) {
     fetch(ORIGIN + '/api/poster-fallback?title=' + encodeURIComponent(cleanTitle || title) + '&type=' + encodeURIComponent(type) + (tmdbId ? '&tmdbId=' + encodeURIComponent(tmdbId) : '') + (imdbId ? '&imdbId=' + encodeURIComponent(imdbId) : ''))
@@ -1307,6 +1346,12 @@ function handlePosterImgError(img) {
         if (data && data.ok && data.poster) {
           img.src = data.poster;
           img.style.display = '';
+          // The ordinary poster stands in for the Better one, which is
+          // switched in if the page's warm call gets it.
+          if (betterPosterId && typeof waitForBetterPoster === 'function') {
+            img.dataset.posterStandIn = data.poster;
+            waitForBetterPoster(img, failedSrc);
+          }
         } else {
           showPosterPlaceholderFor(img);
         }
@@ -1317,6 +1362,19 @@ function handlePosterImgError(img) {
   } else {
     showPosterPlaceholderFor(img);
   }
+}
+
+// A Better Poster that fails on a tile with no onerror of its own -- the
+// Custom List Builder's and Channel Builder's picks, the Curated For You
+// cards -- gets the same treatment rather than a broken-image icon. Captured,
+// because error events do not bubble.
+if (typeof document !== 'undefined' && document && typeof document.addEventListener === 'function') {
+  document.addEventListener('error', function(e) {
+    const img = e && e.target;
+    if (!img || img.tagName !== 'IMG' || typeof img.onerror === 'function') return;
+    if (typeof isBetterPosterUrl !== 'function' || !isBetterPosterUrl(img.getAttribute('src') || '')) return;
+    handlePosterImgError(img);
+  }, true);
 }
 
 // --- Poster-render caches ----------------------------------------------------

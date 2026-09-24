@@ -5075,7 +5075,15 @@ async function checkForNewEpisodes(env, fetchBudget) {
 // Titles on the shared charts -- the Discover tab, Quick Add, the My Lists
 // Addon Charts -- are the ones most people see first, and new ones arrive
 // every day, so the cron fetches their artwork before anyone looks: every
-// title x every style in use, a slice per tick.
+// title x every style in use, a slice per tick, re-fetching any copy more than
+// a day old on the way past.
+//
+// Before any of that, it retries the posters a page asked for and btttr.cc
+// failed to supply (queueBetterPosterRetry, 05). Those are titles someone has
+// actually looked at, so they come first. A random few each tick, so a long
+// btttr.cc outage cycles through all of them without the list having to
+// record who was tried when -- which would be a KV write every tick; this
+// writes only when one is fetched.
 const SHARED_POSTER_IDS_KEY = "bp:sharedids:v1";
 const SHARED_POSTER_IDS_MAX = 2000;
 
@@ -5092,13 +5100,62 @@ async function rememberSharedPosterIds(env, ids) {
   } catch {}
 }
 
+async function retryMissedBetterPosters(env, fetchCap) {
+  if (fetchCap < 1) return 0;
+  let list;
+  try {
+    list = readBetterPosterRetries(await env.CONFIGS.get(BETTER_POSTER_RETRY_KEY));
+  } catch {
+    return 0;
+  }
+  const keys = Object.keys(list);
+  for (let i = keys.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [keys[i], keys[j]] = [keys[j], keys[i]];
+  }
+  const due = keys.slice(0, fetchCap);
+  if (!due.length) return 0;
+  const gone = [];
+  let done = 0;
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(4, due.length) }, async () => {
+    while (next < due.length) {
+      const path = due[next++];
+      let bp = null;
+      try {
+        const u = new URL(path, "https://x.invalid");
+        bp = parseBetterPosterPath(u.pathname, u.searchParams);
+      } catch {}
+      if (!bp) { gone.push(path); continue; }
+      if ((await readStoredBetterPoster(env, null, bp)) || (await fetchBetterPosterUpstream(env, bp, BETTER_POSTER_UPSTREAM_TIMEOUT_MS))) {
+        gone.push(path);
+        done++;
+      }
+    }
+  }));
+  if (gone.length) {
+    // Re-read before writing: pages add to this list while the fetches above
+    // run, and those additions should not be lost to this write.
+    try {
+      const latest = readBetterPosterRetries(await env.CONFIGS.get(BETTER_POSTER_RETRY_KEY));
+      for (const path of gone) delete latest[path];
+      await env.CONFIGS.put(BETTER_POSTER_RETRY_KEY, JSON.stringify(trimBetterPosterRetries(latest, Date.now())));
+    } catch {}
+  }
+  if (done) console.log(`[Cron] BetterPosters: ${done} of ${due.length} missed poster(s) fetched on retry.`);
+  return due.length;
+}
+
 async function prewarmBetterPosters(env, ctx, fetchBudget) {
   if (!env || !env.CONFIGS) return;
+  let fetchCap = Math.min(BETTER_POSTER_PREWARM_FETCHES_PER_TICK, Math.floor(Number(fetchBudget) || 0));
+  if (fetchCap < 1) return;
+  fetchCap -= await retryMissedBetterPosters(env, fetchCap);
+  if (fetchCap < 1) return;
+
   const variants = await betterPosterVariantsInUse(env);
   // Nobody has used Better Posters lately: nothing to fetch ahead for.
   if (!variants.length) return;
-  const fetchCap = Math.min(BETTER_POSTER_PREWARM_FETCHES_PER_TICK, Math.floor(Number(fetchBudget) || 0));
-  if (fetchCap < 1) return;
 
   // The My Lists Addon Charts are built from this add-on's own data (KV/D1,
   // no provider call), so they are read directly each time rather than
@@ -5138,22 +5195,24 @@ async function prewarmBetterPosters(env, ctx, fetchBudget) {
     checked++;
     const bp = betterPosterForVariant(titles[Math.floor(n / variants.length)], variants[n % variants.length]);
     if (!bp) continue;
-    if (await readStoredBetterPoster(env, null, bp)) continue;
+    const have = await readStoredBetterPoster(env, null, bp);
+    if (have && Date.now() - have.at <= BETTER_POSTER_REFRESH_MS) continue;
     work.push(bp);
   }
   // A few at a time: btttr.cc's origin is the slow part, and piling onto it
-  // slows every draw, ours included.
+  // slows every draw, ours included. A refresh that fails leaves the copy
+  // already held exactly as it was.
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(4, work.length) }, async () => {
     while (next < work.length) {
       const bp = work[next++];
-      if (await fetchBetterPosterUpstream(env, bp)) fetched++;
+      if (await fetchBetterPosterUpstream(env, bp, BETTER_POSTER_UPSTREAM_TIMEOUT_MS)) fetched++;
     }
   }));
   try {
     await env.CONFIGS.put("cron:bpwarm:cursor", String((cursor + checked) % total));
   } catch {}
-  if (fetched) console.log(`[Cron] BetterPosters: fetched ${fetched} of ${work.length} missing (${checked} checked).`);
+  if (fetched) console.log(`[Cron] BetterPosters: fetched ${fetched} of ${work.length} missing or stale (${checked} checked).`);
 }
 
 async function prewarmSharedCatalogs(env, ctx, fetchBudget) {
