@@ -335,6 +335,9 @@
             if (!blob || typeof blob !== "object") {
               blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: false };
             }
+            // This whole record is written back below, Watchlist included --
+            // see ensureTrackingWatchlist for why it has to be put back first.
+            await ensureTrackingWatchlist(env, auth.username, blob);
             blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
             blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
             blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
@@ -916,6 +919,8 @@
         if (!blob || typeof blob !== "object") {
           blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: true };
         }
+        // Written back whole below -- see ensureTrackingWatchlist.
+        await ensureTrackingWatchlist(env, authUser, blob);
         blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
         blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
         blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
@@ -3983,13 +3988,15 @@
         data.scrobbleFilterUsers = typeof d1Tracking.scrobbleFilterUsers === "boolean" ? d1Tracking.scrobbleFilterUsers : false;
         data.scrobbleAllowedUsers = typeof d1Tracking.scrobbleAllowedUsers === "string" ? d1Tracking.scrobbleAllowedUsers : "";
         data.scrobbleBlockAnonymous = typeof d1Tracking.scrobbleBlockAnonymous === "boolean" ? d1Tracking.scrobbleBlockAnonymous : false;
-        data.watchlist = [];
-        data.watchlistUpdatedAt = 0;
+        // The newest of the Watchlist's copies, which readCreatorTrackingD1
+        // has already chosen -- see readAccountWatchlist. Reading only the
+        // tracking record's copy handed this browser an EMPTY Watchlist after
+        // any play in Stremio or Plex had emptied that copy.
+        data.watchlist = Array.isArray(d1Tracking.watchlist) ? d1Tracking.watchlist : [];
+        data.watchlistUpdatedAt = Number(d1Tracking.watchlistUpdatedAt) || 0;
         if (trackingRaw) {
           try {
             const tb = JSON.parse(trackingRaw);
-            if (Array.isArray(tb.watchlist)) data.watchlist = tb.watchlist;
-            if (Number(tb.watchlistUpdatedAt)) data.watchlistUpdatedAt = Number(tb.watchlistUpdatedAt);
             if (Array.isArray(tb.continueWatching) && tb.continueWatching.length && Array.isArray(data.continueWatching)) {
               const tbCwMap = new Map();
               tb.continueWatching.forEach((it) => {
@@ -4024,8 +4031,10 @@
           }
           data.watchHistory = Array.isArray(trackingBlob.watchHistory) ? trackingBlob.watchHistory : [];
           data.continueWatching = Array.isArray(trackingBlob.continueWatching) ? trackingBlob.continueWatching : [];
-          data.watchlist = Array.isArray(trackingBlob.watchlist) ? trackingBlob.watchlist : [];
-          data.watchlistUpdatedAt = Number(trackingBlob.watchlistUpdatedAt) || 0;
+          // Newest copy, not just this record's -- see readAccountWatchlist.
+          const wl = await readAccountWatchlist(env, auth.username, trackingBlob);
+          data.watchlist = wl ? wl.items : [];
+          data.watchlistUpdatedAt = wl ? wl.updatedAt : 0;
           // Airing Next and the Discover recommendations were stored by
           // save-tracking but never handed back here, so loadCreatorSync's
           // own restore branches for them (22_client-creator-profile.js)

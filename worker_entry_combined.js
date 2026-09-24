@@ -1221,6 +1221,34 @@ const STREMIO_BADGE_KEYS = [
   "showBadgesStremioWatchlist",
   "showBadgesStremioCatalogs",
 ];
+
+// --- Catalog rows that are one account's live state -------------------------
+//
+// The detectSource names (04_config-resolution.js) whose catalog response is
+// sent no-store instead of the 24-hour public cache every other row gets --
+// see the catalog route (25_api-catalog-routes.js). A row belongs here when
+// its items change because of something the account DID (watched, added,
+// removed), under a URL that stays the same: the install link's config id
+// only changes when the config does, so a cached copy of one of these would
+// sit there, stale, for a day.
+//
+//   autotrack        Watchlist, Watch History, Continue Watching, Airing Next
+//   curated          Recommended Movies / Recommended Shows
+//   trakt-*, mdblist-*, simkl-user
+//                    the same shelves read from a connected account
+const STREMIO_LIVE_ROW_SOURCES = new Set([
+  "autotrack",
+  "curated",
+  "simkl-user",
+  "trakt-watchlist",
+  "trakt-history",
+  "trakt-continue-watching",
+  "trakt-airing-next",
+  "mdblist-watchlist",
+  "mdblist-history",
+  "mdblist-airing-next",
+  "mdblist-upnext",
+]);
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -5823,6 +5851,9 @@ async function purgeCreatorData(env, username, options = {}) {
     // re-registered username's browsers to discard lists it never deleted.
     creatorListTombstoneKey(u),
     `creatorscrobblequeue:${u}`,
+    // Set while this account's D1 tracking rows are behind its KV record --
+    // see trackingD1BehindKey.
+    trackingD1BehindKey(u),
     `creatorlistlikes:${u}`,
     `creatorlikes:${u}`,
     `creatorshare:${u}`,
@@ -6750,8 +6781,52 @@ async function d1HasAiringRemovalColumns(env) {
   return _d1AiringRemovalColumns;
 }
 
+// Set while an account's D1 tracking rows are known to be behind its KV
+// record: saveCreatorTrackingD1 writes it when a write fails and removes it
+// when one succeeds.
+//
+// The Stremio/Nuvio rows for Watch History, Continue Watching and Airing Next
+// read D1 directly, which is the point -- they are the cheap path, and the KV
+// record they would otherwise parse can run to megabytes. But that meant they
+// had no way to notice D1 was stale: a failed write left the rows as they were
+// and the apps kept serving them, while the website (which reads through
+// readCreatorTrackingD1's stamp check) showed the new state. This key is the
+// one-small-read answer to "can D1 be trusted right now?".
+function trackingD1BehindKey(username) {
+  return `trackingd1behind:${username}`;
+}
+
+async function isTrackingD1Behind(env, username) {
+  if (!env || !env.CONFIGS || !username) return false;
+  try {
+    return !!(await env.CONFIGS.get(trackingD1BehindKey(username)));
+  } catch {
+    return false;
+  }
+}
+
 async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   if (!env || !env.DB || !username || !trackingData) return false;
+  const ok = await writeCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval);
+  if (env.CONFIGS) {
+    try {
+      const key = trackingD1BehindKey(username);
+      if (!ok) {
+        await env.CONFIGS.put(key, String(Number(trackingData.updatedAt) || Date.now()));
+      } else if (await env.CONFIGS.get(key)) {
+        // Read first so an ordinary save -- the usual case, with no marker --
+        // costs no KV write.
+        await env.CONFIGS.delete(key);
+      }
+    } catch {
+      // The marker is an optimisation for the catalog rows; the write's own
+      // result is what the caller acts on.
+    }
+  }
+  return ok;
+}
+
+async function writeCreatorTrackingD1(env, username, trackingData, isIntentionalRemoval) {
   try {
     const meta = {
       trackPlayback: trackingData.trackPlayback ? 1 : 0,
@@ -6766,8 +6841,11 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
 
     const stmts = [];
 
-    // 1. Meta
-    stmts.push(
+    // 1. Meta -- built here, written LAST (see the ordering note at the end).
+    // Its updated_at is the stamp readCreatorTrackingD1 compares against the
+    // KV copy to decide which one is current, so it may only advance once
+    // every row it vouches for has landed.
+    const metaStmt = (
       env.DB.prepare(
         `INSERT INTO creator_tracking_meta (
           username, track_playback, remove_watched_watchlist, scrobble_filter_users,
@@ -7022,7 +7100,8 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
       }
     }
 
-    // Upserts first, deletions last, in that order across the whole write.
+    // Upserts first, deletions next, the meta stamp last, in that order across
+    // the whole write.
     //
     // The statements are chunked because one account can be thousands of them
     // and a D1 batch is one transaction with a real size bound -- so the write
@@ -7030,8 +7109,17 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
     // ordering: nothing is removed until everything that replaces it has
     // already landed. A chunk that fails partway leaves stale extras, which the
     // next push corrects; it can no longer leave a hole.
+    //
+    // And the stamp goes last so that a write which dies partway -- one of the
+    // later chunks, or the per-request operation cap on an account with a long
+    // Watch History -- leaves D1 visibly BEHIND the KV copy rather than
+    // claiming to be current. It used to go first: a write that got no further
+    // than its first chunk still advanced updated_at, so D1 read as up to date
+    // while holding the old rows, and nothing ever served KV or repaired it.
+    // Continue Watching and Airing Next removals (the prunes) were the first
+    // casualties, being the last statements of all.
     const CHUNK_SIZE = 80;
-    const ordered = stmts.concat(prunes);
+    const ordered = stmts.concat(prunes, [metaStmt]);
     for (let i = 0; i < ordered.length; i += CHUNK_SIZE) {
       const chunk = ordered.slice(i, i + CHUNK_SIZE);
       await env.DB.batch(chunk);
@@ -7041,6 +7129,75 @@ async function saveCreatorTrackingD1(env, username, trackingData, isIntentionalR
     console.error("D1 write error (saveCreatorTrackingD1):", err);
     return false;
   }
+}
+
+// The account's Watchlist, from whichever of its three copies is newest.
+//
+// The Watchlist is written in three places by /api/creator/sync/save-tracking
+// -- the tracking record's `watchlist` field, and the list record
+// creatorlist:{user}:watchlist in both KV and D1 -- and only the list record
+// is never rebuilt by anything else. The tracking record's copy used to be
+// the one everything READ (the Stremio/Nuvio Watchlist row, and the Watchlist
+// /api/creator/sync/load hands the browser), and it was the fragile one:
+// readCreatorTrackingD1 below did not return a watchlist at all, and the two
+// playback scrobbles read through it and wrote the record back -- so one
+// play in Stremio or Plex left the tracking record with an empty Watchlist
+// or none. The row then showed nothing until the website next pushed.
+//
+// So: every copy is a candidate, the newest stamp wins, and on a tie the list
+// record wins, being the copy nothing but a save writes. A tracking record
+// that was emptied that way carries no watchlistUpdatedAt (the scrobbles never
+// set one), so it loses to any list record that has ever been saved.
+//
+// Read-only on purpose: getCreatorList repairs as it reads, which costs a KV
+// write per call -- not something a catalog request should spend.
+async function readAccountWatchlist(env, username, trackingBlob) {
+  if (!env || !username) return null;
+  const [row, kvRaw] = await Promise.all([
+    env.DB
+      ? env.DB.prepare("SELECT items_json, updated_at FROM creator_lists WHERE id = ?")
+          .bind(`${username}:watchlist`).first().catch(() => null)
+      : Promise.resolve(null),
+    env.CONFIGS
+      ? env.CONFIGS.get(`creatorlist:${username}:watchlist`).catch(() => null)
+      : Promise.resolve(null),
+  ]);
+  const candidates = [];
+  if (kvRaw) {
+    try {
+      const l = JSON.parse(kvRaw);
+      if (l && Array.isArray(l.items)) candidates.push({ items: l.items, updatedAt: Number(l.updatedAt) || 0 });
+    } catch {}
+  }
+  if (row) {
+    try {
+      const items = JSON.parse(row.items_json || "[]");
+      if (Array.isArray(items)) candidates.push({ items, updatedAt: Number(row.updated_at) || 0 });
+    } catch {}
+  }
+  if (trackingBlob && Array.isArray(trackingBlob.watchlist)) {
+    candidates.push({ items: trackingBlob.watchlist, updatedAt: Number(trackingBlob.watchlistUpdatedAt) || 0 });
+  }
+  let best = null;
+  for (const c of candidates) if (!best || c.updatedAt > best.updatedAt) best = c;
+  return best;
+}
+
+// Makes sure a tracking record about to be written back carries the
+// account's Watchlist. A record straight from save-tracking already does
+// (with its stamp), so this costs nothing there; one read through
+// readCreatorTrackingD1 before it returned a watchlist, or emptied by a
+// scrobble that did, gets the newest copy put back instead of written out
+// empty.
+async function ensureTrackingWatchlist(env, username, blob) {
+  if (!blob || typeof blob !== "object") return blob;
+  if (Array.isArray(blob.watchlist) && Number(blob.watchlistUpdatedAt) > 0) return blob;
+  const wl = await readAccountWatchlist(env, username, blob);
+  if (wl) {
+    blob.watchlist = wl.items;
+    blob.watchlistUpdatedAt = wl.updatedAt;
+  }
+  return blob;
 }
 
 // D1 is authoritative for this record -- /api/creator/sync/load and every
@@ -7069,11 +7226,15 @@ async function readCreatorTrackingD1(env, username) {
     // A KV copy stamped later than D1's means a push landed in KV and not here.
     // Returning null hands the caller back to its own KV branch, which is the
     // copy that actually holds the user's data.
+    //
+    // The KV copy is also where the Watchlist lives -- D1's tracking tables
+    // have no column for it -- so it is kept for the return value below.
+    let kvBlob = null;
     if (env.CONFIGS) {
       try {
         const kvRaw = await env.CONFIGS.get(`creatorsynctracking:${username}`);
         if (kvRaw) {
-          const kvBlob = JSON.parse(kvRaw);
+          kvBlob = JSON.parse(kvRaw);
           const kvStamp = Number(kvBlob && kvBlob.updatedAt) || 0;
           const d1Stamp = Number(metaRow.updated_at) || 0;
           if (kvStamp > d1Stamp) {
@@ -7213,10 +7374,17 @@ async function readCreatorTrackingD1(env, username) {
       try { curatedRecs = JSON.parse(metaRow.curated_recommendations); } catch {}
     }
 
+    // Every writer that reads through here writes the whole record back, so a
+    // record without its Watchlist is a Watchlist deleted. See
+    // readAccountWatchlist for which copy this is.
+    const watchlist = await readAccountWatchlist(env, username, kvBlob);
+
     return {
       watchHistory,
       continueWatching,
       airingNext,
+      watchlist: watchlist ? watchlist.items : [],
+      watchlistUpdatedAt: watchlist ? watchlist.updatedAt : 0,
       fullyWatchedShowIds,
       dismissedContinueWatching,
       removedAiringNext,
@@ -13883,7 +14051,12 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
   try {
     let items;
     let airingItems;
-    if (env && env.DB) {
+    // D1 is the cheap read, but only while it is current: a tracking write
+    // that failed leaves the rows as they were, and these rows used to keep
+    // serving them regardless. The KV record below is the newer copy then.
+    // See isTrackingD1Behind.
+    const d1Current = !!(env && env.DB) && slug !== 'watchlist' && !(await isTrackingD1Behind(env, username));
+    if (d1Current) {
       if (slug === 'watch-history') {
         const rows = await env.DB.prepare(
           "SELECT * FROM watch_history WHERE username = ? ORDER BY watched_at DESC LIMIT 100"
@@ -14027,6 +14200,13 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       if (trackingRaw) {
         const trackingBlob = JSON.parse(trackingRaw);
         items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
+        // The Watchlist has three copies and this record's is the one a
+        // playback scrobble used to empty -- serve the newest of them, which
+        // is also what the website shows. See readAccountWatchlist.
+        if (slug === 'watchlist') {
+          const wl = await readAccountWatchlist(env, username, trackingBlob);
+          items = wl ? wl.items : [];
+        }
         // Loaded for the watchlist as well as continue-watching: it is the
         // only source of "this show has an episode coming", and a watchlist
         // entry wants that chip exactly as much as an in-progress one does.
@@ -14058,6 +14238,10 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         if (!blobStr) return [];
         const blob = JSON.parse(blobStr);
         items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
+        if (slug === 'watchlist') {
+          const wl = await readAccountWatchlist(env, username, blob);
+          items = wl ? wl.items : [];
+        }
         // Loaded for the watchlist as well as continue-watching: it is the
         // only source of "this show has an episode coming", and a watchlist
         // entry wants that chip exactly as much as an in-progress one does.
@@ -29472,10 +29656,42 @@ function createSortableList(container, options = {}) {
     }
   }
 
+  // The rows a dragged row is placed among: its SIBLINGS, not every matching
+  // descendant. This used to be a querySelectorAll over the whole subtree,
+  // which on Live Preview walks every poster of every shelf -- thousands of
+  // nodes -- on every dragover and every auto-scroll frame.
+  function siblingItems(parent) {
+    const out = [];
+    const kids = parent.children;
+    for (let i = 0; i < kids.length; i++) {
+      const child = kids[i];
+      if (child === activeItem || child.classList.contains(dragClass) || !child.matches(itemSelector)) continue;
+      out.push(child);
+    }
+    return out;
+  }
+
+  function nextItemSibling(el) {
+    let n = el.nextElementSibling;
+    while (n && !n.matches(itemSelector)) n = n.nextElementSibling;
+    return n;
+  }
+
+  // Moves the row only when its place actually changes.
+  //
+  // It used to re-insert the row on every call whether or not it had moved --
+  // several times a second from dragover, and every frame from auto-scroll.
+  // A re-insert is a real DOM mutation even when the row lands where it was:
+  // it throws away the page's layout, so the getBoundingClientRect reads on
+  // the next call re-laid-out the entire page, and it hands the moved row to
+  // the page-wide MutationObserver that badges posters (initWatchHistory),
+  // which re-badged every poster in it. On a Live Preview with poster
+  // shelves that was the whole frame budget and more, on every frame --
+  // what "the page freezes when I drag" was on a phone.
   function moveItem(y, x) {
     if (!activeItem) return;
     const targetParent = activeItem.parentNode || container;
-    const items = [...targetParent.querySelectorAll(itemSelector + ':not(.' + dragClass + ')')];
+    const items = siblingItems(targetParent);
     if (axis === 'xy' && typeof x === 'number') {
       let targetCard = null;
       for (const child of items) {
@@ -29485,29 +29701,36 @@ function createSortableList(container, options = {}) {
           break;
         }
       }
-      if (targetCard && targetCard !== activeItem) {
+      if (targetCard) {
         const box = targetCard.getBoundingClientRect();
         const isAfter = (y > box.top + box.height / 2) || (y >= box.top && x > box.left + box.width / 2);
         if (isAfter) {
-          targetParent.insertBefore(activeItem, targetCard.nextSibling);
-        } else {
+          if (targetCard.nextElementSibling !== activeItem) targetParent.insertBefore(activeItem, targetCard.nextSibling);
+        } else if (activeItem.nextElementSibling !== targetCard) {
           targetParent.insertBefore(activeItem, targetCard);
         }
         return;
       }
     }
-    const afterEl = items.reduce((closest, child) => {
+    let afterEl = null;
+    let closest = -Infinity;
+    for (const child of items) {
       const box = child.getBoundingClientRect();
       const offset = y - box.top - box.height / 2;
-      if (offset < 0 && offset > closest.offset) {
-        return { offset: offset, element: child };
+      if (offset < 0 && offset > closest) {
+        closest = offset;
+        afterEl = child;
       }
-      return closest;
-    }, { offset: -Infinity, element: null }).element;
+    }
 
     if (afterEl == null) {
-      targetParent.appendChild(activeItem);
-    } else if (afterEl !== activeItem) {
+      // Belongs after every other row -- already there if the last one comes
+      // before it.
+      const last = items[items.length - 1];
+      if (last && !(last.compareDocumentPosition(activeItem) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+        targetParent.appendChild(activeItem);
+      }
+    } else if (nextItemSibling(activeItem) !== afterEl) {
       targetParent.insertBefore(activeItem, afterEl);
     }
   }
@@ -29519,18 +29742,29 @@ function createSortableList(container, options = {}) {
   // progress, so on any list taller than the window -- which is most of them
   // once Live Preview shelves carry posters and each row is ~200px -- dragging
   // past the last visible row did nothing at all: the row stopped at the edge
-  // and sat there. That is what "the drag freezes and won't move the list"
-  // was. It applied to every list this function drives, on desktop and touch
-  // alike.
+  // and sat there. It applied to every list this function drives, on desktop
+  // and touch alike.
   const AUTO_SCROLL_EDGE = 90;   // distance from an edge where scrolling starts
   const AUTO_SCROLL_MAX = 20;    // px per frame at the very edge
+  // A native (HTML5) drag fires dragover continuously -- the spec says at
+  // least every 350ms, even with the pointer held still -- for as long as it
+  // lasts. Silence well past that means it ended without dragend reaching
+  // this list.
+  const HTML5_DRAG_SILENCE_MS = 1500;
   let autoScrollRaf = null;
   let lastClientX = 0;
   let lastClientY = 0;
+  let scrollHost = null;
+  let anchorEl = null;
+  let anchorPrev = '';
+  let html5Drag = false;
+  let lastDragEventAt = 0;
 
   // The page itself scrolls for the catalog and My Lists surfaces, but this
   // same function also drives lists inside scrollable panels, so scroll
-  // whichever actually can.
+  // whichever actually can. Resolved once when a drag starts: it walks every
+  // ancestor through getComputedStyle, and doing that every frame forced a
+  // style recalculation of the whole page sixty times a second.
   function scrollHostFor(el) {
     let n = el && el.parentElement;
     while (n && n !== document.body && n !== document.documentElement) {
@@ -29541,12 +29775,46 @@ function createSortableList(container, options = {}) {
     return null;
   }
 
+  // Called when a drag starts, by either path.
+  function beginDragSession() {
+    scrollHost = scrollHostFor(activeItem);
+    // Scroll anchoring off for the drag. Moving a tall row from above the
+    // fold to below it (which is what every step of a downward drag does)
+    // makes the browser shift the scroll position to keep what is on screen
+    // still -- underneath a drag that is itself scrolling and re-placing the
+    // row from the pointer's position, so the two fight each other.
+    anchorEl = scrollHost || document.scrollingElement || document.documentElement;
+    anchorPrev = anchorEl.style.overflowAnchor;
+    anchorEl.style.overflowAnchor = 'none';
+  }
+
+  function endDragSession() {
+    stopAutoScroll();
+    if (anchorEl) anchorEl.style.overflowAnchor = anchorPrev;
+    anchorEl = null;
+    scrollHost = null;
+    html5Drag = false;
+  }
+
+  function scrollPos() {
+    return scrollHost ? scrollHost.scrollTop : (window.scrollY || window.pageYOffset || 0);
+  }
+
   function autoScrollStep() {
     autoScrollRaf = null;
     if (!activeItem) return;
-    const host = scrollHostFor(activeItem);
-    const top = host ? host.getBoundingClientRect().top : 0;
-    const bottom = host ? host.getBoundingClientRect().bottom : (window.innerHeight || document.documentElement.clientHeight);
+    // A drag can end without this list hearing about it: the row is no
+    // longer on the page (the list was re-rendered under it -- dragend then
+    // fires on a detached node and never bubbles here), or a native drag has
+    // gone silent. Left running, this loop kept scrolling the page and
+    // re-attaching the stale row every frame, indefinitely.
+    if (!activeItem.isConnected || (html5Drag && Date.now() - lastDragEventAt > HTML5_DRAG_SILENCE_MS)) {
+      finishHtml5OrPointerDrag();
+      return;
+    }
+    const hostBox = scrollHost ? scrollHost.getBoundingClientRect() : null;
+    const top = hostBox ? hostBox.top : 0;
+    const bottom = hostBox ? hostBox.bottom : (window.innerHeight || document.documentElement.clientHeight);
     let delta = 0;
     if (lastClientY < top + AUTO_SCROLL_EDGE) {
       delta = -Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (top + AUTO_SCROLL_EDGE - lastClientY) / AUTO_SCROLL_EDGE));
@@ -29554,11 +29822,14 @@ function createSortableList(container, options = {}) {
       delta = Math.ceil(AUTO_SCROLL_MAX * Math.min(1, (lastClientY - (bottom - AUTO_SCROLL_EDGE)) / AUTO_SCROLL_EDGE));
     }
     if (delta) {
-      if (host) host.scrollTop += delta;
+      const before = scrollPos();
+      if (scrollHost) scrollHost.scrollTop += delta;
       else window.scrollBy(0, delta);
       // Re-place the row against the rows that just came into view, or the
-      // page would scroll underneath a row that never moves.
-      moveItem(lastClientY, lastClientX);
+      // page would scroll underneath a row that never moves -- but only if
+      // it did scroll: at the top or bottom of the page there is nothing new
+      // to place it against.
+      if (scrollPos() !== before) moveItem(lastClientY, lastClientX);
     }
     queueAutoScroll();
   }
@@ -29579,6 +29850,7 @@ function createSortableList(container, options = {}) {
     activeItem = item;
     activeItem.classList.add(dragClass);
     document.body.style.userSelect = 'none';
+    beginDragSession();
     if (typeof navigator !== 'undefined' && navigator.vibrate) {
       try { navigator.vibrate(30); } catch (err) {}
     }
@@ -29586,7 +29858,7 @@ function createSortableList(container, options = {}) {
 
   function stopDragging() {
     cancelHold();
-    stopAutoScroll();
+    endDragSession();
     if (isDragging && activeItem) {
       activeItem.classList.remove(dragClass);
       onReorder();
@@ -29594,6 +29866,19 @@ function createSortableList(container, options = {}) {
     isDragging = false;
     activeItem = null;
     document.body.style.userSelect = '';
+  }
+
+  // Ends whichever kind of drag is in progress -- the path the watchdog in
+  // autoScrollStep takes when the drag's own end event never arrived.
+  function finishHtml5OrPointerDrag() {
+    if (html5Drag) {
+      endDragSession();
+      if (activeItem) activeItem.classList.remove(dragClass);
+      activeItem = null;
+      onReorder();
+    } else {
+      stopDragging();
+    }
   }
 
   // HTML5 Drag events for desktop when handle exists
@@ -29606,6 +29891,9 @@ function createSortableList(container, options = {}) {
       activeItem = handle.closest(itemSelector);
       if (!activeItem) return;
       activeItem.classList.add(dragClass);
+      html5Drag = true;
+      lastDragEventAt = Date.now();
+      beginDragSession();
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = 'move';
         try { e.dataTransfer.setData('text/plain', activeItem.dataset && activeItem.dataset.slug ? activeItem.dataset.slug : ''); } catch (err) {}
@@ -29615,21 +29903,28 @@ function createSortableList(container, options = {}) {
     container.addEventListener('dragover', (e) => {
       if (!activeItem) return;
       e.preventDefault();
-      lastClientX = e.clientX;
-      lastClientY = e.clientY;
       moveItem(e.clientY, e.clientX);
-      // dragover stops firing once the pointer is held still at the edge, so
-      // the scrolling has to be driven by its own frame loop rather than by
-      // the event.
+      // dragover arrives in uneven bursts, and only every few hundred
+      // milliseconds once the pointer is held still -- which is exactly when
+      // an edge scroll has to keep going smoothly -- so the scrolling runs on
+      // its own frame loop rather than on the event.
       queueAutoScroll();
     });
 
+    // Where the pointer is, and that the drag is still alive, wherever on the
+    // page it has wandered: near the top edge it is usually over the header,
+    // not this list, and the auto-scroll (and the silence watchdog above)
+    // must keep hearing about it there.
+    document.addEventListener('dragover', (e) => {
+      if (!activeItem || !html5Drag) return;
+      lastDragEventAt = Date.now();
+      lastClientX = e.clientX;
+      lastClientY = e.clientY;
+    }, true);
+
     container.addEventListener('dragend', () => {
-      stopAutoScroll();
-      if (!activeItem) return;
-      activeItem.classList.remove(dragClass);
-      activeItem = null;
-      onReorder();
+      if (!activeItem) { endDragSession(); return; }
+      finishHtml5OrPointerDrag();
     });
   }
 
@@ -72821,9 +73116,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
-      const source = detectSource(entry.url);
-      const isAutoTrack = source === "autotrack";
-      const isUserPersonal = isAutoTrack || source === "simkl-user" || source === "trakt-watchlist" || source === "trakt-history" || source === "mdblist-watchlist" || source === "mdblist-history";
+      // Every line of the row, not just the first: a merged row stores its
+      // sources newline-separated (see fetchCatalog), and one personal source
+      // anywhere in it makes the whole row one account's live state.
+      const rowSources = String(entry.url || "").split("\n").map((u) => u.trim()).filter(Boolean).map(detectSource);
+      const isAutoTrack = rowSources.includes("autotrack");
+      // Rows whose content is one account's live state, and so must never be
+      // cached: the next request has to see what changed since. "curated" is
+      // Recommended Movies/Shows (the account's pushed Discover snapshot),
+      // and the Trakt/MDBList progress shelves change every time something
+      // is watched. All of them used to fall through to the 24-hour public
+      // cache below, which let Stremio and Nuvio keep a day-old copy.
+      const isUserPersonal = rowSources.some((src) => STREMIO_LIVE_ROW_SOURCES.has(src));
 
       // Graceful degradation only applies to the first page (skip === 0):
       // that's the case that makes a whole shelf silently vanish from the
@@ -79793,6 +80097,9 @@ function generateSearchVariations(query) {
             if (!blob || typeof blob !== "object") {
               blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: false };
             }
+            // This whole record is written back below, Watchlist included --
+            // see ensureTrackingWatchlist for why it has to be put back first.
+            await ensureTrackingWatchlist(env, auth.username, blob);
             blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
             blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
             blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
@@ -80374,6 +80681,8 @@ function generateSearchVariations(query) {
         if (!blob || typeof blob !== "object") {
           blob = { watchHistory: [], continueWatching: [], fullyWatchedShowIds: [], dismissedContinueWatching: {}, trackPlayback: true };
         }
+        // Written back whole below -- see ensureTrackingWatchlist.
+        await ensureTrackingWatchlist(env, authUser, blob);
         blob.watchHistory = Array.isArray(blob.watchHistory) ? blob.watchHistory : [];
         blob.continueWatching = Array.isArray(blob.continueWatching) ? blob.continueWatching : [];
         blob.fullyWatchedShowIds = Array.isArray(blob.fullyWatchedShowIds) ? blob.fullyWatchedShowIds : [];
@@ -83441,13 +83750,15 @@ function generateSearchVariations(query) {
         data.scrobbleFilterUsers = typeof d1Tracking.scrobbleFilterUsers === "boolean" ? d1Tracking.scrobbleFilterUsers : false;
         data.scrobbleAllowedUsers = typeof d1Tracking.scrobbleAllowedUsers === "string" ? d1Tracking.scrobbleAllowedUsers : "";
         data.scrobbleBlockAnonymous = typeof d1Tracking.scrobbleBlockAnonymous === "boolean" ? d1Tracking.scrobbleBlockAnonymous : false;
-        data.watchlist = [];
-        data.watchlistUpdatedAt = 0;
+        // The newest of the Watchlist's copies, which readCreatorTrackingD1
+        // has already chosen -- see readAccountWatchlist. Reading only the
+        // tracking record's copy handed this browser an EMPTY Watchlist after
+        // any play in Stremio or Plex had emptied that copy.
+        data.watchlist = Array.isArray(d1Tracking.watchlist) ? d1Tracking.watchlist : [];
+        data.watchlistUpdatedAt = Number(d1Tracking.watchlistUpdatedAt) || 0;
         if (trackingRaw) {
           try {
             const tb = JSON.parse(trackingRaw);
-            if (Array.isArray(tb.watchlist)) data.watchlist = tb.watchlist;
-            if (Number(tb.watchlistUpdatedAt)) data.watchlistUpdatedAt = Number(tb.watchlistUpdatedAt);
             if (Array.isArray(tb.continueWatching) && tb.continueWatching.length && Array.isArray(data.continueWatching)) {
               const tbCwMap = new Map();
               tb.continueWatching.forEach((it) => {
@@ -83482,8 +83793,10 @@ function generateSearchVariations(query) {
           }
           data.watchHistory = Array.isArray(trackingBlob.watchHistory) ? trackingBlob.watchHistory : [];
           data.continueWatching = Array.isArray(trackingBlob.continueWatching) ? trackingBlob.continueWatching : [];
-          data.watchlist = Array.isArray(trackingBlob.watchlist) ? trackingBlob.watchlist : [];
-          data.watchlistUpdatedAt = Number(trackingBlob.watchlistUpdatedAt) || 0;
+          // Newest copy, not just this record's -- see readAccountWatchlist.
+          const wl = await readAccountWatchlist(env, auth.username, trackingBlob);
+          data.watchlist = wl ? wl.items : [];
+          data.watchlistUpdatedAt = wl ? wl.updatedAt : 0;
           // Airing Next and the Discover recommendations were stored by
           // save-tracking but never handed back here, so loadCreatorSync's
           // own restore branches for them (22_client-creator-profile.js)

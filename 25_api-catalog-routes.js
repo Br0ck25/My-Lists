@@ -895,9 +895,18 @@ Sitemap: ${url.origin}/sitemap.xml`;
       const entry = entryIndex >= 0 ? entries[entryIndex] : null;
       if (!entry || entry.enabled === false) return jsonPublic({ metas: [] });
 
-      const source = detectSource(entry.url);
-      const isAutoTrack = source === "autotrack";
-      const isUserPersonal = isAutoTrack || source === "simkl-user" || source === "trakt-watchlist" || source === "trakt-history" || source === "mdblist-watchlist" || source === "mdblist-history";
+      // Every line of the row, not just the first: a merged row stores its
+      // sources newline-separated (see fetchCatalog), and one personal source
+      // anywhere in it makes the whole row one account's live state.
+      const rowSources = String(entry.url || "").split("\n").map((u) => u.trim()).filter(Boolean).map(detectSource);
+      const isAutoTrack = rowSources.includes("autotrack");
+      // Rows whose content is one account's live state, and so must never be
+      // cached: the next request has to see what changed since. "curated" is
+      // Recommended Movies/Shows (the account's pushed Discover snapshot),
+      // and the Trakt/MDBList progress shelves change every time something
+      // is watched. All of them used to fall through to the 24-hour public
+      // cache below, which let Stremio and Nuvio keep a day-old copy.
+      const isUserPersonal = rowSources.some((src) => STREMIO_LIVE_ROW_SOURCES.has(src));
 
       // Graceful degradation only applies to the first page (skip === 0):
       // that's the case that makes a whole shelf silently vanish from the

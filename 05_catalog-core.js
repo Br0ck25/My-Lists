@@ -1510,7 +1510,12 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
   try {
     let items;
     let airingItems;
-    if (env && env.DB) {
+    // D1 is the cheap read, but only while it is current: a tracking write
+    // that failed leaves the rows as they were, and these rows used to keep
+    // serving them regardless. The KV record below is the newer copy then.
+    // See isTrackingD1Behind.
+    const d1Current = !!(env && env.DB) && slug !== 'watchlist' && !(await isTrackingD1Behind(env, username));
+    if (d1Current) {
       if (slug === 'watch-history') {
         const rows = await env.DB.prepare(
           "SELECT * FROM watch_history WHERE username = ? ORDER BY watched_at DESC LIMIT 100"
@@ -1654,6 +1659,13 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
       if (trackingRaw) {
         const trackingBlob = JSON.parse(trackingRaw);
         items = slug === 'watch-history' ? trackingBlob.watchHistory : (slug === 'continue-watching' ? trackingBlob.continueWatching : (slug === 'airing-next' ? trackingBlob.airingNext : (trackingBlob.watchlist || [])));
+        // The Watchlist has three copies and this record's is the one a
+        // playback scrobble used to empty -- serve the newest of them, which
+        // is also what the website shows. See readAccountWatchlist.
+        if (slug === 'watchlist') {
+          const wl = await readAccountWatchlist(env, username, trackingBlob);
+          items = wl ? wl.items : [];
+        }
         // Loaded for the watchlist as well as continue-watching: it is the
         // only source of "this show has an episode coming", and a watchlist
         // entry wants that chip exactly as much as an in-progress one does.
@@ -1685,6 +1697,10 @@ async function fetchAutoTrackedCatalog(entry, env, keys = {}) {
         if (!blobStr) return [];
         const blob = JSON.parse(blobStr);
         items = slug === 'watch-history' ? blob.watchHistory : (slug === 'continue-watching' ? blob.continueWatching : (slug === 'airing-next' ? blob.airingNext : (blob.watchlist || [])));
+        if (slug === 'watchlist') {
+          const wl = await readAccountWatchlist(env, username, blob);
+          items = wl ? wl.items : [];
+        }
         // Loaded for the watchlist as well as continue-watching: it is the
         // only source of "this show has an episode coming", and a watchlist
         // entry wants that chip exactly as much as an in-progress one does.

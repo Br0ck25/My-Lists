@@ -1171,3 +1171,31 @@ const STREMIO_BADGE_KEYS = [
   "showBadgesStremioWatchlist",
   "showBadgesStremioCatalogs",
 ];
+
+// --- Catalog rows that are one account's live state -------------------------
+//
+// The detectSource names (04_config-resolution.js) whose catalog response is
+// sent no-store instead of the 24-hour public cache every other row gets --
+// see the catalog route (25_api-catalog-routes.js). A row belongs here when
+// its items change because of something the account DID (watched, added,
+// removed), under a URL that stays the same: the install link's config id
+// only changes when the config does, so a cached copy of one of these would
+// sit there, stale, for a day.
+//
+//   autotrack        Watchlist, Watch History, Continue Watching, Airing Next
+//   curated          Recommended Movies / Recommended Shows
+//   trakt-*, mdblist-*, simkl-user
+//                    the same shelves read from a connected account
+const STREMIO_LIVE_ROW_SOURCES = new Set([
+  "autotrack",
+  "curated",
+  "simkl-user",
+  "trakt-watchlist",
+  "trakt-history",
+  "trakt-continue-watching",
+  "trakt-airing-next",
+  "mdblist-watchlist",
+  "mdblist-history",
+  "mdblist-airing-next",
+  "mdblist-upnext",
+]);
