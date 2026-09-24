@@ -2006,6 +2006,14 @@ function seededShuffle(arr, seed) {
 const CHANNEL_ROTATION_SHOWS_PER_DAY = 24;
 const CHANNEL_ROTATION_EPISODES_PER_SHOW = 3;
 
+// Where a Story Lock saved before locks carried their own start date
+// (storyLockedSince) counts its walk from. Any fixed day would keep such a
+// lock walking in order; a recent one keeps the count small, and a small
+// count is what lets a run grow without moving the walk (see
+// rotateChannelDayLineup). Ticking the lock off and on again stamps a real
+// date and starts the show over from its first episode.
+const CHANNEL_STORY_LOCK_LEGACY_START = Date.UTC(2026, 8, 24);
+
 // How far a custom channel's own broadcast-schedule dials may be turned
 // (see channelRotationPlan below). The ceilings are not arbitrary: 48 shows
 // x 12 episodes is 576 videos in one day's meta response, already well past
@@ -2209,6 +2217,12 @@ function sanitizeSharedChannel(raw) {
   if (!items.length && !dynamic) return null;
   const plan = channelRotationPlan(raw);
   const itemKeys = new Set(items.map(channelItemShowKey));
+  // Locks for shows the shared picks no longer contain are dropped, so a
+  // shared channel never arrives carrying rules about titles it has not
+  // got.
+  const storyLocked = (Array.isArray(raw.storyLocked) ? raw.storyLocked : [])
+    .map((k) => sharedChannelString(k, 120))
+    .filter((k) => k && itemKeys.has(k));
   const out = {
     name: sharedChannelString(raw.name, SHARED_CHANNEL_NAME_MAX) || "Shared Channel",
     // The channel's own description, not the directory listing's. They used
@@ -2224,12 +2238,11 @@ function sanitizeSharedChannel(raw) {
     sortByAired: !!raw.sortByAired,
     dailyRotate: !!raw.dailyRotate,
     hideWatched: !!raw.hideWatched,
-    // Locks for shows the shared picks no longer contain are dropped, so a
-    // shared channel never arrives carrying rules about titles it has not
-    // got.
-    storyLocked: (Array.isArray(raw.storyLocked) ? raw.storyLocked : [])
-      .map((k) => sharedChannelString(k, 120))
-      .filter((k) => k && itemKeys.has(k)),
+    storyLocked: storyLocked,
+    // When each of those locks was turned on -- the day its walk starts
+    // from. It travels with the channel, so a copy airs the same episode on
+    // the same night as the channel it was copied from.
+    storyLockedSince: channelStoryLockSince(raw.storyLockedSince, storyLocked),
     pairParts: !!raw.pairParts,
     // A channel that keeps up with its shows keeps doing so for whoever
     // takes a copy -- it is the whole point of the flag, and it costs the
@@ -2310,7 +2323,8 @@ function sharedChannelSummary(code, record) {
 //   autoSort     a static arrangement, applied to the lineup after it is
 //                picked -- "interleave" is the one the Worker acts on
 //   storyLocked  shows that must advance in sequence through a shuffle or
-//                a rotation instead of jumping around
+//                a rotation instead of jumping around (storyLockedSince:
+//                when each was locked -- the night a rotation starts it)
 //   hideWatched  drop picks the account has already seen, until it has
 //                seen them all
 //   dynamic      a channel with no stored picks at all, re-derived per
@@ -2380,6 +2394,38 @@ function interleaveChannelItems(items) {
 function channelStoryLockedKeys(payload) {
   const raw = Array.isArray(payload && payload.storyLocked) ? payload.storyLocked : [];
   return new Set(raw.map((k) => String(k || "").trim()).filter(Boolean));
+}
+
+// When each lock was turned on, as { showKey: epoch ms } -- stamped by the
+// builder the moment a show is ticked. Kept only for shows that are actually
+// locked, and only as a real timestamp.
+function channelStoryLockSince(raw, lockedKeys) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const key of lockedKeys) {
+    if (!Object.prototype.hasOwnProperty.call(raw, key)) continue;
+    const ts = Number(raw[key]);
+    if (Number.isFinite(ts) && ts > 0) out[key] = ts;
+  }
+  return out;
+}
+
+// The rotation day each locked show's walk starts from: the day it was
+// locked, counted on the channel's own turnover so "locked this evening"
+// means tonight's lineup, not whichever day midnight UTC says. A stamp from
+// a clock running ahead is held to today rather than starting the walk
+// somewhere past its first block. A lock with no stamp (saved before locks
+// carried one) counts from CHANNEL_STORY_LOCK_LEGACY_START.
+function channelStoryLockStartDays(payload, lockedKeys, turnoverMinutes, today) {
+  const since = channelStoryLockSince(payload && payload.storyLockedSince, lockedKeys);
+  const legacy = channelRotationDay(new Date(CHANNEL_STORY_LOCK_LEGACY_START), turnoverMinutes);
+  const out = new Map();
+  for (const key of lockedKeys) {
+    out.set(key, Object.prototype.hasOwnProperty.call(since, key)
+      ? Math.min(today, channelRotationDay(new Date(since[key]), turnoverMinutes))
+      : legacy);
+  }
+  return out;
 }
 
 // Puts story-locked shows back into sequence after a shuffle.
@@ -2617,30 +2663,16 @@ function channelRotationDay(now, turnoverMinutes) {
 // dozens of episodes of one show and none of many others. Stable within a
 // day, different the next.
 //
-// hideWatchedKeys (null when the channel is not hiding watched -- or when
-// everything has been seen and the pool has reset) only trims what a block
-// CONTAINS. fullItems is the pool BEFORE that trim, and it is what a
-// story-locked show's walk is measured against: a locked block is a position
-// in the show's WHOLE run, and shrinking the run underneath the walk
-// re-maps every position at once. That is what used to teleport a show to a
-// different season overnight -- one watched episode removed re-phased every
-// later day's `day % blocks`.
-function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys, hideWatchedKeys, fullItems) {
+// lockStartDays maps each story-locked show to the rotation day its walk
+// starts from (see channelStoryLockStartDays). followWatched is set when
+// "Hide watched" has trimmed the pool against a real watch history: a locked
+// show then follows the viewer instead of the calendar (see below).
+function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys, lockStartDays, followWatched) {
   const byShow = new Map();
   for (const it of playableItems) {
     const key = channelItemShowKey(it);
     if (!byShow.has(key)) byShow.set(key, []);
     byShow.get(key).push(it);
-  }
-  // The whole runs of the story-locked shows, watched episodes included.
-  const lockedRuns = new Map();
-  if (lockedKeys.size) {
-    for (const it of (fullItems || playableItems)) {
-      const key = channelItemShowKey(it);
-      if (!lockedKeys.has(key)) continue;
-      if (!lockedRuns.has(key)) lockedRuns.set(key, []);
-      lockedRuns.get(key).push(it);
-    }
   }
   // A story-locked show never sits out a night. Its whole promise is that it
   // ADVANCES, and a day without an airing is a day the walk would skip: the
@@ -2662,33 +2694,45 @@ function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys, hide
   const items = [];
   showKeys.forEach((key, i) => {
     const isLocked = lockedKeys.has(key);
-    const showEpisodes = isLocked
-      ? sortChannelItemsSequential(lockedRuns.get(key) || byShow.get(key))
-      : byShow.get(key);
+    const showEpisodes = isLocked ? sortChannelItemsSequential(byShow.get(key)) : byShow.get(key);
     const perShow = Math.min(plan.episodes, showEpisodes.length);
     let start;
-    if (isLocked) {
-      // A story-locked show gets no random starting point: it picks up
-      // where yesterday's block left off and walks its run in broadcast
-      // order -- tonight's E1-3 means tomorrow's E4-6 and the day after's
-      // E7-9 -- wrapping back to the beginning once it reaches the end.
+    if (isLocked && followWatched) {
+      // Hiding watched, with a history to hide against: the pool is already
+      // just what this viewer has not seen, so tonight is simply the next
+      // episodes of it in broadcast order. The history is the bookmark --
+      // watch S1E1-3 and S1E4-6 is next; miss a night and S1E1-3 waits for
+      // you; binge to E9 and E10 is next. A calendar walk here would skip
+      // what a missed night left unseen, and air nothing at all on the
+      // nights it spent catching up with a binge.
+      start = 0;
+    } else if (isLocked) {
+      // Otherwise the show walks its run one block a night from the day it
+      // was locked: E1-3 that night, E4-6 the next, E7-9 the one after,
+      // wrapping back to the beginning once it reaches the end.
       //
-      // The cycle's last block may be SHORT when the run is not a multiple
-      // of the block size (eight episodes at three a night end on E7-8)
-      // rather than clamping the start back to fill the block, which
-      // replayed the episode before it -- a run of eight used to air E6
-      // twice every cycle. "Always in order" means no episode twice.
+      // Counting nights from the lock, not from 1970, is what keeps the walk
+      // where it is when the run changes length. It used to be `day % blocks`
+      // with `day` in the tens of thousands, so one episode more or less --
+      // "Automatically add new episodes", a Live Cloud Sync rebuild, an edit
+      // in the builder -- could change `blocks` and throw the show to an
+      // unrelated block, often another season. From the lock, on the first pass
+      // through the run the count is below `blocks` and does not depend on
+      // it at all: new episodes at the end just extend the walk. Once the run
+      // has looped, a change in its block count moves the walk by about one
+      // block per loop so far -- back when the run grew, forward when it
+      // shrank. Still in order: a replay or a skip, never a scramble.
+      // (Changing the episodes-a-night dial re-cuts the blocks the same
+      // way.) Surviving even that would need a stored cursor, and a
+      // lineup is resolved statelessly from the payload and the clock.
       //
-      // What this deliberately does not survive: the pool itself changing
-      // size -- auto new episodes folding in a season, Live Cloud Sync
-      // rebuilding, picks added or removed in the builder. `day % blocks`
-      // then re-phases AT the change, so the cycle skips or repeats one
-      // block of it (never out of order: the night is still one contiguous
-      // in-order block). Surviving that needs a stored cursor, and a
-      // lineup is resolved statelessly from the payload and the clock --
-      // so one re-phase per pool change is the accepted cost.
+      // The last block of a loop may be SHORT when the run is not a
+      // multiple of the block size (eight episodes at three a night end on
+      // E7-8) rather than clamping the start back to fill it, which replayed
+      // the episode before it -- "in order" means no episode twice.
       const blocks = Math.max(1, Math.ceil(showEpisodes.length / perShow));
-      start = (((day % blocks) + blocks) % blocks) * perShow;
+      const walked = day - ((lockStartDays && lockStartDays.get(key)) || 0);
+      start = (((walked % blocks) + blocks) % blocks) * perShow;
     } else {
       // A contiguous block (not scattered episodes) feels like an actual
       // evening's run of a show -- seeded per-show so different shows
@@ -2700,16 +2744,7 @@ function rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys, hide
       );
       start = starts.length ? starts[0] : 0;
     }
-    // Hide watched drops seen episodes from the block AFTER it is chosen.
-    // The walk keeps its place in the run either way: what has already been
-    // seen is not re-aired, and the day after still continues the same
-    // sequence. (For an unlocked show this is a no-op -- its pool was
-    // already trimmed, which is what keeps a seen episode from costing it a
-    // slot.)
-    for (const it of showEpisodes.slice(start, start + perShow)) {
-      if (hideWatchedKeys && channelItemIsWatched(it, hideWatchedKeys)) continue;
-      items.push(it);
-    }
+    items.push(...showEpisodes.slice(start, start + perShow));
   });
   return items;
 }
@@ -3307,26 +3342,27 @@ async function resolveChannelLineup(payload, opts = {}) {
   // the full pool rather than going dark -- an empty channel reads as
   // broken, and there is nothing else left to offer.
   //
-  // The untrimmed pool and the watched set both travel on to the rotation
-  // (see rotateChannelDayLineup): a story-locked show's block is a position
-  // in its WHOLE run, and trimming the run underneath that walk is what
-  // re-phased it, day by day, into a different season. hideWatchedKeys
-  // stays null on the all-seen reset, because there the channel has chosen
-  // to forget what was seen.
-  const fullPlayableItems = playableItems;
-  let hideWatchedKeys = null;
+  // followWatched tells the rotation the trim happened against a real
+  // history, which is when a story-locked show follows the viewer rather
+  // than the calendar (see rotateChannelDayLineup). An empty history does
+  // not count: resolveConfig hands over [] for an account with no tracking
+  // at all, and following THAT would hold a locked show on its first three
+  // episodes forever. Nor does the all-seen reset, where the channel has
+  // chosen to forget what was seen.
+  let followWatched = false;
   if (payload.hideWatched) {
     const watchedKeys = channelWatchedKeySet(opts.watchHistory);
     const unwatched = playableItems.filter((it) => !channelItemIsWatched(it, watchedKeys));
     if (unwatched.length) {
       playableItems = unwatched;
-      hideWatchedKeys = watchedKeys;
+      followWatched = watchedKeys.size > 0;
     }
   }
   if (!playableItems.length) return null;
   let items;
   if (payload.dailyRotate) {
-    items = rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys, hideWatchedKeys, fullPlayableItems);
+    const lockStartDays = channelStoryLockStartDays(payload, lockedKeys, plan.turnover, day);
+    items = rotateChannelDayLineup(playableItems, plan, seed, day, lockedKeys, lockStartDays, followWatched);
   } else if (payload.shuffle && !payload.sortByAired) {
     items = shuffleChannelItems(playableItems, seed, lockedKeys);
   } else {

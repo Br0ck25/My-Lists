@@ -11313,43 +11313,106 @@ describe("worker: channel video ids are real stream requests", () => {
     }
   });
 
-  it("keeps the walk in step while hide watched trims what has already aired", async () => {
-    // Hide watched used to shrink the pool the walk counted over, so every
-    // watched episode re-mapped every later day to a different block -- the
-    // show could rewind to S1E1 or jump to S3E1 overnight. The walk is now
-    // measured against the whole run: seen episodes inside a block are not
-    // re-aired, and the next day still continues the same sequence.
+  // A run of three seasons x four episodes, in broadcast order, as ids.
+  const threeSeasons = (perSeason) => {
     const items = [];
     for (let s = 1; s <= 3; s++)
-      for (let e = 1; e <= 6; e++)
+      for (let e = 1; e <= perSeason; e++)
         items.push(ep({ imdbId: "tt9001", season: s, episode: e, title: `S${s}E${e}` }));
-    const opts = { dailyRotate: true, rotateShows: 1, rotateEpisodes: 3, storyLocked: ["tt9001"], hideWatched: true };
-    const pos = (id) => {
-      const [, s, e] = id.split(":");
-      return (Number(s) - 1) * 6 + (Number(e) - 1);
+    return items;
+  };
+  const on = (d, hour = 12) => new Date(Date.UTC(2026, 2, 4 + d, hour));
+
+  it("starts a newly locked show at its first episode on the day it is locked", async () => {
+    // The request, word for word: S1E1-3 one night, S1E4-6 the next, S1E7-9
+    // the one after -- from the start of the run, not from wherever a count
+    // of days since 1970 happened to land.
+    const items = [...threeSeasons(4), ...poolOf(8, 4)];
+    const opts = {
+      dailyRotate: true, rotateShows: 3, rotateEpisodes: 3,
+      storyLocked: ["tt9001"], storyLockedSince: { tt9001: on(1, 20).getTime() },
     };
-    let history = [];
-    let prev = null;
-    for (let d = 0; d < 5; d++) {
-      const meta = await channelMeta(items, opts, {
-        now: new Date(Date.UTC(2026, 2, 4 + d, 12)),
-        watchHistory: history,
-      });
-      const serial = idsOf(meta, "tt9001");
-      assert.equal(serial.length, 3, `day ${d}: a block the viewer has not seen plays whole`);
-      assert.ok(serial.every((id) => !history.some((h) => h.id === id)), `day ${d}: nothing re-airs`);
-      if (prev !== null) {
-        assert.equal(pos(serial[0]), (pos(prev) + 1) % 18, `day ${d}: picks up exactly where yesterday stopped`);
-      }
-      const p = pos(serial[0]);
-      assert.deepEqual(serial.map(pos), [p, (p + 1) % 18, (p + 2) % 18],
-        `day ${d}: three consecutive episodes of the run`);
-      prev = serial[serial.length - 1];
-      history = [...history, ...serial.map((id) => {
-        const [, s, e] = id.split(":");
-        return { type: "episode", id, showId: "tt9001", seasonNum: Number(s), episodeNum: Number(e) };
-      })];
+    // Locked on the evening of March 5th: a day on which the old count,
+    // `day % 4`, was 1 -- it would have opened on S1E4.
+    const nights = [];
+    for (let d = 1; d < 6; d++) nights.push(idsOf(await channelMeta(items, opts, { now: on(d) }), "tt9001"));
+    assert.deepEqual(nights, [
+      ["tt9001:1:1", "tt9001:1:2", "tt9001:1:3"],
+      ["tt9001:1:4", "tt9001:2:1", "tt9001:2:2"],
+      ["tt9001:2:3", "tt9001:2:4", "tt9001:3:1"],
+      ["tt9001:3:2", "tt9001:3:3", "tt9001:3:4"],
+      ["tt9001:1:1", "tt9001:1:2", "tt9001:1:3"],
+    ]);
+    // A stamp from a clock running ahead is held to today: episode 1, not
+    // some block past it.
+    const ahead = { ...opts, storyLockedSince: { tt9001: on(3).getTime() } };
+    assert.deepEqual(idsOf(await channelMeta(items, ahead, { now: on(1) }), "tt9001"),
+      ["tt9001:1:1", "tt9001:1:2", "tt9001:1:3"]);
+  });
+
+  it("keeps its place when the run grows -- new episodes extend the walk instead of moving it", async () => {
+    // "Automatically add new episodes" folding one in a night. Counted from
+    // 1970, every change in the run's block count threw the show to an
+    // unrelated block -- S3E2-4 one night, S1E7-9 the next, then backwards.
+    const opts = {
+      dailyRotate: true, rotateShows: 1, rotateEpisodes: 3,
+      storyLocked: ["tt9001"], storyLockedSince: { tt9001: on(0).getTime() },
+    };
+    const aired = [];
+    for (let d = 0; d < 6; d++) {
+      const items = [];
+      for (let s = 1; s <= 2; s++)
+        for (let e = 1; e <= 10; e++) items.push(ep({ imdbId: "tt9001", season: s, episode: e, title: `S${s}E${e}` }));
+      for (let e = 1; e <= 4 + d; e++) items.push(ep({ imdbId: "tt9001", season: 3, episode: e, title: `S3E${e}` }));
+      aired.push(...idsOf(await channelMeta(items, opts, { now: on(d) }), "tt9001"));
     }
+    const run = [1, 2].flatMap((s) => Array.from({ length: 10 }, (_, i) => `tt9001:${s}:${i + 1}`));
+    assert.deepEqual(aired, run.slice(0, 18), "six nights, eighteen episodes, straight through the run");
+  });
+
+  it("with hide watched on, a locked show picks up at the first episode the viewer has not seen", async () => {
+    // Hide watched turns the history into the bookmark: watch a night's
+    // three and the next three follow; miss a night and the same three wait;
+    // binge ahead and the channel continues from where the binge stopped --
+    // never skipping what was not watched, never a night with nothing on.
+    const items = threeSeasons(6);
+    const opts = {
+      dailyRotate: true, rotateShows: 1, rotateEpisodes: 3, hideWatched: true,
+      storyLocked: ["tt9001"], storyLockedSince: { tt9001: on(0).getTime() },
+    };
+    // Something from another show, so the account has a history at all.
+    const history = [watched("tt5555", 1, 1)];
+    const night = async (d) => idsOf(await channelMeta(items, opts, { now: on(d), watchHistory: history }), "tt9001");
+    const saw = (ids) => ids.forEach((id) => {
+      const [, s, e] = id.split(":");
+      history.push(watched("tt9001", Number(s), Number(e)));
+    });
+
+    const first = await night(0);
+    assert.deepEqual(first, ["tt9001:1:1", "tt9001:1:2", "tt9001:1:3"]);
+    saw(first);
+    assert.deepEqual(await night(1), ["tt9001:1:4", "tt9001:1:5", "tt9001:1:6"], "watched along: the next three");
+    // Night 1 was never watched.
+    assert.deepEqual(await night(2), ["tt9001:1:4", "tt9001:1:5", "tt9001:1:6"], "a missed night waits for the viewer");
+    saw(["tt9001:1:4", "tt9001:1:5", "tt9001:1:6", "tt9001:2:1", "tt9001:2:2", "tt9001:2:3"]);
+    assert.deepEqual(await night(3), ["tt9001:2:4", "tt9001:2:5", "tt9001:2:6"], "a binge is continued, not caught up with");
+  });
+
+  it("walks the calendar when hide watched has no history to follow", async () => {
+    // resolveConfig hands over [] for an account with no tracking. Following
+    // that would hold the show on S1E1-3 forever.
+    const items = threeSeasons(6);
+    const opts = {
+      dailyRotate: true, rotateShows: 1, rotateEpisodes: 3, hideWatched: true,
+      storyLocked: ["tt9001"], storyLockedSince: { tt9001: on(0).getTime() },
+    };
+    const nights = [];
+    for (let d = 0; d < 3; d++) nights.push(idsOf(await channelMeta(items, opts, { now: on(d), watchHistory: [] }), "tt9001"));
+    assert.deepEqual(nights, [
+      ["tt9001:1:1", "tt9001:1:2", "tt9001:1:3"],
+      ["tt9001:1:4", "tt9001:1:5", "tt9001:1:6"],
+      ["tt9001:2:1", "tt9001:2:2", "tt9001:2:3"],
+    ]);
   });
 
   it("ends the cycle on a short block instead of replaying the episode before it", async () => {
@@ -11868,6 +11931,21 @@ describe("worker: channel share links", () => {
     const created = await share(env, { channel: channelOf({ storyLocked: ["tt0108778", "tt_not_here"] }) });
     const fetched = await read(env, created.body.code);
     assert.deepEqual(fetched.body.channel.storyLocked, ["tt0108778"]);
+  });
+
+  it("carries the day each Story Lock started, and only for locks it keeps", async () => {
+    // The copy airs the same episode on the same night as the channel it was
+    // copied from; a date for a lock that was dropped, or one that is not a
+    // date, goes nowhere.
+    const env = makeEnv();
+    const created = await share(env, { channel: channelOf({
+      storyLocked: ["tt0108778", "tt_not_here"],
+      storyLockedSince: { tt0108778: 1774000000000, tt_not_here: 1774000000000, constructor: 5 },
+    }) });
+    const fetched = await read(env, created.body.code);
+    assert.deepEqual(fetched.body.channel.storyLockedSince, { tt0108778: 1774000000000 });
+    const junk = await share(env, { channel: channelOf({ storyLocked: ["tt0108778"], storyLockedSince: { tt0108778: "soon" } }) });
+    assert.deepEqual((await read(env, junk.body.code)).body.channel.storyLockedSince, {});
   });
 
   it("carries the rules that make a channel keep itself up to date", async () => {

@@ -5291,7 +5291,7 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
       description: "",
       dailyRotate: false, rotateShows: 0, rotateEpisodes: 0, rotateTurnover: 0,
       rotateTurnoverTime: "", rotateTurnoverZone: "utc", hideWatched: false,
-      storyLocked: [], pairParts: false, pairedGroups: [],
+      storyLocked: [], storyLockedSince: {}, pairParts: false, pairedGroups: [],
       autoNewEpisodes: false, newEpisodesAtTop: false,
       liveSync: false, sourceUrl: "", dynamic: "",
     });
@@ -5355,6 +5355,34 @@ describe("client: a channel's broadcast schedule and smart rules", () => {
     client.call("updateChannelPairControls");
     assert.deepEqual(plain(client.get("channelDraftPairedGroups")), [],
       "a rule about one episode is not a pairing");
+  });
+
+  it("stamps a Story Lock with when it was ticked, and keeps that stamp through every save", () => {
+    // A rotating channel starts a locked show at episode 1 on the day it is
+    // locked. Re-saving must not restart it; unticking and ticking again is
+    // how it is started over on purpose.
+    const client = builder([epOf("tt1", 1, 1, "Simpsons"), epOf("tt1", 1, 2, "Simpsons")]);
+    client.set("channelDraftStoryLockedSince", {});
+    const before = Date.now();
+    client.call("toggleChannelStoryLock", "tt1", true);
+    const stamped = client.get("channelDraftStoryLockedSince").tt1;
+    assert.ok(stamped >= before && stamped <= Date.now(), "stamped at the tick");
+    assert.deepEqual(plain(client.call("readChannelBroadcastSettings").storyLockedSince), { tt1: stamped });
+
+    client.call("saveLocalChannel", {
+      channelId: "ch1", name: "Block Party", items: [epOf("tt1", 1, 1, "Simpsons")],
+      dailyRotate: true, storyLocked: ["tt1"], storyLockedSince: { tt1: stamped, tt_unlocked: 5 },
+    });
+    client.call("saveLocalChannelsMap", client.call("loadLocalChannels"));
+    const saved = client.call("loadLocalChannels").ch1;
+    assert.deepEqual(plain(saved.storyLockedSince), { tt1: stamped }, "kept, and only for a show that is locked");
+
+    client.call("applyChannelBroadcastSettings", saved);
+    assert.deepEqual(plain(client.call("readChannelBroadcastSettings").storyLockedSince), { tt1: stamped },
+      "reopening the builder and saving again keeps the original day");
+
+    client.call("toggleChannelStoryLock", "tt1", false);
+    assert.deepEqual(plain(client.call("readChannelBroadcastSettings").storyLockedSince), {});
   });
 
   it("drops a Story Lock for a show that is no longer in the channel", () => {
