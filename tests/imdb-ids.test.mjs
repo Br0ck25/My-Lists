@@ -134,9 +134,10 @@ describe("applyBetterPostersToTmdbTiles", () => {
     await c.call("applyBetterPostersToTmdbTiles", rootWith([tile]));
     assert.equal(c.__seen.length, 1);
     assert.deepEqual(c.__seen[0].items, [{ id: "tmdb:278", type: "movie" }]);
-    assert.equal(tile._img.src, "https://btttr.cc/poster/imdb/poster-default/tt0068646.jpg");
+    // Served from the Worker's own copy (serveBetterPoster), not btttr.cc.
+    assert.equal(tile._img.src, "https://example.com/bp/poster/tt0068646.jpg");
     // The poster modal reads this back, so it has to match what is shown.
-    assert.equal(tile.dataset.poster, "https://btttr.cc/poster/imdb/poster-default/tt0068646.jpg");
+    assert.equal(tile.dataset.poster, "https://example.com/bp/poster/tt0068646.jpg");
   });
 
   it("leaves a tile alone when TMDB has no IMDB id for it", async () => {

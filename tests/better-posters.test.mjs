@@ -264,7 +264,8 @@ describe("BetterPosters end-to-end via the catalog route", () => {
     assert.equal(on.body.metas.length, 1);
     assert.equal(
       on.body.metas[0].poster,
-      `https://btttr.cc/poster/imdb/poster-default/${SHOW}.jpg`
+      `https://example.test/bp/poster/${SHOW}.jpg`,
+      "served from this Worker's own copy (serveBetterPoster), not btttr.cc directly"
     );
   });
 
@@ -287,7 +288,7 @@ describe("BetterPosters end-to-end via the catalog route", () => {
     assert.equal(res.status, 200);
     assert.equal(
       res.body.metas[0].poster,
-      `https://btttr.cc/poster-rq/imdb/poster-default/${SHOW}.jpg?tag=none&rs=IM`
+      `https://example.test/bp/poster-rq/${SHOW}.jpg?tag=none&rs=IM`
     );
   });
 
@@ -316,7 +317,7 @@ describe("BetterPosters end-to-end via the catalog route", () => {
     const poster = res.body.metas[0].poster;
     assert.ok(poster.includes("/api/poster-badge?"), "badge pass must still run");
     assert.ok(
-      decodeURIComponent(poster).includes("btttr.cc/poster/imdb/poster-default/" + SHOW),
+      decodeURIComponent(poster).includes("https://example.test/bp/poster/" + SHOW + ".jpg"),
       "the badge must be layered over the BetterPosters URL"
     );
   });
@@ -401,7 +402,7 @@ describe("Better Posters survives the /api/save install round trip", () => {
   it("carries the setting through /api/save into the served catalog", async () => {
     assert.equal(
       await saveAndFetch({ betterPosters: true }),
-      `https://btttr.cc/poster/imdb/poster-default/${SAVE_SHOW}.jpg`,
+      `https://example.test/bp/poster/${SAVE_SHOW}.jpg`,
       "a config saved through /api/save must serve BetterPosters artwork"
     );
   });
@@ -416,12 +417,13 @@ describe("Better Posters survives the /api/save install round trip", () => {
         betterPostersLang: "de",
         betterPostersRatingSource: "IM",
       }),
-      `https://btttr.cc/poster-rq/imdb/poster-default/${SAVE_SHOW}.jpg?tag=none&lang=de&rs=IM`
+      `https://example.test/bp/poster-rq/${SAVE_SHOW}.jpg?tag=none&lang=de&rs=IM`
     );
   });
 
   it("still serves the original artwork when the setting is off", async () => {
-    assert.ok(!(await saveAndFetch({})).includes("btttr.cc"));
+    const plain = await saveAndFetch({});
+    assert.ok(!plain.includes("btttr.cc") && !plain.includes("/bp/"), plain);
   });
 
   // /api/save is unauthenticated and the stored value is interpolated into a
@@ -433,7 +435,7 @@ describe("Better Posters survives the /api/save install round trip", () => {
         betterPostersLang: "zh-CN",
         betterPostersRatingSource: "../../evil",
       }),
-      `https://btttr.cc/poster/imdb/poster-default/${SAVE_SHOW}.jpg`
+      `https://example.test/bp/poster/${SAVE_SHOW}.jpg`
     );
   });
 });
@@ -458,7 +460,8 @@ describe("Better Posters on the website", () => {
     const c = loadClient({ storage: ON });
     assert.equal(
       c.call("resolveClientPoster", movie(), "orig.jpg"),
-      "https://btttr.cc/poster/imdb/poster-default/tt0111161.jpg"
+      "https://example.com/bp/poster/tt0111161.jpg",
+      "loaded from this Worker's own copy, not btttr.cc directly"
     );
   });
 
@@ -472,7 +475,7 @@ describe("Better Posters on the website", () => {
     } });
     assert.equal(
       c.call("resolveClientPoster", movie(), "orig.jpg"),
-      "https://btttr.cc/poster-rq/imdb/poster-default/tt0111161.jpg?tag=none&rs=IM"
+      "https://example.com/bp/poster-rq/tt0111161.jpg?tag=none&rs=IM"
     );
   });
 
@@ -480,7 +483,7 @@ describe("Better Posters on the website", () => {
     const c = loadClient({ storage: ON });
     assert.equal(
       c.call("resolveClientPoster", { id: "tt0903747:5:16", poster: "still.jpg" }, "still.jpg"),
-      "https://btttr.cc/poster/imdb/poster-default/tt0903747.jpg"
+      "https://example.com/bp/poster/tt0903747.jpg"
     );
     assert.equal(c.call("resolveClientPoster", { id: "tmdb:550", poster: "keep.jpg" }, "keep.jpg"), "keep.jpg");
   });
@@ -490,7 +493,7 @@ describe("Better Posters on the website", () => {
     const c = loadClient({ storage: { ...ON, "myListAddon:adultContentFilter": "1" } });
     const out = c.call("resolveClientPoster", movie({ isAdult: true }), "orig.jpg");
     assert.ok(out.includes("/api/safe-poster"), out);
-    assert.ok(!out.includes("btttr.cc"), out);
+    assert.ok(!out.includes("btttr.cc") && !out.includes("/bp/"), out);
   });
 
   it("never touches artwork the add-on generates itself", () => {
@@ -521,7 +524,7 @@ describe("Better Posters on the website", () => {
     const c = loadClient({ storage: { ...ON, "myListAddon:betterPostersRating": "0" } });
     const once = c.call("resolveClientPoster", movie(), "orig.jpg");
     const twice = c.call("resolveClientPoster", movie(), once);
-    assert.equal(once, "https://btttr.cc/poster-g/imdb/poster-default/tt0111161.jpg");
+    assert.equal(once, "https://example.com/bp/poster-g/tt0111161.jpg");
     assert.equal(twice, once);
   });
 });
@@ -573,7 +576,7 @@ describe("Better Posters reaches the shared renderers", () => {
     const c = loadClient({ storage: ON });
     const m = movie();
     const html = c.call("livePreviewPosterHtml", m);
-    assert.ok(html.includes("https://btttr.cc/poster/imdb/poster-default/tt0111161.jpg"), html.slice(0, 300));
+    assert.ok(html.includes("https://example.com/bp/poster/tt0111161.jpg"), html.slice(0, 300));
     // The original has to survive, or switching the setting back off would
     // have nothing to restore.
     assert.equal(m.poster, "orig.jpg");
@@ -582,7 +585,7 @@ describe("Better Posters reaches the shared renderers", () => {
   it("renders through renderMediaCard, which used to short-circuit", () => {
     const c = loadClient({ storage: ON });
     const html = c.call("renderMediaCard", movie(), {});
-    assert.ok(html.includes("https://btttr.cc/poster/imdb/poster-default/tt0111161.jpg"), html.slice(0, 300));
+    assert.ok(html.includes("https://example.com/bp/poster/tt0111161.jpg"), html.slice(0, 300));
   });
 
   it("renderMediaCard still honours the Adult Content Filter", () => {

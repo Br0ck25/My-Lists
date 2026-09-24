@@ -6,6 +6,84 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ✨ Most Watched Today rolls over instead of going empty at midnight
+
+"Today" was counted per Eastern day, so at midnight the list emptied and refilled one watch at a time. Now the list stays:
+- Titles watched today go on top, most watched first.
+- Everything else keeps its place below.
+- The list stays 25 long, so each newly watched title pushes the last one off.
+
+It's rebuilt every 15 minutes instead of hourly, so a title just watched reaches the top promptly. The rolling list is kept for 60 days of nobody opening it.
+
+- Tests: three in `tests/my-lists-addon-charts.test.mjs`, covering yesterday's list surviving midnight, today's watches going on top of the carried-over ones, and a newcomer pushing the 25th title off. All three fail on the previous code.
+
+### 🐛 Dragging to reorder froze the page until it was reloaded
+
+Mouse reordering (Live Preview, its Edit mode, and every other reorderable list) used the browser's native drag-and-drop. That hands the gesture to the operating system's drag loop, while `createSortableList` moves the dragged row around the page underneath it. Moving or re-rendering the source of a native drag is what native drag-and-drop handles worst: the drag can end without `dragend`, or not end at all, and the page ignores clicks until it's reloaded. The earlier fixes reduced the work done on each step of a drag, which never touched this. Automated drags don't exercise the real OS drag loop, which is why none of the tests could reproduce it.
+
+- Every reorder is now driven by pointer events, for mouse, touch and pen alike. That means no native drag, no drag image and no OS drag loop. A drag always ends, on `pointerup`, `pointercancel` or the window losing focus.
+- A mouse on a handle starts dragging once it actually moves, so a plain click on a handle isn't a reorder.
+- `draggable="true"` was removed from every handle and card. Any native drag that still starts inside a list (an `<img>` is draggable by default) is refused.
+- The Edit-mode handle gets `touch-action: none`, like the preview handle, so a touch drag isn't taken over by page scrolling.
+
+Verified in Chromium with real mouse input:
+- Live Preview: row 8 dragged to row 19, with the page auto-scrolling about 4,000 px.
+- Edit mode: row 8 dragged to row 37.
+- A click on a handle leaves the order alone, and the page takes clicks right after a drop.
+- Touch drags and a list re-rendered mid-drag still behave.
+
+### 🐛 Wrong posters on list cards, and tiles left blank or "No poster" while btttr.cc was down
+
+**The wrong posters were an ID problem.** On a list card (Discover, My Lists, creator profiles, Curated For You), the poster error handler looked up the list's name instead of the show's. `handlePosterImgError` took the first of `.live-preview-poster-card`, `.list-card` or `[data-title]` above the image. The mini tiles all sit inside a `.list-card`, whose `data-name` is the list's name, so it never reached the tile's own data. A failed poster was then looked up by list name and cached under it:
+- "Hulu" matched a show called Paradise, so The Simpsons and American Dad! in the Hulu card both showed Paradise;
+- "Prime Video Top 10" matched *Video & Arcade Top 10*, which showed on Lioness;
+- "Disney+" and "Trakt Most Played" matched similar near-namesakes.
+
+`posterItemIdentity` now reads the image, then the nearest elements that describe one title, and stops at a list card. It skips anything carrying `data-url`, because the Curated cards' tile wrapper holds the list's title in `data-title`. `resolveMissingPostersInDom` uses it too. For a failed Better Poster, the IMDb id comes from the poster's own URL, which is as certain as it gets.
+
+**The blank and "No poster" tiles were btttr.cc.** On 2026-09-24 its CDN still answered in under a second for anything it had drawn, with copies 3–7 days old. For anything else its origin gave a 504 after 30 s or no answer in 90, and its homepage timed out too. The Worker waited up to 55 s on each such poster, then answered 502, and the page's fallback then looked up the wrong title (above).
+
+- **A tile waits on btttr.cc for 6 s at most.** After that the Worker answers without it, and the fetch carries on in the background (25 s, inside what `waitUntil` allows), so the next visit finds it stored.
+  - **The website** gets a 503 and shows the title's own ordinary poster. When the page's `/api/bp/warm` call, which keeps trying for up to 55 s, reports the Better Poster fetched (its response now lists `ready` URLs), the tile switches over. The new image is loaded first, so the swap is one clean change.
+  - **Stremio/Nuvio** get the title's ordinary poster from the same URL, marked `no-store`, since an app has no fallback of its own and an error there is a blank tile. It becomes the Better Poster as soon as one exists.
+  - Images with no error handler of their own (the builders' picks, the Curated cards) are caught by one capture-phase listener instead of showing a broken-image icon.
+- **A failure is remembered for 10 minutes,** in the isolate and the edge cache, so a page of such titles is answered at once instead of each tile waiting on the same dead end.
+- **Failures are retried by the cron.** They go on a list (`bp:retry:v1`) that `prewarmBetterPosters` works through first, a random few each tick, until btttr.cc draws them. The list is written at most once a minute per isolate, or once per warm batch, and the cron writes it only when it fetches one.
+- **Posters are refreshed daily instead of weekly.** The stored copy is re-fetched once it's a day old, both when it's served and by the cron's pass over the shared charts. The browser and the edge keep it for 6 hours, btttr.cc's own lifetime. Hourly would bring back the same picture almost every time, because btttr.cc's own CDN was serving copies 3–7 days old.
+
+- Tests:
+  - `tests/poster-identity.test.mjs` (8, all failing on the previous code) covers the tile's own title being used on Discover, Curated and My Lists cards, no guessing from a list's name, and a stand-in found by the id in a Better Poster's URL and swapped out once warm reports it (only after it has loaded, and back if it then fails).
+  - `tests/better-posters-mirror.test.mjs` (7 → 12) adds: the website's 503 after the wait, with the fetch finishing behind it; an app's uncached stand-in; a miss not re-asked; the daily re-fetch; and a failed poster listed, left out of `ready`, and fetched by a later cron tick.
+
+### 🐛 Better Posters loaded slowly or not at all: served from the Worker's own copy now
+
+Tiles sat blank all over the site with Better Posters on, and filled in when it was switched off. btttr.cc serves artwork it has drawn recently from Cloudflare's cache in about 0.2 s, and draws everything else at its origin. That origin was struggling: 40–50 s per poster, or a 504 (its own homepage 504'd after 30 s). Its CDN only keeps a drawing for about a week, so any title nobody had asked for lately came from that origin, and the tile waited with no error to fall back on. Nothing on our side changed; btttr.cc's origin got slow.
+
+- **`/bp/<style>/<imdb id>.jpg`** serves each Better Poster from this Worker's copy (`serveBetterPoster`, in `05_catalog-core.js`). It is fetched from btttr.cc once and then kept:
+  - in KV, which is global, so a poster fetched anywhere is instant everywhere;
+  - behind the edge cache;
+  - refreshed in the background once it is a day old;
+  - kept for 60 days, so btttr.cc having a bad day goes unnoticed.
+
+  It accepts only styles and options `buildBetterPosterUrl` can produce (anything else is a 404), so it can't be pointed anywhere else on btttr.cc.
+- **The website and the Stremio/Nuvio rows both use it.** The catalog, search and meta routes pass their origin into `betterPostersOptionsFrom`. The badge route reads the copy directly for a `/bp/` URL on its own origin (a Worker fetching its own hostname doesn't reliably reach itself), and another host's `/bp/` still can't get past the poster allowlist.
+- **Warming:**
+  - **On the website:** every Better Poster that lands on a page, including lazy ones far below the fold, goes to `/api/bp/warm`, so missing posters are fetched while the page is being read. The website sends one batch at a time, the Worker fetches four at a time, and the endpoint is rate-limited per IP.
+  - **In the cron:** `prewarmBetterPosters` fetches artwork for every title on the shared charts (the chart pre-warm now remembers their ids, plus the My Lists Addon Charts). It does this for every Better Posters style in use in the last 14 days, recorded as posters are served. Each tick checks 60 title/style pairs and fetches up to 8 missing ones, from the same spare budget as New on Streaming.
+- **Every tile shows a Better Poster once btttr.cc has drawn it.** What happens while it hasn't is covered in the entry above.
+
+Measured in Chromium, with a stand-in btttr.cc that takes 8 s to draw a poster: on a second visit, every row's posters appeared within 7–55 ms of scrolling to it. The one wait left is the first time anyone ever looks at a title that isn't on a shared chart.
+
+- Tests: `tests/better-posters-mirror.test.mjs` (7) covers:
+  - fetching once, then serving the copy when btttr.cc fails;
+  - each style being its own image;
+  - nothing outside the real styles and ids being fetched;
+  - an uncached answer when btttr.cc can't supply a poster;
+  - warming (missing fetched, stored skipped, foreign URLs ignored);
+  - the badge route reading the copy, and refusing another host's `/bp/`.
+
+  `tests/better-posters.test.mjs` now expects the `/bp/` URLs. The test harness's KV gained binary values and metadata, as real KV has.
+
 ### 🐛 Airing Next and Recommended froze when the website wasn't opened
 
 Both shelves are built by the website and pushed up as snapshots, and nothing on the server rebuilt them. Someone who used only Stremio or Nuvio for ten days saw the same Airing Next the whole time: episodes that had aired still listed as coming, newly announced episodes missing, and shows started since never added. Recommended stayed frozen at whatever the Discover tab last showed.

@@ -1218,19 +1218,12 @@ function createSortableList(container, options = {}) {
   // and touch alike.
   const AUTO_SCROLL_EDGE = 90;   // distance from an edge where scrolling starts
   const AUTO_SCROLL_MAX = 20;    // px per frame at the very edge
-  // A native (HTML5) drag fires dragover continuously -- the spec says at
-  // least every 350ms, even with the pointer held still -- for as long as it
-  // lasts. Silence well past that means it ended without dragend reaching
-  // this list.
-  const HTML5_DRAG_SILENCE_MS = 1500;
   let autoScrollRaf = null;
   let lastClientX = 0;
   let lastClientY = 0;
   let scrollHost = null;
   let anchorEl = null;
   let anchorPrev = '';
-  let html5Drag = false;
-  let lastDragEventAt = 0;
 
   // The page itself scrolls for the catalog and My Lists surfaces, but this
   // same function also drives lists inside scrollable panels, so scroll
@@ -1265,7 +1258,6 @@ function createSortableList(container, options = {}) {
     if (anchorEl) anchorEl.style.overflowAnchor = anchorPrev;
     anchorEl = null;
     scrollHost = null;
-    html5Drag = false;
   }
 
   function scrollPos() {
@@ -1275,13 +1267,12 @@ function createSortableList(container, options = {}) {
   function autoScrollStep() {
     autoScrollRaf = null;
     if (!activeItem) return;
-    // A drag can end without this list hearing about it: the row is no
-    // longer on the page (the list was re-rendered under it -- dragend then
-    // fires on a detached node and never bubbles here), or a native drag has
-    // gone silent. Left running, this loop kept scrolling the page and
-    // re-attaching the stale row every frame, indefinitely.
-    if (!activeItem.isConnected || (html5Drag && Date.now() - lastDragEventAt > HTML5_DRAG_SILENCE_MS)) {
-      finishHtml5OrPointerDrag();
+    // The row is no longer on the page: the list was re-rendered under the
+    // drag (a background sync applying the account's config does this).
+    // Left running, this loop kept scrolling the page and re-attaching the
+    // stale row every frame, indefinitely.
+    if (!activeItem.isConnected) {
+      stopDragging();
       return;
     }
     const hostBox = scrollHost ? scrollHost.getBoundingClientRect() : null;
@@ -1340,105 +1331,76 @@ function createSortableList(container, options = {}) {
     document.body.style.userSelect = '';
   }
 
-  // Ends whichever kind of drag is in progress -- the path the watchdog in
-  // autoScrollStep takes when the drag's own end event never arrived.
-  function finishHtml5OrPointerDrag() {
-    if (html5Drag) {
-      endDragSession();
-      if (activeItem) activeItem.classList.remove(dragClass);
-      activeItem = null;
-      onReorder();
-    } else {
-      stopDragging();
-    }
-  }
+  // Every reorder is driven by pointer events -- mouse, touch and pen alike.
+  //
+  // Mouse drags used to go through the browser's native drag-and-drop instead
+  // (draggable="true" handles, dragstart/dragover/dragend). That hands the
+  // gesture to the operating system's own drag loop, and this function then
+  // moves the dragged row around the page underneath it -- which is exactly
+  // what a native drag handles worst: a drag whose source moves or is
+  // re-rendered can end without dragend, or not end at all, leaving the page
+  // ignoring clicks until it is reloaded. That is what "the page completely
+  // freezes and I have to refresh" was, and why fixes to the work done per
+  // step never touched it. Pointer events keep the whole gesture in this
+  // function's hands: no drag image, no OS loop, and an end that always
+  // arrives (pointerup, pointercancel, or the window losing focus).
+  //
+  // Native drags are refused outright, too: a stale draggable attribute, or
+  // an <img> inside an item (images are draggable by default), would
+  // otherwise start one and cancel the pointer gesture under it.
+  container.addEventListener('dragstart', (e) => {
+    if (e.target && e.target.closest && e.target.closest(itemSelector)) e.preventDefault();
+  });
 
-  // HTML5 Drag events for desktop when handle exists
-  if (handleSelector) {
-    container.addEventListener('dragstart', (e) => {
-      if (typeof options.canDrag === 'function' && !options.canDrag(e)) return;
-      const handle = e.target.closest(handleSelector);
-      if (!handle) { e.preventDefault(); return; }
-      if (e.target.closest('input, button, select, textarea, a, .customListRemovePickBtn, .channelRemovePickBtn')) return;
-      activeItem = handle.closest(itemSelector);
-      if (!activeItem) return;
-      activeItem.classList.add(dragClass);
-      html5Drag = true;
-      lastDragEventAt = Date.now();
-      beginDragSession();
-      if (e.dataTransfer) {
-        e.dataTransfer.effectAllowed = 'move';
-        try { e.dataTransfer.setData('text/plain', activeItem.dataset && activeItem.dataset.slug ? activeItem.dataset.slug : ''); } catch (err) {}
-      }
-    });
-
-    container.addEventListener('dragover', (e) => {
-      if (!activeItem) return;
-      e.preventDefault();
-      moveItem(e.clientY, e.clientX);
-      // dragover arrives in uneven bursts, and only every few hundred
-      // milliseconds once the pointer is held still -- which is exactly when
-      // an edge scroll has to keep going smoothly -- so the scrolling runs on
-      // its own frame loop rather than on the event.
-      queueAutoScroll();
-    });
-
-    // Where the pointer is, and that the drag is still alive, wherever on the
-    // page it has wandered: near the top edge it is usually over the header,
-    // not this list, and the auto-scroll (and the silence watchdog above)
-    // must keep hearing about it there.
-    document.addEventListener('dragover', (e) => {
-      if (!activeItem || !html5Drag) return;
-      lastDragEventAt = Date.now();
-      lastClientX = e.clientX;
-      lastClientY = e.clientY;
-    }, true);
-
-    container.addEventListener('dragend', () => {
-      if (!activeItem) { endDragSession(); return; }
-      finishHtml5OrPointerDrag();
-    });
-  }
-
-  // Pointer events for mobile touch, and desktop hold-to-drag
   container.addEventListener('pointerdown', (e) => {
     if (typeof options.canDrag === 'function' && !options.canDrag(e)) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
     if (e.target.closest('input, button, select, textarea, a, .customListRemovePickBtn, .channelRemovePickBtn, .customListPosInput, .channelPosInput')) return;
     const handle = handleSelector ? e.target.closest(handleSelector) : e.target.closest(itemSelector);
-    if (!handle) return;
+    if (!handle || !container.contains(handle)) return;
     const item = handle.closest(itemSelector);
     if (!item) return;
 
+    // A gesture that never ended (its pointerup went to another window, say)
+    // is finished before this one starts, not left half-open underneath it.
+    if (activeItem) stopDragging();
+
     const isTouch = e.pointerType === 'touch' || e.pointerType === 'pen';
-    if (!isTouch && handleSelector && holdDelay === 0) {
-      return;
-    }
+    // A mouse on a handle drags at once -- once it has actually moved, so a
+    // plain click on the handle is not a reorder. Touch waits out a short
+    // hold so a swipe past the handle still scrolls the page; lists without
+    // a handle keep their own hold delay on every pointer.
+    const immediate = !isTouch && !!handleSelector;
+    const delay = immediate ? 0 : (isTouch ? Math.max(holdDelay, 140) : holdDelay);
+    // No text selection and no native drag starting under a mouse drag.
+    if (!isTouch) e.preventDefault();
 
     cancelHold();
     activeItem = item;
     isDragging = false;
     startX = e.clientX;
     startY = e.clientY;
-
-    const delay = isTouch ? Math.max(holdDelay, 140) : holdDelay;
     if (delay > 0) {
       holdTimer = setTimeout(() => {
         startDragging(item);
       }, delay);
-    } else {
-      startDragging(item);
-      try { handle.setPointerCapture(e.pointerId); } catch (err) {}
     }
+    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
 
     const onPointerMove = (ev) => {
       if (!activeItem) return;
       if (!isDragging) {
         const dist = Math.hypot(ev.clientX - startX, ev.clientY - startY);
-        if (dist > 12) {
-          cancelHold();
-          activeItem = null;
+        if (immediate) {
+          if (dist < 4) return;
+          startDragging(item);
+        } else {
+          if (dist > 12) {
+            cancelHold();
+            activeItem = null;
+          }
+          return;
         }
-        return;
       }
       if (ev.cancelable) ev.preventDefault();
       lastClientX = ev.clientX;
@@ -1449,12 +1411,17 @@ function createSortableList(container, options = {}) {
 
     const onPointerEnd = () => {
       document.removeEventListener('pointermove', onPointerMove);
+      document.removeEventListener('pointerup', onPointerEnd);
+      document.removeEventListener('pointercancel', onPointerEnd);
+      window.removeEventListener('blur', onPointerEnd);
+      try { handle.releasePointerCapture(e.pointerId); } catch (err) {}
       stopDragging();
     };
 
     document.addEventListener('pointermove', onPointerMove, { passive: false });
-    document.addEventListener('pointerup', onPointerEnd, { once: true });
-    document.addEventListener('pointercancel', onPointerEnd, { once: true });
+    document.addEventListener('pointerup', onPointerEnd);
+    document.addEventListener('pointercancel', onPointerEnd);
+    window.addEventListener('blur', onPointerEnd);
   });
 
   const instance = {
@@ -1480,10 +1447,12 @@ function resolveMissingPostersInDom(rootEl) {
   container.querySelectorAll('.live-preview-poster-placeholder[data-needs-fallback="1"]').forEach(ph => {
     if (ph.dataset.fallbackRequested) return;
     ph.dataset.fallbackRequested = '1';
-    const card = ph.closest('.live-preview-poster-card') || ph.closest('.list-card') || ph.closest('[data-title]');
-    const title = (card && card.dataset.title) || (card && card.dataset.name) || '';
-    const type = (card && card.dataset.type) || (card && card.dataset.listType) || 'movie';
-    const id = (card && card.dataset.id) || '';
+    // The tile's own title, never its list card's -- see posterItemIdentity
+    // (23_client-list-management.js).
+    const who = posterItemIdentity(ph);
+    const title = who.title;
+    const type = who.type || 'movie';
+    const id = who.id;
     if (!title && !id) return;
     const tmdbId = id.startsWith('tmdb:') ? id.slice(5) : '';
     const imdbId = id.startsWith('tt') ? id : '';
@@ -3068,7 +3037,7 @@ function addRow(name, url, type, enabled, group, channelId) {
         '<div class="entry-pos-wrap" style="display:flex; align-items:center;">' +
           '<input type="number" class="pos" min="1" title="Type a position number to move this list there" onchange="movePosTo(this)">' +
         '</div>' +
-        '<span class="drag-handle ec-btn" draggable="true" title="Drag to reorder" style="cursor:grab; font-size:1rem;">&#9776;</span>' +
+        '<span class="drag-handle ec-btn" title="Drag to reorder" style="cursor:grab; font-size:1rem;">&#9776;</span>' +
         '<button type="button" class="ec-btn movebtn secondary" onclick="moveRow(this, -1)" title="Move up">&#8593;</button>' +
         '<button type="button" class="ec-btn movebtn secondary" onclick="moveRow(this, 1)" title="Move down">&#8595;</button>' +
         ((isCustomList || isChannel) ? ('<button type="button" class="ec-btn secondary" style="margin-left: auto; margin-right: 6px; font-weight:600; padding: 2px 10px;" onclick="' + (isCustomList ? 'editEntryCustomList(this)' : 'editEntryChannel(this)') + '">Edit</button>') : '') +
@@ -3101,7 +3070,7 @@ function addRow(name, url, type, enabled, group, channelId) {
       : (isChannel || isCustomList || isPremade)
         ? ''
         : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one catalog)</button>') +
-    '<div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span class="shelf-drag-handle" draggable="true" title="Drag to reorder catalog">&#x2630;</span><span class="shelf-title-text">' + escapeHtml(name || 'Unnamed') + ' - ' + (type === 'series' ? 'Series' : 'Movies') + '</span><span class="live-preview-shelf-status"></span><button type="button" class="text-action-btn" disabled>See All &rsaquo;</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>';
+    '<div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span class="shelf-drag-handle" title="Drag to reorder catalog">&#x2630;</span><span class="shelf-title-text">' + escapeHtml(name || 'Unnamed') + ' - ' + (type === 'series' ? 'Series' : 'Movies') + '</span><span class="live-preview-shelf-status"></span><button type="button" class="text-action-btn" disabled>See All &rsaquo;</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>';
   container.appendChild(div);
   updateSourceRemoveButtons(div);
   relocateAddSourceBtn(div);

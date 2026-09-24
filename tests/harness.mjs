@@ -61,25 +61,45 @@ export function makeKv(initial = {}) {
   // corresponding KV call fail. Used to cover the partial-write paths where a
   // route has to decide between reporting success and reporting the truth.
   const hooks = { beforeGet: null, beforePut: null, beforeDelete: null, beforeList: null };
+  // Real KV also keeps binary values (an ArrayBuffer comes back as one when
+  // read with type "arrayBuffer") and a small metadata object per key. Both
+  // are modelled because the BetterPosters copy (serveBetterPoster) relies on
+  // them; string values behave exactly as before.
+  const metadata = new Map();
+  const isBinary = (v) => v instanceof ArrayBuffer || ArrayBuffer.isView(v);
   return {
     _store: store,
     _hooks: hooks,
+    _metadata: metadata,
     async get(key, type) {
       if (hooks.beforeGet) await hooks.beforeGet(key);
       if (!store.has(key)) return null;
       const raw = store.get(key);
-      if (type === "json") {
+      const t = type && typeof type === "object" ? type.type : type;
+      if (t === "json") {
         try { return JSON.parse(raw); } catch { return null; }
+      }
+      if (t === "arrayBuffer") {
+        if (raw instanceof ArrayBuffer) return raw.slice(0);
+        if (ArrayBuffer.isView(raw)) return raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
+        return new TextEncoder().encode(String(raw)).buffer;
       }
       return raw;
     },
-    async put(key, value) {
+    async getWithMetadata(key, type) {
+      const value = await this.get(key, type);
+      return { value, metadata: value === null ? null : (metadata.has(key) ? metadata.get(key) : null) };
+    },
+    async put(key, value, opts) {
       if (hooks.beforePut) await hooks.beforePut(key, value);
-      store.set(key, typeof value === "string" ? value : JSON.stringify(value));
+      store.set(key, typeof value === "string" || isBinary(value) ? value : JSON.stringify(value));
+      if (opts && opts.metadata !== undefined) metadata.set(key, opts.metadata);
+      else metadata.delete(key);
     },
     async delete(key) {
       if (hooks.beforeDelete) await hooks.beforeDelete(key);
       store.delete(key);
+      metadata.delete(key);
     },
     // Real KV cursors are opaque and positioned by KEY, not by offset. An
     // integer offset into a freshly re-sorted array behaves differently the

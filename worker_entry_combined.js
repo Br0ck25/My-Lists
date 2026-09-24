@@ -506,10 +506,14 @@ const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 //
 // Each window/type is a snapshot in KV (mylists:mostwatched:v2:<window>:<type>),
 // rebuilt on the first request after it goes stale: the 7- and 30-day charts
-// once per Eastern day, "today" once an hour -- a "today" that only refreshed
-// at midnight would sit empty all morning.
+// once per Eastern day, "today" every 15 minutes, so a title just watched
+// reaches the top of it promptly. "today" also rolls over rather than
+// starting empty at midnight -- see rollMostWatchedToday.
 const MOST_WATCHED_WINDOWS = ["today", "7", "30"];
-const MOST_WATCHED_TODAY_REFRESH_SECONDS = 3600;
+const MOST_WATCHED_TODAY_REFRESH_SECONDS = 900;
+// How long the rolling "today" list survives with nobody opening it. Past
+// this it starts again from that day's watches alone.
+const MOST_WATCHED_TODAY_KEEP_SECONDS = 60 * 86400;
 // Each Most Watched chart is its top 25. (New on Streaming is not capped: it
 // is the whole 30-day window.)
 const MOST_WATCHED_MAX_ITEMS = 25;
@@ -1291,6 +1295,24 @@ const RECOMMENDATION_SEEDS_PER_SIDE = 12;
 // every account every six hours up to ~180 accounts, and a proportionally
 // slower cadence beyond that rather than a tick that fails.
 const AIRING_NEXT_SWEEP_ACCOUNTS_PER_TICK = 3;
+
+// /api/bp/warm (25_api-catalog-routes.js): posters per request, and per IP
+// per minute. A long Discover page is a few hundred posters, sent in batches
+// of BETTER_POSTER_WARM_MAX; almost all of them are already stored after the
+// first visit and cost one KV read each, so the ceiling is about the fetches
+// a caller could make btttr.cc do, not about this Worker.
+const BETTER_POSTER_WARM_MAX = 40;
+const BETTER_POSTER_WARM_IDS_PER_MINUTE = 800;
+// prewarmBetterPosters (07_source-fetchers-tmdb-simkl.js): how many title x
+// style pairs one tick checks against the Worker's copy (a KV read each), and
+// how many missing ones it fetches from btttr.cc. A fetch btttr.cc has to draw
+// can take most of a minute, so the fetch count is what bounds the tick's
+// wall-clock time: 8 at 4 at a time is two waits, not eight.
+const BETTER_POSTER_PREWARM_CHECKS_PER_TICK = 60;
+const BETTER_POSTER_PREWARM_FETCHES_PER_TICK = 8;
+// Share of the episode sweep's unreachable reserve it may spend -- the same
+// slice New on Streaming and Airing Next get.
+const CRON_BETTER_POSTER_SHARE = 0.25;
 // --- icon (placeholder, replace via /mnt/project source if needed) --------
 const ICON_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAEAAElEQVR42rz9d9xt11Eejs/MWvu0" +
@@ -13595,16 +13617,431 @@ function buildBetterPosterUrl(imdbId, opts) {
     params.push("rs=" + encodeURIComponent(o.ratingSource));
   }
   const qs = params.length ? "?" + params.join("&") : "";
+  // Served through this Worker's own copy whenever the caller knows where
+  // this Worker lives -- see serveBetterPoster below for why.
+  if (o.origin) return `${o.origin}/bp/${betterPostersBase(o)}/${imdbId}.jpg${qs}`;
   return `${BETTER_POSTERS_ORIGIN}/${betterPostersBase(o)}/imdb/poster-default/${imdbId}.jpg${qs}`;
+}
+
+// --- The Worker's own copy of BetterPosters artwork ------------------------
+//
+// btttr.cc serves artwork it has already drawn from Cloudflare's cache in a
+// fraction of a second, and draws anything else on request at its origin --
+// which, measured, took 40-50 seconds or answered a 504, even for titles as
+// common as Ted Lasso (its own homepage 504'd after 30s at the same time). A
+// tile waited on it with no error to fall back on: the blank posters all over
+// the site that appeared the moment Better Posters was switched off.
+//
+// So every BetterPosters image the website and the Stremio/Nuvio rows show is
+// served from here: /bp/<style>/<imdb id>.jpg[?tag=none&lang=..&rs=..], the
+// same style/options btttr.cc's own URL carries. Each one is fetched from
+// btttr.cc once, kept in KV (global, so a poster fetched anywhere is instant
+// everywhere), fronted by the edge cache, and quietly re-fetched once it is a
+// day old so ratings and trend tags move with btttr.cc's. A copy is kept for
+// BETTER_POSTER_KEEP_SECONDS past that, so when btttr.cc's origin is having a
+// bad day the site does not notice.
+//
+// A title btttr.cc has never drawn is the one thing a copy cannot cover, and
+// measured on 2026-09-24 its origin was answering nothing at all for those: a
+// 504 after 30 seconds, or no answer in 90. Nothing waits on that any more.
+// A request gives btttr.cc BETTER_POSTER_PAGE_WAIT_MS, then answers without
+// it (serveBetterPoster says with what) while the fetch carries on in the
+// background; a failure is remembered for BETTER_POSTER_MISS_SECONDS so the
+// next tile does not wait on the same dead end, and is put on a list the cron
+// retries (prewarmBetterPosters, 07) until btttr.cc draws it.
+
+// Every style betterPostersBase can produce -- the only ones this route
+// fetches, so it can never be pointed at anything else on btttr.cc.
+const BETTER_POSTER_STYLES = (() => {
+  const out = new Set();
+  for (const genre of [true, false]) for (const rating of [true, false]) {
+    for (const quality of [true, false]) for (const age of [true, false]) {
+      out.add(betterPostersBase({ genre, rating, quality, age }));
+    }
+  }
+  return out;
+})();
+// Re-fetched once a day. More often buys nothing: btttr.cc's CDN itself was
+// serving copies 3-7 days old (its Age header) when this was measured, so an
+// hourly fetch would bring back the same picture 23 times out of 24.
+const BETTER_POSTER_REFRESH_MS = 86400 * 1000;
+const BETTER_POSTER_KEEP_SECONDS = 60 * 86400;
+// For work nothing is waiting on: the cron and /api/bp/warm.
+const BETTER_POSTER_UPSTREAM_TIMEOUT_MS = 55000;
+// For a fetch a tile started, which carries on after the tile is answered --
+// under waitUntil, which the runtime stops 30 seconds after the response.
+const BETTER_POSTER_BACKGROUND_TIMEOUT_MS = 25000;
+// How long a tile waits on btttr.cc. Anything it has drawn comes back well
+// inside this (0.2-1.2s measured); anything it has not takes 30s or more.
+const BETTER_POSTER_PAGE_WAIT_MS = 6000;
+const BETTER_POSTER_MISS_SECONDS = 600;
+const BETTER_POSTER_MAX_BYTES = 5 * 1024 * 1024;
+
+// /bp/... -> the one poster it names, or null for anything that is not a
+// style/id/option combination buildBetterPosterUrl could have produced.
+function parseBetterPosterPath(pathname, searchParams) {
+  const m = /^\/bp\/([a-z-]+)\/(tt\d{5,12})\.jpg$/.exec(String(pathname || ""));
+  if (!m || !BETTER_POSTER_STYLES.has(m[1])) return null;
+  const tag = searchParams.get("tag") === "none" ? "none" : "";
+  const langRaw = searchParams.get("lang") || "";
+  const lang = BETTER_POSTERS_LANGS.some((l) => l.value === langRaw && l.value !== "en") ? langRaw : "";
+  const rsRaw = searchParams.get("rs") || "";
+  const rs = BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === rsRaw && r.value !== "avg") ? rsRaw : "";
+  const params = [];
+  if (tag) params.push("tag=none");
+  if (lang) params.push("lang=" + encodeURIComponent(lang));
+  if (rs) params.push("rs=" + encodeURIComponent(rs));
+  const qs = params.length ? "?" + params.join("&") : "";
+  return {
+    style: m[1],
+    imdbId: m[2],
+    tag,
+    lang,
+    rs,
+    path: `/bp/${m[1]}/${m[2]}.jpg${qs}`,
+    upstream: `${BETTER_POSTERS_ORIGIN}/${m[1]}/imdb/poster-default/${m[2]}.jpg${qs}`,
+    kvKey: `bpimg:v1:${m[1]}:${m[2]}:${tag}:${lang}:${rs}`,
+  };
+}
+
+function betterPosterImageResponse(bytes, contentType) {
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "Content-Type": contentType || "image/jpeg",
+      // Six hours in the browser and at the edge -- btttr.cc's own lifetime
+      // for the same image -- and a day more while a newer copy is fetched.
+      "Cache-Control": "public, max-age=21600, stale-while-revalidate=86400",
+      "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+// One upstream fetch per poster per isolate at a time: the warm request and
+// the tile's own request for the same poster share it.
+const BETTER_POSTER_IN_FLIGHT = new Map();
+
+async function fetchBetterPosterUpstream(env, bp, timeoutMs) {
+  if (BETTER_POSTER_IN_FLIGHT.has(bp.kvKey)) return BETTER_POSTER_IN_FLIGHT.get(bp.kvKey);
+  const p = (async () => {
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs || BETTER_POSTER_UPSTREAM_TIMEOUT_MS) : null;
+    try {
+      const res = await fetch(bp.upstream, {
+        headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+        signal: ctl ? ctl.signal : undefined,
+      });
+      const contentType = res.headers.get("content-type") || "";
+      if (!res.ok || !contentType.startsWith("image/")) return null;
+      const bytes = await res.arrayBuffer();
+      if (!bytes.byteLength || bytes.byteLength > BETTER_POSTER_MAX_BYTES) return null;
+      if (env && env.CONFIGS) {
+        await env.CONFIGS.put(bp.kvKey, bytes, {
+          expirationTtl: BETTER_POSTER_KEEP_SECONDS,
+          metadata: { ct: contentType, at: Date.now() },
+        }).catch(() => {});
+      }
+      BETTER_POSTER_MISSES.delete(bp.kvKey);
+      return { bytes, contentType };
+    } catch {
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
+      BETTER_POSTER_IN_FLIGHT.delete(bp.kvKey);
+    }
+  })();
+  BETTER_POSTER_IN_FLIGHT.set(bp.kvKey, p);
+  return p;
+}
+
+// The stored copy, if there is one -- and a background refresh when it is
+// more than a day old.
+async function readStoredBetterPoster(env, ctx, bp) {
+  if (!env || !env.CONFIGS) return null;
+  try {
+    const got = await env.CONFIGS.getWithMetadata(bp.kvKey, { type: "arrayBuffer" });
+    if (!got || !got.value) return null;
+    const meta = got.metadata || {};
+    const at = Number(meta.at) || 0;
+    if (Date.now() - at > BETTER_POSTER_REFRESH_MS && ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(fetchBetterPosterUpstream(env, bp, BETTER_POSTER_BACKGROUND_TIMEOUT_MS));
+    }
+    return { bytes: got.value, contentType: meta.ct || "image/jpeg", at };
+  } catch {
+    return null;
+  }
+}
+
+// --- Posters btttr.cc just failed to supply -----------------------------------
+//
+// Remembered here (this isolate) and in the edge cache (every isolate in this
+// data centre) for BETTER_POSTER_MISS_SECONDS, so a page of tiles for titles
+// btttr.cc cannot draw right now is answered at once instead of each one
+// waiting on a fetch that failed a minute ago. The cron's retries (and
+// /api/bp/warm's) ignore it; they are the ones meant to try again.
+const BETTER_POSTER_MISSES = new Map();
+
+function betterPosterMissRequest(origin, bp) {
+  const cache = typeof caches !== "undefined" && caches.default ? caches.default : null;
+  return cache && origin ? { cache, req: new Request(origin + "/bp-miss" + bp.path) } : null;
+}
+
+async function betterPosterRecentlyMissed(origin, bp) {
+  const until = BETTER_POSTER_MISSES.get(bp.kvKey);
+  if (until && until > Date.now()) return true;
+  const edge = betterPosterMissRequest(origin, bp);
+  if (!edge) return false;
+  try {
+    return !!(await edge.cache.match(edge.req));
+  } catch {
+    return false;
+  }
+}
+
+async function noteBetterPosterMiss(origin, bp) {
+  BETTER_POSTER_MISSES.set(bp.kvKey, Date.now() + BETTER_POSTER_MISS_SECONDS * 1000);
+  if (BETTER_POSTER_MISSES.size > 5000) {
+    const now = Date.now();
+    for (const [k, until] of BETTER_POSTER_MISSES) if (until <= now) BETTER_POSTER_MISSES.delete(k);
+  }
+  const edge = betterPosterMissRequest(origin, bp);
+  if (!edge) return;
+  try {
+    await edge.cache.put(edge.req, new Response("", { headers: { "Cache-Control": `max-age=${BETTER_POSTER_MISS_SECONDS}` } }));
+  } catch {}
+}
+
+// --- ...and the list the cron retries them from ------------------------------
+//
+// { "/bp/<style>/<id>.jpg?...": { at: first failed } }. Misses
+// are collected per isolate and written at most once a minute -- one KV write
+// for a page full of them, not one each -- and /api/bp/warm writes its whole
+// batch's worth when it finishes.
+const BETTER_POSTER_RETRY_KEY = "bp:retry:v1";
+const BETTER_POSTER_RETRY_MAX = 500;
+const BETTER_POSTER_RETRY_KEEP_MS = 3 * 86400 * 1000;
+const _betterPosterRetryPending = new Map();
+let _betterPosterRetryFlushedAt = 0;
+
+function queueBetterPosterRetry(bp) {
+  if (!_betterPosterRetryPending.has(bp.path)) _betterPosterRetryPending.set(bp.path, Date.now());
+}
+
+async function flushBetterPosterRetries(env, force) {
+  if (!env || !env.CONFIGS || !_betterPosterRetryPending.size) return;
+  const now = Date.now();
+  if (!force && now - _betterPosterRetryFlushedAt < 60000) return;
+  _betterPosterRetryFlushedAt = now;
+  const add = [..._betterPosterRetryPending];
+  _betterPosterRetryPending.clear();
+  try {
+    const raw = await env.CONFIGS.get(BETTER_POSTER_RETRY_KEY);
+    const list = readBetterPosterRetries(raw);
+    let changed = false;
+    for (const [path, at] of add) {
+      if (!list[path]) { list[path] = { at }; changed = true; }
+    }
+    if (changed) await env.CONFIGS.put(BETTER_POSTER_RETRY_KEY, JSON.stringify(trimBetterPosterRetries(list, now)));
+  } catch {}
+}
+
+function readBetterPosterRetries(raw) {
+  try {
+    const list = raw ? JSON.parse(raw) : {};
+    return list && typeof list === "object" && !Array.isArray(list) ? list : {};
+  } catch {
+    return {};
+  }
+}
+
+// Drops what has been failing for BETTER_POSTER_RETRY_KEEP_MS (the next
+// visitor to see it puts it back), then keeps the newest if still over.
+function trimBetterPosterRetries(list, now) {
+  const kept = Object.entries(list)
+    .filter(([, e]) => e && now - (Number(e.at) || 0) <= BETTER_POSTER_RETRY_KEEP_MS)
+    .sort((a, b) => (Number(b[1].at) || 0) - (Number(a[1].at) || 0))
+    .slice(0, BETTER_POSTER_RETRY_MAX);
+  return Object.fromEntries(kept);
+}
+
+// Fetches one poster from btttr.cc on behalf of a page, and records the
+// outcome: into the edge cache when it worked, as a miss (and a retry) when
+// it did not.
+async function fetchBetterPosterForPage(env, ctx, bp, origin, timeoutMs) {
+  const found = await fetchBetterPosterUpstream(env, bp, timeoutMs);
+  const cache = typeof caches !== "undefined" && caches.default ? caches.default : null;
+  if (found && cache && origin) {
+    try {
+      await cache.put(new Request(origin + bp.path), betterPosterImageResponse(found.bytes, found.contentType));
+    } catch {}
+  } else if (!found) {
+    await noteBetterPosterMiss(origin, bp);
+    queueBetterPosterRetry(bp);
+  }
+  return found;
+}
+
+// The bytes for one poster from wherever they are nearest: the edge cache,
+// the stored copy, or btttr.cc. btttr.cc gets opts.waitMs when given -- after
+// that this returns null and the fetch finishes in the background, so the
+// next request finds it stored -- and is not asked at all about a poster it
+// failed to supply in the last BETTER_POSTER_MISS_SECONDS.
+async function getBetterPoster(env, ctx, bp, origin, opts) {
+  const waitMs = opts && opts.waitMs;
+  const cache = typeof caches !== "undefined" && caches.default ? caches.default : null;
+  const cacheReq = cache && origin ? new Request(origin + bp.path) : null;
+  const background = (p) => { if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p); };
+  if (cacheReq) {
+    try {
+      const hit = await cache.match(cacheReq);
+      if (hit) {
+        return { bytes: await hit.arrayBuffer(), contentType: hit.headers.get("content-type") || "image/jpeg", fromEdge: true };
+      }
+    } catch {}
+  }
+  const stored = await readStoredBetterPoster(env, ctx, bp);
+  if (stored) {
+    if (cacheReq) background(cache.put(cacheReq, betterPosterImageResponse(stored.bytes, stored.contentType)).catch(() => {}));
+    return stored;
+  }
+  if (await betterPosterRecentlyMissed(origin, bp)) return null;
+  const pending = fetchBetterPosterForPage(env, ctx, bp, origin, waitMs ? BETTER_POSTER_BACKGROUND_TIMEOUT_MS : BETTER_POSTER_UPSTREAM_TIMEOUT_MS)
+    .then(async (found) => {
+      if (!found) await flushBetterPosterRetries(env, false);
+      return found;
+    });
+  if (!waitMs) return await pending;
+  let timer = null;
+  const outcome = await Promise.race([
+    pending,
+    new Promise((resolve) => { timer = setTimeout(() => resolve(undefined), waitMs); }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (outcome === undefined) {
+    background(pending);
+    return null;
+  }
+  return outcome;
+}
+
+// Whether a /bp/ request comes from this Worker's own website, which has its
+// own way of standing in for a poster (handlePosterImgError, 23) -- and a way
+// to swap the real one in when it arrives, which an app does not.
+function isOwnSiteRequest(request, origin) {
+  if (!request || !request.headers || !origin) return false;
+  const site = request.headers.get("sec-fetch-site");
+  if (site) return site === "same-origin";
+  const ref = request.headers.get("referer") || "";
+  return ref === origin || ref.startsWith(origin + "/");
+}
+
+// The title's ordinary poster, for an app to show while its Better Poster is
+// unavailable. Never cached anywhere, so the app asks again next time and gets
+// the Better Poster as soon as there is one.
+async function betterPosterStandIn(bp) {
+  try {
+    const res = await fetch(`https://images.metahub.space/poster/medium/${bp.imdbId}/img`, {
+      cf: { cacheTtl: 86400, cacheEverything: true },
+    });
+    const contentType = res.headers.get("content-type") || "";
+    if (!res.ok || !contentType.startsWith("image/")) return null;
+    const bytes = await res.arrayBuffer();
+    if (!bytes.byteLength || bytes.byteLength > BETTER_POSTER_MAX_BYTES) return null;
+    return { bytes, contentType };
+  } catch {
+    return null;
+  }
+}
+
+// --- Which styles are in use, for the cron's pre-fetch -----------------------
+//
+// Every combination of style options is its own image, so the cron can only
+// fetch ahead for combinations someone actually uses. Recorded as posters are
+// served, at most once per style per isolate every few hours, and written only
+// when the stored record is missing it or a day stale -- a handful of KV
+// writes a day, not one per poster.
+const BETTER_POSTER_VARIANTS_KEY = "bp:variants:v1";
+const BETTER_POSTER_VARIANT_TTL_MS = 14 * 86400 * 1000;
+const _betterPosterVariantNoted = new Map();
+
+function betterPosterVariantKey(bp) {
+  return `${bp.style}|${bp.tag}|${bp.lang}|${bp.rs}`;
+}
+
+async function noteBetterPosterVariant(env, bp) {
+  if (!env || !env.CONFIGS || !bp) return;
+  const key = betterPosterVariantKey(bp);
+  const now = Date.now();
+  if (now - (_betterPosterVariantNoted.get(key) || 0) < 6 * 3600 * 1000) return;
+  _betterPosterVariantNoted.set(key, now);
+  try {
+    const raw = await env.CONFIGS.get(BETTER_POSTER_VARIANTS_KEY);
+    const seen = raw ? JSON.parse(raw) : {};
+    if (now - (Number(seen[key]) || 0) < 86400 * 1000) return;
+    seen[key] = now;
+    for (const k of Object.keys(seen)) if (now - Number(seen[k]) > BETTER_POSTER_VARIANT_TTL_MS) delete seen[k];
+    await env.CONFIGS.put(BETTER_POSTER_VARIANTS_KEY, JSON.stringify(seen));
+  } catch {}
+}
+
+// The styles used within BETTER_POSTER_VARIANT_TTL_MS, as posters for one
+// title: variant -> the parsed /bp/ path for that title in that style.
+async function betterPosterVariantsInUse(env) {
+  if (!env || !env.CONFIGS) return [];
+  try {
+    const raw = await env.CONFIGS.get(BETTER_POSTER_VARIANTS_KEY);
+    const seen = raw ? JSON.parse(raw) : {};
+    const now = Date.now();
+    return Object.keys(seen).filter((k) => now - Number(seen[k]) <= BETTER_POSTER_VARIANT_TTL_MS).map((k) => {
+      const [style, tag, lang, rs] = k.split("|");
+      return { style, tag, lang, rs };
+    });
+  } catch {
+    return [];
+  }
+}
+
+function betterPosterForVariant(imdbId, v) {
+  const params = new URLSearchParams();
+  if (v.tag) params.set("tag", v.tag);
+  if (v.lang) params.set("lang", v.lang);
+  if (v.rs) params.set("rs", v.rs);
+  return parseBetterPosterPath(`/bp/${v.style}/${imdbId}.jpg`, params);
+}
+
+async function serveBetterPoster(env, ctx, bp, origin, request) {
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(noteBetterPosterVariant(env, bp));
+  const found = await getBetterPoster(env, ctx, bp, origin, { waitMs: BETTER_POSTER_PAGE_WAIT_MS });
+  if (found) return betterPosterImageResponse(found.bytes, found.contentType);
+  const unavailable = { "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" };
+  // The website shows the title's ordinary poster itself, and swaps this one
+  // in when /api/bp/warm reports it fetched.
+  if (isOwnSiteRequest(request, origin)) {
+    return new Response(null, { status: 503, headers: { ...unavailable, "Retry-After": "30" } });
+  }
+  // An app has no such fallback: an error is a blank tile. So it gets the
+  // ordinary poster from this same URL, uncached, until the Better one exists.
+  const standIn = await betterPosterStandIn(bp);
+  if (standIn) {
+    return new Response(standIn.bytes, {
+      status: 200,
+      headers: { ...unavailable, "Content-Type": standIn.contentType, "X-Content-Type-Options": "nosniff", "X-Better-Poster": "pending" },
+    });
+  }
+  return new Response(null, { status: 502, headers: unavailable });
 }
 
 // Packs a resolved config's betterPosters* keys into the shape
 // buildBetterPosterUrl reads. Each default matches btttr.cc's own default for
 // that option, so an install that never touched the style controls gets the
 // same artwork its configurator hands out.
-function betterPostersOptionsFrom(cfg) {
+function betterPostersOptionsFrom(cfg, origin) {
   const c = cfg || {};
   return {
+    // This Worker's own origin, so posters are served from its copy (see
+    // serveBetterPoster). Left off, the URL points at btttr.cc directly.
+    ...(origin ? { origin } : {}),
     genre: c.betterPostersGenre !== false,
     rating: c.betterPostersRating !== false,
     quality: !!c.betterPostersQuality,
@@ -20910,6 +21347,20 @@ async function buildMostWatchedMetas(env, ctx, window, type) {
   return metas;
 }
 
+// Most Watched Today, rolling over rather than starting empty.
+//
+// Counted per Eastern day, "today" used to go blank at midnight and fill up
+// again one watch at a time. Now what was on it stays: whatever has been
+// watched today goes on top (most watched first, as before), everything else
+// keeps its place below, and the list stays MOST_WATCHED_MAX_ITEMS long --
+// so each newly watched title pushes the last one off the end.
+function rollMostWatchedToday(todayMetas, previousSnap) {
+  const fresh = Array.isArray(todayMetas) ? todayMetas : [];
+  const previous = previousSnap && Array.isArray(previousSnap.metas) ? previousSnap.metas : [];
+  const onTop = new Set(fresh.map((m) => m && m.id));
+  return [...fresh, ...previous.filter((m) => m && m.id && !onTop.has(m.id))].slice(0, MOST_WATCHED_MAX_ITEMS);
+}
+
 async function fetchMostWatchedCatalog(entry, skip = 0, keys = {}) {
   const env = keys && keys.env;
   const window = parseMostWatchedWindow(entry && entry.url);
@@ -20930,10 +21381,15 @@ async function fetchMostWatchedCatalog(entry, skip = 0, keys = {}) {
   }
   if (!mostWatchedSnapshotFresh(snap, window, nowMs)) {
     try {
-      const metas = await buildMostWatchedMetas(env, keys.ctx, window, type);
+      let metas = await buildMostWatchedMetas(env, keys.ctx, window, type);
+      if (window === "today") metas = rollMostWatchedToday(metas, snap);
       snap = { builtAt: nowMs, day: easternDateKey(new Date(nowMs)), metas };
       if (env && env.CONFIGS) {
-        const put = env.CONFIGS.put(key, JSON.stringify(snap), { expirationTtl: 3 * 86400 }).catch(() => {});
+        // "today" is carried from one day to the next (rollMostWatchedToday),
+        // so its snapshot has to outlive a quiet spell; the others are
+        // rebuilt from scratch and only need to last out their day.
+        const ttl = window === "today" ? MOST_WATCHED_TODAY_KEEP_SECONDS : 3 * 86400;
+        const put = env.CONFIGS.put(key, JSON.stringify(snap), { expirationTtl: ttl }).catch(() => {});
         if (keys.ctx && typeof keys.ctx.waitUntil === "function") keys.ctx.waitUntil(put);
         else await put;
       }
@@ -22723,6 +23179,154 @@ async function checkForNewEpisodes(env, fetchBudget) {
 // so a budget that fits only a few per tick still covers all of them over the
 // following ticks instead of re-warming the first few forever. A budget that
 // fits the whole list warms the whole list, exactly as this always did.
+// --- BetterPosters for the shared charts, fetched ahead of time ---------------
+//
+// The Worker's copy of a BetterPosters image (serveBetterPoster, 05) is instant
+// for everyone once anyone has fetched it; the first fetch of a title btttr.cc
+// has not drawn lately waits on its origin, which was taking 40-50 seconds.
+// Titles on the shared charts -- the Discover tab, Quick Add, the My Lists
+// Addon Charts -- are the ones most people see first, and new ones arrive
+// every day, so the cron fetches their artwork before anyone looks: every
+// title x every style in use, a slice per tick, re-fetching any copy more than
+// a day old on the way past.
+//
+// Before any of that, it retries the posters a page asked for and btttr.cc
+// failed to supply (queueBetterPosterRetry, 05). Those are titles someone has
+// actually looked at, so they come first. A random few each tick, so a long
+// btttr.cc outage cycles through all of them without the list having to
+// record who was tried when -- which would be a KV write every tick; this
+// writes only when one is fetched.
+const SHARED_POSTER_IDS_KEY = "bp:sharedids:v1";
+const SHARED_POSTER_IDS_MAX = 2000;
+
+// Newest first, de-duplicated, capped: a title that is still charting keeps
+// coming back to the front, one that dropped off ages out.
+async function rememberSharedPosterIds(env, ids) {
+  if (!env || !env.CONFIGS || !ids.length) return;
+  try {
+    const raw = await env.CONFIGS.get(SHARED_POSTER_IDS_KEY);
+    const prev = raw ? JSON.parse(raw) : [];
+    const merged = [...new Set([...ids, ...(Array.isArray(prev) ? prev : [])])].slice(0, SHARED_POSTER_IDS_MAX);
+    if (JSON.stringify(merged) === raw) return;
+    await env.CONFIGS.put(SHARED_POSTER_IDS_KEY, JSON.stringify(merged));
+  } catch {}
+}
+
+async function retryMissedBetterPosters(env, fetchCap) {
+  if (fetchCap < 1) return 0;
+  let list;
+  try {
+    list = readBetterPosterRetries(await env.CONFIGS.get(BETTER_POSTER_RETRY_KEY));
+  } catch {
+    return 0;
+  }
+  const keys = Object.keys(list);
+  for (let i = keys.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [keys[i], keys[j]] = [keys[j], keys[i]];
+  }
+  const due = keys.slice(0, fetchCap);
+  if (!due.length) return 0;
+  const gone = [];
+  let done = 0;
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(4, due.length) }, async () => {
+    while (next < due.length) {
+      const path = due[next++];
+      let bp = null;
+      try {
+        const u = new URL(path, "https://x.invalid");
+        bp = parseBetterPosterPath(u.pathname, u.searchParams);
+      } catch {}
+      if (!bp) { gone.push(path); continue; }
+      if ((await readStoredBetterPoster(env, null, bp)) || (await fetchBetterPosterUpstream(env, bp, BETTER_POSTER_UPSTREAM_TIMEOUT_MS))) {
+        gone.push(path);
+        done++;
+      }
+    }
+  }));
+  if (gone.length) {
+    // Re-read before writing: pages add to this list while the fetches above
+    // run, and those additions should not be lost to this write.
+    try {
+      const latest = readBetterPosterRetries(await env.CONFIGS.get(BETTER_POSTER_RETRY_KEY));
+      for (const path of gone) delete latest[path];
+      await env.CONFIGS.put(BETTER_POSTER_RETRY_KEY, JSON.stringify(trimBetterPosterRetries(latest, Date.now())));
+    } catch {}
+  }
+  if (done) console.log(`[Cron] BetterPosters: ${done} of ${due.length} missed poster(s) fetched on retry.`);
+  return due.length;
+}
+
+async function prewarmBetterPosters(env, ctx, fetchBudget) {
+  if (!env || !env.CONFIGS) return;
+  let fetchCap = Math.min(BETTER_POSTER_PREWARM_FETCHES_PER_TICK, Math.floor(Number(fetchBudget) || 0));
+  if (fetchCap < 1) return;
+  fetchCap -= await retryMissedBetterPosters(env, fetchCap);
+  if (fetchCap < 1) return;
+
+  const variants = await betterPosterVariantsInUse(env);
+  // Nobody has used Better Posters lately: nothing to fetch ahead for.
+  if (!variants.length) return;
+
+  // The My Lists Addon Charts are built from this add-on's own data (KV/D1,
+  // no provider call), so they are read directly each time rather than
+  // waiting for a chart pre-warm to pass them.
+  const ids = [];
+  for (const chart of MY_LISTS_ADDON_CHARTS) {
+    for (const type of ["movie", "series"]) {
+      try {
+        const metas = await fetchCatalog({ url: chart.movieUrl, type }, 0, { env, ctx });
+        for (const m of (Array.isArray(metas) ? metas : [])) {
+          const id = betterPostersImdbId(m);
+          if (id) ids.push(id);
+        }
+      } catch {}
+    }
+  }
+  try {
+    const raw = await env.CONFIGS.get(SHARED_POSTER_IDS_KEY);
+    const shared = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(shared)) ids.push(...shared);
+  } catch {}
+  const titles = [...new Set(ids)];
+  if (!titles.length) return;
+
+  // Resumes where the last tick stopped, over every title x style pair.
+  const total = titles.length * variants.length;
+  let cursor = 0;
+  try {
+    cursor = (parseInt(await env.CONFIGS.get("cron:bpwarm:cursor"), 10) || 0) % total;
+  } catch {}
+
+  let checked = 0;
+  let fetched = 0;
+  const work = [];
+  while (checked < Math.min(total, BETTER_POSTER_PREWARM_CHECKS_PER_TICK) && work.length < fetchCap) {
+    const n = (cursor + checked) % total;
+    checked++;
+    const bp = betterPosterForVariant(titles[Math.floor(n / variants.length)], variants[n % variants.length]);
+    if (!bp) continue;
+    const have = await readStoredBetterPoster(env, null, bp);
+    if (have && Date.now() - have.at <= BETTER_POSTER_REFRESH_MS) continue;
+    work.push(bp);
+  }
+  // A few at a time: btttr.cc's origin is the slow part, and piling onto it
+  // slows every draw, ours included. A refresh that fails leaves the copy
+  // already held exactly as it was.
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(4, work.length) }, async () => {
+    while (next < work.length) {
+      const bp = work[next++];
+      if (await fetchBetterPosterUpstream(env, bp, BETTER_POSTER_UPSTREAM_TIMEOUT_MS)) fetched++;
+    }
+  }));
+  try {
+    await env.CONFIGS.put("cron:bpwarm:cursor", String((cursor + checked) % total));
+  } catch {}
+  if (fetched) console.log(`[Cron] BetterPosters: fetched ${fetched} of ${work.length} missing or stale (${checked} checked).`);
+}
+
 async function prewarmSharedCatalogs(env, ctx, fetchBudget) {
   if (!env || !env.CONFIGS) return;
 
@@ -22845,15 +23449,25 @@ async function prewarmSharedCatalogs(env, ctx, fetchBudget) {
     }
 
     const take = Math.min(warmTasks.length, maxWarms);
+    const chartIds = [];
     for (let n = 0; n < take; n++) {
       const item = warmTasks[(warmCursor + n) % warmTasks.length];
       try {
-        await item.run();
+        const result = await item.run();
+        if (Array.isArray(result)) {
+          for (const m of result) {
+            const id = betterPostersImdbId(m);
+            if (id) chartIds.push(id);
+          }
+        }
         await new Promise((resolve) => setTimeout(resolve, item.pauseMs));
       } catch (e) {
         console.warn(`[Cron] Prewarm ${item.label} failed:`, e && e.message ? e.message : e);
       }
     }
+    // The titles these charts hold, for prewarmBetterPosters (below) to fetch
+    // BetterPosters artwork for before anyone scrolls to them.
+    if (chartIds.length) await rememberSharedPosterIds(env, chartIds);
 
     // Advanced after the slice, not before it: a tick terminated part-way
     // through must not have already committed a move it did not make. The
@@ -27008,6 +27622,12 @@ ${seoHeadHtml}
   .shelf-drag-handle:active {
     cursor: grabbing;
   }
+  /* The Edit-mode handle is dragged by pointer events too (createSortableList),
+     so on a touch screen it must not hand the gesture to page scrolling. */
+  .entry .drag-handle {
+    touch-action: none;
+    user-select: none;
+  }
   .entry.dragging {
     opacity: 0.45;
     transform: scale(0.99);
@@ -30177,19 +30797,12 @@ function createSortableList(container, options = {}) {
   // and touch alike.
   const AUTO_SCROLL_EDGE = 90;   // distance from an edge where scrolling starts
   const AUTO_SCROLL_MAX = 20;    // px per frame at the very edge
-  // A native (HTML5) drag fires dragover continuously -- the spec says at
-  // least every 350ms, even with the pointer held still -- for as long as it
-  // lasts. Silence well past that means it ended without dragend reaching
-  // this list.
-  const HTML5_DRAG_SILENCE_MS = 1500;
   let autoScrollRaf = null;
   let lastClientX = 0;
   let lastClientY = 0;
   let scrollHost = null;
   let anchorEl = null;
   let anchorPrev = '';
-  let html5Drag = false;
-  let lastDragEventAt = 0;
 
   // The page itself scrolls for the catalog and My Lists surfaces, but this
   // same function also drives lists inside scrollable panels, so scroll
@@ -30224,7 +30837,6 @@ function createSortableList(container, options = {}) {
     if (anchorEl) anchorEl.style.overflowAnchor = anchorPrev;
     anchorEl = null;
     scrollHost = null;
-    html5Drag = false;
   }
 
   function scrollPos() {
@@ -30234,13 +30846,12 @@ function createSortableList(container, options = {}) {
   function autoScrollStep() {
     autoScrollRaf = null;
     if (!activeItem) return;
-    // A drag can end without this list hearing about it: the row is no
-    // longer on the page (the list was re-rendered under it -- dragend then
-    // fires on a detached node and never bubbles here), or a native drag has
-    // gone silent. Left running, this loop kept scrolling the page and
-    // re-attaching the stale row every frame, indefinitely.
-    if (!activeItem.isConnected || (html5Drag && Date.now() - lastDragEventAt > HTML5_DRAG_SILENCE_MS)) {
-      finishHtml5OrPointerDrag();
+    // The row is no longer on the page: the list was re-rendered under the
+    // drag (a background sync applying the account's config does this).
+    // Left running, this loop kept scrolling the page and re-attaching the
+    // stale row every frame, indefinitely.
+    if (!activeItem.isConnected) {
+      stopDragging();
       return;
     }
     const hostBox = scrollHost ? scrollHost.getBoundingClientRect() : null;
@@ -30299,105 +30910,76 @@ function createSortableList(container, options = {}) {
     document.body.style.userSelect = '';
   }
 
-  // Ends whichever kind of drag is in progress -- the path the watchdog in
-  // autoScrollStep takes when the drag's own end event never arrived.
-  function finishHtml5OrPointerDrag() {
-    if (html5Drag) {
-      endDragSession();
-      if (activeItem) activeItem.classList.remove(dragClass);
-      activeItem = null;
-      onReorder();
-    } else {
-      stopDragging();
-    }
-  }
+  // Every reorder is driven by pointer events -- mouse, touch and pen alike.
+  //
+  // Mouse drags used to go through the browser's native drag-and-drop instead
+  // (draggable="true" handles, dragstart/dragover/dragend). That hands the
+  // gesture to the operating system's own drag loop, and this function then
+  // moves the dragged row around the page underneath it -- which is exactly
+  // what a native drag handles worst: a drag whose source moves or is
+  // re-rendered can end without dragend, or not end at all, leaving the page
+  // ignoring clicks until it is reloaded. That is what "the page completely
+  // freezes and I have to refresh" was, and why fixes to the work done per
+  // step never touched it. Pointer events keep the whole gesture in this
+  // function's hands: no drag image, no OS loop, and an end that always
+  // arrives (pointerup, pointercancel, or the window losing focus).
+  //
+  // Native drags are refused outright, too: a stale draggable attribute, or
+  // an <img> inside an item (images are draggable by default), would
+  // otherwise start one and cancel the pointer gesture under it.
+  container.addEventListener('dragstart', (e) => {
+    if (e.target && e.target.closest && e.target.closest(itemSelector)) e.preventDefault();
+  });
 
-  // HTML5 Drag events for desktop when handle exists
-  if (handleSelector) {
-    container.addEventListener('dragstart', (e) => {
-      if (typeof options.canDrag === 'function' && !options.canDrag(e)) return;
-      const handle = e.target.closest(handleSelector);
-      if (!handle) { e.preventDefault(); return; }
-      if (e.target.closest('input, button, select, textarea, a, .customListRemovePickBtn, .channelRemovePickBtn')) return;
-      activeItem = handle.closest(itemSelector);
-      if (!activeItem) return;
-      activeItem.classList.add(dragClass);
-      html5Drag = true;
-      lastDragEventAt = Date.now();
-      beginDragSession();
-      if (e.dataTransfer) {
-        e.dataTransfer.effectAllowed = 'move';
-        try { e.dataTransfer.setData('text/plain', activeItem.dataset && activeItem.dataset.slug ? activeItem.dataset.slug : ''); } catch (err) {}
-      }
-    });
-
-    container.addEventListener('dragover', (e) => {
-      if (!activeItem) return;
-      e.preventDefault();
-      moveItem(e.clientY, e.clientX);
-      // dragover arrives in uneven bursts, and only every few hundred
-      // milliseconds once the pointer is held still -- which is exactly when
-      // an edge scroll has to keep going smoothly -- so the scrolling runs on
-      // its own frame loop rather than on the event.
-      queueAutoScroll();
-    });
-
-    // Where the pointer is, and that the drag is still alive, wherever on the
-    // page it has wandered: near the top edge it is usually over the header,
-    // not this list, and the auto-scroll (and the silence watchdog above)
-    // must keep hearing about it there.
-    document.addEventListener('dragover', (e) => {
-      if (!activeItem || !html5Drag) return;
-      lastDragEventAt = Date.now();
-      lastClientX = e.clientX;
-      lastClientY = e.clientY;
-    }, true);
-
-    container.addEventListener('dragend', () => {
-      if (!activeItem) { endDragSession(); return; }
-      finishHtml5OrPointerDrag();
-    });
-  }
-
-  // Pointer events for mobile touch, and desktop hold-to-drag
   container.addEventListener('pointerdown', (e) => {
     if (typeof options.canDrag === 'function' && !options.canDrag(e)) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
     if (e.target.closest('input, button, select, textarea, a, .customListRemovePickBtn, .channelRemovePickBtn, .customListPosInput, .channelPosInput')) return;
     const handle = handleSelector ? e.target.closest(handleSelector) : e.target.closest(itemSelector);
-    if (!handle) return;
+    if (!handle || !container.contains(handle)) return;
     const item = handle.closest(itemSelector);
     if (!item) return;
 
+    // A gesture that never ended (its pointerup went to another window, say)
+    // is finished before this one starts, not left half-open underneath it.
+    if (activeItem) stopDragging();
+
     const isTouch = e.pointerType === 'touch' || e.pointerType === 'pen';
-    if (!isTouch && handleSelector && holdDelay === 0) {
-      return;
-    }
+    // A mouse on a handle drags at once -- once it has actually moved, so a
+    // plain click on the handle is not a reorder. Touch waits out a short
+    // hold so a swipe past the handle still scrolls the page; lists without
+    // a handle keep their own hold delay on every pointer.
+    const immediate = !isTouch && !!handleSelector;
+    const delay = immediate ? 0 : (isTouch ? Math.max(holdDelay, 140) : holdDelay);
+    // No text selection and no native drag starting under a mouse drag.
+    if (!isTouch) e.preventDefault();
 
     cancelHold();
     activeItem = item;
     isDragging = false;
     startX = e.clientX;
     startY = e.clientY;
-
-    const delay = isTouch ? Math.max(holdDelay, 140) : holdDelay;
     if (delay > 0) {
       holdTimer = setTimeout(() => {
         startDragging(item);
       }, delay);
-    } else {
-      startDragging(item);
-      try { handle.setPointerCapture(e.pointerId); } catch (err) {}
     }
+    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
 
     const onPointerMove = (ev) => {
       if (!activeItem) return;
       if (!isDragging) {
         const dist = Math.hypot(ev.clientX - startX, ev.clientY - startY);
-        if (dist > 12) {
-          cancelHold();
-          activeItem = null;
+        if (immediate) {
+          if (dist < 4) return;
+          startDragging(item);
+        } else {
+          if (dist > 12) {
+            cancelHold();
+            activeItem = null;
+          }
+          return;
         }
-        return;
       }
       if (ev.cancelable) ev.preventDefault();
       lastClientX = ev.clientX;
@@ -30408,12 +30990,17 @@ function createSortableList(container, options = {}) {
 
     const onPointerEnd = () => {
       document.removeEventListener('pointermove', onPointerMove);
+      document.removeEventListener('pointerup', onPointerEnd);
+      document.removeEventListener('pointercancel', onPointerEnd);
+      window.removeEventListener('blur', onPointerEnd);
+      try { handle.releasePointerCapture(e.pointerId); } catch (err) {}
       stopDragging();
     };
 
     document.addEventListener('pointermove', onPointerMove, { passive: false });
-    document.addEventListener('pointerup', onPointerEnd, { once: true });
-    document.addEventListener('pointercancel', onPointerEnd, { once: true });
+    document.addEventListener('pointerup', onPointerEnd);
+    document.addEventListener('pointercancel', onPointerEnd);
+    window.addEventListener('blur', onPointerEnd);
   });
 
   const instance = {
@@ -30439,10 +31026,12 @@ function resolveMissingPostersInDom(rootEl) {
   container.querySelectorAll('.live-preview-poster-placeholder[data-needs-fallback="1"]').forEach(ph => {
     if (ph.dataset.fallbackRequested) return;
     ph.dataset.fallbackRequested = '1';
-    const card = ph.closest('.live-preview-poster-card') || ph.closest('.list-card') || ph.closest('[data-title]');
-    const title = (card && card.dataset.title) || (card && card.dataset.name) || '';
-    const type = (card && card.dataset.type) || (card && card.dataset.listType) || 'movie';
-    const id = (card && card.dataset.id) || '';
+    // The tile's own title, never its list card's -- see posterItemIdentity
+    // (23_client-list-management.js).
+    const who = posterItemIdentity(ph);
+    const title = who.title;
+    const type = who.type || 'movie';
+    const id = who.id;
     if (!title && !id) return;
     const tmdbId = id.startsWith('tmdb:') ? id.slice(5) : '';
     const imdbId = id.startsWith('tt') ? id : '';
@@ -32027,7 +32616,7 @@ function addRow(name, url, type, enabled, group, channelId) {
         '<div class="entry-pos-wrap" style="display:flex; align-items:center;">' +
           '<input type="number" class="pos" min="1" title="Type a position number to move this list there" onchange="movePosTo(this)">' +
         '</div>' +
-        '<span class="drag-handle ec-btn" draggable="true" title="Drag to reorder" style="cursor:grab; font-size:1rem;">&#9776;</span>' +
+        '<span class="drag-handle ec-btn" title="Drag to reorder" style="cursor:grab; font-size:1rem;">&#9776;</span>' +
         '<button type="button" class="ec-btn movebtn secondary" onclick="moveRow(this, -1)" title="Move up">&#8593;</button>' +
         '<button type="button" class="ec-btn movebtn secondary" onclick="moveRow(this, 1)" title="Move down">&#8595;</button>' +
         ((isCustomList || isChannel) ? ('<button type="button" class="ec-btn secondary" style="margin-left: auto; margin-right: 6px; font-weight:600; padding: 2px 10px;" onclick="' + (isCustomList ? 'editEntryCustomList(this)' : 'editEntryChannel(this)') + '">Edit</button>') : '') +
@@ -32060,7 +32649,7 @@ function addRow(name, url, type, enabled, group, channelId) {
       : (isChannel || isCustomList || isPremade)
         ? ''
         : '<button type="button" class="secondary add-source-btn" onclick="addSourceRow(this)">+ Add another source (merge into one catalog)</button>') +
-    '<div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span class="shelf-drag-handle" draggable="true" title="Drag to reorder catalog">&#x2630;</span><span class="shelf-title-text">' + escapeHtml(name || 'Unnamed') + ' - ' + (type === 'series' ? 'Series' : 'Movies') + '</span><span class="live-preview-shelf-status"></span><button type="button" class="text-action-btn" disabled>See All &rsaquo;</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>';
+    '<div class="live-preview-shelf" style="padding:0; margin:0; border:none; background:transparent;"><div class="live-preview-shelf-title"><span class="shelf-drag-handle" title="Drag to reorder catalog">&#x2630;</span><span class="shelf-title-text">' + escapeHtml(name || 'Unnamed') + ' - ' + (type === 'series' ? 'Series' : 'Movies') + '</span><span class="live-preview-shelf-status"></span><button type="button" class="text-action-btn" disabled>See All &rsaquo;</button></div><div class="live-preview-posters"><p style="color:var(--muted); font-size:0.88rem; text-align:center; padding: 20px;"><small>Click "Refresh Preview" above to load posters.</small></p></div></div>';
   container.appendChild(div);
   updateSourceRemoveButtons(div);
   relocateAddSourceBtn(div);
@@ -36703,6 +37292,18 @@ function getSafePosterUrl(item) {
 // that trap entirely.
 
 const BETTER_POSTERS_ORIGIN_WEB = 'https://btttr.cc';
+// This Worker's own copy of each BetterPosters image (serveBetterPoster,
+// 05_catalog-core.js). Every Better Poster on the website is loaded from here,
+// never from btttr.cc directly: btttr.cc draws anything it has not drawn
+// lately at an origin that was taking 40-50 seconds (or failing) per poster,
+// which is what left tiles blank. Once any visitor has fetched a poster,
+// everyone gets it from here in a fraction of a second.
+function betterPosterMirrorPrefix() {
+  return ORIGIN + '/bp/';
+}
+function isBetterPosterUrl(p) {
+  return typeof p === 'string' && (p.indexOf(BETTER_POSTERS_ORIGIN_WEB) === 0 || p.indexOf(betterPosterMirrorPrefix()) === 0);
+}
 
 function betterPostersOnWeb() {
   return typeof getBetterPostersSetting === 'function' && getBetterPostersSetting('betterPosters', false);
@@ -36752,7 +37353,7 @@ function betterPostersWebUrl(imdbId) {
   if (lang && lang !== 'en') params.push('lang=' + encodeURIComponent(lang));
   const rs = pick('betterPostersRatingSource', 'avg');
   if (rs && rs !== 'avg') params.push('rs=' + encodeURIComponent(rs));
-  return BETTER_POSTERS_ORIGIN_WEB + '/' + base + '/imdb/poster-default/' + imdbId + '.jpg' +
+  return betterPosterMirrorPrefix() + base + '/' + imdbId + '.jpg' +
     (params.length ? '?' + params.join('&') : '');
 }
 
@@ -36769,7 +37370,7 @@ function isGeneratedPosterUrl(p) {
 
 function applyBetterPosterWeb(it, poster) {
   if (!betterPostersOnWeb()) return poster;
-  const alreadyBetter = typeof poster === 'string' && poster.indexOf(BETTER_POSTERS_ORIGIN_WEB) === 0;
+  const alreadyBetter = isBetterPosterUrl(poster);
   if (!alreadyBetter) {
     if (isGeneratedPosterUrl(poster)) return poster;
     if (it && it.posterShape === 'landscape') return poster;
@@ -36785,6 +37386,149 @@ function applyBetterPosterWeb(it, poster) {
   return betterPostersWebUrl(imdbId);
 }
 window.applyBetterPosterWeb = applyBetterPosterWeb;
+
+// --- Warming: fetch a page's Better Posters before they are scrolled to ----
+//
+// A poster nobody has asked this Worker for yet still has to come from
+// btttr.cc once, and that is the slow part. Every Better Poster that lands on
+// the page -- including the lazy ones far below the fold, which the browser
+// has not requested yet -- is sent to /api/bp/warm as soon as it is rendered,
+// so the Worker fetches the missing ones while the page is still being read.
+// By the time a row is scrolled to its posters are stored and load at once.
+//
+// One batch in flight at a time, and each poster at most once per page load:
+// the Worker is gentle with btttr.cc on our behalf, and flooding it with
+// parallel batches would only slow every draw down.
+const BETTER_POSTER_WARM_BATCH = 40;
+var _betterPosterWarmSent = null;
+var _betterPosterWarmQueue = [];
+var _betterPosterWarmBusy = false;
+
+function queueBetterPosterWarm(src) {
+  if (!src || src.indexOf(betterPosterMirrorPrefix()) !== 0) return;
+  if (!_betterPosterWarmSent) _betterPosterWarmSent = new Set();
+  if (_betterPosterWarmSent.has(src)) return;
+  _betterPosterWarmSent.add(src);
+  _betterPosterWarmQueue.push(src.slice(ORIGIN.length));
+}
+
+async function drainBetterPosterWarm() {
+  if (_betterPosterWarmBusy) return;
+  _betterPosterWarmBusy = true;
+  try {
+    while (_betterPosterWarmQueue.length) {
+      const batch = _betterPosterWarmQueue.splice(0, BETTER_POSTER_WARM_BATCH);
+      try {
+        const res = await fetch(ORIGIN + '/api/bp/warm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls: batch }),
+        });
+        // Rate-limited: stop for now. Whatever is left loads on its own as
+        // it is scrolled to.
+        if (res.status === 429) { _betterPosterWarmQueue = []; break; }
+        const data = await res.json().catch(() => null);
+        if (data && Array.isArray(data.ready)) betterPostersReady(data.ready);
+      } catch (e) {
+        break;
+      }
+    }
+  } finally {
+    _betterPosterWarmBusy = false;
+  }
+}
+
+// --- Tiles waiting on their Better Poster ----------------------------------
+//
+// A poster btttr.cc has not drawn cannot be had quickly -- the Worker gives it
+// a few seconds and then answers 503 (serveBetterPoster, 05_catalog-core.js).
+// handlePosterImgError (23) shows the title's ordinary poster in the meantime
+// and parks the tile here, and the page's /api/bp/warm call, which keeps
+// trying for most of a minute, reports the ones it got. Each tile waiting on
+// one of those is switched over -- after the image has loaded, so the swap is
+// a single clean change and never a flash of an empty tile.
+var _betterPosterWaiting = new Map();
+var _betterPosterReadyUrls = new Set();
+
+function waitForBetterPoster(img, url) {
+  if (!img || !url) return;
+  if (_betterPosterReadyUrls.has(url)) { swapInBetterPoster(url, [img]); return; }
+  const list = _betterPosterWaiting.get(url) || [];
+  list.push(img);
+  _betterPosterWaiting.set(url, list);
+}
+
+function betterPostersReady(paths) {
+  for (let i = 0; i < paths.length; i++) {
+    const p = String(paths[i] || '');
+    const url = p.indexOf('/') === 0 ? ORIGIN + p : p;
+    _betterPosterReadyUrls.add(url);
+    const waiting = _betterPosterWaiting.get(url);
+    if (!waiting) continue;
+    _betterPosterWaiting.delete(url);
+    swapInBetterPoster(url, waiting);
+  }
+}
+
+function swapInBetterPoster(url, imgs) {
+  if (typeof Image !== 'function') return;
+  const probe = new Image();
+  probe.onload = function() {
+    for (let i = 0; i < imgs.length; i++) {
+      const img = imgs[i];
+      // Re-rendered, or pointed somewhere else since: not this tile any more.
+      if (!img.isConnected || !img.dataset.posterStandIn || img.getAttribute('src') !== img.dataset.posterStandIn) continue;
+      img.src = url;
+    }
+  };
+  probe.src = url;
+}
+
+// The IMDb id in a Better Poster URL -- ours (/bp/<style>/tt123.jpg) or
+// btttr.cc's (.../poster-default/tt123.jpg). String scanning, not a regex,
+// for the reason given at the top of this section.
+function betterPosterImdbFromUrl(url) {
+  if (!isBetterPosterUrl(url)) return '';
+  const path = url.split('?')[0];
+  const file = path.slice(path.lastIndexOf('/') + 1);
+  if (file.slice(-4) !== '.jpg') return '';
+  return betterPostersWebImdbId({ id: file.slice(0, -4) });
+}
+
+function warmBetterPostersIn(root) {
+  if (!root || root.nodeType !== 1) return;
+  const imgs = root.tagName === 'IMG' ? [root] : root.querySelectorAll('img[src^="' + betterPosterMirrorPrefix() + '"]');
+  for (let i = 0; i < imgs.length; i++) queueBetterPosterWarm(imgs[i].getAttribute('src') || '');
+}
+
+// New tiles, and tiles whose src is set after render (applyBetterPostersTo-
+// TmdbTiles below). Collected and handled once per frame, like the poster
+// badges' observer (initWatchHistory), so a grid rendering in batches costs a
+// pass per frame rather than one per tile.
+(function warmBetterPostersOnPage() {
+  if (typeof MutationObserver !== 'function' || !document.body) return;
+  let pending = [];
+  let scheduled = false;
+  const flush = () => {
+    scheduled = false;
+    const nodes = pending;
+    pending = [];
+    if (!betterPostersOnWeb()) return;
+    for (let i = 0; i < nodes.length; i++) if (nodes[i].isConnected) warmBetterPostersIn(nodes[i]);
+    if (_betterPosterWarmQueue.length) drainBetterPosterWarm();
+  };
+  new MutationObserver((mutations) => {
+    for (let i = 0; i < mutations.length; i++) {
+      const m = mutations[i];
+      if (m.type === 'attributes') pending.push(m.target);
+      else for (let j = 0; j < m.addedNodes.length; j++) pending.push(m.addedNodes[j]);
+    }
+    if (!pending.length || scheduled) return;
+    scheduled = true;
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(flush);
+    else setTimeout(flush, 16);
+  }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+})();
 
 // Gives BetterPosters artwork to tiles whose item has only a TMDB id.
 //
@@ -51809,7 +52553,7 @@ function renderMyCreatedChannelsList() {
       '<div class="list-card-header">' +
         '<div class="list-card-body">' +
           '<div class="list-card-title" style="cursor:pointer;" onclick="openChannelDetailsPage(&quot;' + escapeJsAttr(ch.channelId) + '&quot;)" title="Open ' + escapeAttr(ch.name) + '">' +
-            '<span class="drag-handle-list channel-drag-handle" draggable="true" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
+            '<span class="drag-handle-list channel-drag-handle" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
             escapeHtml(ch.name) +
           '</div>' +
           (ch.description ? '<div style="font-size:0.8rem; color:var(--text); margin-top:2px;">' + escapeHtml(ch.description) + '</div>' : '') +
@@ -58477,11 +59221,11 @@ function buildAiringNextCardHtml() {
     (isAdded ? 'style="color:var(--danger);"' : '') +
     ' data-slug="airing-next">' + (isAdded ? 'Remove' : '+ Add') + '</button>';
 
-  return '<div class="creator-list-row list-card" draggable="true" data-slug="airing-next" data-list-type="series">' +
+  return '<div class="creator-list-row list-card" data-slug="airing-next" data-list-type="series">' +
     '<div class="list-card-header">' +
       '<div class="list-card-body">' +
         '<div class="list-card-title">' +
-          '<span class="drag-handle-list" draggable="true" title="Drag to reorder">&#x2630;</span>' +
+          '<span class="drag-handle-list" title="Drag to reorder">&#x2630;</span>' +
           'Airing Next' +
         '</div>' +
         '<div class="list-card-meta">' +
@@ -63210,7 +63954,7 @@ async function renderCreatorDashboard(options) {
       const syncBtnHtml = isSynced
         ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
         : '';
-      return '<div class="list-card creator-list-row" draggable="true" data-slug="' + escapeAttr(l.slug) + '">' +
+      return '<div class="list-card creator-list-row" data-slug="' + escapeAttr(l.slug) + '">' +
         '<div class="list-card-header">' +
           '<div class="list-card-body creatorListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type) + '" style="cursor:pointer;">' +
             '<div class="list-card-title">' +
@@ -63612,11 +64356,11 @@ function buildLocalListCardHtml(l) {
     ? '<button type="button" class="lc-btn secondary customListSyncBtn" data-slug="' + escapeAttr(l.slug) + '" title="Sync with external link">Sync</button>'
     : '';
 
-  return '<div class="' + cardClass + '" draggable="true" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
+  return '<div class="' + cardClass + '" data-slug="' + escapeAttr(l.slug) + '" data-list-type="' + escapeAttr(l.type || 'movie') + '">' +
     '<div class="list-card-header">' +
       '<div class="list-card-body localListViewBtn" data-slug="' + escapeAttr(l.slug) + '" data-name="' + escapeAttr(l.name) + '" data-type="' + escapeAttr(l.type || 'movie') + '" style="cursor:pointer;">' +
         '<div class="list-card-title">' +
-          '<span class="drag-handle-list" draggable="true" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
+          '<span class="drag-handle-list" title="Drag to reorder" onclick="event.stopPropagation();">&#x2630;</span>' +
           escapeHtml(l.name) +
         '</div>' +
         '<div class="list-card-meta">' +
@@ -66555,24 +67299,63 @@ function showPosterPlaceholderFor(img) {
   ph.style.display = 'flex';
 }
 
+// The title a poster belongs to: { id, title, type }.
+//
+// Read from the img itself, then from the nearest elements above it that
+// describe one title -- stopping at a list card. It used to take the first of
+// .live-preview-poster-card, .list-card or [data-title], and the mini tiles
+// on Discover, My Lists and creator profiles sit inside a .list-card, whose
+// data-name is the LIST's name. So a failed poster in the "Hulu" card was
+// looked up as a show called "Hulu" (Paradise), in "Prime Video Top 10" as
+// one called that (Video & Arcade Top 10), and so on: the right tile, the
+// wrong title's poster. Anything carrying data-url is a list too (the curated
+// cards' tile wrapper holds the list's title in data-title), so it is skipped.
+function posterItemIdentity(el) {
+  const who = { id: '', title: '', type: '' };
+  let node = el;
+  for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+    const cl = node.classList;
+    if (depth > 0 && cl && (cl.contains('list-card') || cl.contains('list-card-posters') || cl.contains('entry'))) break;
+    const d = node.dataset || {};
+    if (d.url || d.listType) continue;
+    const id = d.id || d.imdb || d.imdbId || '';
+    if (!who.id && id) who.id = id;
+    if (!who.title && d.title) who.title = d.title;
+    if (!who.type && d.type && (id || d.title)) who.type = d.type;
+    if (who.id && who.title) break;
+  }
+  return who;
+}
+
 function handlePosterImgError(img) {
   if (!img) return;
+  // A Better Poster swapped in over its stand-in (swapInBetterPoster, 19)
+  // that failed after all: back to the stand-in.
+  const standIn = img.dataset.posterStandIn;
+  if (standIn && img.getAttribute('src') !== standIn) {
+    img.src = standIn;
+    return;
+  }
   if (img.dataset.hasFailedFallback) {
     showPosterPlaceholderFor(img);
     return;
   }
   img.dataset.hasFailedFallback = '1';
 
-  const card = img.closest('.live-preview-poster-card') || img.closest('.list-card') || img.closest('[data-title]');
-  let title = (card && (card.dataset.title || card.dataset.name)) || '';
-  const type = (card && (card.dataset.type || card.dataset.listType)) || 'movie';
-  const id = (card && (card.dataset.id || card.dataset.imdbId)) || '';
+  const failedSrc = img.getAttribute('src') || '';
+  const who = posterItemIdentity(img);
+  const title = who.title;
+  const type = who.type || 'movie';
+  const id = who.id;
+  // A Better Poster names its title in its own URL, which is as certain as
+  // an id gets -- and the one thing to go on for a tile carrying none.
+  const betterPosterId = typeof betterPosterImdbFromUrl === 'function' ? betterPosterImdbFromUrl(failedSrc) : '';
 
   // Clean episode indicators from show title for fallback lookup, e.g. "Ted Lasso S03E01" -> "Ted Lasso"
   const cleanTitle = title.replace(/\s+S\d+E\d+.*$/i, '').trim();
 
-  const tmdbId = id.startsWith('tmdb:') ? id.slice(5).split(':')[0] : (/^\d+/.test(id) ? id.split(':')[0] : '');
-  const imdbId = id.startsWith('tt') ? id.split(':')[0] : '';
+  const tmdbId = betterPosterId ? '' : (id.startsWith('tmdb:') ? id.slice(5).split(':')[0] : (/^\d+/.test(id) ? id.split(':')[0] : ''));
+  const imdbId = betterPosterId || (id.startsWith('tt') ? id.split(':')[0] : '');
 
   if (cleanTitle || tmdbId || imdbId) {
     fetch(ORIGIN + '/api/poster-fallback?title=' + encodeURIComponent(cleanTitle || title) + '&type=' + encodeURIComponent(type) + (tmdbId ? '&tmdbId=' + encodeURIComponent(tmdbId) : '') + (imdbId ? '&imdbId=' + encodeURIComponent(imdbId) : ''))
@@ -66581,6 +67364,12 @@ function handlePosterImgError(img) {
         if (data && data.ok && data.poster) {
           img.src = data.poster;
           img.style.display = '';
+          // The ordinary poster stands in for the Better one, which is
+          // switched in if the page's warm call gets it.
+          if (betterPosterId && typeof waitForBetterPoster === 'function') {
+            img.dataset.posterStandIn = data.poster;
+            waitForBetterPoster(img, failedSrc);
+          }
         } else {
           showPosterPlaceholderFor(img);
         }
@@ -66591,6 +67380,19 @@ function handlePosterImgError(img) {
   } else {
     showPosterPlaceholderFor(img);
   }
+}
+
+// A Better Poster that fails on a tile with no onerror of its own -- the
+// Custom List Builder's and Channel Builder's picks, the Curated For You
+// cards -- gets the same treatment rather than a broken-image icon. Captured,
+// because error events do not bubble.
+if (typeof document !== 'undefined' && document && typeof document.addEventListener === 'function') {
+  document.addEventListener('error', function(e) {
+    const img = e && e.target;
+    if (!img || img.tagName !== 'IMG' || typeof img.onerror === 'function') return;
+    if (typeof isBetterPosterUrl !== 'function' || !isBetterPosterUrl(img.getAttribute('src') || '')) return;
+    handlePosterImgError(img);
+  }, true);
 }
 
 // --- Poster-render caches ----------------------------------------------------
@@ -72908,6 +73710,71 @@ async function handleFetch(request, env, ctx) {
     }
 
     // /api/poster-badge -> Dynamic badged SVG poster for Stremio / Nuvio
+    // This Worker's copy of a BetterPosters image -- see serveBetterPoster
+    // (05_catalog-core.js).
+    if (path.startsWith("/bp/") && (request.method === "GET" || request.method === "HEAD")) {
+      const bp = parseBetterPosterPath(path, url.searchParams);
+      if (!bp) return new Response(null, { status: 404 });
+      return await serveBetterPoster(env, ctx, bp, url.origin, request);
+    }
+
+    // /api/bp/warm  (POST)  { urls: ["/bp/...", ...] } -> { ok, stored, fetched, ready: [...] }
+    //
+    // Fetches, from btttr.cc, any of these posters this Worker does not hold
+    // yet -- so the wait for a poster btttr.cc has never drawn happens before
+    // it is scrolled to, not while someone is looking at an empty tile. The
+    // website sends every BetterPosters image on a page as soon as it is
+    // rendered, including the lazy ones far below the fold.
+    //
+    // `ready` lists which of the urls, exactly as sent, this Worker now holds:
+    // a tile that has been showing the title's ordinary poster while its
+    // Better one was fetched is switched over when it appears there.
+    //
+    // The request stays open until the fetches finish rather than running
+    // them after the response: a draw can take most of a minute, and work
+    // left to waitUntil is cut off 30 seconds after the response is sent. A
+    // poster btttr.cc failed to supply in the last few minutes is not asked
+    // for again here -- the cron retries those.
+    if (path === "/api/bp/warm" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400, { "Cache-Control": "no-store" });
+      }
+      const warmIp = clientIpKey(request);
+      if (!warmIp) return json({ ok: false }, 400, { "Cache-Control": "no-store" });
+      const wanted = [];
+      const seen = new Set();
+      for (const raw of (Array.isArray(body && body.urls) ? body.urls : []).slice(0, BETTER_POSTER_WARM_MAX)) {
+        let u;
+        try { u = new URL(String(raw || ""), url.origin); } catch { continue; }
+        if (u.origin !== url.origin) continue;
+        const bp = parseBetterPosterPath(u.pathname, u.searchParams);
+        if (bp && !seen.has(bp.kvKey)) { seen.add(bp.kvKey); wanted.push({ bp, sent: String(raw) }); }
+      }
+      if (!wanted.length) return json({ ok: true, stored: 0, fetched: 0, ready: [] }, 200, { "Cache-Control": "no-store" });
+      if (await consumeRateLimit(env, ctx, "bpwarm", warmIp, BETTER_POSTER_WARM_IDS_PER_MINUTE, 60, wanted.length)) {
+        return json({ ok: false, error: "Too many requests just now." }, 429, { "Cache-Control": "no-store" });
+      }
+      let stored = 0;
+      let fetched = 0;
+      const ready = [];
+      let cursor = 0;
+      // A few at a time: btttr.cc's origin is the thing being slow, and
+      // piling onto it would make every draw slower, ours included.
+      await Promise.all(Array.from({ length: Math.min(4, wanted.length) }, async () => {
+        while (cursor < wanted.length) {
+          const { bp, sent } = wanted[cursor++];
+          if (await readStoredBetterPoster(env, ctx, bp)) { stored++; ready.push(sent); continue; }
+          if (await betterPosterRecentlyMissed(url.origin, bp)) continue;
+          if (await fetchBetterPosterForPage(env, ctx, bp, url.origin, BETTER_POSTER_UPSTREAM_TIMEOUT_MS)) { fetched++; ready.push(sent); }
+        }
+      }));
+      await flushBetterPosterRetries(env, true);
+      return json({ ok: true, stored, fetched, ready }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/api/poster-badge") {
       const posterUrl = url.searchParams.get("poster") || "";
       const rawAirDate = url.searchParams.get("airDate") || "";
@@ -72920,7 +73787,17 @@ async function handleFetch(request, env, ctx) {
       const finaleDate = !isFinaleAired ? rawFinaleDate : "";
       const companion = url.searchParams.get("companion") || "";
 
-      if (!posterUrl || !isAllowedPosterUrl(posterUrl)) {
+      // This Worker's own BetterPosters copy. Recognised by being on THIS
+      // origin under /bp/ -- never by path alone, which would let any host's
+      // /bp/ through the allowlist below -- and read directly: a Worker
+      // fetching its own hostname does not reliably reach itself.
+      let ownBetterPoster = null;
+      try {
+        const pu = new URL(posterUrl);
+        if (pu.origin === url.origin && pu.pathname.startsWith("/bp/")) ownBetterPoster = parseBetterPosterPath(pu.pathname, pu.searchParams);
+      } catch {}
+
+      if (!posterUrl || (!ownBetterPoster && !isAllowedPosterUrl(posterUrl))) {
         // Missing entirely, or not one of the image hosts this add-on
         // itself ever puts in a `poster` field (see isAllowedPosterUrl).
         // This is a public, CORS-open, unauthenticated endpoint -- without
@@ -72940,13 +73817,27 @@ async function handleFetch(request, env, ctx) {
 
       let embeddedPosterDataUri = "";
       try {
-        const imgRes = await fetch(posterUrl, {
-          headers: { "User-Agent": "my-list-addon/1.14" },
-          cf: { cacheTtl: 86400, cacheEverything: true }
-        });
-        if (imgRes.ok) {
-          const contentType = imgRes.headers.get("content-type") || "image/jpeg";
-          const buffer = await imgRes.arrayBuffer();
+        let contentType = "";
+        let buffer = null;
+        if (ownBetterPoster) {
+          // Waits no longer than a tile would; without it, the redirect below
+          // hands the app the same URL, which answers with a stand-in.
+          const found = await getBetterPoster(env, ctx, ownBetterPoster, url.origin, { waitMs: BETTER_POSTER_PAGE_WAIT_MS });
+          if (found) {
+            contentType = found.contentType;
+            buffer = found.bytes;
+          }
+        } else {
+          const imgRes = await fetch(posterUrl, {
+            headers: { "User-Agent": "my-list-addon/1.14" },
+            cf: { cacheTtl: 86400, cacheEverything: true }
+          });
+          if (imgRes.ok) {
+            contentType = imgRes.headers.get("content-type") || "image/jpeg";
+            buffer = await imgRes.arrayBuffer();
+          }
+        }
+        if (buffer) {
           const bytes = new Uint8Array(buffer);
           let binary = "";
           const len = bytes.byteLength;
@@ -73546,7 +74437,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // fetchCatalog, so it needs its own call -- otherwise search results
         // would be the one row in Stremio still showing the old artwork.
         if (searchConfig.betterPosters) {
-          metas = applyBetterPostersToMetas(metas, betterPostersOptionsFrom(searchConfig));
+          metas = applyBetterPostersToMetas(metas, betterPostersOptionsFrom(searchConfig, url.origin));
         }
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400" });
       }
@@ -73588,7 +74479,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // to a config that PROVED it belongs to that account. See resolveConfig
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
-        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist, env, ctx, origin: url.origin });
+        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig, url.origin), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist, env, ctx, origin: url.origin });
         if (dedupeAcrossLists) {
           metas = await dedupeAcrossListEntries(entries, entryIndex, skip, metas, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, env, ctx });
         }
@@ -73952,7 +74843,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
           // the episode list all stay exactly as fetchStandardItemMeta built
           // them, and a non-IMDB id (tmdb:...) is left alone.
           if (metaConfig.betterPosters) {
-            meta = applyBetterPosterToMeta(meta, betterPostersOptionsFrom(metaConfig));
+            meta = applyBetterPosterToMeta(meta, betterPostersOptionsFrom(metaConfig, url.origin));
           }
           return jsonPublic(
             { meta },
@@ -87431,11 +88322,20 @@ export default {
       "refreshAiringNextSweep",
       episodeSweep.then(() => refreshAiringNextSweep(env, ctx, airingNextBudget))
     );
+    // BetterPosters artwork for the shared charts, fetched before anyone
+    // scrolls to it -- see prewarmBetterPosters. Same reserve, same size of
+    // slice; the three shares add to 0.75, so a quarter stays unspent.
+    const betterPosterBudget = Math.floor((episodeBudget - episodeCeiling) * CRON_BETTER_POSTER_SHARE);
+    const betterPosterWarm = guard(
+      "prewarmBetterPosters",
+      episodeSweep.then(() => prewarmBetterPosters(env, ctx, betterPosterBudget))
+    );
     ctx.waitUntil(
       Promise.all([
         episodeSweep,
         streamingSweep,
         airingNextSweep,
+        betterPosterWarm,
         guard("bumpNewOnStreamingEpisodes", streamingSweep.then(() => bumpNewOnStreamingEpisodes(env, ctx, newOnStreamingBudget))),
         guard("prewarmSharedCatalogs", streamingSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
         // One Quick Add network per tick (see prewarmChannelPresets,

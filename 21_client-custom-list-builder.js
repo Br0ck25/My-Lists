@@ -4058,11 +4058,11 @@ function buildAiringNextCardHtml() {
     (isAdded ? 'style="color:var(--danger);"' : '') +
     ' data-slug="airing-next">' + (isAdded ? 'Remove' : '+ Add') + '</button>';
 
-  return '<div class="creator-list-row list-card" draggable="true" data-slug="airing-next" data-list-type="series">' +
+  return '<div class="creator-list-row list-card" data-slug="airing-next" data-list-type="series">' +
     '<div class="list-card-header">' +
       '<div class="list-card-body">' +
         '<div class="list-card-title">' +
-          '<span class="drag-handle-list" draggable="true" title="Drag to reorder">&#x2630;</span>' +
+          '<span class="drag-handle-list" title="Drag to reorder">&#x2630;</span>' +
           'Airing Next' +
         '</div>' +
         '<div class="list-card-meta">' +

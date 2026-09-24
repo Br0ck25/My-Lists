@@ -3235,6 +3235,20 @@ async function buildMostWatchedMetas(env, ctx, window, type) {
   return metas;
 }
 
+// Most Watched Today, rolling over rather than starting empty.
+//
+// Counted per Eastern day, "today" used to go blank at midnight and fill up
+// again one watch at a time. Now what was on it stays: whatever has been
+// watched today goes on top (most watched first, as before), everything else
+// keeps its place below, and the list stays MOST_WATCHED_MAX_ITEMS long --
+// so each newly watched title pushes the last one off the end.
+function rollMostWatchedToday(todayMetas, previousSnap) {
+  const fresh = Array.isArray(todayMetas) ? todayMetas : [];
+  const previous = previousSnap && Array.isArray(previousSnap.metas) ? previousSnap.metas : [];
+  const onTop = new Set(fresh.map((m) => m && m.id));
+  return [...fresh, ...previous.filter((m) => m && m.id && !onTop.has(m.id))].slice(0, MOST_WATCHED_MAX_ITEMS);
+}
+
 async function fetchMostWatchedCatalog(entry, skip = 0, keys = {}) {
   const env = keys && keys.env;
   const window = parseMostWatchedWindow(entry && entry.url);
@@ -3255,10 +3269,15 @@ async function fetchMostWatchedCatalog(entry, skip = 0, keys = {}) {
   }
   if (!mostWatchedSnapshotFresh(snap, window, nowMs)) {
     try {
-      const metas = await buildMostWatchedMetas(env, keys.ctx, window, type);
+      let metas = await buildMostWatchedMetas(env, keys.ctx, window, type);
+      if (window === "today") metas = rollMostWatchedToday(metas, snap);
       snap = { builtAt: nowMs, day: easternDateKey(new Date(nowMs)), metas };
       if (env && env.CONFIGS) {
-        const put = env.CONFIGS.put(key, JSON.stringify(snap), { expirationTtl: 3 * 86400 }).catch(() => {});
+        // "today" is carried from one day to the next (rollMostWatchedToday),
+        // so its snapshot has to outlive a quiet spell; the others are
+        // rebuilt from scratch and only need to last out their day.
+        const ttl = window === "today" ? MOST_WATCHED_TODAY_KEEP_SECONDS : 3 * 86400;
+        const put = env.CONFIGS.put(key, JSON.stringify(snap), { expirationTtl: ttl }).catch(() => {});
         if (keys.ctx && typeof keys.ctx.waitUntil === "function") keys.ctx.waitUntil(put);
         else await put;
       }
@@ -5048,6 +5067,154 @@ async function checkForNewEpisodes(env, fetchBudget) {
 // so a budget that fits only a few per tick still covers all of them over the
 // following ticks instead of re-warming the first few forever. A budget that
 // fits the whole list warms the whole list, exactly as this always did.
+// --- BetterPosters for the shared charts, fetched ahead of time ---------------
+//
+// The Worker's copy of a BetterPosters image (serveBetterPoster, 05) is instant
+// for everyone once anyone has fetched it; the first fetch of a title btttr.cc
+// has not drawn lately waits on its origin, which was taking 40-50 seconds.
+// Titles on the shared charts -- the Discover tab, Quick Add, the My Lists
+// Addon Charts -- are the ones most people see first, and new ones arrive
+// every day, so the cron fetches their artwork before anyone looks: every
+// title x every style in use, a slice per tick, re-fetching any copy more than
+// a day old on the way past.
+//
+// Before any of that, it retries the posters a page asked for and btttr.cc
+// failed to supply (queueBetterPosterRetry, 05). Those are titles someone has
+// actually looked at, so they come first. A random few each tick, so a long
+// btttr.cc outage cycles through all of them without the list having to
+// record who was tried when -- which would be a KV write every tick; this
+// writes only when one is fetched.
+const SHARED_POSTER_IDS_KEY = "bp:sharedids:v1";
+const SHARED_POSTER_IDS_MAX = 2000;
+
+// Newest first, de-duplicated, capped: a title that is still charting keeps
+// coming back to the front, one that dropped off ages out.
+async function rememberSharedPosterIds(env, ids) {
+  if (!env || !env.CONFIGS || !ids.length) return;
+  try {
+    const raw = await env.CONFIGS.get(SHARED_POSTER_IDS_KEY);
+    const prev = raw ? JSON.parse(raw) : [];
+    const merged = [...new Set([...ids, ...(Array.isArray(prev) ? prev : [])])].slice(0, SHARED_POSTER_IDS_MAX);
+    if (JSON.stringify(merged) === raw) return;
+    await env.CONFIGS.put(SHARED_POSTER_IDS_KEY, JSON.stringify(merged));
+  } catch {}
+}
+
+async function retryMissedBetterPosters(env, fetchCap) {
+  if (fetchCap < 1) return 0;
+  let list;
+  try {
+    list = readBetterPosterRetries(await env.CONFIGS.get(BETTER_POSTER_RETRY_KEY));
+  } catch {
+    return 0;
+  }
+  const keys = Object.keys(list);
+  for (let i = keys.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [keys[i], keys[j]] = [keys[j], keys[i]];
+  }
+  const due = keys.slice(0, fetchCap);
+  if (!due.length) return 0;
+  const gone = [];
+  let done = 0;
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(4, due.length) }, async () => {
+    while (next < due.length) {
+      const path = due[next++];
+      let bp = null;
+      try {
+        const u = new URL(path, "https://x.invalid");
+        bp = parseBetterPosterPath(u.pathname, u.searchParams);
+      } catch {}
+      if (!bp) { gone.push(path); continue; }
+      if ((await readStoredBetterPoster(env, null, bp)) || (await fetchBetterPosterUpstream(env, bp, BETTER_POSTER_UPSTREAM_TIMEOUT_MS))) {
+        gone.push(path);
+        done++;
+      }
+    }
+  }));
+  if (gone.length) {
+    // Re-read before writing: pages add to this list while the fetches above
+    // run, and those additions should not be lost to this write.
+    try {
+      const latest = readBetterPosterRetries(await env.CONFIGS.get(BETTER_POSTER_RETRY_KEY));
+      for (const path of gone) delete latest[path];
+      await env.CONFIGS.put(BETTER_POSTER_RETRY_KEY, JSON.stringify(trimBetterPosterRetries(latest, Date.now())));
+    } catch {}
+  }
+  if (done) console.log(`[Cron] BetterPosters: ${done} of ${due.length} missed poster(s) fetched on retry.`);
+  return due.length;
+}
+
+async function prewarmBetterPosters(env, ctx, fetchBudget) {
+  if (!env || !env.CONFIGS) return;
+  let fetchCap = Math.min(BETTER_POSTER_PREWARM_FETCHES_PER_TICK, Math.floor(Number(fetchBudget) || 0));
+  if (fetchCap < 1) return;
+  fetchCap -= await retryMissedBetterPosters(env, fetchCap);
+  if (fetchCap < 1) return;
+
+  const variants = await betterPosterVariantsInUse(env);
+  // Nobody has used Better Posters lately: nothing to fetch ahead for.
+  if (!variants.length) return;
+
+  // The My Lists Addon Charts are built from this add-on's own data (KV/D1,
+  // no provider call), so they are read directly each time rather than
+  // waiting for a chart pre-warm to pass them.
+  const ids = [];
+  for (const chart of MY_LISTS_ADDON_CHARTS) {
+    for (const type of ["movie", "series"]) {
+      try {
+        const metas = await fetchCatalog({ url: chart.movieUrl, type }, 0, { env, ctx });
+        for (const m of (Array.isArray(metas) ? metas : [])) {
+          const id = betterPostersImdbId(m);
+          if (id) ids.push(id);
+        }
+      } catch {}
+    }
+  }
+  try {
+    const raw = await env.CONFIGS.get(SHARED_POSTER_IDS_KEY);
+    const shared = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(shared)) ids.push(...shared);
+  } catch {}
+  const titles = [...new Set(ids)];
+  if (!titles.length) return;
+
+  // Resumes where the last tick stopped, over every title x style pair.
+  const total = titles.length * variants.length;
+  let cursor = 0;
+  try {
+    cursor = (parseInt(await env.CONFIGS.get("cron:bpwarm:cursor"), 10) || 0) % total;
+  } catch {}
+
+  let checked = 0;
+  let fetched = 0;
+  const work = [];
+  while (checked < Math.min(total, BETTER_POSTER_PREWARM_CHECKS_PER_TICK) && work.length < fetchCap) {
+    const n = (cursor + checked) % total;
+    checked++;
+    const bp = betterPosterForVariant(titles[Math.floor(n / variants.length)], variants[n % variants.length]);
+    if (!bp) continue;
+    const have = await readStoredBetterPoster(env, null, bp);
+    if (have && Date.now() - have.at <= BETTER_POSTER_REFRESH_MS) continue;
+    work.push(bp);
+  }
+  // A few at a time: btttr.cc's origin is the slow part, and piling onto it
+  // slows every draw, ours included. A refresh that fails leaves the copy
+  // already held exactly as it was.
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(4, work.length) }, async () => {
+    while (next < work.length) {
+      const bp = work[next++];
+      if (await fetchBetterPosterUpstream(env, bp, BETTER_POSTER_UPSTREAM_TIMEOUT_MS)) fetched++;
+    }
+  }));
+  try {
+    await env.CONFIGS.put("cron:bpwarm:cursor", String((cursor + checked) % total));
+  } catch {}
+  if (fetched) console.log(`[Cron] BetterPosters: fetched ${fetched} of ${work.length} missing or stale (${checked} checked).`);
+}
+
 async function prewarmSharedCatalogs(env, ctx, fetchBudget) {
   if (!env || !env.CONFIGS) return;
 
@@ -5170,15 +5337,25 @@ async function prewarmSharedCatalogs(env, ctx, fetchBudget) {
     }
 
     const take = Math.min(warmTasks.length, maxWarms);
+    const chartIds = [];
     for (let n = 0; n < take; n++) {
       const item = warmTasks[(warmCursor + n) % warmTasks.length];
       try {
-        await item.run();
+        const result = await item.run();
+        if (Array.isArray(result)) {
+          for (const m of result) {
+            const id = betterPostersImdbId(m);
+            if (id) chartIds.push(id);
+          }
+        }
         await new Promise((resolve) => setTimeout(resolve, item.pauseMs));
       } catch (e) {
         console.warn(`[Cron] Prewarm ${item.label} failed:`, e && e.message ? e.message : e);
       }
     }
+    // The titles these charts hold, for prewarmBetterPosters (below) to fetch
+    // BetterPosters artwork for before anyone scrolls to them.
+    if (chartIds.length) await rememberSharedPosterIds(env, chartIds);
 
     // Advanced after the slice, not before it: a tick terminated part-way
     // through must not have already committed a move it did not make. The
