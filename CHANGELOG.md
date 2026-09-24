@@ -6,6 +6,17 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### ✨ Most Watched Today rolls over instead of going empty at midnight
+
+"Today" was counted per Eastern day, so at midnight the list emptied and refilled one watch at a time. Now the list stays:
+- Titles watched today go on top, most watched first.
+- Everything else keeps its place below.
+- The list stays 25 long, so each newly watched title pushes the last one off.
+
+It's rebuilt every 15 minutes instead of hourly, so a title just watched reaches the top promptly. The rolling list is kept for 60 days of nobody opening it.
+
+- Tests: three in `tests/my-lists-addon-charts.test.mjs`, covering yesterday's list surviving midnight, today's watches going on top of the carried-over ones, and a newcomer pushing the 25th title off. All three fail on the previous code.
+
 ### 🐛 Dragging to reorder froze the page until it was reloaded
 
 Mouse reordering (Live Preview, its Edit mode, and every other reorderable list) used the browser's native drag-and-drop. That hands the gesture to the operating system's drag loop, while `createSortableList` moves the dragged row around the page underneath it. Moving or re-rendering the source of a native drag is what native drag-and-drop handles worst: the drag can end without `dragend`, or not end at all, and the page ignores clicks until it's reloaded. The earlier fixes reduced the work done on each step of a drag, which never touched this. Automated drags don't exercise the real OS drag loop, which is why none of the tests could reproduce it.
@@ -21,13 +32,34 @@ Verified in Chromium with real mouse input:
 - A click on a handle leaves the order alone, and the page takes clicks right after a drop.
 - Touch drags and a list re-rendered mid-drag still behave.
 
-### 🐛 Better Posters: some tiles stayed blank
+### 🐛 Better Posters loaded slowly or not at all: served from the Worker's own copy now
 
-btttr.cc draws a title's artwork the first time anyone asks for it. For titles it hadn't drawn yet, that took 40–50 seconds (measured: Ted Lasso 50 s, Slow Horses 39 s, against about 0.3 s for one already drawn). The request neither failed nor answered in that time, so the tile's error fallback never ran and it stayed blank. Switching Better Posters off made them appear.
+Tiles sat blank all over the site with Better Posters on, and filled in when it was switched off. btttr.cc serves artwork it has drawn recently from Cloudflare's cache in about 0.2 s, and draws everything else at its origin. That origin was struggling: 40–50 s per poster, or a 504 (its own homepage 504'd after 30 s). Its CDN only keeps a drawing for about a week, so any title nobody had asked for lately came from that origin, and the tile waited with no error to fall back on. Nothing on our side changed; btttr.cc's origin got slow.
 
-A Better Poster that hasn't loaded 4 seconds after it comes near the screen now shows the poster it replaced, or the generic poster for its IMDb id. It swaps back in as soon as btttr.cc delivers it; btttr.cc's own `max-age` makes that instant. A Better Poster that loads promptly is never touched, so there's no flicker in the usual case. This is website-only: Stremio and Nuvio fetch the btttr.cc URL themselves, so a not-yet-drawn title shows late there until btttr.cc has drawn it once.
+- **`/bp/<style>/<imdb id>.jpg`** serves each Better Poster from this Worker's copy (`serveBetterPoster`, in `05_catalog-core.js`). It is fetched from btttr.cc once and then kept:
+  - in KV, which is global, so a poster fetched anywhere is instant everywhere;
+  - behind the edge cache;
+  - refreshed in the background once it is a week old (btttr.cc's own CDN lifetime);
+  - kept for 60 days, so btttr.cc having a bad day goes unnoticed.
 
-- Tests: `tests/slow-better-posters.test.mjs` (3) checks which poster is shown meanwhile. The timing was verified in Chromium against a btttr.cc stand-in: the fast title untouched, the slow one plain at 6.5 s and the Better Poster at 15 s.
+  It accepts only styles and options `buildBetterPosterUrl` can produce (anything else is a 404), so it can't be pointed anywhere else on btttr.cc.
+- **The website and the Stremio/Nuvio rows both use it.** The catalog, search and meta routes pass their origin into `betterPostersOptionsFrom`. The badge route reads the copy directly for a `/bp/` URL on its own origin (a Worker fetching its own hostname doesn't reliably reach itself), and another host's `/bp/` still can't get past the poster allowlist.
+- **Warming:**
+  - **On the website:** every Better Poster that lands on a page, including lazy ones far below the fold, goes to `/api/bp/warm`, so missing posters are fetched while the page is being read. The website sends one batch at a time, the Worker fetches four at a time, and the endpoint is rate-limited per IP.
+  - **In the cron:** `prewarmBetterPosters` fetches artwork for every title on the shared charts (the chart pre-warm now remembers their ids, plus the My Lists Addon Charts). It does this for every Better Posters style in use in the last 14 days, recorded as posters are served. Each tick checks 60 title/style pairs and fetches up to 8 missing ones, from the same spare budget as New on Streaming.
+- **No plain-poster fallback.** Every tile shows a Better Poster.
+
+Measured in Chromium, with a stand-in btttr.cc that takes 8 s to draw a poster: on a second visit, every row's posters appeared within 7–55 ms of scrolling to it. The one wait left is the first time anyone ever looks at a title that isn't on a shared chart.
+
+- Tests: `tests/better-posters-mirror.test.mjs` (7) covers:
+  - fetching once, then serving the copy when btttr.cc fails;
+  - each style being its own image;
+  - nothing outside the real styles and ids being fetched;
+  - a 502, uncached, when btttr.cc can't supply a poster;
+  - warming (missing fetched, stored skipped, foreign URLs ignored);
+  - the badge route reading the copy, and refusing another host's `/bp/`.
+
+  `tests/better-posters.test.mjs` now expects the `/bp/` URLs. The test harness's KV gained binary values and metadata, as real KV has.
 
 ### 🐛 Airing Next and Recommended froze when the website wasn't opened
 

@@ -456,10 +456,14 @@ const CRON_NEW_ON_STREAMING_SHARE = 0.25;
 //
 // Each window/type is a snapshot in KV (mylists:mostwatched:v2:<window>:<type>),
 // rebuilt on the first request after it goes stale: the 7- and 30-day charts
-// once per Eastern day, "today" once an hour -- a "today" that only refreshed
-// at midnight would sit empty all morning.
+// once per Eastern day, "today" every 15 minutes, so a title just watched
+// reaches the top of it promptly. "today" also rolls over rather than
+// starting empty at midnight -- see rollMostWatchedToday.
 const MOST_WATCHED_WINDOWS = ["today", "7", "30"];
-const MOST_WATCHED_TODAY_REFRESH_SECONDS = 3600;
+const MOST_WATCHED_TODAY_REFRESH_SECONDS = 900;
+// How long the rolling "today" list survives with nobody opening it. Past
+// this it starts again from that day's watches alone.
+const MOST_WATCHED_TODAY_KEEP_SECONDS = 60 * 86400;
 // Each Most Watched chart is its top 25. (New on Streaming is not capped: it
 // is the whole 30-day window.)
 const MOST_WATCHED_MAX_ITEMS = 25;
@@ -1241,3 +1245,21 @@ const RECOMMENDATION_SEEDS_PER_SIDE = 12;
 // every account every six hours up to ~180 accounts, and a proportionally
 // slower cadence beyond that rather than a tick that fails.
 const AIRING_NEXT_SWEEP_ACCOUNTS_PER_TICK = 3;
+
+// /api/bp/warm (25_api-catalog-routes.js): posters per request, and per IP
+// per minute. A long Discover page is a few hundred posters, sent in batches
+// of BETTER_POSTER_WARM_MAX; almost all of them are already stored after the
+// first visit and cost one KV read each, so the ceiling is about the fetches
+// a caller could make btttr.cc do, not about this Worker.
+const BETTER_POSTER_WARM_MAX = 40;
+const BETTER_POSTER_WARM_IDS_PER_MINUTE = 800;
+// prewarmBetterPosters (07_source-fetchers-tmdb-simkl.js): how many title x
+// style pairs one tick checks against the Worker's copy (a KV read each), and
+// how many missing ones it fetches from btttr.cc. A fetch btttr.cc has to draw
+// can take most of a minute, so the fetch count is what bounds the tick's
+// wall-clock time: 8 at 4 at a time is two waits, not eight.
+const BETTER_POSTER_PREWARM_CHECKS_PER_TICK = 60;
+const BETTER_POSTER_PREWARM_FETCHES_PER_TICK = 8;
+// Share of the episode sweep's unreachable reserve it may spend -- the same
+// slice New on Streaming and Airing Next get.
+const CRON_BETTER_POSTER_SHARE = 0.25;

@@ -7385,11 +7385,20 @@ export default {
       "refreshAiringNextSweep",
       episodeSweep.then(() => refreshAiringNextSweep(env, ctx, airingNextBudget))
     );
+    // BetterPosters artwork for the shared charts, fetched before anyone
+    // scrolls to it -- see prewarmBetterPosters. Same reserve, same size of
+    // slice; the three shares add to 0.75, so a quarter stays unspent.
+    const betterPosterBudget = Math.floor((episodeBudget - episodeCeiling) * CRON_BETTER_POSTER_SHARE);
+    const betterPosterWarm = guard(
+      "prewarmBetterPosters",
+      episodeSweep.then(() => prewarmBetterPosters(env, ctx, betterPosterBudget))
+    );
     ctx.waitUntil(
       Promise.all([
         episodeSweep,
         streamingSweep,
         airingNextSweep,
+        betterPosterWarm,
         guard("bumpNewOnStreamingEpisodes", streamingSweep.then(() => bumpNewOnStreamingEpisodes(env, ctx, newOnStreamingBudget))),
         guard("prewarmSharedCatalogs", streamingSweep.then(() => prewarmSharedCatalogs(env, ctx, cronBudget - episodeBudget))),
         // One Quick Add network per tick (see prewarmChannelPresets,

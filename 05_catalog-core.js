@@ -947,16 +947,248 @@ function buildBetterPosterUrl(imdbId, opts) {
     params.push("rs=" + encodeURIComponent(o.ratingSource));
   }
   const qs = params.length ? "?" + params.join("&") : "";
+  // Served through this Worker's own copy whenever the caller knows where
+  // this Worker lives -- see serveBetterPoster below for why.
+  if (o.origin) return `${o.origin}/bp/${betterPostersBase(o)}/${imdbId}.jpg${qs}`;
   return `${BETTER_POSTERS_ORIGIN}/${betterPostersBase(o)}/imdb/poster-default/${imdbId}.jpg${qs}`;
+}
+
+// --- The Worker's own copy of BetterPosters artwork ------------------------
+//
+// btttr.cc serves artwork it has already drawn from Cloudflare's cache in a
+// fraction of a second, and draws anything else on request at its origin --
+// which, measured, took 40-50 seconds or answered a 504, even for titles as
+// common as Ted Lasso (its own homepage 504'd after 30s at the same time). Its
+// CDN keeps a drawing for about a week, so anything nobody had asked for
+// lately came from that origin. A tile waited on it with no error to fall
+// back on: the blank posters all over the site that appeared the moment
+// Better Posters was switched off.
+//
+// So every BetterPosters image the website and the Stremio/Nuvio rows show is
+// served from here: /bp/<style>/<imdb id>.jpg[?tag=none&lang=..&rs=..], the
+// same style/options btttr.cc's own URL carries. Each one is fetched from
+// btttr.cc once, kept in KV (global, so a poster fetched anywhere is instant
+// everywhere), fronted by the edge cache, and refreshed in the background
+// once it is a week old -- btttr.cc's own CDN lifetime, so ratings and trend
+// tags stay as current as they would have been. A copy is kept for
+// BETTER_POSTER_KEEP_SECONDS past that, so when btttr.cc's origin is having
+// a bad day the site does not notice.
+//
+// What cannot be helped is a title nobody has ever asked for: the first
+// request waits on btttr.cc. /api/bp/warm (the website asks it for every
+// poster on a page as soon as the page has them) moves that wait off the
+// screen for most of them.
+
+// Every style betterPostersBase can produce -- the only ones this route
+// fetches, so it can never be pointed at anything else on btttr.cc.
+const BETTER_POSTER_STYLES = (() => {
+  const out = new Set();
+  for (const genre of [true, false]) for (const rating of [true, false]) {
+    for (const quality of [true, false]) for (const age of [true, false]) {
+      out.add(betterPostersBase({ genre, rating, quality, age }));
+    }
+  }
+  return out;
+})();
+const BETTER_POSTER_REFRESH_MS = 7 * 86400 * 1000;
+const BETTER_POSTER_KEEP_SECONDS = 60 * 86400;
+const BETTER_POSTER_UPSTREAM_TIMEOUT_MS = 55000;
+const BETTER_POSTER_MAX_BYTES = 5 * 1024 * 1024;
+
+// /bp/... -> the one poster it names, or null for anything that is not a
+// style/id/option combination buildBetterPosterUrl could have produced.
+function parseBetterPosterPath(pathname, searchParams) {
+  const m = /^\/bp\/([a-z-]+)\/(tt\d{5,12})\.jpg$/.exec(String(pathname || ""));
+  if (!m || !BETTER_POSTER_STYLES.has(m[1])) return null;
+  const tag = searchParams.get("tag") === "none" ? "none" : "";
+  const langRaw = searchParams.get("lang") || "";
+  const lang = BETTER_POSTERS_LANGS.some((l) => l.value === langRaw && l.value !== "en") ? langRaw : "";
+  const rsRaw = searchParams.get("rs") || "";
+  const rs = BETTER_POSTERS_RATING_SOURCES.some((r) => r.value === rsRaw && r.value !== "avg") ? rsRaw : "";
+  const params = [];
+  if (tag) params.push("tag=none");
+  if (lang) params.push("lang=" + encodeURIComponent(lang));
+  if (rs) params.push("rs=" + encodeURIComponent(rs));
+  const qs = params.length ? "?" + params.join("&") : "";
+  return {
+    style: m[1],
+    imdbId: m[2],
+    tag,
+    lang,
+    rs,
+    path: `/bp/${m[1]}/${m[2]}.jpg${qs}`,
+    upstream: `${BETTER_POSTERS_ORIGIN}/${m[1]}/imdb/poster-default/${m[2]}.jpg${qs}`,
+    kvKey: `bpimg:v1:${m[1]}:${m[2]}:${tag}:${lang}:${rs}`,
+  };
+}
+
+function betterPosterImageResponse(bytes, contentType) {
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "Content-Type": contentType || "image/jpeg",
+      // A day in the browser and at the edge, and a week more while a new
+      // copy is fetched: the image behind a URL only changes when btttr.cc
+      // re-draws it (a rating moving), never in a way worth a round trip.
+      "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+      "Access-Control-Allow-Origin": "*",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+// One upstream fetch per poster per isolate at a time: the warm request and
+// the tile's own request for the same poster share it.
+const BETTER_POSTER_IN_FLIGHT = new Map();
+
+async function fetchBetterPosterUpstream(env, bp) {
+  if (BETTER_POSTER_IN_FLIGHT.has(bp.kvKey)) return BETTER_POSTER_IN_FLIGHT.get(bp.kvKey);
+  const p = (async () => {
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), BETTER_POSTER_UPSTREAM_TIMEOUT_MS) : null;
+    try {
+      const res = await fetch(bp.upstream, {
+        headers: { "User-Agent": `my-lists-addon/${ADDON_VERSION}` },
+        signal: ctl ? ctl.signal : undefined,
+      });
+      const contentType = res.headers.get("content-type") || "";
+      if (!res.ok || !contentType.startsWith("image/")) return null;
+      const bytes = await res.arrayBuffer();
+      if (!bytes.byteLength || bytes.byteLength > BETTER_POSTER_MAX_BYTES) return null;
+      if (env && env.CONFIGS) {
+        await env.CONFIGS.put(bp.kvKey, bytes, {
+          expirationTtl: BETTER_POSTER_KEEP_SECONDS,
+          metadata: { ct: contentType, at: Date.now() },
+        }).catch(() => {});
+      }
+      return { bytes, contentType };
+    } catch {
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
+      BETTER_POSTER_IN_FLIGHT.delete(bp.kvKey);
+    }
+  })();
+  BETTER_POSTER_IN_FLIGHT.set(bp.kvKey, p);
+  return p;
+}
+
+// The stored copy, if there is one -- and a background refresh when it is
+// older than btttr.cc's own CDN would have kept it.
+async function readStoredBetterPoster(env, ctx, bp) {
+  if (!env || !env.CONFIGS) return null;
+  try {
+    const got = await env.CONFIGS.getWithMetadata(bp.kvKey, { type: "arrayBuffer" });
+    if (!got || !got.value) return null;
+    const meta = got.metadata || {};
+    if (Date.now() - (Number(meta.at) || 0) > BETTER_POSTER_REFRESH_MS && ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(fetchBetterPosterUpstream(env, bp));
+    }
+    return { bytes: got.value, contentType: meta.ct || "image/jpeg" };
+  } catch {
+    return null;
+  }
+}
+
+// The bytes for one poster from wherever they are nearest: the edge cache,
+// the stored copy, or -- only when neither has it -- btttr.cc. Returns null
+// only when btttr.cc could not supply it either.
+async function getBetterPoster(env, ctx, bp, origin) {
+  const cache = typeof caches !== "undefined" && caches.default ? caches.default : null;
+  const cacheReq = cache && origin ? new Request(origin + bp.path) : null;
+  if (cacheReq) {
+    try {
+      const hit = await cache.match(cacheReq);
+      if (hit) {
+        return { bytes: await hit.arrayBuffer(), contentType: hit.headers.get("content-type") || "image/jpeg", fromEdge: true };
+      }
+    } catch {}
+  }
+  const found = (await readStoredBetterPoster(env, ctx, bp)) || (await fetchBetterPosterUpstream(env, bp));
+  if (found && cacheReq) {
+    const put = cache.put(cacheReq, betterPosterImageResponse(found.bytes, found.contentType)).catch(() => {});
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(put);
+  }
+  return found;
+}
+
+// --- Which styles are in use, for the cron's pre-fetch -----------------------
+//
+// Every combination of style options is its own image, so the cron can only
+// fetch ahead for combinations someone actually uses. Recorded as posters are
+// served, at most once per style per isolate every few hours, and written only
+// when the stored record is missing it or a day stale -- a handful of KV
+// writes a day, not one per poster.
+const BETTER_POSTER_VARIANTS_KEY = "bp:variants:v1";
+const BETTER_POSTER_VARIANT_TTL_MS = 14 * 86400 * 1000;
+const _betterPosterVariantNoted = new Map();
+
+function betterPosterVariantKey(bp) {
+  return `${bp.style}|${bp.tag}|${bp.lang}|${bp.rs}`;
+}
+
+async function noteBetterPosterVariant(env, bp) {
+  if (!env || !env.CONFIGS || !bp) return;
+  const key = betterPosterVariantKey(bp);
+  const now = Date.now();
+  if (now - (_betterPosterVariantNoted.get(key) || 0) < 6 * 3600 * 1000) return;
+  _betterPosterVariantNoted.set(key, now);
+  try {
+    const raw = await env.CONFIGS.get(BETTER_POSTER_VARIANTS_KEY);
+    const seen = raw ? JSON.parse(raw) : {};
+    if (now - (Number(seen[key]) || 0) < 86400 * 1000) return;
+    seen[key] = now;
+    for (const k of Object.keys(seen)) if (now - Number(seen[k]) > BETTER_POSTER_VARIANT_TTL_MS) delete seen[k];
+    await env.CONFIGS.put(BETTER_POSTER_VARIANTS_KEY, JSON.stringify(seen));
+  } catch {}
+}
+
+// The styles used within BETTER_POSTER_VARIANT_TTL_MS, as posters for one
+// title: variant -> the parsed /bp/ path for that title in that style.
+async function betterPosterVariantsInUse(env) {
+  if (!env || !env.CONFIGS) return [];
+  try {
+    const raw = await env.CONFIGS.get(BETTER_POSTER_VARIANTS_KEY);
+    const seen = raw ? JSON.parse(raw) : {};
+    const now = Date.now();
+    return Object.keys(seen).filter((k) => now - Number(seen[k]) <= BETTER_POSTER_VARIANT_TTL_MS).map((k) => {
+      const [style, tag, lang, rs] = k.split("|");
+      return { style, tag, lang, rs };
+    });
+  } catch {
+    return [];
+  }
+}
+
+function betterPosterForVariant(imdbId, v) {
+  const params = new URLSearchParams();
+  if (v.tag) params.set("tag", v.tag);
+  if (v.lang) params.set("lang", v.lang);
+  if (v.rs) params.set("rs", v.rs);
+  return parseBetterPosterPath(`/bp/${v.style}/${imdbId}.jpg`, params);
+}
+
+async function serveBetterPoster(env, ctx, bp, origin) {
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(noteBetterPosterVariant(env, bp));
+  const found = await getBetterPoster(env, ctx, bp, origin);
+  if (!found) {
+    // btttr.cc could not draw it either. Not cached anywhere, so the next
+    // request tries again.
+    return new Response(null, { status: 502, headers: { "Cache-Control": "no-store" } });
+  }
+  return betterPosterImageResponse(found.bytes, found.contentType);
 }
 
 // Packs a resolved config's betterPosters* keys into the shape
 // buildBetterPosterUrl reads. Each default matches btttr.cc's own default for
 // that option, so an install that never touched the style controls gets the
 // same artwork its configurator hands out.
-function betterPostersOptionsFrom(cfg) {
+function betterPostersOptionsFrom(cfg, origin) {
   const c = cfg || {};
   return {
+    // This Worker's own origin, so posters are served from its copy (see
+    // serveBetterPoster). Left off, the URL points at btttr.cc directly.
+    ...(origin ? { origin } : {}),
     genre: c.betterPostersGenre !== false,
     rating: c.betterPostersRating !== false,
     quality: !!c.betterPostersQuality,

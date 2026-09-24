@@ -253,6 +253,18 @@ function getSafePosterUrl(item) {
 // that trap entirely.
 
 const BETTER_POSTERS_ORIGIN_WEB = 'https://btttr.cc';
+// This Worker's own copy of each BetterPosters image (serveBetterPoster,
+// 05_catalog-core.js). Every Better Poster on the website is loaded from here,
+// never from btttr.cc directly: btttr.cc draws anything it has not drawn
+// lately at an origin that was taking 40-50 seconds (or failing) per poster,
+// which is what left tiles blank. Once any visitor has fetched a poster,
+// everyone gets it from here in a fraction of a second.
+function betterPosterMirrorPrefix() {
+  return ORIGIN + '/bp/';
+}
+function isBetterPosterUrl(p) {
+  return typeof p === 'string' && (p.indexOf(BETTER_POSTERS_ORIGIN_WEB) === 0 || p.indexOf(betterPosterMirrorPrefix()) === 0);
+}
 
 function betterPostersOnWeb() {
   return typeof getBetterPostersSetting === 'function' && getBetterPostersSetting('betterPosters', false);
@@ -302,7 +314,7 @@ function betterPostersWebUrl(imdbId) {
   if (lang && lang !== 'en') params.push('lang=' + encodeURIComponent(lang));
   const rs = pick('betterPostersRatingSource', 'avg');
   if (rs && rs !== 'avg') params.push('rs=' + encodeURIComponent(rs));
-  return BETTER_POSTERS_ORIGIN_WEB + '/' + base + '/imdb/poster-default/' + imdbId + '.jpg' +
+  return betterPosterMirrorPrefix() + base + '/' + imdbId + '.jpg' +
     (params.length ? '?' + params.join('&') : '');
 }
 
@@ -319,7 +331,7 @@ function isGeneratedPosterUrl(p) {
 
 function applyBetterPosterWeb(it, poster) {
   if (!betterPostersOnWeb()) return poster;
-  const alreadyBetter = typeof poster === 'string' && poster.indexOf(BETTER_POSTERS_ORIGIN_WEB) === 0;
+  const alreadyBetter = isBetterPosterUrl(poster);
   if (!alreadyBetter) {
     if (isGeneratedPosterUrl(poster)) return poster;
     if (it && it.posterShape === 'landscape') return poster;
@@ -332,128 +344,92 @@ function applyBetterPosterWeb(it, poster) {
   // Rebuilt from the current settings every time rather than kept, so
   // changing a style option re-renders with the new one instead of keeping
   // whatever URL happened to be produced first.
-  const url = betterPostersWebUrl(imdbId);
-  if (!alreadyBetter) rememberBetterPosterOriginal(url, poster);
-  return url;
+  return betterPostersWebUrl(imdbId);
 }
 window.applyBetterPosterWeb = applyBetterPosterWeb;
 
-// --- A Better Poster that is slow to arrive shows the plain one meanwhile ----
+// --- Warming: fetch a page's Better Posters before they are scrolled to ----
 //
-// btttr.cc draws a title's artwork the first time anyone asks for it, and for
-// a title it has not drawn yet that took 40-50 seconds (measured: Ted Lasso
-// 50s, Slow Horses 39s, against ~0.3s for one already drawn). The request
-// neither fails nor answers in that time, so the tile's onerror fallback
-// never ran and the tile sat blank -- the empty tiles on Discover and Live
-// Preview that disappeared the moment Better Posters was switched off.
+// A poster nobody has asked this Worker for yet still has to come from
+// btttr.cc once, and that is the slow part. Every Better Poster that lands on
+// the page -- including the lazy ones far below the fold, which the browser
+// has not requested yet -- is sent to /api/bp/warm as soon as it is rendered,
+// so the Worker fetches the missing ones while the page is still being read.
+// By the time a row is scrolled to its posters are stored and load at once.
 //
-// So a Better Poster still not loaded BETTER_POSTER_SLOW_MS after it came on
-// screen shows the poster it replaced, and is swapped back in the moment
-// btttr.cc delivers it. One that loads promptly is never touched, so there is
-// no flicker in the ordinary case.
-const BETTER_POSTER_SLOW_MS = 4000;
-// var, not const: applyBetterPosterWeb above can run before this line has
-// (a render during start-up), and a const read that early throws.
-var _betterPosterOriginals = new Map();
+// One batch in flight at a time, and each poster at most once per page load:
+// the Worker is gentle with btttr.cc on our behalf, and flooding it with
+// parallel batches would only slow every draw down.
+const BETTER_POSTER_WARM_BATCH = 40;
+var _betterPosterWarmSent = null;
+var _betterPosterWarmQueue = [];
+var _betterPosterWarmBusy = false;
 
-function rememberBetterPosterOriginal(url, original) {
-  if (!_betterPosterOriginals) return;
-  if (!url || !original || typeof original !== 'string') return;
-  if (original.indexOf(BETTER_POSTERS_ORIGIN_WEB) === 0) return;
-  // Bounded: every poster on a long session passes through here.
-  if (_betterPosterOriginals.size > 5000) _betterPosterOriginals.clear();
-  _betterPosterOriginals.set(url, original);
+function queueBetterPosterWarm(src) {
+  if (!src || src.indexOf(betterPosterMirrorPrefix()) !== 0) return;
+  if (!_betterPosterWarmSent) _betterPosterWarmSent = new Set();
+  if (_betterPosterWarmSent.has(src)) return;
+  _betterPosterWarmSent.add(src);
+  _betterPosterWarmQueue.push(src.slice(ORIGIN.length));
 }
 
-// The poster to show while btttr.cc is drawing: the one this URL replaced, or,
-// when that is unknown, the generic poster for the same IMDb id.
-// Plain string scanning, not a regex: this file is embedded in a template
-// literal that eats one round of backslashes (see betterPostersWebImdbId).
-function plainPosterFor(betterUrl) {
-  const known = _betterPosterOriginals && _betterPosterOriginals.get(betterUrl);
-  if (known) return known;
-  const marker = '/imdb/poster-default/';
-  const at = betterUrl.indexOf(marker);
-  if (at < 0) return '';
-  const id = betterUrl.slice(at + marker.length).split('.')[0];
-  return /^tt[0-9]+$/.test(id) ? 'https://images.metahub.space/poster/medium/' + id + '/img' : '';
+async function drainBetterPosterWarm() {
+  if (_betterPosterWarmBusy) return;
+  _betterPosterWarmBusy = true;
+  try {
+    while (_betterPosterWarmQueue.length) {
+      const batch = _betterPosterWarmQueue.splice(0, BETTER_POSTER_WARM_BATCH);
+      try {
+        const res = await fetch(ORIGIN + '/api/bp/warm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls: batch }),
+        });
+        // Rate-limited: stop for now. Whatever is left loads on its own as
+        // it is scrolled to.
+        if (res.status === 429) { _betterPosterWarmQueue = []; break; }
+      } catch (e) {
+        break;
+      }
+    }
+  } finally {
+    _betterPosterWarmBusy = false;
+  }
 }
 
-function startBetterPosterTimer(img) {
-  const src = img.dataset.bpWatched;
-  setTimeout(() => {
-    // Gone, loaded, or already replaced by something else (its own onerror
-    // fallback, a re-render) -- nothing to do.
-    if (!img.isConnected || img.getAttribute('src') !== src) return;
-    if (img.complete && img.naturalWidth > 0) return;
-    const plain = plainPosterFor(src);
-    if (!plain) return;
-    img.src = plain;
-    const pending = new Image();
-    pending.onload = () => {
-      if (img.isConnected && img.getAttribute('src') === plain) img.src = src;
-    };
-    pending.src = src;
-  }, BETTER_POSTER_SLOW_MS);
-}
-
-// Timed from when the tile comes near the screen, not from when it was built:
-// most posters are loading="lazy", and one far down a page has not even been
-// requested yet.
-const _betterPosterSeen = typeof IntersectionObserver === 'function'
-  ? new IntersectionObserver((entries) => {
-      entries.forEach((en) => {
-        if (!en.isIntersecting) return;
-        _betterPosterSeen.unobserve(en.target);
-        startBetterPosterTimer(en.target);
-      });
-    }, { rootMargin: '200px' })
-  : null;
-
-function watchBetterPoster(img) {
-  const src = img.getAttribute('src') || '';
-  if (src.indexOf(BETTER_POSTERS_ORIGIN_WEB) !== 0) return;
-  if (img.dataset.bpWatched === src) return;
-  img.dataset.bpWatched = src;
-  if (img.complete && img.naturalWidth > 0) return;
-  if (_betterPosterSeen) _betterPosterSeen.observe(img);
-  else startBetterPosterTimer(img);
-}
-
-function watchBetterPostersIn(root) {
+function warmBetterPostersIn(root) {
   if (!root || root.nodeType !== 1) return;
-  if (root.tagName === 'IMG') { watchBetterPoster(root); return; }
-  const imgs = root.querySelectorAll('img[src^="' + BETTER_POSTERS_ORIGIN_WEB + '"]');
-  for (let i = 0; i < imgs.length; i++) watchBetterPoster(imgs[i]);
+  const imgs = root.tagName === 'IMG' ? [root] : root.querySelectorAll('img[src^="' + betterPosterMirrorPrefix() + '"]');
+  for (let i = 0; i < imgs.length; i++) queueBetterPosterWarm(imgs[i].getAttribute('src') || '');
 }
 
-// New tiles, and tiles whose src is set after render (applyBetterPostersToTmdb-
-// Tiles below). Collected and handled once per frame, like the poster badges'
-// observer (initWatchHistory), so a grid rendering in batches costs a pass per
-// frame rather than one per tile.
-(function watchBetterPostersOnPage() {
+// New tiles, and tiles whose src is set after render (applyBetterPostersTo-
+// TmdbTiles below). Collected and handled once per frame, like the poster
+// badges' observer (initWatchHistory), so a grid rendering in batches costs a
+// pass per frame rather than one per tile.
+(function warmBetterPostersOnPage() {
   if (typeof MutationObserver !== 'function' || !document.body) return;
-  let queue = [];
+  let pending = [];
   let scheduled = false;
-  const drain = () => {
+  const flush = () => {
     scheduled = false;
-    const nodes = queue;
-    queue = [];
+    const nodes = pending;
+    pending = [];
     if (!betterPostersOnWeb()) return;
-    for (let i = 0; i < nodes.length; i++) if (nodes[i].isConnected) watchBetterPostersIn(nodes[i]);
+    for (let i = 0; i < nodes.length; i++) if (nodes[i].isConnected) warmBetterPostersIn(nodes[i]);
+    if (_betterPosterWarmQueue.length) drainBetterPosterWarm();
   };
   new MutationObserver((mutations) => {
     for (let i = 0; i < mutations.length; i++) {
       const m = mutations[i];
-      if (m.type === 'attributes') queue.push(m.target);
-      else for (let j = 0; j < m.addedNodes.length; j++) queue.push(m.addedNodes[j]);
+      if (m.type === 'attributes') pending.push(m.target);
+      else for (let j = 0; j < m.addedNodes.length; j++) pending.push(m.addedNodes[j]);
     }
-    if (!queue.length || scheduled) return;
+    if (!pending.length || scheduled) return;
     scheduled = true;
-    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(drain);
-    else setTimeout(drain, 16);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(flush);
+    else setTimeout(flush, 16);
   }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
-  if (betterPostersOnWeb()) watchBetterPostersIn(document.body);
 })();
 
 // Gives BetterPosters artwork to tiles whose item has only a TMDB id.
@@ -514,10 +490,7 @@ async function applyBetterPostersToTmdbTiles(rootEl) {
     if (!imdbId) return;
     const url = betterPostersWebUrl(imdbId);
     const img = el.querySelector('img');
-    if (img) {
-      rememberBetterPosterOriginal(url, img.getAttribute('src'));
-      img.src = url;
-    }
+    if (img) img.src = url;
     // The poster modal reads this back, so it has to match what is shown.
     if (el.dataset.poster) el.dataset.poster = url;
   });

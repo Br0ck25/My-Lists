@@ -242,6 +242,63 @@ async function handleFetch(request, env, ctx) {
     }
 
     // /api/poster-badge -> Dynamic badged SVG poster for Stremio / Nuvio
+    // This Worker's copy of a BetterPosters image -- see serveBetterPoster
+    // (05_catalog-core.js).
+    if (path.startsWith("/bp/") && (request.method === "GET" || request.method === "HEAD")) {
+      const bp = parseBetterPosterPath(path, url.searchParams);
+      if (!bp) return new Response(null, { status: 404 });
+      return await serveBetterPoster(env, ctx, bp, url.origin);
+    }
+
+    // /api/bp/warm  (POST)  { urls: ["/bp/...", ...] } -> { ok, stored, fetched }
+    //
+    // Fetches, from btttr.cc, any of these posters this Worker does not hold
+    // yet -- so the wait for a poster btttr.cc has never drawn happens before
+    // it is scrolled to, not while someone is looking at an empty tile. The
+    // website sends every BetterPosters image on a page as soon as it is
+    // rendered, including the lazy ones far below the fold.
+    //
+    // The request stays open until the fetches finish rather than running
+    // them after the response: a draw can take most of a minute, and work
+    // left to waitUntil is cut off 30 seconds after the response is sent.
+    if (path === "/api/bp/warm" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400, { "Cache-Control": "no-store" });
+      }
+      const warmIp = clientIpKey(request);
+      if (!warmIp) return json({ ok: false }, 400, { "Cache-Control": "no-store" });
+      const wanted = [];
+      const seen = new Set();
+      for (const raw of (Array.isArray(body && body.urls) ? body.urls : []).slice(0, BETTER_POSTER_WARM_MAX)) {
+        let u;
+        try { u = new URL(String(raw || ""), url.origin); } catch { continue; }
+        if (u.origin !== url.origin) continue;
+        const bp = parseBetterPosterPath(u.pathname, u.searchParams);
+        if (bp && !seen.has(bp.kvKey)) { seen.add(bp.kvKey); wanted.push(bp); }
+      }
+      if (!wanted.length) return json({ ok: true, stored: 0, fetched: 0 }, 200, { "Cache-Control": "no-store" });
+      if (await consumeRateLimit(env, ctx, "bpwarm", warmIp, BETTER_POSTER_WARM_IDS_PER_MINUTE, 60, wanted.length)) {
+        return json({ ok: false, error: "Too many requests just now." }, 429, { "Cache-Control": "no-store" });
+      }
+      let stored = 0;
+      let fetched = 0;
+      let cursor = 0;
+      // A few at a time: btttr.cc's origin is the thing being slow, and
+      // piling onto it would make every draw slower, ours included.
+      await Promise.all(Array.from({ length: Math.min(4, wanted.length) }, async () => {
+        while (cursor < wanted.length) {
+          const bp = wanted[cursor++];
+          const have = await readStoredBetterPoster(env, ctx, bp);
+          if (have) { stored++; continue; }
+          if (await fetchBetterPosterUpstream(env, bp)) fetched++;
+        }
+      }));
+      return json({ ok: true, stored, fetched }, 200, { "Cache-Control": "no-store" });
+    }
+
     if (path === "/api/poster-badge") {
       const posterUrl = url.searchParams.get("poster") || "";
       const rawAirDate = url.searchParams.get("airDate") || "";
@@ -254,7 +311,17 @@ async function handleFetch(request, env, ctx) {
       const finaleDate = !isFinaleAired ? rawFinaleDate : "";
       const companion = url.searchParams.get("companion") || "";
 
-      if (!posterUrl || !isAllowedPosterUrl(posterUrl)) {
+      // This Worker's own BetterPosters copy. Recognised by being on THIS
+      // origin under /bp/ -- never by path alone, which would let any host's
+      // /bp/ through the allowlist below -- and read directly: a Worker
+      // fetching its own hostname does not reliably reach itself.
+      let ownBetterPoster = null;
+      try {
+        const pu = new URL(posterUrl);
+        if (pu.origin === url.origin && pu.pathname.startsWith("/bp/")) ownBetterPoster = parseBetterPosterPath(pu.pathname, pu.searchParams);
+      } catch {}
+
+      if (!posterUrl || (!ownBetterPoster && !isAllowedPosterUrl(posterUrl))) {
         // Missing entirely, or not one of the image hosts this add-on
         // itself ever puts in a `poster` field (see isAllowedPosterUrl).
         // This is a public, CORS-open, unauthenticated endpoint -- without
@@ -274,13 +341,25 @@ async function handleFetch(request, env, ctx) {
 
       let embeddedPosterDataUri = "";
       try {
-        const imgRes = await fetch(posterUrl, {
-          headers: { "User-Agent": "my-list-addon/1.14" },
-          cf: { cacheTtl: 86400, cacheEverything: true }
-        });
-        if (imgRes.ok) {
-          const contentType = imgRes.headers.get("content-type") || "image/jpeg";
-          const buffer = await imgRes.arrayBuffer();
+        let contentType = "";
+        let buffer = null;
+        if (ownBetterPoster) {
+          const found = await getBetterPoster(env, ctx, ownBetterPoster, url.origin);
+          if (found) {
+            contentType = found.contentType;
+            buffer = found.bytes;
+          }
+        } else {
+          const imgRes = await fetch(posterUrl, {
+            headers: { "User-Agent": "my-list-addon/1.14" },
+            cf: { cacheTtl: 86400, cacheEverything: true }
+          });
+          if (imgRes.ok) {
+            contentType = imgRes.headers.get("content-type") || "image/jpeg";
+            buffer = await imgRes.arrayBuffer();
+          }
+        }
+        if (buffer) {
           const bytes = new Uint8Array(buffer);
           let binary = "";
           const len = bytes.byteLength;
@@ -880,7 +959,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // fetchCatalog, so it needs its own call -- otherwise search results
         // would be the one row in Stremio still showing the old artwork.
         if (searchConfig.betterPosters) {
-          metas = applyBetterPostersToMetas(metas, betterPostersOptionsFrom(searchConfig));
+          metas = applyBetterPostersToMetas(metas, betterPostersOptionsFrom(searchConfig, url.origin));
         }
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400" });
       }
@@ -922,7 +1001,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         // to a config that PROVED it belongs to that account. See resolveConfig
         // (04_config-resolution.js) for how that is established and
         // mayReadTrackedShelf (02_http-and-creator-utils.js) for what it gates.
-        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist, env, ctx, origin: url.origin });
+        let metas = await fetchCatalog(entry, skip, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, adultContentFilter, isStremioCatalog: true, betterPosters, betterPostersOptions: betterPostersOptionsFrom(resolvedConfig, url.origin), showBadgesStremio, showBadgesStremioAiringNext, showBadgesStremioContinueWatching, showBadgesStremioCatalogs, showBadgesStremioWatchlist, env, ctx, origin: url.origin });
         if (dedupeAcrossLists) {
           metas = await dedupeAcrossListEntries(entries, entryIndex, skip, metas, { tmdbKey, mdblistKey, mdblistAccessToken, traktKey, traktAccessToken, simklKey, simklAccessToken, shuffleItems, configParam: config, trackCreatorName, verifiedOwner: trackOwner, region, hideNonDigitalReleases, env, ctx });
         }
@@ -1286,7 +1365,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
           // the episode list all stay exactly as fetchStandardItemMeta built
           // them, and a non-IMDB id (tmdb:...) is left alone.
           if (metaConfig.betterPosters) {
-            meta = applyBetterPosterToMeta(meta, betterPostersOptionsFrom(metaConfig));
+            meta = applyBetterPosterToMeta(meta, betterPostersOptionsFrom(metaConfig, url.origin));
           }
           return jsonPublic(
             { meta },

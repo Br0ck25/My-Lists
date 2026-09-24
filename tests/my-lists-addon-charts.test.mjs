@@ -66,7 +66,7 @@ describe("My Lists Addon Most Watched catalog", () => {
     assert.equal(shows.sample[0].id, "tt5000001");
   });
 
-  it("serves the 7-day chart from one snapshot per day, and rebuilds \"today\" once it is an hour old", async () => {
+  it("serves the 7-day chart from one snapshot per day, and rebuilds \"today\" once it is 15 minutes old", async () => {
     const env = makeEnv({ DB: makeD1() });
     await watch(env, [{ id: "tt6000001", title: "First", mediaType: "movie" }]);
     assert.deepEqual((await preview(env, "mylists:most-watched:7", "movie")).sample.map((m) => m.name), ["First"]);
@@ -78,7 +78,7 @@ describe("My Lists Addon Most Watched catalog", () => {
     // Same Eastern day: the 7-day chart is the morning's snapshot.
     assert.deepEqual((await preview(env, "mylists:most-watched:7", "movie")).sample.map((m) => m.name), ["First"]);
 
-    // "today" is still inside its hour, then isn't.
+    // "today" is still fresh, then isn't.
     assert.deepEqual((await preview(env, "mylists:most-watched:today", "movie")).sample.map((m) => m.name), ["First"]);
     const key = "mylists:mostwatched:v2:today:movie";
     const snap = JSON.parse(await env.CONFIGS.get(key));
@@ -93,6 +93,70 @@ describe("My Lists Addon Most Watched catalog", () => {
     snap7.day = "2000-01-01";
     await env.CONFIGS.put(key7, JSON.stringify(snap7));
     assert.deepEqual((await preview(env, "mylists:most-watched:7", "movie")).sample.map((m) => m.name), ["Second", "First"]);
+  });
+
+  // Most Watched Today used to start empty at midnight. It now rolls over:
+  // yesterday's list stays, today's watches go on top, the list keeps its
+  // length by dropping the last title.
+  describe("Most Watched Today rolls over into the next day", () => {
+    const KEY = "mylists:mostwatched:v2:today:movie";
+    const names = async (env) => (await preview(env, "mylists:most-watched:today", "movie")).sample.map((m) => m.name);
+    // Midnight: every watch recorded so far becomes yesterday's, and the
+    // snapshot is yesterday's too.
+    async function nextDay(env) {
+      const yesterday = easternDay(Date.now() - 864e5);
+      env.DB._db.prepare("UPDATE stats SET day = ? WHERE kind LIKE 'evt:watched:%' AND day = ?").run(yesterday, easternDay());
+      const snap = JSON.parse(await env.CONFIGS.get(KEY));
+      snap.day = yesterday;
+      await env.CONFIGS.put(KEY, JSON.stringify(snap));
+    }
+    async function expire(env) {
+      const snap = JSON.parse(await env.CONFIGS.get(KEY));
+      snap.builtAt -= 901 * 1000;
+      await env.CONFIGS.put(KEY, JSON.stringify(snap));
+    }
+
+    it("keeps yesterday's titles when the day turns over, instead of going empty", async () => {
+      const env = makeEnv({ DB: makeD1() });
+      await watch(env, [{ id: "tt7000001", title: "Alpha", mediaType: "movie" }]);
+      await watch(env, [{ id: "tt7000002", title: "Beta", mediaType: "movie" }]);
+      await watch(env, [{ id: "tt7000002", title: "Beta", mediaType: "movie" }]);
+      assert.deepEqual(await names(env), ["Beta", "Alpha"]);
+      await nextDay(env);
+      assert.deepEqual(await names(env), ["Beta", "Alpha"], "a new day with nothing watched yet keeps the list");
+    });
+
+    it("puts what is watched today on top of what was carried over", async () => {
+      const env = makeEnv({ DB: makeD1() });
+      await watch(env, [{ id: "tt7100001", title: "Old One", mediaType: "movie" }]);
+      await watch(env, [{ id: "tt7100002", title: "Old Two", mediaType: "movie" }]);
+      await watch(env, [{ id: "tt7100002", title: "Old Two", mediaType: "movie" }]);
+      await names(env);
+      await nextDay(env);
+      await watch(env, [{ id: "tt7100003", title: "New Today", mediaType: "movie" }]);
+      await watch(env, [{ id: "tt7100001", title: "Old One", mediaType: "movie" }]);
+      await watch(env, [{ id: "tt7100001", title: "Old One", mediaType: "movie" }]);
+      await expire(env);
+      assert.deepEqual(await names(env), ["Old One", "New Today", "Old Two"],
+        "today's watches first (most watched first), then the rest in their old order");
+    });
+
+    it("stays 25 long: a newly watched title pushes the last one off", async () => {
+      const env = makeEnv({ DB: makeD1() });
+      for (let i = 0; i < 25; i++) {
+        const id = "tt72" + String(i).padStart(5, "0");
+        for (let n = 0; n < 25 - i; n++) await watch(env, [{ id, title: "T" + i, mediaType: "movie" }]);
+      }
+      const before = await names(env);
+      assert.equal(before.length, 25);
+      await nextDay(env);
+      await watch(env, [{ id: "tt7299999", title: "Newcomer", mediaType: "movie" }]);
+      await expire(env);
+      const after = await names(env);
+      assert.equal(after.length, 25);
+      assert.equal(after[0], "Newcomer");
+      assert.deepEqual(after.slice(1), before.slice(0, 24), "the last title is the one that drops off");
+    });
   });
 
   // The "null iv" entry: watches whose id had been through String(null)
