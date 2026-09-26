@@ -2464,7 +2464,13 @@ function trackingSyncSignature(localMap) {
   var wl = localMap['watchlist'] || {};
   return [
     listSig((localMap['watch-history'] || {}).items),
-    listSig((localMap['continue-watching'] || {}).items),
+    // A show's next episode can change in place without moving its show id,
+    // changing the list length, or adding a watchedAt stamp. The old listSig
+    // missed that edit and left the installed Continue Watching catalog on
+    // the previous episode until the ten-minute heartbeat (while Live
+    // Preview read the new local item immediately). Track the actual shelf
+    // content, including episode/air-date/badge changes, not just its edges.
+    JSON.stringify((localMap['continue-watching'] || {}).items || []),
     listSig((localMap['airing-next'] || {}).items),
     curatedRecsSignature(loadCuratedRecommendations()),
     // Its stamp too, which moves at most every CURATED_RECS_RESTAMP_MS when
@@ -2613,8 +2619,13 @@ async function pushTrackingSync(opts) {
       // removed elsewhere.
       recordTrackingLocalBaseline(sentStamps);
     }
-    window._lastTrackingSyncPushedAt = Date.now();
-    window._lastTrackingSig = sig;
+    // Do not acknowledge a failed push. Otherwise an unchanged signature
+    // suppresses the next retry even though Stremio/Nuvio still have the old
+    // record (the local Live Preview has already advanced).
+    if (data && data.ok) {
+      window._lastTrackingSyncPushedAt = Date.now();
+      window._lastTrackingSig = sig;
+    }
   } catch (e) {
     // silently fail, it's a background sync
   }

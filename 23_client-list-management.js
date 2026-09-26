@@ -2628,7 +2628,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       const cleanPath = (typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
       const safeUrlParam = (listUrl && listUrl.length < 1500) ? listUrl : '';
       const targetUrl = cleanPath || ('/#/list?' + new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam }).toString());
-      history.replaceState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', targetUrl);
+      history.replaceState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', targetUrl);
     } catch (e) {}
   } else if (!opts.skipPushState) {
     try {
@@ -2641,7 +2641,12 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
           history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', cleanPath);
         } else {
           const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam });
-          history.pushState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', '/#/list?' + params.toString());
+          // The URL is deliberately shortened for large embedded lists, but
+          // history.state must keep the *real* URL. Back from a poster
+          // compares it to _currentListDetailsKey to reuse the already
+          // paginated grid; storing '' here caused it to rebuild page 1 and
+          // clamp a deep scroll position back to the top.
+          history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', '/#/list?' + params.toString());
         }
       }
     } catch (e) {}

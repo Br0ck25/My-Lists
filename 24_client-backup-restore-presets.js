@@ -2765,6 +2765,25 @@ tryAutoRestoreCreatorProfile();
   }
 })();
 
+// Returning from an item unhides a list panel which may have hundreds of
+// already-paginated posters. Restore after layout as well as immediately:
+// browsers can apply their own history scroll position *after* popstate, and
+// images/font layout can move the target during the following frames.
+function restoreListDetailsScroll(scrollY) {
+  if (typeof scrollY !== 'number' || !Number.isFinite(scrollY)) return;
+  const listKey = window._currentListDetailsKey;
+  const restore = () => {
+    const panel = document.getElementById('content-list-details');
+    if (panel && !panel.hidden && window._currentListDetailsKey === listKey) {
+      window.scrollTo({ top: scrollY, behavior: 'instant' });
+    }
+  };
+  restore();
+  requestAnimationFrame(restore);
+  setTimeout(restore, 50);
+  setTimeout(restore, 150);
+}
+
 window.addEventListener('popstate', (e) => {
   const state = e.state;
   const path = location.pathname || '';
@@ -2778,10 +2797,7 @@ window.addEventListener('popstate', (e) => {
     const gridEl = document.getElementById('detailGrid');
     if (gridEl && gridEl.children.length > 0 && currentListKey === listKey) {
       switchTab('list-details');
-      if (typeof window._listScrollY === 'number') {
-        const targetScroll = window._listScrollY;
-        window.scrollTo({ top: targetScroll, behavior: 'instant' });
-      }
+      restoreListDetailsScroll(window._listScrollY);
       return;
     }
     openListDetailsPage(state.name, state.type, state.listUrl, null, { skipPushState: true, restoreScrollY: window._listScrollY });

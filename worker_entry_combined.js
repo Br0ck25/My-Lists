@@ -30405,10 +30405,7 @@ function navigateBackFromDetail() {
       history.back();
     } else {
       switchTab('list-details');
-      if (typeof window._listScrollY === 'number') {
-        const scrollPos = window._listScrollY;
-        window.scrollTo({ top: scrollPos, behavior: 'instant' });
-      }
+      if (typeof restoreListDetailsScroll === 'function') restoreListDetailsScroll(window._listScrollY);
     }
   } else if (history.length > 1 && window._previousTab && window._previousTab !== 'list-details' && window._previousTab !== 'item-details') {
     history.back();
@@ -62309,7 +62306,13 @@ function trackingSyncSignature(localMap) {
   var wl = localMap['watchlist'] || {};
   return [
     listSig((localMap['watch-history'] || {}).items),
-    listSig((localMap['continue-watching'] || {}).items),
+    // A show's next episode can change in place without moving its show id,
+    // changing the list length, or adding a watchedAt stamp. The old listSig
+    // missed that edit and left the installed Continue Watching catalog on
+    // the previous episode until the ten-minute heartbeat (while Live
+    // Preview read the new local item immediately). Track the actual shelf
+    // content, including episode/air-date/badge changes, not just its edges.
+    JSON.stringify((localMap['continue-watching'] || {}).items || []),
     listSig((localMap['airing-next'] || {}).items),
     curatedRecsSignature(loadCuratedRecommendations()),
     // Its stamp too, which moves at most every CURATED_RECS_RESTAMP_MS when
@@ -62458,8 +62461,13 @@ async function pushTrackingSync(opts) {
       // removed elsewhere.
       recordTrackingLocalBaseline(sentStamps);
     }
-    window._lastTrackingSyncPushedAt = Date.now();
-    window._lastTrackingSig = sig;
+    // Do not acknowledge a failed push. Otherwise an unchanged signature
+    // suppresses the next retry even though Stremio/Nuvio still have the old
+    // record (the local Live Preview has already advanced).
+    if (data && data.ok) {
+      window._lastTrackingSyncPushedAt = Date.now();
+      window._lastTrackingSig = sig;
+    }
   } catch (e) {
     // silently fail, it's a background sync
   }
@@ -69083,7 +69091,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       const cleanPath = (typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
       const safeUrlParam = (listUrl && listUrl.length < 1500) ? listUrl : '';
       const targetUrl = cleanPath || ('/#/list?' + new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam }).toString());
-      history.replaceState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', targetUrl);
+      history.replaceState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', targetUrl);
     } catch (e) {}
   } else if (!opts.skipPushState) {
     try {
@@ -69096,7 +69104,12 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
           history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', cleanPath);
         } else {
           const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam });
-          history.pushState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', '/#/list?' + params.toString());
+          // The URL is deliberately shortened for large embedded lists, but
+          // history.state must keep the *real* URL. Back from a poster
+          // compares it to _currentListDetailsKey to reuse the already
+          // paginated grid; storing '' here caused it to rebuild page 1 and
+          // clamp a deep scroll position back to the top.
+          history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', '/#/list?' + params.toString());
         }
       }
     } catch (e) {}
@@ -72962,6 +72975,25 @@ tryAutoRestoreCreatorProfile();
   }
 })();
 
+// Returning from an item unhides a list panel which may have hundreds of
+// already-paginated posters. Restore after layout as well as immediately:
+// browsers can apply their own history scroll position *after* popstate, and
+// images/font layout can move the target during the following frames.
+function restoreListDetailsScroll(scrollY) {
+  if (typeof scrollY !== 'number' || !Number.isFinite(scrollY)) return;
+  const listKey = window._currentListDetailsKey;
+  const restore = () => {
+    const panel = document.getElementById('content-list-details');
+    if (panel && !panel.hidden && window._currentListDetailsKey === listKey) {
+      window.scrollTo({ top: scrollY, behavior: 'instant' });
+    }
+  };
+  restore();
+  requestAnimationFrame(restore);
+  setTimeout(restore, 50);
+  setTimeout(restore, 150);
+}
+
 window.addEventListener('popstate', (e) => {
   const state = e.state;
   const path = location.pathname || '';
@@ -72975,10 +73007,7 @@ window.addEventListener('popstate', (e) => {
     const gridEl = document.getElementById('detailGrid');
     if (gridEl && gridEl.children.length > 0 && currentListKey === listKey) {
       switchTab('list-details');
-      if (typeof window._listScrollY === 'number') {
-        const targetScroll = window._listScrollY;
-        window.scrollTo({ top: targetScroll, behavior: 'instant' });
-      }
+      restoreListDetailsScroll(window._listScrollY);
       return;
     }
     openListDetailsPage(state.name, state.type, state.listUrl, null, { skipPushState: true, restoreScrollY: window._listScrollY });
