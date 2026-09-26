@@ -87,6 +87,27 @@ const SAVED_CONFIG_BYTES_MAX = 10 * 1024 * 1024;        // 10 MB of serialized J
 // export was ~1,200 items.
 const CREATOR_LIST_BYTES_MAX = 1_800_000;
 
+// --- The signed-out browser's live list store (listlive:{token}) -------------
+//
+// /api/list-live/save writes one of these per Custom List a browser with no
+// Creator Profile owns, so that list's catalog row is re-read live instead of
+// serving the snapshot baked into the install link. See readLiveListItems and
+// fetchCustomListCatalog (05_catalog-core.js) for the read side and the route
+// itself (25_api-catalog-routes.js) for why an unauthenticated write is
+// acceptable: the token in the URL is the capability, and it only ever exists
+// inside a link that already carries the list's whole contents.
+//
+// Per IP per minute, higher than /api/save's 20 because this fires on every
+// list edit (debounced in the browser) rather than on link generation, and
+// working through a batch of adds is ordinary use.
+const LIVE_LIST_SAVE_PER_MINUTE = 60;
+// Six months. Unlike an install config, an expired key is not a broken
+// install: the row still carries the list's items as a snapshot and falls
+// back to it, and every edit re-writes the key and re-stamps the TTL. That
+// bounds what a signed-out browser can leave behind without a way for anyone
+// to end up with an empty shelf.
+const LIVE_LIST_TTL_SEC = 180 * 24 * 3600;
+
 // --- Bound on what /api/creator/lists reads in one invocation ---------------
 //
 // That route is the creator dashboard's only data source. It read the account's
