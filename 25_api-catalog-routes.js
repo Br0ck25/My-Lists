@@ -1028,7 +1028,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         if (isUserPersonal) {
           return jsonPublic({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
-        return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+        return jsonPublic({ metas }, 200, { Cache-Control: public, max-age=300, s-maxage=300 });
       } catch (err) {
         const errMsg = safeErrorMessage(err);
         if (isUserPersonal) {
