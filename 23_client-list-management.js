@@ -304,10 +304,22 @@ function buildConfig(entries, keys) {
   if (keys && keys.simklKey) payload.simklKey = keys.simklKey;
   if (keys && keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
   if (keys && keys.simklUsername) payload.simklUsername = keys.simklUsername;
-  if (keys && keys.track) {
-    payload.track = true;
+  if (keys && keys.trackCreatorName) {
+    if (keys.track) payload.track = true;
+    // The identity travels whenever collectKeys actually found one of this
+    // account's shelves in the config, not only when Auto-track Playback
+    // happens to be on -- this is exactly what /api/save already sends, and
+    // the fallback link has to agree with it. The server needs the account
+    // name to resolve a local custom-list row against it
+    // (fetchCustomListCatalog, 05_catalog-core.js), which is what makes an add
+    // or a remove reach the apps; without it such a row only ever falls back
+    // to its snapshot. Still conditional rather than unconditional: an install
+    // link is a bearer credential (see README), and collectKeys leaves the
+    // name out for a config that holds nothing belonging to this account.
     payload.trackCreatorName = keys.trackCreatorName;
     payload.trackCreatorKey = keys.trackCreatorKey;
+  } else if (keys && keys.track) {
+    payload.track = true;
   }
   if (keys && keys.shuffleShelves) payload.shuffleShelves = true;
   if (keys && keys.shuffleItems) payload.shuffleItems = true;
@@ -688,14 +700,30 @@ function collectKeys() {
     // resolve only for a proven owner (see fetchLiveCreatorListItems,
     // 05_catalog-core.js), and without the key in the link the proof can't
     // be made and every private list silently falls back to its snapshot.
+    //
+    // A purely LOCAL custom-list row belongs to the account just as much --
+    // every local-list edit mirrors to creatorlist:{user}:{slug}, and the
+    // server resolves such a row against the account the link belongs to
+    // (fetchCustomListCatalog) precisely so an add or a remove reaches the
+    // apps. That resolution needs the account's name in the link to know
+    // whose lists to look in, so a config holding one of these rows carries
+    // the identity too. Rows naming a DIFFERENT creator are excluded: the
+    // key is a bearer credential and goes in a link only for shelves that
+    // are actually this account's.
     const hasOwnCreatorList = [...document.querySelectorAll('#lists .entry .url')]
       .some((el) => {
         const v = String(el.value || '').trim();
-        if (v.indexOf('customlist:v1:') === -1 || v.indexOf('creatorSlug') === -1) return false;
+        if (v.indexOf('customlist:v1:') === -1) return false;
         if (typeof parseCustomListPayloadClient !== 'function') return false;
+        const me = String(activeCreator.creatorName).toLowerCase();
         return v.split('\\n').some((line) => {
           const p = parseCustomListPayloadClient(line);
-          return !!(p && p.creatorSlug);
+          if (!p) return false;
+          // Someone else's list -- public or private, this account's key
+          // proves nothing about it and does not belong in the link.
+          if (p.creatorOwner && String(p.creatorOwner).toLowerCase() !== me) return false;
+          if (p.creatorSlug) return true;
+          return !!(p.localSlug || p.listSlug || p.slug);
         });
       });
     if (track || hasPersonalShelf || hasOwnCreatorList) {
@@ -1268,7 +1296,7 @@ async function renderLivePreview() {
           continue;
         }
         entryDOM.style.display = '';
-        livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample: data.sample, maybeMore: data.maybeMore, totalItems: data.totalItems };
+        livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample: data.sample, maybeMore: data.maybeMore, totalItems: data.totalItems, entryDOM: entryDOM };
         const sliced = data.sample.slice(0, visibleCount);
         sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; item.isLivePreviewShelf = true; });
         postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
@@ -1279,7 +1307,7 @@ async function renderLivePreview() {
         if (fallback && fallback.length) {
           entryDOM.style.display = '';
           const sample = fallback.map(it => _liveFallbackMeta(it, s.type === 'movie' ? 'movie' : 'series'));
-          livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample, maybeMore: false, totalItems: sample.length };
+          livePreviewShelfData[i] = { name: s.name, type: s.type, url: s.url, sample, maybeMore: false, totalItems: sample.length, entryDOM: entryDOM };
           const sliced = sample.slice(0, visibleCount);
           sliced.forEach(item => { item.listUrl = s.url; item.listName = s.name; item.isLivePreviewShelf = true; });
           postersContainer.innerHTML = sliced.map(livePreviewPosterHtml).join('');
@@ -3692,10 +3720,23 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
 function openLivePreviewSeeAll(i) {
   const shelf = livePreviewShelfData[i];
   if (!shelf) return;
+  // The row's CURRENT name, not the one the last preview render captured.
+  // This record is built from collectEntries() at fetch time, and a rename
+  // from the Custom List panel happens after that -- it updates the Name
+  // field and the shelf title (see syncCustomListToCatalogRows) but not this
+  // object. The See All page titles itself from whatever it is handed, so
+  // handing it the stale name put the old title on the page while the shelf
+  // above it already showed the new one. Read the field; fall back to the
+  // captured name when the row is gone (removed since the last render).
+  let name = shelf.name;
+  try {
+    const nameInput = shelf.entryDOM && shelf.entryDOM.querySelector ? shelf.entryDOM.querySelector('.name') : null;
+    if (nameInput && String(nameInput.value || '').trim()) name = nameInput.value.trim();
+  } catch (e) {}
   // itemCount, not just the page-0 sample, so the header shows the list's
   // real size right away instead of the first page's length (100, if the
   // list has more) until scrolling has paged in the rest. The server
   // already knows this from the same /api/preview call that fetched
   // sample -- see /api/preview's own totalItems (25_api-catalog-routes.js).
-  openListDetailsPage(shelf.name, shelf.type, shelf.url, { sample: shelf.sample, maybeMore: shelf.maybeMore, itemCount: shelf.totalItems });
+  openListDetailsPage(name, shelf.type, shelf.url, { sample: shelf.sample, maybeMore: shelf.maybeMore, itemCount: shelf.totalItems });
 }
