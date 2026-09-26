@@ -168,6 +168,36 @@ describe("a live list addressed by token, for a browser with no account", () => 
     assert.deepEqual(await catalogIds(env, "tokenlive2"), ["tt0000001"]);
   });
 
+  // The whole loop the browser drives: it POSTs the list under its token on
+  // every edit, and the row -- which carries that token and no items of its
+  // own worth serving -- is read from the record. Written through the route
+  // rather than planted in KV, so the route's own coercion and caps are what
+  // the row ends up being served from.
+  it("serves what the browser POSTed, add and remove alike", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await env.CONFIGS.put("cfg:tokenlive4", JSON.stringify({
+      entries: [{ id: "faves", type: "movie", name: "Mine", url: tokenRow("abcdefghijklmnopqrstuv", [item(1)]), enabled: true }],
+    }));
+
+    const post = (items) => call(env, "/api/list-live/save", {
+      method: "POST",
+      json: { token: "abcdefghijklmnopqrstuv", name: "Mine", type: "mixed", items },
+    });
+    let r = await post([item(1), item(2)]);
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.deepEqual((await catalogIds(env, "tokenlive4")).sort(), ["tt0000001", "tt0000002"]);
+
+    // The remove. The row's own snapshot still holds both items, so this only
+    // passes if the row is being read from the record rather than the URL.
+    r = await post([item(2)]);
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.deepEqual(await catalogIds(env, "tokenlive4"), ["tt0000002"]);
+
+    r = await post([]);
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.deepEqual(await catalogIds(env, "tokenlive4"), []);
+  });
+
   it("ignores a token that is not the shape this Worker mints", async () => {
     const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
     await env.CONFIGS.put("cfg:tokenlive3", JSON.stringify({

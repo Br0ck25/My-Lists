@@ -1516,12 +1516,15 @@ function fetchChannelCatalog(entry, origin) {
 // Catalogs" was clicked. Every one of those three now re-reads live on every
 // catalog request, by identity rather than by content, and the embedded
 // snapshot is kept as the fallback in all cases: if the row names nothing
-// live, or the account it implies has no such list, or the KV lookup comes
-// back empty (list since deleted, KV hiccup, or a private list read by
+// live, or the account it implies has no such list, or the KV record is
+// missing altogether (list since deleted, key expired, a private list read by
 // someone who didn't prove ownership -- fetchLiveCreatorListItems serves
 // public lists to anyone but private ones only to a verified owner), this
 // drops straight back to the old behavior rather than serving an empty
-// shelf.
+// shelf. A live read that DOES answer is taken at its word, empty list
+// included -- that is the whole point: the last item leaving a list has to
+// empty the shelf, and a record that is merely missing is not the same thing
+// as a list that is now empty.
 // The four shelves the website auto-tracks. Their live form is an
 // autotrack:<slug>:<type>:<username> row (fetchAutoTrackedCatalog below), not
 // a custom list, so the implicit account resolution in
