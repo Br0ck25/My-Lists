@@ -7975,3 +7975,113 @@ describe("client: list renames, dashboard CW button isolation, and sync preserva
   });
 
 });
+
+const snapRow = (extra) => "customlist:v1:" + JSON.stringify(Object.assign(
+  { listId: "x1", localSlug: "watchlist", listSlug: "watchlist", type: "movie", items: [{ id: "tt1" }], shuffle: false },
+  extra || {}
+));
+
+describe("client: frozen auto-shelf snapshots upgrade to live rows", () => {
+  it("a watchlist snapshot becomes an autotrack URL when signed in", async () => {
+    const client = loadClient();
+    client.set("activeCreator", { creatorName: "alice" });
+    assert.equal(
+      client.call("upgradeSnapshotShelfToLive", snapRow(), "movie"),
+      "autotrack:watchlist:movie:alice");
+    assert.equal(
+      client.call("upgradeSnapshotShelfToLive", snapRow({ type: "series" }), "series"),
+      "autotrack:watchlist:series:alice");
+  });
+
+  it("leaves everything alone when signed out", async () => {
+    const client = loadClient();
+    client.set("activeCreator", null);
+    const row = snapRow();
+    assert.equal(client.call("upgradeSnapshotShelfToLive", row, "movie"), row);
+  });
+
+  it("never touches a genuine custom list", async () => {
+    const client = loadClient();
+    client.set("activeCreator", { creatorName: "alice" });
+    const row = snapRow({ localSlug: "my-picks", listSlug: "my-picks" });
+    assert.equal(client.call("upgradeSnapshotShelfToLive", row, "movie"), row);
+    assert.equal(client.call("upgradeSnapshotShelfToLive", "https://mdblist.com/lists/x/y", "movie"),
+      "https://mdblist.com/lists/x/y");
+  });
+
+  it("upgrades airing-next for series rows only", async () => {
+    const client = loadClient();
+    client.set("activeCreator", { creatorName: "alice" });
+    const seriesRow = snapRow({ localSlug: "airing-next", listSlug: "airing-next", type: "series" });
+    assert.equal(client.call("upgradeSnapshotShelfToLive", seriesRow, "series"),
+      "autotrack:airing-next:series:alice");
+    const movieRow = snapRow({ localSlug: "airing-next", listSlug: "airing-next", type: "movie" });
+    assert.equal(client.call("upgradeSnapshotShelfToLive", movieRow, "movie"), movieRow);
+  });
+
+  it("never rewrites another creator's row", async () => {
+    const client = loadClient();
+    client.set("activeCreator", { creatorName: "alice" });
+    const row = snapRow({ creatorOwner: "bob" });
+    assert.equal(client.call("upgradeSnapshotShelfToLive", row, "movie"), row);
+  });
+});
+
+describe("client: creator-list rows missing their live identity get it backfilled", () => {
+  it("stamps creatorSlug and creatorOwner onto a matching row", async () => {
+    const client = loadClient();
+    signedIn(client, listWith([{ id: "tt1" }], 1000));
+    const row = snapRow({ localSlug: undefined, listSlug: "faves", creatorSlug: undefined });
+    const out = client.call("backfillCreatorSlugInSnapshot", row);
+    assert.notEqual(out, row);
+    const payload = JSON.parse(out.slice("customlist:v1:".length));
+    assert.equal(payload.creatorSlug, "faves");
+    assert.equal(payload.creatorOwner, "alice");
+    assert.deepEqual(payload.items, [{ id: "tt1" }], "embedded items stay as the fallback");
+  });
+
+  it("leaves unknown slugs, other owners and stamped rows alone", async () => {
+    const client = loadClient();
+    signedIn(client, listWith([{ id: "tt1" }], 1000));
+    const unknown = snapRow({ localSlug: undefined, listSlug: "nope", creatorSlug: undefined });
+    assert.equal(client.call("backfillCreatorSlugInSnapshot", unknown), unknown);
+    const others = snapRow({ localSlug: undefined, listSlug: "faves", creatorSlug: undefined, creatorOwner: "bob" });
+    assert.equal(client.call("backfillCreatorSlugInSnapshot", others), others);
+    const stamped = snapRow({ localSlug: undefined, listSlug: "faves", creatorSlug: "faves", creatorOwner: "alice" });
+    assert.equal(client.call("backfillCreatorSlugInSnapshot", stamped), stamped);
+  });
+
+  it("is a no-op when signed out or before the dashboard loads", async () => {
+    const out = loadClient();
+    out.set("activeCreator", null);
+    out.set("lastCreatorListsData", [{ slug: "faves" }]);
+    const row = snapRow({ localSlug: undefined, listSlug: "faves", creatorSlug: undefined });
+    assert.equal(out.call("backfillCreatorSlugInSnapshot", row), row);
+
+    const cold = loadClient();
+    cold.set("activeCreator", { creatorName: "alice" });
+    cold.set("lastCreatorListsData", []);
+    assert.equal(cold.call("backfillCreatorSlugInSnapshot", row), row);
+  });
+});
+
+describe("client: preview proves ownership for its own creator-list rows", () => {
+  const keyed = () => loadClient({ storage: { "myListAddon:creatorKey": "KEY-123" } });
+
+  it("sends the key for a row naming this account's list", async () => {
+    const client = keyed();
+    client.set("activeCreator", { creatorName: "alice" });
+    assert.equal(client.call("previewCreatorKey", snapRow({ localSlug: undefined, listSlug: "faves", creatorSlug: "faves" })), "KEY-123");
+    assert.equal(client.call("previewCreatorKey", snapRow({ localSlug: undefined, listSlug: "faves", creatorSlug: "faves", creatorOwner: "alice" })), "KEY-123");
+  });
+
+  it("sends nothing for other owners, local snapshots, or signed-out", async () => {
+    const client = keyed();
+    client.set("activeCreator", { creatorName: "alice" });
+    assert.equal(client.call("previewCreatorKey", snapRow({ localSlug: undefined, listSlug: "faves", creatorSlug: "faves", creatorOwner: "bob" })), "");
+    assert.equal(client.call("previewCreatorKey", snapRow()), "");
+    const out = keyed();
+    out.set("activeCreator", null);
+    assert.equal(out.call("previewCreatorKey", snapRow({ creatorSlug: "faves" })), "");
+  });
+});

@@ -1,5 +1,61 @@
 # Changes Log
 
+## 2026-09-26 - All catalog rows live (watchlist freeze, private lists, 24h cache)
+
+### Files Changed
+`00_constants.js`, `05_catalog-core.js`, `22_client-creator-profile.js`,
+`23_client-list-management.js`, `25_api-catalog-routes.js`, `worker_entry_combined.js`,
+`tests/live-rows-stay-live.test.mjs`, `tests/client.test.mjs`,
+`CHANGELOG.md`, `Changes.md`, `FUNCTION-MAP.md`
+
+### The request
+
+A Watchlist added from the Lists page never picked up website-side edits in
+Stremio -- stuck at 2 items while the site showed 3, across restarts. Then:
+fix the root cause for ALL lists (New on Streaming, Most Watched, New
+Releases, everything) so they always update in Stremio without regenerating
+the install link.
+
+### What was actually wrong (three bugs, one symptom)
+
+1. **Watchlist +Add baked a snapshot.** The Lists-page "+ Add" handler
+   generated live `autotrack:` rows for Watch History and Continue Watching
+   but fell through to a frozen `customlist:v1:` snapshot for `watchlist`.
+   The 2 items were literally inside the installed link. Fixed by including
+   `watchlist` in the live branch (22).
+2. **Private Creator lists were never re-read live.** `fetchLiveCreatorListItems`
+   only returned public lists' items, so a private list's row always served
+   its embedded snapshot. It now also serves private lists to a reader that
+   proves ownership via `verifiedOwner` -- the same proof autotrack shelves
+   gate on -- with the snapshot kept as fallback. The install link carries
+   the Creator Key whenever a creatorSlug row is present (23 `collectKeys`),
+   and Live Preview/Test sends it for those rows too (`previewCreatorKey`).
+   Single-type Creator adds also stamp `creatorSlug`/`creatorOwner` now (22),
+   as mixed-type ones already did.
+3. **Shared rows were cached for a day.** Non-personal catalogs were served
+   `max-age=86400`, so even server-live rows (charts re-read every 10 min,
+   New on Streaming straight from D1, Most Watched Today every 15 min) sat
+   stale in Stremio/edge for 24h. Now 5 minutes (25); personal shelves stay
+   `no-store`. This also fixed a committed syntax error on that line
+   (`{ Cache-Control: public, ... }`, unquoted), which failed `node --check`.
+
+### Healing existing installs
+
+Link generation (`collectEntries`, 23) now self-heals on the way out, written
+back into the rows like `repairAutotrackUrl`: auto-shelf snapshots become
+their `autotrack:` URLs when signed in (`upgradeSnapshotShelfToLive`), and
+Creator rows missing their live identity get it backfilled when the slug
+matches an account list (`backfillCreatorSlugInSnapshot`). One Update Link
+while signed in converts old rows permanently. Narrow by design: signed-in
+only, own account only, airing-next series-only, no-op before dashboard data
+loads.
+
+### Verification
+
+Rebuilt via `build.py`; `node --check`, both scope checks, builder/admin/
+hostile renders, and the full suite pass: 1226 tests, 1225 pass, 0 fail
+(1 pre-existing skip), including 4 new worker and 10 new client tests.
+
 ## 2026-09-21 - Better Posters (btttr.cc) integration
 
 ### Files Changed

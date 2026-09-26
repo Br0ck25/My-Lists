@@ -993,7 +993,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // cached: the next request has to see what changed since. "curated" is
       // Recommended Movies/Shows (the account's pushed Discover snapshot),
       // and the Trakt/MDBList progress shelves change every time something
-      // is watched. All of them used to fall through to the 24-hour public
+      // is watched. All of them used to fall through to the day-long public
       // cache below, which let Stremio and Nuvio keep a day-old copy.
       const isUserPersonal = rowSources.some((src) => STREMIO_LIVE_ROW_SOURCES.has(src));
 
@@ -1028,6 +1028,12 @@ Sitemap: ${url.origin}/sitemap.xml`;
         if (isUserPersonal) {
           return jsonPublic({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
+        // Five minutes, not a day: every shared row -- charts, New on
+        // Streaming, Most Watched, public/provider lists -- is re-read live
+        // (or from a short worker-side TTL) on each origin hit, so a day-long
+        // max-age was the only thing standing between a website-side change
+        // and Stremio/Nuvio showing it. Upstream rate limits are still guarded
+        // by the fetchers' own freshTtlSec windows, not by this header.
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=300, s-maxage=300" });
       } catch (err) {
         const errMsg = safeErrorMessage(err);

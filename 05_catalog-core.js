@@ -1524,10 +1524,11 @@ function fetchChannelCatalog(entry, origin) {
 // below -- an older saved row's payload may only have creatorSlug, from
 // before creatorOwner started getting stamped in; keys.trackCreatorName/
 // keys.creatorName cover that using the request's own signed-in account),
-// or the KV lookup comes back empty (list since deleted, KV hiccup, made
-// private -- fetchLiveCreatorListItems only returns public lists' items),
-// this drops straight back to the old behavior rather than serving an
-// empty shelf.
+// or the KV lookup comes back empty (list since deleted, KV hiccup, or a
+// private list read by someone who didn't prove ownership --
+// fetchLiveCreatorListItems serves public lists to anyone but private ones
+// only to a verified owner), this drops straight back to the old behavior
+// rather than serving an empty shelf.
 function parseCustomListPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
@@ -1543,13 +1544,22 @@ function parseCustomListPayload(rawUrl) {
 // Re-reads a Creator-hosted list's current items straight from this
 // Worker's own KV, the same key shape /api/creator/lists/save writes to
 // and the /lists/:username/:slug viewer route already reads from. Returns
-// null (never []) on anything short of a confirmed, parseable, public hit,
-// so callers can tell "list has zero items right now" apart from "couldn't
-// resolve this live, fall back to the snapshot".
-async function fetchLiveCreatorListItems(owner, slug, env) {
+// null (never []) on anything short of a confirmed, parseable hit -- public
+// to anyone, private only to a verified owner -- so callers can tell "list
+// has zero items right now" apart from "couldn't resolve this live, fall
+// back to the snapshot".
+async function fetchLiveCreatorListItems(owner, slug, env, verifiedOwner = "") {
   if (!owner || !slug || !env || !env.CONFIGS) return null;
   const ownerLower = String(owner).toLowerCase();
   const slugLower = String(slug).toLowerCase();
+  // A private list is live only to a reader that PROVED it owns the account
+  // -- the same verifiedOwner autotrack shelves gate on (see
+  // mayReadTrackedShelf, 02_http-and-creator-utils.js), carried here from the
+  // install link's Creator Key or the preview caller's key. Anyone else gets
+  // public lists only and falls back to the row's embedded snapshot, exactly
+  // as before. trackCreatorName is deliberately NOT enough: it is a claim,
+  // and a bare claim must never unlock somebody's private list.
+  const provenOwner = String(verifiedOwner || "").toLowerCase();
   const keysToTry = [
     `creatorlist:${ownerLower}:${slugLower}`,
     `creatorlist:${owner}:${slug}`,
@@ -1562,6 +1572,9 @@ async function fetchLiveCreatorListItems(owner, slug, env) {
       if (parsed && Array.isArray(parsed.items)) {
         await stampListVisibilityIfNeeded(env, k, parsed);
         if (isPublicListVisibility(parsed.visibility)) {
+          return parsed.items;
+        }
+        if (provenOwner && provenOwner === ownerLower) {
           return parsed.items;
         }
       }
@@ -1577,7 +1590,7 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   let sourceItems = payload.items;
   const liveOwner = payload.creatorOwner || (payload.creatorSlug ? (keys.trackCreatorName || keys.creatorName || '') : '');
   if (payload.creatorSlug && liveOwner) {
-    const liveItems = await fetchLiveCreatorListItems(liveOwner, payload.creatorSlug, keys.env);
+    const liveItems = await fetchLiveCreatorListItems(liveOwner, payload.creatorSlug, keys.env, keys.verifiedOwner || '');
     if (liveItems) sourceItems = liveItems;
   }
 

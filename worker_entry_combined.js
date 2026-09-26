@@ -1229,12 +1229,12 @@ const STREMIO_BADGE_KEYS = [
 // --- Catalog rows that are one account's live state -------------------------
 //
 // The detectSource names (04_config-resolution.js) whose catalog response is
-// sent no-store instead of the 24-hour public cache every other row gets --
+// sent no-store instead of the 5-minute public cache every other row gets --
 // see the catalog route (25_api-catalog-routes.js). A row belongs here when
 // its items change because of something the account DID (watched, added,
-// removed), under a URL that stays the same: the install link's config id
-// only changes when the config does, so a cached copy of one of these would
-// sit there, stale, for a day.
+// removed), under a URL that stays the same: even five minutes of cache on
+// one of these would show a shelf that disagrees with what the account just
+// did, so the next request always re-reads.
 //
 //   autotrack        Watchlist, Watch History, Continue Watching, Airing Next
 //   curated          Recommended Movies / Recommended Shows
@@ -14194,10 +14194,11 @@ function fetchChannelCatalog(entry, origin) {
 // below -- an older saved row's payload may only have creatorSlug, from
 // before creatorOwner started getting stamped in; keys.trackCreatorName/
 // keys.creatorName cover that using the request's own signed-in account),
-// or the KV lookup comes back empty (list since deleted, KV hiccup, made
-// private -- fetchLiveCreatorListItems only returns public lists' items),
-// this drops straight back to the old behavior rather than serving an
-// empty shelf.
+// or the KV lookup comes back empty (list since deleted, KV hiccup, or a
+// private list read by someone who didn't prove ownership --
+// fetchLiveCreatorListItems serves public lists to anyone but private ones
+// only to a verified owner), this drops straight back to the old behavior
+// rather than serving an empty shelf.
 function parseCustomListPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
@@ -14213,13 +14214,22 @@ function parseCustomListPayload(rawUrl) {
 // Re-reads a Creator-hosted list's current items straight from this
 // Worker's own KV, the same key shape /api/creator/lists/save writes to
 // and the /lists/:username/:slug viewer route already reads from. Returns
-// null (never []) on anything short of a confirmed, parseable, public hit,
-// so callers can tell "list has zero items right now" apart from "couldn't
-// resolve this live, fall back to the snapshot".
-async function fetchLiveCreatorListItems(owner, slug, env) {
+// null (never []) on anything short of a confirmed, parseable hit -- public
+// to anyone, private only to a verified owner -- so callers can tell "list
+// has zero items right now" apart from "couldn't resolve this live, fall
+// back to the snapshot".
+async function fetchLiveCreatorListItems(owner, slug, env, verifiedOwner = "") {
   if (!owner || !slug || !env || !env.CONFIGS) return null;
   const ownerLower = String(owner).toLowerCase();
   const slugLower = String(slug).toLowerCase();
+  // A private list is live only to a reader that PROVED it owns the account
+  // -- the same verifiedOwner autotrack shelves gate on (see
+  // mayReadTrackedShelf, 02_http-and-creator-utils.js), carried here from the
+  // install link's Creator Key or the preview caller's key. Anyone else gets
+  // public lists only and falls back to the row's embedded snapshot, exactly
+  // as before. trackCreatorName is deliberately NOT enough: it is a claim,
+  // and a bare claim must never unlock somebody's private list.
+  const provenOwner = String(verifiedOwner || "").toLowerCase();
   const keysToTry = [
     `creatorlist:${ownerLower}:${slugLower}`,
     `creatorlist:${owner}:${slug}`,
@@ -14232,6 +14242,9 @@ async function fetchLiveCreatorListItems(owner, slug, env) {
       if (parsed && Array.isArray(parsed.items)) {
         await stampListVisibilityIfNeeded(env, k, parsed);
         if (isPublicListVisibility(parsed.visibility)) {
+          return parsed.items;
+        }
+        if (provenOwner && provenOwner === ownerLower) {
           return parsed.items;
         }
       }
@@ -14247,7 +14260,7 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   let sourceItems = payload.items;
   const liveOwner = payload.creatorOwner || (payload.creatorSlug ? (keys.trackCreatorName || keys.creatorName || '') : '');
   if (payload.creatorSlug && liveOwner) {
-    const liveItems = await fetchLiveCreatorListItems(liveOwner, payload.creatorSlug, keys.env);
+    const liveItems = await fetchLiveCreatorListItems(liveOwner, payload.creatorSlug, keys.env, keys.verifiedOwner || '');
     if (liveItems) sourceItems = liveItems;
   }
 
@@ -64709,7 +64722,10 @@ if (_creatorDashEl) {
         const sPayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: listMeta.creatorName || (activeCreator ? activeCreator.creatorName : undefined), type: 'series', items: series, shuffle: false, publishedUrl: listMeta.url || undefined };
         addRow(listMeta.name + ' (Shows)', 'customlist:v1:' + JSON.stringify(sPayload), 'series', true, 'Custom Lists');
       } else {
-        const payload = { listId: generateChannelId(), listSlug: slug, type: listMeta.type, items: listMeta.items || [], shuffle: false };
+        // creatorSlug + creatorOwner, same as the mixed branch above: without
+        // them the server can never re-read this list live and the row stays
+        // a frozen snapshot of whatever the list held when + Add was clicked.
+        const payload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: listMeta.creatorName || (activeCreator ? activeCreator.creatorName : undefined), type: listMeta.type, items: listMeta.items || [], shuffle: false, publishedUrl: listMeta.url || undefined };
         addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type, true, 'Custom Lists');
       }
       addToConfigBtn.classList.add('is-added', 'secondary');
@@ -64793,7 +64809,7 @@ if (_creatorDashEl) {
     }
     
     let isAdded = localAddToConfigBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, listMeta.type, slug));
-    if (!isAdded && (slug === 'watch-history' || slug === 'continue-watching')) {
+    if (!isAdded && (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist')) {
       const entries = document.querySelectorAll('#lists .entry');
       for (const entry of entries) {
         const nameInput = entry.querySelector('.name');
@@ -64827,7 +64843,7 @@ if (_creatorDashEl) {
           if (entry) entry.remove();
         }
       });
-      if (slug === 'watch-history' || slug === 'continue-watching') {
+      if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
         document.querySelectorAll('#lists .entry').forEach((entry) => {
           const nameInput = entry.querySelector('.name');
           if (nameInput && nameInput.value.trim().toLowerCase().startsWith(listMeta.name.toLowerCase())) {
@@ -64847,8 +64863,8 @@ if (_creatorDashEl) {
     }
 
     const items = normalizeSnapshotItemsForCatalog(listMeta.items || []);
-    
-    if (listMeta.type === 'mixed' || slug === 'watch-history' || slug === 'continue-watching') {
+
+    if (listMeta.type === 'mixed' || slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
       const movies = [];
       const series = [];
       
@@ -64876,11 +64892,18 @@ if (_creatorDashEl) {
         }
       });
       
-      const movieUrl = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
+      // Signed in, this shelf has a live server-side form -- an autotrack: row
+      // that re-reads the account on every catalog request -- so it gets one.
+      // Watchlist used to be missing from this condition and fell through to
+      // a frozen customlist:v1: snapshot, which is why a Watchlist added from
+      // the Lists page never picked up website-side edits in Stremio until
+      // the row was deleted and the link regenerated.
+      const useLiveAutotrack = activeCreator && (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist');
+      const movieUrl = useLiveAutotrack
         ? 'autotrack:' + slug + ':movie:' + activeCreator.creatorName
         : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'movie', items: movies, shuffle: false });
       addRow(listMeta.name + ' (Movies)', movieUrl, 'movie', true, 'My Lists');
-      const showUrl = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
+      const showUrl = useLiveAutotrack
         ? 'autotrack:' + slug + ':series:' + activeCreator.creatorName
         : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'series', items: series, shuffle: false });
       addRow(listMeta.name + ' (Shows)', showUrl, 'series', true, 'My Lists');
@@ -66383,6 +66406,69 @@ function repairAutotrackUrl(url) {
   return 'autotrack:' + m[1] + ':' + m[2] + ':' + activeCreator.creatorName;
 }
 
+// Upgrades a frozen snapshot of an auto-tracked shelf to its live form.
+//
+// Clicking "+ Add" on the Watchlist used to bake a customlist:v1: snapshot
+// of that moment's items into the row -- and link generation copied rows
+// verbatim, so the frozen items followed every regenerated link forever and
+// no website-side edit ever reached Stremio. A signed-in account has a live
+// server-side form for these shelves, so on the way out the snapshot is
+// swapped for the autotrack: URL that re-reads the account on every catalog
+// request, and the row heals itself the next time the link is generated.
+//
+// Deliberately narrow: only the four auto-shelf slugs (no genuine custom
+// list can own one -- new server lists can't take creatorlist:{user}:
+// watchlist et al, and local creation auto-increments on collision), only
+// when signed in (a local-only browser has no server copy to read --
+// converting its rows would empty them), only rows that name this account
+// or no account (never another creator's list), and airing-next only for
+// series rows (it has no movie form server-side; a movie snapshot of it is
+// left alone rather than converted into a row that can only ever be empty).
+function upgradeSnapshotShelfToLive(raw, rowType) {
+  if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return raw;
+  if (typeof parseCustomListPayloadClient !== 'function') return raw;
+  const payload = parseCustomListPayloadClient(raw);
+  if (!payload) return raw;
+  const slug = String(payload.localSlug || payload.listSlug || payload.creatorSlug || payload.slug || '').toLowerCase();
+  if (slug !== 'watchlist' && slug !== 'watch-history' && slug !== 'continue-watching' && slug !== 'airing-next') return raw;
+  if (payload.creatorOwner && String(payload.creatorOwner).toLowerCase() !== String(activeCreator.creatorName).toLowerCase()) return raw;
+  const t = String(rowType || '').toLowerCase();
+  if (t !== 'movie' && t !== 'series') return raw;
+  if (slug === 'airing-next' && t !== 'series') return raw;
+  return 'autotrack:' + slug + ':' + t + ':' + activeCreator.creatorName;
+}
+
+// Backfills the live-read identity onto a Creator-list row that lacks it.
+//
+// Single-type Creator lists added to Catalogs before creatorSlug started
+// being stamped on them carry only a listSlug, so the server can never
+// re-read them live and they stay frozen snapshots. When the slug matches a
+// list on this signed-in account, stamp creatorSlug + creatorOwner onto the
+// row so catalog requests resolve it live (public to anyone, private to a
+// proven owner -- see fetchLiveCreatorListItems, 05_catalog-core.js). The
+// embedded items stay untouched as the fallback. A no-op when the dashboard
+// data hasn't loaded yet, when the slug matches nothing, or when the row
+// already names a different owner -- every one of those means "leave it".
+function backfillCreatorSlugInSnapshot(raw) {
+  if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return raw;
+  if (typeof parseCustomListPayloadClient !== 'function') return raw;
+  if (typeof lastCreatorListsData === 'undefined' || !Array.isArray(lastCreatorListsData) || !lastCreatorListsData.length) return raw;
+  const payload = parseCustomListPayloadClient(raw);
+  if (!payload) return raw;
+  if (payload.creatorOwner && String(payload.creatorOwner).toLowerCase() !== String(activeCreator.creatorName).toLowerCase()) return raw;
+  const slug = String(payload.creatorSlug || payload.localSlug || payload.listSlug || payload.slug || '');
+  if (!slug) return raw;
+  if (payload.creatorSlug && payload.creatorOwner) return raw;
+  const known = lastCreatorListsData.some((l) => l && String(l.slug || '').toLowerCase() === slug.toLowerCase());
+  if (!known) return raw;
+  const upgraded = Object.assign({}, payload, { creatorSlug: slug, creatorOwner: activeCreator.creatorName });
+  try {
+    return 'customlist:v1:' + JSON.stringify(upgraded);
+  } catch (e) {
+    return raw;
+  }
+}
+
 // The Creator Key that lets /api/preview prove who is asking.
 //
 // Watch History, Continue Watching, Watchlist and Airing Next are
@@ -66404,12 +66490,30 @@ function repairAutotrackUrl(url) {
 // mdblist/trakt/tmdb list has no business carrying it.
 function previewCreatorKey(url) {
   if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return '';
-  if (!urlHasAutotrackSource(url)) return '';
+  if (!urlHasAutotrackSource(url) && !urlReferencesOwnCreatorList(url)) return '';
   try {
     return localStorage.getItem('myListAddon:creatorKey') || '';
   } catch (e) {
     return '';
   }
+}
+
+// A customlist:v1: row naming this signed-in account's server list (a
+// creatorSlug with no creatorOwner, or one naming this account): previewing
+// it is a private-list read exactly like an autotrack shelf, so it carries
+// the key for the same proof. Rows naming another creator's list, and
+// local-only snapshots with no creatorSlug at all, get nothing.
+function urlReferencesOwnCreatorList(url) {
+  if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return false;
+  if (typeof parseCustomListPayloadClient !== 'function') return false;
+  if (String(url || '').indexOf('customlist:v1:') === -1) return false;
+  const me = String(activeCreator.creatorName).toLowerCase();
+  return String(url).split('\\n').some((line) => {
+    const p = parseCustomListPayloadClient(line);
+    if (!p || !p.creatorSlug) return false;
+    if (p.creatorOwner && String(p.creatorOwner).toLowerCase() !== me) return false;
+    return true;
+  });
 }
 
 // A merged row stacks several sources into one newline-separated url (see
@@ -66435,9 +66539,16 @@ function collectEntries() {
     // A merged entry has multiple .url inputs (one per source); join them
     // newline-separated into the single stored "url" field -- fetchCatalog
     // server-side splits on the same delimiter to fan out to each source.
+    const rowType = div.querySelector('.type') ? div.querySelector('.type').value : '';
     const urls = [...div.querySelectorAll('.url')].map(el => {
       const raw = el.value.trim();
-      const repaired = repairAutotrackUrl(raw);
+      let repaired = repairAutotrackUrl(raw);
+      // Frozen snapshots of live shelves upgrade to their live form on the
+      // way out -- an auto-tracked shelf becomes its autotrack: URL, a
+      // Creator list missing its live identity gets it backfilled -- so one
+      // Update Link heals rows that predated the live add-paths.
+      repaired = upgradeSnapshotShelfToLive(repaired, rowType);
+      repaired = backfillCreatorSlugInSnapshot(repaired);
       // Written back into the actual input, not just the returned data --
       // so the repair sticks (gets picked up by the next autosave/sync)
       // instead of silently re-appearing every time this runs.
@@ -66613,7 +66724,22 @@ function collectKeys() {
     // key in one that carries nothing belonging to that account.
     const hasPersonalShelf = [...document.querySelectorAll('#lists .entry .url')]
       .some((el) => String(el.value || '').trim().startsWith('autotrack:'));
-    if (track || hasPersonalShelf) {
+    // A Creator-list row (customlist:v1: with a creatorSlug) is also one of
+    // this account's shelves once the server reads it live: private lists
+    // resolve only for a proven owner (see fetchLiveCreatorListItems,
+    // 05_catalog-core.js), and without the key in the link the proof can't
+    // be made and every private list silently falls back to its snapshot.
+    const hasOwnCreatorList = [...document.querySelectorAll('#lists .entry .url')]
+      .some((el) => {
+        const v = String(el.value || '').trim();
+        if (v.indexOf('customlist:v1:') === -1 || v.indexOf('creatorSlug') === -1) return false;
+        if (typeof parseCustomListPayloadClient !== 'function') return false;
+        return v.split('\\n').some((line) => {
+          const p = parseCustomListPayloadClient(line);
+          return !!(p && p.creatorSlug);
+        });
+      });
+    if (track || hasPersonalShelf || hasOwnCreatorList) {
       keys.trackCreatorName = activeCreator.creatorName;
       keys.trackCreatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     }
@@ -74461,7 +74587,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // cached: the next request has to see what changed since. "curated" is
       // Recommended Movies/Shows (the account's pushed Discover snapshot),
       // and the Trakt/MDBList progress shelves change every time something
-      // is watched. All of them used to fall through to the 24-hour public
+      // is watched. All of them used to fall through to the day-long public
       // cache below, which let Stremio and Nuvio keep a day-old copy.
       const isUserPersonal = rowSources.some((src) => STREMIO_LIVE_ROW_SOURCES.has(src));
 
@@ -74496,7 +74622,13 @@ Sitemap: ${url.origin}/sitemap.xml`;
         if (isUserPersonal) {
           return jsonPublic({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
-        return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=86400, s-maxage=86400" });
+        // Five minutes, not a day: every shared row -- charts, New on
+        // Streaming, Most Watched, public/provider lists -- is re-read live
+        // (or from a short worker-side TTL) on each origin hit, so a day-long
+        // max-age was the only thing standing between a website-side change
+        // and Stremio/Nuvio showing it. Upstream rate limits are still guarded
+        // by the fetchers' own freshTtlSec windows, not by this header.
+        return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=300, s-maxage=300" });
       } catch (err) {
         const errMsg = safeErrorMessage(err);
         if (isUserPersonal) {

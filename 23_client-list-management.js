@@ -365,6 +365,69 @@ function repairAutotrackUrl(url) {
   return 'autotrack:' + m[1] + ':' + m[2] + ':' + activeCreator.creatorName;
 }
 
+// Upgrades a frozen snapshot of an auto-tracked shelf to its live form.
+//
+// Clicking "+ Add" on the Watchlist used to bake a customlist:v1: snapshot
+// of that moment's items into the row -- and link generation copied rows
+// verbatim, so the frozen items followed every regenerated link forever and
+// no website-side edit ever reached Stremio. A signed-in account has a live
+// server-side form for these shelves, so on the way out the snapshot is
+// swapped for the autotrack: URL that re-reads the account on every catalog
+// request, and the row heals itself the next time the link is generated.
+//
+// Deliberately narrow: only the four auto-shelf slugs (no genuine custom
+// list can own one -- new server lists can't take creatorlist:{user}:
+// watchlist et al, and local creation auto-increments on collision), only
+// when signed in (a local-only browser has no server copy to read --
+// converting its rows would empty them), only rows that name this account
+// or no account (never another creator's list), and airing-next only for
+// series rows (it has no movie form server-side; a movie snapshot of it is
+// left alone rather than converted into a row that can only ever be empty).
+function upgradeSnapshotShelfToLive(raw, rowType) {
+  if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return raw;
+  if (typeof parseCustomListPayloadClient !== 'function') return raw;
+  const payload = parseCustomListPayloadClient(raw);
+  if (!payload) return raw;
+  const slug = String(payload.localSlug || payload.listSlug || payload.creatorSlug || payload.slug || '').toLowerCase();
+  if (slug !== 'watchlist' && slug !== 'watch-history' && slug !== 'continue-watching' && slug !== 'airing-next') return raw;
+  if (payload.creatorOwner && String(payload.creatorOwner).toLowerCase() !== String(activeCreator.creatorName).toLowerCase()) return raw;
+  const t = String(rowType || '').toLowerCase();
+  if (t !== 'movie' && t !== 'series') return raw;
+  if (slug === 'airing-next' && t !== 'series') return raw;
+  return 'autotrack:' + slug + ':' + t + ':' + activeCreator.creatorName;
+}
+
+// Backfills the live-read identity onto a Creator-list row that lacks it.
+//
+// Single-type Creator lists added to Catalogs before creatorSlug started
+// being stamped on them carry only a listSlug, so the server can never
+// re-read them live and they stay frozen snapshots. When the slug matches a
+// list on this signed-in account, stamp creatorSlug + creatorOwner onto the
+// row so catalog requests resolve it live (public to anyone, private to a
+// proven owner -- see fetchLiveCreatorListItems, 05_catalog-core.js). The
+// embedded items stay untouched as the fallback. A no-op when the dashboard
+// data hasn't loaded yet, when the slug matches nothing, or when the row
+// already names a different owner -- every one of those means "leave it".
+function backfillCreatorSlugInSnapshot(raw) {
+  if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return raw;
+  if (typeof parseCustomListPayloadClient !== 'function') return raw;
+  if (typeof lastCreatorListsData === 'undefined' || !Array.isArray(lastCreatorListsData) || !lastCreatorListsData.length) return raw;
+  const payload = parseCustomListPayloadClient(raw);
+  if (!payload) return raw;
+  if (payload.creatorOwner && String(payload.creatorOwner).toLowerCase() !== String(activeCreator.creatorName).toLowerCase()) return raw;
+  const slug = String(payload.creatorSlug || payload.localSlug || payload.listSlug || payload.slug || '');
+  if (!slug) return raw;
+  if (payload.creatorSlug && payload.creatorOwner) return raw;
+  const known = lastCreatorListsData.some((l) => l && String(l.slug || '').toLowerCase() === slug.toLowerCase());
+  if (!known) return raw;
+  const upgraded = Object.assign({}, payload, { creatorSlug: slug, creatorOwner: activeCreator.creatorName });
+  try {
+    return 'customlist:v1:' + JSON.stringify(upgraded);
+  } catch (e) {
+    return raw;
+  }
+}
+
 // The Creator Key that lets /api/preview prove who is asking.
 //
 // Watch History, Continue Watching, Watchlist and Airing Next are
@@ -386,12 +449,30 @@ function repairAutotrackUrl(url) {
 // mdblist/trakt/tmdb list has no business carrying it.
 function previewCreatorKey(url) {
   if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return '';
-  if (!urlHasAutotrackSource(url)) return '';
+  if (!urlHasAutotrackSource(url) && !urlReferencesOwnCreatorList(url)) return '';
   try {
     return localStorage.getItem('myListAddon:creatorKey') || '';
   } catch (e) {
     return '';
   }
+}
+
+// A customlist:v1: row naming this signed-in account's server list (a
+// creatorSlug with no creatorOwner, or one naming this account): previewing
+// it is a private-list read exactly like an autotrack shelf, so it carries
+// the key for the same proof. Rows naming another creator's list, and
+// local-only snapshots with no creatorSlug at all, get nothing.
+function urlReferencesOwnCreatorList(url) {
+  if (typeof activeCreator === 'undefined' || !activeCreator || !activeCreator.creatorName) return false;
+  if (typeof parseCustomListPayloadClient !== 'function') return false;
+  if (String(url || '').indexOf('customlist:v1:') === -1) return false;
+  const me = String(activeCreator.creatorName).toLowerCase();
+  return String(url).split('\\n').some((line) => {
+    const p = parseCustomListPayloadClient(line);
+    if (!p || !p.creatorSlug) return false;
+    if (p.creatorOwner && String(p.creatorOwner).toLowerCase() !== me) return false;
+    return true;
+  });
 }
 
 // A merged row stacks several sources into one newline-separated url (see
@@ -417,9 +498,16 @@ function collectEntries() {
     // A merged entry has multiple .url inputs (one per source); join them
     // newline-separated into the single stored "url" field -- fetchCatalog
     // server-side splits on the same delimiter to fan out to each source.
+    const rowType = div.querySelector('.type') ? div.querySelector('.type').value : '';
     const urls = [...div.querySelectorAll('.url')].map(el => {
       const raw = el.value.trim();
-      const repaired = repairAutotrackUrl(raw);
+      let repaired = repairAutotrackUrl(raw);
+      // Frozen snapshots of live shelves upgrade to their live form on the
+      // way out -- an auto-tracked shelf becomes its autotrack: URL, a
+      // Creator list missing its live identity gets it backfilled -- so one
+      // Update Link heals rows that predated the live add-paths.
+      repaired = upgradeSnapshotShelfToLive(repaired, rowType);
+      repaired = backfillCreatorSlugInSnapshot(repaired);
       // Written back into the actual input, not just the returned data --
       // so the repair sticks (gets picked up by the next autosave/sync)
       // instead of silently re-appearing every time this runs.
@@ -595,7 +683,22 @@ function collectKeys() {
     // key in one that carries nothing belonging to that account.
     const hasPersonalShelf = [...document.querySelectorAll('#lists .entry .url')]
       .some((el) => String(el.value || '').trim().startsWith('autotrack:'));
-    if (track || hasPersonalShelf) {
+    // A Creator-list row (customlist:v1: with a creatorSlug) is also one of
+    // this account's shelves once the server reads it live: private lists
+    // resolve only for a proven owner (see fetchLiveCreatorListItems,
+    // 05_catalog-core.js), and without the key in the link the proof can't
+    // be made and every private list silently falls back to its snapshot.
+    const hasOwnCreatorList = [...document.querySelectorAll('#lists .entry .url')]
+      .some((el) => {
+        const v = String(el.value || '').trim();
+        if (v.indexOf('customlist:v1:') === -1 || v.indexOf('creatorSlug') === -1) return false;
+        if (typeof parseCustomListPayloadClient !== 'function') return false;
+        return v.split('\\n').some((line) => {
+          const p = parseCustomListPayloadClient(line);
+          return !!(p && p.creatorSlug);
+        });
+      });
+    if (track || hasPersonalShelf || hasOwnCreatorList) {
       keys.trackCreatorName = activeCreator.creatorName;
       keys.trackCreatorKey = localStorage.getItem('myListAddon:creatorKey') || '';
     }
