@@ -129,6 +129,37 @@ describe("client: a local custom list gets a live server-side copy", () => {
     assert.match(posts[0].body.token, /^[A-Za-z0-9_-]{22}$/);
   });
 
+  it("leaves a snapshot of an auto-tracked shelf alone", () => {
+    const client = loadClient({ routes: { [LIVE_SAVE]: () => ({ json: { ok: true } }) } });
+    // Watch History / Continue Watching / Watchlist / Airing Next live as
+    // autotrack: rows, and the server does not read a token record for them.
+    const snapshot = localRow("continue-watching", [item(1)]);
+    assert.equal(client.call("withLiveListToken", snapshot), snapshot);
+    const mine = localRow("mine", [item(1)]);
+    assert.notEqual(client.call("withLiveListToken", mine), mine);
+  });
+
+  it("stores the list's own name and type, not the row's half of it", async () => {
+    const client = loadClient({
+      storage: {
+        "myListAddon:localCustomLists": JSON.stringify({
+          faves: { slug: "faves", name: "Faves", type: "mixed", items: [item(1), item(2)] },
+        }),
+      },
+      routes: { [LIVE_SAVE]: () => ({ json: { ok: true } }) } },
+    );
+    // A signed-in edit re-pushes an already-stamped row (the path
+    // syncCustomListToCatalogRows takes); the record still has to describe the
+    // whole list rather than whichever row fired the push.
+    const stamped = JSON.parse(client.call("withLiveListToken", localRow("faves", [item(1)])).slice("customlist:v1:".length));
+    await client.call("flushLiveLists");
+    const body = requestsTo(client, LIVE_SAVE)[0].body;
+    assert.equal(body.name, "Faves");
+    assert.equal(body.type, "mixed");
+    assert.deepEqual(body.items.map((i) => i.id), ["tt0000001", "tt0000002"]);
+    assert.equal(body.token, stamped.liveToken);
+  });
+
   it("does not stamp a token onto a row naming another creator's list", async () => {
     const client = loadClient({ routes: { [LIVE_SAVE]: () => ({ json: { ok: true } }) } });
     client.call("addRow", "Theirs", creatorRow("faves", [item(1)], "bob"), "movie", true, "Custom Lists");

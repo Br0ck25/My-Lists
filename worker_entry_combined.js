@@ -32491,6 +32491,15 @@ function parseCustomListPayloadClient(u) {
 // link is regenerated, exactly like the other live-row upgrades
 // (upgradeSnapshotShelfToLive) that need one Update Link.
 const LIVE_LIST_TOKEN_PREFIX = 'myListAddon:liveListToken:';
+// The four shelves the website auto-tracks, matching the server's
+// AUTO_TRACK_SHELF_SLUGS (05_catalog-core.js). Their live form is an
+// autotrack: row, so a customlist snapshot of one gets no token.
+const AUTOTRACK_SHELF_SLUGS = new Set([
+  'watchlist',
+  'watch-history',
+  'continue-watching',
+  'airing-next',
+]);
 
 function mintLiveListToken() {
   const bytes = new Uint8Array(16);
@@ -32542,6 +32551,27 @@ async function flushLiveLists() {
   }
 }
 
+// Pushes the list's live copy from its own local record when there is one, so
+// the stored name and type are the list's ("mixed", for a list that is two
+// rows) rather than whichever row happened to fire the push, and so a mixed
+// list's record holds both halves. Falls back to what the caller passed when
+// the list is not in localStorage any more.
+function pushLiveListForSlug(token, slug, fallbackName, fallbackType, items) {
+  let fullName = fallbackName || '';
+  let fullType = fallbackType || 'movie';
+  let fullItems = Array.isArray(items) ? items : [];
+  try {
+    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
+    const local = slug ? map[slug] : null;
+    if (local) {
+      if (local.name) fullName = local.name;
+      if (local.type) fullType = local.type;
+      if (Array.isArray(local.items) && local.items.length) fullItems = local.items;
+    }
+  } catch (e) {}
+  pushLiveList(token, fullName, fullType, fullItems);
+}
+
 // Stamps the live token onto a customlist payload that has none and is not
 // one of this account's server lists, returning the (possibly rewritten)
 // URL. Signed-in lists skip this entirely: their live copy is the account's,
@@ -32553,25 +32583,15 @@ function withLiveListToken(url) {
   if (!payload || payload.creatorSlug || payload.creatorOwner || payload.liveToken) return url;
   const slug = String(payload.localSlug || payload.listSlug || payload.slug || '');
   if (!slug) return url;
+  // The four shelves the website auto-tracks have a live form of their own --
+  // an autotrack: row, not a custom list (see AUTO_TRACK_SHELF_SLUGS,
+  // 05_catalog-core.js). A snapshot of one of them is left alone: the server
+  // deliberately does not read a token record for them, so minting one would
+  // only be storage nothing ever reads.
+  if (AUTOTRACK_SHELF_SLUGS.has(slug)) return url;
   const token = liveListTokenFor(slug);
   payload.liveToken = token;
-  // The list's full items, not this row's slice of them: a mixed list is two
-  // rows (movies and shows) over one list and one token, and the record they
-  // share has to hold both halves or the other row would filter itself down
-  // to nothing.
-  let fullItems = payload.items || [];
-  let fullName = payload.name || '';
-  let fullType = payload.type || 'movie';
-  try {
-    const map = (typeof loadLocalCustomLists === 'function') ? loadLocalCustomLists() : {};
-    const local = map[slug];
-    if (local && Array.isArray(local.items) && local.items.length) {
-      fullItems = local.items;
-      if (local.name) fullName = local.name;
-      if (local.type) fullType = local.type;
-    }
-  } catch (e) {}
-  pushLiveList(token, fullName, fullType, fullItems);
+  pushLiveListForSlug(token, slug, payload.name || '', payload.type || 'movie', payload.items);
   return 'customlist:v1:' + JSON.stringify(payload);
 }
 
@@ -32688,7 +32708,7 @@ function syncCustomListToCatalogRows(slug, items, name, type) {
         let finalUrl = 'customlist:v1:' + JSON.stringify(payload);
         if (!payload.creatorSlug && !payload.creatorOwner) {
           if (payload.liveToken) {
-            pushLiveList(payload.liveToken, name || payload.name || '', payload.type || type || 'movie', items);
+            pushLiveListForSlug(payload.liveToken, slug, name || payload.name || '', payload.type || type || 'movie', items);
           } else {
             finalUrl = withLiveListToken(finalUrl);
           }
