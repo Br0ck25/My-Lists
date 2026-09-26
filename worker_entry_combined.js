@@ -12691,7 +12691,13 @@ async function searchTraktLists(query, traktKeyOverride) {
 }
 // --- manifest ----------------------------------------------------------
 
-function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
+// A shelf's TITLE in the apps. `liveNames` (see liveShelfNames) carries the
+// current name of any list that has a live copy, so renaming a list on the
+// website reaches the apps instead of leaving the shelf titled with whatever
+// the link said the day it was generated. A name that is absent or unchanged
+// leaves the config's own name alone -- a row with nothing live behind it has
+// nothing newer to say.
+function buildManifest(entries, origin, track, shuffleShelves, configSeed, liveNames = null) {
   let active = entries.filter((e) => e.enabled !== false);
   if (shuffleShelves && active.length > 1) {
     active = deterministicDailyShuffle(active, `shelves:${configSeed || ''}`);
@@ -12736,7 +12742,7 @@ function buildManifest(entries, origin, track, shuffleShelves, configSeed) {
       ...active.map((e) => ({
         type: e.type,
         id: e.id,
-        name: e.name,
+        name: (liveNames && liveNames[e.id]) || e.name,
         // Lets wako/Stremio page through lists longer than one screen by
         // re-requesting the catalog with an increasing `skip`.
         extra: [{ name: "skip", isRequired: false }],
@@ -14259,15 +14265,20 @@ function isValidLiveListToken(token) {
 
 // The list's current items, or null when there is no readable record --
 // which callers treat as "fall back to the row's snapshot", never as "empty".
-async function readLiveListItems(env, token) {
+async function readLiveListRecord(env, token) {
   if (!env || !env.CONFIGS || !isValidLiveListToken(token)) return null;
   const raw = await env.CONFIGS.get(LIVE_LIST_KEY_PREFIX + token);
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw);
-    if (parsed && Array.isArray(parsed.items)) return parsed.items;
+    if (parsed && Array.isArray(parsed.items)) return parsed;
   } catch {}
   return null;
+}
+
+async function readLiveListItems(env, token) {
+  const rec = await readLiveListRecord(env, token);
+  return rec ? rec.items : null;
 }
 
 // True when any source line of a (possibly merged) row is a custom list that
@@ -14301,14 +14312,17 @@ function parseCustomListPayload(rawUrl) {
   }
 }
 
-// Re-reads a Creator-hosted list's current items straight from this
+// Re-reads a Creator-hosted list's current record straight from this
 // Worker's own KV, the same key shape /api/creator/lists/save writes to
 // and the /lists/:username/:slug viewer route already reads from. Returns
-// null (never []) on anything short of a confirmed, parseable hit -- public
-// to anyone, private only to a verified owner -- so callers can tell "list
-// has zero items right now" apart from "couldn't resolve this live, fall
-// back to the snapshot".
-async function fetchLiveCreatorListItems(owner, slug, env, verifiedOwner = "") {
+// null (never a record with no items) on anything short of a confirmed,
+// parseable hit -- public to anyone, private only to a verified owner -- so
+// callers can tell "list has zero items right now" apart from "couldn't
+// resolve this live, fall back to the snapshot". The whole record rather
+// than just its items, because the manifest needs its name too (see
+// liveShelfName): a shelf whose title lags its contents is the same bug
+// with a different symptom.
+async function readLiveCreatorList(env, owner, slug, verifiedOwner = "") {
   if (!owner || !slug || !env || !env.CONFIGS) return null;
   const ownerLower = String(owner).toLowerCase();
   const slugLower = String(slug).toLowerCase();
@@ -14332,10 +14346,10 @@ async function fetchLiveCreatorListItems(owner, slug, env, verifiedOwner = "") {
       if (parsed && Array.isArray(parsed.items)) {
         await stampListVisibilityIfNeeded(env, k, parsed);
         if (isPublicListVisibility(parsed.visibility)) {
-          return parsed.items;
+          return parsed;
         }
         if (provenOwner && provenOwner === ownerLower) {
-          return parsed.items;
+          return parsed;
         }
       }
     } catch {}
@@ -14343,54 +14357,138 @@ async function fetchLiveCreatorListItems(owner, slug, env, verifiedOwner = "") {
   return null;
 }
 
-async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
-  const payload = parseCustomListPayload(entry.url);
-  if (!payload) return [];
+async function fetchLiveCreatorListItems(owner, slug, env, verifiedOwner = "") {
+  const rec = await readLiveCreatorList(env, owner, slug, verifiedOwner);
+  return rec ? rec.items : null;
+}
 
-  let sourceItems = payload.items;
-  // Whether any live copy answered, so the token store below is only
-  // consulted when nothing better did: for a signed-in browser the account's
-  // copy is the cross-device one, and this browser's token record is a
-  // same-list copy of it.
-  let liveResolved = false;
+// The one place that decides which copy of a custom-list payload is the live
+// one. fetchCustomListCatalog reads its items through here, and the
+// manifest's shelf title reads its name through here (liveShelfName below),
+// so the two can never disagree: a shelf whose title lags its contents is
+// the same staleness bug with a different symptom.
+//
+// Returns the whole record, or null when there is nothing live to read --
+// which callers treat as "fall back to the row's snapshot", never as "empty".
+async function resolveLiveCustomList(env, payload, keys = {}) {
+  if (!env || !env.CONFIGS || !payload) return null;
   const liveOwner = payload.creatorOwner || (payload.creatorSlug ? (keys.trackCreatorName || keys.creatorName || '') : '');
   if (payload.creatorSlug && liveOwner) {
-    const liveItems = await fetchLiveCreatorListItems(liveOwner, payload.creatorSlug, keys.env, keys.verifiedOwner || '');
-    if (liveItems) { sourceItems = liveItems; liveResolved = true; }
+    const rec = await readLiveCreatorList(env, liveOwner, payload.creatorSlug, keys.verifiedOwner || '');
+    if (rec) return rec;
   }
 
   // A row saved before its list had any live identity at all -- a local
   // Custom List, a Letterboxd import, a list cloned from someone else's
-  // public one -- carries only a local slug, so the row above has nothing to
-  // resolve. The list itself is on the account, though: every local-list
+  // public one -- carries only a local slug, so the branch above has nothing
+  // to resolve. The list itself is on the account, though: every local-list
   // edit mirrors to creatorlist:{username}:{slug} (see
   // /api/creator/lists/save), so if the install link belongs to an account
   // that HAS this slug, that copy is the live one and the row should read it
   // -- which is what makes an add or a remove reach the apps without the
   // link being regenerated.
   //
-  // Gated exactly as fetchLiveCreatorListItems gates everything else: a
-  // public list to any reader, a private one only to a reader that proved it
-  // owns the account (the link's Creator Key). A config that merely CLAIMS a
-  // name therefore cannot read a stranger's private list through this. The
-  // four auto-tracked slugs are excluded -- their live form is an autotrack:
-  // row, and a snapshot of one of those is left to the client's own
-  // upgrade path rather than being answered from a different record.
-  if (!liveResolved && !payload.creatorSlug && !payload.creatorOwner) {
+  // Gated exactly as readLiveCreatorList gates everything else: a public list
+  // to any reader, a private one only to a reader that proved it owns the
+  // account (the link's Creator Key). A config that merely CLAIMS a name
+  // therefore cannot read a stranger's private list through this. The four
+  // auto-tracked slugs are excluded -- their live form is an autotrack: row,
+  // and a snapshot of one of those is left to the client's own upgrade path
+  // rather than being answered from a different record.
+  if (!payload.creatorSlug && !payload.creatorOwner) {
     const localSlug = String(payload.localSlug || payload.listSlug || payload.slug || '');
     const accountOwner = String(keys.verifiedOwner || keys.trackCreatorName || keys.creatorName || '');
     if (localSlug && accountOwner && !AUTO_TRACK_SHELF_SLUGS.has(localSlug)) {
-      const liveItems = await fetchLiveCreatorListItems(accountOwner, localSlug, keys.env, keys.verifiedOwner || '');
-      if (liveItems) { sourceItems = liveItems; liveResolved = true; }
+      const rec = await readLiveCreatorList(env, accountOwner, localSlug, keys.verifiedOwner || '');
+      if (rec) return rec;
     }
   }
 
   // No account (or no such list on it): the browser's own token-addressed
   // copy, which exists for exactly the lists a signed-out person builds.
-  if (!liveResolved && payload.liveToken) {
-    const tokenItems = await readLiveListItems(keys.env, payload.liveToken);
-    if (tokenItems) sourceItems = tokenItems;
+  if (payload.liveToken) {
+    const rec = await readLiveListRecord(env, payload.liveToken);
+    if (rec) return rec;
   }
+  return null;
+}
+
+// What a catalog shelf is CALLED in Stremio/Nuvio comes from the manifest,
+// and the manifest's name for a Custom List used to be whatever the config
+// said the day the install link was generated -- so renaming a list on the
+// website changed it everywhere except in the apps, where the shelf kept the
+// old name forever. This resolves the list's current name from the same live
+// copy the catalog row reads its items from, so a rename travels with the
+// items.
+//
+// Returns null when there is no live name to use, and the caller keeps the
+// config's name -- which is the right answer for a row with no live identity
+// (nothing has changed server-side, so nothing has changed to say) and for a
+// published list whose owner made it private again.
+async function liveShelfName(env, url, keys = {}) {
+  if (!env || !env.CONFIGS) return null;
+  const lines = String(url || '').split(/[\r\n]+/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const payload = parseCustomListPayload(trimmed);
+    if (payload) {
+      const rec = await resolveLiveCustomList(env, payload, keys);
+      // A mixed list is TWO rows over ONE list ("Faves" the list, "Faves
+      // (Movies)" and "Faves (Shows)" the rows). Handing both rows the list's
+      // name would give the board two shelves with the same title, so a split
+      // row keeps its own derived label.
+      if (rec && !(rec.type === 'mixed' && payload.type && payload.type !== 'mixed')) {
+        const name = String(rec.name || '').trim();
+        if (name) return name;
+      }
+      continue;
+    }
+    // A shared/published list: the same creatorlist: record, reached through
+    // its share URL, and public only -- a private one is nobody else's
+    // business to rename.
+    const published = parsePublishedListUrl(trimmed);
+    if (published) {
+      const rec = await readLiveCreatorList(env, published.rawUsername, published.rawListName, keys.verifiedOwner || '');
+      if (rec && isPublicListVisibility(rec.visibility)) {
+        const name = String(rec.name || '').trim();
+        if (name) return name;
+      }
+    }
+  }
+  return null;
+}
+
+// The live shelf names for a whole config's entries, keyed by catalog id.
+// Bounded by the number of custom-list rows in the config, and only ever run
+// on a manifest request (install, refresh) rather than on the catalog reads
+// the apps make constantly -- see the manifest route in
+// 25_api-catalog-routes.js.
+async function liveShelfNames(env, entries, keys = {}) {
+  const names = {};
+  if (!env || !env.CONFIGS || !Array.isArray(entries)) return names;
+  for (const e of entries) {
+    if (!e || e.enabled === false || !e.url || typeof e.url !== 'string') continue;
+    if (e.url.indexOf('customlist:v1:') === -1 && !parsePublishedListUrl(e.url)) continue;
+    try {
+      const name = await liveShelfName(env, e.url, keys);
+      if (name && name !== e.name) names[e.id] = name;
+    } catch {}
+  }
+  return names;
+}
+
+async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
+  const payload = parseCustomListPayload(entry.url);
+  if (!payload) return [];
+
+  // The row's snapshot, replaced wholesale by whatever live copy answers --
+  // including an empty one, which is the whole point: the last item leaving a
+  // list has to empty the shelf. Only a record that is not there at all
+  // leaves the snapshot in place.
+  let sourceItems = payload.items;
+  const live = await resolveLiveCustomList(keys.env, payload, keys);
+  if (live) sourceItems = live.items;
 
   if (!sourceItems || !sourceItems.length) {
     if (payload && (
@@ -74668,8 +74766,32 @@ async function handleFetch(request, env, ctx) {
       if (isBrowserNavigation(request)) {
         return Response.redirect(`${url.origin}/${m[1]}/configure`, 302);
       }
-      const { entries, track, shuffleShelves } = await resolveConfig(m[1], env);
-      return jsonPublic(buildManifest(entries, url.origin, track, shuffleShelves, m[1]));
+      const resolved = await resolveConfig(m[1], env);
+      const { entries, track, shuffleShelves } = resolved;
+      // A shelf's title in the apps comes from here, so the title has to be
+      // read from the same live copy the shelf's items are read from
+      // (liveShelfNames, 05_catalog-core.js) -- otherwise renaming a list on
+      // the website changed it everywhere except in Stremio and Nuvio, which
+      // kept showing the old name for as long as the link existed.
+      //
+      // Only a manifest holding a list with a live copy is sent no-store: the
+      // title is part of what can still change, and a cached copy is a copy
+      // that disagrees. This is the request an app makes on install and on
+      // refresh, not the per-board-visit catalog read, so the cost of not
+      // caching it is a KV read or two per custom-list row on the rare
+      // request rather than on every shelf fetch.
+      const liveNames = await liveShelfNames(env, entries, {
+        trackCreatorName: resolved.trackCreatorName,
+        verifiedOwner: resolved.trackOwner,
+      });
+      const hasLiveShelf = entries.some((e) => e && typeof e.url === 'string' && (
+        customListRowIsLive(e.url, !!resolved.trackCreatorName) || !!parsePublishedListUrl(e.url)
+      ));
+      return jsonPublic(
+        buildManifest(entries, url.origin, track, shuffleShelves, m[1], liveNames),
+        200,
+        hasLiveShelf ? { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" } : {}
+      );
     }
 
     // bare manifest.json with no config

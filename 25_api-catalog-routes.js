@@ -743,8 +743,32 @@ async function handleFetch(request, env, ctx) {
       if (isBrowserNavigation(request)) {
         return Response.redirect(`${url.origin}/${m[1]}/configure`, 302);
       }
-      const { entries, track, shuffleShelves } = await resolveConfig(m[1], env);
-      return jsonPublic(buildManifest(entries, url.origin, track, shuffleShelves, m[1]));
+      const resolved = await resolveConfig(m[1], env);
+      const { entries, track, shuffleShelves } = resolved;
+      // A shelf's title in the apps comes from here, so the title has to be
+      // read from the same live copy the shelf's items are read from
+      // (liveShelfNames, 05_catalog-core.js) -- otherwise renaming a list on
+      // the website changed it everywhere except in Stremio and Nuvio, which
+      // kept showing the old name for as long as the link existed.
+      //
+      // Only a manifest holding a list with a live copy is sent no-store: the
+      // title is part of what can still change, and a cached copy is a copy
+      // that disagrees. This is the request an app makes on install and on
+      // refresh, not the per-board-visit catalog read, so the cost of not
+      // caching it is a KV read or two per custom-list row on the rare
+      // request rather than on every shelf fetch.
+      const liveNames = await liveShelfNames(env, entries, {
+        trackCreatorName: resolved.trackCreatorName,
+        verifiedOwner: resolved.trackOwner,
+      });
+      const hasLiveShelf = entries.some((e) => e && typeof e.url === 'string' && (
+        customListRowIsLive(e.url, !!resolved.trackCreatorName) || !!parsePublishedListUrl(e.url)
+      ));
+      return jsonPublic(
+        buildManifest(entries, url.origin, track, shuffleShelves, m[1], liveNames),
+        200,
+        hasLiveShelf ? { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" } : {}
+      );
     }
 
     // bare manifest.json with no config

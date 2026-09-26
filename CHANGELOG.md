@@ -16,7 +16,9 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 - **The per-user memo could serve a copy for minutes after an edit, and the shared `lastgood:` fallback for 30 days.** Rows that are genuinely live — auto-tracked shelves, Creator lists and these new live copies — are now answered `no-store` with no `lastgood:` entry; every other row keeps its 5-minute cache.
 - **External lists (MDBList, Trakt, TMDB) lagged the provider by up to an hour.** Their freshness windows are now 10 minutes for MDBList lists and 5 for Trakt and TMDB lists, and a private MDBList list is cached under its own key instead of a shared one — before, a private list's contents could be served to a caller who never supplied a key.
 
-- Tests: `tests/every-list-live.test.mjs` (14, server) and `tests/every-list-live.client.test.mjs` (14, browser) — the live-copy, account-resolution and no-store tests in them fail on the previous code. `tests/live-rows-stay-live.test.mjs` gained the new cache lifetimes. Full suite: 1254 pass / 0 fail.
+- **Renaming a list reached the website but not the apps.** A shelf's title in Stremio/Nuvio comes from the manifest, and the manifest's name for a Custom List was whatever the install link's config said the day it was generated — so the shelf kept the old name for as long as the link existed. The manifest now reads the name from the same live copy the shelf reads its items from, and a manifest holding a live list is sent `no-store` so the app's next manifest read picks the new name up. A mixed list's two split rows keep their own "(Movies)" / "(Shows)" labels rather than both being retitled with the list's name.
+
+- Tests: `tests/every-list-live.test.mjs` (21, server) and `tests/every-list-live.client.test.mjs` (14, browser) — the live-copy, account-resolution, rename and no-store tests in them fail on the previous code. `tests/live-rows-stay-live.test.mjs` gained the new cache lifetimes. Full suite: 1263 pass / 0 fail.
 
 ### 🔴 All catalog rows are live now -- website edits reach Stremio/Nuvio without regenerating the link
 

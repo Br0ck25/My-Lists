@@ -256,3 +256,111 @@ describe("POST /api/list-live/save", () => {
     assert.equal(last.status, 429);
   });
 });
+
+// A shelf's TITLE in Stremio/Nuvio comes from the manifest, and the
+// manifest's name for a Custom List used to be whatever the install link's
+// config said the day it was generated -- so renaming a list on the website
+// changed it everywhere except in the apps, where the shelf kept the old
+// name for as long as the link existed. The manifest now reads the name from
+// the same live copy the shelf reads its items from.
+describe("renaming a list reaches the shelf title in the apps", () => {
+  const manifest = async (env, config) => {
+    const res = await call(env, `/${config}/manifest.json`);
+    assert.equal(res.status, 200);
+    return res.body;
+  };
+  const shelfName = (m, id) => (m.catalogs || []).find((c) => c.id === id).name;
+
+  it("titles a Creator list row with the list's current name", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const user = await createUser(env, "rename1");
+    const slug = await accountList(env, user, [item(1)], "private");
+    const config = await signedInConfig(env, "renamecfg1", user, localRow("faves", [item(1)]));
+    assert.equal(shelfName(await manifest(env, config), "faves"), "Faves");
+
+    // The rename on the website (the Custom List panel saves it to the server).
+    const r = await call(env, "/api/creator/lists/save", {
+      method: "POST",
+      json: {
+        creatorName: user.creatorName, creatorKey: user.creatorKey,
+        slug, name: "Saturday Night Picks", type: "movie", items: [item(1)], visibility: "private",
+      },
+    });
+    assert.equal(r.body.ok, true, r.body.error);
+    assert.equal(shelfName(await manifest(env, config), "faves"), "Saturday Night Picks",
+      "the shelf in the apps has to be called what the list is called now");
+    // ...and the items still come from the same live copy.
+    assert.deepEqual(await catalogIds(env, config), ["tt0000001"]);
+  });
+
+  it("titles a token-addressed row with the list's current name", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const row = "customlist:v1:" + JSON.stringify({
+      listId: "L9", localSlug: "mine", listSlug: "mine", type: "movie",
+      liveToken: "abcdefghijklmnopqrstuv", items: [item(1)], shuffle: false,
+    });
+    await env.CONFIGS.put("cfg:renamecfg2", JSON.stringify({
+      entries: [{ id: "mine", type: "movie", name: "My List", url: row, enabled: true }],
+    }));
+    const save = (name) => call(env, "/api/list-live/save", {
+      method: "POST",
+      json: { token: "abcdefghijklmnopqrstuv", name, type: "movie", items: [item(1)] },
+    });
+    assert.equal(shelfName(await manifest(env, "renamecfg2"), "mine"), "My List");
+    await save("Renamed In The Browser");
+    assert.equal(shelfName(await manifest(env, "renamecfg2"), "mine"), "Renamed In The Browser");
+  });
+
+  it("keeps the config's name when nothing live has a newer one", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await env.CONFIGS.put("cfg:renamecfg3", JSON.stringify({
+      entries: [{ id: "mine", type: "movie", name: "My List", url: localRow("mine", [item(1)]), enabled: true }],
+    }));
+    // No token, no account: the row is still a snapshot, so the config's name
+    // is the only name there is.
+    assert.equal(shelfName(await manifest(env, "renamecfg3"), "mine"), "My List");
+  });
+
+  it("leaves a mixed list's two split rows with their own labels", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await env.CONFIGS.put("listlive:abcdefghijklmnopqrstuv", JSON.stringify({
+      name: "Faves", type: "mixed", items: [item(1)], updatedAt: 1,
+    }));
+    const half = (type) => "customlist:v1:" + JSON.stringify({
+      listId: "L10", localSlug: "faves", listSlug: "faves", type,
+      liveToken: "abcdefghijklmnopqrstuv", items: [item(1)], shuffle: false,
+    });
+    await env.CONFIGS.put("cfg:renamecfg4", JSON.stringify({
+      entries: [
+        { id: "faves", type: "movie", name: "Faves (Movies)", url: half("movie"), enabled: true },
+        { id: "faves-2", type: "series", name: "Faves (Shows)", url: half("series"), enabled: true },
+      ],
+    }));
+    const m = await manifest(env, "renamecfg4");
+    // One list, two shelves: handing both the list's name would put two
+    // shelves with the same title on the board.
+    assert.equal(shelfName(m, "faves"), "Faves (Movies)");
+    assert.equal(shelfName(m, "faves-2"), "Faves (Shows)");
+  });
+
+  it("is sent no-store, so the app's next manifest read sees the new name", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const user = await createUser(env, "rename2");
+    const config = await signedInConfig(env, "renamecfg5", user, localRow("faves", [item(1)]));
+    await accountList(env, user, [item(1)], "public");
+    const res = await call(env, `/${config}/manifest.json`);
+    assert.equal(res.headers.get("cache-control"), "no-cache, no-store, must-revalidate, max-age=0");
+  });
+
+  it("keeps the ordinary cache for a manifest with nothing live in it", async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    await env.CONFIGS.put("cfg:renamechart6", JSON.stringify({
+      entries: [{ id: "chart", type: "movie", name: "Popular", url: "tmdb:chart:popular", enabled: true }],
+    }));
+    const res = await call(env, `/renamechart6/manifest.json`);
+    // The manifest resolved (not an empty one) and keeps its ordinary cache:
+    // nothing in it can change server-side, so caching it costs nothing.
+    assert.equal(shelfName(res.body, "chart"), "Popular");
+    assert.equal(res.headers.get("cache-control"), "max-age=3600");
+  });
+});
