@@ -6,6 +6,18 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🔴 Adding *or removing* an item now reaches Stremio for every list, not just the two tracked shelves
+
+"Continue watching" and "Airing next" behaved; everything else was broken in one of two ways, and both came from the same place: a custom list was read as a one-time snapshot baked into the install link, not as a list that keeps changing.
+
+- **A list with no Creator Profile behind it was frozen for everyone.** A `customlist:v1:` row carried its items inside the row itself and the server served that copy forever. In a signed-in browser, adding an item refreshed the snapshot, so *some* installs showed additions; removals never appeared, and any other install — or the same one after the link was made — saw the list exactly as it was the day it was generated.
+- **Every local list now has a live server-side copy.** The first time a row is created the browser mints a token and stores the list under it (`listlive:<token>` in KV, kept 180 days and re-stamped on every edit), and the token is stamped into the row so the install link carries it. From then on the catalog is read from that record, which the website writes on every add, remove, restore, import and reorder. The snapshot stays in the row as the fallback for when the record is missing or expired.
+- **A row resolves against the account the link belongs to**, so a signed-in person's list edits land where the server reads from, in both directions. The link now carries that account's name and key whenever it really contains one of that account's lists — not only when Auto-track Playback happens to be on, which is what `/api/save` already did and the base64 fallback link did not.
+- **The per-user memo could serve a copy for minutes after an edit, and the shared `lastgood:` fallback for 30 days.** Rows that are genuinely live — auto-tracked shelves, Creator lists and these new live copies — are now answered `no-store` with no `lastgood:` entry; every other row keeps its 5-minute cache.
+- **External lists (MDBList, Trakt, TMDB) lagged the provider by up to an hour.** Their freshness windows are now 10 minutes for MDBList lists and 5 for Trakt and TMDB lists, and a private MDBList list is cached under its own key instead of a shared one — before, a private list's contents could be served to a caller who never supplied a key.
+
+- Tests: `tests/every-list-live.test.mjs` (14, server) and `tests/every-list-live.client.test.mjs` (14, browser) — the live-copy, account-resolution and no-store tests in them fail on the previous code. `tests/live-rows-stay-live.test.mjs` gained the new cache lifetimes. Full suite: 1254 pass / 0 fail.
+
 ### 🔴 All catalog rows are live now -- website edits reach Stremio/Nuvio without regenerating the link
 
 Three separate staleness bugs, one symptom ("I changed something on the site and the apps never show it"):

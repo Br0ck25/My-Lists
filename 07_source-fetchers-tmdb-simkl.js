@@ -558,7 +558,12 @@ async function fetchTmdb(entry, skip = 0, apiKey = "") {
     }
     const res = await fetch(src, {
       headers: { "User-Agent": "my-list-addon/1.6" },
-      cf: { cacheTtl: 900, cacheEverything: true },
+      // Five minutes, not fifteen. A TMDB list is one the account can edit on
+      // themoviedb.org, so an item added or removed there has to reach the row
+      // on the timescale the catalog route already promises; this edge TTL is
+      // the only cache this fetcher has, and it was the thing deciding how
+      // long a removal took to disappear.
+      cf: { cacheTtl: 300, cacheEverything: true },
     });
     if (!res.ok) {
       if (tmdbPage === 1) {

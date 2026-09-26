@@ -996,6 +996,16 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // is watched. All of them used to fall through to the day-long public
       // cache below, which let Stremio and Nuvio keep a day-old copy.
       const isUserPersonal = rowSources.some((src) => STREMIO_LIVE_ROW_SOURCES.has(src));
+      // A custom-list row that resolves live -- a Creator list, a
+      // token-addressed one, or a local snapshot this config's account has a
+      // server copy of -- changes because of something the person DID on the
+      // website, so it gets the same no-store treatment as the shelves above
+      // rather than the five-minute public cache: an item removed from a
+      // list has to disappear from the row on the next fetch, not five
+      // minutes later. A row that names nothing live keeps the public cache
+      // (there is nothing server-side for it to change).
+      const isLiveCustomList = rowSources.includes("custom-list") &&
+        customListRowIsLive(entry.url, !!trackCreatorName);
 
       // Graceful degradation only applies to the first page (skip === 0):
       // that's the case that makes a whole shelf silently vanish from the
@@ -1004,7 +1014,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
       // before. Only active when a CONFIGS KV namespace is bound (optional,
       // same as the short-link feature) -- without one this behaves exactly
       // as it did previously.
-      const staleKey = env && env.CONFIGS && !isAutoTrack && !isUserPersonal ? `lastgood:${config}:${type}:${id}` : null;
+      const staleKey = env && env.CONFIGS && !isAutoTrack && !isUserPersonal && !isLiveCustomList ? `lastgood:${config}:${type}:${id}` : null;
 
       try {
         // verifiedOwner, not trackCreatorName: a personal shelf is served only
@@ -1025,7 +1035,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
             env.CONFIGS.put(staleKey, JSON.stringify(metas), { expirationTtl: 2592000 })
           );
         }
-        if (isUserPersonal) {
+        if (isUserPersonal || isLiveCustomList) {
           return jsonPublic({ metas }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
         // Five minutes, not a day: every shared row -- charts, New on
@@ -1037,7 +1047,7 @@ Sitemap: ${url.origin}/sitemap.xml`;
         return jsonPublic({ metas }, 200, { "Cache-Control": "public, max-age=300, s-maxage=300" });
       } catch (err) {
         const errMsg = safeErrorMessage(err);
-        if (isUserPersonal) {
+        if (isUserPersonal || isLiveCustomList) {
           console.error("User personal catalog fetch error:", errMsg);
           return jsonPublic({ metas: [] }, 200, { "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0" });
         }
@@ -7122,6 +7132,73 @@ function generateSearchVariations(query) {
       }
       await env.CONFIGS.put(savedConfigKey(id), savePayload);
       return json({ ok: true, id });
+    }
+
+    // POST /api/list-live/save  { token, name, type, items } -> { ok: true }
+    //
+    // Writes the server-side copy of a Custom List that belongs to no
+    // Creator Profile, so its catalog row can be re-read live instead of
+    // serving the snapshot baked into the install link (see
+    // readLiveListItems / fetchCustomListCatalog, 05_catalog-core.js). This
+    // is what makes a signed-out browser's list behave like Continue
+    // Watching: an item added or removed on the website reaches Stremio
+    // without the link being regenerated.
+    //
+    // The token is the capability and the only authorization there is. It is
+    // minted in the browser (128 bits, base64url), kept in the list's own
+    // local record and embedded in the row's URL -- so it only ever exists
+    // inside an install link that already carries the list's entire
+    // contents. A write for a token nobody holds can only touch that token's
+    // own key, which is why an unauthenticated write is acceptable here in a
+    // way it would not be for an account's data. The same shape of endpoint
+    // as /api/save above, and the same bounds: rate-limited per IP, capped on
+    // items and on the exact bytes about to be stored, rejected rather than
+    // truncated.
+    if (path === "/api/list-live/save" && request.method === "POST") {
+      if (!env || !env.CONFIGS) {
+        return json({ ok: false, error: "no-kv" });
+      }
+      const liveIp = clientIpKey(request);
+      if (!liveIp) return json({ ok: false, error: "Could not process this request." }, 400);
+      // Higher than /api/save's 20: this fires on every list edit (debounced
+      // in the browser), and someone working through a batch of adds is
+      // normal. It is a KV write of a list the caller already owns, not a
+      // mint of a new install link.
+      if (await consumeRateLimit(env, ctx, "listlive", liveIp, LIVE_LIST_SAVE_PER_MINUTE)) {
+        return json({ ok: false, error: "Too many saves just now. Please wait a minute and try again." }, 429);
+      }
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON body." }, 400);
+      }
+      const token = String(body.token || "");
+      if (!isValidLiveListToken(token)) {
+        return json({ ok: false, error: "That list reference is not valid." }, 400);
+      }
+      const items = Array.isArray(body.items) ? body.items : [];
+      if (items.length > PUBLISHED_LIST_ITEMS_MAX) {
+        return json({ ok: false, error: `That list is too large to save (limit ${PUBLISHED_LIST_ITEMS_MAX} items).` }, 413);
+      }
+      const name = String(body.name || "").slice(0, PUBLISHED_LIST_NAME_MAX);
+      const type = body.type === "series" || body.type === "movie" || body.type === "mixed" ? body.type : "movie";
+      const payload = { name, type, items, updatedAt: Date.now() };
+      const bytes = utf8ByteLength(JSON.stringify(payload));
+      if (bytes > CREATOR_LIST_BYTES_MAX) {
+        return json({ ok: false, error: "That list is too large to save. Try splitting it into more than one list." }, 413);
+      }
+      // A long TTL rather than none, unlike the install configs above: this
+      // key is only ever read through a row that ALSO carries the list's
+      // items as a snapshot, so an expired key degrades to the last snapshot
+      // the link carried rather than to an empty shelf -- and every edit
+      // re-writes the key, which re-stamps the TTL. That bounds the storage a
+      // signed-out browser can accumulate without a way for anyone to be
+      // left with a broken row.
+      await env.CONFIGS.put(LIVE_LIST_KEY_PREFIX + token, JSON.stringify(payload), {
+        expirationTtl: LIVE_LIST_TTL_SEC,
+      });
+      return json({ ok: true });
     }
 
     // /api/publish-list was removed in 1.5.3.

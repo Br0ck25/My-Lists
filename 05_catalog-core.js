@@ -1503,32 +1503,98 @@ function fetchChannelCatalog(entry, origin) {
 // in the builder. When served in a catalog shelf, items are automatically filtered
 // to match the shelf type (entry.type).
 //
-// A Custom List someone built lives one of two places: purely in this
-// browser's localStorage (no Creator Profile), or on this Worker's own KV
-// under creatorlist:{username}:{slug} (signed in, saved via
-// /api/creator/lists/save -- see 26_api-creator-and-admin-routes.js). Either
-// way, adding it to Catalogs used to bake a one-time snapshot of `items`
-// straight into this URL, so an edit made afterward (add/remove/reorder a
-// pick) never reached a catalog shelf that already existed -- the shelf,
-// and the Live Preview reading the same source, both kept serving whatever
-// was true at the moment "+ Add to Catalogs" was clicked. For a
-// Creator-hosted list this function now re-reads creatorlist:{owner}:{slug}
-// fresh on every catalog request instead, the same live-by-identity
-// approach fetchPublishedListCatalog already uses for the separate
-// publishedlist: URL scheme just above. A local-only list has no
-// server-reachable copy to re-read (localStorage never leaves the browser),
-// so those stay snapshot-based -- there's no way around that without also
-// giving local lists a KV-backed presence, a much bigger change than this.
-// The embedded snapshot is kept as a fallback in all cases: if this isn't a
-// creatorSlug row at all, or the owner can't be determined (see liveOwner
-// below -- an older saved row's payload may only have creatorSlug, from
-// before creatorOwner started getting stamped in; keys.trackCreatorName/
-// keys.creatorName cover that using the request's own signed-in account),
-// or the KV lookup comes back empty (list since deleted, KV hiccup, or a
-// private list read by someone who didn't prove ownership --
-// fetchLiveCreatorListItems serves public lists to anyone but private ones
-// only to a verified owner), this drops straight back to the old behavior
-// rather than serving an empty shelf.
+// A Custom List someone built lives in one of three places: purely in this
+// browser's localStorage (no Creator Profile), on this Worker's own KV under
+// creatorlist:{username}:{slug} (signed in, saved via
+// /api/creator/lists/save -- see 26_api-creator-and-admin-routes.js), or
+// under listlive:{token} (a signed-out browser's own server-side copy, see
+// readLiveListItems). Either way, adding it to Catalogs used to bake a
+// one-time snapshot of `items` straight into this URL, so an edit made
+// afterward (add/remove/reorder a pick) never reached a catalog shelf that
+// already existed -- the shelf, and the Live Preview reading the same
+// source, both kept serving whatever was true at the moment "+ Add to
+// Catalogs" was clicked. Every one of those three now re-reads live on every
+// catalog request, by identity rather than by content, and the embedded
+// snapshot is kept as the fallback in all cases: if the row names nothing
+// live, or the account it implies has no such list, or the KV lookup comes
+// back empty (list since deleted, KV hiccup, or a private list read by
+// someone who didn't prove ownership -- fetchLiveCreatorListItems serves
+// public lists to anyone but private ones only to a verified owner), this
+// drops straight back to the old behavior rather than serving an empty
+// shelf.
+// The four shelves the website auto-tracks. Their live form is an
+// autotrack:<slug>:<type>:<username> row (fetchAutoTrackedCatalog below), not
+// a custom list, so the implicit account resolution in
+// fetchCustomListCatalog deliberately steps around them: converting a frozen
+// snapshot of one into a creatorlist read would answer a different question
+// than the row asks (the tracking record is the newest of three copies, see
+// readAccountWatchlist), and the client already upgrades these snapshots to
+// their live URL at link-generation time (upgradeSnapshotShelfToLive,
+// 23_client-list-management.js).
+const AUTO_TRACK_SHELF_SLUGS = new Set([
+  "watchlist",
+  "watch-history",
+  "continue-watching",
+  "airing-next",
+]);
+
+// --- a browser's own live list, addressed by token -------------------------
+//
+// A Custom List saved with no Creator Profile has no account to live under:
+// it exists only in that browser's localStorage, and the row it produced was
+// a one-time snapshot, so nothing the person did afterward reached an
+// installed add-on. Giving every such list a server-side copy keyed by an
+// unguessable token fixes that the same way the Creator-list read already
+// works -- the row names a record, and the record is re-read on every
+// request.
+//
+// The token is the capability. It is minted in the browser, stored in the
+// list's own local record and embedded in the row's URL, so it only ever
+// exists inside an install link that already carries the list's full
+// contents. 22 base64url characters is 128 bits, which is not guessable, and
+// a write for a token nobody holds can only ever touch that token's own key.
+const LIVE_LIST_KEY_PREFIX = "listlive:";
+// Exactly what the client mints (16 random bytes, base64url, no padding).
+// Anchored at both ends and length-bounded so a crafted token cannot reach a
+// key outside this prefix -- "../" and friends never get near CONFIGS.get.
+const LIVE_LIST_TOKEN_RE = /^[A-Za-z0-9_-]{22}$/;
+
+function isValidLiveListToken(token) {
+  return LIVE_LIST_TOKEN_RE.test(String(token || ""));
+}
+
+// The list's current items, or null when there is no readable record --
+// which callers treat as "fall back to the row's snapshot", never as "empty".
+async function readLiveListItems(env, token) {
+  if (!env || !env.CONFIGS || !isValidLiveListToken(token)) return null;
+  const raw = await env.CONFIGS.get(LIVE_LIST_KEY_PREFIX + token);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && Array.isArray(parsed.items)) return parsed.items;
+  } catch {}
+  return null;
+}
+
+// True when any source line of a (possibly merged) row is a custom list that
+// resolves live, and so must be sent no-store like the personal shelves: a
+// Creator list, one addressed by token, or a local snapshot the server will
+// resolve against the account the install link belongs to (see
+// fetchCustomListCatalog). The four auto-tracked shelves are excluded --
+// their live form is an autotrack: row, not this one.
+function customListRowIsLive(url, configNamesAccount) {
+  return String(url || "")
+    .split(/[\r\n]+/)
+    .some((line) => {
+      const payload = parseCustomListPayload(line.trim());
+      if (!payload) return false;
+      if (payload.creatorSlug || payload.liveToken) return true;
+      if (!configNamesAccount || payload.creatorOwner) return false;
+      const slug = String(payload.localSlug || payload.listSlug || payload.slug || "");
+      return !!slug && !AUTO_TRACK_SHELF_SLUGS.has(slug);
+    });
+}
+
 function parseCustomListPayload(rawUrl) {
   try {
     const raw = String(rawUrl || "").trim();
@@ -1588,10 +1654,48 @@ async function fetchCustomListCatalog(entry, skip = 0, keys = {}) {
   if (!payload) return [];
 
   let sourceItems = payload.items;
+  // Whether any live copy answered, so the token store below is only
+  // consulted when nothing better did: for a signed-in browser the account's
+  // copy is the cross-device one, and this browser's token record is a
+  // same-list copy of it.
+  let liveResolved = false;
   const liveOwner = payload.creatorOwner || (payload.creatorSlug ? (keys.trackCreatorName || keys.creatorName || '') : '');
   if (payload.creatorSlug && liveOwner) {
     const liveItems = await fetchLiveCreatorListItems(liveOwner, payload.creatorSlug, keys.env, keys.verifiedOwner || '');
-    if (liveItems) sourceItems = liveItems;
+    if (liveItems) { sourceItems = liveItems; liveResolved = true; }
+  }
+
+  // A row saved before its list had any live identity at all -- a local
+  // Custom List, a Letterboxd import, a list cloned from someone else's
+  // public one -- carries only a local slug, so the row above has nothing to
+  // resolve. The list itself is on the account, though: every local-list
+  // edit mirrors to creatorlist:{username}:{slug} (see
+  // /api/creator/lists/save), so if the install link belongs to an account
+  // that HAS this slug, that copy is the live one and the row should read it
+  // -- which is what makes an add or a remove reach the apps without the
+  // link being regenerated.
+  //
+  // Gated exactly as fetchLiveCreatorListItems gates everything else: a
+  // public list to any reader, a private one only to a reader that proved it
+  // owns the account (the link's Creator Key). A config that merely CLAIMS a
+  // name therefore cannot read a stranger's private list through this. The
+  // four auto-tracked slugs are excluded -- their live form is an autotrack:
+  // row, and a snapshot of one of those is left to the client's own
+  // upgrade path rather than being answered from a different record.
+  if (!liveResolved && !payload.creatorSlug && !payload.creatorOwner) {
+    const localSlug = String(payload.localSlug || payload.listSlug || payload.slug || '');
+    const accountOwner = String(keys.verifiedOwner || keys.trackCreatorName || keys.creatorName || '');
+    if (localSlug && accountOwner && !AUTO_TRACK_SHELF_SLUGS.has(localSlug)) {
+      const liveItems = await fetchLiveCreatorListItems(accountOwner, localSlug, keys.env, keys.verifiedOwner || '');
+      if (liveItems) { sourceItems = liveItems; liveResolved = true; }
+    }
+  }
+
+  // No account (or no such list on it): the browser's own token-addressed
+  // copy, which exists for exactly the lists a signed-out person builds.
+  if (!liveResolved && payload.liveToken) {
+    const tokenItems = await readLiveListItems(keys.env, payload.liveToken);
+    if (tokenItems) sourceItems = tokenItems;
   }
 
   if (!sourceItems || !sourceItems.length) {
