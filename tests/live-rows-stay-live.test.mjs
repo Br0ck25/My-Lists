@@ -111,7 +111,11 @@ describe("catalog cache lifetimes", () => {
       trackCreatorName: user.creatorName,
       trackCreatorKey: user.creatorKey,
       entries: [
+        // The account's own list: re-read from creatorlist:{user}:{slug} on
+        // every request, so it is live state and is never cached.
         { id: "snap", type: "movie", name: "Snap", enabled: true, url: customRow(user.creatorName, "faves", [{ id: "tt1", imdbId: "tt1", type: "movie", title: "T" }]) },
+        // Someone else's published list: shared content, five minutes.
+        { id: "shared", type: "movie", name: "Shared", enabled: true, url: "https://example.test/lists/someone/some-list" },
         { id: "wl", type: "movie", name: "Watchlist", enabled: true, url: `autotrack:watchlist:movie:${user.creatorName}` },
       ],
     }));
@@ -120,9 +124,19 @@ describe("catalog cache lifetimes", () => {
 
   it("shared rows revalidate within minutes, not a day", async () => {
     const { env, config } = await setup();
-    const res = await call(env, `/${config}/catalog/movie/snap.json`);
+    const res = await call(env, `/${config}/catalog/movie/shared.json`);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("cache-control"), "public, max-age=300, s-maxage=300");
+  });
+
+  it("a Creator list row is live state, so it is never cached", async () => {
+    const { env, config } = await setup();
+    const res = await call(env, `/${config}/catalog/movie/snap.json`);
+    assert.equal(res.status, 200);
+    // The server re-reads this list on every request (fetchCustomListCatalog),
+    // so a cached copy is a copy that can disagree with what the account just
+    // did -- the same reason the autotrack shelves below are no-store.
+    assert.equal(res.headers.get("cache-control"), "no-cache, no-store, must-revalidate, max-age=0");
   });
 
   it("personal shelves are still never cached", async () => {

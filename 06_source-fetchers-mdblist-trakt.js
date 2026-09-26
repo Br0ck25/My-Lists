@@ -255,15 +255,31 @@ async function fetchMdblist(entry, skip = 0, mdblistKey = "", env = null, ctx = 
   }
 
   const listId = await hashStringForKey(entry.url);
-  const cacheKey = `user_cache:mdblist:list:v3:${listId}:${entry.type}:${skip}`;
-  const kvKey = `mdblist:list:v3:${listId}:${entry.type}:${skip}`;
+  // The credential is part of the key, the way fetchTrakt's is: an MDBList
+  // list fetched WITH a key can be somebody's private list, and this cache
+  // used to be keyed on the URL alone -- so one account's keyed read was
+  // served to every later caller of the same URL, key or no key. It also
+  // meant the one thing that could invalidate a list the account had just
+  // edited (invalidatePerUserCache on the external-list write paths) could
+  // never match the entry: those are per-user-hashed, and these were not.
+  // A keyless caller keeps sharing one entry -- that is the pre-warmed,
+  // public-content path.
+  const credHash = mdblistKey ? safeUserHash(mdblistKey) : "public";
+  const cacheKey = `user_cache:mdblist:list:v3:${listId}:${entry.type}:${skip}:${credHash}`;
+  const kvKey = `mdblist:list:v3:${listId}:${entry.type}:${skip}:${credHash}`;
 
   return await fetchWithPerUserCacheAndCircuitBreaker({
     cacheKey,
     kvKey,
     env,
     ctx,
-    freshTtlSec: 3600,
+    // Ten minutes, not an hour. An mdblist list is one of the account's own
+    // shelves -- items go on and come off it because of something the person
+    // DID -- so the freshness contract is the one the catalog route already
+    // makes (five minutes) rather than a shared chart's. The outbound fetch
+    // below asks Cloudflare for the same ten minutes, so the two tiers agree
+    // and mdblist's origin is not leaned on harder than it already was.
+    freshTtlSec: 600,
     staleTtlSec: 86400,
     kvTtlSec: 86400,
     providerLabel: "MDBList",
@@ -538,7 +554,14 @@ async function fetchTrakt(entry, skip = 0, traktKey = "", accessToken = "", env 
     kvKey,
     env,
     ctx,
-    freshTtlSec: accessToken ? 60 : 600,
+    // A list the account can edit is one of its own shelves, whether it is
+    // reached with its token (60s, as the watchlist and history below are) or
+    // as a public one (five minutes, the same contract the catalog route
+    // makes) -- not the ten a shared chart gets. An item taken off a Trakt
+    // list has to leave the row on the timescale the person expects, and a
+    // 429 from Trakt still degrades to the stale copy below rather than to an
+    // empty row.
+    freshTtlSec: accessToken ? 60 : 300,
     staleTtlSec: 86400,
     kvTtlSec: 86400,
     providerLabel: "Trakt List",

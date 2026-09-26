@@ -304,10 +304,22 @@ function buildConfig(entries, keys) {
   if (keys && keys.simklKey) payload.simklKey = keys.simklKey;
   if (keys && keys.simklAccessToken) payload.simklAccessToken = keys.simklAccessToken;
   if (keys && keys.simklUsername) payload.simklUsername = keys.simklUsername;
-  if (keys && keys.track) {
-    payload.track = true;
+  if (keys && keys.trackCreatorName) {
+    if (keys.track) payload.track = true;
+    // The identity travels whenever collectKeys actually found one of this
+    // account's shelves in the config, not only when Auto-track Playback
+    // happens to be on -- this is exactly what /api/save already sends, and
+    // the fallback link has to agree with it. The server needs the account
+    // name to resolve a local custom-list row against it
+    // (fetchCustomListCatalog, 05_catalog-core.js), which is what makes an add
+    // or a remove reach the apps; without it such a row only ever falls back
+    // to its snapshot. Still conditional rather than unconditional: an install
+    // link is a bearer credential (see README), and collectKeys leaves the
+    // name out for a config that holds nothing belonging to this account.
     payload.trackCreatorName = keys.trackCreatorName;
     payload.trackCreatorKey = keys.trackCreatorKey;
+  } else if (keys && keys.track) {
+    payload.track = true;
   }
   if (keys && keys.shuffleShelves) payload.shuffleShelves = true;
   if (keys && keys.shuffleItems) payload.shuffleItems = true;
@@ -688,14 +700,30 @@ function collectKeys() {
     // resolve only for a proven owner (see fetchLiveCreatorListItems,
     // 05_catalog-core.js), and without the key in the link the proof can't
     // be made and every private list silently falls back to its snapshot.
+    //
+    // A purely LOCAL custom-list row belongs to the account just as much --
+    // every local-list edit mirrors to creatorlist:{user}:{slug}, and the
+    // server resolves such a row against the account the link belongs to
+    // (fetchCustomListCatalog) precisely so an add or a remove reaches the
+    // apps. That resolution needs the account's name in the link to know
+    // whose lists to look in, so a config holding one of these rows carries
+    // the identity too. Rows naming a DIFFERENT creator are excluded: the
+    // key is a bearer credential and goes in a link only for shelves that
+    // are actually this account's.
     const hasOwnCreatorList = [...document.querySelectorAll('#lists .entry .url')]
       .some((el) => {
         const v = String(el.value || '').trim();
-        if (v.indexOf('customlist:v1:') === -1 || v.indexOf('creatorSlug') === -1) return false;
+        if (v.indexOf('customlist:v1:') === -1) return false;
         if (typeof parseCustomListPayloadClient !== 'function') return false;
+        const me = String(activeCreator.creatorName).toLowerCase();
         return v.split('\\n').some((line) => {
           const p = parseCustomListPayloadClient(line);
-          return !!(p && p.creatorSlug);
+          if (!p) return false;
+          // Someone else's list -- public or private, this account's key
+          // proves nothing about it and does not belong in the link.
+          if (p.creatorOwner && String(p.creatorOwner).toLowerCase() !== me) return false;
+          if (p.creatorSlug) return true;
+          return !!(p.localSlug || p.listSlug || p.slug);
         });
       });
     if (track || hasPersonalShelf || hasOwnCreatorList) {
