@@ -13238,3 +13238,99 @@ describe("self-service recovery: set recovery answer & forgot username", () => {
   });
 });
 
+
+// Live Preview intentionally shows the browser's local CW shelf. The installed
+// catalog must converge on that shelf when it is pushed, rather than merging
+// back obsolete server rows or an old fully-watched flag.
+describe('Continue Watching catalog agrees with the saved Live Preview', () => {
+  it('replaces stale shows and episodes and clears a no-longer-fully-watched D1 flag', async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const user = await createUser(env, 'cwshelfmatch');
+    const auth = { creatorName: user.creatorName, creatorKey: user.creatorKey };
+    const ep = (showId, episodeNum) => ({ id: `${showId}:1:${episodeNum}`, showId, showTitle: showId,
+      type: 'episode', seasonNum: 1, episodeNum });
+    const first = await call(env, '/api/creator/sync/save-tracking', { method: 'POST', json: {
+      ...auth, continueWatching: [ep('tt-ark', 2), ep('tt-revival', 1)], fullyWatchedShowIds: ['tt-see'],
+    } });
+    assert.equal(first.body.ok, true);
+    const second = await call(env, '/api/creator/sync/save-tracking', { method: 'POST', json: {
+      ...auth, expectedClientVersion: first.body.clientVersion, trackingBaseUpdatedAt: first.body.updatedAt,
+      continueWatching: [ep('tt-ark', 3), ep('tt-homestead', 1), ep('tt-see', 2)],
+      fullyWatchedShowIds: [],
+    } });
+    assert.equal(second.body.ok, true);
+    const dbItems = env.DB.q('SELECT show_id, episode_num FROM continue_watching ORDER BY show_id');
+    assert.deepEqual(dbItems.map(x => [x.show_id, x.episode_num]),
+      [['tt-ark', 3], ['tt-homestead', 1], ['tt-see', 2]]);
+    assert.equal(env.DB.q("SELECT is_fully_watched FROM creator_show_states WHERE show_id = 'tt-see'")[0].is_fully_watched, 0);
+    const installed = await call(env, '/api/save', { method: 'POST', json: {
+      entries: [{ id: 'cw', name: 'Continue Watching', type: 'series', url: 'autotrack:continue-watching:series:cwshelfmatch' }],
+      trackCreatorName: user.creatorName, trackCreatorKey: user.creatorKey,
+    } });
+    assert.equal(installed.body.ok, true);
+    const catalog = await call(env, `/${installed.body.id}/catalog/series/cw.json`);
+    assert.deepEqual(catalog.body.metas.map(x => x.id), ['tt-ark', 'tt-homestead', 'tt-see'],
+      'installed catalog must preserve both the items and the Live Preview order');
+  });
+
+  it('still rescues a genuinely new server scrobble without rewinding newer client progress', async () => {
+    const env = makeEnv({ CONFIGS: makeKv() });
+    const user = await createUser(env, 'cwfreshping');
+    const auth = { creatorName: user.creatorName, creatorKey: user.creatorKey };
+    const ep = (n) => ({ id: `tt-show:1:${n}`, showId: 'tt-show', type: 'episode', seasonNum: 1, episodeNum: n });
+    const first = await call(env, '/api/creator/sync/save-tracking', { method: 'POST', json: {
+      ...auth, continueWatching: [ep(2)],
+    } });
+    const key = 'creatorsynctracking:cwfreshping';
+    const ping = JSON.parse(env.CONFIGS._store.get(key));
+    ping.watchHistory = [{ id: 'tt-show:1:2', showId: 'tt-show', type: 'episode', watchedAt: first.body.updatedAt + 10 }];
+    ping.continueWatching = [ep(3)];
+    ping.updatedAt = first.body.updatedAt + 10;
+    env.CONFIGS._store.set(key, JSON.stringify(ping));
+
+    const next = await call(env, '/api/creator/sync/save-tracking', { method: 'POST', json: {
+      ...auth, expectedClientVersion: first.body.clientVersion, trackingBaseUpdatedAt: first.body.updatedAt,
+      continueWatching: [ep(2)], watchHistory: [],
+    } });
+    assert.equal(next.body.ok, true);
+    assert.equal(JSON.parse(env.CONFIGS._store.get(key)).continueWatching[0].episodeNum, 3,
+      'a new scrobble may advance the shelf');
+    const further = await call(env, '/api/creator/sync/save-tracking', { method: 'POST', json: {
+      ...auth, expectedClientVersion: next.body.clientVersion, trackingBaseUpdatedAt: next.body.updatedAt,
+      continueWatching: [ep(4)], watchHistory: ping.watchHistory,
+    } });
+    assert.equal(further.body.ok, true);
+    assert.equal(JSON.parse(env.CONFIGS._store.get(key)).continueWatching[0].episodeNum, 4,
+      'the older server episode must not override a later one the browser now shows');
+  });
+
+  it('does not let an old scrobble queue re-add a deleted show, but keeps a new scrobble', async () => {
+    const env = makeEnv({ CONFIGS: makeKv(), DB: makeD1() });
+    const user = await createUser(env, 'cwqueuefresh');
+    const auth = { creatorName: user.creatorName, creatorKey: user.creatorKey };
+    const first = await call(env, '/api/creator/sync/save-tracking', { method: 'POST', json: {
+      ...auth, continueWatching: [{ id: 'tt-old:1:2', showId: 'tt-old', type: 'episode', seasonNum: 1, episodeNum: 2 }],
+    } });
+    env.CONFIGS._store.set('creatorscrobblequeue:cwqueuefresh', JSON.stringify({
+      watchHistory: [{ id: 'tt-old:1:1', showId: 'tt-old', watchedAt: first.body.updatedAt - 100 }],
+      continueWatching: [{ id: 'tt-old:1:2', showId: 'tt-old', type: 'episode', seasonNum: 1, episodeNum: 2 }],
+    }));
+    const second = await call(env, '/api/creator/sync/save-tracking', { method: 'POST', json: {
+      ...auth, expectedClientVersion: first.body.clientVersion, trackingBaseUpdatedAt: first.body.updatedAt,
+      continueWatching: [],
+    } });
+    assert.equal(second.body.ok, true);
+    const loaded = await call(env, '/api/creator/sync/load', { method: 'POST', json: auth });
+    assert.deepEqual(loaded.body.data.continueWatching, [], 'old queue must not override a newer deletion');
+    env.CONFIGS._store.set('creatorscrobblequeue:cwqueuefresh', JSON.stringify({
+      watchHistory: [{ id: 'tt-new:1:1', showId: 'tt-new', watchedAt: second.body.updatedAt + 100 }],
+      continueWatching: [{ id: 'tt-new:1:2', showId: 'tt-new', type: 'episode', seasonNum: 1, episodeNum: 2 }],
+    }));
+    const third = await call(env, '/api/creator/sync/save-tracking', { method: 'POST', json: {
+      ...auth, expectedClientVersion: second.body.clientVersion, trackingBaseUpdatedAt: second.body.updatedAt,
+      continueWatching: [],
+    } });
+    assert.equal(third.body.ok, true);
+    assert.deepEqual(JSON.parse(env.CONFIGS._store.get('creatorsynctracking:cwqueuefresh')).continueWatching.map(x => x.showId), ['tt-new']);
+  });
+});

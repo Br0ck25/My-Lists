@@ -60,3 +60,38 @@ describe('See All back navigation', () => {
     assert.equal(requestsTo(client, '/api/preview').length, 0);
   });
 });
+
+describe('Continue Watching startup reconciliation', () => {
+  it('does not overwrite the correct local shelf with an older server merge at the same version', async () => {
+    const local = [
+      { id: 'tt-ark:1:3', showId: 'tt-ark', type: 'episode', seasonNum: 1, episodeNum: 3 },
+      { id: 'tt-see:1:2', showId: 'tt-see', type: 'episode', seasonNum: 1, episodeNum: 2 },
+    ];
+    const client = loadClient({
+      storage: {
+        'myListAddon:creatorKey': 'key',
+        'myListAddon:localCustomLists': JSON.stringify({
+          'continue-watching': { slug: 'continue-watching', items: local, updatedAt: 5000 },
+        }),
+      },
+      routes: {
+        '/api/creator/sync/load': () => ({ json: { ok: true, data: {
+          trackingUpdatedAt: 5000,
+          continueWatching: [
+            { id: 'tt-ark:1:2', showId: 'tt-ark', type: 'episode', seasonNum: 1, episodeNum: 2 },
+            { id: 'tt-revival:1:1', showId: 'tt-revival', type: 'episode', seasonNum: 1, episodeNum: 1 },
+          ],
+          fullyWatchedShowIds: ['tt-see'],
+        } } }),
+        '/api/creator/lists': () => ({ json: { ok: true, lists: [] } }),
+      },
+    });
+    client.set('activeCreator', { creatorName: 'alice' });
+    client.set('window._serverTrackingUpdatedAt', 5000);
+    await client.call('loadCreatorSync');
+    const cw = client.get("loadLocalCustomLists()['continue-watching'].items");
+    assert.deepEqual(cw.map(it => it.showId), ['tt-ark', 'tt-see']);
+    assert.equal(cw[0].episodeNum, 3);
+    assert.equal(client.get('window._fullyWatchedShowIds').has('tt-see'), false);
+  });
+});
