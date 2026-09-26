@@ -6,6 +6,18 @@ All notable changes to **My Lists Addon** ([mylistsaddon.com](https://mylistsadd
 
 ## [Unreleased]
 
+### 🔴 All catalog rows are live now -- website edits reach Stremio/Nuvio without regenerating the link
+
+Three separate staleness bugs, one symptom ("I changed something on the site and the apps never show it"):
+
+- **The Watchlist froze when added from the Lists page.** The "+ Add" button generated live `autotrack:` rows for Watch History and Continue Watching but a one-time `customlist:v1:` snapshot for the Watchlist, so items added later never appeared in Stremio. It now generates a live row when signed in, like its siblings.
+- **Private Creator lists froze in the apps.** The server only re-read *public* lists live; private ones always fell back to the row's embedded snapshot. They now resolve live too, gated on the same ownership proof the auto-tracked shelves use (the install link's Creator Key), with the snapshot kept as the fallback. Single-type lists also stamp `creatorSlug`/`creatorOwner` on add, as mixed-type ones already did.
+- **Shared rows were cached for 24 hours.** Charts, New on Streaming, Most Watched and provider lists are now served with a 5-minute `max-age` (personal shelves stay `no-store`). Upstream rate limits are still guarded by the fetchers' own server-side TTLs, not by that header.
+
+Existing installs heal with one Update Link while signed in: link generation now upgrades frozen auto-shelf snapshots to their live `autotrack:` URLs and backfills missing live identity onto Creator-list rows, writing the fix back into the rows themselves.
+
+- Tests: `tests/live-rows-stay-live.test.mjs` (4 -- the live-edit and cache-lifetime tests fail on the previous code; the other two lock the snapshot fallback and the personal no-store in place) and 10 client tests covering the snapshot upgrade, the identity backfill, and the preview key, all failing on the previous code.
+
 ### ✨ Most Watched Today rolls over instead of going empty at midnight
 
 "Today" was counted per Eastern day, so at midnight the list emptied and refilled one watch at a time. Now the list stays:

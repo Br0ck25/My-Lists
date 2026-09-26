@@ -5291,7 +5291,10 @@ if (_creatorDashEl) {
         const sPayload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: listMeta.creatorName || (activeCreator ? activeCreator.creatorName : undefined), type: 'series', items: series, shuffle: false, publishedUrl: listMeta.url || undefined };
         addRow(listMeta.name + ' (Shows)', 'customlist:v1:' + JSON.stringify(sPayload), 'series', true, 'Custom Lists');
       } else {
-        const payload = { listId: generateChannelId(), listSlug: slug, type: listMeta.type, items: listMeta.items || [], shuffle: false };
+        // creatorSlug + creatorOwner, same as the mixed branch above: without
+        // them the server can never re-read this list live and the row stays
+        // a frozen snapshot of whatever the list held when + Add was clicked.
+        const payload = { listId: generateChannelId(), creatorSlug: slug, listSlug: slug, creatorOwner: listMeta.creatorName || (activeCreator ? activeCreator.creatorName : undefined), type: listMeta.type, items: listMeta.items || [], shuffle: false, publishedUrl: listMeta.url || undefined };
         addRow(listMeta.name, 'customlist:v1:' + JSON.stringify(payload), listMeta.type, true, 'Custom Lists');
       }
       addToConfigBtn.classList.add('is-added', 'secondary');
@@ -5375,7 +5378,7 @@ if (_creatorDashEl) {
     }
     
     let isAdded = localAddToConfigBtn.classList.contains('is-added') || (typeof isListAddedToConfig === 'function' && isListAddedToConfig(null, listMeta.type, slug));
-    if (!isAdded && (slug === 'watch-history' || slug === 'continue-watching')) {
+    if (!isAdded && (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist')) {
       const entries = document.querySelectorAll('#lists .entry');
       for (const entry of entries) {
         const nameInput = entry.querySelector('.name');
@@ -5409,7 +5412,7 @@ if (_creatorDashEl) {
           if (entry) entry.remove();
         }
       });
-      if (slug === 'watch-history' || slug === 'continue-watching') {
+      if (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
         document.querySelectorAll('#lists .entry').forEach((entry) => {
           const nameInput = entry.querySelector('.name');
           if (nameInput && nameInput.value.trim().toLowerCase().startsWith(listMeta.name.toLowerCase())) {
@@ -5429,8 +5432,8 @@ if (_creatorDashEl) {
     }
 
     const items = normalizeSnapshotItemsForCatalog(listMeta.items || []);
-    
-    if (listMeta.type === 'mixed' || slug === 'watch-history' || slug === 'continue-watching') {
+
+    if (listMeta.type === 'mixed' || slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist') {
       const movies = [];
       const series = [];
       
@@ -5458,11 +5461,18 @@ if (_creatorDashEl) {
         }
       });
       
-      const movieUrl = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
+      // Signed in, this shelf has a live server-side form -- an autotrack: row
+      // that re-reads the account on every catalog request -- so it gets one.
+      // Watchlist used to be missing from this condition and fell through to
+      // a frozen customlist:v1: snapshot, which is why a Watchlist added from
+      // the Lists page never picked up website-side edits in Stremio until
+      // the row was deleted and the link regenerated.
+      const useLiveAutotrack = activeCreator && (slug === 'watch-history' || slug === 'continue-watching' || slug === 'watchlist');
+      const movieUrl = useLiveAutotrack
         ? 'autotrack:' + slug + ':movie:' + activeCreator.creatorName
         : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'movie', items: movies, shuffle: false });
       addRow(listMeta.name + ' (Movies)', movieUrl, 'movie', true, 'My Lists');
-      const showUrl = activeCreator && (slug === 'watch-history' || slug === 'continue-watching')
+      const showUrl = useLiveAutotrack
         ? 'autotrack:' + slug + ':series:' + activeCreator.creatorName
         : 'customlist:v1:' + JSON.stringify({ listId: generateChannelId(), localSlug: slug, listSlug: slug, type: 'series', items: series, shuffle: false });
       addRow(listMeta.name + ' (Shows)', showUrl, 'series', true, 'My Lists');

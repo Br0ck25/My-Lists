@@ -1179,12 +1179,12 @@ const STREMIO_BADGE_KEYS = [
 // --- Catalog rows that are one account's live state -------------------------
 //
 // The detectSource names (04_config-resolution.js) whose catalog response is
-// sent no-store instead of the 24-hour public cache every other row gets --
+// sent no-store instead of the 5-minute public cache every other row gets --
 // see the catalog route (25_api-catalog-routes.js). A row belongs here when
 // its items change because of something the account DID (watched, added,
-// removed), under a URL that stays the same: the install link's config id
-// only changes when the config does, so a cached copy of one of these would
-// sit there, stale, for a day.
+// removed), under a URL that stays the same: even five minutes of cache on
+// one of these would show a shelf that disagrees with what the account just
+// did, so the next request always re-reads.
 //
 //   autotrack        Watchlist, Watch History, Continue Watching, Airing Next
 //   curated          Recommended Movies / Recommended Shows
