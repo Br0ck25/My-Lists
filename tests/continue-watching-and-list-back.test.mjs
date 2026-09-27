@@ -95,3 +95,56 @@ describe('Continue Watching startup reconciliation', () => {
     assert.equal(client.get('window._fullyWatchedShowIds').has('tt-see'), false);
   });
 });
+
+describe('Live Preview personal-shelf posters open the title, not its next episode', () => {
+  it('renders the same show id/type as Your Custom Lists even for a bare numeric episode id', async () => {
+    const client = loadClient({
+      routes: {
+        '/api/preview': () => ({ json: { ok: true, sample: [{ id: 'tt0903747', type: 'series', name: 'Show' }], maybeMore: false } }),
+        '/api/details': () => ({ json: { ok: true, details: { id: 'tt0903747', type: 'series', title: 'Show', seasonsData: [] } } }),
+      },
+      storage: { 'myListAddon:localCustomLists': JSON.stringify({
+        'continue-watching': { slug: 'continue-watching', items: [
+          { id: '123456', showId: 'tt0903747', type: 'episode', name: 'Next Episode', showTitle: 'Show', seasonNum: 2, episodeNum: 3 },
+        ] },
+      }) },
+    });
+    const input = (value) => ({ value });
+    const posters = { innerHTML: '', classList: { add() {}, remove() {}, toggle() {} } };
+    const row = {
+      dataset: {}, style: {},
+      querySelector(sel) {
+        if (sel === '.name') return input('Continue Watching (Shows)');
+        if (sel === '.type') return input('series');
+        if (sel === '.url') return input('autotrack:continue-watching:series:alice');
+        if (sel === '.live-preview-posters') return posters;
+        if (sel === '.live-preview-shelf-status') return { innerHTML: '' };
+        return null;
+      },
+      querySelectorAll(sel) { return sel === '.url' ? [input('autotrack:continue-watching:series:alice')] : []; },
+    };
+    client.document.getElementById('lists').querySelectorAll = (sel) => sel === '.entry' ? [row] : [];
+    client.document.querySelectorAll = (sel) => sel === '#lists .entry' ? [row] : [];
+    await client.call('renderLivePreview');
+    assert.match(posters.innerHTML, /data-id="tt0903747" data-type="series"/);
+    assert.doesNotMatch(posters.innerHTML, /data-id="123456"/);
+    // The delegated poster click passes these two data attributes through to
+    // openItemDetailsModal. Exercise that request too, not just the HTML.
+    const [, id, type] = posters.innerHTML.match(/clickable-poster[^>]*data-id="([^"]+)" data-type="([^"]+)"/);
+    await client.call('openItemDetailsModal', id, type);
+    const detail = requestsTo(client, '/api/details')[0];
+    assert.equal(new URL(detail.url).searchParams.get('imdbId'), 'tt0903747');
+    assert.equal(new URL(detail.url).searchParams.get('type'), 'series');
+  });
+
+  it('keeps TMDB show ids intact and leaves actual movies as movies', () => {
+    const client = loadClient();
+    const episode = client.call('_liveFallbackMeta', { id: 'tmdb:1396:2:3', showId: 'tmdb:1396', type: 'episode' }, 'series');
+    assert.equal(episode.id, 'tmdb:1396');
+    assert.equal(episode.type, 'series');
+    const movie = client.call('_liveFallbackMeta', { id: 'tt1234567', type: 'movie', name: 'Movie' }, 'movie');
+    assert.equal(movie.id, 'tt1234567');
+    assert.equal(movie.type, 'movie');
+    assert.equal(movie.showId, undefined);
+  });
+});
