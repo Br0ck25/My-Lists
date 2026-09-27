@@ -2464,7 +2464,20 @@ function trackingSyncSignature(localMap) {
   var wl = localMap['watchlist'] || {};
   return [
     listSig((localMap['watch-history'] || {}).items),
-    listSig((localMap['continue-watching'] || {}).items),
+    // A show's next episode can change in place without moving its show id,
+    // changing the list length, or adding a watchedAt stamp. The old listSig
+    // missed that edit and left the installed Continue Watching catalog on
+    // the previous episode until the ten-minute heartbeat (while Live
+    // Preview read the new local item immediately). Track the actual shelf
+    // content, including episode/air-date/badge changes, not just its edges.
+    JSON.stringify(((localMap['continue-watching'] || {}).items || []).map(it => {
+      // D1 assigns its own updatedAt for catalog ordering. That is not a
+      // change to the episode; including it would cause a sync on every
+      // load, with each sync assigning another timestamp indefinitely.
+      const copy = Object.assign({}, it);
+      delete copy.updatedAt;
+      return copy;
+    })),
     listSig((localMap['airing-next'] || {}).items),
     curatedRecsSignature(loadCuratedRecommendations()),
     // Its stamp too, which moves at most every CURATED_RECS_RESTAMP_MS when
@@ -2578,6 +2591,10 @@ async function pushTrackingSync(opts) {
         // rather than updatedAt (a scrobble moves updatedAt and must not
         // start a conflict).
         expectedClientVersion: window._serverTrackingClientVersion,
+        // Server scrobbles newer than this snapshot may be rescued. Older
+        // server CW rows are NOT allowed to replace the local shelf (the
+        // Live Preview already shows this browser's current list).
+        trackingBaseUpdatedAt: window._serverTrackingUpdatedAt,
       }),
     });
     if (res && res.status === 409) {
@@ -2613,8 +2630,17 @@ async function pushTrackingSync(opts) {
       // removed elsewhere.
       recordTrackingLocalBaseline(sentStamps);
     }
-    window._lastTrackingSyncPushedAt = Date.now();
-    window._lastTrackingSig = sig;
+    // Do not acknowledge a failed push. Otherwise an unchanged signature
+    // suppresses the next retry even though Stremio/Nuvio still have the old
+    // record (the local Live Preview has already advanced).
+    if (data && data.ok) {
+      if (Number.isFinite(Number(data.updatedAt))) {
+        window._serverTrackingUpdatedAt = Number(data.updatedAt);
+        saveSyncBaselines({ tracking: Number(data.updatedAt) });
+      }
+      window._lastTrackingSyncPushedAt = Date.now();
+      window._lastTrackingSig = sig;
+    }
   } catch (e) {
     // silently fail, it's a background sync
   }
@@ -3227,6 +3253,7 @@ async function loadCreatorSync(opts) {
     // any local-only items so server scrobbles take immediate precedence without
     // losing un-pushed local edits.
     let touchedTracking = false;
+    let localCwWonOnLoad = false;
     if (!isBackgroundResume || trackingChanged) {
       let isRecentRemoval = false;
       try {
@@ -3295,7 +3322,20 @@ async function loadCreatorSync(opts) {
         const localOnlyCW = keepLocalOnlyCW
           ? localCWItems.filter((it) => it && (!it.showId || !serverShowIds.has(String(it.showId))))
           : [];
-        let mergedCW = dedupeContinueWatchingItems([...serverCW, ...localOnlyCW]);
+        // An unchanged server version cannot contain another device's new
+        // progress. If its CW rows nevertheless differ from this device's
+        // already-synced shelf, they may be from the old server-first merge
+        // (which acknowledged a save while keeping obsolete shows). Keep the
+        // list the user actually sees and repair the account on the next
+        // push. A genuinely newer server version still wins as before.
+        const cwIdentity = (items) => JSON.stringify(items.filter(Boolean)
+          .map(it => [it.showId || it.id, it.id, it.seasonNum, it.episodeNum])
+          .sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+        const localSnapshotWins = !!(localCW && priorServerTrackingUpdatedAt &&
+          Number(synced.trackingUpdatedAt) <= Number(priorServerTrackingUpdatedAt) &&
+          cwIdentity(localCWItems) !== cwIdentity(serverCW));
+        localCwWonOnLoad = localSnapshotWins;
+        let mergedCW = localSnapshotWins ? localCWItems : dedupeContinueWatchingItems([...serverCW, ...localOnlyCW]);
         if (isRecentRemoval) {
           mergedCW = localCWItems;
         }
@@ -3309,7 +3349,7 @@ async function loadCreatorSync(opts) {
         saveLocalCustomListsMap(map);
         window._inProgressShowIds = new Set(mergedCW.map((it) => String(it && it.showId)).filter(Boolean));
 
-        if ((localOnlyCW.length > 0 || carriedCW) && typeof scheduleTrackingSync === 'function') {
+        if ((localSnapshotWins || localOnlyCW.length > 0 || carriedCW) && typeof scheduleTrackingSync === 'function') {
           scheduleTrackingSync();
         } else if (!isRecentRemoval) {
           recordTrackingLocalBaseline({ 'continue-watching': cw.updatedAt });
@@ -3388,7 +3428,7 @@ async function loadCreatorSync(opts) {
           if (typeof scheduleTrackingSync === 'function') scheduleTrackingSync();
         }
       }
-      if (Array.isArray(synced.fullyWatchedShowIds)) {
+      if (!localCwWonOnLoad && Array.isArray(synced.fullyWatchedShowIds)) {
         window._fullyWatchedShowIds = new Set(synced.fullyWatchedShowIds.map(String));
         try {
           localStorage.setItem('myListAddon:fullyWatchedShows', JSON.stringify(synced.fullyWatchedShowIds));

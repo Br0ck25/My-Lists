@@ -4366,6 +4366,22 @@ async function writeCreatorTrackingD1(env, username, trackingData, isIntentional
     ]);
     if (isIntentionalRemoval) {
       prunes.push(...await d1ReplaceRowsById(env, "creator_show_states", username, "show_id", allShows));
+    } else {
+      // A show that was fully watched can become active again when a new
+      // episode airs. Non-removal saves used to leave its old D1 flag set
+      // forever, even after the browser removed it from fullyWatchedShowIds.
+      // The catalog read then filtered the new CW row out. Clear only this
+      // flag; preserve dismissals and Airing Next removals on those rows.
+      const staleFull = await env.DB.prepare(
+        "SELECT show_id FROM creator_show_states WHERE username = ? AND is_fully_watched = 1"
+      ).bind(username).all();
+      for (const row of (staleFull.results || [])) {
+        if (!fullyWatched.includes(String(row.show_id))) {
+          stmts.push(env.DB.prepare(
+            "UPDATE creator_show_states SET is_fully_watched = 0 WHERE username = ? AND show_id = ?"
+          ).bind(username, row.show_id));
+        }
+      }
     }
     for (const sid of allShows) {
       const isFw = fullyWatched.includes(sid) ? 1 : 0;
@@ -4416,6 +4432,7 @@ async function writeCreatorTrackingD1(env, username, trackingData, isIntentional
       // dedupeContinueWatchingItems (21_client-custom-list-builder.js), so the
       // two sides cannot disagree about which entry survives.
       const cwSeen = new Set();
+      let cwIndex = 0;
       for (const item of trackingData.continueWatching) {
         if (!item) continue;
         const showId = String(item.showId || item.id || "");
@@ -4442,7 +4459,10 @@ async function writeCreatorTrackingD1(env, username, trackingData, isIntentional
         const showPoster = item.showPoster || null;
         const seasonNum = item.seasonNum != null ? Number(item.seasonNum) : null;
         const episodeNum = item.episodeNum != null ? Number(item.episodeNum) : null;
-        const itemUpdated = Number(item.updatedAt || item.watchedAt) || meta.updatedAt;
+        // This is the displayed shelf order. Sorting by a mixture of old
+        // per-item timestamps and a fresh save time shuffled the installed
+        // catalog relative to the browser, even when the sets matched.
+        const itemUpdated = meta.updatedAt - cwIndex++;
         stmts.push(
           env.DB.prepare(
             `INSERT INTO continue_watching (username, show_id, item_id, name, poster, show_title, show_poster, season_num, episode_num, updated_at)

@@ -1006,10 +1006,20 @@ function _liveMergeShowKey(item) {
 // Airing Next data) into the same meta shape the live /api/preview sample
 // uses, for the shelves below that fall back to it.
 function _liveFallbackMeta(it, defaultType) {
+  // Tracking stores the NEXT EPISODE as the item id (sometimes a TMDB
+  // episode's bare numeric id). A poster represents the SHOW, just like the
+  // same item on Your Custom Lists does. Passing the episode id and type
+  // 'episode' to /api/details made every click fail with a TMDB 404.
+  const isMovie = it.kind === 'movie' || it.type === 'movie' ||
+    (!it.type && defaultType === 'movie' && !it.showId && it.seasonNum == null && it.episodeNum == null);
+  const epId = String(it.id || '');
+  const showId = isMovie ? '' : (it.showId || it.imdbId ||
+    (epId.startsWith('tmdb:') && epId.split(':').length > 2 ? epId.split(':').slice(0, 2).join(':') :
+      (epId.startsWith('tt') && epId.includes(':') ? epId.split(':')[0] : epId)));
   return {
-    id: it.id,
-    showId: it.showId || it.id,
-    type: it.type || defaultType || (it.episodeTitle ? 'series' : 'series'),
+    id: isMovie ? (it.imdbId || it.id) : showId,
+    showId: isMovie ? undefined : showId,
+    type: isMovie ? 'movie' : 'series',
     name: it.name || it.title,
     // Resolved the same way the Lists tab resolves it. Reading it.poster
     // alone left every Airing Next tile as "No poster": those items carry no
@@ -2628,7 +2638,7 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
       const cleanPath = (typeof getListCleanPath === 'function') ? getListCleanPath(listUrl, name) : null;
       const safeUrlParam = (listUrl && listUrl.length < 1500) ? listUrl : '';
       const targetUrl = cleanPath || ('/#/list?' + new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam }).toString());
-      history.replaceState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', targetUrl);
+      history.replaceState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', targetUrl);
     } catch (e) {}
   } else if (!opts.skipPushState) {
     try {
@@ -2641,7 +2651,12 @@ async function openListDetailsPage(name, type, listUrl, preloaded, opts) {
           history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', cleanPath);
         } else {
           const params = new URLSearchParams({ name: name || '', type: type || 'movie', url: safeUrlParam });
-          history.pushState({ view: 'list', name: name, type: type, listUrl: safeUrlParam, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', '/#/list?' + params.toString());
+          // The URL is deliberately shortened for large embedded lists, but
+          // history.state must keep the *real* URL. Back from a poster
+          // compares it to _currentListDetailsKey to reuse the already
+          // paginated grid; storing '' here caused it to rebuild page 1 and
+          // clamp a deep scroll position back to the top.
+          history.pushState({ view: 'list', name: name, type: type, listUrl: listUrl, fromTab: currentActiveTab, fromCatalogsSubmenu: currentSubmenu, fromChannelsSubmenu: currentChannelsSubmenu, previousScrollY: window._previousScrollY }, '', '/#/list?' + params.toString());
         }
       }
     } catch (e) {}

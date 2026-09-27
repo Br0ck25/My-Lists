@@ -555,10 +555,7 @@ function navigateBackFromDetail() {
       history.back();
     } else {
       switchTab('list-details');
-      if (typeof window._listScrollY === 'number') {
-        const scrollPos = window._listScrollY;
-        window.scrollTo({ top: scrollPos, behavior: 'instant' });
-      }
+      if (typeof restoreListDetailsScroll === 'function') restoreListDetailsScroll(window._listScrollY);
     }
   } else if (history.length > 1 && window._previousTab && window._previousTab !== 'list-details' && window._previousTab !== 'item-details') {
     history.back();

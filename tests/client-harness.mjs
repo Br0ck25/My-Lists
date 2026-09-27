@@ -157,6 +157,7 @@ export function loadClient(opts = {}) {
     addEventListener() {}, removeEventListener() {}, cookie: "",
   };
 
+  const windowListeners = new Map();
   const sandbox = {
     console: opts.console || { log() {}, warn() {}, error() {}, info() {}, debug() {} },
     Date, Math, JSON, TextEncoder, TextDecoder, URL, URLSearchParams,
@@ -182,7 +183,17 @@ export function loadClient(opts = {}) {
     atob: (s) => Buffer.from(s, "base64").toString("binary"),
     btoa: (s) => Buffer.from(s, "binary").toString("base64"),
     crypto: globalThis.crypto,
-    addEventListener() {}, removeEventListener() {}, dispatchEvent: () => true,
+    addEventListener(type, fn) {
+      if (!windowListeners.has(type)) windowListeners.set(type, []);
+      windowListeners.get(type).push(fn);
+    },
+    removeEventListener(type, fn) {
+      windowListeners.set(type, (windowListeners.get(type) || []).filter((f) => f !== fn));
+    },
+    dispatchEvent(event) {
+      for (const fn of windowListeners.get(event.type) || []) fn(event);
+      return true;
+    },
     // Viewport and scrolling. lockBackgroundScroll (16_client-row-core.js) reads
     // and restores the scroll position around every modal, so without these the
     // stub throws on any test that opens one -- which is most of them now.

@@ -385,6 +385,7 @@
                       showPoster: latest.showPoster || "",
                       seasonNum: next.seasonNum,
                       episodeNum: next.episode.episode_number,
+                      updatedAt: Date.now(),
                     });
                     blob.fullyWatchedShowIds = blob.fullyWatchedShowIds.filter((s) => s !== imdbId);
                   } else if (!blob.fullyWatchedShowIds.includes(imdbId)) {
@@ -1022,6 +1023,7 @@
                 showPoster: finalShowPoster,
                 seasonNum: next.seasonNum,
                 episodeNum: next.episode.episode_number,
+                updatedAt: Date.now(),
               });
               blob.fullyWatchedShowIds = blob.fullyWatchedShowIds.filter((s) => s !== resolvedShowId && s !== imdbId);
             } else if (!blob.fullyWatchedShowIds.includes(resolvedShowId)) {
@@ -3234,62 +3236,69 @@
       // preserved at the front. Skip the merge only for intentionalRemoval.
       let rescuedCount = 0;
       if (!body.intentionalRemoval) {
+        // The browser's CW array is the shelf it actually displayed. The old
+        // merge prepended *every* stored CW row before it, so a stale Revival
+        // survived indefinitely and a refreshed episode on an existing show
+        // was always replaced by the server's older one. Only a scrobble the
+        // browser has not yet seen may override that snapshot.
+        const incomingHistoryIds = new Set(
+          (Array.isArray(body.watchHistory) ? body.watchHistory : []).map(it => String(it && it.id || ''))
+        );
+        const baseStamp = Number(body.trackingBaseUpdatedAt) || (Date.now() - 2 * 60 * 1000);
+        const freshScrobbledShows = new Set();
+        const noteFreshScrobble = (it) => {
+          if (!it || !it.id || incomingHistoryIds.has(String(it.id)) || Number(it.watchedAt) <= baseStamp) return;
+          if (it.showId) freshScrobbledShows.add(trackingShowKey(String(it.showId)));
+        };
+        const mergeFreshContinueWatching = (serverItems) => {
+          if (!Array.isArray(serverItems)) return;
+          const incoming = Array.isArray(body.continueWatching) ? body.continueWatching.slice() : [];
+          for (const item of serverItems) {
+            if (!item || !(item.showId || item.id)) continue;
+            const key = trackingShowKey(String(item.showId || item.id));
+            if (!freshScrobbledShows.has(key)) continue;
+            const idx = incoming.findIndex(it => it && trackingShowKey(String(it.showId || it.id || '')) === key);
+            if (idx >= 0) {
+              const previous = incoming[idx];
+              // The browser may already have advanced this show further than
+              // the delayed scrobble. Never step it back, or discard its
+              // richer air-date/season-badge metadata for the same episode.
+              const oldSeason = Number(previous.seasonNum) || 0;
+              const newSeason = Number(item.seasonNum) || 0;
+              const oldEpisode = Number(previous.episodeNum) || 0;
+              const newEpisode = Number(item.episodeNum) || 0;
+              if (String(previous.id) === String(item.id) ||
+                  newSeason < oldSeason || (newSeason === oldSeason && newEpisode <= oldEpisode)) continue;
+              incoming.splice(idx, 1);
+            }
+            incoming.unshift(item);
+          }
+          body.continueWatching = incoming;
+        };
         try {
           if (existingBlob) {
-            // Watch History: find server items not present in the incoming payload
-            const incomingIds = new Set(
-              (Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id))
-            );
             const serverOnlyItems = (Array.isArray(existingBlob.watchHistory) ? existingBlob.watchHistory : [])
-              .filter((it) => it && it.id && !incomingIds.has(String(it.id)));
+              .filter(it => it && it.id && !incomingHistoryIds.has(String(it.id)));
+            for (const it of serverOnlyItems) noteFreshScrobble(it);
             if (serverOnlyItems.length) {
-              // Sort server-only items newest-first and prepend them
               serverOnlyItems.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
               body.watchHistory = [...serverOnlyItems, ...(Array.isArray(body.watchHistory) ? body.watchHistory : [])];
               rescuedCount = serverOnlyItems.length;
             }
-
-            // Continue Watching: when scrobbles occur on the server (Nuvio / Plex),
-            // the server computes the next episode and updates existingBlob.continueWatching.
-            // If the server has a show in continueWatching, its version must take precedence
-            // over the client's stale incoming item for that same show!
-            const serverCwList = Array.isArray(existingBlob.continueWatching) ? existingBlob.continueWatching : [];
-            if (serverCwList.length) {
-              const incomingCwList = Array.isArray(body.continueWatching) ? body.continueWatching : [];
-              const mergedCw = [];
-              const handledShows = new Set();
-              const fullyWatchedSet = new Set([
-                ...(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []),
-                ...(Array.isArray(existingBlob.fullyWatchedShowIds) ? existingBlob.fullyWatchedShowIds.map(String) : [])
-              ]);
-              
-              // Server's updated Continue Watching items come first, but NEVER resurrect fully watched shows!
-              for (const sItem of serverCwList) {
-                if (sItem && (sItem.showId || sItem.id)) {
-                  const sKey = String(sItem.showId || sItem.id);
-                  const baseKey = trackingShowKey(sKey);
-                  if (!sItem.isCompanion && (fullyWatchedSet.has(sKey) || fullyWatchedSet.has(baseKey) || (sItem.showId && fullyWatchedSet.has(String(sItem.showId))))) {
-                    continue;
-                  }
-                  mergedCw.push(sItem);
-                  handledShows.add(sKey);
-                  if (baseKey) handledShows.add(baseKey);
-                }
-              }
-              // Add any client-only Continue Watching shows that aren't on the server
-              for (const cItem of incomingCwList) {
-                if (cItem && (cItem.showId || cItem.id)) {
-                  const cKey = String(cItem.showId || cItem.id);
-                  const baseKey = trackingShowKey(cKey);
-                  if (!handledShows.has(cKey) && !handledShows.has(baseKey)) {
-                    mergedCw.push(cItem);
-                    handledShows.add(cKey);
-                    if (baseKey) handledShows.add(baseKey);
-                  }
-                }
-              }
-              body.continueWatching = mergedCw;
+            mergeFreshContinueWatching(existingBlob.continueWatching);
+            // A fresh server scrobble can also FINISH a show. Preserve that
+            // completion, but never union every historical fully-watched id:
+            // an old completion is cleared when a newly aired episode puts
+            // the show back on this browser's CW shelf.
+            const fw = new Set(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []);
+            for (const sid of (existingBlob.fullyWatchedShowIds || [])) {
+              const key = trackingShowKey(String(sid));
+              if (!freshScrobbledShows.has(key)) continue;
+              if ((existingBlob.continueWatching || []).some(it => it && trackingShowKey(String(it.showId || it.id || '')) === key)) continue;
+              fw.add(String(sid));
+              body.continueWatching = (body.continueWatching || []).filter(it => it && trackingShowKey(String(it.showId || it.id || '')) !== key);
             }
+            body.fullyWatchedShowIds = [...fw];
 
             // Airing Next and the Discover recommendations are DERIVED
             // lists: a browser only has them once it has computed them
@@ -3348,16 +3357,6 @@
               }
             }
 
-            // fullyWatchedShowIds: union
-            if (Array.isArray(existingBlob.fullyWatchedShowIds) && existingBlob.fullyWatchedShowIds.length) {
-              const incomingFW = new Set(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []);
-              for (const sid of existingBlob.fullyWatchedShowIds) {
-                if (!incomingFW.has(String(sid))) {
-                  body.fullyWatchedShowIds = body.fullyWatchedShowIds || [];
-                  body.fullyWatchedShowIds.push(sid);
-                }
-              }
-            }
           }
         } catch {
           // Merge is best-effort -- never block the save over it.
@@ -3381,48 +3380,18 @@
               queueCw = Array.isArray(queue.continueWatching) ? queue.continueWatching : [];
             }
             if (queueWh.length) {
+              for (const it of queueWh) noteFreshScrobble(it);
               const currentIds = new Set(
-                (Array.isArray(body.watchHistory) ? body.watchHistory : []).map((it) => String(it && it.id))
+                (Array.isArray(body.watchHistory) ? body.watchHistory : []).map(it => String(it && it.id))
               );
-              const queueOnly = queueWh.filter((it) => it && it.id && !currentIds.has(String(it.id)));
+              const queueOnly = queueWh.filter(it => it && it.id && !currentIds.has(String(it.id)));
               if (queueOnly.length) {
                 queueOnly.sort((a, b) => (b.watchedAt || 0) - (a.watchedAt || 0));
                 body.watchHistory = [...queueOnly, ...(Array.isArray(body.watchHistory) ? body.watchHistory : [])];
                 rescuedCount += queueOnly.length;
               }
             }
-            if (queueCw.length) {
-              const fullyWatchedSet = new Set([
-                ...(Array.isArray(body.fullyWatchedShowIds) ? body.fullyWatchedShowIds.map(String) : []),
-                ...(Array.isArray(existingBlob.fullyWatchedShowIds) ? existingBlob.fullyWatchedShowIds.map(String) : [])
-              ]);
-              const mergedCw = [];
-              const handledShows = new Set();
-              for (const qItem of queueCw) {
-                if (qItem && (qItem.showId || qItem.id)) {
-                  const qKey = String(qItem.showId || qItem.id);
-                  const baseKey = trackingShowKey(qKey);
-                  if (!qItem.isCompanion && (fullyWatchedSet.has(qKey) || fullyWatchedSet.has(baseKey) || (qItem.showId && fullyWatchedSet.has(String(qItem.showId))))) {
-                    continue;
-                  }
-                  mergedCw.push(qItem);
-                  handledShows.add(qKey);
-                  if (baseKey) handledShows.add(baseKey);
-                }
-              }
-              for (const bItem of (Array.isArray(body.continueWatching) ? body.continueWatching : [])) {
-                if (bItem && (bItem.showId || bItem.id)) {
-                  const bKey = String(bItem.showId || bItem.id);
-                  const baseKey = trackingShowKey(bKey);
-                  if (!handledShows.has(bKey) && !handledShows.has(baseKey)) {
-                    mergedCw.push(bItem);
-                    handledShows.add(bKey);
-                    if (baseKey) handledShows.add(baseKey);
-                  }
-                }
-              }
-              body.continueWatching = mergedCw;
-            }
+            mergeFreshContinueWatching(queueCw);
           }
         } catch {
           // Best-effort
@@ -3588,7 +3557,7 @@
       // clientVersion goes back so the browser can advance its baseline from
       // the save itself, without a /sync/load round trip in between -- exactly
       // what sync/save returns updatedAt for.
-      return json({ ok: true, rescuedFromScrobble: rescuedCount, clientVersion: blob.clientVersion });
+      return json({ ok: true, rescuedFromScrobble: rescuedCount, clientVersion: blob.clientVersion, updatedAt: blob.updatedAt });
     }
 
     // /api/creator/sync/save-presets  (POST)  { creatorName, creatorKey,
@@ -4091,24 +4060,31 @@
               }
             }
             if (queueCw.length) {
-              const mergedCw = [];
-              const handledShows = new Set();
+              const base = Number(data.trackingUpdatedAt) || 0;
+              const freshShows = new Set(queueWh.filter(it => it && it.showId && Number(it.watchedAt) > base)
+                .map(it => trackingShowKey(String(it.showId))));
+              const current = Array.isArray(data.continueWatching) ? data.continueWatching.slice() : [];
               for (const qItem of queueCw) {
-                if (qItem && (qItem.showId || qItem.id)) {
-                  mergedCw.push(qItem);
-                  handledShows.add(String(qItem.showId || qItem.id));
+                if (!qItem || !(qItem.showId || qItem.id)) continue;
+                const key = trackingShowKey(String(qItem.showId || qItem.id));
+                // A queue entry can outlive the browser save that removed
+                // this show. Only scrobbles NEWER than the tracking record
+                // it just loaded may amend its Continue Watching shelf.
+                if (!freshShows.has(key)) continue;
+                const idx = current.findIndex(it => it && trackingShowKey(String(it.showId || it.id || '')) === key);
+                if (idx >= 0) {
+                  const previous = current[idx];
+                  const oldSeason = Number(previous.seasonNum) || 0;
+                  const newSeason = Number(qItem.seasonNum) || 0;
+                  const oldEpisode = Number(previous.episodeNum) || 0;
+                  const newEpisode = Number(qItem.episodeNum) || 0;
+                  if (String(previous.id) === String(qItem.id) ||
+                      newSeason < oldSeason || (newSeason === oldSeason && newEpisode <= oldEpisode)) continue;
+                  current.splice(idx, 1);
                 }
+                current.unshift(qItem);
               }
-              for (const dItem of (Array.isArray(data.continueWatching) ? data.continueWatching : [])) {
-                if (dItem && (dItem.showId || dItem.id)) {
-                  const dKey = String(dItem.showId || dItem.id);
-                  if (!handledShows.has(dKey)) {
-                    mergedCw.push(dItem);
-                    handledShows.add(dKey);
-                  }
-                }
-              }
-              data.continueWatching = mergedCw;
+              data.continueWatching = current;
             }
           }
         }
